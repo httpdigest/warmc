@@ -1,0 +1,17 @@
+package dir:root@2.0.0
+interface 0 model [dir:root@2.0.0]
+  record entry { key: string, value: u64 }
+  variant outcome { ok: entry#0, failed: string }
+interface 1 api [dir:root@2.0.0]
+  use entry from model.entry (pkg 1 iface 0 def 0)
+  use outcome from model.outcome (pkg 1 iface 0 def 1)
+  use handle from vendor:store/kv@0.5.0.handle (pkg 0 iface 0 def 0)
+  func put(h: borrow<handle#2>, e: entry#0) -> outcome#1
+world 0 service [dir:root@2.0.0]
+  import path vendor:store/kv@0.5.0 (pkg 0 iface 0)
+  export path api (pkg 1 iface 1)
+package vendor:store@0.5.0
+interface 0 kv [vendor:store@0.5.0]
+  resource handle
+    func [constructor]handle()
+    func [method]handle.get(k: string) -> option<string>

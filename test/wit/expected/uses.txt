@@ -1,0 +1,26 @@
+package test:uses@3.1.4-beta.1+build.7
+interface 0 base [test:uses@3.1.4-beta.1+build.7]
+  record thing { n: u32 }
+  type alias = thing#0
+  resource res
+interface 1 derived [test:uses@3.1.4-beta.1+build.7]
+  use thing from base.thing (pkg 0 iface 0 def 0)
+  use other-alias from base.alias (pkg 0 iface 0 def 1)
+  use res from base.res (pkg 0 iface 0 def 2)
+  func make() -> thing#0
+  func take(r: borrow<res#2>) -> other-alias#1
+interface 2 foreign [test:uses@3.1.4-beta.1+build.7]
+  use imported from other:pkg/iface@1.2.3.imported (pkg 1 iface 0 def 0)
+  use u2 from other:pkg/iface@1.2.3.also (pkg 1 iface 0 def 1)
+  func go(x: imported#0) -> u2#1
+world 0 w [test:uses@3.1.4-beta.1+build.7]
+  import path derived (pkg 0 iface 1)
+  import path other:pkg/iface@1.2.3 (pkg 1 iface 0)
+package other:pkg@1.2.3
+use iface as local-iface
+interface 0 iface [other:pkg@1.2.3]
+  type imported = u64
+  type also = string
+interface 1 consumer [other:pkg@1.2.3]
+  use imported from local-iface.imported (pkg 1 iface 0 def 0)
+  func peek() -> imported#0

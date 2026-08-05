@@ -1,0 +1,8 @@
+module 0: cm0, 1 funcs, 0 imports, 1 exports
+module 1: cm1, 1 funcs, 0 imports, 1 exports
+canon 0: lift unresolved (the core instance does not export it) [func], core () -> (i32), memory=no
+func 0: canon 0
+export "run": func 0
+blocked: instance export "mod" is a core module, which this plan cannot alias out yet
+blocked: a core module this component imports is instantiated
+blocked: core instance export "v" is missing

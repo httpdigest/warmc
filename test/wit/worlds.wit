@@ -1,0 +1,66 @@
+// The world grammar: every item shape, including the two that begin
+// identically -- `name: func()` and a path with a namespace.
+package test:worlds@0.2.1;
+
+interface shared {
+  type token = u64;
+}
+
+interface provider {
+  ping: func() -> u32;
+}
+
+interface consumer {
+  pong: func(n: u32);
+}
+
+world app {
+  import provider;
+  export consumer;
+
+  // A named item whose type is a function -- `x:` looks like a namespace.
+  import log: func(msg: string);
+  export run: func() -> result<_, string>;
+
+  // A whole interface written inline.
+  export control: interface {
+    stop: func();
+    status: func() -> u8;
+  }
+
+  // A type defined in the world itself.
+  record config { verbose: bool }
+  use shared.{token as world-token};
+
+  // A world-level type *used by a world-level function* while an inline
+  // interface is also present.  Every type parsed in a world body goes into
+  // one flat array, and the inline interface was being given the world's
+  // whole range rather than its own -- so its resolution pass reached the
+  // world's names, found them missing from its own defs, and refused the
+  // document.  `control` above cannot show it: it mentions only primitives,
+  // so no name of the world's ever entered the window it was handed.
+  export tagged: func() -> world-token;
+  export report: func(c: config) -> u8;
+}
+
+// The other half of the same window, where a name exists in both scopes.
+// The inline interface's `slot` and the world's are different types, and
+// resolving them against a shared range bound the world's function to
+// whichever came first -- with a def index belonging to the wrong scope.
+world shadowed {
+  export inner: interface {
+    type slot = string;
+    peek: func() -> slot;
+  }
+  record slot { n: u32 }
+  export outer: func() -> slot;
+}
+
+world other {
+  include app;
+}
+
+world renamed {
+  // The `with` form takes no trailing semicolon.
+  include app with { log as app-log }
+}

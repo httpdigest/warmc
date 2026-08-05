@@ -1,0 +1,14 @@
+package dir:root@2.0.0;
+
+// The other half of the same package, in a separate file: it uses both the
+// package's own interface and one from deps/.
+interface api {
+  use model.{entry, outcome};
+  use vendor:store/kv@0.5.0.{handle};
+  put: func(h: borrow<handle>, e: entry) -> outcome;
+}
+
+world service {
+  import vendor:store/kv@0.5.0;
+  export api;
+}

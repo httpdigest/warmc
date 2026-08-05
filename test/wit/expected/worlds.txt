@@ -1,0 +1,31 @@
+package test:worlds@0.2.1
+interface 0 shared [test:worlds@0.2.1]
+  type token = u64
+interface 1 provider [test:worlds@0.2.1]
+  func ping() -> u32
+interface 2 consumer [test:worlds@0.2.1]
+  func pong(n: u32)
+interface-inline 3 control [test:worlds@0.2.1]
+  func stop()
+  func status() -> u8
+interface-inline 4 inner [test:worlds@0.2.1]
+  type slot = string
+  func peek() -> slot#0
+world 0 app [test:worlds@0.2.1]
+  record config { verbose: bool }
+  use world-token from shared.token (pkg 0 iface 0 def 0)
+  import path provider (pkg 0 iface 1)
+  export path consumer (pkg 0 iface 2)
+  import func log(msg: string)
+  export func run() -> result<_, string>
+  export inline control (iface 3)
+  export func tagged() -> world-token#1
+  export func report(c: config#0) -> u8
+world 1 shadowed [test:worlds@0.2.1]
+  record slot { n: u32 }
+  export inline inner (iface 4)
+  export func outer() -> slot#0
+world 2 other [test:worlds@0.2.1]
+  include app
+world 3 renamed [test:worlds@0.2.1]
+  include app

@@ -1,0 +1,5 @@
+module 0: cm0, 2 funcs, 0 imports, 3 exports
+instance 0: module 0, 0 imports
+canon 0: lift instance 0 "name" [func], core () -> (i32), memory=yes
+func 0: canon 0
+export "name": func 0

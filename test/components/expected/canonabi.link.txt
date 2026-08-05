@@ -1,0 +1,25 @@
+module 0: cm0, 1 funcs, 0 imports, 2 exports
+module 1: cm1, 5 funcs, 4 imports, 1 exports
+instance 0: module 0, 0 imports
+instance 1: module 1, 4 imports
+  bind "test:abi/iface" "f-flat" <- canon 0 [func]
+  bind "test:abi/iface" "f-spill" <- canon 1 [func]
+  bind "test:abi/iface" "f-ptr" <- canon 2 [func]
+  bind "test:abi/iface" "f-wide" <- canon 3 [func]
+canon 0: lower func 0, core (i32 i32) -> (i64), memory=no
+canon 1: lower func 1, core (i32 i32 i32) -> (), memory=yes
+canon 2: lower func 2, core (i32 i32) -> (), memory=yes
+canon 3: lower func 3, core (i32 i32) -> (), memory=yes
+canon 4: lift instance 1 "run" [func], core (i32 i32) -> (i32), memory=yes
+func 0: import "f-flat"
+func 1: import "f-spill"
+func 2: import "f-ptr"
+func 3: import "f-wide"
+func 4: canon 4
+export "run": func 4
+blocked: import "test:abi/iface" is an instance no host here provides
+blocked: instance export "f-flat" is not a function this plan has
+blocked: instance export "f-spill" is not a function this plan has
+blocked: a lowered function the component imports has nothing to lift
+blocked: instance export "f-ptr" is not a function this plan has
+blocked: instance export "f-wide" is not a function this plan has

@@ -1,0 +1,49 @@
+core module 0: 6 funcs, 6 exports
+core module 1: 1 funcs, 2 exports
+core module 2: 1 funcs, 0 exports
+core instance 0: instantiate module 1, 0 args
+core instance 1: 1 inline exports
+core instance 2: instantiate module 0, 1 args
+core instance 3: 1 inline exports
+core instance 4: instantiate module 2, 2 args
+type 0: instance
+type 1: record
+type 2: variant
+type 3: func
+type 4: func
+type 5: func
+alias 0: core export 0 "0" (core func)
+alias 1: core export 2 "memory" (core memory)
+alias 2: export 0 "write" (func)
+alias 3: core export 2 "example:calc/ops@0.1.0#add" (core func)
+alias 4: core export 2 "example:calc/ops@0.1.0#area" (core func)
+alias 5: core export 2 "example:calc/ops@0.1.0#name" (core func)
+alias 6: core export 2 "cabi_post_example:calc/ops@0.1.0#name" (core func)
+instance 0: instantiate component 0, 5 args
+canon 0: lower, 2 options
+canon 1: lift, 0 options
+canon 2: lift, 0 options
+canon 3: lift, 3 options
+import 0: "example:calc/log@0.1.0" kind 5
+export 0: "example:calc/ops@0.1.0" (instance 1)
+component 0:
+  type 0: func
+  type 1: record
+  type 2: variant
+  type 3: func
+  type 4: func
+  type 5: record
+  type 6: variant
+  type 7: func
+  type 8: func
+  type 9: func
+  import 0: "import-func-add" kind 1
+  import 1: "import-type-point" kind 3
+  import 2: "import-type-shape" kind 3
+  import 3: "import-func-area" kind 1
+  import 4: "import-func-name" kind 1
+  export 0: "point" (type 7)
+  export 1: "shape" (type 9)
+  export 2: "add" (func 0)
+  export 3: "area" (func 1)
+  export 4: "name" (func 2)

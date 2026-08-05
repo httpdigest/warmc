@@ -1,0 +1,1908 @@
+#include "warmc.h"
+#include "a64.h"
+
+#include <stdio.h>
+#include <sys/stat.h>
+#include <time.h>
+#include <stdlib.h>
+#include <string.h>
+
+typedef enum { K_TEXT, K_RODATA, K_DATA, K_BSS, K_DROP } SecKind;
+
+typedef struct {
+  char *name;
+  const uint8_t *data;
+  uint64_t size, align;
+  uint64_t addr;
+  SecKind kind;
+} InSec;
+
+typedef struct {
+  char *name;
+  int32_t sec;
+  uint64_t value;
+  bool global, weak, common;
+  uint64_t comm_size, comm_align;
+} InSym;
+
+typedef struct {
+  uint32_t sec;
+  uint64_t off;
+  int32_t sym;
+  uint32_t type;
+  int64_t addend;
+  bool pcrel;
+  uint8_t length;
+} InRel;
+
+typedef struct {
+  char *name;
+  uint8_t *buf;
+  size_t len;
+  InSec *secs; uint32_t nsecs;
+  InSym *syms; uint32_t nsyms;
+  InRel *rels; uint32_t nrels;
+} InObj;
+
+typedef struct {
+  char *name;
+  int32_t obj;
+  int32_t sym;
+  uint64_t addr;
+  bool defined, weak, imported;
+  uint32_t got_slot;
+  uint32_t stub;
+} GSym;
+
+#define NO_SLOT 0xffffffffu
+
+typedef struct {
+  InObj *objs; uint32_t nobjs, cap_objs;
+  GSym *gsyms; uint32_t ngsyms, cap_gsyms;
+  uint32_t *gs_ix; uint32_t gs_ix_cap;
+
+  uint64_t text_addr, text_size;
+  uint64_t rodata_addr, rodata_size;
+  uint64_t data_addr, data_size;
+  uint64_t bss_addr, bss_size;
+
+  uint64_t *rebase; uint32_t nrebase, cap_rebase;
+  uint32_t *got;  uint32_t ngot,  cap_got;
+  uint32_t *stub; uint32_t nstub, cap_stub;
+  uint64_t got_addr, stub_addr;
+
+  bool macho;
+} Linker;
+
+static void layout_macos(Linker *L);
+static void write_macho_exec(Linker *L, const char *path, uint64_t entry);
+
+static uint32_t gs_hash(const char *s) {
+  uint32_t h = 2166136261u;
+  for (; *s; s++) h = (h ^ (unsigned char)*s) * 16777619u;
+  return h;
+}
+
+static void gs_ix_put(Linker *L, uint32_t i) {
+  uint32_t mask = L->gs_ix_cap - 1;
+  uint32_t h = gs_hash(L->gsyms[i].name) & mask;
+  while (L->gs_ix[h]) h = (h + 1) & mask;
+  L->gs_ix[h] = i + 1;
+}
+
+static void gs_ix_grow(Linker *L) {
+  uint32_t want = L->gs_ix_cap ? L->gs_ix_cap * 2 : 1024;
+  xfree(L->gs_ix);
+  L->gs_ix = xcalloc(want, sizeof(uint32_t));
+  L->gs_ix_cap = want;
+  for (uint32_t i = 0; i < L->ngsyms; i++) gs_ix_put(L, i);
+}
+
+static int32_t gs_find(Linker *L, const char *name) {
+  if (!L->gs_ix_cap) return -1;
+  uint32_t mask = L->gs_ix_cap - 1;
+  uint32_t h = gs_hash(name) & mask;
+  while (L->gs_ix[h]) {
+    uint32_t i = L->gs_ix[h] - 1;
+    if (!strcmp(L->gsyms[i].name, name)) return (int32_t)i;
+    h = (h + 1) & mask;
+  }
+  return -1;
+}
+
+static uint32_t gs_intern(Linker *L, const char *name) {
+  int32_t i = gs_find(L, name);
+  if (i >= 0) return (uint32_t)i;
+  if (L->ngsyms == L->cap_gsyms) {
+    L->cap_gsyms = L->cap_gsyms ? L->cap_gsyms * 2 : 256;
+    L->gsyms = xrealloc(L->gsyms, L->cap_gsyms * sizeof(GSym));
+  }
+  GSym *g = &L->gsyms[L->ngsyms];
+  memset(g, 0, sizeof *g);
+  g->name = xstrndup(name, strlen(name));
+  g->obj = g->sym = -1;
+  g->got_slot = g->stub = NO_SLOT;
+  uint32_t idx = L->ngsyms++;
+  if ((uint64_t)L->ngsyms * 3 >= (uint64_t)L->gs_ix_cap * 2) gs_ix_grow(L);
+  else gs_ix_put(L, idx);
+  return idx;
+}
+
+static uint16_t rd16(const uint8_t *p) { return (uint16_t)(p[0] | (p[1] << 8)); }
+static uint32_t rd32(const uint8_t *p) {
+  return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+static uint64_t rd64(const uint8_t *p) {
+  return (uint64_t)rd32(p) | ((uint64_t)rd32(p + 4) << 32);
+}
+
+static double lk_ms(void) {
+  struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+  return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
+}
+
+static void chmod_exec(const char *path) {
+  if (chmod(path, 0755) != 0) warmc_fatal("link: cannot make %s executable", path);
+}
+
+static uint8_t *read_file(const char *path, size_t *len) {
+  FILE *f = fopen(path, "rb");
+  if (!f) warmc_fatal("link: cannot open %s", path);
+  fseek(f, 0, SEEK_END);
+  long n = ftell(f);
+  if (n < 0) warmc_fatal("link: cannot size %s", path);
+  fseek(f, 0, SEEK_SET);
+  uint8_t *b = xmalloc((size_t)n ? (size_t)n : 1);
+  if (n && fread(b, 1, (size_t)n, f) != (size_t)n)
+    warmc_fatal("link: short read on %s", path);
+  fclose(f);
+  *len = (size_t)n;
+  return b;
+}
+
+static InObj *obj_new(Linker *L, const char *name, uint8_t *buf, size_t len) {
+  if (L->nobjs == L->cap_objs) {
+    L->cap_objs = L->cap_objs ? L->cap_objs * 2 : 16;
+    L->objs = xrealloc(L->objs, L->cap_objs * sizeof(InObj));
+  }
+  InObj *o = &L->objs[L->nobjs++];
+  memset(o, 0, sizeof *o);
+  o->name = xstrndup(name, strlen(name));
+  o->buf = buf;
+  o->len = len;
+  return o;
+}
+
+typedef struct { const char *name; const uint8_t *data; size_t size; } ArMember;
+
+typedef struct {
+  uint8_t *buf; size_t len, pos;
+  const char *longnames; size_t nlongnames;
+  char namebuf[256];
+} ArReader;
+
+static void ar_open(ArReader *a, uint8_t *buf, size_t len, const char *path) {
+  if (len < 8 || memcmp(buf, "!<arch>\n", 8))
+    warmc_fatal("link: %s is not an archive", path);
+  memset(a, 0, sizeof *a);
+  a->buf = buf; a->len = len; a->pos = 8;
+}
+
+static bool ar_next(ArReader *a, ArMember *m) {
+  while (a->pos + 60 <= a->len) {
+    const uint8_t *h = a->buf + a->pos;
+    char szbuf[11];
+    memcpy(szbuf, h + 48, 10); szbuf[10] = 0;
+    size_t size = (size_t)strtoul(szbuf, NULL, 10);
+    const uint8_t *data = h + 60;
+    size_t adv = 60 + size + (size & 1);
+    if (a->pos + 60 + size > a->len) return false;
+
+    char raw[17];
+    memcpy(raw, h, 16); raw[16] = 0;
+    for (int i = 15; i >= 0 && (raw[i] == ' ' || raw[i] == '/'); i--) raw[i] = 0;
+
+    a->pos += adv;
+
+    if (!strncmp(raw, "#1/", 3)) {
+      size_t nl = (size_t)strtoul(raw + 3, NULL, 10);
+      if (nl > size) return false;
+      size_t n = nl < sizeof a->namebuf - 1 ? nl : sizeof a->namebuf - 1;
+      memcpy(a->namebuf, data, n);
+      a->namebuf[n] = 0;
+
+      m->name = a->namebuf;
+      m->data = data + nl;
+      m->size = size - nl;
+    } else if (raw[0] == '/' && raw[1] >= '0' && raw[1] <= '9') {
+
+      size_t off = (size_t)strtoul(raw + 1, NULL, 10);
+      if (off >= a->nlongnames) return false;
+      const char *s = a->longnames + off;
+      size_t n = 0;
+      while (off + n < a->nlongnames && s[n] != '/' && s[n] != '\n') n++;
+      if (n >= sizeof a->namebuf) n = sizeof a->namebuf - 1;
+      memcpy(a->namebuf, s, n);
+      a->namebuf[n] = 0;
+      m->name = a->namebuf;
+      m->data = data;
+      m->size = size;
+    } else if (raw[0] == '/' || raw[0] == 0) {
+      char first[17];
+      memcpy(first, h, 16); first[16] = 0;
+      if (!strncmp(first, "//", 2)) { a->longnames = (const char *)data; a->nlongnames = size; }
+      continue;
+    } else {
+      snprintf(a->namebuf, sizeof a->namebuf, "%s", raw);
+      m->name = a->namebuf;
+      m->data = data;
+      m->size = size;
+    }
+
+    if (!strncmp(m->name, "__.SYMDEF", 9)) continue;
+    return true;
+  }
+  return false;
+}
+
+#define SHT_PROGBITS 1
+#define SHT_SYMTAB   2
+#define SHT_STRTAB   3
+#define SHT_RELA     4
+#define SHT_NOBITS   8
+
+#define SHF_WRITE     0x1
+#define SHF_ALLOC     0x2
+#define SHF_EXECINSTR 0x4
+
+#define STB_LOCAL 0
+#define STB_WEAK  2
+#define SHN_UNDEF  0
+#define SHN_ABS    0xfff1
+#define SHN_COMMON 0xfff2
+
+#define R_AARCH64_ABS64              257
+#define R_AARCH64_ABS32              258
+#define R_AARCH64_PREL32             261
+#define R_AARCH64_PREL64             260
+#define R_AARCH64_ADR_PREL_PG_HI21   275
+#define R_AARCH64_ADD_ABS_LO12_NC    277
+#define R_AARCH64_CALL26             283
+#define R_AARCH64_JUMP26             282
+#define R_AARCH64_LDST8_ABS_LO12_NC  278
+#define R_AARCH64_LDST16_ABS_LO12_NC 284
+#define R_AARCH64_LDST32_ABS_LO12_NC 285
+#define R_AARCH64_LDST64_ABS_LO12_NC 286
+#define R_AARCH64_LDST128_ABS_LO12_NC 299
+#define R_AARCH64_ADR_GOT_PAGE       311
+#define R_AARCH64_LD64_GOT_LO12_NC   312
+
+static SecKind elf_kind(const char *name, uint32_t type, uint64_t flags) {
+  if (!(flags & SHF_ALLOC)) return K_DROP;
+  if (type == SHT_NOBITS) return K_BSS;
+  if (flags & SHF_EXECINSTR) return K_TEXT;
+  if (flags & SHF_WRITE) return K_DATA;
+  (void)name;
+  return K_RODATA;
+}
+
+static void read_elf_obj(InObj *o) {
+  const uint8_t *b = o->buf;
+  if (o->len < 64 || memcmp(b, "\177ELF", 4) || b[4] != 2 || b[5] != 1)
+    warmc_fatal("link: %s is not a little-endian ELF64 object", o->name);
+  uint64_t shoff = rd64(b + 0x28);
+  uint16_t shentsize = rd16(b + 0x3a), shnum = rd16(b + 0x3c), shstrndx = rd16(b + 0x3e);
+  const uint8_t *sh = b + shoff;
+  const char *shstr = (const char *)(b + rd64(sh + (size_t)shstrndx * shentsize + 0x18));
+
+  o->nsecs = shnum;
+  o->secs = xcalloc(shnum ? shnum : 1, sizeof(InSec));
+  for (uint32_t i = 0; i < shnum; i++) {
+    const uint8_t *s = sh + (size_t)i * shentsize;
+    uint32_t type = rd32(s + 4);
+    uint64_t flags = rd64(s + 8), off = rd64(s + 0x18), size = rd64(s + 0x20);
+    uint64_t align = rd64(s + 0x30);
+    InSec *is = &o->secs[i];
+    is->name = xstrndup(shstr + rd32(s), strlen(shstr + rd32(s)));
+    is->size = size;
+    is->align = align ? align : 1;
+    is->kind = elf_kind(is->name, type, flags);
+    is->data = (type == SHT_NOBITS || is->kind == K_DROP) ? NULL : b + off;
+  }
+
+  for (uint32_t i = 0; i < shnum; i++) {
+    const uint8_t *s = sh + (size_t)i * shentsize;
+    if (rd32(s + 4) != SHT_SYMTAB) continue;
+    uint64_t off = rd64(s + 0x18), size = rd64(s + 0x20), esz = rd64(s + 0x38);
+    uint32_t strtab = rd32(s + 0x28);
+    const char *str = (const char *)(b + rd64(sh + (size_t)strtab * shentsize + 0x18));
+    uint32_t n = esz ? (uint32_t)(size / esz) : 0;
+    o->nsyms = n;
+    o->syms = xcalloc(n ? n : 1, sizeof(InSym));
+    for (uint32_t k = 0; k < n; k++) {
+      const uint8_t *e = b + off + (size_t)k * esz;
+      InSym *sy = &o->syms[k];
+      const char *nm = str + rd32(e);
+      sy->name = xstrndup(nm, strlen(nm));
+      uint8_t info = e[4];
+      uint16_t shndx = rd16(e + 6);
+      sy->value = rd64(e + 8);
+      sy->global = (info >> 4) != STB_LOCAL;
+      sy->weak = (info >> 4) == STB_WEAK;
+      if (shndx == SHN_COMMON) {
+        sy->common = true; sy->sec = -1;
+        sy->comm_size = rd64(e + 16);
+        sy->comm_align = sy->value ? sy->value : 1;
+      } else if (shndx == SHN_UNDEF || shndx >= SHN_ABS) {
+        sy->sec = -1;
+      } else {
+        sy->sec = (int32_t)shndx;
+      }
+    }
+    break;
+  }
+
+  uint32_t total = 0;
+  for (uint32_t i = 0; i < shnum; i++)
+    if (rd32(sh + (size_t)i * shentsize + 4) == SHT_RELA)
+      total += (uint32_t)(rd64(sh + (size_t)i * shentsize + 0x20) / 24);
+  o->rels = xcalloc(total ? total : 1, sizeof(InRel));
+  for (uint32_t i = 0; i < shnum; i++) {
+    const uint8_t *s = sh + (size_t)i * shentsize;
+    if (rd32(s + 4) != SHT_RELA) continue;
+    uint32_t target = rd32(s + 0x2c);
+    uint64_t off = rd64(s + 0x18), size = rd64(s + 0x20);
+    if (target >= shnum || o->secs[target].kind == K_DROP) continue;
+    for (uint64_t p = 0; p + 24 <= size; p += 24) {
+      const uint8_t *r = b + off + p;
+      InRel *ir = &o->rels[o->nrels++];
+      ir->sec = target;
+      ir->off = rd64(r);
+      uint64_t info = rd64(r + 8);
+      ir->sym = (int32_t)(info >> 32);
+      ir->type = (uint32_t)(info & 0xffffffffu);
+      ir->addend = (int64_t)rd64(r + 16);
+    }
+  }
+}
+
+#define MH_MAGIC_64 0xfeedfacfu
+#define LC_SEGMENT_64 0x19
+#define LC_SYMTAB     0x02
+
+#define MH_SUBSECTIONS_VIA_SYMBOLS 0x2000u
+
+#define S_REGULAR           0x0
+#define S_ZEROFILL          0x1
+#define SECTION_TYPE        0x000000ffu
+#define S_ATTR_PURE_INSTRUCTIONS 0x80000000u
+#define S_ATTR_SOME_INSTRUCTIONS 0x00000400u
+
+#define N_STAB 0xe0
+#define N_TYPE 0x0e
+#define N_EXT  0x01
+#define N_WEAK_DEF 0x0080
+#define N_UNDF 0x0
+#define N_SECT 0xe
+#define N_ABS  0x2
+
+#define ARM64_RELOC_UNSIGNED            0
+#define ARM64_RELOC_SUBTRACTOR          1
+#define ARM64_RELOC_BRANCH26            2
+#define ARM64_RELOC_PAGE21              3
+#define ARM64_RELOC_PAGEOFF12           4
+#define ARM64_RELOC_GOT_LOAD_PAGE21     5
+#define ARM64_RELOC_GOT_LOAD_PAGEOFF12  6
+#define ARM64_RELOC_ADDEND             10
+
+static SecKind macho_kind(const char *seg, const char *sect, uint32_t flags) {
+  if ((flags & SECTION_TYPE) == S_ZEROFILL && !strcmp(seg, "__DATA")) return K_BSS;
+  if (!strcmp(seg, "__TEXT")) {
+    if (flags & (S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS)) return K_TEXT;
+    return K_RODATA;
+  }
+  if (!strcmp(seg, "__DATA")) {
+    if (!strcmp(sect, "__bss") || !strcmp(sect, "__common")) return K_BSS;
+    return K_DATA;
+  }
+
+  return K_DROP;
+}
+
+static int cmp_u64(const void *a, const void *b) {
+  uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+  return x < y ? -1 : (x > y ? 1 : 0);
+}
+
+static uint32_t atom_of(const uint64_t *bnd, uint32_t n, uint64_t off) {
+  uint32_t lo = 0, hi = n;
+  while (hi - lo > 1) {
+    uint32_t mid = lo + (hi - lo) / 2;
+    if (bnd[mid] <= off) lo = mid; else hi = mid;
+  }
+  return lo;
+}
+
+static void split_subsections(InObj *o) {
+  uint32_t old_n = o->nsecs;
+  uint64_t **bnd = xcalloc(old_n ? old_n : 1, sizeof(uint64_t *));
+  uint32_t *nbnd = xcalloc(old_n ? old_n : 1, sizeof(uint32_t));
+  uint32_t *base = xcalloc(old_n ? old_n : 1, sizeof(uint32_t));
+
+  for (uint32_t s = 0; s < old_n; s++) {
+    InSec *is = &o->secs[s];
+    if (is->kind == K_DROP || !is->size) continue;
+    uint32_t n = 0;
+    for (uint32_t k = 0; k < o->nsyms; k++)
+      if (o->syms[k].sec == (int32_t)s && o->syms[k].value < is->size) n++;
+    if (!n) continue;
+    uint64_t *v = xmalloc((n + 1) * sizeof(uint64_t));
+    n = 0;
+    v[n++] = 0;
+    for (uint32_t k = 0; k < o->nsyms; k++)
+      if (o->syms[k].sec == (int32_t)s && o->syms[k].value < is->size)
+        v[n++] = o->syms[k].value;
+    qsort(v, n, sizeof(uint64_t), cmp_u64);
+    uint32_t u = 1;
+    for (uint32_t i = 1; i < n; i++) if (v[i] != v[u - 1]) v[u++] = v[i];
+    bnd[s] = v; nbnd[s] = u;
+  }
+
+  uint32_t total = 0;
+  for (uint32_t s = 0; s < old_n; s++) {
+    base[s] = total;
+    total += nbnd[s] ? nbnd[s] : 1;
+  }
+  if (total == old_n) {
+    for (uint32_t s = 0; s < old_n; s++) xfree(bnd[s]);
+    xfree(bnd); xfree(nbnd); xfree(base);
+    return;
+  }
+
+  InSec *ns = xcalloc(total ? total : 1, sizeof(InSec));
+  for (uint32_t s = 0; s < old_n; s++) {
+    InSec *is = &o->secs[s];
+    if (!nbnd[s]) { ns[base[s]] = *is; continue; }
+    for (uint32_t a = 0; a < nbnd[s]; a++) {
+      uint64_t from = bnd[s][a];
+      uint64_t to = a + 1 < nbnd[s] ? bnd[s][a + 1] : is->size;
+      InSec *d = &ns[base[s] + a];
+      d->name = xstrndup(is->name, strlen(is->name));
+      d->data = is->data ? is->data + from : NULL;
+      d->size = to - from;
+      d->align = is->align;
+      d->kind = is->kind;
+    }
+    xfree(is->name);
+  }
+  xfree(o->secs);
+  o->secs = ns;
+  o->nsecs = total;
+
+  for (uint32_t k = 0; k < o->nsyms; k++) {
+    InSym *sy = &o->syms[k];
+    if (sy->sec < 0 || !nbnd[sy->sec]) {
+      if (sy->sec >= 0) sy->sec = (int32_t)base[sy->sec];
+      continue;
+    }
+    uint32_t a = atom_of(bnd[sy->sec], nbnd[sy->sec], sy->value);
+    sy->value -= bnd[sy->sec][a];
+    sy->sec = (int32_t)(base[sy->sec] + a);
+  }
+  for (uint32_t r = 0; r < o->nrels; r++) {
+    InRel *ir = &o->rels[r];
+    if (!nbnd[ir->sec]) { ir->sec = base[ir->sec]; continue; }
+    uint32_t a = atom_of(bnd[ir->sec], nbnd[ir->sec], ir->off);
+    ir->off -= bnd[ir->sec][a];
+    ir->sec = base[ir->sec] + a;
+  }
+
+  for (uint32_t pass = 0; pass < 2; pass++)
+    for (uint32_t k = 0; k < o->nsyms; k++) {
+      InSym *sy = &o->syms[k];
+      if (sy->sec < 0 || sy->value || !sy->name[0]) continue;
+      if (sy->global != (pass == 0)) continue;
+      InSec *is = &o->secs[sy->sec];
+      if (!is->name || strchr(is->name, '(')) continue;
+      char full[160];
+      snprintf(full, sizeof full, "%s(%s)", is->name, sy->name);
+      xfree(is->name);
+      is->name = xstrndup(full, strlen(full));
+    }
+
+  for (uint32_t s = 0; s < old_n; s++) xfree(bnd[s]);
+  xfree(bnd); xfree(nbnd); xfree(base);
+}
+
+static void read_macho_obj(InObj *o) {
+  const uint8_t *b = o->buf;
+  if (o->len < 32 || rd32(b) != MH_MAGIC_64)
+    warmc_fatal("link: %s is not a 64-bit Mach-O object", o->name);
+  uint32_t ncmds = rd32(b + 16);
+  const uint8_t *lc = b + 32;
+
+  uint32_t nsect = 0;
+  const uint8_t *p = lc;
+  for (uint32_t i = 0; i < ncmds; i++) {
+    uint32_t cmd = rd32(p), sz = rd32(p + 4);
+    if (cmd == LC_SEGMENT_64) nsect += rd32(p + 64);
+    p += sz;
+  }
+  o->nsecs = nsect + 1;
+  o->secs = xcalloc(o->nsecs, sizeof(InSec));
+
+  uint32_t si = 1;
+  uint32_t nreloc_total = 0;
+  p = lc;
+  for (uint32_t i = 0; i < ncmds; i++) {
+    uint32_t cmd = rd32(p), sz = rd32(p + 4);
+    if (cmd == LC_SEGMENT_64) {
+      uint32_t ns = rd32(p + 64);
+      const uint8_t *s = p + 72;
+      for (uint32_t k = 0; k < ns; k++, s += 80, si++) {
+        char sect[17], seg[17];
+        memcpy(sect, s, 16); sect[16] = 0;
+        memcpy(seg, s + 16, 16); seg[16] = 0;
+        InSec *is = &o->secs[si];
+        uint64_t size = rd64(s + 40);
+        uint32_t off = rd32(s + 48), align = rd32(s + 52), flags = rd32(s + 64);
+        char full[40];
+        snprintf(full, sizeof full, "%s,%s", seg, sect);
+        is->name = xstrndup(full, strlen(full));
+        is->size = size;
+        is->align = 1ull << align;
+        is->kind = macho_kind(seg, sect, flags);
+        is->data = (is->kind == K_BSS || is->kind == K_DROP) ? NULL : b + off;
+        nreloc_total += rd32(s + 56);
+      }
+    }
+    p += sz;
+  }
+
+  p = lc;
+  for (uint32_t i = 0; i < ncmds; i++) {
+    uint32_t cmd = rd32(p), sz = rd32(p + 4);
+    if (cmd == LC_SYMTAB) {
+      uint32_t symoff = rd32(p + 8), nsyms = rd32(p + 12), stroff = rd32(p + 16);
+      const char *str = (const char *)(b + stroff);
+      o->nsyms = nsyms;
+      o->syms = xcalloc(nsyms ? nsyms : 1, sizeof(InSym));
+      for (uint32_t k = 0; k < nsyms; k++) {
+        const uint8_t *e = b + symoff + (size_t)k * 16;
+        InSym *sy = &o->syms[k];
+        const char *nm = str + rd32(e);
+        sy->name = xstrndup(nm, strlen(nm));
+        uint8_t type = e[4], sect = e[5];
+        uint16_t desc = rd16(e + 6);
+        sy->value = rd64(e + 8);
+        if (type & N_STAB) { sy->sec = -1; sy->global = false; continue; }
+        sy->global = (type & N_EXT) != 0;
+        sy->weak = (desc & N_WEAK_DEF) != 0;
+        sy->sec = ((type & N_TYPE) == N_SECT) ? (int32_t)sect : -1;
+
+        if (sy->sec > 0 && (uint32_t)sy->sec >= o->nsecs)
+          warmc_fatal("link: a symbol names section %d of %u",
+                      sy->sec, o->nsecs);
+      }
+    }
+    p += sz;
+  }
+
+  {
+    uint64_t *secaddr = xcalloc(o->nsecs ? o->nsecs : 1, sizeof(uint64_t));
+    uint32_t j = 1;
+    p = lc;
+    for (uint32_t i = 0; i < ncmds; i++) {
+      uint32_t cmd = rd32(p), sz = rd32(p + 4);
+      if (cmd == LC_SEGMENT_64) {
+        uint32_t ns = rd32(p + 64);
+        const uint8_t *s = p + 72;
+        for (uint32_t k = 0; k < ns; k++, s += 80, j++) secaddr[j] = rd64(s + 32);
+      }
+      p += sz;
+    }
+    for (uint32_t k = 0; k < o->nsyms; k++)
+      if (o->syms[k].sec > 0) o->syms[k].value -= secaddr[o->syms[k].sec];
+    xfree(secaddr);
+  }
+
+  o->rels = xcalloc(nreloc_total ? nreloc_total : 1, sizeof(InRel));
+  si = 1;
+  p = lc;
+  for (uint32_t i = 0; i < ncmds; i++) {
+    uint32_t cmd = rd32(p), sz = rd32(p + 4);
+    if (cmd == LC_SEGMENT_64) {
+      uint32_t ns = rd32(p + 64);
+      const uint8_t *s = p + 72;
+      for (uint32_t k = 0; k < ns; k++, s += 80, si++) {
+        uint32_t reloff = rd32(s + 56), nrel = rd32(s + 60);
+        if (o->secs[si].kind == K_DROP) continue;
+        int64_t pending_addend = 0;
+        bool have_addend = false;
+        for (uint32_t r = 0; r < nrel; r++) {
+          const uint8_t *e = b + reloff + (size_t)r * 8;
+          uint32_t addr = rd32(e), word = rd32(e + 4);
+          if (addr & 0x80000000u)
+            warmc_fatal("link: %s has a scattered relocation, which is not supported",
+                        o->name);
+          uint32_t symnum = word & 0xffffffu;
+          uint32_t pcrel = (word >> 24) & 1, length = (word >> 25) & 3;
+          uint32_t ext = (word >> 27) & 1, type = (word >> 28) & 0xf;
+          if (type == ARM64_RELOC_ADDEND) {
+
+            pending_addend = (int64_t)(int32_t)(symnum << 8) >> 8;
+            have_addend = true;
+            continue;
+          }
+          if (type == ARM64_RELOC_SUBTRACTOR)
+            warmc_fatal("link: %s uses ARM64_RELOC_SUBTRACTOR, which is not supported",
+                        o->name);
+          if (!ext)
+            warmc_fatal("link: %s has a section-relative relocation, which is "
+                        "not supported (compile the runtime with -ffunction-sections?)",
+                        o->name);
+          InRel *ir = &o->rels[o->nrels++];
+          ir->sec = si;
+          ir->off = addr;
+          ir->sym = (int32_t)symnum;
+          ir->type = type;
+          ir->pcrel = pcrel != 0;
+          ir->length = (uint8_t)length;
+          ir->addend = have_addend ? pending_addend : 0;
+          have_addend = false;
+          pending_addend = 0;
+        }
+      }
+    }
+    p += sz;
+  }
+
+  if (rd32(b + 24) & MH_SUBSECTIONS_VIA_SYMBOLS) split_subsections(o);
+}
+
+static void collect_globals(Linker *L, uint32_t oi) {
+  InObj *o = &L->objs[oi];
+  for (uint32_t i = 0; i < o->nsyms; i++) {
+    InSym *s = &o->syms[i];
+    if (!s->global || !s->name[0]) continue;
+    uint32_t g = gs_intern(L, s->name);
+    GSym *gs = &L->gsyms[g];
+    bool defines = s->sec >= 0 || s->common;
+    if (!defines) continue;
+    if (gs->defined && !gs->weak && !s->weak)
+      warmc_fatal("link: %s defined twice (%s and %s)", s->name,
+                  L->objs[gs->obj].name, o->name);
+
+    if (gs->defined && !gs->weak) continue;
+    gs->defined = true;
+    gs->weak = s->weak;
+    gs->obj = (int32_t)oi;
+    gs->sym = (int32_t)i;
+  }
+}
+
+static bool any_undefined(Linker *L) {
+  for (uint32_t i = 0; i < L->ngsyms; i++)
+    if (!L->gsyms[i].defined) return true;
+  return false;
+}
+
+typedef struct {
+  const char *path;
+  uint8_t *buf; size_t len;
+  bool *taken; uint32_t nmem;
+} Archive;
+
+static void ar_load(Archive *a, const char *path) {
+  a->path = path;
+  a->buf = read_file(path, &a->len);
+  ArReader r; ArMember m;
+  ar_open(&r, a->buf, a->len, path);
+  a->nmem = 0;
+  while (ar_next(&r, &m)) a->nmem++;
+  a->taken = xcalloc(a->nmem ? a->nmem : 1, sizeof(bool));
+}
+
+static bool ar_take_one(Linker *L, Archive *a, void (*rd)(InObj *)) {
+  ArReader r; ArMember m;
+  ar_open(&r, a->buf, a->len, a->path);
+  uint32_t mi = 0;
+  while (ar_next(&r, &m)) {
+    uint32_t me = mi++;
+    if (a->taken[me]) continue;
+    uint8_t *copy = xmalloc(m.size ? m.size : 1);
+    memcpy(copy, m.data, m.size);
+    InObj probe;
+    memset(&probe, 0, sizeof probe);
+    probe.name = xstrndup(m.name, strlen(m.name));
+    probe.buf = copy; probe.len = m.size;
+    rd(&probe);
+    bool want = false;
+    for (uint32_t i = 0; i < probe.nsyms && !want; i++) {
+      InSym *sy = &probe.syms[i];
+      if (!sy->global || (sy->sec < 0 && !sy->common) || !sy->name[0]) continue;
+      int32_t g = gs_find(L, sy->name);
+      if (g >= 0 && !L->gsyms[g].defined) want = true;
+    }
+    if (!want) {
+      for (uint32_t i = 0; i < probe.nsecs; i++) xfree(probe.secs[i].name);
+      for (uint32_t i = 0; i < probe.nsyms; i++) xfree(probe.syms[i].name);
+      xfree(probe.secs); xfree(probe.syms); xfree(probe.rels);
+      xfree(probe.name); xfree(copy);
+      continue;
+    }
+    a->taken[me] = true;
+    if (getenv("WARMC_LINK_DEBUG"))
+      for (uint32_t q = 0; q < probe.nsecs; q++)
+        if (probe.secs[q].kind == K_DROP && probe.secs[q].size)
+          fprintf(stderr, "link:   drop %s %s (%llu bytes)\n", probe.name,
+                  probe.secs[q].name, (unsigned long long)probe.secs[q].size);
+    InObj *o = obj_new(L, probe.name, probe.buf, probe.len);
+    o->secs = probe.secs; o->nsecs = probe.nsecs;
+    o->syms = probe.syms; o->nsyms = probe.nsyms;
+    o->rels = probe.rels; o->nrels = probe.nrels;
+    xfree(probe.name);
+    collect_globals(L, L->nobjs - 1);
+    for (uint32_t i = 0; i < o->nsyms; i++)
+      if (o->syms[i].global && o->syms[i].sec < 0 && !o->syms[i].common && o->syms[i].name[0])
+        gs_intern(L, o->syms[i].name);
+    return true;
+  }
+  return false;
+}
+
+static void pull_archives(Linker *L, Archive *ars, uint32_t nars, void (*rd)(InObj *)) {
+  for (;;) {
+    bool progress = false;
+    for (uint32_t i = 0; i < nars && !progress; i++)
+      progress = ar_take_one(L, &ars[i], rd);
+    if (!progress) return;
+  }
+}
+
+typedef struct { uint32_t obj, sec; } Site;
+typedef struct { Site *v; uint32_t n, cap; } SiteStack;
+
+typedef struct { int32_t obj, sec; } Prev;
+typedef struct {
+  SiteStack st;
+  bool **live;
+  Prev **prev;
+  Site at;
+  bool root;
+} Walk;
+
+static void ds_push(Walk *w, uint32_t oi, uint32_t s) {
+  if (w->live[oi][s]) return;
+  w->live[oi][s] = true;
+  if (w->prev) {
+    w->prev[oi][s].obj = w->root ? -1 : (int32_t)w->at.obj;
+    w->prev[oi][s].sec = w->root ? -1 : (int32_t)w->at.sec;
+  }
+  SiteStack *st = &w->st;
+  if (st->n == st->cap) {
+    st->cap = st->cap ? st->cap * 2 : 256;
+    st->v = xrealloc(st->v, st->cap * sizeof(Site));
+  }
+  st->v[st->n].obj = oi;
+  st->v[st->n].sec = s;
+  st->n++;
+}
+
+static void ds_sym(Linker *L, Walk *w, uint32_t oi, int32_t si) {
+  InObj *o = &L->objs[oi];
+  if (si < 0 || (uint32_t)si >= o->nsyms) return;
+  InSym *s = &o->syms[si];
+  if (!s->global) {
+    if (s->sec >= 0 && (uint32_t)s->sec < o->nsecs) ds_push(w, oi, (uint32_t)s->sec);
+    return;
+  }
+  int32_t g = gs_find(L, s->name);
+  if (g < 0 || !L->gsyms[g].defined || L->gsyms[g].obj < 0) return;
+  InObj *d = &L->objs[L->gsyms[g].obj];
+  InSym *ds = &d->syms[L->gsyms[g].sym];
+  if (ds->sec >= 0 && (uint32_t)ds->sec < d->nsecs)
+    ds_push(w, (uint32_t)L->gsyms[g].obj, (uint32_t)ds->sec);
+}
+
+static void ds_why(Linker *L, Walk *w, const char *why) {
+  for (uint32_t i = 0; i < L->nobjs; i++)
+    for (uint32_t s = 0; s < L->objs[i].nsecs; s++) {
+      const char *nm = L->objs[i].secs[s].name;
+      if (!w->live[i][s] || !nm || !strstr(nm, why)) continue;
+      fprintf(stderr, "why: %s %s\n", nm, L->objs[i].name);
+      int32_t oi = (int32_t)i, si = (int32_t)s;
+      for (uint32_t hop = 0; hop < 64; hop++) {
+        Prev p = w->prev[oi][si];
+        if (p.obj < 0) { fprintf(stderr, "why:   <- a root\n"); break; }
+        fprintf(stderr, "why:   <- %s %s\n", L->objs[p.obj].secs[p.sec].name,
+                L->objs[p.obj].name);
+        oi = p.obj; si = p.sec;
+      }
+    }
+}
+
+static void dead_strip(Linker *L, const char *entry) {
+  const char *why = getenv("WARMC_LINK_WHY");
+  Walk w;
+  memset(&w, 0, sizeof w);
+  bool **live = xcalloc(L->nobjs ? L->nobjs : 1, sizeof(bool *));
+  bool **hasdef = xcalloc(L->nobjs ? L->nobjs : 1, sizeof(bool *));
+  w.live = live;
+  if (why) w.prev = xcalloc(L->nobjs ? L->nobjs : 1, sizeof(Prev *));
+
+  uint32_t **rstart = xcalloc(L->nobjs ? L->nobjs : 1, sizeof(uint32_t *));
+  uint32_t **rcount = xcalloc(L->nobjs ? L->nobjs : 1, sizeof(uint32_t *));
+  uint32_t **rord = xcalloc(L->nobjs ? L->nobjs : 1, sizeof(uint32_t *));
+  for (uint32_t i = 0; i < L->nobjs; i++) {
+    InObj *o = &L->objs[i];
+    uint32_t n = o->nsecs ? o->nsecs : 1;
+    live[i] = xcalloc(n, sizeof(bool));
+    hasdef[i] = xcalloc(n, sizeof(bool));
+    if (why) w.prev[i] = xcalloc(n, sizeof(Prev));
+    rstart[i] = xcalloc(n, sizeof(uint32_t));
+    rcount[i] = xcalloc(n, sizeof(uint32_t));
+    rord[i] = xmalloc((o->nrels ? o->nrels : 1) * sizeof(uint32_t));
+    for (uint32_t k = 0; k < o->nsyms; k++)
+      if (o->syms[k].sec >= 0 && (uint32_t)o->syms[k].sec < o->nsecs)
+        hasdef[i][o->syms[k].sec] = true;
+    for (uint32_t r = 0; r < o->nrels; r++) rcount[i][o->rels[r].sec]++;
+    uint32_t at = 0;
+    for (uint32_t s = 0; s < o->nsecs; s++) {
+      rstart[i][s] = at; at += rcount[i][s]; rcount[i][s] = 0;
+    }
+    for (uint32_t r = 0; r < o->nrels; r++) {
+      uint32_t s = o->rels[r].sec;
+      rord[i][rstart[i][s] + rcount[i][s]++] = r;
+    }
+  }
+
+  w.root = true;
+  for (uint32_t s = 0; s < L->objs[0].nsecs; s++)
+    if (L->objs[0].secs[s].kind != K_DROP) ds_push(&w, 0, s);
+  for (uint32_t i = 0; i < L->nobjs; i++)
+    for (uint32_t s = 0; s < L->objs[i].nsecs; s++)
+      if (L->objs[i].secs[s].kind != K_DROP && !hasdef[i][s])
+        ds_push(&w, i, s);
+  int32_t e = gs_find(L, entry);
+  if (e >= 0 && L->gsyms[e].defined && L->gsyms[e].obj >= 0) {
+    InObj *d = &L->objs[L->gsyms[e].obj];
+    InSym *ds = &d->syms[L->gsyms[e].sym];
+    if (ds->sec >= 0) ds_push(&w, (uint32_t)L->gsyms[e].obj, (uint32_t)ds->sec);
+  }
+  w.root = false;
+
+  while (w.st.n) {
+    Site at = w.st.v[--w.st.n];
+    w.at = at;
+    InObj *o = &L->objs[at.obj];
+    uint32_t from = rstart[at.obj][at.sec], n = rcount[at.obj][at.sec];
+    for (uint32_t k = 0; k < n; k++)
+      ds_sym(L, &w, at.obj, o->rels[rord[at.obj][from + k]].sym);
+  }
+  if (why) ds_why(L, &w, why);
+
+  uint64_t gone[K_DROP], kept[K_DROP];
+  memset(gone, 0, sizeof gone);
+  memset(kept, 0, sizeof kept);
+  uint32_t ndrop = 0;
+  for (uint32_t i = 0; i < L->nobjs; i++)
+    for (uint32_t s = 0; s < L->objs[i].nsecs; s++) {
+      InSec *is = &L->objs[i].secs[s];
+      if (is->kind == K_DROP) continue;
+      if (live[i][s]) { kept[is->kind] += is->size; continue; }
+      gone[is->kind] += is->size;
+      ndrop++;
+      is->kind = K_DROP;
+      if (getenv("WARMC_LINK_STRIP"))
+        fprintf(stderr, "strip: %-8llu %-52s %s\n", (unsigned long long)is->size,
+                is->name, L->objs[i].name);
+    }
+  if (getenv("WARMC_LINK_DEBUG"))
+    fprintf(stderr, "link: dead-stripped %u sections: text %llu of %llu, "
+                    "rodata %llu of %llu, data %llu of %llu, bss %llu of %llu\n",
+            ndrop,
+            (unsigned long long)gone[K_TEXT],
+            (unsigned long long)(gone[K_TEXT] + kept[K_TEXT]),
+            (unsigned long long)gone[K_RODATA],
+            (unsigned long long)(gone[K_RODATA] + kept[K_RODATA]),
+            (unsigned long long)gone[K_DATA],
+            (unsigned long long)(gone[K_DATA] + kept[K_DATA]),
+            (unsigned long long)gone[K_BSS],
+            (unsigned long long)(gone[K_BSS] + kept[K_BSS]));
+
+  xfree(w.st.v);
+  for (uint32_t i = 0; i < L->nobjs; i++) {
+    xfree(live[i]); xfree(hasdef[i]); xfree(rstart[i]); xfree(rcount[i]); xfree(rord[i]);
+    if (why) xfree(w.prev[i]);
+  }
+  xfree(live); xfree(hasdef); xfree(rstart); xfree(rcount); xfree(rord); xfree(w.prev);
+}
+
+static uint64_t align_up(uint64_t v, uint64_t a) {
+  return a <= 1 ? v : (v + a - 1) & ~(a - 1);
+}
+
+static uint64_t place(Linker *L, SecKind k, uint64_t at) {
+  for (uint32_t i = 0; i < L->nobjs; i++) {
+    InObj *o = &L->objs[i];
+    for (uint32_t s = 0; s < o->nsecs; s++) {
+      InSec *is = &o->secs[s];
+      if (is->kind != k || (!is->size && k != K_BSS)) continue;
+      if (!is->size) continue;
+      at = align_up(at, is->align);
+      is->addr = at;
+      at += is->size;
+    }
+  }
+  return at;
+}
+
+static void add_rebase(Linker *L, uint64_t addr) {
+  if (L->nrebase == L->cap_rebase) {
+    L->cap_rebase = L->cap_rebase ? L->cap_rebase * 2 : 64;
+    L->rebase = xrealloc(L->rebase, L->cap_rebase * sizeof(uint64_t));
+  }
+  L->rebase[L->nrebase++] = addr;
+}
+
+static uint32_t got_for(Linker *L, uint32_t g) {
+  if (L->gsyms[g].got_slot != NO_SLOT) return L->gsyms[g].got_slot;
+  if (L->ngot == L->cap_got) {
+    L->cap_got = L->cap_got ? L->cap_got * 2 : 32;
+    L->got = xrealloc(L->got, L->cap_got * sizeof(uint32_t));
+  }
+  L->got[L->ngot] = g;
+  return L->gsyms[g].got_slot = L->ngot++;
+}
+
+static uint32_t stub_for(Linker *L, uint32_t g) {
+  if (L->gsyms[g].stub != NO_SLOT) return L->gsyms[g].stub;
+  if (L->nstub == L->cap_stub) {
+    L->cap_stub = L->cap_stub ? L->cap_stub * 2 : 32;
+    L->stub = xrealloc(L->stub, L->cap_stub * sizeof(uint32_t));
+  }
+  got_for(L, g);
+  L->stub[L->nstub] = g;
+  return L->gsyms[g].stub = L->nstub++;
+}
+
+static uint64_t sym_addr(Linker *L, uint32_t oi, int32_t si, const char *what) {
+  InObj *o = &L->objs[oi];
+  if (si < 0 || (uint32_t)si >= o->nsyms)
+    warmc_fatal("link: %s: relocation names symbol %d, which does not exist", o->name, si);
+  InSym *s = &o->syms[si];
+  if (s->global) {
+    int32_t g = gs_find(L, s->name);
+    if (g < 0) warmc_fatal("link: undefined symbol %s (referenced from %s, %s)",
+                           s->name, o->name, what);
+
+    if (L->gsyms[g].imported) return 0;
+    if (!L->gsyms[g].defined)
+      warmc_fatal("link: undefined symbol %s (referenced from %s, %s)",
+                  s->name, o->name, what);
+    return L->gsyms[g].addr;
+  }
+  if (s->sec < 0 || (uint32_t)s->sec >= o->nsecs)
+    warmc_fatal("link: %s: local symbol %s has no section", o->name, s->name);
+  return o->secs[s->sec].addr + s->value;
+}
+
+static void wr32(uint8_t *p, uint32_t v) {
+  p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8);
+  p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
+}
+static void wr64(uint8_t *p, uint64_t v) { wr32(p, (uint32_t)v); wr32(p + 4, (uint32_t)(v >> 32)); }
+
+static void patch_branch26(uint8_t *p, int64_t disp, const char *nm) {
+  if (disp < -(1 << 27) || disp >= (1 << 27) || (disp & 3))
+    warmc_fatal("link: branch to %s is %lld bytes away, out of range", nm, (long long)disp);
+  uint32_t insn = rd32(p);
+  wr32(p, (insn & 0xfc000000u) | (((uint32_t)(disp >> 2)) & 0x03ffffffu));
+}
+
+static void patch_page21(uint8_t *p, uint64_t target, uint64_t pc, const char *nm) {
+  int64_t d = (int64_t)(target & ~0xfffull) - (int64_t)(pc & ~0xfffull);
+  if (d < -(1LL << 32) || d >= (1LL << 32))
+    warmc_fatal("link: %s is more than 4GB from its ADRP", nm);
+  uint64_t pages = (uint64_t)(d >> 12);
+  uint32_t insn = rd32(p);
+  insn &= ~((3u << 29) | (0x7ffffu << 5));
+  insn |= (uint32_t)((pages & 3) << 29);
+  insn |= (uint32_t)(((pages >> 2) & 0x7ffff) << 5);
+  wr32(p, insn);
+}
+
+static void patch_lo12(uint8_t *p, uint64_t value, int shift_or_neg1) {
+  uint32_t insn = rd32(p);
+  uint32_t imm = (uint32_t)(value & 0xfff);
+  int shift = shift_or_neg1;
+  if (shift < 0) {
+    shift = 0;
+    if ((insn & 0x3b000000u) == 0x39000000u) {
+      shift = (int)(insn >> 30);
+      uint32_t v = (insn >> 26) & 1, opc = (insn >> 22) & 3;
+      if (v && (opc & 2)) shift = 4;
+    }
+  }
+  if (imm & ((1u << shift) - 1))
+    warmc_fatal("link: unaligned low-12 relocation (%u, shift %d)", imm, shift);
+  imm >>= shift;
+  wr32(p, (insn & ~(0xfffu << 10)) | ((imm & 0xfff) << 10));
+}
+
+static uint8_t *sec_writable(InSec *is) {
+  if (!is->data || !is->size) return NULL;
+  uint8_t *c = xmalloc(is->size);
+  memcpy(c, is->data, is->size);
+  is->data = c;
+  return c;
+}
+
+static void apply_relocs(Linker *L) {
+  for (uint32_t oi = 0; oi < L->nobjs; oi++) {
+    InObj *o = &L->objs[oi];
+    for (uint32_t s = 0; s < o->nsecs; s++)
+      if (o->secs[s].kind != K_DROP && o->secs[s].kind != K_BSS) sec_writable(&o->secs[s]);
+    for (uint32_t r = 0; r < o->nrels; r++) {
+      InRel *ir = &o->rels[r];
+      InSec *is = &o->secs[ir->sec];
+      if (is->kind == K_DROP || !is->data) continue;
+      uint64_t need = 4;
+      if (L->macho) need = ir->length == 3 ? 8u : 4u;
+      else if (ir->type == R_AARCH64_ABS64 || ir->type == R_AARCH64_PREL64)
+        need = 8;
+      if (ir->off > is->size || need > is->size - ir->off)
+        warmc_fatal("link: %s: relocation past the end of %s", o->name, is->name);
+      if (ir->sym < 0 || (uint32_t)ir->sym >= o->nsyms)
+        warmc_fatal("link: %s: relocation names symbol %d of %u",
+                    o->name, ir->sym, o->nsyms);
+      uint8_t *p = (uint8_t *)is->data + ir->off;
+      uint64_t pc = is->addr + ir->off;
+      InSym *sy = &o->syms[ir->sym];
+      const char *nm = sy->name;
+      uint64_t S = sym_addr(L, oi, ir->sym, is->name);
+      int64_t A = ir->addend;
+
+      if (L->macho) {
+        switch (ir->type) {
+          case ARM64_RELOC_BRANCH26: {
+            uint64_t t = S + (uint64_t)A;
+            int32_t g = sy->global ? gs_find(L, sy->name) : -1;
+            if (g >= 0 && L->gsyms[g].imported)
+              t = L->stub_addr + (uint64_t)stub_for(L, (uint32_t)g) * 12;
+            patch_branch26(p, (int64_t)t - (int64_t)pc, nm);
+            break;
+          }
+          case ARM64_RELOC_PAGE21:
+          case ARM64_RELOC_PAGEOFF12: {
+            int32_t g = sy->global ? gs_find(L, sy->name) : -1;
+            if (g >= 0 && L->gsyms[g].imported)
+              warmc_fatal("link: %s takes the address of the imported symbol %s "
+                          "directly; only calls and GOT loads of an import are "
+                          "supported", o->name, nm);
+            if (ir->type == ARM64_RELOC_PAGE21) patch_page21(p, S + (uint64_t)A, pc, nm);
+            else patch_lo12(p, S + (uint64_t)A, -1);
+            break;
+          }
+          case ARM64_RELOC_GOT_LOAD_PAGE21: {
+            int32_t g = gs_find(L, sy->name);
+            uint64_t ga = L->got_addr + (uint64_t)got_for(L, (uint32_t)g) * 8;
+            patch_page21(p, ga, pc, nm); break;
+          }
+          case ARM64_RELOC_GOT_LOAD_PAGEOFF12: {
+            int32_t g = gs_find(L, sy->name);
+            uint64_t ga = L->got_addr + (uint64_t)got_for(L, (uint32_t)g) * 8;
+            patch_lo12(p, ga, 3); break;
+          }
+          case ARM64_RELOC_UNSIGNED: {
+            int32_t g = sy->global ? gs_find(L, sy->name) : -1;
+            if (g >= 0 && L->gsyms[g].imported)
+              warmc_fatal("link: %s stores a pointer to the imported symbol %s, "
+                          "which would need a rebase this linker does not emit",
+                          o->name, nm);
+
+            if (ir->length == 3) {
+              wr64(p, S + (uint64_t)A + rd64(p));
+              if (is->kind == K_DATA) add_rebase(L, is->addr + ir->off);
+              else warmc_fatal("link: %s puts an absolute pointer in %s, which "
+                               "is not writable and so cannot be slid",
+                               o->name, is->name);
+            } else if (ir->length == 2) {
+              wr32(p, (uint32_t)(S + (uint64_t)A + rd32(p)));
+            } else {
+              warmc_fatal("link: %s: an absolute relocation on %s is %u bytes "
+                          "wide, which this linker does not write",
+                          o->name, nm, 1u << ir->length);
+            }
+            break;
+          }
+          default:
+            warmc_fatal("link: %s: unsupported Mach-O relocation type %u on %s",
+                        o->name, ir->type, nm);
+        }
+        continue;
+      }
+
+      switch (ir->type) {
+        case R_AARCH64_CALL26: case R_AARCH64_JUMP26:
+          patch_branch26(p, (int64_t)(S + (uint64_t)A) - (int64_t)pc, nm); break;
+        case R_AARCH64_ADR_PREL_PG_HI21:
+          patch_page21(p, S + (uint64_t)A, pc, nm); break;
+        case R_AARCH64_ADD_ABS_LO12_NC:   patch_lo12(p, S + (uint64_t)A, 0); break;
+        case R_AARCH64_LDST8_ABS_LO12_NC: patch_lo12(p, S + (uint64_t)A, 0); break;
+        case R_AARCH64_LDST16_ABS_LO12_NC: patch_lo12(p, S + (uint64_t)A, 1); break;
+        case R_AARCH64_LDST32_ABS_LO12_NC: patch_lo12(p, S + (uint64_t)A, 2); break;
+        case R_AARCH64_LDST64_ABS_LO12_NC: patch_lo12(p, S + (uint64_t)A, 3); break;
+        case R_AARCH64_LDST128_ABS_LO12_NC: patch_lo12(p, S + (uint64_t)A, 4); break;
+        case R_AARCH64_ABS64:  wr64(p, S + (uint64_t)A); break;
+        case R_AARCH64_ABS32:  wr32(p, (uint32_t)(S + (uint64_t)A)); break;
+        case R_AARCH64_PREL32: wr32(p, (uint32_t)((int64_t)(S + (uint64_t)A) - (int64_t)pc)); break;
+        case R_AARCH64_PREL64: wr64(p, (uint64_t)((int64_t)(S + (uint64_t)A) - (int64_t)pc)); break;
+        case R_AARCH64_ADR_GOT_PAGE: {
+          int32_t g = gs_find(L, sy->name);
+          uint64_t ga = L->got_addr + (uint64_t)got_for(L, (uint32_t)g) * 8;
+          patch_page21(p, ga, pc, nm); break;
+        }
+        case R_AARCH64_LD64_GOT_LO12_NC: {
+          int32_t g = gs_find(L, sy->name);
+          uint64_t ga = L->got_addr + (uint64_t)got_for(L, (uint32_t)g) * 8;
+          patch_lo12(p, ga, 3); break;
+        }
+        default:
+          warmc_fatal("link: %s: unsupported ELF relocation type %u on %s",
+                      o->name, ir->type, nm);
+      }
+    }
+  }
+}
+
+static void reserve_indirection(Linker *L) {
+  for (uint32_t oi = 0; oi < L->nobjs; oi++) {
+    InObj *o = &L->objs[oi];
+    for (uint32_t r = 0; r < o->nrels; r++) {
+      InRel *ir = &o->rels[r];
+      if (o->secs[ir->sec].kind == K_DROP) continue;
+      if (ir->sym < 0 || (uint32_t)ir->sym >= o->nsyms)
+        warmc_fatal("link: %s: relocation names symbol %d of %u",
+                    o->name, ir->sym, o->nsyms);
+      InSym *sy = &o->syms[ir->sym];
+      int32_t g = sy->global ? gs_find(L, sy->name) : -1;
+      if (L->macho) {
+        if (ir->type == ARM64_RELOC_GOT_LOAD_PAGE21 ||
+            ir->type == ARM64_RELOC_GOT_LOAD_PAGEOFF12) {
+          if (g < 0) warmc_fatal("link: GOT relocation on non-global %s", sy->name);
+          got_for(L, (uint32_t)g);
+        } else if (ir->type == ARM64_RELOC_BRANCH26 && g >= 0 && L->gsyms[g].imported) {
+          stub_for(L, (uint32_t)g);
+        }
+      } else if (ir->type == R_AARCH64_ADR_GOT_PAGE ||
+                 ir->type == R_AARCH64_LD64_GOT_LO12_NC) {
+        if (g < 0) warmc_fatal("link: GOT relocation on non-global %s", sy->name);
+        got_for(L, (uint32_t)g);
+      }
+    }
+  }
+}
+
+static void place_commons(Linker *L, uint64_t *bss_end) {
+  for (uint32_t i = 0; i < L->ngsyms; i++) {
+    GSym *g = &L->gsyms[i];
+    if (!g->defined || g->obj < 0) continue;
+    InSym *s = &L->objs[g->obj].syms[g->sym];
+    if (!s->common) continue;
+    *bss_end = align_up(*bss_end, s->comm_align ? s->comm_align : 8);
+    g->addr = *bss_end;
+    *bss_end += s->comm_size;
+  }
+}
+
+static void resolve_addrs(Linker *L) {
+  for (uint32_t i = 0; i < L->ngsyms; i++) {
+    GSym *g = &L->gsyms[i];
+    if (!g->defined || g->obj < 0) continue;
+    InSym *s = &L->objs[g->obj].syms[g->sym];
+    if (s->common) continue;
+    if (s->sec < 0) continue;
+    g->addr = L->objs[g->obj].secs[s->sec].addr + s->value;
+  }
+}
+
+#define PT_LOAD 1
+#define PF_X 1
+#define PF_W 2
+#define PF_R 4
+#define ELF_PAGE 0x10000ull
+#define ELF_BASE 0x400000ull
+
+static void emit_secs(Buf *b, Linker *L, SecKind k, uint64_t seg_addr, uint64_t seg_off) {
+  for (uint32_t i = 0; i < L->nobjs; i++) {
+    InObj *o = &L->objs[i];
+    for (uint32_t s = 0; s < o->nsecs; s++) {
+      InSec *is = &o->secs[s];
+      if (is->kind != k || !is->size || !is->data) continue;
+      uint64_t want = seg_off + (is->addr - seg_addr);
+      while (b->len < want) buf_u8(b, 0);
+      buf_bytes(b, is->data, is->size);
+    }
+  }
+}
+
+static void write_elf_exec(Linker *L, const char *path, uint64_t entry) {
+  Buf out; memset(&out, 0, sizeof out);
+
+  uint64_t hdr = 64 + 2 * 56;
+  uint64_t text_off = hdr;
+
+  uint64_t ro_off  = text_off + (L->rodata_addr - L->text_addr);
+  uint64_t ro_end  = ro_off + L->rodata_size;
+
+  uint64_t rw_off  = align_up(ro_end, ELF_PAGE) + (L->got_addr & (ELF_PAGE - 1));
+
+  uint64_t data_off = rw_off + (L->data_addr - L->got_addr);
+  uint64_t rw_file = (L->data_addr + L->data_size) - L->got_addr;
+
+  buf_bytes(&out, "\177ELF\2\1\1", 7);
+  for (int i = 7; i < 16; i++) buf_u8(&out, 0);
+  buf_u16(&out, 2);
+  buf_u16(&out, 183);
+  buf_u32(&out, 1);
+  buf_u64(&out, entry);
+  buf_u64(&out, 64);
+  buf_u64(&out, 0);
+  buf_u32(&out, 0);
+  buf_u16(&out, 64); buf_u16(&out, 56); buf_u16(&out, 2);
+  buf_u16(&out, 64); buf_u16(&out, 0); buf_u16(&out, 0);
+
+  buf_u32(&out, PT_LOAD); buf_u32(&out, PF_R | PF_X);
+  buf_u64(&out, 0); buf_u64(&out, L->text_addr - hdr); buf_u64(&out, L->text_addr - hdr);
+  buf_u64(&out, ro_end); buf_u64(&out, ro_end); buf_u64(&out, ELF_PAGE);
+
+  buf_u32(&out, PT_LOAD); buf_u32(&out, PF_R | PF_W);
+  buf_u64(&out, rw_off); buf_u64(&out, L->got_addr); buf_u64(&out, L->got_addr);
+  buf_u64(&out, rw_file); buf_u64(&out, (L->bss_addr + L->bss_size) - L->got_addr);
+  buf_u64(&out, ELF_PAGE);
+
+  emit_secs(&out, L, K_TEXT, L->text_addr, text_off);
+  emit_secs(&out, L, K_RODATA, L->rodata_addr, ro_off);
+  while (out.len < rw_off) buf_u8(&out, 0);
+  for (uint32_t i = 0; i < L->ngot; i++) buf_u64(&out, L->gsyms[L->got[i]].addr);
+  emit_secs(&out, L, K_DATA, L->data_addr, data_off);
+
+  FILE *f = fopen(path, "wb");
+  if (!f) warmc_fatal("link: cannot write %s", path);
+  if (out.len && fwrite(out.data, 1, out.len, f) != out.len)
+    warmc_fatal("link: short write on %s", path);
+  fclose(f);
+  chmod_exec(path);
+  xfree(out.data);
+}
+
+static void load_main(Linker *L, const char *objpath) {
+  size_t len; uint8_t *buf = read_file(objpath, &len);
+  InObj *o = obj_new(L, objpath, buf, len);
+  if (L->macho) read_macho_obj(o); else read_elf_obj(o);
+  collect_globals(L, 0);
+  for (uint32_t i = 0; i < o->nsyms; i++)
+    if (o->syms[i].global && o->syms[i].sec < 0 && !o->syms[i].common && o->syms[i].name[0])
+      gs_intern(L, o->syms[i].name);
+}
+
+static void layout_linux(Linker *L) {
+  uint64_t hdr = 64 + 2 * 56;
+  L->text_addr = ELF_BASE + hdr;
+  uint64_t at = place(L, K_TEXT, L->text_addr);
+  L->text_size = at - L->text_addr;
+  at = align_up(at, 16);
+  L->rodata_addr = at;
+  at = place(L, K_RODATA, at);
+  L->rodata_size = at - L->rodata_addr;
+
+  at = align_up(at, ELF_PAGE);
+  L->got_addr = at;
+  at += (uint64_t)L->ngot * 8;
+  at = align_up(at, 16);
+  L->data_addr = at;
+  at = place(L, K_DATA, at);
+  L->data_size = at - L->data_addr;
+  at = align_up(at, 16);
+  L->bss_addr = at;
+  at = place(L, K_BSS, at);
+  place_commons(L, &at);
+  L->bss_size = at - L->bss_addr;
+}
+
+void warmc_link_exec(bool macho, const char *out, const char *objpath,
+                     const char *wasi, const char *rt, const char *entry,
+                     bool strip) {
+  Linker L;
+  memset(&L, 0, sizeof L);
+  L.macho = macho;
+
+  bool tm = getenv("WARMC_TIME") != NULL;
+  double t0 = tm ? lk_ms() : 0, t_read, t_pull, t_lay, t_rel;
+  load_main(&L, objpath);
+
+  gs_intern(&L, entry);
+  void (*rd)(InObj *) = macho ? read_macho_obj : read_elf_obj;
+  Archive ars[2];
+  uint32_t nars = 0;
+  if (wasi) ar_load(&ars[nars++], wasi);
+  ar_load(&ars[nars++], rt);
+  if (tm) { t_read = lk_ms() - t0; t0 = lk_ms(); }
+  pull_archives(&L, ars, nars, rd);
+  if (tm) { t_pull = lk_ms() - t0; t0 = lk_ms(); }
+
+  if (!macho && any_undefined(&L)) {
+
+    uint32_t nu = 0;
+    for (uint32_t i = 0; i < L.ngsyms; i++)
+      if (!L.gsyms[i].defined) nu++;
+    for (uint32_t i = 0, shown = 0; i < L.ngsyms && shown < 8; i++) {
+      if (L.gsyms[i].defined) continue;
+      fprintf(stderr, "warmc: link: undefined symbol %s\n", L.gsyms[i].name);
+      shown++;
+    }
+    if (nu > 8) fprintf(stderr, "warmc: link: and %u more\n", nu - 8);
+
+    if (wasi)
+      fprintf(stderr,
+              "warmc: on Linux the WASI host calls libc for the filesystem, "
+              "and this link has no libc.\nwarmc: compile to an object and "
+              "link that with a compiler driver instead:\nwarmc:   warmc -c "
+              "--target linux -o P.o P.wasm\nwarmc:   cc -nostartfiles -no-pie "
+              "-u warmc_driver_hook -o P P.o %s %s\n", wasi, rt);
+    warmc_fatal("link: %u undefined symbol%s", nu, nu == 1 ? "" : "s");
+  }
+
+  for (uint32_t i = 0; i < L.ngsyms; i++)
+    if (!L.gsyms[i].defined) L.gsyms[i].imported = true;
+
+  if (strip) dead_strip(&L, entry);
+  reserve_indirection(&L);
+  if (getenv("WARMC_LINK_DEBUG")) {
+    uint32_t nimp = 0;
+    for (uint32_t i = 0; i < L.ngsyms; i++) if (L.gsyms[i].imported) nimp++;
+    fprintf(stderr, "link: %u objects, %u globals, %u imported, %u got, %u stubs\n",
+            L.nobjs, L.ngsyms, nimp, L.ngot, L.nstub);
+    for (uint32_t i = 0; i < L.nobjs; i++)
+      fprintf(stderr, "link:   obj %s\n", L.objs[i].name);
+    for (uint32_t i = 0; i < L.ngsyms; i++)
+      if (L.gsyms[i].imported)
+        fprintf(stderr, "link:   import %-24s got=%u stub=%u\n", L.gsyms[i].name,
+                L.gsyms[i].got_slot, L.gsyms[i].stub);
+  }
+  if (macho) layout_macos(&L); else layout_linux(&L);
+  resolve_addrs(&L);
+  if (tm) { t_lay = lk_ms() - t0; t0 = lk_ms(); }
+
+  if (getenv("WARMC_LINK_MAP")) {
+    for (uint32_t i = 0; i < L.ngsyms; i++)
+      if (L.gsyms[i].defined)
+        fprintf(stderr, "map %016llx %s\n",
+                (unsigned long long)L.gsyms[i].addr, L.gsyms[i].name);
+  }
+  if (getenv("WARMC_LINK_DEBUG"))
+    fprintf(stderr, "link: text %llx+%llx rodata %llx+%llx got %llx+%x "
+            "data %llx+%llx bss %llx+%llx\n",
+            (unsigned long long)L.text_addr, (unsigned long long)L.text_size,
+            (unsigned long long)L.rodata_addr, (unsigned long long)L.rodata_size,
+            (unsigned long long)L.got_addr, L.ngot * 8,
+            (unsigned long long)L.data_addr, (unsigned long long)L.data_size,
+            (unsigned long long)L.bss_addr, (unsigned long long)L.bss_size);
+
+  if (getenv("WARMC_LINK_SECS"))
+    for (uint32_t i = 0; i < L.nobjs; i++)
+      for (uint32_t s = 0; s < L.objs[i].nsecs; s++) {
+        InSec *is = &L.objs[i].secs[s];
+        if (is->kind == K_DROP || (!is->size && is->kind != K_BSS)) continue;
+        fprintf(stderr, "link:   sec %016llx+%-6llx a%-3llu k%d %-20s %s\n",
+                (unsigned long long)is->addr, (unsigned long long)is->size,
+                (unsigned long long)is->align, (int)is->kind, is->name,
+                L.objs[i].name);
+      }
+  if (getenv("WARMC_LINK_DEBUG"))
+    for (uint32_t i = 0; i < L.ngot; i++)
+      fprintf(stderr, "link:   got[%u] +0x%02x %016llx %s%s\n", i, i * 8,
+              (unsigned long long)L.gsyms[L.got[i]].addr, L.gsyms[L.got[i]].name,
+              L.gsyms[L.got[i]].imported ? " (imported)" : "");
+  int32_t e = gs_find(&L, entry);
+  if (e < 0 || !L.gsyms[e].defined) warmc_fatal("link: no entry point %s", entry);
+  apply_relocs(&L);
+  if (getenv("WARMC_LINK_DEBUG")) {
+    uint32_t own = 0;
+    for (uint32_t i = 0; i < L.ngot; i++) if (!L.gsyms[L.got[i]].imported) own++;
+    fprintf(stderr, "link: %u rebases from data + %u from the got\n", L.nrebase, own);
+    if (getenv("WARMC_LINK_REBASE"))
+      for (uint32_t i = 0; i < L.nrebase; i++)
+        fprintf(stderr, "reb %016llx\n", (unsigned long long)L.rebase[i]);
+  }
+
+  if (tm) { t_rel = lk_ms() - t0; t0 = lk_ms(); }
+  if (macho) write_macho_exec(&L, out, L.gsyms[e].addr);
+  else write_elf_exec(&L, out, L.gsyms[e].addr);
+  if (tm)
+    fprintf(stderr, "link time: read %.1f pull %.1f layout %.1f reloc %.1f write %.1f\n",
+            t_read, t_pull, t_lay, t_rel, lk_ms() - t0);
+}
+
+#if defined(__APPLE__)
+
+#include <CommonCrypto/CommonDigest.h>
+#define SHA_HW 1
+#endif
+
+typedef struct { uint32_t h[8]; uint64_t n; uint8_t buf[64]; size_t nbuf; } Sha256;
+
+static const uint32_t SHA_K[64] = {
+  0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+  0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+  0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+  0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+  0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+  0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+  0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+  0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2 };
+
+static uint32_t ror32(uint32_t x, int n) { return (x >> n) | (x << (32 - n)); }
+
+static void sha_block(Sha256 *s, const uint8_t *p) {
+  uint32_t w[64];
+  for (int i = 0; i < 16; i++)
+    w[i] = ((uint32_t)p[i*4] << 24) | ((uint32_t)p[i*4+1] << 16) |
+           ((uint32_t)p[i*4+2] << 8) | (uint32_t)p[i*4+3];
+  for (int i = 16; i < 64; i++) {
+    uint32_t s0 = ror32(w[i-15],7) ^ ror32(w[i-15],18) ^ (w[i-15] >> 3);
+    uint32_t s1 = ror32(w[i-2],17) ^ ror32(w[i-2],19) ^ (w[i-2] >> 10);
+    w[i] = w[i-16] + s0 + w[i-7] + s1;
+  }
+  uint32_t a=s->h[0],b=s->h[1],c=s->h[2],d=s->h[3],e=s->h[4],f=s->h[5],g=s->h[6],h=s->h[7];
+  for (int i = 0; i < 64; i++) {
+    uint32_t S1 = ror32(e,6) ^ ror32(e,11) ^ ror32(e,25);
+    uint32_t ch = (e & f) ^ (~e & g);
+    uint32_t t1 = h + S1 + ch + SHA_K[i] + w[i];
+    uint32_t S0 = ror32(a,2) ^ ror32(a,13) ^ ror32(a,22);
+    uint32_t mj = (a & b) ^ (a & c) ^ (b & c);
+    uint32_t t2 = S0 + mj;
+    h=g; g=f; f=e; e=d+t1; d=c; c=b; b=a; a=t1+t2;
+  }
+  s->h[0]+=a; s->h[1]+=b; s->h[2]+=c; s->h[3]+=d;
+  s->h[4]+=e; s->h[5]+=f; s->h[6]+=g; s->h[7]+=h;
+}
+
+__attribute__((unused))
+static void sha_init(Sha256 *s) {
+  static const uint32_t iv[8] = {0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,
+                                 0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19};
+  memcpy(s->h, iv, sizeof iv); s->n = 0; s->nbuf = 0;
+}
+__attribute__((unused))
+static void sha_update(Sha256 *s, const void *p, size_t n) {
+  const uint8_t *q = p; s->n += n;
+  while (n) {
+    size_t k = 64 - s->nbuf; if (k > n) k = n;
+    memcpy(s->buf + s->nbuf, q, k);
+    s->nbuf += k; q += k; n -= k;
+    if (s->nbuf == 64) { sha_block(s, s->buf); s->nbuf = 0; }
+  }
+}
+__attribute__((unused))
+static void sha_final(Sha256 *s, uint8_t out[32]) {
+  uint64_t bits = s->n * 8;
+  uint8_t pad = 0x80;
+  sha_update(s, &pad, 1);
+  uint8_t z = 0;
+  while (s->nbuf != 56) sha_update(s, &z, 1);
+  uint8_t len[8];
+  for (int i = 0; i < 8; i++) len[i] = (uint8_t)(bits >> (56 - 8*i));
+  sha_update(s, len, 8);
+  for (int i = 0; i < 8; i++) {
+    out[i*4]   = (uint8_t)(s->h[i] >> 24); out[i*4+1] = (uint8_t)(s->h[i] >> 16);
+    out[i*4+2] = (uint8_t)(s->h[i] >> 8);  out[i*4+3] = (uint8_t)s->h[i];
+  }
+}
+
+#define MACHO_BASE     0x100000000ull
+#define MACHO_PAGE     0x4000ull
+#define STUB_SIZE      12
+
+#define MACHO_DYLIB "/usr/lib/libSystem.B.dylib"
+#define MACHO_DYLD  "/usr/lib/dyld"
+
+static uint64_t macho_hdr_size(void) {
+  uint64_t n = 32;
+  n += 4 * 72;
+  n += 6 * 80;
+  n += 48 + 24 + 80 + 24 + 24 + 16;
+
+  n += align_up(12 + strlen(MACHO_DYLD) + 1, 8);
+  n += align_up(24 + strlen(MACHO_DYLIB) + 1, 8);
+  return align_up(n, 16);
+}
+
+static void layout_macos(Linker *L) {
+  L->text_addr = MACHO_BASE + macho_hdr_size();
+  uint64_t at = place(L, K_TEXT, L->text_addr);
+  at = align_up(at, 4);
+  L->stub_addr = at;
+  at += (uint64_t)L->nstub * STUB_SIZE;
+  L->text_size = at - L->text_addr;
+  at = align_up(at, 16);
+  L->rodata_addr = at;
+  at = place(L, K_RODATA, at);
+  L->rodata_size = at - L->rodata_addr;
+
+  at = align_up(at, MACHO_PAGE);
+  L->got_addr = at;
+  at += (uint64_t)L->ngot * 8;
+  at = align_up(at, 16);
+  L->data_addr = at;
+  at = place(L, K_DATA, at);
+  L->data_size = at - L->data_addr;
+  at = align_up(at, 16);
+  L->bss_addr = at;
+  at = place(L, K_BSS, at);
+  place_commons(L, &at);
+  L->bss_size = at - L->bss_addr;
+}
+
+static void be32(Buf *b, uint32_t v) {
+  buf_u8(b, (uint8_t)(v >> 24)); buf_u8(b, (uint8_t)(v >> 16));
+  buf_u8(b, (uint8_t)(v >> 8));  buf_u8(b, (uint8_t)v);
+}
+static void be64(Buf *b, uint64_t v) { be32(b, (uint32_t)(v >> 32)); be32(b, (uint32_t)v); }
+
+static void uleb(Buf *b, uint64_t v) {
+  do { uint8_t byte = v & 0x7f; v >>= 7; if (v) byte |= 0x80; buf_u8(b, byte); } while (v);
+}
+
+static void lc_str16(Buf *b, const char *s) {
+  char t[16]; memset(t, 0, 16);
+  snprintf(t, 16, "%s", s);
+  buf_bytes(b, t, 16);
+}
+
+#define LC_REQ_DYLD 0x80000000u
+#define LC_SYMTAB_C       0x02
+#define LC_DYSYMTAB       0x0b
+#define LC_LOAD_DYLIB     0x0c
+#define LC_LOAD_DYLINKER  0x0e
+#define LC_CODE_SIGNATURE 0x1d
+#define LC_DYLD_INFO_ONLY (0x22 | LC_REQ_DYLD)
+#define LC_MAIN           (0x28 | LC_REQ_DYLD)
+#define LC_BUILD_VERSION  0x32
+
+#define MH_EXECUTE  2
+#define MH_NOUNDEFS 0x1
+#define MH_DYLDLINK 0x4
+#define MH_TWOLEVEL 0x80
+#define MH_PIE      0x200000
+
+#define VM_PROT_READ 1
+#define VM_PROT_WRITE 2
+#define VM_PROT_EXEC 4
+
+#define BIND_OPCODE_DONE                          0x00
+#define BIND_OPCODE_SET_DYLIB_ORDINAL_IMM         0x10
+#define BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM 0x40
+#define BIND_OPCODE_SET_TYPE_IMM                  0x50
+#define BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB   0x70
+#define BIND_OPCODE_DO_BIND                       0x90
+#define BIND_TYPE_POINTER 1
+
+static void seg_cmd(Buf *b, const char *name, uint64_t vmaddr, uint64_t vmsize,
+                    uint64_t fileoff, uint64_t filesize, uint32_t maxprot,
+                    uint32_t initprot, uint32_t nsects) {
+  buf_u32(b, LC_SEGMENT_64);
+  buf_u32(b, 72 + 80 * nsects);
+  lc_str16(b, name);
+  buf_u64(b, vmaddr); buf_u64(b, vmsize);
+  buf_u64(b, fileoff); buf_u64(b, filesize);
+  buf_u32(b, maxprot); buf_u32(b, initprot);
+  buf_u32(b, nsects); buf_u32(b, 0);
+}
+
+static void sect_cmd(Buf *b, const char *sect, const char *seg, uint64_t addr,
+                     uint64_t size, uint32_t off, uint32_t align, uint32_t flags) {
+  lc_str16(b, sect); lc_str16(b, seg);
+  buf_u64(b, addr); buf_u64(b, size);
+  buf_u32(b, off); buf_u32(b, align);
+  buf_u32(b, 0); buf_u32(b, 0);
+  buf_u32(b, flags);
+  buf_u32(b, 0); buf_u32(b, 0); buf_u32(b, 0);
+}
+
+static uint32_t macho_sect_of(Linker *L, uint64_t a) {
+  if (a < L->stub_addr) return 1;
+  if (a < L->rodata_addr) return 2;
+  if (a < L->got_addr) return 3;
+  if (a < L->data_addr) return 4;
+  if (a < L->bss_addr) return 5;
+  return 6;
+}
+
+static void write_macho_exec(Linker *L, const char *path, uint64_t entry) {
+  const char *dylib = MACHO_DYLIB;
+  const char *dyld  = MACHO_DYLD;
+  const char *ident = strrchr(path, '/') ? strrchr(path, '/') + 1 : path;
+
+  uint64_t text_end = align_up(L->rodata_addr + L->rodata_size, 16);
+  uint64_t text_fsz = text_end - MACHO_BASE;
+  uint64_t data_foff = L->got_addr - MACHO_BASE;
+  uint64_t data_fsz  = (L->data_addr + L->data_size) - L->got_addr;
+  uint64_t data_vsz  = (L->bss_addr + L->bss_size) - L->got_addr;
+  uint64_t link_foff = align_up(data_foff + data_fsz, MACHO_PAGE);
+  uint64_t link_vaddr = align_up(L->got_addr + data_vsz, MACHO_PAGE);
+
+  Buf reb; memset(&reb, 0, sizeof reb);
+  {
+    uint64_t *all = xmalloc(((size_t)L->ngot + L->nrebase + 1) * sizeof(uint64_t));
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < L->ngot; i++)
+      if (!L->gsyms[L->got[i]].imported) all[n++] = L->got_addr + (uint64_t)i * 8;
+    for (uint32_t i = 0; i < L->nrebase; i++) all[n++] = L->rebase[i];
+    for (uint32_t i = 1; i < n; i++) {
+      uint64_t v = all[i]; uint32_t j = i;
+      while (j && all[j-1] > v) { all[j] = all[j-1]; j--; }
+      all[j] = v;
+    }
+
+    if (n) {
+      buf_u8(&reb, 0x10 | 1);
+      buf_u8(&reb, 0x20 | 2);
+      uleb(&reb, all[0] - L->got_addr);
+      uint32_t i = 0;
+      while (i < n) {
+
+        uint32_t run = 1;
+        while (i + run < n && all[i + run] == all[i + run - 1] + 8) run++;
+        buf_u8(&reb, 0x60); uleb(&reb, run);
+        i += run;
+        if (i < n) { buf_u8(&reb, 0x30); uleb(&reb, all[i] - all[i-1] - 8); }
+      }
+    }
+    buf_u8(&reb, 0x00);
+    while (reb.len & 7) buf_u8(&reb, 0);
+    xfree(all);
+  }
+
+  Buf bind; memset(&bind, 0, sizeof bind);
+  for (uint32_t i = 0; i < L->ngot; i++) {
+    GSym *g = &L->gsyms[L->got[i]];
+    if (!g->imported) continue;
+    buf_u8(&bind, BIND_OPCODE_SET_DYLIB_ORDINAL_IMM | 1);
+    buf_u8(&bind, BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM | 0);
+    buf_bytes(&bind, g->name, strlen(g->name) + 1);
+    buf_u8(&bind, BIND_OPCODE_SET_TYPE_IMM | BIND_TYPE_POINTER);
+    buf_u8(&bind, BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB | 2);
+    uleb(&bind, (uint64_t)i * 8);
+    buf_u8(&bind, BIND_OPCODE_DO_BIND);
+  }
+  buf_u8(&bind, BIND_OPCODE_DONE);
+  while (bind.len & 7) buf_u8(&bind, 0);
+
+  Buf strt; memset(&strt, 0, sizeof strt);
+  buf_u8(&strt, 0);
+  Buf symt; memset(&symt, 0, sizeof symt);
+  uint32_t ndef = 0, nundef = 0;
+  for (uint32_t i = 0; i < L->ngsyms; i++) {
+    GSym *g = &L->gsyms[i];
+    if (!g->defined || g->imported) continue;
+    uint32_t sx = (uint32_t)strt.len;
+    buf_bytes(&strt, g->name, strlen(g->name) + 1);
+    buf_u32(&symt, sx);
+    buf_u8(&symt, N_SECT | N_EXT);
+    buf_u8(&symt, (uint8_t)macho_sect_of(L, g->addr));
+    buf_u16(&symt, 0);
+    buf_u64(&symt, g->addr);
+    ndef++;
+  }
+  for (uint32_t i = 0; i < L->ngsyms; i++) {
+    GSym *g = &L->gsyms[i];
+    if (!g->imported) continue;
+    uint32_t sx = (uint32_t)strt.len;
+    buf_bytes(&strt, g->name, strlen(g->name) + 1);
+    buf_u32(&symt, sx);
+    buf_u8(&symt, N_UNDF | N_EXT);
+    buf_u8(&symt, 0);
+    buf_u16(&symt, 1 << 8);
+    buf_u64(&symt, 0);
+    nundef++;
+  }
+  while (strt.len & 7) buf_u8(&strt, 0);
+
+  uint64_t reb_off  = link_foff;
+  uint64_t bind_off = reb_off + reb.len;
+  uint64_t sym_off  = bind_off + bind.len;
+  uint64_t str_off  = sym_off + symt.len;
+  uint64_t sig_off  = align_up(str_off + strt.len, 16);
+
+  Buf lc; memset(&lc, 0, sizeof lc);
+  uint32_t ncmds = 0;
+
+  seg_cmd(&lc, "__PAGEZERO", 0, MACHO_BASE, 0, 0, 0, 0, 0); ncmds++;
+
+  seg_cmd(&lc, "__TEXT", MACHO_BASE, align_up(text_fsz, MACHO_PAGE), 0, text_fsz,
+          VM_PROT_READ | VM_PROT_EXEC, VM_PROT_READ | VM_PROT_EXEC, 3); ncmds++;
+  sect_cmd(&lc, "__text", "__TEXT", L->text_addr, L->stub_addr - L->text_addr,
+           (uint32_t)(L->text_addr - MACHO_BASE), 2,
+           S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS);
+  sect_cmd(&lc, "__stubs", "__TEXT", L->stub_addr, (uint64_t)L->nstub * STUB_SIZE,
+           (uint32_t)(L->stub_addr - MACHO_BASE), 2,
+           S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS);
+  sect_cmd(&lc, "__const", "__TEXT", L->rodata_addr, L->rodata_size,
+           (uint32_t)(L->rodata_addr - MACHO_BASE), 4, 0);
+
+  seg_cmd(&lc, "__DATA", L->got_addr, align_up(data_vsz, MACHO_PAGE), data_foff, data_fsz,
+          VM_PROT_READ | VM_PROT_WRITE, VM_PROT_READ | VM_PROT_WRITE, 3); ncmds++;
+  sect_cmd(&lc, "__got", "__DATA", L->got_addr, (uint64_t)L->ngot * 8,
+           (uint32_t)data_foff, 3, 0);
+  sect_cmd(&lc, "__data", "__DATA", L->data_addr, L->data_size,
+           (uint32_t)(L->data_addr - MACHO_BASE), 4, 0);
+  sect_cmd(&lc, "__bss", "__DATA", L->bss_addr, L->bss_size, 0, 4, S_ZEROFILL);
+
+  uint32_t np0 = (uint32_t)((sig_off + 4095) / 4096);
+  uint64_t sig_len = 20 + 88 + strlen(ident) + 1 + (uint64_t)np0 * 32;
+  uint64_t link_fsz = (sig_off - link_foff) + sig_len;
+  seg_cmd(&lc, "__LINKEDIT", link_vaddr, align_up(link_fsz, MACHO_PAGE),
+          link_foff, link_fsz, VM_PROT_READ, VM_PROT_READ, 0); ncmds++;
+
+  buf_u32(&lc, LC_DYLD_INFO_ONLY); buf_u32(&lc, 48);
+  buf_u32(&lc, (uint32_t)reb_off); buf_u32(&lc, (uint32_t)reb.len);
+  buf_u32(&lc, (uint32_t)bind_off); buf_u32(&lc, (uint32_t)bind.len);
+  buf_u32(&lc, 0); buf_u32(&lc, 0);
+  buf_u32(&lc, 0); buf_u32(&lc, 0);
+  buf_u32(&lc, 0); buf_u32(&lc, 0);
+  ncmds++;
+
+  buf_u32(&lc, LC_SYMTAB_C); buf_u32(&lc, 24);
+  buf_u32(&lc, (uint32_t)sym_off); buf_u32(&lc, ndef + nundef);
+  buf_u32(&lc, (uint32_t)str_off); buf_u32(&lc, (uint32_t)strt.len);
+  ncmds++;
+
+  buf_u32(&lc, LC_DYSYMTAB); buf_u32(&lc, 80);
+  buf_u32(&lc, 0); buf_u32(&lc, 0);
+  buf_u32(&lc, 0); buf_u32(&lc, ndef);
+  buf_u32(&lc, ndef); buf_u32(&lc, nundef);
+  for (int i = 0; i < 12; i++) buf_u32(&lc, 0);
+  ncmds++;
+
+  uint32_t dl = (uint32_t)align_up(12 + strlen(dyld) + 1, 8);
+  buf_u32(&lc, LC_LOAD_DYLINKER); buf_u32(&lc, dl); buf_u32(&lc, 12);
+  buf_bytes(&lc, dyld, strlen(dyld) + 1);
+  while ((lc.len % 8) != 0) buf_u8(&lc, 0);
+  ncmds++;
+
+  buf_u32(&lc, LC_BUILD_VERSION); buf_u32(&lc, 24);
+  buf_u32(&lc, 1);
+  buf_u32(&lc, 11 << 16); buf_u32(&lc, 11 << 16); buf_u32(&lc, 0);
+  ncmds++;
+
+  buf_u32(&lc, LC_MAIN); buf_u32(&lc, 24);
+  buf_u64(&lc, entry - MACHO_BASE); buf_u64(&lc, 0);
+  ncmds++;
+
+  uint32_t dylibsz = (uint32_t)align_up(24 + strlen(dylib) + 1, 8);
+  buf_u32(&lc, LC_LOAD_DYLIB); buf_u32(&lc, dylibsz);
+  buf_u32(&lc, 24); buf_u32(&lc, 0); buf_u32(&lc, 0); buf_u32(&lc, 0);
+  buf_bytes(&lc, dylib, strlen(dylib) + 1);
+  while ((lc.len % 8) != 0) buf_u8(&lc, 0);
+  ncmds++;
+
+  buf_u32(&lc, LC_CODE_SIGNATURE); buf_u32(&lc, 16);
+  buf_u32(&lc, (uint32_t)sig_off); buf_u32(&lc, (uint32_t)sig_len);
+  ncmds++;
+
+  if (32 + lc.len > L->text_addr - MACHO_BASE)
+    warmc_fatal("link: load commands are %llu bytes and __text was placed at "
+                "%llu; update macho_hdr_size",
+                (unsigned long long)(32 + lc.len),
+                (unsigned long long)(L->text_addr - MACHO_BASE));
+
+  Buf out; memset(&out, 0, sizeof out);
+  buf_u32(&out, MH_MAGIC_64);
+  buf_u32(&out, 0x0100000c);
+  buf_u32(&out, 0);
+  buf_u32(&out, MH_EXECUTE);
+  buf_u32(&out, ncmds); buf_u32(&out, (uint32_t)lc.len);
+
+  buf_u32(&out, MH_DYLDLINK | MH_TWOLEVEL | MH_PIE |
+                (nundef ? 0u : (uint32_t)MH_NOUNDEFS));
+  buf_u32(&out, 0);
+  buf_bytes(&out, lc.data, lc.len);
+
+  while (out.len < L->text_addr - MACHO_BASE) buf_u8(&out, 0);
+  emit_secs(&out, L, K_TEXT, L->text_addr, L->text_addr - MACHO_BASE);
+  while (out.len < L->stub_addr - MACHO_BASE) buf_u8(&out, 0);
+  for (uint32_t i = 0; i < L->nstub; i++) {
+    uint64_t at = L->stub_addr + (uint64_t)i * STUB_SIZE;
+    uint64_t ga = L->got_addr + (uint64_t)L->gsyms[L->stub[i]].got_slot * 8;
+    uint8_t ins[12];
+    wr32(ins + 0, 0x90000010u);
+    wr32(ins + 4, 0xf9400210u);
+    wr32(ins + 8, 0xd61f0200u);
+    patch_page21(ins + 0, ga, at, "stub");
+    patch_lo12(ins + 4, ga, 3);
+    buf_bytes(&out, ins, 12);
+  }
+  while (out.len < L->rodata_addr - MACHO_BASE) buf_u8(&out, 0);
+  emit_secs(&out, L, K_RODATA, L->rodata_addr, L->rodata_addr - MACHO_BASE);
+
+  while (out.len < data_foff) buf_u8(&out, 0);
+  for (uint32_t i = 0; i < L->ngot; i++) {
+    GSym *g = &L->gsyms[L->got[i]];
+    buf_u64(&out, g->imported ? 0 : g->addr);
+  }
+  while (out.len < L->data_addr - MACHO_BASE) buf_u8(&out, 0);
+  emit_secs(&out, L, K_DATA, L->data_addr, L->data_addr - MACHO_BASE);
+
+  while (out.len < reb_off) buf_u8(&out, 0);
+  buf_bytes(&out, reb.data, reb.len);
+  buf_bytes(&out, bind.data, bind.len);
+  buf_bytes(&out, symt.data, symt.len);
+  buf_bytes(&out, strt.data, strt.len);
+  while (out.len < sig_off) buf_u8(&out, 0);
+
+  uint64_t code_limit = sig_off;
+  uint32_t npages = (uint32_t)((code_limit + 4095) / 4096);
+  uint32_t idlen = (uint32_t)strlen(ident) + 1;
+  uint32_t cd_hdr = 88;
+  uint32_t cd_len = cd_hdr + idlen + npages * 32;
+  uint32_t sb_len = 20 + cd_len;
+
+  Buf cd; memset(&cd, 0, sizeof cd);
+  be32(&cd, 0xfade0c02); be32(&cd, cd_len);
+  be32(&cd, 0x20400);
+  be32(&cd, 0x00000002);
+  be32(&cd, cd_hdr + idlen);
+  be32(&cd, cd_hdr);
+  be32(&cd, 0);
+  be32(&cd, npages);
+  be32(&cd, (uint32_t)code_limit);
+  buf_u8(&cd, 32); buf_u8(&cd, 2);
+  buf_u8(&cd, 0); buf_u8(&cd, 12);
+  be32(&cd, 0);
+  be32(&cd, 0);
+  be32(&cd, 0);
+  be32(&cd, 0);
+  be64(&cd, 0);
+  be64(&cd, 0);
+  be64(&cd, text_fsz);
+  be64(&cd, 1);
+  buf_bytes(&cd, ident, idlen);
+  for (uint32_t p = 0; p < npages; p++) {
+    size_t off = (size_t)p * 4096;
+    size_t n = code_limit - off < 4096 ? (size_t)(code_limit - off) : 4096;
+    uint8_t h[32];
+#ifdef SHA_HW
+    CC_SHA256(out.data + off, (CC_LONG)n, h);
+#else
+    Sha256 s;
+    sha_init(&s); sha_update(&s, out.data + off, n); sha_final(&s, h);
+#endif
+    buf_bytes(&cd, h, 32);
+  }
+
+  Buf sb; memset(&sb, 0, sizeof sb);
+  be32(&sb, 0xfade0cc0);
+  be32(&sb, sb_len);
+  be32(&sb, 1);
+  be32(&sb, 0);
+  be32(&sb, 20);
+  buf_bytes(&out, sb.data, sb.len);
+  buf_bytes(&out, cd.data, cd.len);
+  xfree(sb.data);
+
+  if (sb_len != sig_len)
+    warmc_fatal("link: signature is %u bytes but %llu were reserved",
+                sb_len, (unsigned long long)sig_len);
+
+  FILE *f = fopen(path, "wb");
+  if (!f) warmc_fatal("link: cannot write %s", path);
+  if (out.len && fwrite(out.data, 1, out.len, f) != out.len)
+    warmc_fatal("link: short write on %s", path);
+  fclose(f);
+  chmod_exec(path);
+  xfree(out.data); xfree(lc.data); xfree(cd.data);
+  xfree(reb.data); xfree(bind.data); xfree(symt.data); xfree(strt.data);
+}

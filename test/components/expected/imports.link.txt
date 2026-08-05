@@ -1,0 +1,4 @@
+func 0: import "plain-func"
+blocked: import "plain-func" has nothing to bind it to
+blocked: import "an-instance" is an instance no host here provides
+blocked: import "a-component" is a component

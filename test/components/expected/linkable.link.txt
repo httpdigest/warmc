@@ -1,0 +1,33 @@
+module 0: cm0, 2 funcs, 0 imports, 4 exports
+module 1: cm1, 6 funcs, 6 imports, 2 exports
+module 2: cm2, 3 funcs, 2 imports, 1 exports
+instance 0: module 0, 0 imports
+instance 1: module 0, 0 imports
+instance 2: module 1, 6 imports
+  bind "a" "store" <- instance 0 "put" [func]
+  bind "a" "load" <- instance 0 "get" [func]
+  bind "a" "buf" <- instance 0 "mem" [memory]
+  bind "a" "origin" <- instance 0 "base" [global]
+  bind "b" "store" <- instance 1 "put" [func]
+  bind "b" "load" <- instance 1 "get" [func]
+instance 3: module 0, 0 imports
+instance 4: module 2, 2 imports
+  bind "c" "put" <- instance 3 "put" [func]
+  bind "c" "get" <- instance 3 "get" [func]
+instance 5: module 0, 0 imports
+instance 6: module 2, 2 imports
+  bind "c" "put" <- instance 5 "put" [func]
+  bind "c" "get" <- instance 5 "get" [func]
+canon 0: lift instance 4 "run" [func], core (i32) -> (i32), memory=no
+canon 1: lift instance 6 "run" [func], core (i32) -> (i32), memory=no
+canon 2: lift instance 2 "split" [func], core () -> (i32), memory=no
+canon 3: lift instance 2 "through-mem" [func], core (i32) -> (i32), memory=no
+func 0: canon 0
+func 1: canon 1
+func 2: canon 2
+func 3: canon 3
+export "test:link/ops#split": func 2
+export "test:link/ops#through-mem": func 3
+export "test:link/ops#step-a": func 0
+export "test:link/ops#step-b": func 1
+export "split-flat": func 2

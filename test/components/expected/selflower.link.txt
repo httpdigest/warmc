@@ -1,0 +1,12 @@
+module 0: cm0, 2 funcs, 0 imports, 3 exports
+module 1: cm1, 2 funcs, 1 imports, 1 exports
+instance 0: module 0, 0 imports
+instance 1: module 1, 1 imports
+  bind "" "t" <- canon 1 [func]
+canon 0: lift instance 0 "twice" [func], core (i32) -> (i32), memory=no
+canon 1: lower func 0, core (i32) -> (i32), memory=no
+canon 2: lift instance 1 "run" [func], core (i32) -> (i32), memory=no
+func 0: canon 0
+func 1: canon 2
+export "run": func 1
+blocked: a component instance lowers a lift of its own, which wasmtime traps as re-entrance and the reference implementation permits

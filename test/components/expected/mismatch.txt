@@ -1,0 +1,26 @@
+alias 0: export 0 "f" (func)
+alias 1: export 1 "run" (func)
+instance 0: instantiate component 0, 0 args
+instance 1: instantiate component 1, 1 args
+export 0: "run" (func 1)
+component 0:
+  core module 0: 2 funcs, 3 exports
+  core instance 0: instantiate module 0, 0 args
+  type 0: list
+  type 1: func
+  alias 0: core export 0 "f" (core func)
+  alias 1: core export 0 "mem" (core memory)
+  alias 2: core export 0 "r" (core func)
+  canon 0: lift, 2 options
+  export 0: "f" (func 0)
+component 1:
+  core module 0: 2 funcs, 1 exports
+  core instance 0: 1 inline exports
+  core instance 1: instantiate module 0, 1 args
+  type 0: func
+  type 1: func
+  alias 0: core export 1 "run" (core func)
+  canon 0: lower, 0 options
+  canon 1: lift, 0 options
+  import 0: "f" kind 1
+  export 0: "run" (func 1)

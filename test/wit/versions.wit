@@ -1,0 +1,18 @@
+// A versioned use path followed immediately by its `.{...}` -- the version and
+// the separator are adjacent, and a lexer that takes the dot as part of the
+// number never finds the end of the path.
+package v:test@1.0.0;
+
+interface base {
+  type t = u32;
+}
+
+interface user {
+  use base.{t};
+  // The versions below are the shapes wit-smith produces: prerelease and
+  // build metadata, both of which contain dots and hyphens.
+  use a:b/c@1.2.3.{x};
+  use d:e/f@0.7.9-alpha.0+1.2.0.{y};
+  use g:h/i@10.20.30+build.7.{z};
+  go: func(p: t, q: x, r: y, s: z);
+}

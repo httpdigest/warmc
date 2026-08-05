@@ -1,0 +1,38 @@
+// Every type constructor, and the corners of each.
+package test:types@1.0.0;
+
+interface shapes {
+  type byte = u8;
+  type maybe-name = option<string>;
+  type pair = tuple<u32, string>;
+  type nested = list<list<option<result<u32, string>>>>;
+  type fixed = list<u8, 16>;
+  type bare-result = result;
+  type ok-only = result<u32>;
+  type err-only = result<_, string>;
+  type both = result<u32, string>;
+
+  record point { x: s32, y: s32 }
+  record empty-ish { only: bool }
+  variant shape { circle(u32), rect(point), degenerate }
+  enum colour { red, green, blue }
+  flags perms { read, write, exec }
+
+  // A forward reference: `later` is declared below the record that uses it.
+  record uses-later { f: later }
+  type later = u64;
+
+  resource handle {
+    constructor(seed: u32);
+    read: func() -> list<u8>;
+    write: func(data: list<u8>) -> result<u32, string>;
+    make: static func() -> handle;
+  }
+
+  type owned = own<handle>;
+  type borrowed = borrow<handle>;
+
+  make-point: func(x: s32, y: s32) -> point;
+  no-result: func(a: bool);
+  no-params: func() -> string;
+}

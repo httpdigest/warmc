@@ -1,0 +1,10 @@
+module 0: cm0, 1 funcs, 0 imports, 1 exports
+module 1: cm1, 1 funcs, 0 imports, 1 exports
+instance 0: module 1, 0 imports
+instance 1: module 0, 0 imports
+canon 0: lift instance 1 "v" [func], core () -> (i32), memory=no
+canon 1: lift instance 0 "v" [func], core () -> (i32), memory=no
+func 0: canon 0
+func 1: canon 1
+export "outer": func 0
+export "local": func 1

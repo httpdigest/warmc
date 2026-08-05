@@ -1,0 +1,22 @@
+core module 0: 1 funcs, 2 exports
+core module 1: 5 funcs, 1 exports
+core instance 0: instantiate module 0, 0 args
+core instance 1: 4 inline exports
+core instance 2: instantiate module 1, 1 args
+type 0: instance
+type 1: tuple
+type 2: func
+alias 0: core export 0 "mem" (core memory)
+alias 1: core export 0 "realloc" (core func)
+alias 2: export 0 "f-flat" (func)
+alias 3: export 0 "f-spill" (func)
+alias 4: export 0 "f-ptr" (func)
+alias 5: export 0 "f-wide" (func)
+alias 6: core export 2 "run" (core func)
+canon 0: lower, 0 options
+canon 1: lower, 2 options
+canon 2: lower, 2 options
+canon 3: lower, 2 options
+canon 4: lift, 2 options
+import 0: "test:abi/iface" kind 5
+export 0: "run" (func 4)

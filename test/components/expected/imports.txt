@@ -1,0 +1,8 @@
+type 0: func
+type 1: instance
+type 2: component
+import 0: "plain-func" kind 1
+import 1: "an-instance" kind 5
+import 2: "a-component" kind 4
+import 3: "a-type" kind 3
+import 4: "abstract" kind 3

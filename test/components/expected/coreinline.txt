@@ -1,0 +1,14 @@
+core module 0: 1 funcs, 4 exports
+core module 1: 2 funcs, 1 exports
+core instance 0: instantiate module 0, 0 args
+core instance 1: 4 inline exports
+core instance 2: instantiate module 1, 1 args
+type 0: func
+type 1: func
+alias 0: core export 0 "helper" (core func)
+alias 1: core export 0 "mem" (core memory)
+alias 2: core export 0 "g" (core global)
+alias 3: core export 0 "tbl" (core table)
+alias 4: core export 2 "run" (core func)
+canon 0: lift, 0 options
+export 0: "run" (func 0)

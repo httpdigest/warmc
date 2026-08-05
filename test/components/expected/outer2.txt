@@ -1,0 +1,23 @@
+core module 0: 1 funcs, 1 exports
+alias 0: export 0 "outer" (func)
+alias 1: export 0 "local" (func)
+instance 0: instantiate component 0, 0 args
+export 0: "outer" (func 0)
+export 1: "local" (func 1)
+component 0:
+  core module 0: 1 funcs, 1 exports
+  core instance 0: instantiate module 0, 0 args
+  type 0: func
+  alias 0: export 0 "v" (func)
+  alias 1: core export 0 "v" (core func)
+  instance 0: instantiate component 0, 0 args
+  canon 0: lift, 0 options
+  export 0: "outer" (func 0)
+  export 1: "local" (func 1)
+  component 0:
+    core instance 0: instantiate module 0, 0 args
+    type 0: func
+    alias 0: outer 2 0 (core module)
+    alias 1: core export 0 "v" (core func)
+    canon 0: lift, 0 options
+    export 0: "v" (func 0)
