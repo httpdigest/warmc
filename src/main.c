@@ -1,0 +1,595 @@
+#include <time.h>
+#include "ir.h"
+#include "component.h"
+#include "canon.h"
+#include "wit.h"
+#include "wat.h"
+#include "clink.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+
+static const char *usage_text =
+  "warmc -- WebAssembly to AArch64 ahead-of-time compiler\n"
+  "\n"
+  "usage: warmc [options] input.wasm|input.wat\n"
+  "\n"
+  "  a module may be given in either the binary or the text format; which one\n"
+  "  it is decided by whether it begins with the binary magic, not by its name\n"
+  "\n"
+  "  a *component* is compiled too, when nothing it exports needs conversion\n"
+  "  code -- see --dump-link for what was resolved and why one is refused\n"
+  "\n"
+  "  -o FILE       output path (default a.out, or input.o with -c)\n"
+  "  -j N          compile with at most N worker threads (-jN also works).\n"
+  "                Without it the count comes from the total body size and\n"
+  "                the core count; WARMC_JOBS sets the same thing and -j\n"
+  "                wins over it.  Fewer threads than N are used when the\n"
+  "                module has too few functions to keep them busy, so -j1\n"
+  "                is the one value that is always exact -- which is what\n"
+  "                makes it the flag to reach for when output differs\n"
+  "                between runs\n"
+  "  -O0 -O1 -O2   optimisation level (default -O2)\n"
+  "                O0 every pass off, O1 the optimising pipeline, O2 adds\n"
+  "                guard pages.  Inlining is on at -O2 and off below it;\n"
+  "                -fno-inline turns it off, and src/inline.c has the\n"
+  "                measurements that decided both\n"
+  "  -f[no-]PASS   enable or disable one pass: fold, dce, cse, licm, branch,\n"
+  "                mem, bce, strength, inline, rotate, addroff, memptr,\n"
+  "                align, regalloc, guard-pages, vectorize, unroll, selftail,\n"
+  "                ldcomb, gloop, loopclose, cpool,\n"
+  "                labcache, barelide\n"
+  "                The last four are the passes built on a loop containing\n"
+  "                no safepoint, which is the only assumption the compiler\n"
+  "                makes about the collector: turning them off says whether\n"
+  "                a collection bug that needs -O2 is one of theirs\n"
+  "  -fgssa        turn a global a function uses as a variable into SSA\n"
+  "                values, with a parameter at each merge.  Off by default:\n"
+  "                correct, and a net loss -- a global load is one instruction\n"
+  "                off the instance, and keeping the value live instead costs\n"
+  "                edge copies and register pressure.  asbench/mapint -6.9%\n"
+  "                and instof -4.5%, against bintree +4.0%, virtual +4.6%\n"
+  "  --validate-only  validate and stop; exit 2 malformed, 3 invalid\n"
+  "  --dump-component  print a component's structure, one line per definition\n"
+  "  --dump-canon      print what the canonical ABI makes of each of its types\n"
+  "  --dump-component-wit  render a component's interfaces back as WIT text\n"
+  "  --dump-adapter    print the canonical ABI conversion code, as wasm text\n"
+  "  --dump-link       print a component's instance graph, resolved\n"
+  "  --dump-wit    parse a .wit document and print what it declares\n"
+  "  --emit-wasm   assemble a text module to binary and stop, writing -o\n"
+  "  --wasi        link a wasi host and run the program, instead of the CLI\n"
+  "                harness that invokes an export by name.  Which host is\n"
+  "                decided by the input: a core module gets the\n"
+  "                wasi_snapshot_preview1 one and runs _start, a component\n"
+  "                gets the WASI 0.2 one and runs wasi:cli/run@0.2.0#run,\n"
+  "                whose result is the whole of its exit status -- 0 or 1.\n"
+  "                A wasi:* function this host does not implement traps when\n"
+  "                it is called, naming itself, rather than refusing the link\n"
+  "                The host archive is found beside --rt; --wasi=PATH overrides\n"
+  "                The program it produces takes --dir=HOST::GUEST to preopen\n"
+  "                a directory, --env NAME=VALUE to pass one variable, and\n"
+  "                --inherit-env for the whole environment.  Nothing is\n"
+  "                inherited unless asked for.  --tcplisten=ADDR:PORT hands\n"
+  "                the guest a listening socket to accept on; without it the\n"
+  "                four sock_* calls have no descriptor to work on and the\n"
+  "                guest reaches no network at all\n"
+  "  --symbol-prefix=P  name the module descriptor P_module, so several\n"
+  "                modules can be linked into one program\n"
+  "  --no-export-names  emit only the exports a name can still be needed\n"
+  "                for -- _start and main -- and drop the rest of the export\n"
+  "                table.  The program can then no longer be asked for an\n"
+  "                export by name: the CLI harness's `PROG name args` form\n"
+  "                and its export listing stop working, as does\n"
+  "                warmc_find_export in an embedder.  Refused for a\n"
+  "                component, where a name is how one instance is bound to\n"
+  "                another\n"
+  "  --print-ir    dump the IR after optimisation\n"
+  "  --stats       print optimisation counters\n"
+  "  --profile     count executed instructions at run time\n"
+  "  --profile=P   compile for a wasm profile: full (default) or\n"
+  "                deterministic.  Unrelated to the bare --profile above,\n"
+  "                which is warmc's own instruction counter\n"
+  "  -c            emit a relocatable object and stop\n"
+  "  --target T    linux (ELF, default) or macos (Mach-O).  The macOS link\n"
+  "                needs libSystem, found through `xcrun --show-sdk-path`;\n"
+  "                $WARMC_MACOS_LIBDIR overrides that\n"
+  "  --rt PATH     runtime archive or object to link (default $WARMC_RT)\n"
+  "  --system-ld   link with an external linker instead of doing it here\n"
+  "  --ld PATH     which one, and implies --system-ld\n"
+  "  --keep-obj    do not delete the intermediate object\n"
+  "  -v            print the link command\n"
+  "  -h, --help    this message\n";
+
+static const char *wasi_archive(const char *rt, const char *wasi, bool p2,
+                                char *buf, size_t bufn) {
+  if (!wasi) {
+    const char *base = strrchr(rt, '/');
+    base = base ? base + 1 : rt;
+    if (strncmp(base, "warmrt", 6))
+      warmc_fatal("--wasi cannot guess the host archive from %s; "
+                  "pass --wasi=PATH", rt);
+    snprintf(buf, bufn, "%.*s%s%s", (int)(base - rt), rt,
+             p2 ? "warmwasip2" : "warmwasi", base + 6);
+    wasi = buf;
+  }
+  FILE *probe = fopen(wasi, "rb");
+  if (!probe)
+    warmc_fatal("--wasi: cannot open %s (run `make` to build it)", wasi);
+  fclose(probe);
+  return wasi;
+}
+
+static bool is_directory(const char *path) {
+  struct stat st;
+  return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+static bool ends_with(const char *s, const char *suffix) {
+  size_t n = strlen(s), m = strlen(suffix);
+  return n >= m && !strcmp(s + n - m, suffix);
+}
+
+static const char *macos_libdir(void) {
+  const char *env = getenv("WARMC_MACOS_LIBDIR");
+  if (env && *env) return env;
+
+  static char buf[4096];
+  FILE *p = popen("xcrun --show-sdk-path 2>/dev/null", "r");
+  if (!p) return NULL;
+  char sdk[3800];
+  char *got = fgets(sdk, sizeof sdk, p);
+  pclose(p);
+  if (!got) return NULL;
+  size_t n = strlen(sdk);
+  while (n && (sdk[n - 1] == '\n' || sdk[n - 1] == '\r')) sdk[--n] = 0;
+  if (!n) return NULL;
+
+  snprintf(buf, sizeof buf, "%s/usr/lib", sdk);
+  struct stat st;
+  if (stat(buf, &st) != 0 || !S_ISDIR(st.st_mode)) return NULL;
+  return buf;
+}
+
+static uint8_t *read_file(const char *path, size_t *len_out) {
+  FILE *f = fopen(path, "rb");
+  if (!f) warmc_fatal("cannot open %s", path);
+  fseek(f, 0, SEEK_END);
+  long n = ftell(f);
+  fseek(f, 0, SEEK_SET);
+  if (n < 0) warmc_fatal("cannot size %s", path);
+  uint8_t *buf = xmalloc((size_t)n + 1);
+  if (n && fread(buf, 1, (size_t)n, f) != (size_t)n) warmc_fatal("short read on %s", path);
+  fclose(f);
+  *len_out = (size_t)n;
+  return buf;
+}
+
+int main(int argc, char **argv) {
+  const char *input = NULL, *output = NULL, *target = "linux";
+  const char *rt = getenv("WARMC_RT");
+  const char *ld = getenv("WARMC_LD");
+  const char *wasi = getenv("WARMC_WASI");
+  bool want_wasi = false;
+  bool obj_only = false, keep_obj = false, verbose = false, validate_only = false;
+  bool dead_strip = true;
+
+  bool system_ld = getenv("WARMC_SYSTEM_LD") != NULL;
+  bool dump_component = false, dump_wit = false, emit_wasm = false;
+  bool dump_canon = false;
+  bool dump_adapter = false, dump_cwit = false, dump_link = false;
+
+  OptOpts opt;
+  memset(&opt, 0, sizeof opt);
+  opt.level = 2;
+  opt.fold = opt.dce = opt.cse = opt.licm = opt.branch = true;
+  opt.memopt = opt.bce = opt.strength = true;
+
+  opt.inl = true;
+  opt.rotate = true;
+  opt.addroff = true;
+  opt.memptr = true;
+  opt.align = true;
+  opt.guard_pages = true;
+  opt.regalloc = true;
+  opt.vectorize = true;
+  opt.selftail = true;
+  opt.ldcomb = true;
+  opt.escape = true;
+  opt.gloop = true;
+  opt.loopclose = true;
+  opt.cpool = true;
+  opt.reassoc = true;
+  opt.labcache = true;
+  opt.barelide = true;
+  opt.reach = true;
+  opt.prune = true;
+  opt.devirt = true;
+  opt.unroll = true;
+  opt.gcpure = true;
+  opt.closed_world = true;
+
+  for (int i = 1; i < argc; i++) {
+    const char *a = argv[i];
+    if (!strcmp(a, "-h") || !strcmp(a, "--help")) { fputs(usage_text, stdout); return 0; }
+    else if (!strcmp(a, "-c")) obj_only = true;
+    else if (!strcmp(a, "-v")) verbose = true;
+    else if (!strncmp(a, "-j", 2)) {
+      const char *v = a[2] ? a + 2 : (i + 1 < argc ? argv[++i] : NULL);
+      char *end = NULL;
+      long n = v ? strtol(v, &end, 10) : 0;
+      if (!v || !*v || *end || n < 1) {
+        fprintf(stderr, "warmc: -j wants a worker count of 1 or more\n");
+        return 1;
+      }
+      compile_set_jobs(n);
+    }
+    else if (!strcmp(a, "--keep-obj")) keep_obj = true;
+    else if (!strcmp(a, "--no-dead-strip")) dead_strip = false;
+    else if (!strcmp(a, "--no-export-names")) g_no_export_names = true;
+    else if (!strcmp(a, "-fno-loadbar")) codegen_set_load_barrier(false);
+    else if (!strncmp(a, "--symbol-prefix=", 16)) codegen_set_symbol_prefix(a + 16);
+    else if (!strncmp(a, "--target=", 9)) target = a + 9;
+    else if (!strncmp(a, "--rt=", 5)) rt = a + 5;
+    else if (!strncmp(a, "--ld=", 5)) { ld = a + 5; system_ld = true; }
+    else if (!strcmp(a, "-o") && i + 1 < argc) output = argv[++i];
+    else if (!strcmp(a, "--target") && i + 1 < argc) target = argv[++i];
+    else if (!strcmp(a, "--rt") && i + 1 < argc) rt = argv[++i];
+    else if (!strcmp(a, "--ld") && i + 1 < argc) { ld = argv[++i]; system_ld = true; }
+    else if (!strcmp(a, "--system-ld")) system_ld = true;
+
+    else if (!strncmp(a, "--magic=", 8)) {
+      const char *arg = a + 8;
+      bool wide = false;
+      char *end = NULL;
+      unsigned long long d = strtoull(arg, &end, 0);
+      if (end && *end == ':') wide = !strcmp(end + 1, "64");
+      Magic mg = opt_magic_unsigned((uint64_t)d, wide);
+      printf("%llu %d %d\n", (unsigned long long)mg.m, mg.add, mg.sh);
+      return 0;
+    }
+    else if (!strcmp(a, "-O0")) {
+
+      opt.level = 0;
+      opt.guard_pages = false;
+      opt.align = false;
+      opt.inl = false;
+      opt.devirt = false;
+      opt.unroll = false;
+      opt.gcpure = false;
+    }
+    else if (!strcmp(a, "-O1")) {
+
+      opt.level = 1;
+      opt.guard_pages = false;
+      opt.inl = false;
+      opt.devirt = false;
+      opt.unroll = false;
+      opt.gcpure = false;
+    }
+    else if (!strcmp(a, "-O2")) opt.level = 2;
+    else if (!strcmp(a, "--validate-only")) validate_only = true;
+    else if (!strcmp(a, "--dump-component")) dump_component = true;
+    else if (!strcmp(a, "--dump-canon")) dump_canon = true;
+    else if (!strcmp(a, "--dump-component-wit")) dump_cwit = true;
+    else if (!strcmp(a, "--dump-adapter")) dump_adapter = true;
+    else if (!strcmp(a, "--dump-link")) dump_link = true;
+    else if (!strcmp(a, "--dump-wit")) dump_wit = true;
+    else if (!strcmp(a, "--emit-wasm")) emit_wasm = true;
+    else if (!strcmp(a, "--wasi")) want_wasi = true;
+    else if (!strncmp(a, "--wasi=", 7)) { want_wasi = true; wasi = a + 7; }
+    else if (!strcmp(a, "--print-ir")) opt.print_ir = true;
+    else if (!strcmp(a, "--stats")) opt.stats = true;
+
+    else if (!strcmp(a, "--profile")) opt.profile = true;
+    else if (!strncmp(a, "--profile=", 10)) {
+      const char *p = a + 10;
+      if (!strcmp(p, "deterministic")) opt.det_profile = true;
+      else if (!strcmp(p, "full")) opt.det_profile = false;
+      else {
+        fprintf(stderr, "warmc: unknown profile '%s' "
+                        "(full or deterministic)\n", p);
+        return 1;
+      }
+    }
+    else if (!strncmp(a, "-f", 2)) {
+      const char *name = a + 2;
+      bool on = true;
+      if (!strncmp(name, "no-", 3)) { on = false; name += 3; }
+      if (!strcmp(name, "fold")) opt.fold = on;
+      else if (!strcmp(name, "dce")) opt.dce = on;
+      else if (!strcmp(name, "cse")) opt.cse = on;
+      else if (!strcmp(name, "licm")) opt.licm = on;
+      else if (!strcmp(name, "branch")) opt.branch = on;
+      else if (!strcmp(name, "mem")) opt.memopt = on;
+      else if (!strcmp(name, "bce")) opt.bce = on;
+      else if (!strcmp(name, "strength")) opt.strength = on;
+      else if (!strcmp(name, "inline")) opt.inl = on;
+      else if (!strcmp(name, "reassoc")) opt.reassoc = on;
+      else if (!strcmp(name, "rotate")) opt.rotate = on;
+      else if (!strcmp(name, "addroff")) opt.addroff = on;
+      else if (!strcmp(name, "memptr")) opt.memptr = on;
+      else if (!strcmp(name, "align")) opt.align = on;
+      else if (!strcmp(name, "guard-pages")) opt.guard_pages = on;
+      else if (!strcmp(name, "regalloc")) opt.regalloc = on;
+      else if (!strcmp(name, "vectorize")) opt.vectorize = on;
+      else if (!strcmp(name, "selftail")) opt.selftail = on;
+      else if (!strcmp(name, "ldcomb")) opt.ldcomb = on;
+      else if (!strcmp(name, "escape")) opt.escape = on;
+      else if (!strcmp(name, "gloop")) opt.gloop = on;
+      else if (!strcmp(name, "loopclose")) opt.loopclose = on;
+      else if (!strcmp(name, "cpool")) opt.cpool = on;
+      else if (!strcmp(name, "gssa")) opt.gssa = on;
+      else if (!strcmp(name, "labcache")) opt.labcache = on;
+      else if (!strcmp(name, "barelide")) opt.barelide = on;
+      else if (!strcmp(name, "merge")) codegen_set_merge(on);
+      else if (!strcmp(name, "reach")) opt.reach = on;
+      else if (!strcmp(name, "prune")) opt.prune = on;
+      else if (!strcmp(name, "devirt")) opt.devirt = on;
+      else if (!strcmp(name, "unroll")) opt.unroll = on;
+      else if (!strcmp(name, "gcpure")) opt.gcpure = on;
+      else if (!strcmp(name, "closed-world")) opt.closed_world = on;
+      else warmc_fatal("unknown pass %s", name);
+    }
+    else if (a[0] == '-') warmc_fatal("unknown option %s (try --help)", a);
+    else input = a;
+  }
+  if (!input) { fputs(usage_text, stderr); return 2; }
+
+  bool macho = !strcmp(target, "macos") || !strcmp(target, "darwin");
+  if (!macho && strcmp(target, "linux")) warmc_fatal("unknown target %s", target);
+
+  if (dump_wit || is_directory(input) ||
+      (validate_only && ends_with(input, ".wit"))) {
+    WitRegistry *r = wit_load(input);
+    if (dump_wit) wit_registry_dump(r, stdout);
+    wit_registry_free(r);
+    return 0;
+  }
+
+  size_t len;
+  uint8_t *bin = read_file(input, &len);
+
+  bool named_wat = ends_with(input, ".wat");
+  bool named_wasm = ends_with(input, ".wasm");
+  if (named_wat || (!named_wasm && wat_is_text(bin, len))) {
+    size_t blen;
+    uint8_t *assembled = wat_assemble((const char *)bin, len, input, &blen);
+    xfree(bin);
+    bin = assembled;
+    len = blen;
+    if (emit_wasm) {
+      const char *out = output ? output : "out.wasm";
+      FILE *f = fopen(out, "wb");
+      if (!f) warmc_fatal("cannot write %s", out);
+      if (len && fwrite(bin, 1, len, f) != len) warmc_fatal("short write on %s", out);
+      fclose(f);
+      xfree(bin);
+      return 0;
+    }
+  } else if (emit_wasm) {
+    warmc_fatal("--emit-wasm takes a text module; %s is already binary", input);
+  }
+
+  if (wasm_is_component(bin, len)) {
+
+    if (g_no_export_names)
+      warmc_fatal("--no-export-names: %s is a component, and a component binds "
+                  "one instance to another by export name", input);
+    Component *c = comp_parse(bin, len);
+    if (dump_component) comp_dump(c, stdout);
+    if (dump_cwit) wit_dump_component(c, stdout);
+    if (dump_canon) canon_dump(c, false, stdout);
+    if (dump_adapter) canon_dump_adapters(c, false, stdout);
+    if (dump_link) {
+      LinkPlan *lp = clink_plan(c);
+      clink_dump(lp, stdout);
+      clink_free(lp);
+    }
+    if (!validate_only && !dump_component && !dump_cwit && !dump_canon
+        && !dump_adapter && !dump_link) {
+
+      LinkPlan *lp = clink_plan(c);
+      const char *why = clink_why_not(lp);
+      if (why) warmc_fatal("%s is a component warmc cannot compile yet: %s",
+                           input, why);
+      bool command = false;
+      for (uint32_t i = 0; i < lp->nexports; i++)
+        if (clink_is_command(lp->exports[i].name)) command = true;
+      if (command && !want_wasi && !obj_only)
+        warmc_fatal("%s exports %s, so it needs a wasi host: pass --wasi",
+                    input, CLINK_COMMAND_EXPORT);
+      if (want_wasi && !command)
+        warmc_fatal("--wasi: %s is a component that does not export %s, so "
+                    "there is nothing for the host to run", input,
+                    CLINK_COMMAND_EXPORT);
+      ObjBuilder co;
+      memset(&co, 0, sizeof co);
+      clink_compile(lp, &co, &opt);
+      char cobj[4096];
+      if (obj_only) snprintf(cobj, sizeof cobj, "%s", output ? output : "out.o");
+      else snprintf(cobj, sizeof cobj, "%s.o", output ? output : "a.out");
+      if (macho) write_macho64(&co, cobj);
+      else write_elf64(&co, cobj);
+      if (!obj_only) {
+        if (!rt) warmc_fatal("no runtime specified; pass --rt or set WARMC_RT");
+        char cwasi[4096];
+        warmc_link_exec(macho, output ? output : "a.out", cobj,
+                        want_wasi ? wasi_archive(rt, wasi, true, cwasi,
+                                                 sizeof cwasi) : NULL,
+                        rt, macho ? "_main" : "_start", dead_strip);
+        if (!keep_obj) remove(cobj);
+      }
+      clink_free(lp);
+      comp_free(c);
+      xfree(bin);
+      return 0;
+    }
+    comp_free(c);
+    xfree(bin);
+    return 0;
+  }
+
+  bool wtm = getenv("WARMC_TIME") != NULL;
+  struct timespec _ts; double _t0 = 0, _t1 = 0, _t2 = 0, _t3 = 0;
+#define STAMP(v) do { if (wtm) { clock_gettime(CLOCK_MONOTONIC, &_ts); \
+    (v) = _ts.tv_sec * 1e3 + _ts.tv_nsec / 1e6; } } while (0)
+  STAMP(_t0);
+  Module *m = wasm_parse(bin, len);
+  STAMP(_t1);
+  wasm_validate(m);
+  STAMP(_t2);
+  if (wtm) fprintf(stderr, "front: parse %.1f validate %.1f\n", _t1 - _t0, _t2 - _t1);
+  if (validate_only) { module_free(m); xfree(bin); return 0; }
+
+  if (!obj_only && !want_wasi)
+    for (uint32_t i = 0; i < m->nimports; i++) {
+      const Import *im = &m->imports[i];
+      if (im->module_len == 22 &&
+          !memcmp(im->module, "wasi_snapshot_preview1", 22))
+        warmc_fatal("%s imports wasi_snapshot_preview1.%.*s, and nothing "
+                    "linked into the program provides it; pass --wasi to link "
+                    "the host that does, or -c to link a host of your own",
+                    input, (int)im->name_len, im->name);
+    }
+
+  ObjBuilder o;
+  memset(&o, 0, sizeof o);
+  compile_module(m, &o, &opt);
+  STAMP(_t3);
+  if (wtm) fprintf(stderr, "front: compile_module total %.1f\n", _t3 - _t2);
+  if (opt.stats) {
+    fprintf(stderr,
+            "warmc stats: folded=%llu dce=%llu cse=%llu licm=%llu branch=%llu\n"
+            "             loads_fwd=%llu dead_stores=%llu checks_removed=%llu params=%llu\n"
+            "             strength=%llu inlined=%llu rotated=%llu vectorised=%llu\n"
+            "             self_tail=%llu ldcomb=%llu spills=%llu insts=%llu\n"
+            "             ldpairs=%llu stpairs=%llu\n"
+            "             reloads=%llu caller_saves=%llu csa_restores=%llu"
+            " v128_spills=%llu rb_trips=%llu split_cuts=%llu split_invs=%llu\n"
+            "             escape_removed=%llu escape_forwarded=%llu gloop=%llu\n"
+            "             loop_closed=%llu reassoc=%llu cmp_reused=%llu gssa=%llu\n"
+            "             bar_masks=%llu bar_elided=%llu\n"
+            "             devirt_ref=%llu devirt_indirect=%llu"
+            " devirt_null_kept=%llu\n"
+            "             inl_flat=%llu inl_spliced=%llu inl_once=%llu"
+            " inl_retcall_sites=%llu inl_trans=%llu rej_size=%llu"
+            " rej_budget=%llu rej_tail=%llu rej_retcalls=%llu rej_pads=%llu"
+            " rej_score=%llu rej_depth=%llu rej_rec=%llu max_frame=%llu\n"
+            "             unrolled=%llu unr_guarded=%llu unr_rej_shape=%llu"
+            " unr_rej_body=%llu unr_rej_exit=%llu unr_rej_trip=%llu"
+            " unr_rej_escape=%llu unr_addr_folded=%llu gc_nullchk=%llu\n",
+            (unsigned long long)g_stats.folded, (unsigned long long)g_stats.dce_removed,
+            (unsigned long long)g_stats.cse_removed, (unsigned long long)g_stats.licm_hoisted,
+            (unsigned long long)g_stats.branch_simplified,
+            (unsigned long long)g_stats.loads_forwarded,
+            (unsigned long long)g_stats.stores_removed,
+            (unsigned long long)g_stats.checks_removed,
+            (unsigned long long)g_stats.params_removed,
+            (unsigned long long)g_stats.strength_reduced,
+            (unsigned long long)g_stats.inlined,
+            (unsigned long long)g_stats.rotated,
+            (unsigned long long)g_stats.vectorized,
+            (unsigned long long)g_stats.self_tail,
+            (unsigned long long)g_stats.loads_combined,
+            (unsigned long long)g_stats.spills,
+            (unsigned long long)g_stats.insts_emitted,
+            (unsigned long long)g_stats.ldpairs,
+            (unsigned long long)g_stats.stpairs,
+            (unsigned long long)g_stats.reloads,
+            (unsigned long long)g_stats.caller_saves,
+            (unsigned long long)g_stats.csa_restores,
+            (unsigned long long)g_stats.spills_v128_xcall,
+            (unsigned long long)g_stats.range_budget_trips,
+            (unsigned long long)g_stats.split_cuts,
+            (unsigned long long)g_stats.split_invs,
+            (unsigned long long)g_stats.escape_removed,
+            (unsigned long long)g_stats.escape_forwarded,
+            (unsigned long long)g_stats.globals_promoted,
+            (unsigned long long)g_stats.loops_closed,
+            (unsigned long long)g_stats.reassoc,
+            (unsigned long long)g_stats.cmp_reused,
+            (unsigned long long)g_stats.globals_ssa,
+            (unsigned long long)g_stats.bar_masks,
+            (unsigned long long)g_stats.bar_elided,
+            (unsigned long long)g_stats.devirt_ref,
+            (unsigned long long)g_stats.devirt_indirect,
+            (unsigned long long)g_stats.devirt_null_kept,
+            (unsigned long long)g_stats.inl_flat,
+            (unsigned long long)g_stats.inl_spliced,
+            (unsigned long long)g_stats.inl_once_forced,
+            (unsigned long long)g_stats.inl_retcall_sites,
+            (unsigned long long)g_stats.inl_transitive,
+            (unsigned long long)g_stats.inl_rej_size,
+            (unsigned long long)g_stats.inl_rej_budget,
+            (unsigned long long)g_stats.inl_rej_tailcall,
+            (unsigned long long)g_stats.inl_rej_retcalls,
+            (unsigned long long)g_stats.inl_rej_pads,
+            (unsigned long long)g_stats.inl_rej_score,
+            (unsigned long long)g_stats.inl_rej_depth,
+            (unsigned long long)g_stats.inl_rej_recursion,
+            (unsigned long long)g_stats.max_frame_bytes,
+            (unsigned long long)g_stats.unrolled,
+            (unsigned long long)g_stats.unr_guarded,
+            (unsigned long long)g_stats.unr_rej_shape,
+            (unsigned long long)g_stats.unr_rej_body,
+            (unsigned long long)g_stats.unr_rej_exit,
+            (unsigned long long)g_stats.unr_rej_trip,
+            (unsigned long long)g_stats.unr_rej_escape,
+            (unsigned long long)g_stats.unr_addr_folded,
+            (unsigned long long)g_stats.gc_nullchk_removed);
+  }
+
+  char objpath[4096];
+  if (obj_only) snprintf(objpath, sizeof objpath, "%s", output ? output : "out.o");
+  else snprintf(objpath, sizeof objpath, "%s.o", output ? output : "a.out");
+
+  if (macho) write_macho64(&o, objpath);
+  else write_elf64(&o, objpath);
+
+  if (obj_only) return 0;
+
+  if (!rt) warmc_fatal("no runtime specified; pass --rt or set WARMC_RT");
+  if (!ld) ld = "ld.lld";
+
+  char wasipath[4096];
+  if (want_wasi) wasi = wasi_archive(rt, wasi, false, wasipath, sizeof wasipath);
+
+  if (!system_ld) {
+
+    warmc_link_exec(macho, output ? output : "a.out", objpath,
+                    want_wasi ? wasi : NULL, rt, macho ? "_main" : "_start",
+                    dead_strip);
+    if (!keep_obj) remove(objpath);
+    module_free(m);
+    xfree(bin);
+    return 0;
+  }
+
+  char cmd[8192];
+  if (macho) {
+    const char *libdir = macos_libdir();
+    if (!libdir)
+      warmc_fatal("no macOS SDK found for -lSystem; install the command line "
+                  "tools (xcode-select --install) or set WARMC_MACOS_LIBDIR "
+                  "to the directory holding libSystem.tbd");
+    snprintf(cmd, sizeof cmd,
+             "%s -arch arm64 -platform_version macos 11.0 11.0 -o %s %s %s%s%s "
+             "-lSystem -L%s",
+             ld, output ? output : "a.out", objpath,
+             want_wasi ? wasi : "", want_wasi ? " " : "", rt, libdir);
+  } else {
+    snprintf(cmd, sizeof cmd, "%s -static -e _start -o %s %s %s%s%s",
+             ld, output ? output : "a.out", objpath,
+             want_wasi ? wasi : "", want_wasi ? " " : "", rt);
+  }
+  if (verbose) fprintf(stderr, "warmc: %s\n", cmd);
+  int rc = system(cmd);
+  if (rc != 0) warmc_fatal("link failed (%d)", rc);
+  if (!keep_obj) remove(objpath);
+
+  module_free(m);
+  xfree(bin);
+  return 0;
+}

@@ -1,0 +1,535 @@
+#ifndef WARMC_H
+#define WARMC_H
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+#include "a64.h"
+
+enum { EXIT_FATAL = 1, EXIT_MALFORMED = 2, EXIT_INVALID = 3, EXIT_UNLINKABLE = 4 };
+
+void warmc_fatal(const char *fmt, ...)
+  __attribute__((noreturn, format(printf, 1, 2)));
+void warmc_malformed(const char *fmt, ...)
+  __attribute__((noreturn, format(printf, 1, 2)));
+void warmc_invalid(const char *fmt, ...)
+  __attribute__((noreturn, format(printf, 1, 2)));
+void *xmalloc(size_t n);
+void *xcalloc(size_t n, size_t sz);
+void *xrealloc(void *p, size_t n);
+void xfree(void *p);
+void xcache_release(void);
+char *xstrndup(const char *s, size_t n);
+
+typedef int32_t HeapType;
+#define HT_NOFUNC   (-0x0d)
+#define HT_NOEXTERN (-0x0e)
+#define HT_NONE     (-0x0f)
+#define HT_FUNC     (-0x10)
+#define HT_EXTERN   (-0x11)
+#define HT_ANY      (-0x12)
+#define HT_EQ       (-0x13)
+#define HT_I31      (-0x14)
+#define HT_STRUCT   (-0x15)
+#define HT_ARRAY    (-0x16)
+#define HT_EXN      (-0x17)
+
+#define HT_NOEXN    (-0x0c)
+
+#define HT_BYTE_LO 0x69
+#define HT_BYTE_HI 0x74
+#define HT_OF_BYTE(b) ((HeapType)(b) - 0x80)
+
+typedef uint32_t ValType;
+
+#define VT_I32   0x7fu
+#define VT_I64   0x7eu
+#define VT_F32   0x7du
+#define VT_F64   0x7cu
+#define VT_V128  0x7bu
+
+#define VT_REF   0x63u
+
+#define VT_BOT   0x00u
+
+#define VT_KIND_MASK  0xffu
+#define VT_HEAP_SHIFT 8
+#define VT_HEAP_BITS  22
+#define VT_HEAP_MAX   ((1u << VT_HEAP_BITS) - 1u)
+#define VT_CONCRETE   (1u << 30)
+#define VT_NULLABLE   (1u << 31)
+
+#define VT_REF_ABS(nul, ht)                                                    \
+  ((ValType)(VT_REF | ((uint32_t)(-(ht)) << VT_HEAP_SHIFT) |                   \
+             ((nul) ? VT_NULLABLE : 0u)))
+#define VT_REF_IDX(nul, idx)                                                   \
+  ((ValType)(VT_REF | ((uint32_t)(idx) << VT_HEAP_SHIFT) | VT_CONCRETE |       \
+             ((nul) ? VT_NULLABLE : 0u)))
+
+#define VT_FUNCREF   VT_REF_ABS(true, HT_FUNC)
+#define VT_EXTERNREF VT_REF_ABS(true, HT_EXTERN)
+
+static inline bool vt_is_ref(ValType t) { return (t & VT_KIND_MASK) == VT_REF; }
+static inline bool vt_nullable(ValType t) { return (t & VT_NULLABLE) != 0; }
+static inline bool vt_concrete(ValType t) { return (t & VT_CONCRETE) != 0; }
+static inline uint32_t vt_type_index(ValType t) {
+  return (t >> VT_HEAP_SHIFT) & VT_HEAP_MAX;
+}
+static inline HeapType vt_heap(ValType t) {
+  uint32_t raw = vt_type_index(t);
+  return vt_concrete(t) ? (HeapType)raw : -(HeapType)raw;
+}
+static inline ValType vt_ref(bool nullable, HeapType ht) {
+  return ht >= 0 ? VT_REF_IDX(nullable, (uint32_t)ht) : VT_REF_ABS(nullable, ht);
+}
+
+static inline ValType vt_as_non_null(ValType t) { return t & ~VT_NULLABLE; }
+static inline ValType vt_as_nullable(ValType t) { return t | VT_NULLABLE; }
+
+#define VT_I8   0x78u
+#define VT_I16  0x77u
+static inline bool vt_is_packed(ValType t) { return t == VT_I8 || t == VT_I16; }
+
+static inline bool vt_is_float(ValType t) { return t == VT_F32 || t == VT_F64; }
+static inline bool vt_is_64(ValType t) { return t == VT_I64 || t == VT_F64 || vt_is_ref(t); }
+
+static inline bool vt_is_vec_reg(ValType t) { return vt_is_float(t) || t == VT_V128; }
+
+static inline uint32_t vt_width(ValType t) {
+  if (t == VT_V128) return 16u;
+  if (t == VT_I8) return 1u;
+  if (t == VT_I16) return 2u;
+  return vt_is_64(t) ? 8u : 4u;
+}
+
+static inline ValType vt_unpacked(ValType t) {
+  return vt_is_packed(t) ? VT_I32 : t;
+}
+
+static inline bool vt_defaultable(ValType t) {
+  return !vt_is_ref(t) || vt_nullable(t);
+}
+
+static inline uint8_t vt_abi_code(ValType t) {
+  return vt_is_ref(t) ? 0x70u : (uint8_t)(t & VT_KIND_MASK);
+}
+const char *vt_name(ValType t);
+
+typedef struct {
+  ValType type;
+  bool mutable_;
+
+  uint32_t offset;
+} FieldType;
+
+typedef enum { CT_FUNC = 0, CT_STRUCT = 1, CT_ARRAY = 2 } CompKind;
+
+enum {
+  RTK_ANY = 0, RTK_EQ, RTK_I31, RTK_STRUCT, RTK_ARRAY,
+  RTK_NONE, RTK_FUNC, RTK_NOFUNC, RTK_EXTERN, RTK_NOEXTERN,
+  RTK_EXN, RTK_NOEXN,
+  RTK_CONCRETE_ANY, RTK_CONCRETE_FUNC
+};
+#define RTK_NULLABLE 0x80u
+
+#define GC_HDR_BYTES 8u
+#define GC_HDR_WIDE  16u
+
+#define GC_HDR_FOR(align) ((align) >= 16u ? GC_HDR_WIDE : GC_HDR_BYTES)
+
+#define GC_HDR_WORD_OFF 0u
+
+#define GC_TYPE_SHIFT   0
+
+#define EXN_VALS_OFF 32u
+
+#define STRUCT_MAX_BYTES (1u << 28)
+
+typedef struct {
+  uint8_t kind;
+
+  ValType *params;
+  uint32_t nparams;
+  ValType *results;
+  uint32_t nresults;
+
+  FieldType *fields;
+  uint32_t nfields;
+
+  uint32_t body_size;
+
+  uint32_t hdr_size;
+  bool final_;
+  bool has_super;
+  uint32_t super;
+  uint32_t rec_first, rec_n;
+  uint32_t depth;
+  uint64_t id;
+
+  uint64_t *display;
+} CompType;
+
+typedef enum {
+  EK_FUNC = 0, EK_TABLE = 1, EK_MEM = 2, EK_GLOBAL = 3, EK_TAG = 4
+} ExternKind;
+
+typedef struct {
+  char *module;
+  char *name;
+  uint32_t module_len, name_len;
+  ExternKind kind;
+  uint32_t type_index;
+  bool mutable_;
+  uint64_t min, max;
+  bool has_max;
+} Import;
+
+typedef struct {
+  char *name;
+  uint32_t name_len;
+  ExternKind kind;
+  uint32_t index;
+} Export;
+
+typedef struct {
+  uint32_t type_index;
+
+  const uint8_t *body;
+  const uint8_t *body_end;
+  uint32_t nlocals;
+  ValType *local_types;
+  uint32_t ntotal_locals;
+  bool imported;
+  uint32_t import_index;
+  char *sym;
+} Func;
+
+typedef enum {
+#define CONST_OP(name, extra) IOP_##name,
+#include "../rt/const_ops.inc"
+  IOP_COUNT
+} InitOp;
+
+typedef struct {
+  uint8_t op;
+  uint64_t lo, hi;
+} InitInsn;
+
+typedef struct {
+  InitInsn *ins;
+  uint32_t n;
+} InitExpr;
+
+typedef struct {
+  ValType elem_type;
+  uint64_t min, max;
+  bool has_max;
+  bool imported;
+  bool index64;
+
+  bool has_init;
+  InitExpr init;
+} Table;
+
+typedef struct {
+  uint64_t min, max;
+  bool has_max;
+  bool imported;
+  bool index64;
+} Memory;
+
+typedef struct {
+  ValType type;
+  bool mutable_;
+  InitExpr init;
+  bool imported;
+} Global;
+
+typedef struct {
+  uint32_t type_index;
+  bool imported;
+} Tag;
+
+typedef enum { SEG_ACTIVE, SEG_PASSIVE, SEG_DECLARATIVE } SegMode;
+
+typedef struct {
+  SegMode mode;
+  uint32_t table_index;
+  InitExpr offset;
+  ValType elem_type;
+  uint32_t n;
+  InitExpr *items;
+} ElemSeg;
+
+typedef struct {
+  SegMode mode;
+  uint32_t mem_index;
+  InitExpr offset;
+  const uint8_t *data;
+  uint32_t len;
+} DataSeg;
+
+typedef struct {
+  const uint8_t *bin;
+  size_t bin_len;
+
+  CompType *types; uint32_t ntypes;
+  uint64_t total_locals;
+  uint32_t max_const_depth;
+  Import *imports;  uint32_t nimports;
+  Func *funcs;      uint32_t nfuncs;
+  uint32_t nimported_funcs;
+  Table *tables;    uint32_t ntables;
+  Memory *memories; uint32_t nmemories;
+  Global *globals;  uint32_t nglobals;
+  uint32_t nimported_globals;
+  Tag *tags;        uint32_t ntags;
+  uint32_t nimported_tags;
+  Export *exports;  uint32_t nexports;
+  ElemSeg *elems;   uint32_t nelems;
+  DataSeg *datas;   uint32_t ndatas;
+  bool has_start; uint32_t start_func;
+  bool has_datacount; uint32_t datacount;
+
+  bool *reached;
+
+  bool *type_live;
+
+  bool *type_entry;
+
+  bool *glob_read;
+
+  bool *data_read;
+
+  uint32_t *func_map;
+
+  uint32_t *type_slot;
+} Module;
+
+static inline uint32_t gctype_slot(const Module *m, uint32_t ti) {
+  return m->type_slot ? m->type_slot[ti] : ti;
+}
+
+static inline bool vt_ref_collectable(const Module *m, ValType t) {
+  if (!vt_is_ref(t)) return false;
+  if (vt_concrete(t)) {
+    uint32_t i = vt_type_index(t);
+    return !(i < m->ntypes && m->types[i].kind == CT_FUNC);
+  }
+  switch (vt_heap(t)) {
+    case HT_FUNC: case HT_NOFUNC: case HT_NOEXTERN: case HT_NONE:
+    case HT_NOEXN: case HT_I31:
+      return false;
+    default:
+      return true;
+  }
+}
+
+Module *wasm_parse(const uint8_t *bin, size_t len);
+void wasm_check_utf8(const uint8_t *p, uint32_t n);
+void wasm_validate(Module *m);
+void module_free(Module *m);
+
+bool vt_subtype(const Module *m, ValType a, ValType b);
+
+bool heap_subtype(const Module *m, HeapType a, HeapType b);
+
+ValType vt_join(const Module *m, ValType a, ValType b);
+
+#define VMCTX_MEM_BASE      0
+#define VMCTX_MEM_SIZE      8
+#define VMCTX_MEM_PAGES     16
+#define VMCTX_MEM_MAX_PAGES 24
+#define VMCTX_TABLE_BASE    32
+#define VMCTX_TABLE_LEN     40
+
+#define VMCTX_GC_BADMASK    64
+#define VMCTX_GC_LAB        72
+#define VMCTX_GC_HDR        80
+#define VMCTX_GLOBALS       96
+
+#define GLOBAL_SLOT_SIZE    16
+
+#define ARG_STACK_SLOT 16u
+
+#define RESULT_SLOT_SIZE 16u
+
+#define INVOKE_OUTGOING_BYTES 512u
+
+#define INVOKE_MAX_RESULTS 16u
+
+#define MAX_CONST_DEPTH 1024u
+
+#define MAX_ARRAY_NEW_FIXED 10000u
+
+#define WASM_PAGE_SIZE 65536
+
+#define WASM_GUARD_OFFSET_MAX (32ull << 20)
+
+#define TABLE_ENTRY_SIZE 8
+#define FUNCREF_SIZE     32
+#define FUNCREF_CODE     0
+#define FUNCREF_INSTANCE 8
+#define FUNCREF_TYPE     16
+#define FUNCREF_RTT      24
+
+#define VMCTX_IMPORTS(nglobals) (VMCTX_GLOBALS + GLOBAL_SLOT_SIZE * (nglobals))
+
+#define VMCTX_TABLES(nglobals, nimpfuncs) \
+  (VMCTX_IMPORTS(nglobals) + 16u * (nimpfuncs))
+#define TABLE_SLOT_SIZE 16
+#define TABLE_SLOT_ENTRIES 0
+#define TABLE_SLOT_LEN 8
+
+#define VMCTX_MEMS(nglobals, nimpfuncs, ntables) \
+  (VMCTX_TABLES(nglobals, nimpfuncs) + TABLE_SLOT_SIZE * (ntables))
+#define MEM_SLOT_SIZE 16
+#define MEM_SLOT_BASE 0
+#define MEM_SLOT_LEN 8
+
+#define VMCTX_FUNCREFS(nglobals, nimpfuncs, ntables, nmemories) \
+  (VMCTX_MEMS(nglobals, nimpfuncs, ntables) + MEM_SLOT_SIZE * (nmemories))
+
+#define VTF_REF        1u
+#define VTF_NULL       2u
+#define VTF_BOTTOM     4u
+#define VTF_TOP        8u
+#define VTF_HIER_SHIFT 4
+
+enum {
+  TRAP_UNREACHABLE = 1,
+  TRAP_MEM_OOB = 2,
+  TRAP_DIV_ZERO = 3,
+  TRAP_DIV_OVERFLOW = 4,
+  TRAP_INDIRECT_OOB = 5,
+  TRAP_INDIRECT_NULL = 6,
+  TRAP_INDIRECT_TYPE = 7,
+  TRAP_BAD_CONVERSION = 8,
+  TRAP_UNINIT_ELEM = 9,
+  TRAP_TABLE_OOB = 10,
+  TRAP_STACK_OVERFLOW = 11,
+  TRAP_NULL_REF = 12,
+
+  TRAP_UNCAUGHT_EXN = 13,
+  TRAP_HEAP_OOM = 14,
+  TRAP_ARRAY_OOB = 15,
+  TRAP_CAST = 16,
+  TRAP_LINK = 100
+};
+
+#define TRAP_CODE_COUNT 17
+
+typedef struct {
+  uint32_t pc;
+  uint32_t first;
+  uint32_t n;
+} UwSite;
+
+typedef struct {
+  uint32_t kind;
+  uint32_t tag;
+  uint32_t pad;
+  uint32_t pad_;
+} UwClause;
+
+typedef struct { uint32_t pc, first, n; } GcSite;
+
+#define GCROOT_REG(i)     ((uint32_t)(i) << 1)
+#define GCROOT_SLOT(off)  ((((uint32_t)(off)) << 1) | 1u)
+#define GCROOT_IS_SLOT(v) (((v) & 1u) != 0)
+#define GCROOT_VAL(v)     ((v) >> 1)
+
+#define UW_HAS_LR      1u
+#define UW_GPR_SHIFT   8
+#define UW_FPR_SHIFT  20
+
+typedef struct {
+  uint32_t func_index;
+  uint32_t code_len;
+  uint32_t frame, saved_bytes, exn_slot, fpsave_off;
+  uint32_t saved;
+  UwSite *sites; uint32_t nsites;
+  UwClause *clauses; uint32_t nclauses;
+  GcSite *gcsites; uint32_t ngcsites;
+  uint32_t *gcroots; uint32_t ngcroots;
+} FuncUnwind;
+
+void codegen_note_unwind(const FuncUnwind *u);
+
+void codegen_reset_unwind(void);
+
+typedef enum {
+  REL_CALL26,
+  REL_ADR_PAGE21,
+  REL_ADD_LO12,
+  REL_LDST_LO12,
+  REL_ABS64
+} RelKind;
+
+typedef struct {
+  RelKind kind;
+  int section;
+  uint64_t offset;
+  uint32_t sym;
+  int64_t addend;
+} Reloc;
+
+typedef enum { SYM_LOCAL_FUNC, SYM_GLOBAL_FUNC, SYM_UNDEF_FUNC, SYM_LOCAL_DATA, SYM_GLOBAL_DATA, SYM_UNDEF_DATA } SymKind;
+
+typedef struct {
+  char *name;
+  SymKind kind;
+  int section;
+  uint64_t value;
+  uint64_t size;
+} Sym;
+
+typedef struct {
+  Sym *syms; uint32_t nsyms, cap_syms;
+
+  uint32_t *sym_ix; uint32_t sym_ix_cap;
+
+  bool frozen;
+  Buf text;
+  Buf rodata;
+  Buf data;
+  Reloc *relocs; uint32_t nrelocs, cap_relocs;
+} ObjBuilder;
+
+uint32_t obj_add_sym(ObjBuilder *o, const char *name, SymKind kind, int section, uint64_t value);
+uint32_t obj_find_sym(ObjBuilder *o, const char *name);
+
+void warmc_link_exec(bool macho, const char *out, const char *objpath,
+                     const char *wasi, const char *rt, const char *entry,
+                     bool strip);
+uint32_t obj_intern_sym(ObjBuilder *o, const char *name, SymKind kind, int section, uint64_t value);
+void obj_add_reloc(ObjBuilder *o, RelKind kind, int section, uint64_t off, uint32_t sym, int64_t addend);
+
+void codegen_prepare_module(Module *m, ObjBuilder *o);
+
+void codegen_set_symbol_prefix(const char *prefix);
+
+void codegen_set_load_barrier(bool on);
+extern bool warmc_load_barrier;
+
+void codegen_rename_funcs(Module *m, const char *prefix);
+
+struct LinkPlan;
+void codegen_emit_component(const struct LinkPlan *p, ObjBuilder *o);
+
+uint64_t wasm_type_hash(const CompType *t);
+void codegen_emit_module_data(Module *m, ObjBuilder *o);
+uint32_t codegen_out_bytes(Module *m);
+extern bool g_guard_pages;
+
+extern bool g_det_profile;
+
+extern bool g_no_export_names;
+
+extern bool g_profile;
+
+void write_elf64(ObjBuilder *o, const char *path);
+void write_macho64(ObjBuilder *o, const char *path);
+
+#endif

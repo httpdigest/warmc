@@ -1,0 +1,16 @@
+core module 0: 2 funcs, 3 exports
+core instance 0: instantiate module 0, 0 args
+type 0: list
+type 1: list
+type 2: tuple
+type 3: tuple
+type 4: prim
+type 5: prim
+type 6: prim
+type 7: prim
+type 8: prim
+type 9: prim
+type 10: func
+alias 0: core export 0 "id" (core func)
+canon 0: lift, 0 options
+export 0: "id" (func 0)

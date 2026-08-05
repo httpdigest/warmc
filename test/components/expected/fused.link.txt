@@ -1,0 +1,50 @@
+module 0: cm0, 6 funcs, 0 imports, 7 exports
+module 1: cm1, 1 funcs, 0 imports, 2 exports
+module 2: cm2, 6 funcs, 5 imports, 2 exports
+module 3: ad4, 8 funcs, 6 imports, 1 exports
+module 4: ad5, 2 funcs, 1 imports, 1 exports
+module 5: ad6, 2 funcs, 1 imports, 1 exports
+module 6: ad7, 4 funcs, 5 imports, 1 exports
+instance 0: module 0, 0 imports
+instance 1: module 1, 0 imports
+instance 2: module 3, 6 imports
+  bind "caller" "mem" <- instance 1 "mem" [memory]
+  bind "callee" "mem" <- instance 0 "mem" [memory]
+  bind "caller" "realloc" <- instance 1 "realloc" [func]
+  bind "callee" "realloc" <- instance 0 "realloc" [func]
+  bind "callee" "fn" <- instance 0 "sum" [func]
+  bind "callee" "post" <- instance 0 "dropsum" [func]
+instance 3: module 4, 1 imports
+  bind "callee" "fn" <- instance 0 "seven" [func]
+instance 4: module 5, 1 imports
+  bind "callee" "fn" <- instance 0 "count" [func]
+instance 5: module 6, 5 imports
+  bind "caller" "mem" <- instance 1 "mem" [memory]
+  bind "callee" "mem" <- instance 0 "mem" [memory]
+  bind "caller" "realloc" <- instance 1 "realloc" [func]
+  bind "callee" "realloc" <- instance 0 "realloc" [func]
+  bind "callee" "fn" <- instance 0 "wide" [func]
+instance 6: module 2, 5 imports
+  bind "" "sum" <- instance 2 "adapt" [func]
+  bind "" "flag" <- instance 3 "adapt" [func]
+  bind "" "posts" <- instance 4 "adapt" [func]
+  bind "" "wide" <- instance 5 "adapt" [func]
+  bind "" "mem" <- instance 1 "mem" [memory]
+canon 0: lift instance 0 "sum" [func], core (i32 i32) -> (i32), memory=yes
+canon 1: lift instance 0 "seven" [func], core () -> (i32), memory=no
+canon 2: lift instance 0 "count" [func], core () -> (i32), memory=no
+canon 3: lift instance 0 "wide" [func], core (i32) -> (i32), memory=yes
+canon 4: lower func 0, core (i32 i32) -> (i32), memory=yes
+canon 5: lower func 1, core () -> (i32), memory=no
+canon 6: lower func 2, core () -> (i32), memory=no
+canon 7: lower func 3, core (i32) -> (i32), memory=yes
+canon 8: lift instance 6 "run" [func], core () -> (i32), memory=no
+canon 9: lift instance 6 "wide" [func], core () -> (i32), memory=no
+func 0: canon 0
+func 1: canon 1
+func 2: canon 2
+func 3: canon 3
+func 4: canon 8
+func 5: canon 9
+export "run": func 4
+export "wide": func 5

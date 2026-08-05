@@ -1,0 +1,8 @@
+package dir:root@2.0.0;
+
+// A directory package: every *.wit here is one package, and deps/ holds the
+// dependencies.  This half declares the types.
+interface model {
+  record entry { key: string, value: u64 }
+  variant outcome { ok(entry), failed(string) }
+}

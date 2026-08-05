@@ -1,0 +1,23 @@
+module 0: cm0, 6 funcs, 1 imports, 6 exports
+module 1: cm1, 1 funcs, 0 imports, 2 exports
+module 2: cm2, 1 funcs, 2 imports, 0 exports
+instance 0: module 1, 0 imports
+instance 1: module 0, 1 imports
+  bind "example:calc/log@0.1.0" "write" <- instance 0 "0" [func]
+instance 2: module 2, 2 imports
+  bind "actual" "0" <- canon 0 [func]
+  bind "shim" "$imports" <- instance 0 "$imports" [table]
+canon 0: lower func 0, core (i32 i32) -> (), memory=yes
+canon 1: lift instance 1 "example:calc/ops@0.1.0#add" [func], core (i32 i32) -> (i32), memory=no
+canon 2: lift instance 1 "example:calc/ops@0.1.0#area" [func], core (i32 i32 i32) -> (i32), memory=no
+canon 3: lift instance 1 "example:calc/ops@0.1.0#name" [func], core () -> (i32), memory=yes
+func 0: import "write"
+func 1: canon 1
+func 2: canon 2
+func 3: canon 3
+export "example:calc/ops@0.1.0#add": func 1
+export "example:calc/ops@0.1.0#area": func 2
+export "example:calc/ops@0.1.0#name": func 3
+blocked: import "example:calc/log@0.1.0" is an instance no host here provides
+blocked: instance export "write" is not a function this plan has
+blocked: a lowered function the component imports has nothing to lift

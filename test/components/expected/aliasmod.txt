@@ -1,0 +1,11 @@
+core instance 0: instantiate module 0, 0 args
+type 0: func
+alias 0: export 0 "mod" (core module)
+alias 1: core export 0 "v" (core func)
+instance 0: instantiate component 0, 0 args
+canon 0: lift, 0 options
+export 0: "run" (func 0)
+component 0:
+  core module 0: 1 funcs, 1 exports
+  core module 1: 1 funcs, 1 exports
+  export 0: "mod" (core module 1)

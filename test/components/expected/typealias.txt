@@ -1,0 +1,6 @@
+type 0: record
+type 1: list
+type 2: list
+type 3: record
+import 0: "given" kind 3
+export 0: "rec" (type 0)

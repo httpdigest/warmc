@@ -1,0 +1,10 @@
+package vendor:store@0.5.0;
+
+// The name of this directory is arbitrary; what the package *is* comes from
+// its own declaration.
+interface kv {
+  resource handle {
+    constructor();
+    get: func(k: string) -> option<string>;
+  }
+}

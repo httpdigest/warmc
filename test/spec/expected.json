@@ -1,0 +1,1801 @@
+{
+ "address.wast": {
+  "fail": 0,
+  "pass": 4,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 260
+ },
+ "address0.wast": {
+  "fail": 0,
+  "pass": 1,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 93
+ },
+ "address1.wast": {
+  "fail": 0,
+  "pass": 1,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 128
+ },
+ "address64.wast": {
+  "fail": 0,
+  "pass": 4,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 243
+ },
+ "align.wast": {
+  "fail": 0,
+  "pass": 71,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 74
+ },
+ "align0.wast": {
+  "fail": 0,
+  "pass": 1,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 6
+ },
+ "align64.wast": {
+  "fail": 0,
+  "pass": 63,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 75
+ },
+ "annotations.wast": {
+  "fail": 0,
+  "pass": 4,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 5
+ },
+ "array.wast": {
+  "fail": 0,
+  "pass": 13,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 49
+ },
+ "array_copy.wast": {
+  "fail": 0,
+  "pass": 5,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 32
+ },
+ "array_fill.wast": {
+  "fail": 0,
+  "pass": 4,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 28
+ },
+ "array_init_data.wast": {
+  "fail": 0,
+  "pass": 4,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 45
+ },
+ "array_init_elem.wast": {
+  "fail": 0,
+  "pass": 6,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 34
+ },
+ "array_new_data.wast": {
+  "fail": 0,
+  "pass": 5,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 29
+ },
+ "array_new_elem.wast": {
+  "fail": 0,
+  "pass": 5,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 25
+ },
+ "binary-gc.wast": {
+  "fail": 0,
+  "pass": 1,
+  "run": "nothing to run",
+  "run_fail": 0,
+  "run_pass": 0
+ },
+ "binary-leb128.wast": {
+  "fail": 0,
+  "pass": 91,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 34
+ },
+ "binary.wast": {
+  "fail": 0,
+  "pass": 127,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 21
+ },
+ "binary0.wast": {
+  "fail": 0,
+  "pass": 7,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 6
+ },
+ "binary_leb128_64.wast": {
+  "fail": 0,
+  "pass": 2,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 2
+ },
+ "block.wast": {
+  "fail": 0,
+  "pass": 156,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 54
+ },
+ "br.wast": {
+  "fail": 0,
+  "pass": 21,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 78
+ },
+ "br_if.wast": {
+  "fail": 0,
+  "pass": 31,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 90
+ },
+ "br_on_cast.wast": {
+  "fail": 0,
+  "pass": 9,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 32
+ },
+ "br_on_cast_fail.wast": {
+  "fail": 0,
+  "pass": 9,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 32
+ },
+ "br_on_non_null.wast": {
+  "fail": 0,
+  "pass": 4,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 12
+ },
+ "br_on_null.wast": {
+  "fail": 0,
+  "pass": 4,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 10
+ },
+ "br_table.wast": {
+  "fail": 0,
+  "pass": 25,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 163
+ },
+ "bulk.wast": {
+  "fail": 0,
+  "pass": 13,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 118
+ },
+ "bulk64.wast": {
+  "fail": 0,
+  "pass": 5,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 71
+ },
+ "call.wast": {
+  "fail": 0,
+  "pass": 19,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 74
+ },
+ "call_indirect.wast": {
+  "fail": 0,
+  "pass": 27,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 138
+ },
+ "call_indirect64.wast": {
+  "fail": 0,
+  "pass": 1,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 3
+ },
+ "call_ref.wast": {
+  "fail": 0,
+  "pass": 8,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 32
+ },
+ "comments.wast": {
+  "fail": 0,
+  "pass": 4,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 5
+ },
+ "const.wast": {
+  "fail": 0,
+  "pass": 402,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 703
+ },
+ "conversions.wast": {
+  "fail": 0,
+  "pass": 26,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 595
+ },
+ "custom.wast": {
+  "fail": 0,
+  "pass": 11,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 4
+ },
+ "data.wast": {
+  "fail": 0,
+  "pass": 51,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 46
+ },
+ "data0.wast": {
+  "fail": 0,
+  "pass": 7,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 8
+ },
+ "data1.wast": {
+  "fail": 0,
+  "pass": 0,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 15
+ },
+ "data_drop0.wast": {
+  "fail": 0,
+  "pass": 1,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 12
+ },
+ "elem.wast": {
+  "fail": 0,
+  "pass": 102,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 123
+ },
+ "endianness.wast": {
+  "fail": 0,
+  "pass": 1,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 70
+ },
+ "endianness64.wast": {
+  "fail": 0,
+  "pass": 1,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 70
+ },
+ "exports.wast": {
+  "fail": 0,
+  "pass": 88,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 66
+ },
+ "exports0.wast": {
+  "fail": 0,
+  "pass": 8,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 9
+ },
+ "extern.wast": {
+  "fail": 0,
+  "pass": 1,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 19
+ },
+ "f32.wast": {
+  "fail": 0,
+  "pass": 12,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 2502
+ },
+ "f32_bitwise.wast": {
+  "fail": 0,
+  "pass": 4,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 362
+ },
+ "f32_cmp.wast": {
+  "fail": 0,
+  "pass": 7,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 2402
+ },
+ "f64.wast": {
+  "fail": 0,
+  "pass": 12,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 2502
+ },
+ "f64_bitwise.wast": {
+  "fail": 0,
+  "pass": 4,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 362
+ },
+ "f64_cmp.wast": {
+  "fail": 0,
+  "pass": 7,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 2402
+ },
+ "fac.wast": {
+  "fail": 0,
+  "pass": 1,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 9
+ },
+ "float_exprs.wast": {
+  "fail": 0,
+  "pass": 98,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 928
+ },
+ "float_exprs0.wast": {
+  "fail": 0,
+  "pass": 1,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 15
+ },
+ "float_exprs1.wast": {
+  "fail": 0,
+  "pass": 1,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 4
+ },
+ "float_literals.wast": {
+  "fail": 0,
+  "pass": 2,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 102
+ },
+ "float_memory.wast": {
+  "fail": 0,
+  "pass": 6,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 91
+ },
+ "float_memory0.wast": {
+  "fail": 0,
+  "pass": 2,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 31
+ },
+ "float_memory64.wast": {
+  "fail": 0,
+  "pass": 6,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 91
+ },
+ "float_misc.wast": {
+  "fail": 0,
+  "pass": 1,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 472
+ },
+ "forward.wast": {
+  "fail": 0,
+  "pass": 1,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 6
+ },
+ "func.wast": {
+  "fail": 0,
+  "pass": 56,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 100
+ },
+ "func_ptrs.wast": {
+  "fail": 0,
+  "pass": 10,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 30
+ },
+ "global.wast": {
+  "fail": 0,
+  "pass": 53,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 77
+ },
+ "i16x8_relaxed_q15mulr_s.wast": {
+  "fail": 0,
+  "pass": 1,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 4
+ },
+ "i31.wast": {
+  "fail": 0,
+  "pass": 7,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 73
+ },
+ "i32.wast": {
+  "fail": 0,
+  "pass": 84,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 376
+ },
+ "i32x4_relaxed_trunc.wast": {
+  "fail": 0,
+  "pass": 1,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 2
+ },
+ "i64.wast": {
+  "fail": 0,
+  "pass": 30,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 386
+ },
+ "i8x16_relaxed_swizzle.wast": {
+  "fail": 0,
+  "pass": 1,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 7
+ },
+ "id.wast": {
+  "fail": 0,
+  "pass": 1,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 2
+ },
+ "if.wast": {
+  "fail": 0,
+  "pass": 93,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 126
+ },
+ "imports.wast": {
+  "fail": 0,
+  "pass": 69,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 196
+ },
+ "imports0.wast": {
+  "fail": 0,
+  "pass": 1,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 8
+ },
+ "imports1.wast": {
+  "fail": 0,
+  "pass": 1,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 6
+ },
+ "imports2.wast": {
+  "fail": 0,
+  "pass": 5,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 20
+ },
+ "imports3.wast": {
+  "fail": 0,
+  "pass": 1,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 10
+ },
+ "imports4.wast": {
+  "fail": 0,
+  "pass": 5,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 14
+ },
+ "inline-module.wast": {
+  "fail": 0,
+  "pass": 1,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 2
+ },
+ "instance.wast": {
+  "fail": 0,
+  "pass": 3,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 19
+ },
+ "int_exprs.wast": {
+  "fail": 0,
+  "pass": 19,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 109
+ },
+ "int_literals.wast": {
+  "fail": 0,
+  "pass": 1,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 32
+ },
+ "labels.wast": {
+  "fail": 0,
+  "pass": 4,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 27
+ },
+ "left-to-right.wast": {
+  "fail": 0,
+  "pass": 1,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 97
+ },
+ "linking.wast": {
+  "fail": 0,
+  "pass": 21,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 155
+ },
+ "linking0.wast": {
+  "fail": 0,
+  "pass": 1,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 6
+ },
+ "linking1.wast": {
+  "fail": 0,
+  "pass": 4,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 14
+ },
+ "linking2.wast": {
+  "fail": 0,
+  "pass": 2,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 11
+ },
+ "linking3.wast": {
+  "fail": 0,
+  "pass": 2,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 13
+ },
+ "load.wast": {
+  "fail": 0,
+  "pass": 47,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 39
+ },
+ "load0.wast": {
+  "fail": 0,
+  "pass": 1,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 4
+ },
+ "load1.wast": {
+  "fail": 0,
+  "pass": 2,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 18
+ },
+ "load2.wast": {
+  "fail": 0,
+  "pass": 1,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 39
+ },
+ "load64.wast": {
+  "fail": 0,
+  "pass": 47,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 39
+ },
+ "local_get.wast": {
+  "fail": 0,
+  "pass": 17,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 21
+ },
+ "local_init.wast": {
+  "fail": 0,
+  "pass": 6,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 7
+ },
+ "local_set.wast": {
+  "fail": 0,
+  "pass": 34,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 21
+ },
+ "local_tee.wast": {
+  "fail": 0,
+  "pass": 43,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 57
+ },
+ "loop.wast": {
+  "fail": 0,
+  "pass": 28,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 80
+ },
+ "memory-multi.wast": {
+  "fail": 0,
+  "pass": 2,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 7
+ },
+ "memory.wast": {
+  "fail": 0,
+  "pass": 33,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 65
+ },
+ "memory64-imports.wast": {
+  "fail": 0,
+  "pass": 40,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 71
+ },
+ "memory64.wast": {
+  "fail": 0,
+  "pass": 23,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 55
+ },
+ "memory_copy.wast": {
+  "fail": 0,
+  "pass": 97,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 4387
+ },
+ "memory_copy0.wast": {
+  "fail": 0,
+  "pass": 1,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 30
+ },
+ "memory_copy1.wast": {
+  "fail": 0,
+  "pass": 1,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 15
+ },
+ "memory_copy64.wast": {
+  "fail": 0,
+  "pass": 97,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 4387
+ },
+ "memory_fill.wast": {
+  "fail": 0,
+  "pass": 75,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 37
+ },
+ "memory_fill0.wast": {
+  "fail": 0,
+  "pass": 1,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 17
+ },
+ "memory_fill64.wast": {
+  "fail": 0,
+  "pass": 75,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 37
+ },
+ "memory_grow.wast": {
+  "fail": 0,
+  "pass": 3,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 51
+ },
+ "memory_grow64.wast": {
+  "fail": 0,
+  "pass": 4,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 50
+ },
+ "memory_init.wast": {
+  "fail": 0,
+  "pass": 96,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 184
+ },
+ "memory_init0.wast": {
+  "fail": 0,
+  "pass": 1,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 14
+ },
+ "memory_init64.wast": {
+  "fail": 0,
+  "pass": 96,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 184
+ },
+ "memory_redundancy.wast": {
+  "fail": 0,
+  "pass": 1,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 9
+ },
+ "memory_redundancy64.wast": {
+  "fail": 0,
+  "pass": 1,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 9
+ },
+ "memory_size.wast": {
+  "fail": 0,
+  "pass": 6,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 41
+ },
+ "memory_size0.wast": {
+  "fail": 0,
+  "pass": 1,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 9
+ },
+ "memory_size1.wast": {
+  "fail": 0,
+  "pass": 1,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 16
+ },
+ "memory_size2.wast": {
+  "fail": 0,
+  "pass": 1,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 22
+ },
+ "memory_size3.wast": {
+  "fail": 0,
+  "pass": 2,
+  "run": "nothing to run",
+  "run_fail": 0,
+  "run_pass": 0
+ },
+ "memory_size_import.wast": {
+  "fail": 0,
+  "pass": 2,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 7
+ },
+ "memory_trap.wast": {
+  "fail": 0,
+  "pass": 2,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 183
+ },
+ "memory_trap0.wast": {
+  "fail": 0,
+  "pass": 1,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 15
+ },
+ "memory_trap1.wast": {
+  "fail": 0,
+  "pass": 1,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 169
+ },
+ "memory_trap64.wast": {
+  "fail": 0,
+  "pass": 2,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 173
+ },
+ "names.wast": {
+  "fail": 0,
+  "pass": 4,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 487
+ },
+ "nop.wast": {
+  "fail": 0,
+  "pass": 5,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 85
+ },
+ "obsolete-keywords.wast": {
+  "fail": 0,
+  "pass": 0,
+  "run": "nothing to run",
+  "run_fail": 0,
+  "run_pass": 0
+ },
+ "ref.wast": {
+  "fail": 0,
+  "pass": 13,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 2
+ },
+ "ref_as_non_null.wast": {
+  "fail": 0,
+  "pass": 3,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 7
+ },
+ "ref_cast.wast": {
+  "fail": 0,
+  "pass": 2,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 46
+ },
+ "ref_eq.wast": {
+  "fail": 0,
+  "pass": 7,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 84
+ },
+ "ref_func.wast": {
+  "fail": 0,
+  "pass": 6,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 14
+ },
+ "ref_is_null.wast": {
+  "fail": 0,
+  "pass": 4,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 21
+ },
+ "ref_null.wast": {
+  "fail": 0,
+  "pass": 2,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 35
+ },
+ "ref_test.wast": {
+  "fail": 0,
+  "pass": 2,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 72
+ },
+ "relaxed_dot_product.wast": {
+  "fail": 0,
+  "pass": 1,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 12
+ },
+ "relaxed_laneselect.wast": {
+  "fail": 0,
+  "pass": 1,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 13
+ },
+ "relaxed_madd_nmadd.wast": {
+  "fail": 0,
+  "pass": 2,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 20
+ },
+ "relaxed_min_max.wast": {
+  "fail": 0,
+  "pass": 1,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 26
+ },
+ "return.wast": {
+  "fail": 0,
+  "pass": 21,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 65
+ },
+ "return_call.wast": {
+  "fail": 0,
+  "pass": 15,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 38
+ },
+ "return_call_indirect.wast": {
+  "fail": 0,
+  "pass": 20,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 54
+ },
+ "return_call_ref.wast": {
+  "fail": 0,
+  "pass": 16,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 41
+ },
+ "select.wast": {
+  "fail": 0,
+  "pass": 33,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 128
+ },
+ "simd_address.wast": {
+  "fail": 0,
+  "pass": 3,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 46
+ },
+ "simd_align.wast": {
+  "fail": 0,
+  "pass": 58,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 55
+ },
+ "simd_bit_shift.wast": {
+  "fail": 0,
+  "pass": 26,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 214
+ },
+ "simd_bitwise.wast": {
+  "fail": 0,
+  "pass": 30,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 142
+ },
+ "simd_boolean.wast": {
+  "fail": 0,
+  "pass": 14,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 262
+ },
+ "simd_const.wast": {
+  "fail": 0,
+  "pass": 312,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 578
+ },
+ "simd_conversions.wast": {
+  "fail": 0,
+  "pass": 20,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 235
+ },
+ "simd_f32x4.wast": {
+  "fail": 0,
+  "pass": 10,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 775
+ },
+ "simd_f32x4_arith.wast": {
+  "fail": 0,
+  "pass": 19,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 1807
+ },
+ "simd_f32x4_cmp.wast": {
+  "fail": 0,
+  "pass": 20,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 2584
+ },
+ "simd_f32x4_pmin_pmax.wast": {
+  "fail": 0,
+  "pass": 7,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 3874
+ },
+ "simd_f32x4_rounding.wast": {
+  "fail": 0,
+  "pass": 9,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 178
+ },
+ "simd_f64x2.wast": {
+  "fail": 0,
+  "pass": 10,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 796
+ },
+ "simd_f64x2_arith.wast": {
+  "fail": 0,
+  "pass": 19,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 1810
+ },
+ "simd_f64x2_cmp.wast": {
+  "fail": 0,
+  "pass": 20,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 2662
+ },
+ "simd_f64x2_pmin_pmax.wast": {
+  "fail": 0,
+  "pass": 7,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 3874
+ },
+ "simd_f64x2_rounding.wast": {
+  "fail": 0,
+  "pass": 9,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 178
+ },
+ "simd_i16x8_arith.wast": {
+  "fail": 0,
+  "pass": 13,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 184
+ },
+ "simd_i16x8_arith2.wast": {
+  "fail": 0,
+  "pass": 19,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 154
+ },
+ "simd_i16x8_cmp.wast": {
+  "fail": 0,
+  "pass": 32,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 436
+ },
+ "simd_i16x8_extadd_pairwise_i8x16.wast": {
+  "fail": 0,
+  "pass": 5,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 18
+ },
+ "simd_i16x8_extmul_i8x16.wast": {
+  "fail": 0,
+  "pass": 13,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 106
+ },
+ "simd_i16x8_q15mulr_sat_s.wast": {
+  "fail": 0,
+  "pass": 4,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 28
+ },
+ "simd_i16x8_sat_arith.wast": {
+  "fail": 0,
+  "pass": 14,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 207
+ },
+ "simd_i32x4_arith.wast": {
+  "fail": 0,
+  "pass": 13,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 184
+ },
+ "simd_i32x4_arith2.wast": {
+  "fail": 0,
+  "pass": 16,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 124
+ },
+ "simd_i32x4_cmp.wast": {
+  "fail": 0,
+  "pass": 32,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 436
+ },
+ "simd_i32x4_dot_i16x8.wast": {
+  "fail": 0,
+  "pass": 4,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 30
+ },
+ "simd_i32x4_extadd_pairwise_i16x8.wast": {
+  "fail": 0,
+  "pass": 5,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 18
+ },
+ "simd_i32x4_extmul_i16x8.wast": {
+  "fail": 0,
+  "pass": 13,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 106
+ },
+ "simd_i32x4_trunc_sat_f32x4.wast": {
+  "fail": 0,
+  "pass": 5,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 104
+ },
+ "simd_i32x4_trunc_sat_f64x2.wast": {
+  "fail": 0,
+  "pass": 5,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 104
+ },
+ "simd_i64x2_arith.wast": {
+  "fail": 0,
+  "pass": 13,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 190
+ },
+ "simd_i64x2_arith2.wast": {
+  "fail": 0,
+  "pass": 4,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 24
+ },
+ "simd_i64x2_cmp.wast": {
+  "fail": 0,
+  "pass": 11,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 104
+ },
+ "simd_i64x2_extmul_i32x4.wast": {
+  "fail": 0,
+  "pass": 13,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 106
+ },
+ "simd_i8x16_arith.wast": {
+  "fail": 0,
+  "pass": 10,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 124
+ },
+ "simd_i8x16_arith2.wast": {
+  "fail": 0,
+  "pass": 21,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 187
+ },
+ "simd_i8x16_cmp.wast": {
+  "fail": 0,
+  "pass": 32,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 416
+ },
+ "simd_i8x16_sat_arith.wast": {
+  "fail": 0,
+  "pass": 14,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 191
+ },
+ "simd_int_to_int_extend.wast": {
+  "fail": 0,
+  "pass": 25,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 230
+ },
+ "simd_lane.wast": {
+  "fail": 0,
+  "pass": 95,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 287
+ },
+ "simd_linking.wast": {
+  "fail": 0,
+  "pass": 2,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 3
+ },
+ "simd_load.wast": {
+  "fail": 0,
+  "pass": 19,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 32
+ },
+ "simd_load16_lane.wast": {
+  "fail": 0,
+  "pass": 4,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 34
+ },
+ "simd_load32_lane.wast": {
+  "fail": 0,
+  "pass": 4,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 22
+ },
+ "simd_load64_lane.wast": {
+  "fail": 0,
+  "pass": 4,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 14
+ },
+ "simd_load8_lane.wast": {
+  "fail": 0,
+  "pass": 4,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 50
+ },
+ "simd_load_extend.wast": {
+  "fail": 0,
+  "pass": 14,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 87
+ },
+ "simd_load_splat.wast": {
+  "fail": 0,
+  "pass": 10,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 115
+ },
+ "simd_load_zero.wast": {
+  "fail": 0,
+  "pass": 6,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 30
+ },
+ "simd_memory-multi.wast": {
+  "fail": 0,
+  "pass": 1,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 2
+ },
+ "simd_select.wast": {
+  "fail": 0,
+  "pass": 1,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 8
+ },
+ "simd_splat.wast": {
+  "fail": 0,
+  "pass": 26,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 163
+ },
+ "simd_store.wast": {
+  "fail": 0,
+  "pass": 8,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 20
+ },
+ "simd_store16_lane.wast": {
+  "fail": 0,
+  "pass": 4,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 34
+ },
+ "simd_store32_lane.wast": {
+  "fail": 0,
+  "pass": 4,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 22
+ },
+ "simd_store64_lane.wast": {
+  "fail": 0,
+  "pass": 4,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 14
+ },
+ "simd_store8_lane.wast": {
+  "fail": 0,
+  "pass": 4,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 50
+ },
+ "skip-stack-guard-page.wast": {
+  "fail": 0,
+  "pass": 1,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 12
+ },
+ "stack.wast": {
+  "fail": 0,
+  "pass": 2,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 8
+ },
+ "start.wast": {
+  "fail": 0,
+  "pass": 8,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 17
+ },
+ "start0.wast": {
+  "fail": 0,
+  "pass": 1,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 10
+ },
+ "store.wast": {
+  "fail": 0,
+  "pass": 52,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 11
+ },
+ "store0.wast": {
+  "fail": 0,
+  "pass": 1,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 6
+ },
+ "store1.wast": {
+  "fail": 0,
+  "pass": 3,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 12
+ },
+ "store2.wast": {
+  "fail": 0,
+  "pass": 2,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 25
+ },
+ "struct.wast": {
+  "fail": 0,
+  "pass": 10,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 26
+ },
+ "switch.wast": {
+  "fail": 0,
+  "pass": 2,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 28
+ },
+ "table-sub.wast": {
+  "fail": 0,
+  "pass": 3,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 2
+ },
+ "table.wast": {
+  "fail": 0,
+  "pass": 33,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 23
+ },
+ "table64.wast": {
+  "fail": 0,
+  "pass": 13,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 12
+ },
+ "table_copy.wast": {
+  "fail": 0,
+  "pass": 52,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 1728
+ },
+ "table_copy64.wast": {
+  "fail": 0,
+  "pass": 52,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 1728
+ },
+ "table_copy_mixed.wast": {
+  "fail": 0,
+  "pass": 4,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 2
+ },
+ "table_fill.wast": {
+  "fail": 0,
+  "pass": 10,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 37
+ },
+ "table_fill64.wast": {
+  "fail": 0,
+  "pass": 10,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 72
+ },
+ "table_get.wast": {
+  "fail": 0,
+  "pass": 6,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 12
+ },
+ "table_get64.wast": {
+  "fail": 0,
+  "pass": 1,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 12
+ },
+ "table_grow.wast": {
+  "fail": 0,
+  "pass": 15,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 50
+ },
+ "table_grow64.wast": {
+  "fail": 0,
+  "pass": 1,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 23
+ },
+ "table_init.wast": {
+  "fail": 0,
+  "pass": 108,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 725
+ },
+ "table_init64.wast": {
+  "fail": 0,
+  "pass": 111,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 821
+ },
+ "table_set.wast": {
+  "fail": 0,
+  "pass": 8,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 20
+ },
+ "table_set64.wast": {
+  "fail": 0,
+  "pass": 1,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 20
+ },
+ "table_size.wast": {
+  "fail": 0,
+  "pass": 3,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 38
+ },
+ "table_size64.wast": {
+  "fail": 0,
+  "pass": 1,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 38
+ },
+ "tag.wast": {
+  "fail": 0,
+  "pass": 6,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 7
+ },
+ "throw.wast": {
+  "fail": 0,
+  "pass": 4,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 11
+ },
+ "throw_ref.wast": {
+  "fail": 0,
+  "pass": 3,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 14
+ },
+ "token.wast": {
+  "fail": 0,
+  "pass": 35,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 36
+ },
+ "traps.wast": {
+  "fail": 0,
+  "pass": 4,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 37
+ },
+ "traps0.wast": {
+  "fail": 0,
+  "pass": 1,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 16
+ },
+ "try_table.wast": {
+  "fail": 0,
+  "pass": 15,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 56
+ },
+ "type-canon.wast": {
+  "fail": 0,
+  "pass": 2,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 3
+ },
+ "type-equivalence.wast": {
+  "fail": 0,
+  "pass": 22,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 26
+ },
+ "type-rec.wast": {
+  "fail": 0,
+  "pass": 21,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 17
+ },
+ "type-subtyping.wast": {
+  "fail": 0,
+  "pass": 82,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 84
+ },
+ "type.wast": {
+  "fail": 0,
+  "pass": 1,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 2
+ },
+ "unreachable.wast": {
+  "fail": 0,
+  "pass": 1,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 65
+ },
+ "unreached-invalid.wast": {
+  "fail": 0,
+  "pass": 121,
+  "run": "nothing to run",
+  "run_fail": 0,
+  "run_pass": 0
+ },
+ "unreached-valid.wast": {
+  "fail": 0,
+  "pass": 3,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 14
+ },
+ "unwind.wast": {
+  "fail": 0,
+  "pass": 1,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 51
+ },
+ "utf8-custom-section-id.wast": {
+  "fail": 0,
+  "pass": 176,
+  "run": "nothing to run",
+  "run_fail": 0,
+  "run_pass": 0
+ },
+ "utf8-import-field.wast": {
+  "fail": 0,
+  "pass": 176,
+  "run": "nothing to run",
+  "run_fail": 0,
+  "run_pass": 0
+ },
+ "utf8-import-module.wast": {
+  "fail": 0,
+  "pass": 176,
+  "run": "nothing to run",
+  "run_fail": 0,
+  "run_pass": 0
+ },
+ "utf8-invalid-encoding.wast": {
+  "fail": 0,
+  "pass": 0,
+  "run": "nothing to run",
+  "run_fail": 0,
+  "run_pass": 0
+ }
+}

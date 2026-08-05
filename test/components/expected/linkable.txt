@@ -1,0 +1,35 @@
+core module 0: 2 funcs, 4 exports
+core module 1: 6 funcs, 2 exports
+core instance 0: instantiate module 0, 0 args
+core instance 1: instantiate module 0, 0 args
+core instance 2: 4 inline exports
+core instance 3: 2 inline exports
+core instance 4: instantiate module 1, 2 args
+type 0: func
+type 1: func
+alias 0: core export 0 "put" (core func)
+alias 1: core export 0 "get" (core func)
+alias 2: core export 0 "mem" (core memory)
+alias 3: core export 0 "base" (core global)
+alias 4: core export 1 "put" (core func)
+alias 5: core export 1 "get" (core func)
+alias 6: export 0 "run" (func)
+alias 7: export 1 "run" (func)
+alias 8: core export 4 "split" (core func)
+alias 9: core export 4 "through-mem" (core func)
+instance 0: instantiate component 0, 0 args
+instance 1: instantiate component 0, 0 args
+instance 2: 4 inline exports
+canon 0: lift, 0 options
+canon 1: lift, 0 options
+export 0: "test:link/ops" (instance 2)
+export 1: "split-flat" (func 2)
+component 0:
+  core module 0: 3 funcs, 1 exports
+  core instance 0: instantiate module 0, 0 args
+  core instance 1: instantiate module 1, 1 args
+  type 0: func
+  alias 0: outer 1 0 (core module)
+  alias 1: core export 1 "run" (core func)
+  canon 0: lift, 0 options
+  export 0: "run" (func 0)

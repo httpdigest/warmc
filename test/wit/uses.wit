@@ -1,0 +1,46 @@
+// `use` in all its forms.  A single file declares its dependencies with
+// inline `package ns:name { ... }` blocks -- the spec's rule for the file
+// form, where no other file is ever read.
+package test:uses@3.1.4-beta.1+build.7;
+
+interface base {
+  record thing { n: u32 }
+  type alias = thing;
+  resource res;
+}
+
+interface derived {
+  use base.{thing, alias as other-alias, res};
+  make: func() -> thing;
+  take: func(r: borrow<res>) -> other-alias;
+}
+
+interface foreign {
+  // The version is part of the identity: an unversioned reference does not
+  // match a versioned package, which is what wasm-tools enforces too.
+  use other:pkg/iface@1.2.3.{imported};
+  use other:pkg/iface@1.2.3.{also as u2};
+  go: func(x: imported) -> u2;
+}
+
+world w {
+  import derived;
+  import other:pkg/iface@1.2.3;
+}
+
+package other:pkg@1.2.3 {
+  interface iface {
+    type imported = u64;
+    type also = string;
+  }
+  // A top-level `use` inside a nested package block belongs to *that*
+  // package: an interface of this package resolves the bare name it
+  // introduces, and the file's first package gains nothing.  It used to be
+  // filed against whichever package the file opened with, so this alias went
+  // to test:uses and `consumer` below could not see it.
+  use iface as local-iface;
+  interface consumer {
+    use local-iface.{imported};
+    peek: func() -> imported;
+  }
+}

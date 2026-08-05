@@ -1,0 +1,21 @@
+package example:calc@0.1.0;
+
+// A world with the shapes a real toolchain emits: records and variants over
+// the canonical ABI, a string return (which forces memory, realloc and
+// post-return options on the lift), and an import as well as exports.
+interface ops {
+  record point { x: s32, y: s32 }
+  variant shape { circle(u32), rect(point) }
+  add: func(a: s32, b: s32) -> s32;
+  area: func(s: shape) -> u32;
+  name: func() -> string;
+}
+
+interface log {
+  write: func(msg: string);
+}
+
+world calc {
+  import log;
+  export ops;
+}

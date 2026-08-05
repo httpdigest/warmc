@@ -1,0 +1,30 @@
+--- !tapi-tbd
+tbd-version: 4
+targets: [ arm64-macos ]
+install-name: '/usr/lib/libSystem.B.dylib'
+exports:
+  - targets: [ arm64-macos ]
+    symbols: [ _write, _read, _mmap, _munmap, _mprotect, _madvise, _exit, _sigaction,
+               _memmove,
+               dyld_stub_binder,
+               ___stack_chk_guard, ___stack_chk_fail,
+               _arc4random_buf,
+               _clock_gettime_nsec_np, _pthread_set_qos_class_self_np,
+               # The collector's thread.  __ulock_wait and __ulock_wake are
+               # private API and that is a decision rt/rt.c argues for at the
+               # declaration; what belongs here is the record that the runtime
+               # reaches for them at all, so withdrawing them is a link failure
+               # in this cross-build and not a surprise on somebody's machine.
+               _pthread_create, _pthread_detach, _pthread_self,
+               ___ulock_wait, ___ulock_wake,
+               # The WASI host's filesystem.  Listing them here is not
+               # bookkeeping: this file is what says which of libSystem the
+               # runtime is allowed to reach, and a call added without a line
+               # here fails the Mach-O cross-build rather than passing
+               # unnoticed.
+               _openat, _close, _pread, _pwrite, _lseek,
+               _fstat, _fstatat, _mkdirat, _unlinkat, _renameat,
+               _symlinkat, _readlinkat, _linkat, _fsync, _ftruncate,
+               _futimens, _utimensat, _dup, _poll, ___error,
+               _fdopendir, _readdir, _closedir ]
+...

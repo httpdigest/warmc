@@ -1,0 +1,16 @@
+;; Every value-type constructor the binary format has, in one component.
+(component
+  (type $rec (record (field "a" u32) (field "b" string)))
+  (type $var (variant (case "none") (case "some" u64)))
+  (type $lst (list float32))
+  (type $tup (tuple bool char))
+  (type $flg (flags "read" "write" "exec"))
+  (type $enm (enum "red" "green" "blue"))
+  (type $opt (option $rec))
+  (type $res (result $lst (error string)))
+  (type $nested (list $var))
+  (type $f (func (param "x" $rec) (param "y" $flg) (result $res)))
+  (type $g (func (param "a" s8) (param "b" s16) (param "c" s32) (param "d" s64)
+                 (param "e" u8) (param "f" u16) (param "g" float64)))
+  (type $h (func))
+)

@@ -1,0 +1,6 @@
+package test:escapes
+interface 0 interface [test:escapes]
+  record record { list: u32, func: string, type: bool }
+  type string = u64
+  func enum(variant: s32, flags: u8) -> bool
+  func resource() -> string#1

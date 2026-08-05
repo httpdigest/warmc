@@ -1,0 +1,18 @@
+package root:main@1.0.0
+interface 0 shared [root:main@1.0.0]
+  type id = u64
+  func ping() -> id#0
+interface 1 collide [root:main@1.0.0]
+  type here = bool
+world 0 main [root:main@1.0.0]
+  import path shared (pkg 0 iface 0)
+  export path collide (pkg 0 iface 1)
+package other:dep@2.3.4
+interface 0 collide [other:dep@2.3.4]
+  type there = string
+  func only-here(s: string)
+world 0 dep-world [other:dep@2.3.4]
+  export path collide (pkg 1 iface 0)
+package third:pkg
+interface 0 collide [third:pkg]
+  type third-one = char

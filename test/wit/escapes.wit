@@ -1,0 +1,14 @@
+// Identifiers that collide with keywords, which is what % is for, plus the
+// comment forms including a nested block comment.
+package test:escapes;
+
+/* a block comment
+   /* that nests */
+   and continues after the inner close */
+interface %interface {
+  // `list`, `record` and `func` are keywords; escaped they are names.
+  record %record { %list: u32, %func: string, %type: bool }
+  %enum: func(%variant: s32, %flags: u8) -> bool;
+  type %string = u64;
+  %resource: func() -> %string;
+}

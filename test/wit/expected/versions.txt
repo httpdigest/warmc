@@ -1,0 +1,9 @@
+package v:test@1.0.0
+interface 0 base [v:test@1.0.0]
+  type t = u32
+interface 1 user [v:test@1.0.0]
+  use t from base.t (iface 0 def 0)
+  use x from a:b/c@1.2.3.x (iface 4294967295 def 4294967295)
+  use y from d:e/f@0.7.9-alpha.0+1.2.0.y (iface 4294967295 def 4294967295)
+  use z from g:h/i@10.20.30+build.7.z (iface 4294967295 def 4294967295)
+  func go(p: t#0, q: x#1, r: y#2, s: z#3)

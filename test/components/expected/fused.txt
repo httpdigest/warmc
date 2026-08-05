@@ -1,0 +1,58 @@
+alias 0: export 0 "test:fuse/ops" (instance)
+alias 1: export 2 "run" (func)
+alias 2: export 2 "wide" (func)
+instance 0: instantiate component 0, 0 args
+instance 1: instantiate component 1, 1 args
+export 0: "run" (func 0)
+export 1: "wide" (func 1)
+component 0:
+  core module 0: 6 funcs, 7 exports
+  core instance 0: instantiate module 0, 0 args
+  type 0: func
+  type 1: func
+  type 2: func
+  type 3: func
+  alias 0: core export 0 "sum" (core func)
+  alias 1: core export 0 "mem" (core memory)
+  alias 2: core export 0 "realloc" (core func)
+  alias 3: core export 0 "dropsum" (core func)
+  alias 4: core export 0 "seven" (core func)
+  alias 5: core export 0 "count" (core func)
+  alias 6: core export 0 "wide" (core func)
+  alias 7: core export 0 "mem" (core memory)
+  alias 8: core export 0 "realloc" (core func)
+  instance 0: 4 inline exports
+  canon 0: lift, 3 options
+  canon 1: lift, 0 options
+  canon 2: lift, 0 options
+  canon 3: lift, 2 options
+  export 0: "test:fuse/ops" (instance 0)
+component 1:
+  core module 0: 1 funcs, 2 exports
+  core module 1: 6 funcs, 2 exports
+  core instance 0: instantiate module 0, 0 args
+  core instance 1: 5 inline exports
+  core instance 2: instantiate module 1, 1 args
+  type 0: instance
+  type 1: func
+  type 2: func
+  alias 0: export 0 "sum" (func)
+  alias 1: export 0 "flag" (func)
+  alias 2: export 0 "posts" (func)
+  alias 3: export 0 "wide" (func)
+  alias 4: core export 0 "mem" (core memory)
+  alias 5: core export 0 "realloc" (core func)
+  alias 6: core export 0 "mem" (core memory)
+  alias 7: core export 0 "realloc" (core func)
+  alias 8: core export 0 "mem" (core memory)
+  alias 9: core export 2 "run" (core func)
+  alias 10: core export 2 "wide" (core func)
+  canon 0: lower, 2 options
+  canon 1: lower, 0 options
+  canon 2: lower, 0 options
+  canon 3: lower, 2 options
+  canon 4: lift, 0 options
+  canon 5: lift, 0 options
+  import 0: "test:fuse/ops" kind 5
+  export 0: "run" (func 4)
+  export 1: "wide" (func 5)

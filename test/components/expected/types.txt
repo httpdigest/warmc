@@ -1,0 +1,12 @@
+type 0: record
+type 1: variant
+type 2: list
+type 3: tuple
+type 4: flags
+type 5: enum
+type 6: option
+type 7: result
+type 8: list
+type 9: func
+type 10: func
+type 11: func

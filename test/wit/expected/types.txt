@@ -1,0 +1,28 @@
+package test:types@1.0.0
+interface 0 shapes [test:types@1.0.0]
+  type byte = u8
+  type maybe-name = option<string>
+  type pair = tuple<u32, string>
+  type nested = list<list<option<result<u32, string>>>>
+  type fixed = list<u8, 16>
+  type bare-result = result
+  type ok-only = result<u32>
+  type err-only = result<_, string>
+  type both = result<u32, string>
+  record point { x: s32, y: s32 }
+  record empty-ish { only: bool }
+  variant shape { circle: u32, rect: point#9, degenerate }
+  enum colour { red, green, blue }
+  flags perms { read, write, exec }
+  record uses-later { f: later#15 }
+  type later = u64
+  resource handle
+    func [constructor]handle(seed: u32)
+    func [method]handle.read() -> list<u8>
+    func [method]handle.write(data: list<u8>) -> result<u32, string>
+    func [static]handle.make() -> handle#16
+  type owned = own<handle#16>
+  type borrowed = borrow<handle#16>
+  func make-point(x: s32, y: s32) -> point#9
+  func no-result(a: bool)
+  func no-params() -> string

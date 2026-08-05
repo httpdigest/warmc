@@ -1,0 +1,10 @@
+core module 0: 1 funcs, 2 exports
+core instance 0: instantiate module 0, 0 args
+type 0: resource
+type 1: own
+type 2: borrow
+alias 0: core export 0 "dtor" (core func)
+canon 0: resource.new, 0 options
+canon 1: resource.drop, 0 options
+canon 2: resource.rep, 0 options
+export 0: "r" (type 0)

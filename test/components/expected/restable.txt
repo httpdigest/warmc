@@ -1,0 +1,27 @@
+core module 0: 4 funcs, 4 exports
+core module 1: 5 funcs, 1 exports
+core module 2: 9 funcs, 1 exports
+core instance 0: instantiate module 0, 0 args
+core instance 1: 8 inline exports
+core instance 2: instantiate module 1, 1 args
+core instance 3: instantiate module 2, 1 args
+type 0: resource
+type 1: resource
+type 2: func
+type 3: func
+alias 0: core export 0 "dtor" (core func)
+alias 1: core export 0 "dtor2" (core func)
+alias 2: core export 0 "seen" (core func)
+alias 3: core export 0 "seen2" (core func)
+alias 4: core export 2 "run" (core func)
+alias 5: core export 3 "stress" (core func)
+canon 0: resource.new, 0 options
+canon 1: resource.drop, 0 options
+canon 2: resource.rep, 0 options
+canon 3: resource.new, 0 options
+canon 4: resource.drop, 0 options
+canon 5: resource.rep, 0 options
+canon 6: lift, 0 options
+canon 7: lift, 0 options
+export 0: "run" (func 0)
+export 1: "stress" (func 1)

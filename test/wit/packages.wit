@@ -1,0 +1,36 @@
+// Nested package definitions, and the thing that makes them matter: two
+// packages may each declare an interface of the same name, so the identity of
+// an interface is the pair and not the name.
+package root:main@1.0.0;
+
+interface shared {
+  type id = u64;
+  ping: func() -> id;
+}
+
+interface collide {
+  type here = bool;
+}
+
+package other:dep@2.3.4 {
+  // Same name as an interface of the root package, different contents.
+  interface collide {
+    type there = string;
+    only-here: func(s: string);
+  }
+
+  world dep-world {
+    export collide;
+  }
+}
+
+package third:pkg {
+  interface collide {
+    type third-one = char;
+  }
+}
+
+world main {
+  import shared;
+  export collide;
+}

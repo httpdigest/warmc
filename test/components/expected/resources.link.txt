@@ -1,0 +1,5 @@
+module 0: cm0, 1 funcs, 0 imports, 2 exports
+instance 0: module 0, 0 imports
+canon 0: resource.new table 0
+canon 1: resource.drop table 0, dtor instance 0 "dtor" [func]
+canon 2: resource.rep table 0
