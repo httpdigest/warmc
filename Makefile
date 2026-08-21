@@ -1,5 +1,30 @@
+UNAME_S := $(shell uname -s)
+UNAME_M := $(shell uname -m)
+
+# Host personality: MINGW64_NT / CLANG64_NT / MSYS_NT come from MSYS2-family
+# shells on Windows; the host build must be static there because the test
+# harness spawns warmc with a scrubbed PATH (no DLL resolution).
+ifneq (,$(findstring NT,$(UNAME_S)))
+  HOST_OS     := windows
+  EXE         := .exe
+  HOST_TUNE   := -march=x86-64-v3
+  # 16 MiB stack: mingw's 2 MiB default overflows on parser recursion that
+  # the 8 MiB POSIX default absorbs; thread stacks inherit the same reserve.
+  HOST_LDLIBS := -lpthread -static -Wl,--stack,16777216
+else ifeq ($(UNAME_S)/$(UNAME_M),Darwin/arm64)
+  HOST_OS     := macos
+  EXE         :=
+  HOST_TUNE   := -mcpu=apple-m4
+  HOST_LDLIBS :=
+else
+  HOST_OS     := linux
+  EXE         :=
+  HOST_TUNE   :=
+  HOST_LDLIBS := -lpthread
+endif
+
 CC      ?= clang
-CFLAGS  ?= -std=c11 -O3 -mcpu=apple-m4 -flto=thin -fvisibility=hidden -fvisibility-inlines-hidden -fno-exceptions -fno-rtti -g -Wall -Wextra -Wno-unused-parameter
+CFLAGS  ?= -std=c11 -O3 $(HOST_TUNE) -flto=thin -fvisibility=hidden -fvisibility-inlines-hidden -fno-exceptions -fno-rtti -g -Wall -Wextra -Wno-unused-parameter
 BUILD   ?= build
 
 XCC     ?= clang
@@ -12,10 +37,10 @@ XFLAGS  ?= --target=aarch64-linux-gnu -O2 $(RT_TUNE) -ffreestanding -fno-stack-p
            -Wall -Wextra -Wno-unused-parameter
 LD      ?= ld.lld
 
-WARMC_SRC := src/main.c src/util.c src/a64.c src/parse.c src/opcodes.c \
+WARMC_SRC := src/main.c src/util.c src/a64.c src/x64.c src/parse.c src/opcodes.c \
              src/validate.c src/component.c src/wit.c src/wat.c \
-             src/module_data.c src/elf.c src/macho.c src/ir.c src/ir_build.c \
-             src/opt.c src/isel.c src/inline.c src/compile.c src/link.c src/canon.c src/witgen.c \
+             src/module_data.c src/elf.c src/macho.c src/coff.c src/pe.c src/ir.c src/ir_build.c \
+             src/opt.c src/isel.c src/isel_x64.c src/codegen.c src/inline.c src/compile.c src/link.c src/canon.c src/witgen.c \
              src/clink.c
 RT_OBJS   := $(BUILD)/rt/rt.o $(BUILD)/rt/start.o $(BUILD)/rt/hook.o \
              $(BUILD)/rt/gcthook.o \
@@ -44,78 +69,66 @@ MACFLAGS  ?= --target=arm64-apple-macos11 -DWARMC_DARWIN=1 -O2 $(RT_TUNE) -ffree
              -fno-stack-protector -fno-builtin -nostdlib -mno-outline-atomics \
              -Wall -Wextra -Wno-unused-parameter
 
-all: $(BUILD)/warmc $(BUILD)/warmrt.a $(BUILD)/warmrt-macos.a \
+# Windows x64 target runtime.
+WIN_OBJS  := $(BUILD)/rt/rt-windows.o $(BUILD)/rt/start-windows.o \
+             $(BUILD)/rt/hook-windows.o $(BUILD)/rt/gcthook-windows.o \
+             $(BUILD)/rt/modules-windows.o \
+             $(BUILD)/rt/component-windows.o
+WINFLAGS  ?= --target=x86_64-pc-windows-gnu -DWARMC_WINDOWS=1 -O2 $(RT_TUNE) -ffreestanding \
+             -fno-stack-protector -fno-builtin -nostdlib \
+             -ffunction-sections -fdata-sections \
+             -Wall -Wextra -Wno-unused-parameter
+
+all: $(BUILD)/warmc$(EXE) $(BUILD)/warmrt.a $(BUILD)/warmrt-macos.a \
+     $(BUILD)/warmrt-windows.a \
      $(BUILD)/warmgcth.a $(BUILD)/warmgcth-macos.a \
+     $(BUILD)/warmgcth-windows.a \
      $(BUILD)/warmwasi.a $(BUILD)/warmwasi-macos.a \
-     $(BUILD)/warmwasip2.a $(BUILD)/warmwasip2-macos.a $(BUILD)/a64_test
+     $(BUILD)/warmwasi-windows.a \
+     $(BUILD)/warmwasip2.a $(BUILD)/warmwasip2-macos.a $(BUILD)/a64_test$(EXE)
 
 $(BUILD)/obj/%.o: src/%.c
 	@mkdir -p $(BUILD)/obj
 	$(CC) $(CFLAGS) $(DEPFLAGS) -c -o $@ $<
 
-$(BUILD)/warmc: $(WARMC_OBJS)
+$(BUILD)/warmc$(EXE): $(WARMC_OBJS)
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -o $@ $(WARMC_OBJS)
+	$(CC) $(CFLAGS) -o $@ $(WARMC_OBJS) $(HOST_LDLIBS)
 
-$(BUILD)/rt/rt.o: rt/rt.c $(RT_HDRS)
+# One pattern per runtime flavor; make picks the pattern with the shortest
+# stem, so the suffixed ones win for suffixed objects.  start*.o (assembly)
+# and wasi-stub*.o (built by warmc itself) keep explicit rules below.
+$(BUILD)/rt/%.o: rt/%.c $(RT_HDRS)
 	@mkdir -p $(BUILD)/rt
-	$(XCC) $(XFLAGS) -c -o $@ rt/rt.c
+	$(XCC) $(XFLAGS) -c -o $@ $<
 
-$(BUILD)/rt/gcthook.o: rt/gcthook.c
+$(BUILD)/rt/%-macos.o: rt/%.c $(RT_HDRS)
 	@mkdir -p $(BUILD)/rt
-	$(XCC) $(XFLAGS) -c -o $@ rt/gcthook.c
+	$(XCC) $(MACFLAGS) -c -o $@ $<
 
-$(BUILD)/rt/gcthook-macos.o: rt/gcthook.c
+$(BUILD)/rt/%-windows.o: rt/%.c $(RT_HDRS)
 	@mkdir -p $(BUILD)/rt
-	$(XCC) $(MACFLAGS) -c -o $@ rt/gcthook.c
-
-$(BUILD)/rt/gcthtest.o: rt/gcthtest.c
-	@mkdir -p $(BUILD)/rt
-	$(XCC) $(XFLAGS) -c -o $@ rt/gcthtest.c
-
-$(BUILD)/rt/gcthtest-macos.o: rt/gcthtest.c
-	@mkdir -p $(BUILD)/rt
-	$(XCC) $(MACFLAGS) -c -o $@ rt/gcthtest.c
-
-$(BUILD)/rt/hook.o: rt/hook.c
-	@mkdir -p $(BUILD)/rt
-	$(XCC) $(XFLAGS) -c -o $@ rt/hook.c
-
-$(BUILD)/rt/hook-macos.o: rt/hook.c
-	@mkdir -p $(BUILD)/rt
-	$(XCC) $(MACFLAGS) -c -o $@ rt/hook.c
-
-$(BUILD)/rt/modules.o: rt/modules.c $(RT_HDRS)
-	@mkdir -p $(BUILD)/rt
-	$(XCC) $(XFLAGS) -c -o $@ rt/modules.c
-
-$(BUILD)/rt/modules-macos.o: rt/modules.c $(RT_HDRS)
-	@mkdir -p $(BUILD)/rt
-	$(XCC) $(MACFLAGS) -c -o $@ rt/modules.c
-
-$(BUILD)/rt/component.o: rt/component.c $(RT_HDRS)
-	@mkdir -p $(BUILD)/rt
-	$(XCC) $(XFLAGS) -c -o $@ rt/component.c
-
-$(BUILD)/rt/component-macos.o: rt/component.c $(RT_HDRS)
-	@mkdir -p $(BUILD)/rt
-	$(XCC) $(MACFLAGS) -c -o $@ rt/component.c
+	$(XCC) $(WINFLAGS) -c -o $@ $<
 
 $(BUILD)/rt/start.o: rt/start.S
 	@mkdir -p $(BUILD)/rt
 	$(XCC) --target=aarch64-linux-gnu -c -o $@ rt/start.S
 
+$(BUILD)/rt/start-macos.o: rt/start.S
+	@mkdir -p $(BUILD)/rt
+	$(XCC) --target=arm64-apple-macos11 -DWARMC_DARWIN=1 -c -o $@ rt/start.S
+
+$(BUILD)/rt/start-windows.o: rt/start_x64.S
+	@mkdir -p $(BUILD)/rt
+	$(XCC) --target=x86_64-pc-windows-gnu -DWARMC_WINDOWS=1 -c -o $@ rt/start_x64.S
+
 $(BUILD)/warmrt.a: $(RT_OBJS)
 	@rm -f $@
 	llvm-ar rcs $@ $(RT_OBJS) 2>/dev/null || ar rcs $@ $(RT_OBJS)
 
-$(BUILD)/rt/rt-macos.o: rt/rt.c $(RT_HDRS)
-	@mkdir -p $(BUILD)/rt
-	$(XCC) $(MACFLAGS) -c -o $@ rt/rt.c
-
-$(BUILD)/rt/start-macos.o: rt/start.S
-	@mkdir -p $(BUILD)/rt
-	$(XCC) --target=arm64-apple-macos11 -DWARMC_DARWIN=1 -c -o $@ rt/start.S
+$(BUILD)/warmrt-windows.a: $(WIN_OBJS)
+	@mkdir -p $(BUILD)
+	llvm-ar rcs $@ $(WIN_OBJS)
 
 $(BUILD)/warmrt-macos.a: $(MAC_OBJS)
 	@rm -f $@
@@ -130,34 +143,31 @@ $(BUILD)/warmgcth-macos.a: $(BUILD)/rt/gcthtest-macos.o $(MAC_OBJS)
 	@rm -f $@
 	llvm-ar rcs $@ $(BUILD)/rt/gcthtest-macos.o $(MAC_OBJS)
 
-$(BUILD)/rt/wasi-stub.o: rt/wasi.wat $(BUILD)/warmc
-	@mkdir -p $(BUILD)/rt
-	$(BUILD)/warmc -O2 -c --symbol-prefix=warmc_wasi_stub -o $@ rt/wasi.wat
+$(BUILD)/warmgcth-windows.a: $(BUILD)/rt/gcthtest-windows.o $(WIN_OBJS)
+	@rm -f $@
+	llvm-ar rcs $@ $(BUILD)/rt/gcthtest-windows.o $(WIN_OBJS)
 
-$(BUILD)/rt/wasi-stub-macos.o: rt/wasi.wat $(BUILD)/warmc
+$(BUILD)/rt/wasi-stub.o: rt/wasi.wat $(BUILD)/warmc$(EXE)
 	@mkdir -p $(BUILD)/rt
-	$(BUILD)/warmc -O2 -c --target=macos --symbol-prefix=warmc_wasi_stub \
+	$(BUILD)/warmc$(EXE) -O2 -c --symbol-prefix=warmc_wasi_stub -o $@ rt/wasi.wat
+
+$(BUILD)/rt/wasi-stub-macos.o: rt/wasi.wat $(BUILD)/warmc$(EXE)
+	@mkdir -p $(BUILD)/rt
+	$(BUILD)/warmc$(EXE) -O2 -c --target=macos --symbol-prefix=warmc_wasi_stub \
 	  -o $@ rt/wasi.wat
 
-$(BUILD)/rt/wasi.o: rt/wasi.c $(RT_HDRS)
+$(BUILD)/rt/wasi-stub-windows.o: rt/wasi.wat $(BUILD)/warmc$(EXE)
 	@mkdir -p $(BUILD)/rt
-	$(XCC) $(XFLAGS) -c -o $@ rt/wasi.c
-
-$(BUILD)/rt/wasi-macos.o: rt/wasi.c $(RT_HDRS)
-	@mkdir -p $(BUILD)/rt
-	$(XCC) $(MACFLAGS) -c -o $@ rt/wasi.c
-
-$(BUILD)/rt/wasifs.o: rt/wasifs.c $(RT_HDRS)
-	@mkdir -p $(BUILD)/rt
-	$(XCC) $(XFLAGS) -c -o $@ rt/wasifs.c
-
-$(BUILD)/rt/wasifs-macos.o: rt/wasifs.c $(RT_HDRS)
-	@mkdir -p $(BUILD)/rt
-	$(XCC) $(MACFLAGS) -c -o $@ rt/wasifs.c
+	$(BUILD)/warmc$(EXE) -O2 -c --target=windows --symbol-prefix=warmc_wasi_stub \
+	  -o $@ rt/wasi.wat
 
 WASI_OBJS := $(BUILD)/rt/wasi.o $(BUILD)/rt/wasifs.o $(BUILD)/rt/wasi-stub.o
 WASI_MOBJS := $(BUILD)/rt/wasi-macos.o $(BUILD)/rt/wasifs-macos.o \
               $(BUILD)/rt/wasi-stub-macos.o
+# Windows has no libc behind the POSIX names rt/wasi.c and rt/wasifs.c call,
+# so the archive carries rt/winposix.c, which is that whole surface over Win32.
+WASI_WOBJS := $(BUILD)/rt/wasi-windows.o $(BUILD)/rt/wasifs-windows.o \
+              $(BUILD)/rt/winposix-windows.o $(BUILD)/rt/wasi-stub-windows.o
 
 $(BUILD)/warmwasi.a: $(WASI_OBJS)
 	@rm -f $@
@@ -167,13 +177,9 @@ $(BUILD)/warmwasi-macos.a: $(WASI_MOBJS)
 	@rm -f $@
 	llvm-ar rcs $@ $(WASI_MOBJS)
 
-$(BUILD)/rt/wasip2.o: rt/wasip2.c $(RT_HDRS)
-	@mkdir -p $(BUILD)/rt
-	$(XCC) $(XFLAGS) -c -o $@ rt/wasip2.c
-
-$(BUILD)/rt/wasip2-macos.o: rt/wasip2.c $(RT_HDRS)
-	@mkdir -p $(BUILD)/rt
-	$(XCC) $(MACFLAGS) -c -o $@ rt/wasip2.c
+$(BUILD)/warmwasi-windows.a: $(WASI_WOBJS)
+	@rm -f $@
+	llvm-ar rcs $@ $(WASI_WOBJS)
 
 P2_OBJS := $(BUILD)/rt/wasip2.o $(BUILD)/rt/wasifs.o
 P2_MOBJS := $(BUILD)/rt/wasip2-macos.o $(BUILD)/rt/wasifs-macos.o
@@ -197,29 +203,35 @@ $(BUILD)/obj-asan/%.o: src/%.c
 	@mkdir -p $(BUILD)/obj-asan
 	$(ASAN_CC) $(CFLAGS) $(ASAN_FLAGS) $(DEPFLAGS) -c -o $@ $<
 
-$(BUILD)/warmc-asan: $(ASAN_OBJS)
+$(BUILD)/warmc-asan$(EXE): $(ASAN_OBJS)
 	@mkdir -p $(BUILD)
-	$(ASAN_CC) $(CFLAGS) $(ASAN_FLAGS) -o $@ $(ASAN_OBJS)
+	$(ASAN_CC) $(CFLAGS) $(ASAN_FLAGS) -o $@ $(ASAN_OBJS) $(HOST_LDLIBS)
 
-asan: $(BUILD)/warmc-asan
+asan: $(BUILD)/warmc-asan$(EXE)
 
 $(BUILD)/obj-tsan/%.o: src/%.c
 	@mkdir -p $(BUILD)/obj-tsan
 	$(ASAN_CC) $(CFLAGS) $(TSAN_FLAGS) $(DEPFLAGS) -c -o $@ $<
 
-$(BUILD)/warmc-tsan: $(TSAN_OBJS)
+$(BUILD)/warmc-tsan$(EXE): $(TSAN_OBJS)
 	@mkdir -p $(BUILD)
-	$(ASAN_CC) $(CFLAGS) $(TSAN_FLAGS) -o $@ $(TSAN_OBJS)
+	$(ASAN_CC) $(CFLAGS) $(TSAN_FLAGS) -o $@ $(TSAN_OBJS) $(HOST_LDLIBS)
 
-tsan: $(BUILD)/warmc-tsan
+tsan: $(BUILD)/warmc-tsan$(EXE)
 
-$(BUILD)/a64_test: test/a64_test.c $(WARMC_HDRS) \
+$(BUILD)/a64_test$(EXE): test/a64_test.c $(WARMC_HDRS) \
                    $(BUILD)/obj/a64.o $(BUILD)/obj/util.o
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -o $@ test/a64_test.c $(BUILD)/obj/a64.o $(BUILD)/obj/util.o
+	$(CC) $(CFLAGS) -o $@ test/a64_test.c $(BUILD)/obj/a64.o $(BUILD)/obj/util.o $(HOST_LDLIBS)
 
-check-encoder: $(BUILD)/a64_test
+$(BUILD)/x64_test$(EXE): test/x64_test.c $(WARMC_HDRS) \
+                   $(BUILD)/obj/x64.o $(BUILD)/obj/util.o
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -o $@ test/x64_test.c $(BUILD)/obj/x64.o $(BUILD)/obj/util.o $(HOST_LDLIBS)
+
+check-encoder: $(BUILD)/a64_test$(EXE) $(BUILD)/x64_test$(EXE)
 	@./test/run_a64_test.sh $(BUILD)
+	@./test/run_x64_test.sh $(BUILD)
 
 TESTSUITE_COMMIT := 65a43d2e9464b6967c98b23c8493765c4d124f4e
 
@@ -256,11 +268,13 @@ $(KOTLIN_WASI_KLIB):
 
 kotlin-stdlib: $(KOTLIN_WASI_KLIB)
 
-check-spec: $(BUILD)/warmc $(BUILD)/warmrt.a $(BUILD)/warmrt-macos.a \
-            $(BUILD)/testsuite/README.md $(BUILD)/tools/bin/wasm-tools
-	@python3 test/spec/run.py "--levels=-O1,-O2,-O2 --profile=deterministic"
+SPEC_LEVELS ?= -O1,-O2,-O2 --profile=deterministic
 
-conformance: $(BUILD)/warmc $(BUILD)/warmrt.a $(BUILD)/warmrt-macos.a \
+check-spec: $(BUILD)/warmc$(EXE) $(BUILD)/warmrt.a $(BUILD)/warmrt-macos.a \
+            $(BUILD)/testsuite/README.md $(BUILD)/tools/bin/wasm-tools
+	@python3 test/spec/run.py "--levels=$(SPEC_LEVELS)"
+
+conformance: $(BUILD)/warmc$(EXE) $(BUILD)/warmrt.a $(BUILD)/warmrt-macos.a \
              $(BUILD)/testsuite/README.md $(BUILD)/tools/bin/wasm-tools
 	@{ \
 	  echo '# Conformance'; \
@@ -274,7 +288,25 @@ conformance: $(BUILD)/warmc $(BUILD)/warmrt.a $(BUILD)/warmrt-macos.a \
 	} > CONFORMANCE.md
 	@echo "wrote CONFORMANCE.md"
 
-check: all asan tsan check-encoder
+# TSan does not exist on Windows; ASan on mingw is tried separately.  The
+# fixture is the other way round: it needs the real windows.h, so it is the
+# one check that only a Windows host can run.
+ifeq ($(HOST_OS),windows)
+SAN_TARGETS :=
+WIN_CHECKS  := check-win-fixture
+else
+SAN_TARGETS := asan tsan
+WIN_CHECKS  :=
+endif
+
+# Compiling it is the test: it asserts every Win32 structure offset that
+# rt/win.inc and rt/winposix.c hard-code against the SDK headers.
+check-win-fixture:
+	@mkdir -p $(BUILD)
+	@$(CC) -o $(BUILD)/win_fixture$(EXE) test/win_fixture.c
+	@echo "win-fixture: OK (the Win32 offsets the runtime hard-codes match windows.h)"
+
+check: all $(SAN_TARGETS) $(WIN_CHECKS) check-encoder
 	@./test/run_all.sh
 
 check-linux: all
@@ -296,7 +328,7 @@ bench-record: all
 FUZZ_SEED  ?= 1
 FUZZ_COUNT ?= 300
 
-fuzz: $(BUILD)/warmc $(BUILD)/warmrt.a $(BUILD)/warmrt-macos.a
+fuzz: $(BUILD)/warmc$(EXE) $(BUILD)/warmrt.a $(BUILD)/warmrt-macos.a
 	@python3 test/fuzz.py --seed $(FUZZ_SEED) --count $(FUZZ_COUNT)
 
 JITTER_SEEDS ?= 64

@@ -5,7 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "a64.h"
+#include "buf.h"
 
 enum { EXIT_FATAL = 1, EXIT_MALFORMED = 2, EXIT_INVALID = 3, EXIT_UNLINKABLE = 4 };
 
@@ -464,7 +464,13 @@ typedef enum {
   REL_ADR_PAGE21,
   REL_ADD_LO12,
   REL_LDST_LO12,
-  REL_ABS64
+  REL_ABS64,
+
+  // x64: S + A - P over a 4-byte field (call/jmp rel32 and RIP-relative
+  // operands).  isel records addend -4 and pre-bakes it into the
+  // instruction bytes, so COFF's in-situ-addend convention needs no
+  // special casing.
+  REL_PC32
 } RelKind;
 
 typedef struct {
@@ -500,7 +506,11 @@ typedef struct {
 uint32_t obj_add_sym(ObjBuilder *o, const char *name, SymKind kind, int section, uint64_t value);
 uint32_t obj_find_sym(ObjBuilder *o, const char *name);
 
-void warmc_link_exec(bool macho, const char *out, const char *objpath,
+typedef enum { TGT_ELF, TGT_MACHO, TGT_PE } TargetFmt;
+
+void write_coff64(ObjBuilder *o, const char *path);
+
+void warmc_link_exec(TargetFmt fmt, const char *out, const char *objpath,
                      const char *wasi, const char *rt, const char *entry,
                      bool strip);
 uint32_t obj_intern_sym(ObjBuilder *o, const char *name, SymKind kind, int section, uint64_t value);

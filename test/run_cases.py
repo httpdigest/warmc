@@ -133,7 +133,8 @@ def prepare_case(wat, versions):
 def compile_case(idx, name, wasm, outdir):
     """Compile one case to an object, named apart from every other case."""
     obj = os.path.join(outdir, name + ".o")
-    target = ["--target=macos"] if hostbuild.DARWIN else []
+    target = ["--target=macos"] if hostbuild.DARWIN \
+        else ["--target=windows"] if hostbuild.WINDOWS else []
     try:
         r = sh([os.path.join(BUILD, "warmc")] + WARMC_FLAGS + target +
                ["--symbol-prefix=c%d" % idx, "-c", "-o", obj, wasm],
@@ -179,6 +180,10 @@ def main():
     outdir = os.path.join(WORK, flag_tag())
     os.makedirs(outdir, exist_ok=True)
 
+    bigstack = hostbuild.wabt_bigstack(BUILD)
+    if bigstack:
+        os.environ["PATH"] = bigstack + os.pathsep + os.environ.get("PATH", "")
+
     for tool in ("wat2wasm", "wasm-interp"):
         if subprocess.run(["which", tool], capture_output=True).returncode != 0:
             print("run_cases: wabt (wat2wasm, wasm-interp) not found on PATH",
@@ -223,6 +228,7 @@ def main():
         if r.returncode == 0:
             binary = os.path.join(outdir, "cases")
             r = hostbuild.link([idx_o] + [o for _i, _n, _r, o in live], binary, BUILD)
+            binary = hostbuild.exe(binary)
         if r.returncode != 0:
 
             for m in msgs:

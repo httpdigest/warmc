@@ -26,32 +26,20 @@ wat2wasm $WABT_FLAGS "$WORK/c.wat" -o "$WORK/c.wasm" || exit 1
 wtimeout ./$BUILD/warmc ${WARMC_FLAGS:--O2} $WARMC_TARGET_FLAGS --symbol-prefix=c \
     -c -o "$WORK/c.o" "$WORK/c.wasm" || { echo "FAIL[link]: compiling c"; exit 1; }
 
+# Sets LINKED to the program it produced -- on Windows the linker adds .exe.
 link_prog() {
   local prog="$1" drv="$2"; shift 2
-  case "$(uname -s)/$(uname -m)" in
-    Darwin/arm64)
-      ${XCC:-clang} --target=arm64-apple-macos11 -DWARMC_DARWIN=1 -O2 -ffreestanding \
-        -fno-stack-protector -fno-builtin -nostdlib -c -o "$WORK/$prog.drv.o" "$drv" \
-        || { echo "FAIL[link]: driver $drv"; return 1; }
-      ${WARMC_MACOS_LD:-/usr/bin/ld} -arch arm64 -platform_version macos 11.0 11.0 \
-        -o "$WORK/$prog" "$WORK/$prog.drv.o" "$@" "$BUILD/warmrt-macos.a" \
-        -lSystem -L"$WARMC_MACOS_LIBDIR" \
-        || { echo "FAIL[link]: ld $prog"; return 1; }
-      ;;
-    *)
-      ${XCC:-clang} --target=aarch64-linux-gnu -O2 -ffreestanding -fno-stack-protector \
-        -fno-builtin -nostdlib -c -o "$WORK/$prog.drv.o" "$drv" \
-        || { echo "FAIL[link]: driver $drv"; return 1; }
-      ${LD:-ld.lld} -static -e _start -o "$WORK/$prog" \
-        "$WORK/$prog.drv.o" "$@" "$BUILD/warmrt.a" \
-        || { echo "FAIL[link]: ld $prog"; return 1; }
-      ;;
-  esac
+  python3 test/hostbuild.py cc "$drv" "$WORK/$prog.drv.o" \
+    || { echo "FAIL[link]: driver $drv"; return 1; }
+  BUILD="$BUILD" python3 test/hostbuild.py link "$WORK/$prog" \
+      "$WORK/$prog.drv.o" "$@" \
+    || { echo "FAIL[link]: ld $prog"; return 1; }
+  LINKED=$(python3 test/hostbuild.py exe "$WORK/$prog")
 }
 
 link_prog prog test/link/driver.c "$WORK/a.o" "$WORK/b.o" "$WORK/c.o" || exit 1
 
-got=$(wruntimeout $WARMC_RUN "$WORK/prog" 2>&1)
+got=$(wruntimeout $WARMC_RUN "$LINKED" 2>&1)
 want='reexported_secret=4243
 a_reads_own_secret=4243
 call_import=42
@@ -109,7 +97,7 @@ for lv in -O0 -O1 -O2; do
       -c -o "$WORK/t.o" "$WORK/t.wasm" \
     || { echo "FAIL[link]: compiling trap.wat at $lv"; exit 1; }
   link_prog trapprog test/link/trapdriver.c "$WORK/t.o" || exit 1
-  got=$(wruntimeout $WARMC_RUN "$WORK/trapprog" 2>&1)
+  got=$(wruntimeout $WARMC_RUN "$LINKED" 2>&1)
   if [ "$got" = "$trapwant" ]; then continue; fi
   echo "FAIL[link/trap]: $lv output differs"
   diff <(echo "$trapwant") <(echo "$got") | head -10
@@ -139,7 +127,7 @@ gc_run() {
   local label="$1"; shift
   local got
   got=$( for v in "$@"; do export "$v"; done
-         wruntimeout $WARMC_RUN "$WORK/gcprog" 2>&1 )
+         wruntimeout $WARMC_RUN "$LINKED" 2>&1 )
   if [ "$got" = "$gcwant" ]; then return 0; fi
   echo "FAIL[link/gc]: $label output differs"
   diff <(echo "$gcwant") <(echo "$got") | head -10
@@ -158,7 +146,7 @@ dieargs='gclink_caught=1
 gclink_after=4330'
 for cfg in "WARMC_GC_MIN_KB=4" "WARMC_GC_MIN_KB=4 WARMC_GC_RELOC=8"; do
   got=$( for v in $cfg WARMC_GC_DIE_ROUND=1; do export "$v"; done
-         wruntimeout $WARMC_RUN "$WORK/gcprog" r 2>/dev/null | tail -2 )
+         wruntimeout $WARMC_RUN "$LINKED" r 2>/dev/null | tail -2 )
   if [ "$got" = "$dieargs" ]; then continue; fi
   echo "FAIL[link/gc]: a failed round wedged the collector ($cfg)"
   diff <(echo "$dieargs") <(echo "$got") | head -6

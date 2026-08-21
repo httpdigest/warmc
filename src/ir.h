@@ -318,6 +318,7 @@ int ir_const_cost(uint64_t bits, bool wide);
 int ir_vconst_cost(uint64_t lo, uint64_t hi);
 
 bool ir_imm_ok(IrFunc *f, Ref user, uint32_t idx, uint64_t cval, ValType ct);
+bool ir_mem_disp_ok(uint64_t off, uint32_t size_log2);
 
 uint64_t ir_value_max(IrFunc *f, Ref v, int depth);
 

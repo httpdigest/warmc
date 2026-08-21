@@ -11,8 +11,8 @@ extern const ModuleDesc warmc_wasi_stub_module;
 #define WASI_ENOTSUP  58
 #define WASI_ESPIPE   70
 
-extern void *malloc(unsigned long);
-extern void *realloc(void *, unsigned long);
+extern void *malloc(usz);
+extern void *realloc(void *, usz);
 extern void free(void *);
 
 static int g_argc;
@@ -23,19 +23,19 @@ static void err_u64(unsigned long long v) {
   int i = 24;
   if (!v) { warmc_rt_write(2, "0", 1); return; }
   while (v) { b[--i] = (char)('0' + (v % 10)); v /= 10; }
-  warmc_rt_write(2, b + i, (unsigned long)(24 - i));
+  warmc_rt_write(2, b + i, (usz)(24 - i));
 }
 
 static void err(const char *s) {
   const char *p = s;
   while (*p) p++;
-  warmc_rt_write(2, s, (unsigned long)(p - s));
+  warmc_rt_write(2, s, (usz)(p - s));
 }
 
-static unsigned long cstrlen(const char *s) {
+static usz cstrlen(const char *s) {
   const char *p = s;
   while (*p) p++;
-  return (unsigned long)(p - s);
+  return (usz)(p - s);
 }
 
 static int ok(WarmInstance *vm, u64 off, u64 len) {
@@ -62,6 +62,19 @@ static int get32(WarmInstance *vm, u64 addr, u32 *out) {
 
 static u32 to_wasi_errno(int e);
 
+#if defined(WARMC_WINDOWS)
+/* warmc_rt_read/write know only the three standard handles on Windows; every
+   other descriptor lives in rt/winposix.c's table.  Both answer -errno, the
+   way the raw syscalls behind warmc_rt_read/write do. */
+extern long warmc_win_read(int fd, void *buf, usz n);
+extern long warmc_win_write(int fd, const void *buf, usz n);
+#define host_read  warmc_win_read
+#define host_write warmc_win_write
+#else
+#define host_read  warmc_rt_read
+#define host_write warmc_rt_write
+#endif
+
 static u64 iov_walk_fd(WarmInstance *vm, int hostfd, int writing, u64 iovs_,
                        u64 niov_, u64 pn_) {
   u32 iovs = (u32)iovs_, niov = (u32)niov_, pn = (u32)pn_;
@@ -72,8 +85,8 @@ static u64 iov_walk_fd(WarmInstance *vm, int hostfd, int writing, u64 iovs_,
     if (!get32(vm, rec, &buf) || !get32(vm, rec + 4, &len)) return WASI_EFAULT;
     if (!ok(vm, buf, len)) return WASI_EFAULT;
     if (!len) continue;
-    long r = writing ? warmc_rt_write(hostfd, vm->mem_base + buf, len)
-                     : warmc_rt_read(hostfd, vm->mem_base + buf, len);
+    long r = writing ? host_write(hostfd, vm->mem_base + buf, len)
+                     : host_read(hostfd, vm->mem_base + buf, len);
 
     if (r < 0) {
 
@@ -82,7 +95,7 @@ static u64 iov_walk_fd(WarmInstance *vm, int hostfd, int writing, u64 iovs_,
     }
     total += (u64)r;
 
-    if ((unsigned long)r < len) break;
+    if ((usz)r < len) break;
   }
   if (!put32(vm, pn, (u32)total)) return WASI_EFAULT;
   return WASI_ESUCCESS;
@@ -171,10 +184,10 @@ static u64 vec_get(WarmInstance *vm, char **v, int n, u64 ptrs_, u64 blob_) {
   u32 ptrs = (u32)ptrs_, blob = (u32)blob_;
   u64 at = blob;
   for (int i = 0; i < n; i++) {
-    unsigned long len = cstrlen(v[i]) + 1;
+    usz len = cstrlen(v[i]) + 1;
     if (!ok(vm, at, len)) return WASI_EFAULT;
     if (!put32(vm, (u64)ptrs + 4ull * (u32)i, (u32)at)) return WASI_EFAULT;
-    for (unsigned long j = 0; j < len; j++) vm->mem_base[at + j] = (u8)v[i][j];
+    for (usz j = 0; j < len; j++) vm->mem_base[at + j] = (u8)v[i][j];
     at += len;
   }
   return WASI_ESUCCESS;
@@ -195,7 +208,7 @@ static int add_env(char *kv) {
 
   if (g_nenv + 1 >= g_capenv) {
     int cap = g_capenv ? g_capenv * 2 : 32;
-    char **p = (char **)realloc(g_env, (unsigned long)cap * sizeof *p);
+    char **p = (char **)realloc(g_env, (usz)cap * sizeof *p);
     if (!p) return 0;
     g_env = p;
     g_capenv = cap;
@@ -255,19 +268,31 @@ extern int clock_getres(int, void *);
 #if defined(WARMC_DARWIN)
 
 static const int H_CLOCK[4] = { 0 , 8 , 12 , 16  };
-#else
+#elif !defined(WARMC_WINDOWS)
 static const int H_CLOCK[4] = { 0, 1, 2, 3 };
+#endif
+
+#if defined(WARMC_WINDOWS)
+/* A timespec is two longs, which are 32 bits here, and the two CPU clocks
+   are a different API rather than a different clock id -- so Windows answers
+   all four in nanoseconds directly. */
+extern int warmc_win_clock(int want_res, u32 id, u64 *out);
 #endif
 
 static u64 clock_query(int want_res, u32 id, u64 *out) {
 
   if (id > 3) return WASI_EINVAL;
+#if defined(WARMC_WINDOWS)
+  if (warmc_win_clock(want_res, id, out) < 0) return to_wasi_errno(h_errno);
+  return WASI_ESUCCESS;
+#else
   long ts[2] = { 0, 0 };
   int r = want_res ? clock_getres(H_CLOCK[id], ts)
                    : clock_gettime(H_CLOCK[id], ts);
   if (r < 0) return to_wasi_errno(h_errno);
   *out = (u64)ts[0] * 1000000000ull + (u64)ts[1];
   return WASI_ESUCCESS;
+#endif
 }
 
 #define WASI_ENOENT      44
@@ -331,7 +356,7 @@ static int fds_reserve(u32 want) {
   u32 n = g_nfds ? g_nfds : FD_INIT;
   while (n <= want) n *= 2;
   if (n > FD_LIMIT) n = FD_LIMIT;
-  Fd *p = (Fd *)realloc(g_fds, (unsigned long)n * sizeof *p);
+  Fd *p = (Fd *)realloc(g_fds, (usz)n * sizeof *p);
   if (!p) return 0;
   for (u32 i = g_nfds; i < n; i++) fd_clear(&p[i]);
   g_fds = p;
@@ -464,7 +489,17 @@ static u32 put_filestat(WarmInstance *vm, u64 buf_, const u8 *st) {
   return WASI_ESUCCESS;
 }
 
+#if defined(WARMC_WINDOWS)
+/* x64 spills arguments in eight-byte slots, the same as the Win64 ABI this
+   file is compiled for, so path_open's last two parameters need no help. */
+typedef u64 wide_arg;
+#else
+/* AArch64 has eight argument registers and warmc spills the rest in 16-byte
+   slots, so the two parameters past the eighth have to be declared as
+   something that occupies one.  An __int128 does; a u64 would sit in the
+   low half of the slot the caller wrote and read the wrong one. */
 typedef unsigned __int128 wide_arg;
+#endif
 
 static u32 walk_leaf(int root, char *path, int *out_dir, char *leaf,
                      int follow) {
@@ -560,10 +595,10 @@ static u64 wasi_fd_prestat_dir_name(WarmInstance *vm, u64 fd_, u64 p_, u64 n_) {
   Fd *f = fd_get((u32)fd_);
   if (!f || !f->preopen) return WASI_EBADF;
   u32 p = (u32)p_, n = (u32)n_;
-  unsigned long len = cstrlen(f->pre_name);
+  usz len = cstrlen(f->pre_name);
   if (n < len) return 28 ;
   if (!ok(vm, p, len)) return WASI_EFAULT;
-  for (unsigned long i = 0; i < len; i++) vm->mem_base[p + i] = (u8)f->pre_name[i];
+  for (usz i = 0; i < len; i++) vm->mem_base[p + i] = (u8)f->pre_name[i];
   return WASI_ESUCCESS;
 }
 
@@ -685,7 +720,7 @@ static u64 fs_pio(WarmInstance *vm, u64 fd_, u64 iovs_, u64 niov_, u64 off_,
     }
     total += (u64)r;
     off += r;
-    if ((unsigned long)r < len) break;
+    if ((usz)r < len) break;
   }
   if (!put32(vm, pn, (u32)total)) return WASI_EFAULT;
   return WASI_ESUCCESS;
@@ -1175,8 +1210,8 @@ extern int setsockopt(int, int, int, const void *, unsigned int);
 extern int bind(int, const void *, unsigned int);
 extern int listen(int, int);
 extern int accept(int, void *, void *);
-extern long recv(int, void *, unsigned long, int);
-extern long send(int, const void *, unsigned long, int);
+extern long recv(int, void *, usz, int);
+extern long send(int, const void *, usz, int);
 extern int shutdown(int, int);
 
 #define H_AF_INET     2
@@ -1255,7 +1290,7 @@ static u64 sock_io(WarmInstance *vm, Fd *f, u64 iovs_, u64 niov_, int mflags,
     }
     total += (u64)r;
 
-    if ((unsigned long)r < len) break;
+    if ((usz)r < len) break;
   }
   if (!put32(vm, (u32)pn_, (u32)total)) return WASI_EFAULT;
   return WASI_ESUCCESS;
@@ -1319,7 +1354,7 @@ static u64 wasi_fd_read(WarmInstance *vm, u64 fd, u64 iovs, u64 niov, u64 pn) {
 
 static int add_preopen(const char *spec) {
 
-  unsigned long n = 0;
+  usz n = 0;
   while (spec[n] && !(spec[n] == ':' && spec[n + 1] == ':')) n++;
 
   if (!n || n >= PATHMAX) return 0;
@@ -1327,7 +1362,7 @@ static int add_preopen(const char *spec) {
 
   char *host = (char *)malloc(n + 1);
   if (!host) return 0;
-  for (unsigned long i = 0; i < n; i++) host[i] = spec[i];
+  for (usz i = 0; i < n; i++) host[i] = spec[i];
   host[n] = 0;
 
   int fd = openat(H_AT_FDCWD, host, H_RDONLY | H_DIRECTORY);

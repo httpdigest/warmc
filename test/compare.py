@@ -28,6 +28,33 @@ def fold_v128(text):
         return "v128:0x%032x" % bits
     return V128_RE.sub(one, text)
 
+# The accepted x64 NaN policy (hostenv exports WARMC_X64_NAN on the native
+# Windows row): freshly generated NaNs carry the sign bit on x64 and not on
+# AArch64 or in wasm-interp.  Both are spec-conformant arithmetic NaNs, so
+# exactly the negated canonical patterns fold to the canonical ones --
+# including through i32/i64 reinterpretation, which is how the float cases
+# observe exact bits.
+X64_NAN = os.environ.get("WARMC_X64_NAN") == "1"
+NAN_FOLD = {("i32", 0xffc00000): 0x7fc00000,
+            ("f32", 0xffc00000): 0x7fc00000,
+            ("i64", 0xfff8000000000000): 0x7ff8000000000000,
+            ("f64", 0xfff8000000000000): 0x7ff8000000000000}
+
+def fold_v128_nan(bits):
+    """The same fold inside a vector, whose lane type is no longer in hand.
+
+    A folded v128 is one 128-bit integer, so each rule is applied at its own
+    lane width.  The two patterns cannot be confused for one another: the
+    64-bit one splits into 0xfff80000 and 0, neither of which is the 32-bit
+    one.
+    """
+    for w, pat, canon in ((32, 0xffc00000, 0x7fc00000),
+                          (64, 0xfff8000000000000, 0x7ff8000000000000)):
+        for i in range(128 // w):
+            if (bits >> (i * w)) & ((1 << w) - 1) == pat:
+                bits ^= (pat ^ canon) << (i * w)
+    return bits
+
 def norm(tok):
     tok = tok.strip().rstrip(",")
     if ":" not in tok:
@@ -36,12 +63,22 @@ def norm(tok):
     ty = ty.strip()
     val = val.strip()
     if ty in ("i32", "i64"):
-        v = int(val, 0)
-        return "%s:%x" % (ty, v & MASK[ty])
+        v = int(val, 0) & MASK[ty]
+        if X64_NAN:
+            v = NAN_FOLD.get((ty, v), v)
+        return "%s:%x" % (ty, v)
     if ty in ("f32", "f64"):
         if val.startswith("0x"):
-            return "%s:0x%x" % (ty, int(val, 16) & MASK[ty])
+            v = int(val, 16) & MASK[ty]
+            if X64_NAN:
+                v = NAN_FOLD.get((ty, v), v)
+            return "%s:0x%x" % (ty, v)
         return "%s:%s" % (ty, val)
+    if ty == "v128" and val.startswith("0x"):
+        v = int(val, 16) & ((1 << 128) - 1)
+        if X64_NAN:
+            v = fold_v128_nan(v)
+        return "v128:0x%032x" % v
     return "%s:%s" % (ty, val)
 
 def read_reference(ref_path):

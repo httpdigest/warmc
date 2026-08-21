@@ -1,5 +1,6 @@
 #include "warmc.h"
 #include "clink.h"
+#include "target.h"
 #include "opcodes.h"
 #include "reader.h"
 
@@ -9,15 +10,23 @@
 
 static uint32_t module_max_outgoing(Module *m) {
   uint32_t worst = 0;
+  int int_cap = g_target->narg_int - 1;   /* one int slot carries vmctx */
+  int fp_cap = g_target->narg_fp;
+  /* Mirrors the backends' stack-argument walk: one arg_slot per scalar, an
+     aligned 16 for a v128.  With a64's 16-byte slot that is just
+     nstack * 16, the shape this had before x64 needed a narrower one. */
   for (uint32_t i = 0; i < m->ntypes; i++) {
     CompType *t = &m->types[i];
-    int ints = 0, flts = 0, stack = 0;
+    int ints = 0, flts = 0;
+    uint32_t bytes = 0;
     for (uint32_t j = 0; j < t->nparams; j++) {
-
-      if (vt_is_vec_reg(t->params[j])) { if (flts < 8) flts++; else stack++; }
-      else { if (ints < 7) ints++; else stack++; }
+      bool vec = t->params[j] == VT_V128;
+      if (vt_is_vec_reg(t->params[j])) { if (flts < fp_cap) { flts++; continue; } }
+      else { if (ints < int_cap) { ints++; continue; } }
+      if (vec) bytes = ((bytes + 15) & ~15u) + 16;
+      else bytes += g_target->arg_slot;
     }
-    if ((uint32_t)stack * ARG_STACK_SLOT > worst) worst = (uint32_t)stack * ARG_STACK_SLOT;
+    if (bytes > worst) worst = bytes;
   }
   return (worst + 15) & ~15u;
 }

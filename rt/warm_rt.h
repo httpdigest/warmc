@@ -10,7 +10,13 @@ typedef short i16;
 typedef int i32;
 typedef long long i64;
 
+/* Pointer-sized integers.  A plain long is NOT one on LLP64 Windows,
+   so pointer casts and size parameters go through these instead. */
+typedef __UINTPTR_TYPE__ uptr;
+typedef __SIZE_TYPE__ usz;
+
 _Static_assert(sizeof(void *) == 8, "warmc runtime targets 64-bit only");
+_Static_assert(sizeof(uptr) == 8 && sizeof(usz) == 8, "64-bit only");
 
 #define WASM_PAGE_SIZE 65536
 
@@ -229,6 +235,17 @@ typedef struct {
 #define GC_C_R         (1ull << (GC_COLOUR_SHIFT + 2))
 #define GC_COLOUR_MASK (GC_C_M0 | GC_C_M1 | GC_C_R)
 #define GC_ADDR(p)     ((u64)(p) & ~GC_COLOUR_MASK)
+
+/* A reference as a dereferenceable address.  AArch64's top-byte-ignore makes
+   a colour-tagged reference dereferenceable as it is; x64 has no TBI, so the
+   colour must be masked off at every deref (compiled code does the same).
+   The value that flows onward -- into slots, tables, other frames -- keeps
+   its colour; only the address a deref uses is canonicalized. */
+#if defined(__x86_64__)
+#define GC_CANON(p) GC_ADDR(p)
+#else
+#define GC_CANON(p) ((u64)(p))
+#endif
 
 enum {
   RTK_ANY = 0, RTK_EQ, RTK_I31, RTK_STRUCT, RTK_ARRAY,
@@ -488,12 +505,12 @@ WarmInstance *warmc_instantiate_catching(const ModuleDesc *md, u32 *err);
 u32 warmc_invoke_catching(void *fn, WarmInstance *vm, const u64 *iargs,
                           const u64 *fargs, u64 *retbuf);
 const char *warmc_trap_name(u32 code);
-long warmc_rt_write(int fd, const void *buf, unsigned long n);
-long warmc_rt_read(int fd, void *buf, unsigned long n);
+long warmc_rt_write(int fd, const void *buf, usz n);
+long warmc_rt_read(int fd, void *buf, usz n);
 
 u64 warmc_rt_nanos(int realtime);
 
-int warmc_rt_random(void *buf, unsigned long n);
+int warmc_rt_random(void *buf, usz n);
 char **warmc_rt_environ(void);
 __attribute__((noreturn)) void warmc_rt_exit(int code);
 
@@ -572,6 +589,20 @@ enum { VT_I32 = 0x7f, VT_I64 = 0x7e, VT_F32 = 0x7d, VT_F64 = 0x7c,
 
 void warmc_invoke(void *fn, WarmInstance *vm, const u64 *iargs,
                   const u64 *fargs, u64 *retbuf);
+
+#if defined(__x86_64__)
+/* x64 carries only 3 ints and 4 floats in argument registers; a callee
+   with more reads the rest from its incoming stack slots, which
+   warmc_invoke cannot populate.  These variants also copy a caller-built
+   image of those slots: 16 bytes per parameter past its class's register
+   ceiling, in parameter order. */
+void warmc_invoke_s(void *fn, WarmInstance *vm, const u64 *iargs,
+                    const u64 *fargs, u64 *retbuf,
+                    const u64 *stk, u64 stk_bytes);
+u32 warmc_invoke_catching_s(void *fn, WarmInstance *vm, const u64 *iargs,
+                            const u64 *fargs, u64 *retbuf,
+                            const u64 *stk, u64 stk_bytes);
+#endif
 
 void warmc_trap(u32 code);
 void warmc_unreached(void);

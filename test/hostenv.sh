@@ -32,6 +32,15 @@ case "$(uname -s)/$(uname -m)" in
     WARMC_RUN=""
     WARMC_HOST=native-linux
     ;;
+  MINGW64_NT*/x86_64|CLANG64_NT*/x86_64|MSYS_NT*/x86_64)
+    WARMC_TARGET_FLAGS="--target=windows --rt $BUILD/warmrt-windows.a"
+    WARMC_RUN=""
+    WARMC_HOST=native-windows
+    # Accepted NaN policy: x64 hardware generates the canonical quiet NaN
+    # with the sign bit SET; the comparison folds exactly that pattern.
+    WARMC_X64_NAN=1
+    export WARMC_X64_NAN
+    ;;
   *)
     WARMC_TARGET_FLAGS="--rt $BUILD/warmrt.a"
     WARMC_RUN="qemu-aarch64"

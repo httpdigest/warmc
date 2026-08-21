@@ -5,22 +5,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-typedef struct {
-  uint8_t *data;
-  size_t len, cap;
-
-  uint32_t flags_epoch;
-} Buf;
-
-void buf_reserve(Buf *b, size_t extra);
-void buf_u8(Buf *b, uint8_t v);
-void buf_u16(Buf *b, uint16_t v);
-void buf_u32(Buf *b, uint32_t v);
-void buf_u64(Buf *b, uint64_t v);
-void buf_bytes(Buf *b, const void *p, size_t n);
-void buf_zero(Buf *b, size_t n);
-void buf_align(Buf *b, size_t align);
-void buf_free(Buf *b);
+#include "buf.h"
 
 enum {
   R0, R1, R2, R3, R4, R5, R6, R7,

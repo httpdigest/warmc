@@ -238,7 +238,8 @@ def link(objs, out):
     return hostbuild.link(objs, out, BUILD)
 
 def compile_module(wasm, obj, prefix, level):
-    target = ["--target=macos"] if DARWIN else []
+    target = ["--target=macos"] if DARWIN \
+        else ["--target=windows"] if hostbuild.WINDOWS else []
     return sh([WARMC] + level + target +
               ["--symbol-prefix=" + prefix, "-c", "-o", obj, wasm],
               timeout=WARMC_TIMEOUT)

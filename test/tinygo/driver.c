@@ -22,7 +22,7 @@ const ModuleDesc warmc_module = { 0 };
 static void out(const char *s) {
   const char *p = s;
   while (*p) p++;
-  warmc_rt_write(2, s, (unsigned long)(p - s));
+  warmc_rt_write(2, s, (usz)(p - s));
 }
 
 /* ---- the syscalls ----------------------------------------------------- */

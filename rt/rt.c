@@ -9,35 +9,39 @@
 #define GUARD_RESERVE \
   ((4ull << 30) + WASM_GUARD_OFFSET_MAX + (2ull << 20) + (1ull << 16))
 
-#if defined(WARMC_DARWIN)
+#if defined(WARMC_WINDOWS)
+
+#include "win.inc"
+
+#elif defined(WARMC_DARWIN)
 
 #define MAP_ANONYMOUS 0x1000
-extern long write(int, const void *, unsigned long);
-extern void *mmap(void *, unsigned long, int, int, int, long long);
-extern int mprotect(void *, unsigned long, int);
+extern long write(int, const void *, usz);
+extern void *mmap(void *, usz, int, int, int, long long);
+extern int mprotect(void *, usz, int);
 extern void exit(int) __attribute__((noreturn));
 extern int *__error(void);
 
-static long sys_write(int fd, const void *buf, unsigned long n) {
+static long sys_write(int fd, const void *buf, usz n) {
   long r = write(fd, buf, n);
   return r < 0 ? -(long)*__error() : r;
 }
 __attribute__((noreturn)) static void sys_exit(int code) { exit(code); }
-static void *sys_mmap(void *addr, unsigned long len, int prot, int flags) {
+static void *sys_mmap(void *addr, usz len, int prot, int flags) {
   void *p = mmap(addr, len, prot, flags, -1, 0);
   return ((long)p == -1) ? (void *)0 : p;
 }
-static int sys_mprotect(void *addr, unsigned long len, int prot) {
+static int sys_mprotect(void *addr, usz len, int prot) {
   return mprotect(addr, len, prot);
 }
-extern int munmap(void *, unsigned long);
-static void sys_munmap(void *addr, unsigned long len) { munmap(addr, len); }
+extern int munmap(void *, usz);
+static void sys_munmap(void *addr, usz len) { munmap(addr, len); }
 
-extern int madvise(void *, unsigned long, int);
+extern int madvise(void *, usz, int);
 #define WARMC_MADV_FREE 7
 
 #define WARMC_MADV_ZEROES 0
-static int sys_madvise(void *addr, unsigned long len, int advice) {
+static int sys_madvise(void *addr, usz len, int advice) {
   return madvise(addr, len, advice);
 }
 
@@ -46,13 +50,13 @@ static u64 sys_nanos(void) { return clock_gettime_nsec_np(8); }
 
 static u64 sys_realtime_nanos(void) { return clock_gettime_nsec_np(0); }
 
-extern long read(int, void *, unsigned long);
-static long sys_read(int fd, void *buf, unsigned long n) {
+extern long read(int, void *, usz);
+static long sys_read(int fd, void *buf, usz n) {
   long r = read(fd, buf, n);
   return r < 0 ? -(long)*__error() : r;
 }
-extern void arc4random_buf(void *, unsigned long);
-static int sys_random(void *buf, unsigned long n) {
+extern void arc4random_buf(void *, usz);
+static int sys_random(void *buf, usz n) {
   arc4random_buf(buf, n);
   return 0;
 }
@@ -87,29 +91,29 @@ static long sys(long n, long a, long b, long c, long d, long e, long f) {
   return x0;
 }
 
-static long sys_write(int fd, const void *buf, unsigned long n) {
+static long sys_write(int fd, const void *buf, usz n) {
   return sys(SYS_write, fd, (long)buf, (long)n, 0, 0, 0);
 }
 __attribute__((noreturn)) static void sys_exit(int code) {
   sys(SYS_exit, code, 0, 0, 0, 0, 0);
   __builtin_unreachable();
 }
-static void *sys_mmap(void *addr, unsigned long len, int prot, int flags) {
+static void *sys_mmap(void *addr, usz len, int prot, int flags) {
   long r = sys(SYS_mmap, (long)addr, (long)len, prot, flags, -1, 0);
   if (r < 0 && r > -4096) return (void *)0;
   return (void *)r;
 }
-static int sys_mprotect(void *addr, unsigned long len, int prot) {
+static int sys_mprotect(void *addr, usz len, int prot) {
   return (int)sys(SYS_mprotect, (long)addr, (long)len, prot, 0, 0, 0);
 }
-static void sys_munmap(void *addr, unsigned long len) {
+static void sys_munmap(void *addr, usz len) {
   sys(SYS_munmap, (long)addr, (long)len, 0, 0, 0, 0);
 }
 
 #define WARMC_MADV_FREE 4
 
 #define WARMC_MADV_ZEROES 1
-static int sys_madvise(void *addr, unsigned long len, int advice) {
+static int sys_madvise(void *addr, usz len, int advice) {
   return (int)sys(SYS_madvise, (long)addr, (long)len, advice, 0, 0, 0);
 }
 
@@ -127,16 +131,16 @@ static u64 sys_realtime_nanos(void) {
   sys(SYS_clock_gettime, 0 , (long)ts, 0, 0, 0, 0);
   return (u64)ts[0] * 1000000000ull + (u64)ts[1];
 }
-static long sys_read(int fd, void *buf, unsigned long n) {
+static long sys_read(int fd, void *buf, usz n) {
   return sys(SYS_read, fd, (long)buf, (long)n, 0, 0, 0);
 }
-static int sys_random(void *buf, unsigned long n) {
+static int sys_random(void *buf, usz n) {
 
-  unsigned long got = 0;
+  usz got = 0;
   while (got < n) {
     long r = sys(SYS_getrandom, (long)((char *)buf + got), (long)(n - got), 0, 0, 0, 0);
     if (r <= 0) return -1;
-    got += (unsigned long)r;
+    got += (usz)r;
   }
   return 0;
 }
@@ -144,19 +148,27 @@ static void sys_prefer_fast_core(void) { }
 
 #endif
 
-static void out(const char *s, unsigned long n) { sys_write(1, s, n); }
+static inline void warmc_cpu_relax(void) {
+#if defined(__aarch64__)
+  __asm__ volatile("yield" ::: "memory");
+#else
+  __asm__ volatile("pause" ::: "memory");
+#endif
+}
 
-long warmc_rt_write(int fd, const void *buf, unsigned long n) {
+static void out(const char *s, usz n) { sys_write(1, s, n); }
+
+long warmc_rt_write(int fd, const void *buf, usz n) {
   return sys_write(fd, (const char *)buf, n);
 }
-long warmc_rt_read(int fd, void *buf, unsigned long n) {
+long warmc_rt_read(int fd, void *buf, usz n) {
   return sys_read(fd, buf, n);
 }
 u64 warmc_rt_nanos(int realtime) {
   return realtime ? sys_realtime_nanos() : sys_nanos();
 }
-int warmc_rt_random(void *buf, unsigned long n) { return sys_random(buf, n); }
-static unsigned long slen(const char *s) { const char *p = s; while (*p) p++; return (unsigned long)(p - s); }
+int warmc_rt_random(void *buf, usz n) { return sys_random(buf, n); }
+static usz slen(const char *s) { const char *p = s; while (*p) p++; return (usz)(p - s); }
 static void puts_(const char *s) { out(s, slen(s)); }
 static void eputs(const char *s) { sys_write(2, s, slen(s)); }
 
@@ -165,14 +177,14 @@ static void put_u64(u64 v) {
   int i = 24;
   if (!v) { puts_("0"); return; }
   while (v) { buf[--i] = (char)('0' + (v % 10)); v /= 10; }
-  out(buf + i, (unsigned long)(24 - i));
+  out(buf + i, (usz)(24 - i));
 }
 static void put_u64_e(u64 v) {
   char buf[24];
   int i = 24;
   if (!v) { eputs("0"); return; }
   while (v) { buf[--i] = (char)('0' + (v % 10)); v /= 10; }
-  sys_write(2, buf + i, (unsigned long)(24 - i));
+  sys_write(2, buf + i, (usz)(24 - i));
 }
 static void put_i64(i64 v) {
   if (v < 0) { puts_("-"); put_u64((u64)(-(v + 1)) + 1); }
@@ -183,14 +195,14 @@ static void put_hex(u64 v, int digits) {
   char buf[19];
   buf[0] = '0'; buf[1] = 'x';
   for (int i = 0; i < digits; i++) buf[2 + i] = hexdig[(v >> (4 * (digits - 1 - i))) & 0xf];
-  out(buf, (unsigned long)(2 + digits));
+  out(buf, (usz)(2 + digits));
 }
 
 static void put_hex_raw(u64 v, int digits) {
   static const char hexdig[] = "0123456789abcdef";
   char buf[16];
   for (int i = 0; i < digits; i++) buf[i] = hexdig[(v >> (4 * (digits - 1 - i))) & 0xf];
-  out(buf, (unsigned long)digits);
+  out(buf, (usz)digits);
 }
 
 #define MAX_GLOBALS 4096
@@ -305,7 +317,7 @@ static WarmTable *table_of(Instance *in, u32 i) {
 
 static u64 *global_cell(Instance *in, u32 index) {
   u64 *slot = inst_global(in, index);
-  return (in->md->globals[index].flags & GLOBAL_IMPORTED) ? (u64 *)(unsigned long)*slot : slot;
+  return (in->md->globals[index].flags & GLOBAL_IMPORTED) ? (u64 *)(uptr)*slot : slot;
 }
 
 static void arr_store(u8 *at, u32 width, u64 lo, u64 hi);
@@ -349,7 +361,7 @@ static void const_eval(Instance *in, u32 at, u64 *out) {
   } while (0)
 
 #define CPUSH_OBJ(v) do {                                                      \
-    CPUSH((u64)(unsigned long)(v), 0);                                          \
+    CPUSH((u64)(uptr)(v), 0);                                          \
     roots[sp - 1] = lo[sp - 1];                                                 \
   } while (0)
 
@@ -369,7 +381,7 @@ static void const_eval(Instance *in, u32 at, u64 *out) {
         break;
       case IOP_REF_NULL: CPUSH(0, 0); break;
       case IOP_REF_FUNC:
-        CPUSH((u64)(unsigned long)&inst_funcrefs(in)[p->a], 0);
+        CPUSH((u64)(uptr)&inst_funcrefs(in)[p->a], 0);
         break;
       case IOP_GLOBAL_GET: {
         const u64 *src = global_cell(in, p->a);
@@ -428,9 +440,10 @@ static void const_eval(Instance *in, u32 at, u64 *out) {
           const GcTypeInfo *ti = &in->md->gctypes[p->a];
           if (sp < ti->nfields) die("malformed constant expression");
           sp -= ti->nfields;
+          u8 *ow = (u8 *)(uptr)GC_CANON((u64)(uptr)o);
           for (u32 j = 0; j < ti->nfields; j++) {
 
-            u8 *at = o + gcti_fields(ti)[j].offset;
+            u8 *at = ow + gcti_fields(ti)[j].offset;
             u64 x = lo[sp + j];
             switch (gcti_fields(ti)[j].width) {
               case 1: *(u8 *)at = (u8)x; break;
@@ -497,7 +510,12 @@ static const char *trap_name(u32 code) {
 int warmc_setjmp(u64 *buf);
 __attribute__((noreturn)) void warmc_longjmp(u64 *buf, int val);
 
+#if defined(__x86_64__)
+/* the Win64 callee-saved set plus full-width xmm6-15 needs 240 bytes */
+static u64 g_catch_buf[32];
+#else
 static u64 g_catch_buf[24];
+#endif
 static int g_catching;
 static u32 g_trap_code;
 
@@ -574,6 +592,27 @@ u32 warmc_invoke_catching(void *fn, WarmInstance *v, const u64 *iargs,
   return 0;
 }
 
+#if defined(__x86_64__)
+u32 warmc_invoke_catching_s(void *fn, WarmInstance *v, const u64 *iargs,
+                            const u64 *fargs, u64 *retbuf,
+                            const u64 *stk, u64 stk_bytes) {
+  u64 depth = warmc_gc_invoke_depth;
+  u64 outer[sizeof g_catch_buf / sizeof g_catch_buf[0]];
+  int was;
+  catch_save(outer, &was);
+  if (warmc_setjmp(g_catch_buf)) {
+    catch_restore(outer, was);
+    warmc_gc_invoke_depth = depth;
+    gc_after_trap();
+    return g_trap_code;
+  }
+  g_catching = 1;
+  warmc_invoke_s(fn, v, iargs, fargs, retbuf, stk, stk_bytes);
+  catch_restore(outer, was);
+  return 0;
+}
+#endif
+
 static void republish_memory(WarmMemory *M) {
   for (u32 i = 0; i < ninstances; i++) {
     Instance *in = instances[i];
@@ -614,7 +653,7 @@ u64 warmc_memory_grow(WarmInstance *v, u64 delta, u32 mem) {
   if (delta == 0) return old;
   u64 want = old + delta;
   if (want < old || want > M->max_pages) return (u64)-1;
-  unsigned long add = (unsigned long)delta * WASM_PAGE_SIZE;
+  usz add = (usz)delta * WASM_PAGE_SIZE;
   if (sys_mprotect(M->base + old * WASM_PAGE_SIZE, add, PROT_READ | PROT_WRITE) != 0)
     return (u64)-1;
   M->pages = want;
@@ -632,7 +671,7 @@ typedef unsigned char v16 __attribute__((vector_size(16), aligned(1)));
 
 #if defined(WARMC_DARWIN)
 
-extern void *memmove(void *, const void *, unsigned long);
+extern void *memmove(void *, const void *, usz);
 #define PLATFORM_MEMMOVE_FROM 65536u
 
 #define PLATFORM_MEMMOVE_OVERLAP 512u
@@ -819,7 +858,7 @@ void *warmc_table_get(WarmInstance *v, u64 i, u32 tab) {
   WarmTable *T = table_of(INST_OF(v), tab);
   if (!T || i >= T->len) warmc_trap(TRAP_TABLE_OOB);
 
-  return (void *)(unsigned long)gc_load((u64 *)&T->entries[i]);
+  return (void *)(uptr)gc_load((u64 *)&T->entries[i]);
 }
 
 void warmc_table_set(WarmInstance *v, u64 i, void *ref, u32 tab) {
@@ -897,8 +936,8 @@ static void register_desc(const ModuleDesc *md) {
   if (ndescs >= MAX_MODULE_DESCS) die("too many modules");
   u8 sorted = 1;
   for (u32 k = 1; k < md->nunwind; k++)
-    if ((u64)(unsigned long)md->unwind[k].code <
-        (u64)(unsigned long)md->unwind[k - 1].code) { sorted = 0; break; }
+    if ((u64)(uptr)md->unwind[k].code <
+        (u64)(uptr)md->unwind[k - 1].code) { sorted = 0; break; }
   desc_sorted[ndescs] = sorted;
   descs[ndescs++] = md;
 }
@@ -912,7 +951,7 @@ static const FuncUnwind *find_unwind_in(u64 pc, const ModuleDesc **owner) {
     if (!desc_sorted[i]) {
       for (u32 k = 0; k < md->nunwind; k++) {
         const FuncUnwind *u = &md->unwind[k];
-        u64 base = (u64)(unsigned long)u->code;
+        u64 base = (u64)(uptr)u->code;
         if (pc >= base && pc < base + u->code_len) {
           if (owner) *owner = md;
           return u;
@@ -924,7 +963,7 @@ static const FuncUnwind *find_unwind_in(u64 pc, const ModuleDesc **owner) {
     while (lo < hi) {
       u32 mid = lo + (hi - lo) / 2;
       const FuncUnwind *u = &md->unwind[mid];
-      u64 base = (u64)(unsigned long)u->code;
+      u64 base = (u64)(uptr)u->code;
       if (pc < base) hi = mid;
       else if (pc >= base + u->code_len) lo = mid + 1;
       else { if (owner) *owner = md; return u; }
@@ -935,15 +974,16 @@ static const FuncUnwind *find_unwind_in(u64 pc, const ModuleDesc **owner) {
 
 static const FuncUnwind *find_unwind(u64 pc) { return find_unwind_in(pc, 0); }
 
-static u64 load64(u64 addr) { return *(const u64 *)(unsigned long)addr; }
+static u64 load64(u64 addr) { return *(const u64 *)(uptr)addr; }
 
 __attribute__((noreturn))
 static void unwind(WarmExn *exn, u64 pc, u64 sp, WarmRegs regs) {
+  const WarmExn *xw = (const WarmExn *)(uptr)GC_CANON((u64)(uptr)exn);
   for (;;) {
     const FuncUnwind *u = find_unwind(pc);
 
     if (!u) warmc_trap(TRAP_UNCAUGHT_EXN);
-    u32 off = (u32)(pc - (u64)(unsigned long)u->code);
+    u32 off = (u32)(pc - (u64)(uptr)u->code);
 
     const u8 *s = u->sites;
     u32 spc = 0;
@@ -952,13 +992,13 @@ static void unwind(WarmExn *exn, u64 pc, u64 sp, WarmRegs regs) {
       u32 first = uw_uleb(&s), n = uw_uleb(&s);
       if (spc < off) continue;
       if (spc > off) break;
-      Instance *in = INST_OF((WarmInstance *)(unsigned long)regs.gpr[0]);
+      Instance *in = INST_OF((WarmInstance *)(uptr)regs.gpr[0]);
       for (u32 k = 0; k < n; k++) {
         const UwClause *c = &u->clauses[first + k];
         if (c->kind < 2 &&
-            (c->tag >= in->md->ntags || in->tags[c->tag] != exn->tag))
+            (c->tag >= in->md->ntags || in->tags[c->tag] != xw->tag))
           continue;
-        warmc_resume(sp, (u64)(unsigned long)u->code + c->pad, exn,
+        warmc_resume(sp, (u64)(uptr)u->code + c->pad, exn,
                      u->exn_slot, regs.gpr, regs.fpr);
       }
       break;
@@ -971,7 +1011,12 @@ static void unwind(WarmExn *exn, u64 pc, u64 sp, WarmRegs regs) {
     u32 k = 0;
     for (u32 r = 0; r < 10; r++) {
       if (!(u->saved & (1u << (UW_GPR_SHIFT + r)))) continue;
+#if defined(__x86_64__)
+      /* Sequential pushes in unwind-index order, first at entry-16. */
+      regs.gpr[r] = load64(base - 8ull * k);
+#else
       regs.gpr[r] = load64(base - 16ull * (k / 2 + 1) + 8ull * (k % 2));
+#endif
       k++;
     }
     k = 0;
@@ -990,10 +1035,11 @@ void warmc_throw_c(WarmInstance *v, u32 tag, const u64 *payload, u32 nvals,
   Instance *in = INST_OF(v);
   if (tag >= in->md->ntags) die("throw names a tag the module does not have");
   WarmExn *e = exn_alloc(in, tag);
-  e->tag = in->tags[tag];
-  e->nvals = nvals;
+  WarmExn *ew = (WarmExn *)(uptr)GC_CANON((u64)(uptr)e);
+  ew->tag = in->tags[tag];
+  ew->nvals = nvals;
 
-  for (u32 i = 0; i < 2u * nvals; i++) e->vals[i] = payload[i];
+  for (u32 i = 0; i < 2u * nvals; i++) ew->vals[i] = payload[i];
   unwind(e, pc, sp, *snap);
 }
 
@@ -1010,7 +1056,7 @@ static void report_icount(WarmInstance *inst) {
     int i = 24;
     u64 v = inst->icount;
     while (v) { buf[--i] = (char)('0' + (v % 10)); v /= 10; }
-    sys_write(2, buf + i, (unsigned long)(24 - i));
+    sys_write(2, buf + i, (usz)(24 - i));
   }
   eputs("\n");
 }
@@ -1025,7 +1071,7 @@ static int addr_in_a_guard(const u8 *addr) {
   return 0;
 }
 
-#if !defined(WARMC_DARWIN)
+#if !defined(WARMC_DARWIN) && !defined(WARMC_WINDOWS)
 #define SYS_rt_sigaction 134
 #define SA_SIGINFO   0x00000004u
 #define SA_RESTORER  0x04000000u
@@ -1034,9 +1080,9 @@ static int addr_in_a_guard(const u8 *addr) {
 
 struct k_sigaction {
   void *handler;
-  unsigned long flags;
+  usz flags;
   void *restorer;
-  unsigned long mask;
+  usz mask;
 };
 
 __attribute__((naked)) static void sig_restorer(void) {
@@ -1044,13 +1090,16 @@ __attribute__((naked)) static void sig_restorer(void) {
 }
 #endif
 
+static int gcth_on_collector(void);
+
+/* Windows installs a vectored exception handler instead (win.inc). */
+#if !defined(WARMC_WINDOWS)
+
 #if defined(WARMC_DARWIN)
 #define SI_ADDR_OFF 24
 #else
 #define SI_ADDR_OFF 16
 #endif
-
-static int gcth_on_collector(void);
 
 static void fault_handler(int sig, void *info, void *uc) {
   (void)sig; (void)uc;
@@ -1084,6 +1133,8 @@ static void install_fault_handler(void) {
   sys(SYS_rt_sigaction, 7 , (long)&act, 0, 8, 0, 0);
 #endif
 }
+
+#endif /* !WARMC_WINDOWS */
 
 typedef struct { u32 v; u32 sleepers; } GcthGate;
 
@@ -1142,13 +1193,49 @@ static int gcth_spawn(void (*entry)(void)) {
   return 1;
 }
 
+#elif defined(WARMC_WINDOWS)
+
+static void (*gcth_entry_fn)(void);
+static u32 gcth_tid;
+
+static int gcth_on_collector(void) {
+  u32 t = __atomic_load_n(&gcth_tid, __ATOMIC_ACQUIRE);
+  return t != 0 && GetCurrentThreadId() == t;
+}
+
+static u32 gcth_trampoline(void *arg) {
+  (void)arg;
+  __atomic_store_n(&gcth_tid, GetCurrentThreadId(), __ATOMIC_RELEASE);
+  gcth_entry_fn();
+  return 0;
+}
+
+static int gcth_spawn(void (*entry)(void)) {
+  gcth_entry_fn = entry;
+  void *h = CreateThread(0, 0, gcth_trampoline, 0, 0, 0);
+  if (!h) return 0;
+  CloseHandle(h);
+  return 1;
+}
+
+static void gcth_wait(u32 *w, u32 expect, u64 ns) {
+  u32 ms = 0xffffffffu;                     /* INFINITE */
+  gcth_nwaits++;
+  if (ns) {
+    u64 m = (ns + 999999) / 1000000;        /* round up: never early */
+    ms = !m ? 1 : m > 0xfffffffeull ? 0xfffffffeu : (u32)m;
+  }
+  WaitOnAddress(w, &expect, 4, ms);
+}
+static void gcth_wake(u32 *w) { WakeByAddressSingle(w); }
+
 #else
 
 #define SYS_futex 98
 
 #define GCTH_CLONE_FLAGS 0x50f00ul
 
-extern long warmc_gcth_clone(unsigned long flags, void *stacktop,
+extern long warmc_gcth_clone(usz flags, void *stacktop,
                              void (*entry)(void));
 
 static void gcth_wait(u32 *w, u32 expect, u64 ns) {
@@ -1178,7 +1265,7 @@ static int gcth_spawn(void (*entry)(void)) {
   if (!st) return 0;
   if (sys_mprotect(st, 4096, PROT_NONE) != 0) return 0;
 
-  gcth_stack_lo = (u64)(unsigned long)st;
+  gcth_stack_lo = (u64)(uptr)st;
   gcth_stack_hi = gcth_stack_lo + GCTH_STACK_BYTES;
   if (warmc_gcth_clone(GCTH_CLONE_FLAGS, st + GCTH_STACK_BYTES, entry) <= 0) {
     gcth_stack_lo = gcth_stack_hi = 0;
@@ -1192,7 +1279,7 @@ static int gcth_spawn(void (*entry)(void)) {
 static int gcth_spun_out(GcthGate *g, u32 expect) {
   for (u32 i = __atomic_load_n(&gcth_spin, __ATOMIC_RELAXED); i; i--) {
     if (__atomic_load_n(&g->v, __ATOMIC_ACQUIRE) != expect) return 1;
-    __asm__ volatile("yield" ::: "memory");
+    warmc_cpu_relax();
   }
   return 0;
 }
@@ -1299,8 +1386,8 @@ u32 warmc_bind_import(WarmInstance *v, const char *module, const char *name,
     if (im->kind != 0) continue;
     if (name_eq(im->module, im->module_len, module, mn) &&
         name_eq(im->name, im->name_len, name, nn)) {
-      imports[2 * fi] = (u64)(unsigned long)code;
-      imports[2 * fi + 1] = (u64)(unsigned long)self;
+      imports[2 * fi] = (u64)(uptr)code;
+      imports[2 * fi + 1] = (u64)(uptr)self;
       frs[fi].code = code;
       frs[fi].instance = self;
       bound++;
@@ -1406,7 +1493,7 @@ static u64 gc_gran_hwm;
 static u32 gc_small_page = (u32)-1, gc_medium_page = (u32)-1;
 
 static u32 gc_page_of(const void *p) {
-  return (u32)((GC_ADDR(p) - (u64)(unsigned long)gc_base) >> GC_GRAN_SHIFT);
+  return (u32)((GC_ADDR(p) - (u64)(uptr)gc_base) >> GC_GRAN_SHIFT);
 }
 static u32 gc_page_head(u32 g) {
   return __atomic_load_n(&gc_pages[g].kind, __ATOMIC_ACQUIRE) == GCP_TAIL
@@ -1416,7 +1503,7 @@ static u8 *gc_gran_addr(u32 g) { return gc_base + (u64)g * GC_GRAN; }
 
 static u32 gc_in_heap(u64 v) {
   if (!GC_IS_OBJ(v)) return 0;
-  u64 off = GC_ADDR(v) - (u64)(unsigned long)gc_base;
+  u64 off = GC_ADDR(v) - (u64)(uptr)gc_base;
   if (off >= gc_heap_bytes) return 0;
   return __atomic_load_n(&gc_pages[off >> GC_GRAN_SHIFT].kind,
                          __ATOMIC_ACQUIRE) != GCP_FREE;
@@ -1490,7 +1577,7 @@ static void gc_bits_claim_page(u32 h) {
     if (e == ready) return;
     if (e == busy) {
       while (__atomic_load_n(&gc_page_epoch[h], __ATOMIC_ACQUIRE) != ready)
-        __asm__ volatile("yield" ::: "memory");
+        warmc_cpu_relax();
       return;
     }
     if (__atomic_compare_exchange_n(&gc_page_epoch[h], &e, busy, 0,
@@ -1513,7 +1600,7 @@ static u32 gc_bit_set(u32 g, u64 addr) {
   if (__atomic_load_n(&gc_page_epoch[h], __ATOMIC_ACQUIRE) !=
       GC_EPOCH_READY(gc_cycle_no))
     gc_bits_claim_page(h);
-  u64 i = (GC_ADDR(addr) - (u64)(unsigned long)gc_base) / GC_UNIT;
+  u64 i = (GC_ADDR(addr) - (u64)(uptr)gc_base) / GC_UNIT;
   u64 m = 1ull << (i & 63);
 
   if (!gc_conc_on) {
@@ -1526,7 +1613,7 @@ static u32 gc_bit_set(u32 g, u64 addr) {
 }
 
 static u32 gc_bit_test(u64 addr) {
-  u64 i = (GC_ADDR(addr) - (u64)(unsigned long)gc_base) / GC_UNIT;
+  u64 i = (GC_ADDR(addr) - (u64)(uptr)gc_base) / GC_UNIT;
   return (gc_markbits[i >> 6] >> (i & 63)) & 1u;
 }
 
@@ -1555,7 +1642,7 @@ static void gc_release_pages(u32 h, u32 n) {
   if (!gc_opt_release) return;
   u64 bytes = (u64)n * GC_GRAN;
   if (bytes < gc_opt_release) return;
-  if (sys_madvise(gc_gran_addr(h), (unsigned long)bytes, WARMC_MADV_FREE) == 0) {
+  if (sys_madvise(gc_gran_addr(h), (usz)bytes, WARMC_MADV_FREE) == 0) {
     gc_released += bytes;
     gc_nreleases++;
 
@@ -1567,7 +1654,7 @@ static void gc_release_pages(u32 h, u32 n) {
 static void gc_init(void) {
   if (gc_base) return;
 
-  gc_base = (u8 *)sys_mmap(0, (unsigned long)(gc_heap_bytes + GC_GRAN),
+  gc_base = (u8 *)sys_mmap(0, (usz)(gc_heap_bytes + GC_GRAN),
                            PROT_READ | PROT_WRITE,
                            MAP_PRIVATE | MAP_ANONYMOUS);
   if (!gc_base || gc_base == (u8 *)-1) die("cannot reserve the managed heap");
@@ -1578,27 +1665,27 @@ static void gc_init(void) {
   gc_end = gc_base + gc_heap_bytes;
   gc_ngran = gc_heap_bytes / GC_GRAN;
 
-  gc_pages = (GcPage *)sys_mmap(0, (unsigned long)(gc_ngran * sizeof(GcPage)),
+  gc_pages = (GcPage *)sys_mmap(0, (usz)(gc_ngran * sizeof(GcPage)),
                                 PROT_READ | PROT_WRITE,
                                 MAP_PRIVATE | MAP_ANONYMOUS);
-  gc_page_epoch = (u32 *)sys_mmap(0, (unsigned long)(gc_ngran * sizeof(u32)),
+  gc_page_epoch = (u32 *)sys_mmap(0, (usz)(gc_ngran * sizeof(u32)),
                                   PROT_READ | PROT_WRITE,
                                   MAP_PRIVATE | MAP_ANONYMOUS);
   gc_granfree_words = (gc_ngran + 63) / 64;
-  gc_granfree = (u64 *)sys_mmap(0, (unsigned long)(gc_granfree_words * 8),
+  gc_granfree = (u64 *)sys_mmap(0, (usz)(gc_granfree_words * 8),
                                 PROT_READ | PROT_WRITE,
                                 MAP_PRIVATE | MAP_ANONYMOUS);
 
-  gc_markbits = (u64 *)sys_mmap(0, (unsigned long)(gc_heap_bytes / GC_UNIT / 8),
+  gc_markbits = (u64 *)sys_mmap(0, (usz)(gc_heap_bytes / GC_UNIT / 8),
                                 PROT_READ | PROT_WRITE,
                                 MAP_PRIVATE | MAP_ANONYMOUS);
 
   gc_capgrey = gc_heap_bytes / GC_UNIT;
-  gc_grey = (u8 **)sys_mmap(0, (unsigned long)(gc_capgrey * sizeof(u8 *)),
+  gc_grey = (u8 **)sys_mmap(0, (usz)(gc_capgrey * sizeof(u8 *)),
                             PROT_READ | PROT_WRITE,
                             MAP_PRIVATE | MAP_ANONYMOUS);
 
-  gc_mq = (u8 **)sys_mmap(0, (unsigned long)(gc_capgrey * sizeof(u8 *)),
+  gc_mq = (u8 **)sys_mmap(0, (usz)(gc_capgrey * sizeof(u8 *)),
                           PROT_READ | PROT_WRITE,
                           MAP_PRIVATE | MAP_ANONYMOUS);
   if (!gc_pages || gc_pages == (GcPage *)-1 || !gc_granfree ||
@@ -1610,7 +1697,7 @@ static void gc_init(void) {
   gc_check_tbi();
 
   gc_typetab = (const GcTypeInfo **)sys_mmap(
-      0, (unsigned long)(GC_MAX_TYPES * sizeof(void *)),
+      0, (usz)(GC_MAX_TYPES * sizeof(void *)),
       PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS);
   if (!gc_typetab || gc_typetab == (const GcTypeInfo **)-1)
     die("cannot reserve the type table");
@@ -1649,8 +1736,11 @@ static void gc_publish_colour(void) {
 }
 
 static void gc_check_tbi(void) {
+#if defined(__x86_64__)
+  return;   /* no TBI: every deref masks the colour instead (GC_CANON) */
+#endif
   volatile u64 *raw = (volatile u64 *)gc_base;
-  volatile u64 *tagged = (volatile u64 *)((u64)(unsigned long)gc_base | GC_COLOUR_MASK);
+  volatile u64 *tagged = (volatile u64 *)((u64)(uptr)gc_base | GC_COLOUR_MASK);
   *raw = 0x5aa5c33c0f0f1e1eull;
   if (*tagged != 0x5aa5c33c0f0f1e1eull)
     die("this machine does not ignore the top byte of an address");
@@ -1674,7 +1764,7 @@ static u32 gc_page_lock;
 static u32 gc_lock(void) {
   if (!__atomic_load_n(&gc_conc_on, __ATOMIC_RELAXED)) return 0;
   while (__atomic_exchange_n(&gc_page_lock, 1u, __ATOMIC_ACQUIRE))
-    __asm__ volatile("yield" ::: "memory");
+    warmc_cpu_relax();
   return 1;
 }
 
@@ -1738,8 +1828,8 @@ static u64 gc_nlabs, gc_fast_bytes;
 
 static u64 gc_lab_sync(void) {
   if (!gc_lab_start) return 0;
-  u64 used = GC_ADDR(gc_lab_cell[0]) - (u64)(unsigned long)gc_lab_start;
-  gc_lab_start = (u8 *)(unsigned long)GC_ADDR(gc_lab_cell[0]);
+  u64 used = GC_ADDR(gc_lab_cell[0]) - (u64)(uptr)gc_lab_start;
+  gc_lab_start = (u8 *)(uptr)GC_ADDR(gc_lab_cell[0]);
   gc_alloc_since += used;
   gc_fast_bytes += used;
   return used;
@@ -1748,9 +1838,9 @@ static u64 gc_lab_sync(void) {
 static u64 gc_lab_close(void) {
   u64 used = gc_lab_sync();
   if (gc_lab_cell[1]) {
-    u32 h = gc_page_head(gc_page_of((void *)(unsigned long)gc_lab_cell[0]));
-    if ((u64)(unsigned long)gc_pages[h].top == GC_ADDR(gc_lab_cell[1]))
-      gc_pages[h].top = (u8 *)(unsigned long)GC_ADDR(gc_lab_cell[0]);
+    u32 h = gc_page_head(gc_page_of((void *)(uptr)gc_lab_cell[0]));
+    if ((u64)(uptr)gc_pages[h].top == GC_ADDR(gc_lab_cell[1]))
+      gc_pages[h].top = (u8 *)(uptr)GC_ADDR(gc_lab_cell[0]);
   }
   gc_lab_start = 0;
   gc_lab_cell[0] = gc_lab_cell[1] = 0;
@@ -1811,8 +1901,8 @@ static void gc_lab_refill(void) {
   gc_nlabs++;
   gc_lab_start = p;
 
-  gc_lab_cell[0] = (u64)(unsigned long)p | gc_good;
-  gc_lab_cell[1] = ((u64)(unsigned long)p + q) | gc_good;
+  gc_lab_cell[0] = (u64)(uptr)p | gc_good;
+  gc_lab_cell[1] = ((u64)(uptr)p + q) | gc_good;
 }
 
 static u64 gc_heal_ptr(u64 v);
@@ -1821,7 +1911,7 @@ static u64 gc_heal_reloc(u64 v);
 static u64 gc_born_skipped;
 
 static u32 gc_being_born(u64 v) {
-  if (GCW_TYPE(((const GcHeader *)(unsigned long)GC_ADDR(v))->w)) return 0;
+  if (GCW_TYPE(((const GcHeader *)(uptr)GC_ADDR(v))->w)) return 0;
   if (!__atomic_load_n(&gc_conc_on, __ATOMIC_RELAXED))
     die("a heap object names the reserved type index zero");
   gc_born_skipped++;
@@ -1831,9 +1921,9 @@ static u32 gc_being_born(u64 v) {
 static void gc_mark_word(u64 v) {
   if (!gc_in_heap(v)) return;
   if (gc_being_born(v)) return;
-  u32 g = gc_page_of((void *)(unsigned long)v);
+  u32 g = gc_page_of((void *)(uptr)v);
   if (!gc_bit_set(g, v)) return;
-  u8 *p = (u8 *)(unsigned long)v;
+  u8 *p = (u8 *)(uptr)GC_CANON(v);
   u32 h = gc_page_head(g);
   gc_add_live(h, gc_object_bytes((const GcHeader *)p));
   if (gc_ngrey >= gc_capgrey) die("the collector's mark stack overflowed");
@@ -1843,9 +1933,9 @@ static void gc_mark_word(u64 v) {
 static void gc_mark_ref(u64 v) {
   if (!gc_in_heap(v)) return;
   if (gc_being_born(v)) return;
-  u32 g = gc_page_of((void *)(unsigned long)v);
+  u32 g = gc_page_of((void *)(uptr)v);
   if (!gc_bit_set(g, v)) return;
-  u8 *p = (u8 *)(unsigned long)v;
+  u8 *p = (u8 *)(uptr)GC_CANON(v);
   u32 h = gc_page_head(g);
   gc_add_live(h, gc_object_bytes((const GcHeader *)p));
   gc_mq[gc_mq_head++] = p;
@@ -1935,7 +2025,7 @@ static u64 gc_fwd_await(u64 i) {
   for (;;) {
     u64 to = __atomic_load_n(&gc_fwd[i * 2 + 1], __ATOMIC_ACQUIRE);
     if (to) return to;
-    __asm__ volatile("yield" ::: "memory");
+    warmc_cpu_relax();
   }
 }
 
@@ -1990,7 +2080,7 @@ static void gc_fwd_retire(void) {
 }
 
 static void gc_fwd_unmap(void) {
-  if (gc_fwd_dead) sys_munmap(gc_fwd_dead, (unsigned long)(gc_fwd_dead_slots * 16));
+  if (gc_fwd_dead) sys_munmap(gc_fwd_dead, (usz)(gc_fwd_dead_slots * 16));
   gc_fwd_dead = 0;
   gc_fwd_dead_slots = 0;
 }
@@ -1999,7 +2089,7 @@ static u64 gc_reloc_object(u64 from);
 
 static u32 gc_reloc_wanted(u64 a) {
   if (__atomic_load_n(&gc_phase, __ATOMIC_ACQUIRE) != GCPH_RELOC) return 0;
-  u64 off = a - (u64)(unsigned long)gc_base;
+  u64 off = a - (u64)(uptr)gc_base;
   if (off >= gc_heap_bytes) return 0;
   u32 h = gc_page_head((u32)(off >> GC_GRAN_SHIFT));
   return __atomic_load_n(&gc_pages[h].reloc, __ATOMIC_ACQUIRE);
@@ -2068,7 +2158,7 @@ static void gc_select_reloc(void) {
 
   u64 slots = 16;
   while (slots < nobj * 2) slots <<= 1;
-  u64 *t = (u64 *)sys_mmap(0, (unsigned long)(slots * 16), PROT_READ | PROT_WRITE,
+  u64 *t = (u64 *)sys_mmap(0, (usz)(slots * 16), PROT_READ | PROT_WRITE,
                            MAP_PRIVATE | MAP_ANONYMOUS);
   if (!t || t == (u64 *)-1) {
 
@@ -2114,7 +2204,7 @@ static void gc_visit_frames(GcRootFn fn) {
     const FuncUnwind *u = find_unwind_in(pc, &md);
 
     if (!u) return;
-    u32 off = (u32)(pc - (u64)(unsigned long)u->code);
+    u32 off = (u32)(pc - (u64)(uptr)u->code);
 
     const u8 *s = u->gcsites;
     u32 spc = 0;
@@ -2127,7 +2217,7 @@ static void gc_visit_frames(GcRootFn fn) {
       const u8 *r = md->gcroots + first;
       for (u32 k = 0; k < n; k++) {
         u32 e = uw_uleb(&r);
-        fn(GCROOT_IS_SLOT(e) ? (u64 *)(unsigned long)(sp + GCROOT_VAL(e))
+        fn(GCROOT_IS_SLOT(e) ? (u64 *)(uptr)(sp + GCROOT_VAL(e))
                              : gprloc[GCROOT_VAL(e)]);
       }
       break;
@@ -2140,7 +2230,11 @@ static void gc_visit_frames(GcRootFn fn) {
     for (u32 r = 0; r < 10; r++) {
       if (!(u->saved & (1u << (UW_GPR_SHIFT + r)))) continue;
 
-      gprloc[r] = (u64 *)(unsigned long)(base - 16ull * (k / 2 + 1) + 8ull * (k % 2));
+#if defined(__x86_64__)
+      gprloc[r] = (u64 *)(uptr)(base - 8ull * k);
+#else
+      gprloc[r] = (u64 *)(uptr)(base - 16ull * (k / 2 + 1) + 8ull * (k % 2));
+#endif
       k++;
     }
     sp = entry;
@@ -2221,7 +2315,7 @@ static void gc_jitter(u32 point) {
 
   u32 n = (u32)(r >> 8) & 0x3ffu;
   if (!(r & 0xf000ull)) n <<= 6;
-  while (n--) __asm__ volatile("yield" ::: "memory");
+  while (n--) warmc_cpu_relax();
 }
 
 #define GCR_NONE 0u
@@ -2281,10 +2375,21 @@ static void gc_assert_at_safepoint(void) {
   u64 pc = warmc_gc_ctx.pc;
   if (!find_unwind(pc))
     die("a round was answered at an address no compiled function owns");
-  u32 insn = *(const u32 *)(unsigned long)(pc - 4);
+#if defined(__x86_64__)
+  /* The isel emits exactly two call shapes: E8 rel32 and [REX.B] FF /2
+     (call reg).  Decoding backwards on x86 is heuristic, but a return
+     address that ends none of them is certainly not a call's. */
+  const u8 *p = (const u8 *)(uptr)pc;
+  if (!(p[-5] == 0xE8 ||
+        (p[-2] == 0xFF && (p[-1] & 0xF8) == 0xD0) ||
+        (p[-3] == 0x41 && p[-2] == 0xFF && (p[-1] & 0xF8) == 0xD0)))
+    die("a round was answered at an address that is not a call's return");
+#else
+  u32 insn = *(const u32 *)(uptr)(pc - 4);
   if ((insn & 0xFC000000u) != 0x94000000u &&
       (insn & 0xFFFFFC1Fu) != 0xD63F0000u)
     die("a round was answered at an address that is not a call's return");
+#endif
 }
 
 static u32 gc_round_active;
@@ -2438,7 +2543,7 @@ static void gc_mark_end_rest(u32 n) {
   for (u32 i = __atomic_load_n(&gcth_spin, __ATOMIC_RELAXED); i; i--) {
     if (__atomic_load_n(&gc_round_done.v, __ATOMIC_ACQUIRE) == n) return;
     if (gc_queue_pending()) return;
-    __asm__ volatile("yield" ::: "memory");
+    warmc_cpu_relax();
   }
   gcth_park_timeout(&gc_round_done, n - 1, GC_MARK_END_POLL_NS);
 }
@@ -2494,10 +2599,10 @@ static void gc_verify_ref_at(u64 v, u32 strong) {
   if (!GC_IS_OBJ(v)) return;
   if (strong && (v & gc_badmask))
     gc_verify_fail("a root wears a colour compiled code would refuse", v);
-  u64 off = GC_ADDR(v) - (u64)(unsigned long)gc_base;
+  u64 off = GC_ADDR(v) - (u64)(uptr)gc_base;
   if (off >= gc_heap_bytes) return;
   u64 healed = gc_heal_ptr(v);
-  u32 g = (u32)((GC_ADDR(healed) - (u64)(unsigned long)gc_base) >> GC_GRAN_SHIFT);
+  u32 g = (u32)((GC_ADDR(healed) - (u64)(uptr)gc_base) >> GC_GRAN_SHIFT);
   if (gc_pages[g].kind == GCP_FREE)
     gc_verify_fail("a reference heals to a page that has been freed", v);
   u32 h = gc_page_head(g);
@@ -2506,8 +2611,8 @@ static void gc_verify_ref_at(u64 v, u32 strong) {
   if (gc_bit_test(healed)) return;
 
   if (gc_pages[h].alloc_cycle == (u32)gc_cycle_no &&
-      GC_ADDR(healed) >= (u64)(unsigned long)gc_gran_addr(h) &&
-      GC_ADDR(healed) < (u64)(unsigned long)gc_pages[h].top)
+      GC_ADDR(healed) >= (u64)(uptr)gc_gran_addr(h) &&
+      GC_ADDR(healed) < (u64)(uptr)gc_pages[h].top)
     return;
   gc_verify_fail("a reference does not heal to a live object's first word", v);
 }
@@ -2521,20 +2626,20 @@ static void gc_verify(void) {
     u32 free = (gc_granfree[g >> 6] >> (g & 63)) & 1u;
     if (free != (gc_pages[g].kind == GCP_FREE))
       gc_verify_fail("the free bitmap and the page kinds disagree",
-                     (u64)(unsigned long)gc_gran_addr((u32)g));
+                     (u64)(uptr)gc_gran_addr((u32)g));
   }
   u64 total = 0;
   for (u32 h = 0; h < gc_gran_hwm; h++) {
     if (gc_pages[h].kind == GCP_TAIL || gc_pages[h].kind == GCP_FREE) continue;
     if (gc_pages[h].kind == GCP_FWD) continue;
-    u64 end = (u64)(unsigned long)gc_gran_addr(h) + (u64)gc_pages[h].ngran * GC_GRAN;
+    u64 end = (u64)(uptr)gc_gran_addr(h) + (u64)gc_pages[h].ngran * GC_GRAN;
     u64 seen = 0;
     u8 *p;
     GC_PAGE_FOREACH(h, p) {
       u64 bytes = gc_object_bytes((const GcHeader *)p);
-      if ((u64)(unsigned long)p + bytes > end)
+      if ((u64)(uptr)p + bytes > end)
         gc_verify_fail("a live object runs past the end of its page",
-                       (u64)(unsigned long)p);
+                       (u64)(uptr)p);
       seen += bytes;
       const GcHeader *hd = (const GcHeader *)p;
       const GcTypeInfo *ti = gc_typeinfo(hd->w);
@@ -2550,7 +2655,7 @@ static void gc_verify(void) {
     }
     if (seen != gc_pages[h].live)
       gc_verify_fail("a page's live bytes are not what the walk finds",
-                     (u64)(unsigned long)gc_gran_addr(h));
+                     (u64)(uptr)gc_gran_addr(h));
     total += seen;
   }
   if (total != gc_marked)
@@ -2571,8 +2676,8 @@ static u64 gc_reloc_object(u64 from) {
   gc_jitter(GCJ_RELOC);
   u32 mut = !gcth_on_collector();
   if (mut) { gc_reloc_mut++; gc_claim_from = from; gc_claim_slot = i + 1; }
-  u64 bytes = gc_object_bytes((const GcHeader *)(unsigned long)from);
-  u32 h = gc_page_head(gc_page_of((const void *)(unsigned long)from));
+  u64 bytes = gc_object_bytes((const GcHeader *)(uptr)from);
+  u32 h = gc_page_head(gc_page_of((const void *)(uptr)from));
   u8 *dst = 0;
   if (!gc_opt_reloc_stall ||
       __atomic_fetch_add(&gc_reloc_tried, 1ull, __ATOMIC_RELAXED) %
@@ -2591,16 +2696,16 @@ static u64 gc_reloc_object(u64 from) {
     if (mut) gc_claim_slot = 0;
     return from;
   }
-  mem_move(dst, (const u8 *)(unsigned long)from, bytes);
+  mem_move(dst, (const u8 *)(uptr)from, bytes);
   u32 dg = gc_page_of(dst);
-  gc_bit_set(dg, (u64)(unsigned long)dst);
+  gc_bit_set(dg, (u64)(uptr)dst);
   gc_add_live(gc_page_head(dg), bytes);
 
-  __atomic_store_n(&gc_fwd[i * 2 + 1], (u64)(unsigned long)dst, __ATOMIC_RELEASE);
+  __atomic_store_n(&gc_fwd[i * 2 + 1], (u64)(uptr)dst, __ATOMIC_RELEASE);
   if (mut) gc_claim_slot = 0;
   __atomic_fetch_add(&gc_reloc_objs, 1ull, __ATOMIC_RELAXED);
   __atomic_fetch_add(&gc_reloc_objs_all, 1ull, __ATOMIC_RELAXED);
-  return (u64)(unsigned long)dst;
+  return (u64)(uptr)dst;
 }
 
 static void gc_relocate(void) {
@@ -2611,7 +2716,7 @@ static void gc_relocate(void) {
     for (u32 h = 0; h < hwm; h++) {
       if (!__atomic_load_n(&gc_pages[h].reloc, __ATOMIC_ACQUIRE)) continue;
       u8 *p;
-      GC_PAGE_FOREACH(h, p) gc_reloc_object((u64)(unsigned long)p);
+      GC_PAGE_FOREACH(h, p) gc_reloc_object((u64)(uptr)p);
     }
 
     for (u32 h = 0; h < hwm; h++) {
@@ -2922,7 +3027,7 @@ static void *gc_alloc(u32 type_id, const GcTypeInfo *ti, u64 payload, u64 len) {
       GcHeader *h = (GcHeader *)p;
       h->w = type_id;
       h->len = (u32)len;
-      p = (u8 *)(unsigned long)((u64)(unsigned long)p | gc_good);
+      p = (u8 *)(uptr)((u64)(uptr)p | gc_good);
 
       if (gc_lab_cell[1] - gc_lab_cell[0] < GC_LAB_MIN_TAIL) {
         gc_lab_close();
@@ -3023,9 +3128,11 @@ static void arr_store(u8 *at, u32 width, u64 lo, u64 hi) {
 }
 
 static u8 *arr_data(const GcTypeInfo *ti, void *a) {
-  return (u8 *)a + ti->hdr_size;
+  return (u8 *)(uptr)GC_CANON((u64)(uptr)a) + ti->hdr_size;
 }
-static u32 arr_len(void *a) { return ((GcHeader *)a)->len; }
+static u32 arr_len(void *a) {
+  return ((const GcHeader *)(uptr)GC_CANON((u64)(uptr)a))->len;
+}
 
 static void arr_range(void *a, u64 idx, u64 n) {
   if (!a) warmc_trap(TRAP_NULL_REF);
@@ -3170,21 +3277,21 @@ u32 warmc_ref_test(WarmInstance *vm, u64 v, u32 kind, u64 id, u32 depth) {
       return (GC_IS_I31(v) || GC_IS_OBJ(v)) ? 1 : 0;
     case RTK_STRUCT:
       return (GC_IS_OBJ(v) &&
-              gc_typeinfo(((const GcHeader *)(unsigned long)v)->w)->kind
+              gc_typeinfo(((const GcHeader *)(uptr)GC_CANON(v))->w)->kind
                   == GCK_STRUCT) ? 1 : 0;
     case RTK_ARRAY:
       return (GC_IS_OBJ(v) &&
-              gc_typeinfo(((const GcHeader *)(unsigned long)v)->w)->kind
+              gc_typeinfo(((const GcHeader *)(uptr)GC_CANON(v))->w)->kind
                   == GCK_ARRAY) ? 1 : 0;
     case RTK_CONCRETE_ANY: {
       if (!GC_IS_OBJ(v)) return 0;
       const u64 *rtt =
-          gcti_rtt(gc_typeinfo(((const GcHeader *)(unsigned long)v)->w));
+          gcti_rtt(gc_typeinfo(((const GcHeader *)(uptr)GC_CANON(v))->w));
       return (rtt[0] > depth && rtt[1 + depth] == id) ? 1 : 0;
     }
     case RTK_CONCRETE_FUNC: {
 
-      const FuncRef *fr = (const FuncRef *)(unsigned long)v;
+      const FuncRef *fr = (const FuncRef *)(uptr)v;
       return (fr->rtt[0] > depth && fr->rtt[1 + depth] == id) ? 1 : 0;
     }
   }
@@ -3205,7 +3312,7 @@ static WarmMemory *make_memory(u64 min_pages, u64 max_pages, u32 has_max,
   M->has_max = has_max;
   M->index64 = index64;
 
-  unsigned long reserve = (unsigned long)GUARD_RESERVE;
+  usz reserve = (usz)GUARD_RESERVE;
   u8 *base = needs_guard || !nguards
                ? (u8 *)sys_mmap(0, reserve, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS)
                : 0;
@@ -3216,15 +3323,15 @@ static WarmMemory *make_memory(u64 min_pages, u64 max_pages, u32 has_max,
     guards[nguards].len = GUARD_RESERVE;
     nguards++;
 
-    unsigned long align = 2u << 20;
-    unsigned long adjust = (unsigned long)(-(long)(unsigned long)base) & (align - 1);
+    usz align = 2u << 20;
+    usz adjust = (usz)(-(long)(usz)base) & (align - 1);
     base += adjust;
     reserve -= adjust;
   } else if (needs_guard) {
     die("this module needs a guarded reservation and it is unavailable");
   } else {
-    reserve = (unsigned long)max_pages * WASM_PAGE_SIZE;
-    while (reserve >= (unsigned long)min_pages * WASM_PAGE_SIZE) {
+    reserve = (usz)max_pages * WASM_PAGE_SIZE;
+    while (reserve >= (usz)min_pages * WASM_PAGE_SIZE) {
       base = (u8 *)sys_mmap(0, reserve ? reserve : 4096, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS);
       if (base) break;
       if (reserve <= 4096) break;
@@ -3232,7 +3339,7 @@ static WarmMemory *make_memory(u64 min_pages, u64 max_pages, u32 has_max,
     }
   }
   if (!base) die("cannot reserve linear memory");
-  unsigned long initial = (unsigned long)min_pages * WASM_PAGE_SIZE;
+  usz initial = (usz)min_pages * WASM_PAGE_SIZE;
   if (initial && sys_mprotect(base, initial, PROT_READ | PROT_WRITE) != 0)
     die("cannot commit initial linear memory");
   M->base = base;
@@ -3249,7 +3356,7 @@ static WarmTable *make_table(u64 min, u64 max, u32 has_max, u32 index64) {
   u64 cap = has_max ? max : min + 1024;
   if (cap > MAX_TABLE_ENTRIES) cap = MAX_TABLE_ENTRIES;
   if (cap < min) cap = min;
-  unsigned long bytes = ((unsigned long)cap * sizeof(TableEntry) + 4095) & ~4095UL;
+  usz bytes = ((usz)cap * sizeof(TableEntry) + 4095) & ~4095UL;
   if (bytes == 0) bytes = 4096;
   T->entries = (TableEntry *)sys_mmap(0, bytes, PROT_READ | PROT_WRITE,
                                       MAP_PRIVATE | MAP_ANONYMOUS);
@@ -3334,7 +3441,7 @@ WarmInstance *warmc_instantiate_bound(const ModuleDesc *md,
 
   v->gc_badmask = gc_badmask;
 
-  v->gc_lab = (u64)(unsigned long)gc_lab_cell;
+  v->gc_lab = (u64)(uptr)gc_lab_cell;
   v->gc_hdr_base = (u64)in->gctype_base;
   u64 *imports = inst_imports(in);
   FuncRef *funcrefs = inst_funcrefs(in);
@@ -3346,8 +3453,8 @@ WarmInstance *warmc_instantiate_bound(const ModuleDesc *md,
     if (binds && binds[i].code) {
       if (im->kind != 0) link_error("host binding is not a function",
                                     im->module, im->name);
-      imports[2 * fi] = (u64)(unsigned long)binds[i].code;
-      imports[2 * fi + 1] = (u64)(unsigned long)binds[i].inst;
+      imports[2 * fi] = (u64)(uptr)binds[i].code;
+      imports[2 * fi + 1] = (u64)(uptr)binds[i].inst;
       funcrefs[fi].code = binds[i].code;
       funcrefs[fi].instance = binds[i].inst;
       funcrefs[fi].type_id = im->type_id;
@@ -3372,8 +3479,8 @@ WarmInstance *warmc_instantiate_bound(const ModuleDesc *md,
           link_error("incompatible import type", im->module, im->name);
 
         FuncRef fr = inst_funcrefs(from)[e->index];
-        imports[2 * fi] = (u64)(unsigned long)fr.code;
-        imports[2 * fi + 1] = (u64)(unsigned long)fr.instance;
+        imports[2 * fi] = (u64)(uptr)fr.code;
+        imports[2 * fi + 1] = (u64)(uptr)fr.instance;
         funcrefs[fi] = fr;
         fi++;
         break;
@@ -3402,7 +3509,7 @@ WarmInstance *warmc_instantiate_bound(const ModuleDesc *md,
         if (e->mutable_ != im->mutable_ ||
             (im->mutable_ ? e->type_id != im->type_id : !type_matches(e, im)))
           link_error("incompatible import type", im->module, im->name);
-        inst_global(in, gi)[0] = (u64)(unsigned long)warmc_global_cell(src, e->index);
+        inst_global(in, gi)[0] = (u64)(uptr)warmc_global_cell(src, e->index);
         gi++;
         break;
       case 4:
@@ -3457,7 +3564,7 @@ WarmInstance *warmc_instantiate_bound(const ModuleDesc *md,
     WarmTable *T = in->tabs[i];
     T->dirty = 1;
     for (u64 k = 0; k < T->len; k++)
-      T->entries[k] = (void *)(unsigned long)v2[0];
+      T->entries[k] = (void *)(uptr)v2[0];
   }
 
   {
@@ -3471,7 +3578,7 @@ WarmInstance *warmc_instantiate_bound(const ModuleDesc *md,
     for (u64 k = 0; k < total; k++) {
       u64 v2[2];
       const_eval(in, md->elem_entries[k], v2);
-      in->elem_values[k] = (void *)(unsigned long)v2[0];
+      in->elem_values[k] = (void *)(uptr)v2[0];
     }
   }
 
@@ -3664,6 +3771,50 @@ static int call_export(const ExportDesc *e, const char *name,
 
   FuncRef fr = warmc_export_func(vm, e);
 
+#if defined(__x86_64__)
+  /* Parameters past the register ceilings (3 ints after vmctx, 4 floats)
+     ride the callee's incoming stack slots; warmc_invoke_s copies this
+     image into them.  The layout is the callee's: eight bytes per scalar in
+     parameter order, and a v128 in an aligned sixteen. */
+#define RT_STK_WORDS 24
+  u64 stk[RT_STK_WORDS];
+  u64 stk_bytes = 0;
+  {
+    u32 ni2 = 0, nf2 = 0, w = 0;
+    for (u32 i = 0; i < e->nparams; i++) {
+      switch (e->ptypes[i]) {
+        case VT_V128:
+          if (nf2 >= 4 && w + 2 < RT_STK_WORDS) {
+            if (w & 1) w++;
+            stk[w++] = fargs[2 * nf2];
+            stk[w++] = fargs[2 * nf2 + 1];
+          }
+          nf2++;
+          break;
+        case VT_F32: case VT_F64:
+          if (nf2 >= 4 && w < RT_STK_WORDS) stk[w++] = fargs[2 * nf2];
+          nf2++;
+          break;
+        default:
+          if (ni2 >= 3 && w < RT_STK_WORDS) stk[w++] = iargs[ni2];
+          ni2++;
+          break;
+      }
+    }
+    stk_bytes = 8ull * w;
+  }
+#define RT_INVOKE(ia, fa, rr) \
+  warmc_invoke_s(fr.code, (WarmInstance *)fr.instance, ia, fa, rr, stk, stk_bytes)
+#define RT_INVOKE_CATCHING(ia, fa, rr) \
+  warmc_invoke_catching_s(fr.code, (WarmInstance *)fr.instance, ia, fa, rr, \
+                          stk, stk_bytes)
+#else
+#define RT_INVOKE(ia, fa, rr) \
+  warmc_invoke(fr.code, (WarmInstance *)fr.instance, ia, fa, rr)
+#define RT_INVOKE_CATCHING(ia, fa, rr) \
+  warmc_invoke_catching(fr.code, (WarmInstance *)fr.instance, ia, fa, rr)
+#endif
+
   if (reps > 0) {
     if (reps > BENCH_MAX) reps = BENCH_MAX;
     sys_prefer_fast_core();
@@ -3672,7 +3823,7 @@ static int call_export(const ExportDesc *e, const char *name,
     u64 warm = sys_nanos();
     u64 nwarm = 0;
     do {
-      warmc_invoke(fr.code, (WarmInstance *)fr.instance, iargs, fargs, ret);
+      RT_INVOKE(iargs, fargs, ret);
       nwarm++;
     } while (nwarm < 3 || sys_nanos() - warm < target);
 
@@ -3684,7 +3835,7 @@ static int call_export(const ExportDesc *e, const char *name,
     u64 spent = 0;
     while (n < reps) {
       u64 t0 = sys_nanos();
-      for (u64 k = 0; k < batch; k++) warmc_invoke(fr.code, (WarmInstance *)fr.instance, iargs, fargs, ret);
+      for (u64 k = 0; k < batch; k++) RT_INVOKE(iargs, fargs, ret);
       u64 took = sys_nanos() - t0;
       bench_ns[n++] = per_call(took, batch);
       spent += took;
@@ -3693,15 +3844,16 @@ static int call_export(const ExportDesc *e, const char *name,
     bench_report(name, n);
   } else if (g_catch_traps) {
 
-    u32 t = warmc_invoke_catching(fr.code, (WarmInstance *)fr.instance,
-                                  iargs, fargs, ret);
+    u32 t = RT_INVOKE_CATCHING(iargs, fargs, ret);
     if (t) {
       eputs("trap: "); eputs(warmc_trap_name(t)); eputs("\n");
       return 1;
     }
   } else {
-    warmc_invoke(fr.code, (WarmInstance *)fr.instance, iargs, fargs, ret);
+    RT_INVOKE(iargs, fargs, ret);
   }
+#undef RT_INVOKE
+#undef RT_INVOKE_CATCHING
 
   if (e->nresults == 1) {
     u8 t = e->rtypes[0];
@@ -3920,7 +4072,6 @@ static void gc_read_options(void) {
   gc_opt_conc     = (u32)rt_getenv_u64("WARMC_GC_CONC", 1);
   gc_opt_assist   = rt_getenv_u64("WARMC_GC_ASSIST", gc_opt_assist);
   if (gc_opt_stress) gc_opt_conc = 0;
-
   if (rt_getenv("WARMC_GC_ROUNDS")) gc_opt_conc = 0;
   gc_opt_jitter_seed = rt_getenv_u64("WARMC_GC_JITTER_SEED", 1);
 
@@ -4296,7 +4447,7 @@ __attribute__((noreturn)) static void warmc_run(int argc, char **argv) {
 
   if (warmc_gcth_tests) warmc_gcth_tests();
 
-  u64 here = (u64)(unsigned long)&argv;
+  u64 here = (u64)(uptr)&argv;
   g_stack_limit = here > (6u << 20) ? here - (6u << 20) : 0;
 
   sys_exit(warmc_driver_hook(argc, argv));
@@ -4376,6 +4527,17 @@ int warmc_cli_main(int argc, char **argv) {
 
 int main(int argc, char **argv, char **envp) {
   g_environ = envp;
+  warmc_run(argc, argv);
+}
+#elif defined(WARMC_WINDOWS)
+
+/* the PE entry point: called by the loader with a valid stack, no args */
+__attribute__((noreturn)) void warmc_win_entry(void) {
+  warmc_win_check_isa();
+  int argc;
+  char **argv;
+  warmc_win_cmdline(&argc, &argv);
+  g_environ = warmc_win_environ();
   warmc_run(argc, argv);
 }
 #else

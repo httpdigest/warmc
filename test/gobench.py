@@ -468,6 +468,8 @@ def spill_traffic(names, wasm, target_flags):
     thirty-odd percent of the instructions in its hottest functions.  A
     conclusion drawn from one of those does not transfer to the other.
     """
+    # A frame reference is spelled differently by each backend.
+    frame = "(%rsp)" if any("windows" in f for f in target_flags) else "[sp, #"
     print("%-12s %9s %9s %8s" % ("kernel", "insts", "spill", "ratio"))
     for k in names:
         obj = os.path.join(WORK, k + ".spill.o")
@@ -478,7 +480,7 @@ def spill_traffic(names, wasm, target_flags):
             continue
         d = sh(["llvm-objdump", "-d", obj]).stdout
         insts = sum(1 for l in d.splitlines() if re.match(r"^\s+[0-9a-f]+:", l))
-        spill = sum(1 for l in d.splitlines() if "[sp, #" in l)
+        spill = sum(1 for l in d.splitlines() if frame in l)
         print("%-12s %9d %9d %7.1f%%"
               % (k, insts, spill, 100.0 * spill / insts if insts else 0.0))
     return 0

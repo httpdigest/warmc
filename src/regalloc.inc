@@ -69,12 +69,8 @@ static bool remat_ok(Isel *s, Ref v) {
     if (ir_const_cost(in->imm, vt_is_64((ValType)in->type)) <= cap)
       return true;
   }
-  if (vt_is_float((ValType)in->type) && s->remat_fp) {
-    uint32_t imm8;
-    return a64_fmov_imm(in->imm, vt_is_64((ValType)in->type) ? FT_D : FT_S,
-                        &imm8) ||
-           s->pool_ok;
-  }
+  if (vt_is_float((ValType)in->type) && s->remat_fp)
+    return isel_fp_remat_ok(s, in);
   return false;
 }
 
@@ -1017,8 +1013,9 @@ static void regalloc_linear(Isel *s) {
     if (GPR_ALLOC[i] == s->vmctx_reg || GPR_ALLOC[i] == s->membase_reg) continue;
     gpool[ngpool++] = GPR_ALLOC[i];
   }
-  if (!s->needs_memsize) gpool[ngpool++] = R21;
-  if (!s->needs_retarea && f->sig->nresults <= 1) gpool[ngpool++] = R8;
+  if (!s->needs_memsize) gpool[ngpool++] = REG_MEMSIZE;
+  if (RA_HAVE_RETAREA_REUSE && !s->needs_retarea && f->sig->nresults <= 1)
+    gpool[ngpool++] = RA_RETAREA_REG;
 
   uint32_t slot = 0;
   for (uint32_t i = 0; i < n; i++)
@@ -1163,10 +1160,12 @@ static void regalloc_linear(Isel *s) {
             int rr = pool[k];
 
             /* Callee-saved was already tried (and is no protection for a
-               V128); R0 is written with no call on the allocation fast
-               path. */
-            if (cur->cls ? fpr_is_callee_saved(rr)
-                         : (gpr_is_callee_saved(rr) || rr == R0)) continue;
+               V128); the allocation fast path writes RA_ALLOC_RES_REG with
+               no call. */
+            if (cur->cls
+                    ? fpr_is_callee_saved(rr)
+                    : (gpr_is_callee_saved(rr) || rr == RA_ALLOC_RES_REG))
+              continue;
             if (occ_conflicts(&heaps[rr], cur, R, gone, ostack, &vic) != 0)
               continue;
             csa_reg = rr;

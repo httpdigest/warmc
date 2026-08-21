@@ -22,9 +22,20 @@ engine's own timing facility:
 
 The `startup` column is therefore the price of running a module at all, and
 the per-case columns are what the compiled code costs once it is running.
+
+Each launch also records process CPU time (user+system) and peak resident
+memory.  On POSIX both come from wait4()'s rusage.  On Windows they come
+from test/winmeasure.c, a Job-object wrapper built on first use: MSYS
+python execs a native PE through a Cygwin proxy stub and its wait4() rusage
+describes the stub, not the child, so nothing short of a native wrapper
+measures the right process — and the Job also counts helper subprocesses an
+engine may spawn, and reports the tree's peak commit charge (for warmc that
+includes the probe-free stacks, whose commit equals their reserve).  CPU
+time gets the same startup-floor treatment as wall clock; memory is
+reported absolute, because the startup column IS an engine's baseline
+footprint for running a module at all.
 """
 import os
-import re
 import subprocess
 import sys
 import time
@@ -54,6 +65,9 @@ def sh(cmd):
     return subprocess.run(cmd, shell=True, capture_output=True, text=True)
 
 def host_setup():
+    if os.environ.get("WARMC_TARGET_FLAGS"):
+        return (os.environ["WARMC_TARGET_FLAGS"],
+                (os.environ.get("WARMC_RUN") or "").split())
     r = subprocess.run('. test/hostenv.sh; echo "$WARMC_TARGET_FLAGS"; echo "$WARMC_RUN"; '
                        'echo "$PATH"; echo "$WARMC_MACOS_LIBDIR"',
                        shell=True, capture_output=True, text=True,
@@ -65,6 +79,17 @@ def host_setup():
     return lines[0], (lines[1].split() if lines[1] else [])
 
 TARGET_FLAGS, RUN = host_setup()
+
+WINMEASURE = None
+if "--target=windows" in TARGET_FLAGS:
+    WINMEASURE = os.path.join(BUILD, "winmeasure.exe")
+    src = os.path.join("test", "winmeasure.c")
+    if (not os.path.exists(WINMEASURE)
+            or os.path.getmtime(WINMEASURE) < os.path.getmtime(src)):
+        r = sh("clang -O2 -o %s %s" % (WINMEASURE, src))
+        if r.returncode:
+            print(r.stderr)
+            sys.exit(1)
 
 SHIM = """#include "workload.c"
 static volatile unsigned long long sink;
@@ -89,18 +114,57 @@ def build_case(name, call):
         sys.exit(1)
     return wasm, exe
 
-def timed(argv, reps):
-    """Minimum wall clock over `reps` launches, in milliseconds."""
-    best = None
-    for _ in range(reps):
-        t0 = time.perf_counter()
-        p = subprocess.run(argv, capture_output=True)
-        dt = time.perf_counter() - t0
+def measure_once(argv):
+    """One launch: (wall_ms, cpu_ms, peak_rss_kb, commit_kb) or None on failure.
+    cpu/rss are None where the platform cannot report them; commit is
+    Windows-only (peak commit charge of the whole process tree)."""
+    if WINMEASURE:
+        rpt = os.path.join(WORK, "measure.txt")
+        p = subprocess.run([WINMEASURE, rpt, "300000"] + argv,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         if p.returncode != 0:
             return None
-        if best is None or dt < best:
-            best = dt
-    return best * 1e3
+        with open(rpt) as fh:
+            wall, user, kern, ws, commit = map(int, fh.read().split())
+        return wall / 1e6, (user + kern) / 1e6, ws / 1024.0, commit / 1024.0
+    t0 = time.perf_counter()
+    p = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if hasattr(os, "wait4"):
+        _, status, ru = os.wait4(p.pid, 0)
+        wall = time.perf_counter() - t0
+        p.returncode = os.waitstatus_to_exitcode(status)
+        if p.returncode != 0:
+            return None
+        rss = ru.ru_maxrss / (1024.0 if sys.platform == "darwin" else 1.0)
+        return wall * 1e3, (ru.ru_utime + ru.ru_stime) * 1e3, rss, None
+    rc = p.wait()
+    wall = time.perf_counter() - t0
+    if rc != 0:
+        return None
+    return wall * 1e3, None, None, None
+
+def measure(argv, reps):
+    """Minimum of each metric over `reps` launches."""
+    best = None
+    for _ in range(reps):
+        one = measure_once(argv)
+        if one is None:
+            return None
+        best = one if best is None else tuple(
+            None if a is None or b is None else min(a, b)
+            for a, b in zip(best, one))
+    return best
+
+METRICS = [
+    ("wall clock per launch, milliseconds", 0, True, 1.0),
+    ("process CPU time per launch, user+system, milliseconds", 1, True, 1.0),
+    ("peak resident memory (maxrss / working set), MB, absolute", 2, False, 1024.0),
+    ("peak commit charge of the process tree, MB, absolute", 3, False, 1024.0),
+]
+
+def cell(ms, name, i, scale):
+    v = ms.get(name)
+    return None if v is None or v[i] is None else v[i] / scale
 
 def main():
     args = sys.argv[1:]
@@ -124,52 +188,54 @@ def main():
         built[name] = build_case(name, call)
 
     names = [c[0] for c in cases]
-    rows = []
-    warmc_ms = {}
-    for name in names:
-        wasm, exe = built[name]
-        warmc_ms[name] = timed(RUN + [exe], reps)
-    rows.append(("warmc -O2 (AOT)", warmc_ms))
-    for label, cmd in engines:
-        ms = {}
-        for name in names:
-            wasm, _exe = built[name]
-            ms[name] = timed(cmd + [wasm], reps)
-        rows.append((label, ms))
-
     hdr = [n for n in names if n != "startup"]
-    print("\nwall clock per launch, minimum of %d, milliseconds" % reps)
-    print("%-18s %10s |" % ("engine", "startup") +
-          "".join("%11s" % n[:10] for n in hdr))
-    print("-" * (31 + 11 * len(hdr)))
-    for label, ms in rows:
-        base = ms.get("startup") or 0.0
-        print("%-18s %10.1f |" % (label, base) +
-              "".join("%11.1f" % max(ms[n] - base, 0.0) if ms.get(n) else "%11s" % "-"
-                      for n in hdr))
+    rows = []
+    rows.append(("warmc -O2 (AOT)",
+                 {n: measure(RUN + [built[n][1]], reps) for n in names}))
+    for label, cmd in engines:
+        rows.append((label, {n: measure(cmd + [built[n][0]], reps) for n in names}))
+
+    print("\nminimum over %d launches; times minus each engine's startup floor" % reps)
+    for title, i, sub, scale in METRICS:
+        if all(cell(ms, n, i, scale) is None for _, ms in rows for n in names):
+            continue
+        print("\n" + title)
+        print("%-18s %10s |" % ("engine", "startup") +
+              "".join("%11s" % n[:10] for n in hdr))
+        print("-" * (31 + 11 * len(hdr)))
+        for label, ms in rows:
+            base = cell(ms, "startup", i, scale)
+            line = "%-18s " % label
+            line += "%10.1f" % base if base is not None else "%10s" % "-"
+            line += " |"
+            for n in hdr:
+                v = cell(ms, n, i, scale)
+                if v is None:
+                    line += "%11s" % "-"
+                else:
+                    line += "%11.1f" % (max(v - base, 0.0) if sub and base else v)
+            print(line)
 
     ref = rows[0][1]
-    rbase = ref.get("startup") or 0.0
-    print("\nratio to warmc -O2 (higher = slower than warmc)")
-    print("%-18s %10s |" % ("engine", "startup") +
-          "".join("%11s" % n[:10] for n in hdr) + "%11s" % "geomean")
-    print("-" * (42 + 11 * len(hdr)))
+    print("\nratio to warmc -O2 (higher = slower / bigger than warmc)")
+    print("%-18s" % "engine" +
+          "".join("%11s" % t for t in ("wall", "cpu", "peak-rss", "commit")) +
+          "   geomean over the per-case columns")
+    print("-" * 62)
     for label, ms in rows[1:]:
-        base = ms.get("startup") or 0.0
-        cells, ratios = [], []
-        for n in hdr:
-            a, b = ref.get(n), ms.get(n)
-            if not a or not b or a - rbase <= 0:
-                cells.append("%11s" % "-")
-            else:
-                r = (b - base) / (a - rbase)
-                ratios.append(r)
-                cells.append("%10.2fx" % r)
-        g = 1.0
-        for r in ratios:
-            g *= r
-        g = g ** (1.0 / len(ratios)) if ratios else 0.0
-        print("%-18s %9.1fx |" % (label, base / rbase if rbase else 0) +
-              "".join(cells) + "%10.2fx" % g)
+        line = "%-18s" % label
+        for title, i, sub, scale in METRICS:
+            base = (cell(ms, "startup", i, scale) or 0.0) if sub else 0.0
+            rbase = (cell(ref, "startup", i, scale) or 0.0) if sub else 0.0
+            ratios = []
+            for n in hdr:
+                a, b = cell(ref, n, i, scale), cell(ms, n, i, scale)
+                if a is not None and b is not None and a - rbase > 0:
+                    ratios.append((b - base) / (a - rbase))
+            g = 1.0
+            for r in ratios:
+                g *= r
+            line += ("%10.2fx" % g ** (1.0 / len(ratios))) if ratios else "%11s" % "-"
+        print(line)
 
 main()

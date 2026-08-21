@@ -57,8 +57,12 @@ SRC = "test/components"
 WORK = os.path.join(BUILD, "components")
 GOLDEN = os.path.join(SRC, "expected")
 DARWIN = platform.system() == "Darwin"
-RT = os.path.join(BUILD, "warmrt-macos.a" if DARWIN else "warmrt.a")
-TARGET = ["--target", "macos"] if DARWIN else []
+WINDOWS = os.name == "nt" or "NT" in platform.system()
+# The linked programs are run, so they have to be built for this host.
+RT = os.path.join(BUILD, "warmrt-macos.a" if DARWIN else
+                  "warmrt-windows.a" if WINDOWS else "warmrt.a")
+TARGET = ["--target", "macos"] if DARWIN else \
+         ["--target", "windows"] if WINDOWS else []
 
 npass = nfail = 0
 

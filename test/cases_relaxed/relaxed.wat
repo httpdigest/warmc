@@ -325,16 +325,27 @@
   (func $chk64 (param $got i64) (param $want i64)
     (if (i64.ne (local.get $got) (local.get $want)) (then unreachable)))
 
-  ;; With no NaN operand, an invalid operation already produces the positive
-  ;; canonical NaN on this hardware, so both profiles agree here.  This is the
-  ;; case that says the *other* results below are about propagation and not
-  ;; about NaN production in general.
+  ;; With no NaN operand, an invalid operation already produces a canonical
+  ;; NaN on this hardware, so both profiles agree on the payload here.  This
+  ;; is the case that says the *other* results below are about propagation
+  ;; and not about NaN production in general.
+  ;;
+  ;; The sign is masked off because the spec leaves it open -- a canonical
+  ;; NaN is +-nan(canonN) -- and the two hardwares disagree: AArch64's
+  ;; default NaN is positive, x86-64's "floating-point indefinite" is
+  ;; negative.  Everything below still pins the payload exactly.
   (func (export "nan_invalid")
     (global.set $f (f32.const inf))
-    (call $chk32 (i32.reinterpret_f32 (f32.sub (global.get $f) (f32.const inf)))
+    (call $chk32 (i32.and
+                   (i32.reinterpret_f32
+                     (f32.sub (global.get $f) (f32.const inf)))
+                   (i32.const 0x7fffffff))
                  (i32.const 0x7fc00000))
     (global.set $d (f64.const inf))
-    (call $chk64 (i64.reinterpret_f64 (f64.sub (global.get $d) (f64.const inf)))
+    (call $chk64 (i64.and
+                   (i64.reinterpret_f64
+                     (f64.sub (global.get $d) (f64.const inf)))
+                   (i64.const 0x7fffffffffffffff))
                  (i64.const 0x7ff8000000000000)))
 
   ;; fneg, fabs and fcopysign are excluded from the rule by name, and FPCR.DN
@@ -385,4 +396,99 @@
     (call $nan_arith (i32.const 0x7fc00000) (i32.const 0x7fc00000)
                      (i64.const 0x7ff8000000000000)
                      (i64.const 0x7fc000007fc00000)))
+
+  ;; ---- the same rule, over every instruction it covers -----------------
+  ;;
+  ;; nan_det above asks three of them.  The rule reaches every floating-point
+  ;; instruction that *generates* a NaN, so these are the rest -- including
+  ;; the ones where the two hardwares differ about the SIGN rather than the
+  ;; payload: an invalid operation with no NaN operand answers x86-64's
+  ;; negative "indefinite" and AArch64's positive default NaN, so
+  ;; f32.sqrt(-1) is as much a case here as f32.add(nan, 1) is.
+  ;;
+  ;; Asked only in the deterministic profile.  In the full profile these are
+  ;; propagation, which the two hardwares are entitled to differ over and
+  ;; which nan_invalid above masks the sign of for that reason.
+  (global $g (mut f32) (f32.const 0))
+  (global $e (mut f64) (f64.const 0))
+
+  (func $c32 (param $got f32)
+    (call $chk32 (i32.reinterpret_f32 (local.get $got))
+                 (i32.const 0x7fc00000)))
+  (func $c64 (param $got f64)
+    (call $chk64 (i64.reinterpret_f64 (local.get $got))
+                 (i64.const 0x7ff8000000000000)))
+  (func $cv32 (param $got v128)
+    (call $chk (local.get $got)
+               (v128.const i32x4 0x7fc00000 0x7fc00000 0x7fc00000 0x7fc00000)))
+  (func $cv64 (param $got v128)
+    (call $chk (local.get $got)
+               (v128.const i64x2 0x7ff8000000000000 0x7ff8000000000000)))
+
+  (func (export "nan_det_ops")
+    (global.set $f (f32.const nan:0x200000))
+    (global.set $g (f32.const 1))
+    (call $c32 (f32.sub (global.get $f) (global.get $g)))
+    (call $c32 (f32.div (global.get $f) (global.get $g)))
+    (call $c32 (f32.min (global.get $f) (global.get $g)))
+    (call $c32 (f32.max (global.get $f) (global.get $g)))
+    (call $c32 (f32.sqrt (global.get $f)))
+    (call $c32 (f32.ceil (global.get $f)))
+    (call $c32 (f32.floor (global.get $f)))
+    (call $c32 (f32.trunc (global.get $f)))
+    (call $c32 (f32.nearest (global.get $f)))
+    (call $c64 (f64.promote_f32 (global.get $f)))
+    ;; no NaN to propagate: the sign is the whole question
+    (global.set $f (f32.const -1))
+    (call $c32 (f32.sqrt (global.get $f)))
+    (global.set $f (f32.const 0))
+    (global.set $g (f32.const 0))
+    (call $c32 (f32.div (global.get $f) (global.get $g)))
+
+    (global.set $d (f64.const nan:0x4000000000000))
+    (global.set $e (f64.const 1))
+    (call $c64 (f64.add (global.get $d) (global.get $e)))
+    (call $c64 (f64.min (global.get $d) (global.get $e)))
+    (call $c64 (f64.max (global.get $d) (global.get $e)))
+    (call $c64 (f64.sqrt (global.get $d)))
+    (call $c64 (f64.nearest (global.get $d)))
+    (call $c32 (f32.demote_f64 (global.get $d)))
+    (global.set $d (f64.const -1))
+    (call $c64 (f64.sqrt (global.get $d)))
+    (global.set $d (f64.const 0))
+    (global.set $e (f64.const 0))
+    (call $c64 (f64.div (global.get $d) (global.get $e)))
+
+    ;; the vector register file, which FPCR.DN covers in the same breath and
+    ;; which the x64 back end has to canonicalise lane by lane
+    (global.set $a (v128.const f32x4 nan:0x200000 nan:0x200000
+                                     nan:0x200000 nan:0x200000))
+    (global.set $b (v128.const f32x4 1 1 1 1))
+    (call $cv32 (f32x4.add (global.get $a) (global.get $b)))
+    (call $cv32 (f32x4.sub (global.get $a) (global.get $b)))
+    (call $cv32 (f32x4.mul (global.get $a) (global.get $b)))
+    (call $cv32 (f32x4.div (global.get $a) (global.get $b)))
+    (call $cv32 (f32x4.min (global.get $a) (global.get $b)))
+    (call $cv32 (f32x4.max (global.get $a) (global.get $b)))
+    (call $cv32 (f32x4.sqrt (global.get $a)))
+    (call $cv32 (f32x4.ceil (global.get $a)))
+    (call $cv32 (f32x4.floor (global.get $a)))
+    (call $cv32 (f32x4.trunc (global.get $a)))
+    (call $cv32 (f32x4.nearest (global.get $a)))
+    (call $cv64 (f64x2.promote_low_f32x4 (global.get $a)))
+    (global.set $a (v128.const f32x4 -1 -1 -1 -1))
+    (call $cv32 (f32x4.sqrt (global.get $a)))
+    (global.set $a (v128.const f32x4 0 0 0 0))
+    (global.set $b (v128.const f32x4 0 0 0 0))
+    (call $cv32 (f32x4.div (global.get $a) (global.get $b)))
+
+    (global.set $a (v128.const f64x2 nan:0x4000000000000 nan:0x4000000000000))
+    (global.set $b (v128.const f64x2 1 1))
+    (call $cv64 (f64x2.add (global.get $a) (global.get $b)))
+    (call $cv64 (f64x2.min (global.get $a) (global.get $b)))
+    (call $cv64 (f64x2.max (global.get $a) (global.get $b)))
+    (call $cv64 (f64x2.sqrt (global.get $a)))
+    (call $cv64 (f64x2.ceil (global.get $a)))
+    (call $chk (f32x4.demote_f64x2_zero (global.get $a))
+               (v128.const i32x4 0x7fc00000 0x7fc00000 0 0)))
 )

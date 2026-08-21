@@ -26,6 +26,13 @@ BUILD=${BUILD:-build}
 
 RUST_TARGET=wasm32-wasip2
 
+case "${WARMC_TARGET_FLAGS:-}" in
+  *--target=windows*)
+    echo "rswasip2: SKIPPED (there is no warmwasip2-windows.a -- the preview2"
+    echo "    host on Windows is a follow-up to the preview1 one in"
+    echo "    rt/winposix.c)"
+    exit 0;;
+esac
 if ! command -v rustc >/dev/null 2>&1; then
   echo "rswasip2: SKIPPED (rustc not on PATH)"
   exit 0

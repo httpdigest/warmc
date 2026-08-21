@@ -55,18 +55,8 @@ fi
 
 "$WT" parse test/tinygo/wasi_stub.wat -o "$WORK/wasistub.wasm" || exit 1
 
-case "$(uname -s)/$(uname -m)" in
-  Darwin/arm64)
-    ${XCC:-clang} --target=arm64-apple-macos11 -DWARMC_DARWIN=1 -O2 -ffreestanding \
-      -fno-stack-protector -fno-builtin -nostdlib -c -o "$WORK/driver.o" \
-      test/tinygo/driver.c || { echo "FAIL[tinygo]: driver"; exit 1; }
-    ;;
-  *)
-    ${XCC:-clang} --target=aarch64-linux-gnu -O2 -ffreestanding -fno-stack-protector \
-      -fno-builtin -nostdlib -c -o "$WORK/driver.o" test/tinygo/driver.c \
-      || { echo "FAIL[tinygo]: driver"; exit 1; }
-    ;;
-esac
+python3 test/hostbuild.py cc test/tinygo/driver.c "$WORK/driver.o" \
+  || { echo "FAIL[tinygo]: driver"; exit 1; }
 
 for lv in -O0 -O1 -O2; do
   wtimeout ./$BUILD/warmc $lv $WARMC_TARGET_FLAGS --symbol-prefix=app \
@@ -75,20 +65,11 @@ for lv in -O0 -O1 -O2; do
   wtimeout ./$BUILD/warmc $lv $WARMC_TARGET_FLAGS --symbol-prefix=wasistub \
       -c -o "$WORK/stub$lv.o" "$WORK/wasistub.wasm" \
     || { echo "FAIL[tinygo]: compiling stub at $lv"; fail=1; continue; }
-  case "$(uname -s)/$(uname -m)" in
-    Darwin/arm64)
-      ${WARMC_MACOS_LD:-/usr/bin/ld} -arch arm64 -platform_version macos 11.0 11.0 \
-        -o "$WORK/prog$lv" "$WORK/driver.o" "$WORK/app$lv.o" "$WORK/stub$lv.o" \
-        "$BUILD/warmrt-macos.a" -lSystem -L"$WARMC_MACOS_LIBDIR" \
-        || { echo "FAIL[tinygo]: ld at $lv"; fail=1; continue; }
-      ;;
-    *)
-      ${LD:-ld.lld} -static -e _start -o "$WORK/prog$lv" \
-        "$WORK/driver.o" "$WORK/app$lv.o" "$WORK/stub$lv.o" "$BUILD/warmrt.a" \
-        || { echo "FAIL[tinygo]: ld at $lv"; fail=1; continue; }
-      ;;
-  esac
-  if ! wruntimeout $WARMC_RUN "$WORK/prog$lv" > "$WORK/out$lv.txt" 2>"$WORK/err$lv.txt"; then
+  BUILD="$BUILD" python3 test/hostbuild.py link "$WORK/prog$lv" \
+      "$WORK/driver.o" "$WORK/app$lv.o" "$WORK/stub$lv.o" \
+    || { echo "FAIL[tinygo]: link at $lv"; fail=1; continue; }
+  PROG=$(python3 test/hostbuild.py exe "$WORK/prog$lv")
+  if ! wruntimeout $WARMC_RUN "$PROG" > "$WORK/out$lv.txt" 2>"$WORK/err$lv.txt"; then
     echo "FAIL[tinygo]: prog$lv exited nonzero"
     sed -n 1,5p "$WORK/err$lv.txt"
     fail=1
