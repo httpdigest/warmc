@@ -1,33 +1,8 @@
 #include "a64.h"
-#include "warmc.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-void buf_reserve(Buf *b, size_t extra) {
-  if (b->len + extra <= b->cap) return;
-  size_t cap = b->cap ? b->cap : 256;
-  while (cap < b->len + extra) cap *= 2;
-  uint8_t *p = xrealloc(b->data, cap);
-  if (!p) { fprintf(stderr, "warmc: out of memory\n"); exit(1); }
-  b->data = p;
-  b->cap = cap;
-}
-void buf_u8(Buf *b, uint8_t v) { buf_reserve(b, 1); b->data[b->len++] = v; }
-void buf_u16(Buf *b, uint16_t v) { buf_u8(b, v & 0xff); buf_u8(b, v >> 8); }
-void buf_u32(Buf *b, uint32_t v) { buf_u16(b, v & 0xffff); buf_u16(b, v >> 16); }
-void buf_u64(Buf *b, uint64_t v) { buf_u32(b, (uint32_t)v); buf_u32(b, (uint32_t)(v >> 32)); }
-void buf_bytes(Buf *b, const void *p, size_t n) {
-  buf_reserve(b, n); memcpy(b->data + b->len, p, n); b->len += n;
-}
-void buf_zero(Buf *b, size_t n) {
-  buf_reserve(b, n); memset(b->data + b->len, 0, n); b->len += n;
-}
-void buf_align(Buf *b, size_t align) {
-  while (b->len % align) buf_u8(b, 0);
-}
-void buf_free(Buf *b) { xfree(b->data); b->data = NULL; b->len = b->cap = 0; }
 
 void a64_word(Buf *b, uint32_t insn) { buf_u32(b, insn); }
 

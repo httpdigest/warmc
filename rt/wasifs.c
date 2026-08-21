@@ -62,8 +62,8 @@ u8 wasifs_filetype(const u8 *st) {
   }
 }
 
-void wasifs_str_copy(char *d, const char *s, unsigned long n) {
-  unsigned long i = 0;
+void wasifs_str_copy(char *d, const char *s, usz n) {
+  usz i = 0;
   for (; i < n && s[i]; i++) d[i] = s[i];
   d[i] = 0;
 }
@@ -148,9 +148,9 @@ u32 wasifs_walk(int root, const char *path, int *out_dir, char *leaf) {
       *p = save;
       wasifs_str_copy(rest, p, PATHMAX * 2 - 1);
       char joined[PATHMAX * 2];
-      unsigned long k = 0;
+      usz k = 0;
       for (long j = 0; link[j] && k < PATHMAX * 2 - 2; j++) joined[k++] = link[j];
-      for (unsigned long j = 0; rest[j] && k < PATHMAX * 2 - 2; j++) joined[k++] = rest[j];
+      for (usz j = 0; rest[j] && k < PATHMAX * 2 - 2; j++) joined[k++] = rest[j];
       joined[k] = 0;
       wasifs_str_copy(work, joined, PATHMAX * 2 - 1);
       p = work;
@@ -172,13 +172,13 @@ done:
 void wasifs_walk_done(int root, int dir) { if (dir != root) close(dir); }
 
 u32 wasifs_splice_leaf(char *path, const char *link) {
-  unsigned long cut = 0;
-  for (unsigned long i = 0; path[i]; i++) if (path[i] == '/') cut = i + 1;
+  usz cut = 0;
+  for (usz i = 0; path[i]; i++) if (path[i] == '/') cut = i + 1;
   char next[PATHMAX];
   if (cut >= PATHMAX) return 37;
-  for (unsigned long i = 0; i < cut; i++) next[i] = path[i];
-  unsigned long j = cut;
-  for (unsigned long i = 0; link[i]; i++) {
+  for (usz i = 0; i < cut; i++) next[i] = path[i];
+  usz j = cut;
+  for (usz i = 0; link[i]; i++) {
     if (j >= PATHMAX - 1) return 37;
     next[j++] = link[i];
   }

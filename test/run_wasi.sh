@@ -13,6 +13,11 @@ fi
 
 WASMTIME=$(command -v wasmtime)
 
+case "${WARMC_TARGET_FLAGS:-}" in
+  *--target=windows*) WIN=1;;
+  *) WIN=0;;
+esac
+
 FTAG=$(printf '%s' "${WARMC_FLAGS:-default}" | tr -c 'A-Za-z0-9' '_')
 WORK="$BUILD/wasirun-$FTAG"
 rm -rf "$WORK"; mkdir -p "$WORK"
@@ -121,7 +126,19 @@ if build_driven brokenpipe; then
   rc_warmc=${PIPESTATUS[0]}
   "$WASMTIME" "$DRIVEN_WASM" 2>/dev/null | head -1 >/dev/null
   rc_ref=${PIPESTATUS[0]}
-  if [ "$rc_warmc" != "$rc_ref" ]; then
+  if [ "$WIN" = 1 ]; then
+    # Win32 fails the write with ERROR_NO_DATA, which is EPIPE -- 64, the
+    # exit this module documents as the healthy one.  wasmtime 47 reports
+    # EIO there instead, so on Windows the status is asserted rather than
+    # diffed; that both engines fail the write at all is still differential.
+    if [ "$rc_warmc" != 64 ] || [ "$rc_ref" = 0 ]; then
+      echo "FAIL[wasi/brokenpipe]: exit $rc_warmc (want 64)," \
+           "wasmtime exit $rc_ref (want non-zero)"
+      fail=1
+    else
+      pass=$((pass + 1))
+    fi
+  elif [ "$rc_warmc" != "$rc_ref" ]; then
     echo "FAIL[wasi/brokenpipe]: exit $rc_warmc, wasmtime exit $rc_ref"
     fail=1
   elif [ "$rc_warmc" = 0 ]; then
@@ -193,10 +210,35 @@ else
   fail=1
 fi
 
+# A path component that is a separator to Win32 and a filename character
+# everywhere else.  What warmc answers is the same on every host, so it is
+# written out rather than diffed -- see the header on the module.
+if build_driven backslash; then
+  d="$WORK/backslash.dir"; rm -rf "$d"; mkdir -p "$d"
+  printf 'outside
+' > "$WORK/backslash.secret"
+  got=$(env -i "$DRIVEN_EXE" --dir="$d::/d" 2>/dev/null)
+  want="44 63 "
+  if [ "$got" != "$want" ]; then
+    echo "FAIL[wasi/backslash]: got [$got], want [$want]"
+    echo "    (a leaf carrying a backslash is not there; the same escape"
+    echo "     spelled with a slash is refused by the sandbox)"
+    fail=1
+  else
+    pass=$((pass + 1))
+  fi
+else
+  fail=1
+fi
+
 # A preopened listening socket, which is the only way a guest can ever reach
 # the four sock_* calls.  wasmtime 47 refuses -S tcplisten for wasip1, so the
 # reply is written out rather than diffed.
-if build_driven echoserver; then
+if [ "$WIN" = 1 ]; then
+  echo "wasi/echoserver: SKIPPED (sockets are not part of the Windows WASI"
+  echo "    host -- rt/winposix.c answers the socket calls ENOSYS, so"
+  echo "    --tcplisten has nothing to preopen; Winsock is a follow-up)"
+elif build_driven echoserver; then
   port=0
   for try in $(seq 0 9); do
     cand=$((34500 + RANDOM % 1000))

@@ -1,4 +1,5 @@
 #include "ir.h"
+#include "target.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -616,24 +617,11 @@ void ir_order(IrFunc *f) {
 }
 
 int ir_const_cost(uint64_t bits, bool wide) {
-  int nwords = wide ? 4 : 2;
-  if (!wide) bits &= 0xffffffffu;
-  int zeros = 0, ones = 0;
-  for (int i = 0; i < nwords; i++) {
-    uint16_t w = (uint16_t)(bits >> (16 * i));
-    if (w != 0) zeros++;
-    if (w != 0xffff) ones++;
-  }
-  int n = zeros < ones ? zeros : ones;
-  return n < 1 ? 1 : n;
+  return g_target->const_cost(bits, wide);
 }
 
 int ir_vconst_cost(uint64_t lo, uint64_t hi) {
-  if (lo == hi) {
-    if (lo == (lo & 0xffu) * 0x0101010101010101ull) return 1;
-    return ir_const_cost(lo, true) + 1;
-  }
-  return ir_const_cost(lo, true) + ir_const_cost(hi, true) + 2;
+  return g_target->vconst_cost(lo, hi);
 }
 
 bool ir_has_result(const Inst *in) {
@@ -910,50 +898,14 @@ uint64_t ir_known_bits(IrFunc *f, Ref v, int depth) {
 }
 
 bool ir_imm_ok(IrFunc *f, Ref user, uint32_t idx, uint64_t cval, ValType ct) {
-  Inst *in = &f->insts[user];
-  int sf = vt_is_64(ct) ? SF64 : SF32;
-  uint64_t masked = sf ? cval : (cval & 0xffffffffu);
-  switch (in->op) {
-    case I_ADD: case I_SUB:
-      if (idx != 1) return false;
-      if (masked <= 0xfff) return true;
-
-      return (0 - (uint64_t)(sf ? (int64_t)masked : (int64_t)(int32_t)masked)) <= 0xfff;
-    case I_EQ: case I_NE: case I_LTS: case I_LTU: case I_GTS: case I_GTU:
-    case I_LES: case I_LEU: case I_GES: case I_GEU:
-      if (idx != 1) return false;
-      if (masked <= 0xfff) return true;
-      return (0 - (uint64_t)(sf ? (int64_t)masked : (int64_t)(int32_t)masked)) <= 0xfff;
-    case I_SHL: case I_SHRS: case I_SHRU: case I_ROTR: case I_ROTL:
-      return idx == 1;
-    case I_AND: case I_OR: case I_XOR: {
-      if (idx != 1) return false;
-
-      if (in->op == I_XOR && masked == (sf ? ~0ull : 0xffffffffu)) return true;
-      uint32_t enc;
-      return a64_logical_imm(masked, sf, &enc);
-    }
-    case I_SELECT: {
-
-      if (idx > 1 || vt_is_float(ct)) return false;
-      if (masked == 0) return true;
-      Ref other = ir_args(f, user)[idx ^ 1u];
-      if (f->insts[other].op != I_CONST) return false;
-      uint64_t om = sf ? f->insts[other].imm : (f->insts[other].imm & 0xffffffffu);
-      if (om != 0) return false;
-      return masked == 1 || masked == (sf ? ~0ull : 0xffffffffu);
-    }
-    case I_LOAD: case I_STORE: {
-
-      if (idx != 0) return false;
-      uint32_t size = (uint32_t)MEMF_SIZE(in->imm2);
-      if (cval & ((1u << size) - 1)) return false;
-      return (cval >> size) <= 0xfff;
-    }
-    default:
-      return false;
-  }
+  return g_target->imm_ok(f, user, idx, cval, ct);
 }
+
+bool ir_mem_disp_ok(uint64_t off, uint32_t size_log2) {
+  return g_target->mem_disp_ok(off, size_log2);
+}
+
+const Target *g_target = &warmc_target_a64;
 
 bool ir_is_pure(const Inst *in) {
   switch (in->op) {

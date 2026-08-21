@@ -1,78 +1,10 @@
-#include "warmc.h"
-#include "a64.h"
+#include "linkobj.h"
 
 #include <stdio.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <stdlib.h>
 #include <string.h>
-
-typedef enum { K_TEXT, K_RODATA, K_DATA, K_BSS, K_DROP } SecKind;
-
-typedef struct {
-  char *name;
-  const uint8_t *data;
-  uint64_t size, align;
-  uint64_t addr;
-  SecKind kind;
-} InSec;
-
-typedef struct {
-  char *name;
-  int32_t sec;
-  uint64_t value;
-  bool global, weak, common;
-  uint64_t comm_size, comm_align;
-} InSym;
-
-typedef struct {
-  uint32_t sec;
-  uint64_t off;
-  int32_t sym;
-  uint32_t type;
-  int64_t addend;
-  bool pcrel;
-  uint8_t length;
-} InRel;
-
-typedef struct {
-  char *name;
-  uint8_t *buf;
-  size_t len;
-  InSec *secs; uint32_t nsecs;
-  InSym *syms; uint32_t nsyms;
-  InRel *rels; uint32_t nrels;
-} InObj;
-
-typedef struct {
-  char *name;
-  int32_t obj;
-  int32_t sym;
-  uint64_t addr;
-  bool defined, weak, imported;
-  uint32_t got_slot;
-  uint32_t stub;
-} GSym;
-
-#define NO_SLOT 0xffffffffu
-
-typedef struct {
-  InObj *objs; uint32_t nobjs, cap_objs;
-  GSym *gsyms; uint32_t ngsyms, cap_gsyms;
-  uint32_t *gs_ix; uint32_t gs_ix_cap;
-
-  uint64_t text_addr, text_size;
-  uint64_t rodata_addr, rodata_size;
-  uint64_t data_addr, data_size;
-  uint64_t bss_addr, bss_size;
-
-  uint64_t *rebase; uint32_t nrebase, cap_rebase;
-  uint32_t *got;  uint32_t ngot,  cap_got;
-  uint32_t *stub; uint32_t nstub, cap_stub;
-  uint64_t got_addr, stub_addr;
-
-  bool macho;
-} Linker;
 
 static void layout_macos(Linker *L);
 static void write_macho_exec(Linker *L, const char *path, uint64_t entry);
@@ -141,8 +73,12 @@ static double lk_ms(void) {
   return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
 }
 
-static void chmod_exec(const char *path) {
+void chmod_exec(const char *path) {
+#ifdef _WIN32
+  (void)path;
+#else
   if (chmod(path, 0755) != 0) warmc_fatal("link: cannot make %s executable", path);
+#endif
 }
 
 static uint8_t *read_file(const char *path, size_t *len) {
@@ -660,6 +596,209 @@ static void read_macho_obj(InObj *o) {
   if (rd32(b + 24) & MH_SUBSECTIONS_VIA_SYMBOLS) split_subsections(o);
 }
 
+#define IMAGE_SCN_CNT_CODE_L             0x00000020u
+#define IMAGE_SCN_CNT_UNINITIALIZED_DATA 0x00000080u
+#define IMAGE_SCN_LNK_INFO               0x00000200u
+#define IMAGE_SCN_LNK_REMOVE             0x00000800u
+#define IMAGE_SCN_LNK_COMDAT             0x00001000u
+#define IMAGE_SCN_LNK_NRELOC_OVFL_L      0x01000000u
+#define IMAGE_SCN_MEM_DISCARDABLE        0x02000000u
+#define IMAGE_SCN_MEM_EXECUTE_L          0x20000000u
+#define IMAGE_SCN_MEM_WRITE_L            0x80000000u
+
+#define IMAGE_REL_AMD64_ADDR64   1
+#define IMAGE_REL_AMD64_ADDR32   2
+#define IMAGE_REL_AMD64_ADDR32NB 3
+#define IMAGE_REL_AMD64_REL32    4
+#define IMAGE_REL_AMD64_REL32_5  9
+
+#define IMAGE_SYM_CLASS_EXTERNAL_L    2
+#define IMAGE_SYM_CLASS_STATIC_L      3
+#define IMAGE_SYM_CLASS_LABEL         6
+#define IMAGE_SYM_CLASS_WEAK_EXTERNAL 105
+
+static SecKind coff_kind(const char *name, uint32_t ch) {
+  if (ch & (IMAGE_SCN_LNK_INFO | IMAGE_SCN_LNK_REMOVE | IMAGE_SCN_MEM_DISCARDABLE))
+    return K_DROP;
+  /* SEH tables and debug sections have no consumer in our runtime */
+  if (!strncmp(name, ".debug", 6) || !strncmp(name, ".pdata", 6) ||
+      !strncmp(name, ".xdata", 6) || !strncmp(name, ".llvm", 5))
+    return K_DROP;
+  if (ch & IMAGE_SCN_CNT_UNINITIALIZED_DATA) return K_BSS;
+  if (ch & (IMAGE_SCN_CNT_CODE_L | IMAGE_SCN_MEM_EXECUTE_L)) return K_TEXT;
+  if (ch & IMAGE_SCN_MEM_WRITE_L) return K_DATA;
+  return K_RODATA;
+}
+
+static void read_coff_obj(InObj *o) {
+  const uint8_t *b = o->buf;
+  if (o->len < 20 || rd16(b) != 0x8664)
+    warmc_fatal("link: %s is not an AMD64 COFF object", o->name);
+  uint32_t nsec = rd16(b + 2);
+  uint32_t symoff = rd32(b + 8), nraw = rd32(b + 12);
+  const uint8_t *sh = b + 20 + rd16(b + 16);
+  const char *strtab = (const char *)(b + symoff + 18ull * nraw);
+
+  /* COFF section numbers are 1-based; slot 0 is a dummy */
+  o->nsecs = nsec + 1;
+  o->secs = xcalloc(o->nsecs, sizeof(InSec));
+  o->secs[0].name = xstrndup("", 0);
+  o->secs[0].kind = K_DROP;
+  o->secs[0].align = 1;
+  bool *comdat = xcalloc(o->nsecs, sizeof(bool));
+  for (uint32_t i = 0; i < nsec; i++) {
+    const uint8_t *s = sh + (size_t)i * 40;
+    char name[64];
+    if (s[0] == '/' && s[1] >= '0' && s[1] <= '9') {
+      char digits[8];
+      memcpy(digits, s + 1, 7); digits[7] = 0;
+      snprintf(name, sizeof name, "%s", strtab + strtoul(digits, NULL, 10));
+    } else {
+      memcpy(name, s, 8); name[8] = 0;
+    }
+    uint32_t rawsize = rd32(s + 16), rawptr = rd32(s + 20), ch = rd32(s + 36);
+    InSec *is = &o->secs[i + 1];
+    is->name = xstrndup(name, strlen(name));
+    is->size = rawsize;
+    uint32_t al = (ch >> 20) & 0xf;
+    is->align = al ? 1ull << (al - 1) : 16;
+    is->kind = coff_kind(name, ch);
+    is->data = (is->kind == K_BSS || is->kind == K_DROP || !rawptr) ? NULL : b + rawptr;
+    comdat[i + 1] = (ch & IMAGE_SCN_LNK_COMDAT) != 0;
+  }
+
+  o->nsyms = nraw;
+  o->syms = xcalloc(nraw ? nraw : 1, sizeof(InSym));
+  uint8_t *sel = xcalloc(o->nsecs, 1);
+  uint32_t *weak_at = xmalloc((nraw ? nraw : 1) * sizeof(uint32_t));
+  uint32_t *weak_tag = xmalloc((nraw ? nraw : 1) * sizeof(uint32_t));
+  uint32_t nweak = 0;
+  for (uint32_t k = 0; k < nraw; k++) {
+    const uint8_t *e = b + symoff + (size_t)k * 18;
+    InSym *sy = &o->syms[k];
+    char inbuf[9];
+    const char *nm;
+    if (rd32(e) == 0) {
+      nm = strtab + rd32(e + 4);
+    } else {
+      memcpy(inbuf, e, 8); inbuf[8] = 0;
+      nm = inbuf;
+    }
+    sy->name = xstrndup(nm, strlen(nm));
+    uint32_t value = rd32(e + 8);
+    int32_t secn = (int16_t)rd16(e + 12);
+    uint8_t cls = e[16], naux = e[17];
+    sy->sec = -1;
+    if (cls == IMAGE_SYM_CLASS_EXTERNAL_L) {
+      sy->global = true;
+      if (secn == 0 && value > 0) {
+        sy->common = true;
+        sy->comm_size = value;
+        sy->comm_align = 16;
+      } else if (secn > 0 && (uint32_t)secn < o->nsecs) {
+        sy->sec = secn;
+        sy->value = value;
+      }
+    } else if (cls == IMAGE_SYM_CLASS_STATIC_L || cls == IMAGE_SYM_CLASS_LABEL) {
+      if (secn > 0 && (uint32_t)secn < o->nsecs) {
+        sy->sec = secn;
+        sy->value = value;
+      }
+      /* a section symbol's aux record carries the COMDAT selection */
+      if (cls == IMAGE_SYM_CLASS_STATIC_L && naux >= 1 && sy->sec > 0 &&
+          value == 0 && !strcmp(sy->name, o->secs[sy->sec].name))
+        sel[sy->sec] = b[symoff + (size_t)(k + 1) * 18 + 14];
+    } else if (cls == IMAGE_SYM_CLASS_WEAK_EXTERNAL) {
+      sy->global = true;
+      sy->weak = true;
+      if (naux >= 1) {
+        weak_at[nweak] = k;
+        weak_tag[nweak] = rd32(b + symoff + (size_t)(k + 1) * 18);
+        nweak++;
+      }
+    }
+    for (uint8_t a = 0; a < naux && k + 1 < nraw; a++) {
+      k++;
+      o->syms[k].name = xstrndup("", 0);
+      o->syms[k].sec = -1;
+    }
+  }
+
+  /* a weak external adopts the default definition its aux record names */
+  for (uint32_t i = 0; i < nweak; i++) {
+    if (weak_tag[i] >= nraw) continue;
+    InSym *t = &o->syms[weak_tag[i]];
+    if (t->sec >= 0) {
+      o->syms[weak_at[i]].sec = t->sec;
+      o->syms[weak_at[i]].value = t->value;
+    }
+  }
+
+  /* COMDAT ANY/SAME_SIZE/EXACT_MATCH/LARGEST definitions dedup like weak
+     symbols: the first definition wins, duplicates are laid out unreferenced
+     (and dead-stripped when -strip is on) */
+  for (uint32_t k = 0; k < nraw; k++) {
+    InSym *sy = &o->syms[k];
+    if (!sy->global || sy->sec <= 0 || !comdat[sy->sec]) continue;
+    uint8_t s = sel[sy->sec];
+    if (s == 2 || s == 3 || s == 4 || s == 6) sy->weak = true;
+  }
+  xfree(weak_at); xfree(weak_tag); xfree(sel); xfree(comdat);
+
+  uint32_t total = 0;
+  for (uint32_t i = 0; i < nsec; i++) {
+    const uint8_t *s = sh + (size_t)i * 40;
+    uint32_t n = rd16(s + 32);
+    if ((rd32(s + 36) & IMAGE_SCN_LNK_NRELOC_OVFL_L) && n == 0xffff)
+      n = rd32(b + rd32(s + 24)) - 1;
+    total += n;
+  }
+  o->rels = xcalloc(total ? total : 1, sizeof(InRel));
+  for (uint32_t i = 0; i < nsec; i++) {
+    const uint8_t *s = sh + (size_t)i * 40;
+    InSec *is = &o->secs[i + 1];
+    if (is->kind == K_DROP || is->kind == K_BSS) continue;
+    uint32_t va0 = rd32(s + 12);
+    uint32_t n = rd16(s + 32);
+    const uint8_t *r = b + rd32(s + 24);
+    if ((rd32(s + 36) & IMAGE_SCN_LNK_NRELOC_OVFL_L) && n == 0xffff) {
+      n = rd32(r) - 1;
+      r += 10;
+    }
+    for (uint32_t j = 0; j < n; j++, r += 10) {
+      InRel *ir = &o->rels[o->nrels++];
+      ir->sec = i + 1;
+      ir->off = rd32(r) - va0;
+      ir->sym = (int32_t)rd32(r + 4);
+      ir->type = rd16(r + 8);
+      /* the addend lives in the section bytes (COFF relocations carry
+         none); REL32+k counts from k bytes past the end of the field, so
+         normalize to our S + A - P reading */
+      uint64_t need = ir->type == IMAGE_REL_AMD64_ADDR64 ? 8u : 4u;
+      if (ir->off > is->size || need > is->size - ir->off)
+        warmc_fatal("link: %s: relocation past the end of %s", o->name, is->name);
+      const uint8_t *p = is->data + ir->off;
+      switch (ir->type) {
+        case IMAGE_REL_AMD64_ADDR64:
+          ir->addend = (int64_t)rd64(p);
+          break;
+        case IMAGE_REL_AMD64_ADDR32:
+        case IMAGE_REL_AMD64_ADDR32NB:
+          ir->addend = (int32_t)rd32(p);
+          break;
+        default:
+          if (ir->type >= IMAGE_REL_AMD64_REL32 && ir->type <= IMAGE_REL_AMD64_REL32_5) {
+            ir->addend = (int64_t)(int32_t)rd32(p) - 4 -
+                         (int64_t)(ir->type - IMAGE_REL_AMD64_REL32);
+            break;
+          }
+          warmc_fatal("link: %s: unsupported COFF relocation type %u in %s",
+                      o->name, ir->type, is->name);
+      }
+    }
+  }
+}
+
 static void collect_globals(Linker *L, uint32_t oi) {
   InObj *o = &L->objs[oi];
   for (uint32_t i = 0; i < o->nsyms; i++) {
@@ -683,7 +822,7 @@ static void collect_globals(Linker *L, uint32_t oi) {
 
 static bool any_undefined(Linker *L) {
   for (uint32_t i = 0; i < L->ngsyms; i++)
-    if (!L->gsyms[i].defined) return true;
+    if (!L->gsyms[i].defined && !L->gsyms[i].imported) return true;
   return false;
 }
 
@@ -923,7 +1062,7 @@ static uint64_t align_up(uint64_t v, uint64_t a) {
   return a <= 1 ? v : (v + a - 1) & ~(a - 1);
 }
 
-static uint64_t place(Linker *L, SecKind k, uint64_t at) {
+uint64_t place(Linker *L, SecKind k, uint64_t at) {
   for (uint32_t i = 0; i < L->nobjs; i++) {
     InObj *o = &L->objs[i];
     for (uint32_t s = 0; s < o->nsecs; s++) {
@@ -1049,7 +1188,8 @@ static void apply_relocs(Linker *L) {
       InSec *is = &o->secs[ir->sec];
       if (is->kind == K_DROP || !is->data) continue;
       uint64_t need = 4;
-      if (L->macho) need = ir->length == 3 ? 8u : 4u;
+      if (L->fmt == TGT_MACHO) need = ir->length == 3 ? 8u : 4u;
+      else if (L->fmt == TGT_PE) need = ir->type == IMAGE_REL_AMD64_ADDR64 ? 8u : 4u;
       else if (ir->type == R_AARCH64_ABS64 || ir->type == R_AARCH64_PREL64)
         need = 8;
       if (ir->off > is->size || need > is->size - ir->off)
@@ -1064,7 +1204,7 @@ static void apply_relocs(Linker *L) {
       uint64_t S = sym_addr(L, oi, ir->sym, is->name);
       int64_t A = ir->addend;
 
-      if (L->macho) {
+      if (L->fmt == TGT_MACHO) {
         switch (ir->type) {
           case ARM64_RELOC_BRANCH26: {
             uint64_t t = S + (uint64_t)A;
@@ -1124,6 +1264,42 @@ static void apply_relocs(Linker *L) {
         continue;
       }
 
+      if (L->fmt == TGT_PE) {
+        int32_t g = sy->global ? gs_find(L, sy->name) : -1;
+        bool imp = g >= 0 && L->gsyms[g].imported;
+        switch (ir->type) {
+          case IMAGE_REL_AMD64_ADDR64:
+            if (imp)
+              warmc_fatal("link: %s stores a pointer to the imported symbol %s; "
+                          "only rip-relative references to an import are supported",
+                          o->name, nm);
+            wr64(p, S + (uint64_t)A);
+            break;
+          case IMAGE_REL_AMD64_ADDR32NB:
+            if (imp)
+              warmc_fatal("link: %s takes the image-relative address of the "
+                          "imported symbol %s", o->name, nm);
+            wr32(p, (uint32_t)(S + (uint64_t)A - PE_BASE));
+            break;
+          case IMAGE_REL_AMD64_REL32:
+          case IMAGE_REL_AMD64_REL32 + 1: case IMAGE_REL_AMD64_REL32 + 2:
+          case IMAGE_REL_AMD64_REL32 + 3: case IMAGE_REL_AMD64_REL32 + 4:
+          case IMAGE_REL_AMD64_REL32_5: {
+            uint64_t t = S;
+            if (imp)
+              t = !strncmp(nm, "__imp_", 6)
+                    ? L->got_addr + (uint64_t)L->gsyms[g].got_slot * 8
+                    : L->stub_addr + (uint64_t)L->gsyms[g].stub * 6;
+            wr32(p, (uint32_t)((int64_t)(t + (uint64_t)A) - (int64_t)pc));
+            break;
+          }
+          default:
+            warmc_fatal("link: %s: unsupported COFF relocation type %u on %s",
+                        o->name, ir->type, nm);
+        }
+        continue;
+      }
+
       switch (ir->type) {
         case R_AARCH64_CALL26: case R_AARCH64_JUMP26:
           patch_branch26(p, (int64_t)(S + (uint64_t)A) - (int64_t)pc, nm); break;
@@ -1168,13 +1344,22 @@ static void reserve_indirection(Linker *L) {
                     o->name, ir->sym, o->nsyms);
       InSym *sy = &o->syms[ir->sym];
       int32_t g = sy->global ? gs_find(L, sy->name) : -1;
-      if (L->macho) {
+      if (L->fmt == TGT_MACHO) {
         if (ir->type == ARM64_RELOC_GOT_LOAD_PAGE21 ||
             ir->type == ARM64_RELOC_GOT_LOAD_PAGEOFF12) {
           if (g < 0) warmc_fatal("link: GOT relocation on non-global %s", sy->name);
           got_for(L, (uint32_t)g);
         } else if (ir->type == ARM64_RELOC_BRANCH26 && g >= 0 && L->gsyms[g].imported) {
           stub_for(L, (uint32_t)g);
+        }
+      } else if (L->fmt == TGT_PE) {
+        if (g >= 0 && L->gsyms[g].imported) {
+          if (ir->type < IMAGE_REL_AMD64_REL32 || ir->type > IMAGE_REL_AMD64_REL32_5)
+            warmc_fatal("link: %s: relocation type %u on the imported symbol %s; "
+                        "only rip-relative references to an import are supported",
+                        o->name, ir->type, sy->name);
+          if (!strncmp(sy->name, "__imp_", 6)) got_for(L, (uint32_t)g);
+          else stub_for(L, (uint32_t)g);
         }
       } else if (ir->type == R_AARCH64_ADR_GOT_PAGE ||
                  ir->type == R_AARCH64_LD64_GOT_LO12_NC) {
@@ -1185,7 +1370,7 @@ static void reserve_indirection(Linker *L) {
   }
 }
 
-static void place_commons(Linker *L, uint64_t *bss_end) {
+void place_commons(Linker *L, uint64_t *bss_end) {
   for (uint32_t i = 0; i < L->ngsyms; i++) {
     GSym *g = &L->gsyms[i];
     if (!g->defined || g->obj < 0) continue;
@@ -1215,7 +1400,7 @@ static void resolve_addrs(Linker *L) {
 #define ELF_PAGE 0x10000ull
 #define ELF_BASE 0x400000ull
 
-static void emit_secs(Buf *b, Linker *L, SecKind k, uint64_t seg_addr, uint64_t seg_off) {
+void emit_secs(Buf *b, Linker *L, SecKind k, uint64_t seg_addr, uint64_t seg_off) {
   for (uint32_t i = 0; i < L->nobjs; i++) {
     InObj *o = &L->objs[i];
     for (uint32_t s = 0; s < o->nsecs; s++) {
@@ -1281,7 +1466,9 @@ static void write_elf_exec(Linker *L, const char *path, uint64_t entry) {
 static void load_main(Linker *L, const char *objpath) {
   size_t len; uint8_t *buf = read_file(objpath, &len);
   InObj *o = obj_new(L, objpath, buf, len);
-  if (L->macho) read_macho_obj(o); else read_elf_obj(o);
+  if (L->fmt == TGT_MACHO) read_macho_obj(o);
+  else if (L->fmt == TGT_PE) read_coff_obj(o);
+  else read_elf_obj(o);
   collect_globals(L, 0);
   for (uint32_t i = 0; i < o->nsyms; i++)
     if (o->syms[i].global && o->syms[i].sec < 0 && !o->syms[i].common && o->syms[i].name[0])
@@ -1312,19 +1499,21 @@ static void layout_linux(Linker *L) {
   L->bss_size = at - L->bss_addr;
 }
 
-void warmc_link_exec(bool macho, const char *out, const char *objpath,
+void warmc_link_exec(TargetFmt fmt, const char *out, const char *objpath,
                      const char *wasi, const char *rt, const char *entry,
                      bool strip) {
+  bool macho = fmt == TGT_MACHO;
   Linker L;
   memset(&L, 0, sizeof L);
-  L.macho = macho;
+  L.fmt = fmt;
 
   bool tm = getenv("WARMC_TIME") != NULL;
   double t0 = tm ? lk_ms() : 0, t_read, t_pull, t_lay, t_rel;
   load_main(&L, objpath);
 
   gs_intern(&L, entry);
-  void (*rd)(InObj *) = macho ? read_macho_obj : read_elf_obj;
+  void (*rd)(InObj *) = macho ? read_macho_obj
+                      : fmt == TGT_PE ? read_coff_obj : read_elf_obj;
   Archive ars[2];
   uint32_t nars = 0;
   if (wasi) ar_load(&ars[nars++], wasi);
@@ -1332,6 +1521,18 @@ void warmc_link_exec(bool macho, const char *out, const char *objpath,
   if (tm) { t_read = lk_ms() - t0; t0 = lk_ms(); }
   pull_archives(&L, ars, nars, rd);
   if (tm) { t_pull = lk_ms() - t0; t0 = lk_ms(); }
+
+  if (fmt == TGT_PE)
+    for (uint32_t i = 0; i < L.ngsyms; i++) {
+      GSym *g = &L.gsyms[i];
+      if (g->defined) continue;
+      if (!strcmp(g->name, "__ImageBase")) {
+        g->defined = true;
+        g->addr = PE_BASE;
+      } else if (pe_dll_for(g->name)) {
+        g->imported = true;
+      }
+    }
 
   if (!macho && any_undefined(&L)) {
 
@@ -1372,7 +1573,9 @@ void warmc_link_exec(bool macho, const char *out, const char *objpath,
         fprintf(stderr, "link:   import %-24s got=%u stub=%u\n", L.gsyms[i].name,
                 L.gsyms[i].got_slot, L.gsyms[i].stub);
   }
-  if (macho) layout_macos(&L); else layout_linux(&L);
+  if (macho) layout_macos(&L);
+  else if (fmt == TGT_PE) layout_windows(&L);
+  else layout_linux(&L);
   resolve_addrs(&L);
   if (tm) { t_lay = lk_ms() - t0; t0 = lk_ms(); }
 
@@ -1420,6 +1623,7 @@ void warmc_link_exec(bool macho, const char *out, const char *objpath,
 
   if (tm) { t_rel = lk_ms() - t0; t0 = lk_ms(); }
   if (macho) write_macho_exec(&L, out, L.gsyms[e].addr);
+  else if (fmt == TGT_PE) write_pe_exec(&L, out, L.gsyms[e].addr);
   else write_elf_exec(&L, out, L.gsyms[e].addr);
   if (tm)
     fprintf(stderr, "link time: read %.1f pull %.1f layout %.1f reloc %.1f write %.1f\n",

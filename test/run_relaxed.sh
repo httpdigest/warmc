@@ -58,8 +58,17 @@ for lvl in 0 1 2; do
     LABEL="-O$lvl/$prof"
     for c in $COMMON; do expect_ok "$c"; done
 
-    if [ "$prof" = det ]; then expect_ok madd_unfused; expect_ok nan_det
-    else                       expect_ok madd_fused;   expect_ok nan_full; fi
+    if [ "$prof" = det ]; then
+      expect_ok madd_unfused
+      # a64 gets the profile's NaN rule from FPCR.DN, set once at
+      # instantiation; x86-64 has no such mode, so the x64 backend emits
+      # the check after each instruction the rule covers.  Same assertion
+      # on both targets -- which is the point of it being one test.
+      expect_ok nan_det
+      expect_ok nan_det_ops
+    else
+      expect_ok madd_fused;   expect_ok nan_full
+    fi
   done
 done
 
@@ -74,6 +83,11 @@ cli() {
 cli "an unknown profile name is refused" 1 --profile=bogus -O1
 cli "--profile=full is accepted"         0 --profile=full -O1
 cli "a bare --profile is still the counter" 0 --profile -O1
+# ... and it is the counter on whichever backend this host emits for, which
+# is not the same code: a64 patches a count of words into an add's imm12,
+# x64 an instruction count into a memory add's imm32.
+cli "the counter compiles for the host target" 0 --profile -O1 \
+    $WARMC_TARGET_FLAGS
 
 echo "relaxed: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

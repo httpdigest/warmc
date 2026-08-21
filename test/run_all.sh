@@ -74,6 +74,11 @@ start cases-O0 env WARMC_FLAGS=-O0 ./test/run_tests.sh
 start cases-O1 env WARMC_FLAGS=-O1 ./test/run_tests.sh
 start cases-O2 env WARMC_VERIFY_RA=1 WARMC_FLAGS=-O2 ./test/run_tests.sh
 
+# A second, independent engine over the same corpus; the row skips itself
+# politely where wasmtime is not installed.
+start cases-wasmtime \
+  bash -c '. test/hostenv.sh; WARMC_FLAGS=-O2 python3 test/run_wasmtime.py'
+
 start cases-noinl env WARMC_VERIFY_RA=1 WARMC_FLAGS="-O2 -fno-inline" ./test/run_tests.sh
 start gc-noinl    env WARMC_FLAGS="-O2 -fno-inline" ./test/run_gc.sh
 start workload-noinl \
@@ -124,6 +129,7 @@ start link     ./test/run_link.sh
 start macho    ./test/run_macho.sh
 
 start elf      ./test/run_elf.sh
+start pe       ./test/run_pe.sh
 
 start tinygo   ./test/run_tinygo.sh
 

@@ -6,6 +6,13 @@ cd "$(dirname "$0")/.."
 BUILD=${BUILD:-build}
 . ./test/hostenv.sh
 
+case "${WARMC_TARGET_FLAGS:-}" in
+  *--target=windows*)
+    echo "gowasip2: SKIPPED (there is no warmwasip2-windows.a -- the preview2"
+    echo "    host on Windows is a follow-up to the preview1 one in"
+    echo "    rt/winposix.c)"
+    exit 0;;
+esac
 if ! command -v tinygo >/dev/null 2>&1; then
   echo "gowasip2: SKIPPED (tinygo not on PATH)"
   exit 0

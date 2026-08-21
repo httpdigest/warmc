@@ -10,8 +10,9 @@ mkdir -p "$WORK"
 fail=0
 
 case "$WARMC_TARGET_FLAGS" in
-  *macos*) GCTH_RT="$BUILD/warmgcth-macos.a" ;;
-  *)       GCTH_RT="$BUILD/warmgcth.a" ;;
+  *macos*)   GCTH_RT="$BUILD/warmgcth-macos.a" ;;
+  *windows*) GCTH_RT="$BUILD/warmgcth-windows.a" ;;
+  *)         GCTH_RT="$BUILD/warmgcth.a" ;;
 esac
 if [ ! -s "$GCTH_RT" ]; then
   echo "FAIL[gcthread]: $GCTH_RT not built (run \`make\`)"

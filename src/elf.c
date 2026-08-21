@@ -41,7 +41,9 @@ static uint32_t elf_reltype(RelKind k) {
     case REL_ADD_LO12: return R_AARCH64_ADD_ABS_LO12_NC;
     case REL_LDST_LO12: return R_AARCH64_LDST64_ABS_LO12_NC;
     case REL_ABS64: return R_AARCH64_ABS64;
+    default: break;
   }
+  warmc_fatal("elf: relocation kind %d has no AArch64 mapping", (int)k);
   return 0;
 }
 

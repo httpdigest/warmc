@@ -5865,8 +5865,7 @@ static bool offset_is_free(IrFunc *f, Ref ea, const uint32_t *uses) {
         if (j != 0 || (in->op != I_LOAD && in->op != I_STORE)) return false;
         uint32_t size = (uint32_t)MEMF_SIZE(in->imm2);
         uint64_t off = f->insts[ea].imm;
-        if (off & ((1u << size) - 1)) return false;
-        if ((off >> size) > 0xfff) return false;
+        if (!ir_mem_disp_ok(off, size)) return false;
       }
     }
   }
@@ -6022,8 +6021,7 @@ static bool addr_users_are_accesses(IrFunc *f, const UseIdx *ui, Ref ea,
     if (!ui->arg0[k] || (in->op != I_LOAD && in->op != I_STORE)) return false;
     if (in->imm != 0) return false;
     uint32_t size = (uint32_t)MEMF_SIZE(in->imm2);
-    if (off & ((1u << size) - 1)) return false;
-    if ((off >> size) > 0xfff) return false;
+    if (!ir_mem_disp_ok(off, size)) return false;
 
     if (*seen && *mem != MEMF_MEM(in->imm2)) return false;
     *mem = MEMF_MEM(in->imm2);

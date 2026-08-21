@@ -80,7 +80,8 @@ void write_macho64(ObjBuilder *o, const char *path) {
       case REL_ADD_LO12:
       case REL_LDST_LO12:  type = ARM64_RELOC_PAGEOFF12; pcrel = 0; length = 2; break;
       case REL_ABS64:      type = ARM64_RELOC_UNSIGNED;  pcrel = 0; length = 3; break;
-      default: continue;
+      default:
+        warmc_fatal("macho: relocation kind %d has no arm64 mapping", (int)r->kind);
     }
     Buf *rb = &reloc[r->section];
     buf_u32(rb, (uint32_t)r->offset);

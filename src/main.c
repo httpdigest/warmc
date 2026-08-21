@@ -1,5 +1,6 @@
 #include <time.h>
 #include "ir.h"
+#include "target.h"
 #include "component.h"
 #include "canon.h"
 #include "wit.h"
@@ -10,6 +11,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#endif
 
 static const char *usage_text =
   "warmc -- WebAssembly to AArch64 ahead-of-time compiler\n"
@@ -92,8 +97,9 @@ static const char *usage_text =
   "                deterministic.  Unrelated to the bare --profile above,\n"
   "                which is warmc's own instruction counter\n"
   "  -c            emit a relocatable object and stop\n"
-  "  --target T    linux (ELF, default) or macos (Mach-O).  The macOS link\n"
-  "                needs libSystem, found through `xcrun --show-sdk-path`;\n"
+  "  --target T    linux (ELF, default), macos (Mach-O) or windows (PE,\n"
+  "                x64; default output a.exe).  The macOS link needs\n"
+  "                libSystem, found through `xcrun --show-sdk-path`;\n"
   "                $WARMC_MACOS_LIBDIR overrides that\n"
   "  --rt PATH     runtime archive or object to link (default $WARMC_RT)\n"
   "  --system-ld   link with an external linker instead of doing it here\n"
@@ -106,6 +112,10 @@ static const char *wasi_archive(const char *rt, const char *wasi, bool p2,
                                 char *buf, size_t bufn) {
   if (!wasi) {
     const char *base = strrchr(rt, '/');
+#ifdef _WIN32
+    const char *bs = strrchr(rt, '\\');
+    if (bs && (!base || bs > base)) base = bs;
+#endif
     base = base ? base + 1 : rt;
     if (strncmp(base, "warmrt", 6))
       warmc_fatal("--wasi cannot guess the host archive from %s; "
@@ -135,6 +145,7 @@ static const char *macos_libdir(void) {
   const char *env = getenv("WARMC_MACOS_LIBDIR");
   if (env && *env) return env;
 
+#ifdef __APPLE__
   static char buf[4096];
   FILE *p = popen("xcrun --show-sdk-path 2>/dev/null", "r");
   if (!p) return NULL;
@@ -150,6 +161,9 @@ static const char *macos_libdir(void) {
   struct stat st;
   if (stat(buf, &st) != 0 || !S_ISDIR(st.st_mode)) return NULL;
   return buf;
+#else
+  return NULL;
+#endif
 }
 
 static uint8_t *read_file(const char *path, size_t *len_out) {
@@ -167,6 +181,12 @@ static uint8_t *read_file(const char *path, size_t *len_out) {
 }
 
 int main(int argc, char **argv) {
+#ifdef _WIN32
+  /* Dumps are byte-compared against golden files; keep the streams free
+     of CRLF translation so output matches the POSIX hosts exactly. */
+  _setmode(_fileno(stdout), _O_BINARY);
+  _setmode(_fileno(stderr), _O_BINARY);
+#endif
   const char *input = NULL, *output = NULL, *target = "linux";
   const char *rt = getenv("WARMC_RT");
   const char *ld = getenv("WARMC_LD");
@@ -337,8 +357,15 @@ int main(int argc, char **argv) {
   }
   if (!input) { fputs(usage_text, stderr); return 2; }
 
-  bool macho = !strcmp(target, "macos") || !strcmp(target, "darwin");
-  if (!macho && strcmp(target, "linux")) warmc_fatal("unknown target %s", target);
+  TargetFmt fmt = TGT_ELF;
+  if (!strcmp(target, "macos") || !strcmp(target, "darwin")) fmt = TGT_MACHO;
+  else if (!strcmp(target, "windows")) fmt = TGT_PE;
+  else if (strcmp(target, "linux")) warmc_fatal("unknown target %s", target);
+  if (fmt == TGT_PE) g_target = &warmc_target_x64;
+  bool macho = fmt == TGT_MACHO;
+  const char *outdef = fmt == TGT_PE ? "a.exe" : "a.out";
+  const char *entry_sym = fmt == TGT_PE ? "warmc_win_entry"
+                        : macho ? "_main" : "_start";
 
   if (dump_wit || is_directory(input) ||
       (validate_only && ends_with(input, ".wit"))) {
@@ -409,16 +436,17 @@ int main(int argc, char **argv) {
       clink_compile(lp, &co, &opt);
       char cobj[4096];
       if (obj_only) snprintf(cobj, sizeof cobj, "%s", output ? output : "out.o");
-      else snprintf(cobj, sizeof cobj, "%s.o", output ? output : "a.out");
+      else snprintf(cobj, sizeof cobj, "%s.o", output ? output : outdef);
       if (macho) write_macho64(&co, cobj);
+      else if (fmt == TGT_PE) write_coff64(&co, cobj);
       else write_elf64(&co, cobj);
       if (!obj_only) {
         if (!rt) warmc_fatal("no runtime specified; pass --rt or set WARMC_RT");
         char cwasi[4096];
-        warmc_link_exec(macho, output ? output : "a.out", cobj,
+        warmc_link_exec(fmt, output ? output : outdef, cobj,
                         want_wasi ? wasi_archive(rt, wasi, true, cwasi,
                                                  sizeof cwasi) : NULL,
-                        rt, macho ? "_main" : "_start", dead_strip);
+                        rt, entry_sym, dead_strip);
         if (!keep_obj) remove(cobj);
       }
       clink_free(lp);
@@ -543,9 +571,10 @@ int main(int argc, char **argv) {
 
   char objpath[4096];
   if (obj_only) snprintf(objpath, sizeof objpath, "%s", output ? output : "out.o");
-  else snprintf(objpath, sizeof objpath, "%s.o", output ? output : "a.out");
+  else snprintf(objpath, sizeof objpath, "%s.o", output ? output : outdef);
 
   if (macho) write_macho64(&o, objpath);
+  else if (fmt == TGT_PE) write_coff64(&o, objpath);
   else write_elf64(&o, objpath);
 
   if (obj_only) return 0;
@@ -558,8 +587,8 @@ int main(int argc, char **argv) {
 
   if (!system_ld) {
 
-    warmc_link_exec(macho, output ? output : "a.out", objpath,
-                    want_wasi ? wasi : NULL, rt, macho ? "_main" : "_start",
+    warmc_link_exec(fmt, output ? output : outdef, objpath,
+                    want_wasi ? wasi : NULL, rt, entry_sym,
                     dead_strip);
     if (!keep_obj) remove(objpath);
     module_free(m);
@@ -568,6 +597,10 @@ int main(int argc, char **argv) {
   }
 
   char cmd[8192];
+  if (fmt == TGT_PE)
+    warmc_fatal("--system-ld --target windows: not wired up; the built-in "
+                "linker handles the PE link (an SDK-import-lib escape hatch "
+                "can come later)");
   if (macho) {
     const char *libdir = macos_libdir();
     if (!libdir)
@@ -577,11 +610,11 @@ int main(int argc, char **argv) {
     snprintf(cmd, sizeof cmd,
              "%s -arch arm64 -platform_version macos 11.0 11.0 -o %s %s %s%s%s "
              "-lSystem -L%s",
-             ld, output ? output : "a.out", objpath,
+             ld, output ? output : outdef, objpath,
              want_wasi ? wasi : "", want_wasi ? " " : "", rt, libdir);
   } else {
     snprintf(cmd, sizeof cmd, "%s -static -e _start -o %s %s %s%s%s",
-             ld, output ? output : "a.out", objpath,
+             ld, output ? output : outdef, objpath,
              want_wasi ? wasi : "", want_wasi ? " " : "", rt);
   }
   if (verbose) fprintf(stderr, "warmc: %s\n", cmd);

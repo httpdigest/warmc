@@ -19,12 +19,11 @@ extern const ModuleDesc c_module;
  * harness but not the reference. */
 const ModuleDesc warmc_module = { 0 };
 
-long warmc_rt_write(int fd, const void *buf, unsigned long n);
 
 static void out(const char *s) {
   const char *p = s;
   while (*p) p++;
-  warmc_rt_write(1, s, (unsigned long)(p - s));
+  warmc_rt_write(1, s, (usz)(p - s));
 }
 
 static void put_i32(int v) {
@@ -34,7 +33,7 @@ static void put_i32(int v) {
   if (!u) buf[--i] = '0';
   while (u) { buf[--i] = (char)('0' + (u % 10)); u /= 10; }
   if (v < 0) buf[--i] = '-';
-  warmc_rt_write(1, buf + i, (unsigned long)(16 - i));
+  warmc_rt_write(1, buf + i, (usz)(16 - i));
 }
 
 static u64 call(WarmInstance *inst, const char *name, u64 arg, int nargs) {

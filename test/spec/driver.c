@@ -231,8 +231,37 @@ static int run_one(const SpecFile *f) {
         /* An export may re-export a function another module defines, and
          * that one has to be entered with its own instance. */
         FuncRef fr = warmc_export_func(target, e);
+#if defined(__x86_64__)
+        /* Parameters past x64's register ceilings (3 ints, 4 floats) go
+         * through the stack-slot image warmc_invoke_s copies for us, laid
+         * out the way the callee reads it: eight bytes per scalar in
+         * parameter order, an aligned sixteen for a v128. */
+#define SPEC_STK_WORDS 24
+        u64 stk[SPEC_STK_WORDS];
+        unsigned ni2 = 0, nf2 = 0, w = 0;
+        for (unsigned i = 0; i < cmd->nargs; i++) {
+          const SpecVal *a = &cmd->args[i];
+          if (a->kind == SV_V128 || a->kind == SV_V128_NAN) {
+            if (nf2 >= 4 && w + 2 < SPEC_STK_WORDS) {
+              if (w & 1) w++;
+              stk[w++] = a->bits; stk[w++] = a->hi;
+            }
+            nf2++;
+          } else if (is_vreg_kind(a->kind)) {
+            if (nf2 >= 4 && w < SPEC_STK_WORDS) stk[w++] = a->bits;
+            nf2++;
+          } else {
+            if (ni2 >= 3 && w < SPEC_STK_WORDS) stk[w++] = a->bits;
+            ni2++;
+          }
+        }
+        u32 trap = warmc_invoke_catching_s(fr.code,
+                                           (WarmInstance *)fr.instance,
+                                           iargs, fargs, ret, stk, 8ull * w);
+#else
         u32 trap = warmc_invoke_catching(fr.code, (WarmInstance *)fr.instance,
                                          iargs, fargs, ret);
+#endif
 
         if (cmd->expect == EXPECT_EXCEPTION) {
           /* Exactly an uncaught exception.  Any other trap means the module

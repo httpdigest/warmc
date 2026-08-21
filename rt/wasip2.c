@@ -1,6 +1,6 @@
 #include "wasifs.h"
 
-extern void *malloc(unsigned long);
+extern void *malloc(usz);
 extern void free(void *);
 extern void (*signal(int, void (*)(int)))(int);
 extern int isatty(int);
@@ -61,7 +61,7 @@ static u32 g_nenv, g_env_cap;
 static void err(const char *s) {
   const char *p = s;
   while (*p) p++;
-  warmc_rt_write(2, s, (unsigned long)(p - s));
+  warmc_rt_write(2, s, (usz)(p - s));
 }
 
 static int str_eq(const char *a, const char *b) {
@@ -69,10 +69,10 @@ static int str_eq(const char *a, const char *b) {
   return *a == *b;
 }
 
-static unsigned long cstrlen(const char *s) {
+static usz cstrlen(const char *s) {
   const char *p = s;
   while (*p) p++;
-  return (unsigned long)(p - s);
+  return (usz)(p - s);
 }
 
 static int ok(WarmInstance *vm, u64 off, u64 len) {
@@ -136,7 +136,7 @@ static void put_string(WarmInstance *vm, u64 at, const char *s, u64 n) {
 }
 
 static Stream *stream_of(u32 rt, u64 h) {
-  Stream *s = (Stream *)(unsigned long)warmc_res_lift_borrow(rt, (u32)h);
+  Stream *s = (Stream *)(uptr)warmc_res_lift_borrow(rt, (u32)h);
   warmc_res_release(rt, (u32)h);
   return s;
 }
@@ -156,7 +156,7 @@ static Stream *stream_make(int fd, u8 input, u8 no_close, u8 seekable,
 
 static u64 stdio_handle(int fd, u8 input) {
   return warmc_res_lower_own(input ? RT_INPUT_STREAM : RT_OUTPUT_STREAM,
-                             (u64)(unsigned long)stream_make(fd, input, 1, 0, 0, 0));
+                             (u64)(uptr)stream_make(fd, input, 1, 0, 0, 0));
 }
 
 static void stream_ok(WarmInstance *vm, u64 ret) { put8(vm, ret, 0); }
@@ -183,7 +183,7 @@ static u64 p2_get_stderr(WarmInstance *vm) { return stdio_handle(2, 0); }
 
 static u64 p2_stream_drop(WarmInstance *vm, u64 h, u32 rt) {
   u32 owned = 0;
-  Stream *s = (Stream *)(unsigned long)warmc_res_drop(rt, (u32)h, &owned);
+  Stream *s = (Stream *)(uptr)warmc_res_drop(rt, (u32)h, &owned);
   if (s && !s->no_close) close(s->fd);
   free(s);
   return 0;
@@ -214,11 +214,11 @@ static u64 p2_write_and_flush(WarmInstance *vm, u64 self, u64 ptr, u64 len,
   while (done < len) {
     long r;
     if (s->seekable && !s->append)
-      r = pwrite(s->fd, vm->mem_base + ptr + done, (unsigned long)(len - done),
+      r = pwrite(s->fd, vm->mem_base + ptr + done, (usz)(len - done),
                  (long long)(s->pos + done));
     else
       r = warmc_rt_write(s->fd, vm->mem_base + ptr + done,
-                         (unsigned long)(len - done));
+                         (usz)(len - done));
     if (r < 0) {
       if (-r == 32) stream_closed(vm, ret);
       else stream_failed(vm, ret, (int)-r);
@@ -289,14 +289,14 @@ static u64 p2_blocking_read(WarmInstance *vm, u64 self, u64 len, u64 ret) {
   Stream *s = stream_of(RT_INPUT_STREAM, self);
   if (len > (1u << 20)) len = 1u << 20;
 
-  char *buf = len ? malloc((unsigned long)len) : 0;
+  char *buf = len ? malloc((usz)len) : 0;
   if (len && !buf) { stream_failed(vm, ret, EC_NOMEM); return 0; }
   long r = 0;
   if (len) {
     if (s->seekable)
-      r = pread(s->fd, buf, (unsigned long)len, (long long)s->pos);
+      r = pread(s->fd, buf, (usz)len, (long long)s->pos);
     else
-      r = warmc_rt_read(s->fd, buf, (unsigned long)len);
+      r = warmc_rt_read(s->fd, buf, (usz)len);
   }
   if (r < 0) { free(buf); stream_failed(vm, ret, (int)-r); return 0; }
   if (!r && len) { free(buf); stream_closed(vm, ret); return 0; }
@@ -319,7 +319,7 @@ static u64 p2_random_u64(WarmInstance *vm) {
 static u64 p2_random_bytes(WarmInstance *vm, u64 len, u64 ret) {
   if (len > (1u << 20)) len = 1u << 20;
   u64 p = guest_alloc(vm, 1, (u32)len);
-  if (len) warmc_rt_random(vm->mem_base + p, (unsigned long)len);
+  if (len) warmc_rt_random(vm->mem_base + p, (usz)len);
   put32(vm, ret, (u32)p);
   put32(vm, ret + 4, (u32)len);
   return 0;
@@ -346,7 +346,7 @@ static u64 pollable_new(u8 kind, int fd, u64 deadline) {
   p->kind = kind;
   p->fd = fd;
   p->deadline = deadline;
-  return warmc_res_lower_own(RT_POLLABLE, (u64)(unsigned long)p);
+  return warmc_res_lower_own(RT_POLLABLE, (u64)(uptr)p);
 }
 
 static int pollable_ready(const Pollable *p) {
@@ -402,14 +402,14 @@ static u64 p2_output_subscribe(WarmInstance *vm, u64 self) {
 
 static u64 p2_pollable_ready(WarmInstance *vm, u64 self) {
   Pollable *p =
-      (Pollable *)(unsigned long)warmc_res_lift_borrow(RT_POLLABLE, (u32)self);
+      (Pollable *)(uptr)warmc_res_lift_borrow(RT_POLLABLE, (u32)self);
   warmc_res_release(RT_POLLABLE, (u32)self);
   return (u64)(pollable_ready(p) != 0);
 }
 
 static u64 p2_pollable_block(WarmInstance *vm, u64 self) {
   Pollable *p =
-      (Pollable *)(unsigned long)warmc_res_lift_borrow(RT_POLLABLE, (u32)self);
+      (Pollable *)(uptr)warmc_res_lift_borrow(RT_POLLABLE, (u32)self);
   warmc_res_release(RT_POLLABLE, (u32)self);
   pollable_block(p);
   return 0;
@@ -417,7 +417,7 @@ static u64 p2_pollable_block(WarmInstance *vm, u64 self) {
 
 static u64 p2_drop_pollable(WarmInstance *vm, u64 h) {
   u32 owned = 0;
-  free((void *)(unsigned long)warmc_res_drop(RT_POLLABLE, (u32)h, &owned));
+  free((void *)(uptr)warmc_res_drop(RT_POLLABLE, (u32)h, &owned));
   return 0;
 }
 
@@ -430,13 +430,13 @@ static u64 p2_poll(WarmInstance *vm, u64 ptr, u64 len, u64 ret) {
     return 0;
   }
 
-  Pollable **ps = malloc(sizeof(Pollable *) * (unsigned long)len);
-  u32 *hit = malloc(sizeof(u32) * (unsigned long)len);
+  Pollable **ps = malloc(sizeof(Pollable *) * (usz)len);
+  u32 *hit = malloc(sizeof(u32) * (usz)len);
   if (!ps || !hit) { free(ps); free(hit); warmc_trap(TRAP_HEAP_OOM); }
   for (u64 i = 0; i < len; i++) {
     u32 h = 0;
     __builtin_memcpy(&h, vm->mem_base + ptr + i * 4, 4);
-    ps[i] = (Pollable *)(unsigned long)warmc_res_lift_borrow(RT_POLLABLE, h);
+    ps[i] = (Pollable *)(uptr)warmc_res_lift_borrow(RT_POLLABLE, h);
     warmc_res_release(RT_POLLABLE, h);
   }
 
@@ -512,7 +512,7 @@ static u64 p2_get_environment(WarmInstance *vm, u64 ret) {
   u64 arr = guest_alloc(vm, 4, n * 16);
   for (u32 i = 0; i < n; i++) {
     const char *e = src[i];
-    unsigned long k = 0;
+    usz k = 0;
     while (e[k] && e[k] != '=') k++;
     put_string(vm, arr + (u64)i * 16, e, k);
     const char *v = e[k] ? e + k + 1 : e + k;
@@ -598,7 +598,7 @@ static u8 p2_filetype(u8 ft) {
 }
 
 static Desc *desc_of(u64 h) {
-  Desc *d = (Desc *)(unsigned long)warmc_res_lift_borrow(RT_DESCRIPTOR, (u32)h);
+  Desc *d = (Desc *)(uptr)warmc_res_lift_borrow(RT_DESCRIPTOR, (u32)h);
   warmc_res_release(RT_DESCRIPTOR, (u32)h);
   return d;
 }
@@ -636,9 +636,9 @@ static u32 at_leaf(Desc *d, WarmInstance *vm, u64 p, u64 n, int follow,
 static u64 p2_get_directories(WarmInstance *vm, u64 ret) {
   u64 arr = guest_alloc(vm, 4, g_npre * 12);
   for (u32 i = 0; i < g_npre; i++) {
-    Desc *d = (Desc *)(unsigned long)warmc_res_rep(RT_DESCRIPTOR, g_pre[i]);
+    Desc *d = (Desc *)(uptr)warmc_res_rep(RT_DESCRIPTOR, g_pre[i]);
     put32(vm, arr + (u64)i * 12, warmc_res_lower_own(RT_DESCRIPTOR,
-                                                     (u64)(unsigned long)d));
+                                                     (u64)(uptr)d));
     put_string(vm, arr + (u64)i * 12 + 4, d->guest, cstrlen(d->guest));
   }
   put32(vm, ret, (u32)arr);
@@ -717,16 +717,16 @@ static u64 p2_open_at(WarmInstance *vm, u64 self, u64 pflags, u64 p, u64 n,
   nd->preopen = 0;
   nd->guest = 0;
   put8(vm, ret, 0);
-  put32(vm, ret + 4, warmc_res_lower_own(RT_DESCRIPTOR, (u64)(unsigned long)nd));
+  put32(vm, ret + 4, warmc_res_lower_own(RT_DESCRIPTOR, (u64)(uptr)nd));
   return 0;
 }
 
 static u64 p2_read(WarmInstance *vm, u64 self, u64 len, u64 off, u64 ret) {
   Desc *d = desc_of(self);
   if (len > (1u << 24)) len = 1u << 24;
-  char *buf = len ? malloc((unsigned long)len) : 0;
+  char *buf = len ? malloc((usz)len) : 0;
   if (len && !buf) { res_err(vm, ret, 4, EC_NOMEM); return 0; }
-  long r = len ? pread(d->fd, buf, (unsigned long)len, (long long)off) : 0;
+  long r = len ? pread(d->fd, buf, (usz)len, (long long)off) : 0;
   if (r < 0) {
     u32 ec = ec_of_host(h_errno);
     free(buf);
@@ -751,7 +751,7 @@ static u64 p2_write(WarmInstance *vm, u64 self, u64 p, u64 n, u64 off,
   if (!ok(vm, p, n)) { res_err(vm, ret, 8, EC_INVALID); return 0; }
   u64 done = 0;
   while (done < n) {
-    long r = pwrite(d->fd, vm->mem_base + p + done, (unsigned long)(n - done),
+    long r = pwrite(d->fd, vm->mem_base + p + done, (usz)(n - done),
                     (long long)(off + done));
     if (r < 0) {
       u32 ec = ec_of_host(h_errno);
@@ -809,7 +809,7 @@ static u64 via_stream(WarmInstance *vm, u64 self, u64 offset, u64 ret,
   put8(vm, ret, 0);
   put32(vm, ret + 4,
         warmc_res_lower_own(input ? RT_INPUT_STREAM : RT_OUTPUT_STREAM,
-                            (u64)(unsigned long)s));
+                            (u64)(uptr)s));
   return 0;
 }
 
@@ -886,13 +886,13 @@ static u64 p2_read_directory(WarmInstance *vm, u64 self, u64 ret) {
   if (!ds) { closedir(dir); res_err(vm, ret, 4, EC_NOMEM); return 0; }
   ds->dir = dir;
   put8(vm, ret, 0);
-  put32(vm, ret + 4, warmc_res_lower_own(RT_DIRSTREAM, (u64)(unsigned long)ds));
+  put32(vm, ret + 4, warmc_res_lower_own(RT_DIRSTREAM, (u64)(uptr)ds));
   return 0;
 }
 
 static u64 p2_read_directory_entry(WarmInstance *vm, u64 self, u64 ret) {
   DirStream *ds =
-      (DirStream *)(unsigned long)warmc_res_lift_borrow(RT_DIRSTREAM, (u32)self);
+      (DirStream *)(uptr)warmc_res_lift_borrow(RT_DIRSTREAM, (u32)self);
   warmc_res_release(RT_DIRSTREAM, (u32)self);
 
   for (;;) {
@@ -1012,7 +1012,7 @@ static u64 p2_sync_data(WarmInstance *vm, u64 self, u64 ret) {
 
 static u64 p2_drop_descriptor(WarmInstance *vm, u64 h) {
   u32 owned = 0;
-  Desc *d = (Desc *)(unsigned long)warmc_res_drop(RT_DESCRIPTOR, (u32)h, &owned);
+  Desc *d = (Desc *)(uptr)warmc_res_drop(RT_DESCRIPTOR, (u32)h, &owned);
   if (d && !d->preopen) { close(d->fd); free(d); }
   return 0;
 }
@@ -1020,7 +1020,7 @@ static u64 p2_drop_descriptor(WarmInstance *vm, u64 h) {
 static u64 p2_drop_dirstream(WarmInstance *vm, u64 h) {
   u32 owned = 0;
   DirStream *ds =
-      (DirStream *)(unsigned long)warmc_res_drop(RT_DIRSTREAM, (u32)h, &owned);
+      (DirStream *)(uptr)warmc_res_drop(RT_DIRSTREAM, (u32)h, &owned);
   if (ds) { closedir(ds->dir); free(ds); }
   return 0;
 }
@@ -1160,7 +1160,7 @@ static int add_env(char *kv) {
 static int add_preopen(const char *spec) {
   char host[PATHMAX];
   const char *guest = spec;
-  unsigned long i = 0;
+  usz i = 0;
   for (; spec[i] && !(spec[i] == ':' && spec[i + 1] == ':'); i++) {
     if (i >= PATHMAX - 1) return 0;
     host[i] = spec[i];
@@ -1178,7 +1178,7 @@ static int add_preopen(const char *spec) {
   d->preopen = 1;
   d->guest = guest;
   if (g_npre == sizeof g_pre / sizeof g_pre[0]) { close(fd); free(d); return 0; }
-  g_pre[g_npre++] = warmc_res_new(RT_DESCRIPTOR, (u64)(unsigned long)d);
+  g_pre[g_npre++] = warmc_res_new(RT_DESCRIPTOR, (u64)(uptr)d);
   return 1;
 }
 

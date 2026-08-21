@@ -1,11 +1,11 @@
 #include "ir.h"
+#include "a64.h"
+#include "target.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdlib.h>
-
-#define ALIGN_BYTES 64u
 
 #define REG_VMCTX   (s->vmctx_reg)
 #define REG_MEMBASE (s->membase_reg)
@@ -38,228 +38,7 @@ static const int FPR_ALLOC[] = { 0, 1, 2, 3, 4, 5, 6, 7,
 static bool gpr_is_callee_saved(int r) { return r >= R21 && r <= R28; }
 static bool fpr_is_callee_saved(int r) { return r >= 8 && r <= 15; }
 
-typedef struct { int src, dst; uint8_t fp, wide, vec; } Move;
-
-#define LOC_NONE  0x7fffffff
-#define SLOT(n)   (-((int)(n) + 1))
-#define IS_SLOT(l) ((l) < 0)
-#define SLOT_OF(l) ((uint32_t)(-(l) - 1))
-
-struct Bfx { bool ok, sign; int immr, imms; Ref src; };
-
-typedef struct BrFix {
-  size_t site;
-  int is19;
-  uint32_t target;
-  struct BrFix *next;
-} BrFix;
-
-typedef struct TabFix {
-  size_t word;
-  size_t base;
-  size_t stub;
-  struct TabFix *next;
-} TabFix;
-
-/* The live-range split plan: written by the first allocation, consumed by
-   the retry.  veto flags params whose ENTRY-edge coalescing the retry
-   skips, cutting a spilled web at its loop boundary so the in-loop piece
-   competes for a register on its own; addv/addhdr name values to thread
-   through a NEW header param first (the loop-invariant shape).  The plan
-   only ever asks -- the retry's allocation stays the sole authority. */
-typedef struct SplitCtl {
-  uint8_t *veto;
-  uint32_t veto_n;
-  Ref *addv;
-  uint32_t *addhdr;
-  Ref *addp;
-  uint32_t nadd, cap_add;
-  uint32_t nflagged;
-
-  /* The retry-aware half: cutp lists the vetoed params so the retry can
-     see a cut fail (its web still in a slot) the same way it sees an inv
-     param fail.  The retry marks failures instead of emitting; the driver
-     rolls the IR back, drops the failed grants and re-runs, so a failed
-     grant never competes -- the second-order shuffle that kept the whole
-     feature opt-in.  accept stops the loop: failures are then absorbed by
-     the singleton slot-alias fallback. */
-  Ref *cutp;
-  uint32_t ncut, cap_cut;
-  uint8_t *inv_fail;
-  uint8_t *cut_fail;
-  uint32_t nfailed_new;
-  bool accept;
-} SplitCtl;
-
-typedef struct {
-  IrFunc *f;
-  ObjBuilder *o;
-  const OptOpts *opt;
-
-  Buf body;
-  Reloc *relocs; uint32_t nrelocs, cap_relocs;
-
-  int *loc;
-  uint8_t *cls;
-  uint32_t nslots;
-
-  uint32_t out_bytes;
-  uint32_t slots_off;
-  uint32_t retarea_off;
-  uint32_t retptr_slot;
-  uint32_t fpsave_off;
-
-  uint32_t exn_slot;
-  uint32_t throw_area_off, throw_area_bytes;
-  uint32_t frame;
-
-  uint32_t *block_off;
-  BrFix *fixups;
-
-  uint32_t used_gpr_cs;
-  uint32_t used_fpr_cs;
-
-  bool mem_valid;
-  bool naive;
-
-  SplitCtl *split_sc;
-  bool split_collect;
-
-  bool tail_done;
-
-  bool has_call;
-  bool needs_mem;
-  bool needs_memsize;
-  bool needs_vmctx;
-  bool needs_retarea;
-  bool has_pads;
-  uint32_t saved_bytes;
-  uint8_t *mem_valid_in;
-
-  UwSite *sites; uint32_t nsites, cap_sites;
-  UwClause *clauses; uint32_t nclauses, cap_clauses;
-
-  uint32_t *sp_first, *sp_n;
-  Ref *sp_vals; uint32_t nsp_vals, cap_sp_vals;
-
-  int32_t *csa_slot;
-  uint8_t *csa_on;
-  uint32_t *csa_first, *csa_n;
-  Ref *csa_vals; uint32_t ncsa_vals, cap_csa_vals;
-  uint32_t csa_consumed;
-  GcSite *gcsites; uint32_t ngcsites, cap_gcsites;
-  uint32_t *gcroots; uint32_t ngcroots, cap_gcroots;
-  uint32_t cur_block;
-
-  Ref cur_inst;
-
-  bool at_eh_site;
-  uint8_t *pinned;
-
-  uint64_t *lv_in, *lv_out;
-
-  bool no_imm;
-  uint8_t *imm_fold;
-  uint8_t *fused;
-  uint8_t *addr_fuse;
-  uint8_t *ptr_fuse;
-  uint8_t *zx_fuse;
-  uint8_t *no_remat;
-  uint8_t *paired;
-  bool no_ldpair;
-  /* one-entry cache: TMP1 holds mem_base(t1_mem) + zx(t1_aa), set by the
-     fused-address emissions, cleared at every other instruction */
-  Ref t1_aa;
-  uint32_t t1_mem;
-  bool t1_ok, t1_was;
-  uint8_t *folded;
-  struct Bfx *bfx;
-  uint32_t *uses;
-
-  uint32_t prof_skip;
-  size_t *prof_site;
-  size_t *prof_start;
-
-  struct TrapFix { size_t site; bool is19; int code; struct TrapFix *next; } *traps;
-
-  struct { uint64_t word; size_t at; } *pool;
-  uint32_t npool, cap_pool;
-  struct PoolFix { size_t site; uint32_t idx; struct PoolFix *next; } *poolfix;
-  bool pool_ok;
-  bool remat_fp, remat_v128, remat_glob;
-  int remat_cost;
-  double remat2_w, remat2_seg, remat2_wcap;
-  bool far_br, far_br_needed;
-
-  struct EdgeStub {
-    size_t site;
-    Move *mv; int n;
-    uint32_t target;
-    struct EdgeStub *next;
-  } *edge_stubs;
-  uint8_t trap_used[TRAP_CODE_COUNT];
-
-  int lab_reg;
-
-  int vmctx_reg, membase_reg;
-
-  int fl_kind;
-  Ref fl_a, fl_b;
-  uint64_t fl_imm;
-  int fl_sf;
-  uint32_t fl_epoch;
-
-  Ref cmp_ref;
-  int cmp_cc;
-  size_t cmp_len;
-
-  int rc_reg[2];
-  uint32_t rc_slot[2];
-  uint8_t rc_used[2];
-  uint8_t rc_next;
-
-  int tid_reg;
-  uint64_t tid_val;
-
-  struct AllocFix {
-    size_t site;
-    bool cached;
-    size_t back;
-    const Ref *args; uint32_t nargs;
-    const char *helper; uint32_t type_idx;
-    Ref inst;
-    struct AllocFix *next;
-  } *allocs;
-
-  struct BarFix {
-    size_t site;
-    size_t back;
-    int dst;
-    int base;
-    int off_reg;
-    uint32_t off;
-    struct BarFix *next;
-  } *bars;
-} Isel;
-
-#define B (&s->body)
-
-static void isel_reloc(Isel *s, RelKind kind, uint64_t off, uint32_t sym, int64_t addend) {
-  if (s->nrelocs == s->cap_relocs) {
-    s->cap_relocs = s->cap_relocs ? s->cap_relocs * 2 : 16;
-    s->relocs = xrealloc(s->relocs, s->cap_relocs * sizeof(Reloc));
-  }
-  Reloc *r = &s->relocs[s->nrelocs++];
-  r->kind = kind; r->section = 0; r->offset = off; r->sym = sym; r->addend = addend;
-}
-
-static void add_fix(Isel *s, size_t site, int is19, uint32_t target) {
-  BrFix *fx = xmalloc(sizeof *fx);
-  fx->site = site; fx->is19 = is19; fx->target = target; fx->next = s->fixups;
-  s->fixups = fx;
-}
-
-static uint32_t slot_off(Isel *s, uint32_t slot) { return s->slots_off + 8u * slot; }
+#include "isel_core.inc"
 
 static void slot_load(Buf *bf, int fp, int vec, int reg, uint32_t off) {
   if (vec) a64_ldr_q(bf, reg, RSP, off);
@@ -273,12 +52,29 @@ static void slot_store(Buf *bf, int fp, int vec, int reg, uint32_t off) {
   else a64_str_imm(bf, 3, reg, RSP, off);
 }
 
-static bool is_vec_value(IrFunc *f, Ref v) { return (ValType)f->insts[v].type == VT_V128; }
-static bool is_fp_value(IrFunc *f, Ref v) {
-  ValType t = (ValType)f->insts[v].type;
-  return vt_is_float(t) || t == VT_V128;
+static void emit_reg_move(Buf *out, int dst, int src, int fp, int wide,
+                          int vec) {
+  if (vec) a64_vmov(out, dst, src);
+  else if (fp) a64_fmov_reg(out, wide ? FT_D : FT_S, dst, src);
+  else a64_mov_reg(out, SF64, dst, src);
 }
-static bool is64(IrFunc *f, Ref v) { return vt_is_64((ValType)f->insts[v].type); }
+
+static int isel_cs_index(int r) {
+  return r >= R19 && r <= R28 && gpr_is_callee_saved(r) ? r - R19 : -1;
+}
+
+static int isel_break_reg(int bank) { return bank ? F3 : TMP1; }
+
+static bool isel_fp_remat_ok(Isel *s, const Inst *in) {
+  uint32_t imm8;
+  return a64_fmov_imm(in->imm, vt_is_64((ValType)in->type) ? FT_D : FT_S,
+                      &imm8) ||
+         s->pool_ok;
+}
+
+#define RA_HAVE_RETAREA_REUSE 1
+#define RA_RETAREA_REG R8
+#define RA_ALLOC_RES_REG R0
 
 #define A64_IDX_UXTW 2
 #define A64_IDX_LSL  3
@@ -288,22 +84,6 @@ static int idx_option(IrFunc *f, Ref addr) {
 
 static Ref addr_index(Isel *s, IrFunc *f, Ref addr) {
   return (s->zx_fuse && s->zx_fuse[addr]) ? ir_args(f, addr)[0] : addr;
-}
-
-static bool fits_gpr(IrFunc *f, Ref v) {
-  ValType t = (ValType)f->insts[v].type;
-  return !vt_is_float(t) && t != VT_V128;
-}
-
-static bool is_imm(Isel *s, Ref v) { return s->imm_fold && s->imm_fold[v]; }
-static uint64_t imm_of(Isel *s, Ref v) { return s->f->insts[v].imm; }
-
-static bool is_imm_at(Isel *s, Ref user, uint32_t idx, Ref v) {
-  if (s->imm_fold && s->imm_fold[v]) return true;
-  if (s->no_imm) return false;
-  Inst *in = &s->f->insts[v];
-  if (in->op != I_CONST || !fits_gpr(s->f, v)) return false;
-  return ir_imm_ok(s->f, user, idx, in->imm, (ValType)in->type);
 }
 
 static void load_vconst(Isel *s, int fr, uint64_t lo, uint64_t hi);
@@ -383,72 +163,10 @@ static int rd(Isel *s, Ref v, int scratch) {
   return scratch;
 }
 
-static void rc_clear(Isel *s) { s->rc_slot[0] = 0; s->rc_slot[1] = 0; }
-
-static void rc_kill_reg(Isel *s, int reg) {
-  for (int i = 0; i < 2; i++) if (s->rc_reg[i] == reg) s->rc_slot[i] = 0;
-}
-
-static void rc_kill_slot(Isel *s, uint32_t slot) {
-  for (int i = 0; i < 2; i++) if (s->rc_slot[i] == slot + 1) s->rc_slot[i] = 0;
-}
-
-static void rc_clear(Isel *s);
-static void rc_kill_slot(Isel *s, uint32_t slot);
-
-static bool op_clobbers_caller_saved(uint16_t op);
-
-static int wr(Isel *s, Ref v, int scratch) {
-  int l = s->loc[v];
-  return IS_SLOT(l) ? scratch : l;
-}
-
-static void commit(Isel *s, Ref v, int reg) {
-  int l = s->loc[v];
-  if (IS_SLOT(l)) rc_kill_slot(s, SLOT_OF(l));
-  if (l == LOC_NONE)
-    warmc_fatal("internal: committing v%u which has no location", v);
-  if (!IS_SLOT(l)) {
-    if (l != reg) {
-      if (is_vec_value(s->f, v)) a64_vmov(B, l, reg);
-      else if (is_fp_value(s->f, v)) a64_fmov_reg(B, is64(s->f, v) ? FT_D : FT_S, l, reg);
-      else a64_mov_reg(B, SF64, l, reg);
-    }
-    return;
-  }
-  slot_store(B, is_fp_value(s->f, v), is_vec_value(s->f, v), reg,
-             slot_off(s, SLOT_OF(l)));
-}
-
 static void reload_size(Isel *s) {
   if (s->mem_valid || !s->needs_memsize) return;
   a64_ldr_imm(B, 3, REG_MEMSIZE, REG_VMCTX, VMCTX_MEM_SIZE);
   s->mem_valid = true;
-}
-
-/* A value the allocator marked caller-saved-around-call keeps its register
-   everywhere except across the clobber sites it is live over: its register is
-   stored to a private slot before the site's call and reloaded after.  The
-   save must precede argument marshalling (which writes the argument
-   registers) and the restore must follow the result commit. */
-static void csa_save(Isel *s, Ref site) {
-  if (!s->csa_n || !s->csa_n[site]) return;
-  for (uint32_t k = 0; k < s->csa_n[site]; k++) {
-    Ref v = s->csa_vals[s->csa_first[site] + k];
-    slot_store(B, is_fp_value(s->f, v), is_vec_value(s->f, v), s->loc[v],
-               slot_off(s, (uint32_t)s->csa_slot[v]));
-  }
-  s->csa_consumed += s->csa_n[site];
-}
-
-static void csa_restore(Isel *s, Ref site) {
-  if (!s->csa_n || !s->csa_n[site]) return;
-  for (uint32_t k = 0; k < s->csa_n[site]; k++) {
-    Ref v = s->csa_vals[s->csa_first[site] + k];
-    slot_load(B, is_fp_value(s->f, v), is_vec_value(s->f, v), s->loc[v],
-              slot_off(s, (uint32_t)s->csa_slot[v]));
-    g_stats.csa_restores++;
-  }
 }
 
 static void emit_trap(Isel *s, int code) {
@@ -487,13 +205,6 @@ static void br_patch(Isel *s, size_t site, size_t target) {
   if (!a64_patch_b19_ok(B, site, target)) s->far_br_needed = true;
 }
 
-static void trap_defer(Isel *s, size_t site, bool is19, int code) {
-  struct TrapFix *t = xmalloc(sizeof *t);
-  t->site = site; t->is19 = is19; t->code = code; t->next = s->traps;
-  s->traps = t;
-  s->trap_used[code] = 1;
-}
-
 static uint32_t pool_ref(Isel *s, uint64_t word) {
   for (uint32_t i = 0; i < s->npool; i++)
     if (s->pool[i].word == word) return i;
@@ -511,7 +222,7 @@ static void pool_load(Isel *s, int ft, int fr, uint64_t bits) {
   size_t site = B->len;
   a64_ldr_lit_fp(B, ft, fr);
   struct PoolFix *p = xmalloc(sizeof *p);
-  p->site = site; p->idx = idx; p->next = s->poolfix;
+  p->site = site; p->idx = idx; p->vec = false; p->next = s->poolfix;
   s->poolfix = p;
 }
 
@@ -528,17 +239,6 @@ static void trap_if_cc(Isel *s, int cond, int code) {
 static void trap_if_zero(Isel *s, int sf, int reg, int code) {
   size_t site = br_cc(s, 1, 0, sf, reg);
   trap_defer(s, site, !s->far_br, code);
-}
-
-static bool load_needs_barrier(const IrFunc *f, const Inst *in) {
-  if (in->imm2 & GCF_NOBAR) return false;
-  return warmc_load_barrier && vt_ref_collectable(f->m, (ValType)in->type);
-}
-
-static Ref load_barrier_mask(const IrFunc *f, Ref v) {
-  const Inst *in = &f->insts[v];
-  if (!(in->imm2 & GCF_MASKARG)) return REF_NONE;
-  return ir_args((IrFunc *)f, v)[in->nargs - 1];
 }
 
 static int emit_gc_load_barrier_pre(Isel *s, int dst, int base) {
@@ -593,109 +293,6 @@ static void emit_gc_load_stubs(Isel *s) {
     bf = n;
   }
   s->bars = 0;
-}
-
-static void emit_move_to(Isel *s, Buf *out, int dst, int src, int fp, int wide,
-                         int vec) {
-  if (dst == src) return;
-  if (src == LOC_NONE || dst == LOC_NONE)
-    warmc_fatal("internal: move involving a value with no location");
-
-  if (IS_SLOT(dst)) rc_kill_slot(s, SLOT_OF(dst));
-  if (IS_SLOT(dst) && IS_SLOT(src)) {
-    int t = (fp || vec) ? FTMP : TMP0;
-    slot_load(out, fp, vec, t, slot_off(s, SLOT_OF(src)));
-    slot_store(out, fp, vec, t, slot_off(s, SLOT_OF(dst)));
-  } else if (IS_SLOT(dst)) {
-    slot_store(out, fp, vec, src, slot_off(s, SLOT_OF(dst)));
-  } else if (IS_SLOT(src)) {
-    slot_load(out, fp, vec, dst, slot_off(s, SLOT_OF(src)));
-  } else {
-    if (vec) a64_vmov(out, dst, src);
-    else if (fp) a64_fmov_reg(out, wide ? FT_D : FT_S, dst, src);
-    else a64_mov_reg(out, SF64, dst, src);
-  }
-}
-
-static bool move_bank(const Move *m) { return m->fp || m->vec; }
-
-static bool same_place(int a, bool abank, int b, bool bbank) {
-  if (a != b) return false;
-  return IS_SLOT(a) || abank == bbank;
-}
-
-static void parallel_copy_to(Isel *s, Buf *out, Move *mv, int n) {
-  uint8_t *done = xcalloc(n ? n : 1, 1);
-  int remaining = 0;
-  for (int i = 0; i < n; i++) {
-    if (mv[i].src == mv[i].dst) done[i] = 1;
-    else remaining++;
-  }
-  while (remaining > 0) {
-    int progress = 0;
-    for (int i = 0; i < n; i++) {
-      if (done[i]) continue;
-      int blocked = 0;
-      for (int j = 0; j < n; j++)
-        if (!done[j] && j != i &&
-            same_place(mv[j].src, move_bank(&mv[j]),
-                       mv[i].dst, move_bank(&mv[i]))) { blocked = 1; break; }
-      if (blocked) continue;
-      emit_move_to(s, out, mv[i].dst, mv[i].src, mv[i].fp, mv[i].wide, mv[i].vec);
-      done[i] = 1;
-      remaining--;
-      progress = 1;
-    }
-    if (progress) continue;
-
-    bool broke = false;
-    for (int i = 0; i < n && !broke; i++) {
-      if (done[i]) continue;
-      int tmp = move_bank(&mv[i]) ? F3 : TMP1;
-      if (mv[i].src == tmp) continue;
-      emit_move_to(s, out, tmp, mv[i].src, mv[i].fp, mv[i].wide, mv[i].vec);
-
-      for (int j = 0; j < n; j++)
-        if (!done[j] && mv[j].src == mv[i].src &&
-            move_bank(&mv[j]) == move_bank(&mv[i]))
-          mv[j].src = tmp;
-      broke = true;
-    }
-    if (!broke)
-      warmc_fatal("internal: %d moves left with no cycle to break", remaining);
-  }
-  xfree(done);
-}
-
-static void parallel_copy(Isel *s, Move *mv, int n) {
-  parallel_copy_to(s, B, mv, n);
-}
-
-static int edge_moves(Isel *s, Edge *e, Move *mv) {
-  IrFunc *f = s->f;
-  Block *t = &f->blocks[e->target];
-  int n = 0;
-  for (uint32_t i = 0; i < t->nparams; i++) {
-    Ref dstv = t->params[i], srcv = e->args[i];
-    if (s->loc[dstv] == LOC_NONE) continue;
-    if (s->loc[dstv] == s->loc[srcv]) continue;
-    mv[n].src = s->loc[srcv];
-    mv[n].dst = s->loc[dstv];
-    mv[n].fp = is_fp_value(f, dstv);
-    mv[n].wide = is64(f, dstv);
-    mv[n].vec = is_vec_value(f, dstv);
-    n++;
-  }
-  return n;
-}
-
-static void emit_edge(Isel *s, Edge *e) {
-  Block *t = &s->f->blocks[e->target];
-  if (t->nparams == 0) return;
-  Move *mv = xmalloc(t->nparams * sizeof(Move));
-  int n = edge_moves(s, e, mv);
-  parallel_copy(s, mv, n);
-  xfree(mv);
 }
 
 __attribute__((unused))
@@ -903,8 +500,6 @@ static void emit_ret_area(Isel *s, CompType *sig) {
   else { a64_load_imm(B, SF64, TMP0, off); a64_add_extx(B, R8, RSP, TMP0, 0); }
 }
 
-static void note_safepoint(Isel *s, Ref v);
-
 static void call_helper_imm(Isel *s, const char *name, const Ref *args, uint32_t nargs,
                             uint64_t imm, Ref result, bool has_result) {
   csa_save(s, s->cur_inst);
@@ -1088,126 +683,6 @@ static void call_helper_imm2(Isel *s, const char *name, const Ref *args, uint32_
 static void emit_teardown(Isel *s);
 static void emit_epilogue(Isel *s);
 static void emit_block(Isel *s, uint32_t bi, uint32_t next_bi);
-static bool skip_location(Isel *s, Ref v);
-
-static void note_site(Isel *s) {
-  if (!s->has_pads || !s->at_eh_site) return;
-  IrFunc *f = s->f;
-  Block *b = &f->blocks[s->cur_block];
-  uint32_t first = s->nclauses, n = 0;
-  for (uint32_t i = 0; i < b->nsuccs; i++) {
-    if (!b->succs[i].eh) continue;
-    Block *pad = &f->blocks[b->succs[i].target];
-    if (s->nclauses == s->cap_clauses) {
-      s->cap_clauses = s->cap_clauses ? s->cap_clauses * 2 : 8;
-      s->clauses = xrealloc(s->clauses, s->cap_clauses * sizeof(UwClause));
-    }
-    UwClause *c = &s->clauses[s->nclauses++];
-    c->kind = pad->pad_kind;
-    c->tag = pad->pad_tag;
-    c->pad = b->succs[i].target;
-    c->pad_ = 0;
-    n++;
-  }
-  if (!n) return;
-  if (s->nsites == s->cap_sites) {
-    s->cap_sites = s->cap_sites ? s->cap_sites * 2 : 8;
-    s->sites = xrealloc(s->sites, s->cap_sites * sizeof(UwSite));
-  }
-  UwSite *site = &s->sites[s->nsites++];
-  site->pc = (uint32_t)s->body.len;
-  site->first = first;
-  site->n = n;
-}
-
-static void note_safepoint(Isel *s, Ref v) {
-  if (!s->sp_n || !s->sp_n[v]) return;
-  IrFunc *f = s->f;
-  uint32_t first = s->ngcroots;
-  for (uint32_t k = 0; k < s->sp_n[v]; k++) {
-    Ref x = s->sp_vals[s->sp_first[v] + k];
-    int l = s->loc[x];
-    uint32_t entry;
-    if (l == LOC_NONE || skip_location(s, x)) {
-
-      /* A null constant needs no root; an immutable global's referent is
-         rooted by the global itself for as long as the module lives, and
-         the collector never moves it, so a rematerialised copy the tables
-         cannot see stays valid. */
-      Inst *xi = &f->insts[x];
-      if (xi->op != I_CONST &&
-          !(xi->op == I_GLOBAL_GET && !f->m->globals[xi->imm].mutable_))
-        warmc_fatal("internal: %s live across a safepoint in %s has no location",
-                    ir_op_name(xi->op),
-                    f->m->funcs[f->func_index].sym);
-      continue;
-    }
-    if (IS_SLOT(l)) {
-      entry = GCROOT_SLOT(slot_off(s, SLOT_OF(l)));
-    } else {
-      if (l < R19 || l > R28 || !gpr_is_callee_saved(l))
-        warmc_fatal("internal: a reference live across a safepoint in %s is in "
-                    "x%d, which a callee does not preserve",
-                    f->m->funcs[f->func_index].sym, l);
-      entry = GCROOT_REG((uint32_t)(l - R19));
-    }
-
-    bool seen = false;
-    for (uint32_t j = first; j < s->ngcroots && !seen; j++)
-      if (s->gcroots[j] == entry) seen = true;
-    if (seen) continue;
-    if (s->ngcroots == s->cap_gcroots) {
-      s->cap_gcroots = s->cap_gcroots ? s->cap_gcroots * 2 : 16;
-      s->gcroots = xrealloc(s->gcroots, s->cap_gcroots * sizeof(uint32_t));
-    }
-    s->gcroots[s->ngcroots++] = entry;
-  }
-
-  if (s->ngcroots == first) return;
-  if (s->ngcsites == s->cap_gcsites) {
-    s->cap_gcsites = s->cap_gcsites ? s->cap_gcsites * 2 : 8;
-    s->gcsites = xrealloc(s->gcsites, s->cap_gcsites * sizeof(GcSite));
-  }
-  GcSite *site = &s->gcsites[s->ngcsites++];
-  site->pc = (uint32_t)s->body.len;
-  site->first = first;
-  site->n = s->ngcroots - first;
-}
-
-static void emit_eh_stores(Isel *s, uint32_t bi) {
-  IrFunc *f = s->f;
-  Block *b = &f->blocks[bi];
-  uint32_t cap = 0;
-  for (uint32_t i = 0; i < b->nsuccs; i++)
-    if (b->succs[i].eh) cap += f->blocks[b->succs[i].target].nparams;
-  if (!cap) return;
-  Move *mv = xmalloc(cap * sizeof(Move));
-  int n = 0;
-  for (uint32_t i = 0; i < b->nsuccs; i++)
-    if (b->succs[i].eh) n += edge_moves(s, &b->succs[i], mv + n);
-  parallel_copy(s, mv, n);
-  xfree(mv);
-}
-
-static bool is_not(IrFunc *f, Ref v) {
-  Inst *in = &f->insts[v];
-  if (in->op != I_XOR || in->nargs != 2) return false;
-  Ref c = ir_args(f, v)[1];
-  if (f->insts[c].op != I_CONST) return false;
-  uint64_t m = vt_is_64((ValType)in->type) ? ~0ull : 0xffffffffu;
-  return (f->insts[c].imm & m) == m;
-}
-
-static bool is_zero_test(Isel *s, Ref v) {
-  Inst *in = &s->f->insts[v];
-  if (in->op == I_EQZ) return true;
-  if (in->op != I_EQ && in->op != I_NE) return false;
-  Ref c = ir_args(s->f, v)[1];
-  Inst *ci = &s->f->insts[c];
-  if (ci->op != I_CONST) return false;
-  uint64_t m = vt_is_64((ValType)ci->type) ? ci->imm : (ci->imm & 0xffffffffu);
-  return m == 0;
-}
 
 static int shift_fuse_kind(IrFunc *f, Ref v, ValType t, bool no_imm) {
   Inst *in = &f->insts[v];
@@ -1225,21 +700,6 @@ static int shift_fuse_kind(IrFunc *f, Ref v, ValType t, bool no_imm) {
     case I_SHRS: return SH_ASR;
     default:     return SH_ROR;
   }
-}
-
-static int low_run(uint64_t m, int width) {
-  if (m == 0) return 0;
-  int w = 0;
-  while (w < 64 && (m >> w) != 0) w++;
-  uint64_t full = (w >= 64) ? ~0ull : ((1ull << w) - 1);
-  if (m != full || w >= width) return 0;
-  return w;
-}
-
-static bool const_arg(IrFunc *f, Ref v, uint64_t *out) {
-  if (f->insts[v].op != I_CONST) return false;
-  *out = f->insts[v].imm;
-  return true;
 }
 
 static struct Bfx bfx_of(Isel *s, Ref v) {
@@ -1706,160 +1166,6 @@ static int cs_gpr_list(Isel *s, int *list) {
   return n;
 }
 
-static bool invalidates_mem(uint16_t op) {
-  switch (op) {
-    case I_CALL: case I_CALL_INDIRECT: case I_CALL_REF:
-    case I_MEM_GROW: case I_MEM_COPY:
-    case I_MEM_FILL: case I_MEM_INIT: case I_DATA_DROP: case I_TABLE_GET:
-    case I_TABLE_SET: case I_TABLE_GROW: case I_TABLE_FILL: case I_TABLE_COPY:
-    case I_TABLE_INIT: case I_ELEM_DROP:
-    case I_STRUCT_NEW: case I_ARRAY_NEW: case I_ARRAY_NEW_SEG:
-    case I_ARRAY_OP: case I_REF_TEST:
-      return true;
-    default:
-      return false;
-  }
-}
-
-static bool uses_mem(const Inst *in) {
-  return in->op == I_BOUNDS_CHECK && in->imm == 0;
-}
-
-static void compute_mem_validity(Isel *s) {
-  IrFunc *f = s->f;
-  s->mem_valid_in = xcalloc(f->nblocks, 1);
-  uint8_t *out = xcalloc(f->nblocks, 1);
-  for (uint32_t i = 0; i < f->nblocks; i++) { s->mem_valid_in[i] = 1; out[i] = 1; }
-  s->mem_valid_in[f->entry] = 1;
-
-  bool changed = true;
-  while (changed) {
-    changed = false;
-    for (uint32_t oi = 0; oi < f->norder; oi++) {
-      uint32_t bi = f->order[oi];
-      Block *b = &f->blocks[bi];
-      uint8_t in = 1;
-      if (bi != f->entry) {
-        in = 1;
-        for (uint32_t p = 0; p < b->npreds; p++) if (!out[b->preds[p]]) { in = 0; break; }
-        if (b->npreds == 0) in = 1;
-      }
-      uint8_t cur = in;
-      for (uint32_t i = 0; i < b->ninsts; i++) {
-        const Inst *in = &f->insts[b->insts[i]];
-        if (invalidates_mem(in->op)) cur = 0;
-        else if (uses_mem(in)) cur = 1;
-      }
-      if (s->mem_valid_in[bi] != in) { s->mem_valid_in[bi] = in; changed = true; }
-      if (out[bi] != cur) { out[bi] = cur; changed = true; }
-    }
-  }
-  xfree(out);
-}
-
-static void analyse_function(Isel *s) {
-  IrFunc *f = s->f;
-  s->has_call = false;
-  s->needs_mem = false;
-  s->needs_memsize = false;
-  s->needs_retarea = false;
-  bool touches_instance = false;
-  for (uint32_t oi = 0; oi < f->norder; oi++) {
-    Block *b = &f->blocks[f->order[oi]];
-    for (uint32_t i = 0; i < b->ninsts; i++) {
-      Inst *in = &f->insts[b->insts[i]];
-      switch (in->op) {
-
-        case I_LOAD: case I_STORE:
-          if (MEMF_MEM(in->imm2) == 0) s->needs_mem = true;
-          touches_instance = true;
-          break;
-
-        case I_MEM_PTR: case I_MEM_BASE:
-          if (in->imm2 == 0) s->needs_mem = true;
-          touches_instance = true;
-          break;
-        case I_VLOAD: case I_VSTORE:
-          s->needs_mem = true;
-          touches_instance = true;
-          break;
-        case I_BOUNDS_CHECK:
-
-          if (in->imm == 0 && in->nargs != 2) {
-            s->needs_mem = true;
-            s->needs_memsize = true;
-          }
-          touches_instance = true;
-          break;
-        case I_MEM_LIMIT:
-          if (in->imm == 0) s->needs_memsize = true;
-          touches_instance = true;
-          break;
-
-        case I_FIELD_GET: case I_ARRAY_GET: case I_EXN_PAYLOAD:
-          if (load_needs_barrier(f, in)) {
-            s->has_call = true;
-            touches_instance = true;
-          }
-          break;
-
-        case I_GC_BADMASK:
-          touches_instance = true;
-          break;
-        case I_CALL: case I_CALL_INDIRECT: case I_CALL_REF: {
-          CompType *sig = (in->op == I_CALL)
-              ? &f->m->types[f->m->funcs[in->imm].type_index]
-              : &f->m->types[in->imm];
-          if (sig->nresults > 1) s->needs_retarea = true;
-          s->has_call = true;
-          touches_instance = true;
-          break;
-        }
-
-        case I_RETURN_CALL: case I_RETURN_CALL_INDIRECT: case I_RETURN_CALL_REF:
-          touches_instance = true;
-          break;
-        case I_MEM_GROW: case I_MEM_COPY: case I_MEM_FILL: case I_MEM_INIT:
-        case I_DATA_DROP: case I_TABLE_GET: case I_TABLE_SET:
-        case I_TABLE_GROW: case I_TABLE_FILL: case I_TABLE_COPY:
-        case I_TABLE_INIT: case I_ELEM_DROP:
-        case I_STRUCT_NEW: case I_ARRAY_NEW: case I_ARRAY_NEW_SEG:
-        case I_ARRAY_OP: case I_REF_TEST:
-          s->has_call = true;
-          touches_instance = true;
-          break;
-        case I_TABLE_SIZE:
-
-          if (in->imm != 0) s->has_call = true;
-          touches_instance = true;
-          break;
-        case I_GLOBAL_GET: case I_GLOBAL_SET: case I_MEM_SIZE:
-          touches_instance = true;
-          break;
-
-        case I_THROW: {
-          const CompType *tt =
-              &f->m->types[f->m->tags[in->imm].type_index];
-          uint32_t want = ARG_STACK_SLOT * tt->nparams;
-          if (want > s->throw_area_bytes) s->throw_area_bytes = want;
-          touches_instance = true;
-        }
-
-        case I_THROW_REF:
-
-          s->has_call = true;
-          break;
-        default: break;
-      }
-    }
-
-    if (b->reachable && b->is_pad) { s->has_pads = true; touches_instance = true; }
-  }
-  if (f->sig->nresults > 1) touches_instance = true;
-  if (s->opt->profile) touches_instance = true;
-  s->needs_vmctx = touches_instance;
-}
-
 static int cs_fpr_list(Isel *s, int *list) {
   int n = 0;
   for (int r = 8; r <= 15; r++) if (s->used_fpr_cs & (1u << r)) list[n++] = r;
@@ -2017,33 +1323,10 @@ static void emit_epilogue(Isel *s) {
   a64_ret(B);
 }
 
-static uint32_t module_max_results(Module *m) {
-  uint32_t worst = 1;
-  for (uint32_t i = 0; i < m->ntypes; i++)
-    if (m->types[i].nresults > worst) worst = m->types[i].nresults;
-  return worst;
-}
-
 static void regalloc_naive(Isel *s);
 static void regalloc_linear(Isel *s);
 
 #include "regalloc.inc"
-
-static void collect_refs(IrFunc *f, FuncOut *fout) {
-  uint32_t n = 0, cap = 0;
-  uint32_t *v = NULL;
-  for (uint32_t b = 0; b < f->nblocks; b++)
-    for (uint32_t k = 0; k < f->blocks[b].ninsts; k++) {
-      const Inst *in = &f->insts[f->blocks[b].insts[k]];
-      if (in->op != I_CALL && in->op != I_RETURN_CALL && in->op != I_REF_FUNC)
-        continue;
-      if (in->imm < f->m->nimported_funcs || in->imm >= f->m->nfuncs) continue;
-      if (n == cap) { cap = cap ? cap * 2 : 8; v = xrealloc(v, cap * sizeof *v); }
-      v[n++] = (uint32_t)in->imm;
-    }
-  fout->refs = v;
-  fout->nrefs = n;
-}
 
 /* 1 = emitted, 0 = a conditional branch needs the far layout, 2 = the
    allocation filed a split plan; the caller applies it and retries. */
@@ -2417,426 +1700,99 @@ give_up:
   return s->far_br_needed ? 0 : 1;
 }
 
-static void split_edge_push_arg(IrFunc *f, uint32_t from, uint32_t si, Ref v) {
-  Edge *e = &f->blocks[from].succs[si];
-  if (e->nargs == e->cap) {
-    uint32_t oc = e->cap;
-    e->cap = e->cap ? e->cap * 2 : 4;
-    e->args = ir_grow(f, e->args, (size_t)oc * sizeof(Ref),
-                      (size_t)e->cap * sizeof(Ref));
-  }
-  e->args[e->nargs++] = v;
-}
+/* ---- the a64 target descriptor -------------------------------------- */
 
-/* Thread each planned value through a new param of its loop header: the
-   value itself arrives on the entry edges, the param carries itself around
-   the back edges, and every use inside the loop reads the param.  Exit
-   edges keep the original value -- the param's range stays the loop, and a
-   post-loop use goes on reading the slot it always read.  The new param is
-   vetoed so the retry's coalescer does not stitch the web back together. */
-static void split_apply_adds(IrFunc *f, SplitCtl *sc) {
-  if (!sc->nadd) return;
-  if (!sc->addp) sc->addp = xmalloc(sc->nadd * sizeof(Ref));
-  uint8_t *member = xcalloc(f->nblocks ? f->nblocks : 1, 1);
-  uint32_t *stack = xmalloc(f->nblocks * sizeof(uint32_t));
-  uint32_t *mblk = xmalloc(f->nblocks * sizeof(uint32_t));
-  {
-    uint32_t need = f->ninsts + sc->nadd;
-    if (!sc->veto) {
-      sc->veto = xcalloc(need, 1);
-      sc->veto_n = need;
-    } else if (sc->veto_n < need) {
-      sc->veto = xrealloc(sc->veto, need);
-      memset(sc->veto + sc->veto_n, 0, need - sc->veto_n);
-      sc->veto_n = need;
+static bool imm_ok_a64(IrFunc *f, Ref user, uint32_t idx, uint64_t cval, ValType ct) {
+  Inst *in = &f->insts[user];
+  int sf = vt_is_64(ct) ? SF64 : SF32;
+  uint64_t masked = sf ? cval : (cval & 0xffffffffu);
+  switch (in->op) {
+    case I_ADD: case I_SUB:
+      if (idx != 1) return false;
+      if (masked <= 0xfff) return true;
+
+      return (0 - (uint64_t)(sf ? (int64_t)masked : (int64_t)(int32_t)masked)) <= 0xfff;
+    case I_EQ: case I_NE: case I_LTS: case I_LTU: case I_GTS: case I_GTU:
+    case I_LES: case I_LEU: case I_GES: case I_GEU:
+      if (idx != 1) return false;
+      if (masked <= 0xfff) return true;
+      return (0 - (uint64_t)(sf ? (int64_t)masked : (int64_t)(int32_t)masked)) <= 0xfff;
+    case I_SHL: case I_SHRS: case I_SHRU: case I_ROTR: case I_ROTL:
+      return idx == 1;
+    case I_AND: case I_OR: case I_XOR: {
+      if (idx != 1) return false;
+
+      if (in->op == I_XOR && masked == (sf ? ~0ull : 0xffffffffu)) return true;
+      uint32_t enc;
+      return a64_logical_imm(masked, sf, &enc);
     }
-  }
-  for (uint32_t k = 0; k < sc->nadd; k++) {
-    Ref v = sc->addv[k];
-    uint32_t hb = sc->addhdr[k];
-    Block *hd = &f->blocks[hb];
-    uint32_t nm = 0, sp = 0;
-    member[hb] = 1; mblk[nm++] = hb;
-    for (uint32_t p = 0; p < hd->npreds; p++) {
-      uint32_t pb = hd->preds[p];
-      if (!f->blocks[pb].reachable || f->blocks[pb].rpo < hd->rpo) continue;
-      if (!member[pb]) { member[pb] = 1; mblk[nm++] = pb; stack[sp++] = pb; }
+    case I_SELECT: {
+
+      if (idx > 1 || vt_is_float(ct)) return false;
+      if (masked == 0) return true;
+      Ref other = ir_args(f, user)[idx ^ 1u];
+      if (f->insts[other].op != I_CONST) return false;
+      uint64_t om = sf ? f->insts[other].imm : (f->insts[other].imm & 0xffffffffu);
+      if (om != 0) return false;
+      return masked == 1 || masked == (sf ? ~0ull : 0xffffffffu);
     }
-    while (sp) {
-      Block *c = &f->blocks[stack[--sp]];
-      for (uint32_t p = 0; p < c->npreds; p++) {
-        uint32_t pb = c->preds[p];
-        if (member[pb] || !f->blocks[pb].reachable) continue;
-        member[pb] = 1; mblk[nm++] = pb; stack[sp++] = pb;
-      }
+    case I_LOAD: case I_STORE: {
+
+      if (idx != 0) return false;
+      uint32_t size = (uint32_t)MEMF_SIZE(in->imm2);
+      if (cval & ((1u << size) - 1)) return false;
+      return (cval >> size) <= 0xfff;
     }
-
-    Ref pnew = ir_add_param(f, hb, (ValType)f->insts[v].type);
-    sc->addp[k] = pnew;
-    sc->veto[pnew] = 1;
-    for (uint32_t bi = 0; bi < f->nblocks; bi++) {
-      Block *b2 = &f->blocks[bi];
-      for (uint32_t si = 0; si < b2->nsuccs; si++) {
-        if (b2->succs[si].target != hb) continue;
-        split_edge_push_arg(f, bi, si, member[bi] ? pnew : v);
-      }
-    }
-    for (uint32_t mi = 0; mi < nm; mi++) {
-      Block *b2 = &f->blocks[mblk[mi]];
-      for (uint32_t i = 0; i < b2->ninsts; i++) {
-        Inst *in = &f->insts[b2->insts[i]];
-        Ref *a = ir_args(f, b2->insts[i]);
-        for (uint32_t j = 0; j < in->nargs; j++)
-          if (a[j] == v) a[j] = pnew;
-      }
-      if ((b2->term == T_BRIF || b2->term == T_BRTABLE) && b2->term_arg == v)
-        b2->term_arg = pnew;
-      for (uint32_t i = 0; i < b2->nret; i++)
-        if (b2->ret_args[i] == v) b2->ret_args[i] = pnew;
-      for (uint32_t si = 0; si < b2->nsuccs; si++) {
-        Edge *e = &b2->succs[si];
-        if (e->target == hb || !member[e->target]) continue;
-        for (uint32_t j = 0; j < e->nargs; j++)
-          if (e->args[j] == v) e->args[j] = pnew;
-      }
-    }
-    for (uint32_t mi = 0; mi < nm; mi++) member[mblk[mi]] = 0;
+    default:
+      return false;
   }
-  ir_verify(f, "post-split");
-  xfree(member); xfree(stack); xfree(mblk);
 }
 
-/* Undo split_apply_adds exactly: each added param is the newest inst and
-   the newest param of its header, every use of it was a use of the source
-   value, and every edge into the header carries it (or the value) as the
-   newest arg.  Unapplying in reverse add order pops each layer off the
-   same stacks it was pushed on, leaving the IR the retry's allocation
-   never has to know was edited. */
-static void split_unapply_adds(IrFunc *f, SplitCtl *sc) {
-  for (uint32_t k = sc->nadd; k-- > 0;) {
-    Ref p = sc->addp[k], v = sc->addv[k];
-    uint32_t hb = sc->addhdr[k];
-    for (uint32_t bi = 0; bi < f->nblocks; bi++) {
-      Block *b = &f->blocks[bi];
-      for (uint32_t i = 0; i < b->ninsts; i++) {
-        Inst *in = &f->insts[b->insts[i]];
-        Ref *a = ir_args(f, b->insts[i]);
-        for (uint32_t j = 0; j < in->nargs; j++)
-          if (a[j] == p) a[j] = v;
-      }
-      if ((b->term == T_BRIF || b->term == T_BRTABLE) && b->term_arg == p)
-        b->term_arg = v;
-      for (uint32_t i = 0; i < b->nret; i++)
-        if (b->ret_args[i] == p) b->ret_args[i] = v;
-      for (uint32_t si = 0; si < b->nsuccs; si++) {
-        Edge *e = &b->succs[si];
-        if (e->target == hb) {
-          if (!e->nargs)
-            warmc_fatal("split unapply: edge %u->%u has no arg to pop", bi, hb);
-          e->nargs--;
-        } else {
-          for (uint32_t j = 0; j < e->nargs; j++)
-            if (e->args[j] == p) e->args[j] = v;
-        }
-      }
-    }
-    Block *hd = &f->blocks[hb];
-    if (!hd->nparams || hd->params[hd->nparams - 1] != p)
-      warmc_fatal("split unapply: param v%u is not block %u's newest", p, hb);
-    hd->nparams--;
-    if (p != f->ninsts - 1)
-      warmc_fatal("split unapply: param v%u is not the newest inst", p);
-    f->ninsts--;
+static int const_cost_a64(uint64_t bits, bool wide) {
+  int nwords = wide ? 4 : 2;
+  if (!wide) bits &= 0xffffffffu;
+  int zeros = 0, ones = 0;
+  for (int i = 0; i < nwords; i++) {
+    uint16_t w = (uint16_t)(bits >> (16 * i));
+    if (w != 0) zeros++;
+    if (w != 0xffff) ones++;
   }
-  if (sc->nadd) ir_verify(f, "post-split-unapply");
+  int n = zeros < ones ? zeros : ones;
+  return n < 1 ? 1 : n;
 }
 
-/* Drop every grant the retry failed to keep in a register.  Cut grants
-   are only a veto bit, so pruning one restores the entry-edge coalescing
-   it blocked; inv grants were already rolled out of the IR by
-   split_unapply_adds, so pruning is compacting them out of the plan.
-   Grant counters follow the survivors -- --stats reports what the emitted
-   code carries, not what was asked for. */
-static void split_prune_plan(IrFunc *f, SplitCtl *sc) {
-  bool dbg = getenv("WARMC_SPLIT_DEBUG") != NULL;
-  uint32_t w = 0;
-  for (uint32_t k = 0; k < sc->nadd; k++) {
-    if (sc->inv_fail && sc->inv_fail[k]) {
-      if (dbg)
-        fprintf(stderr, "split[%u] PRUNE inv v%u hdr=b%u\n", f->func_index,
-                sc->addv[k], sc->addhdr[k]);
-      g_stats.split_invs--;
-      continue;
-    }
-    sc->addv[w] = sc->addv[k];
-    sc->addhdr[w] = sc->addhdr[k];
-    w++;
+static int vconst_cost_a64(uint64_t lo, uint64_t hi) {
+  if (lo == hi) {
+    if (lo == (lo & 0xffu) * 0x0101010101010101ull) return 1;
+    return const_cost_a64(lo, true) + 1;
   }
-  sc->nadd = w;
-  w = 0;
-  for (uint32_t c = 0; c < sc->ncut; c++) {
-    Ref p = sc->cutp[c];
-    if (sc->cut_fail && sc->cut_fail[c]) {
-      if (dbg) fprintf(stderr, "split[%u] PRUNE cut v%u\n", f->func_index, p);
-      if (p < sc->veto_n) sc->veto[p] = 0;
-      g_stats.split_cuts--;
-      continue;
-    }
-    sc->cutp[w++] = p;
-  }
-  sc->ncut = w;
-  if (sc->veto && sc->veto_n > f->ninsts)
-    memset(sc->veto + f->ninsts, 0, sc->veto_n - f->ninsts);
-  if (sc->inv_fail) memset(sc->inv_fail, 0, sc->cap_add);
-  if (sc->cut_fail) memset(sc->cut_fail, 0, sc->cap_cut);
-  sc->nfailed_new = 0;
+  return const_cost_a64(lo, true) + const_cost_a64(hi, true) + 2;
 }
 
-void ir_produce_function(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
-                         uint32_t out_bytes, FuncOut *fout) {
-  SplitCtl sc;
-  memset(&sc, 0, sizeof sc);
-
-  /* Loop-boundary live-range splitting, opt-in.  The prune loop below
-     rolls every failed grant out of the IR, so enabling this never loses
-     a race any more (the old chunks +4.9% and the ktbench drift are
-     gone); what remains is one reproduced winner (asbench mapint -3%)
-     for +8-9% compile time on granted modules -- 71% of grants fail the
-     retry and cost their extra regalloc rounds anyway.  Not a trade to
-     make by default.  The measured record lives with the
-     warmc-split-series memory note. */
-  bool collect = opt->regalloc && getenv("WARMC_SPLIT") != NULL;
-  int r = produce_body(f, obj, opt, out_bytes, fout, false, &sc, collect);
-  if (r == 2) {
-    split_apply_adds(f, &sc);
-    r = produce_body(f, obj, opt, out_bytes, fout, false, &sc, false);
-  }
-  /* Each round the retry reports the grants it could not keep in
-     registers; they are rolled out of the IR and the survivors re-run, so
-     a failed grant never competes.  Every round removes at least one
-     grant, so this terminates on its own; the accept backstop only caps a
-     pathological function's regalloc reruns. */
-  for (int rounds = 0; r == 3; rounds++) {
-    split_unapply_adds(f, &sc);
-    split_prune_plan(f, &sc);
-    split_apply_adds(f, &sc);
-    if (rounds >= 8) sc.accept = true;
-    r = produce_body(f, obj, opt, out_bytes, fout, false, &sc, false);
-  }
-  if (r == 0) {
-    sc.accept = true;
-    r = produce_body(f, obj, opt, out_bytes, fout, true, &sc, false);
-  }
-  xfree(sc.veto); xfree(sc.addv); xfree(sc.addhdr); xfree(sc.addp);
-  xfree(sc.cutp); xfree(sc.inv_fail); xfree(sc.cut_fail);
-  if (r == 1) return;
-  warmc_fatal("function %u cannot be laid out: a conditional branch is still "
-              "out of range after relaxation", f->func_index);
+static bool mem_disp_ok_a64(uint64_t off, uint32_t size_log2) {
+  if (off & ((1u << size_log2) - 1)) return false;
+  return (off >> size_log2) <= 0xfff;
 }
 
-typedef struct {
-  uint64_t hash;
-  uint64_t base;
-  uint32_t code_len;
-  uint8_t *aux;
-  uint32_t naux;
-} MergedBody;
+static void pad_nop_a64(Buf *b) { a64_nop(b); }
 
-typedef struct { uint8_t *p; uint32_t len, cap; } AuxBuf;
-
-static MergedBody *g_mb;
-static uint32_t g_nmb, g_cap_mb;
-static uint32_t *g_mb_ix, g_mb_ix_cap;
-static uint32_t g_mb_hits;
-static uint64_t g_mb_bytes;
-static AuxBuf g_aux;
-static bool g_merge_on = true;
-static uint32_t g_dead_bodies;
-static uint64_t g_dead_bytes;
-static uint64_t g_dead_stub = UINT64_MAX;
-
-void codegen_set_merge(bool on) { g_merge_on = on; }
-
-void codegen_reset_merge(void) {
-  for (uint32_t i = 0; i < g_nmb; i++) xfree(g_mb[i].aux);
-  xfree(g_mb); xfree(g_mb_ix); xfree(g_aux.p);
-  g_mb = NULL; g_mb_ix = NULL; g_aux.p = NULL;
-  g_nmb = g_cap_mb = g_mb_ix_cap = 0;
-  g_aux.len = g_aux.cap = 0;
-  g_mb_hits = 0; g_mb_bytes = 0;
-  g_dead_bodies = 0; g_dead_bytes = 0;
-  g_dead_stub = UINT64_MAX;
-}
-
-void codegen_merge_stats(uint32_t *bodies, uint64_t *bytes) {
-  *bodies = g_mb_hits;
-  *bytes = g_mb_bytes;
-}
-
-static void aux_u32(AuxBuf *a, uint32_t v) {
-  if (a->len + 4 > a->cap) {
-    a->cap = a->cap ? a->cap * 2 : 256;
-    a->p = xrealloc(a->p, a->cap);
-  }
-  memcpy(a->p + a->len, &v, 4);
-  a->len += 4;
-}
-
-static void aux_u64(AuxBuf *a, uint64_t v) {
-  aux_u32(a, (uint32_t)v);
-  aux_u32(a, (uint32_t)(v >> 32));
-}
-
-static void aux_build(AuxBuf *a, const FuncOut *fo) {
-  const FuncUnwind *u = &fo->uw;
-  a->len = 0;
-  aux_u32(a, fo->want_align ? 1u : 0u);
-  aux_u32(a, fo->nrelocs);
-  for (uint32_t i = 0; i < fo->nrelocs; i++) {
-    aux_u32(a, (uint32_t)fo->relocs[i].kind);
-    aux_u64(a, fo->relocs[i].offset);
-    aux_u32(a, fo->relocs[i].sym);
-    aux_u64(a, (uint64_t)fo->relocs[i].addend);
-  }
-  aux_u32(a, u->frame); aux_u32(a, u->saved_bytes);
-  aux_u32(a, u->exn_slot); aux_u32(a, u->fpsave_off);
-  aux_u32(a, u->saved);
-  aux_u32(a, u->nsites);
-  for (uint32_t i = 0; i < u->nsites; i++) {
-    aux_u32(a, u->sites[i].pc); aux_u32(a, u->sites[i].first);
-    aux_u32(a, u->sites[i].n);
-  }
-  aux_u32(a, u->nclauses);
-  for (uint32_t i = 0; i < u->nclauses; i++) {
-    aux_u32(a, u->clauses[i].kind); aux_u32(a, u->clauses[i].tag);
-    aux_u32(a, u->clauses[i].pad);
-  }
-  aux_u32(a, u->ngcsites);
-  for (uint32_t i = 0; i < u->ngcsites; i++) {
-    aux_u32(a, u->gcsites[i].pc); aux_u32(a, u->gcsites[i].first);
-    aux_u32(a, u->gcsites[i].n);
-  }
-  aux_u32(a, u->ngcroots);
-  for (uint32_t i = 0; i < u->ngcroots; i++) aux_u32(a, u->gcroots[i]);
-}
-
-static uint64_t mb_hash(const void *p, size_t n) {
-  const uint8_t *b = p;
-  uint64_t h = 1469598103934665603ull;
-  for (size_t i = 0; i < n; i++) { h ^= b[i]; h *= 1099511628211ull; }
-  return h;
-}
-
-static void mb_ix_put(uint32_t i) {
-  uint32_t mask = g_mb_ix_cap - 1;
-  uint32_t h = (uint32_t)g_mb[i].hash & mask;
-  while (g_mb_ix[h]) h = (h + 1) & mask;
-  g_mb_ix[h] = i + 1;
-}
-
-static void mb_ix_grow(void) {
-  uint32_t want = g_mb_ix_cap ? g_mb_ix_cap * 2 : 256;
-  xfree(g_mb_ix);
-  g_mb_ix = xcalloc(want, sizeof(uint32_t));
-  g_mb_ix_cap = want;
-  for (uint32_t i = 0; i < g_nmb; i++) mb_ix_put(i);
-}
-
-static uint64_t mb_find(const ObjBuilder *obj, const FuncOut *fo,
-                        const AuxBuf *aux, uint64_t h) {
-  if (!g_mb_ix_cap) return UINT64_MAX;
-  uint32_t mask = g_mb_ix_cap - 1;
-  uint32_t k = (uint32_t)h & mask;
-  while (g_mb_ix[k]) {
-    const MergedBody *b = &g_mb[g_mb_ix[k] - 1];
-    if (b->hash == h && b->code_len == fo->code_len && b->naux == aux->len &&
-        !memcmp(obj->text.data + b->base, fo->code, fo->code_len) &&
-        !memcmp(b->aux, aux->p, aux->len))
-      return b->base;
-    k = (k + 1) & mask;
-  }
-  return UINT64_MAX;
-}
-
-static void mb_add(uint64_t base, const FuncOut *fo, const AuxBuf *aux,
-                   uint64_t h) {
-  if (g_nmb == g_cap_mb) {
-    g_cap_mb = g_cap_mb ? g_cap_mb * 2 : 64;
-    g_mb = xrealloc(g_mb, g_cap_mb * sizeof(MergedBody));
-  }
-  g_mb[g_nmb].hash = h;
-  g_mb[g_nmb].base = base;
-  g_mb[g_nmb].code_len = fo->code_len;
-  g_mb[g_nmb].naux = aux->len;
-  g_mb[g_nmb].aux = xmalloc(aux->len ? aux->len : 1);
-  memcpy(g_mb[g_nmb].aux, aux->p, aux->len);
-  uint32_t idx = g_nmb++;
-
-  if ((uint64_t)g_nmb * 3 >= (uint64_t)g_mb_ix_cap * 2) mb_ix_grow();
-  else mb_ix_put(idx);
-}
-
-static uint64_t dead_stub(ObjBuilder *obj) {
-  if (g_dead_stub != UINT64_MAX) return g_dead_stub;
-  g_dead_stub = obj->text.len;
-  uint32_t sym = obj_intern_sym(obj, "warmc_unreached", SYM_UNDEF_FUNC, -1, 0);
+static void emit_dead_call_a64(ObjBuilder *obj, uint32_t sym) {
   obj_add_reloc(obj, REL_CALL26, 0, obj->text.len, sym, 0);
   a64_b(&obj->text, 0);
-  return g_dead_stub;
 }
 
-void codegen_drop_function(ObjBuilder *obj, FuncOut *fo) {
-  uint64_t at = dead_stub(obj);
-  obj_intern_sym(obj, fo->sym, SYM_LOCAL_FUNC, 0, at);
-  uint32_t si = obj_find_sym(obj, fo->sym);
-  obj->syms[si].value = at;
-  obj->syms[si].size = 4;
-  g_dead_bodies++;
-  g_dead_bytes += fo->code_len;
-  xfree(fo->uw.sites); xfree(fo->uw.clauses);
-  xfree(fo->uw.gcsites); xfree(fo->uw.gcroots);
-  xfree(fo->code); xfree(fo->relocs); xfree(fo->refs);
-}
-
-void codegen_dead_stats(uint32_t *bodies, uint64_t *bytes) {
-  *bodies = g_dead_bodies;
-  *bytes = g_dead_bytes;
-}
-
-void codegen_commit_function(ObjBuilder *obj, FuncOut *fo) {
-  aux_build(&g_aux, fo);
-  uint64_t h = mb_hash(fo->code, fo->code_len);
-  h ^= mb_hash(g_aux.p, g_aux.len) * 1099511628211ull;
-  uint64_t at = g_merge_on ? mb_find(obj, fo, &g_aux, h) : UINT64_MAX;
-  if (at != UINT64_MAX) {
-
-    obj_intern_sym(obj, fo->sym, SYM_LOCAL_FUNC, 0, at);
-    uint32_t si = obj_find_sym(obj, fo->sym);
-    obj->syms[si].value = at;
-    obj->syms[si].size = fo->code_len;
-    g_mb_hits++;
-    g_mb_bytes += fo->code_len;
-    g_stats.insts_emitted += fo->insts_emitted;
-    xfree(fo->uw.sites); xfree(fo->uw.clauses);
-    xfree(fo->uw.gcsites); xfree(fo->uw.gcroots);
-    xfree(fo->code); xfree(fo->relocs);
-    return;
-  }
-  if (fo->want_align)
-    while (obj->text.len & (ALIGN_BYTES - 1)) a64_nop(&obj->text);
-  uint64_t base = obj->text.len;
-  buf_bytes(&obj->text, fo->code, fo->code_len);
-  for (uint32_t i = 0; i < fo->nrelocs; i++)
-    obj_add_reloc(obj, fo->relocs[i].kind, 0, base + fo->relocs[i].offset,
-                  fo->relocs[i].sym, fo->relocs[i].addend);
-  obj_intern_sym(obj, fo->sym, SYM_LOCAL_FUNC, 0, base);
-  uint32_t si = obj_find_sym(obj, fo->sym);
-  obj->syms[si].value = base;
-  obj->syms[si].size = fo->code_len;
-  g_stats.insts_emitted += fo->insts_emitted;
-  codegen_note_unwind(&fo->uw);
-  if (g_merge_on) mb_add(base, fo, &g_aux, h);
-  xfree(fo->uw.sites); xfree(fo->uw.clauses);
-  xfree(fo->uw.gcsites); xfree(fo->uw.gcroots);
-  xfree(fo->code); xfree(fo->relocs); xfree(fo->refs);
-}
+const Target warmc_target_a64 = {
+  .name = "a64",
+  .is_x64 = false,
+  .imm_ok = imm_ok_a64,
+  .const_cost = const_cost_a64,
+  .vconst_cost = vconst_cost_a64,
+  .mem_disp_ok = mem_disp_ok_a64,
+  .produce_body = produce_body,
+  .pad_nop = pad_nop_a64,
+  .emit_dead_call = emit_dead_call_a64,
+  .narg_int = 8,
+  .narg_fp = 8,
+  .arg_slot = ARG_STACK_SLOT,
+  .max_frame = 32000,
+};
