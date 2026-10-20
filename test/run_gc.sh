@@ -279,33 +279,63 @@ expect keep_reused        "OK" 1 5
 expect keep_reused        "OK" 0 2
 expect keep_shared_edge   "OK" 0 2
 expect keep_shared_edge   "OK" 3 100
+expect pe_rare_call       "OK" 20 0 570
+expect pe_found           "OK" 10 49 7049
+expect pe_found           "OK" 10 50 -1
+expect pe_best            "OK" 50 32100
+expect pe_array           "OK" 1 180
+expect pe_array           "OK" 0 11
+expect pe_packed          "OK" 1 -199000
+expect pe_packed          "OK" 0 -199000
+expect pe_merge           "OK" 1 1 111
+expect pe_merge           "OK" 0 1 113
+expect pe_merge           "OK" 1 0 11
+expect pe_merge           "OK" 0 0 13
+expect pe_edge            "OK" 1 15
+expect pe_edge            "OK" 0 -1
+expect pe_nested          "OK" 1 8
+expect pe_nested          "OK" 0 -1
+expect keep_escape_write  "OK" 1 9
+expect keep_escape_write  "OK" 0 9
+expect keep_escape_identity "OK" 1 1
+expect keep_escape_identity "OK" 0 0
+expect keep_loop_escape   "OK" 5 5
 
-# The sr_ cases are right whether or not their objects were replaced, so
-# whether they were is asked separately: at the default -O2, every
-# allocation in an sr_ function must end the pipeline replaced.
+# The sr_ and pe_ cases are right whether or not their objects were
+# replaced, so whether they were is asked separately: at the default -O2,
+# every allocation in an sr_ function must end the pipeline replaced, and
+# a pe_ function must have one made at its escape points, with nothing else
+# standing but the objects so made, which escape on every path.
 # WARMC_ESCAPE_DEBUG names functions by index; wasm-tools maps them back.
 if [ -z "${WARMC_FLAGS:-}" ] || [ "${WARMC_FLAGS:-}" = -O2 ]; then
   if why=$(WARMC_ESCAPE_DEBUG=1 wtimeout ./$BUILD/warmc -O2 -j1 -c -o /dev/null \
              "$WORK/escape.wasm" 2>&1 >/dev/null |
            python3 -c '
 import re, subprocess, sys
+text = subprocess.run([sys.argv[1], "print", sys.argv[2]],
+                      capture_output=True, text=True).stdout
+ids = {m.group(1): int(m.group(2)) for m in re.finditer(r"\(func (\$[^\s()]+) \(;(\d+);\)", text)}
 names = {}
-for m in re.finditer(r"\(export \"(sr_\w+)\" \(func (\d+)\)\)",
-                     subprocess.run([sys.argv[1], "print", sys.argv[2]],
-                                    capture_output=True, text=True).stdout):
-    names[int(m.group(2))] = m.group(1)
+for m in re.finditer(r"\(export \"((?:sr|pe)_\w+)\" \(func (\d+|\$[^\s()]+)\)\)", text):
+    names[int(m.group(2)) if m.group(2).isdigit() else ids[m.group(2)]] = m.group(1)
 last = {}
 for line in sys.stdin:
     m = re.match(r"escape wasm_func_(\d+) (v\d+) \w+ d\d+: (.*)", line.strip())
     if m and int(m.group(1)) in names: last[(int(m.group(1)), m.group(2))] = m.group(3)
-bad = ["%s %s: %s" % (names[f], v, w) for (f, v), w in sorted(last.items()) if w != "replaced"]
+def fine(n, w):
+    if n.startswith("sr_"): return w == "replaced"
+    return w == "replaced" or w.startswith("partial:") or w.endswith(" on every path")
+bad = ["%s %s: %s" % (names[f], v, w) for (f, v), w in sorted(last.items()) if not fine(names[f], w)]
 bad += ["%s: no allocation reached the pass" % n for f, n in sorted(names.items())
         if not any(k[0] == f for k in last)]
+bad += ["%s: nothing was made at an escape point" % n for f, n in sorted(names.items())
+        if n.startswith("pe_") and not any(k[0] == f and w.startswith("partial:")
+                                          for k, w in last.items())]
 print("; ".join(bad))
 sys.exit(1 if bad else 0)' "$WT" "$WORK/escape.wasm"); then
     pass=$((pass+1))
   else
-    echo "FAIL[gc] escape: an sr_ allocation was not replaced: $why"
+    echo "FAIL[gc] escape: an sr_ or pe_ allocation was not replaced: $why"
     fail=$((fail+1))
   fi
 fi
