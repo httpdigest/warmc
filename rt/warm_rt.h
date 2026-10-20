@@ -285,9 +285,6 @@ void warmc_array_init_data(WarmInstance *vm, u32 type_index, u32 seg, void *a,
 void warmc_array_init_elem(WarmInstance *vm, u32 type_index, u32 seg, void *a,
                            u32 di, u32 so, u32 n);
 
-void warmc_gc_satb(u64 old);
-
-void warmc_gc_satb_swap(void);
 void warmc_gc_hold(u64 *base, const u32 *n, void *slot);
 void warmc_gc_release(void *slot);
 unsigned warmc_gc_hold_bytes(void);
