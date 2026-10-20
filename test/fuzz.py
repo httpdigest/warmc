@@ -42,9 +42,7 @@ sys.path.insert(0, os.path.join(ROOT, "test"))
 import compare as cmp_mod
 import hostbuild
 
-WABT_FLAGS = """--enable-exceptions --enable-function-references --enable-tail-call
---enable-gc --enable-memory64 --enable-multi-memory --enable-extended-const
---enable-relaxed-simd --enable-annotations""".split()
+WABT_FLAGS = hostbuild.wabt_flags()
 
 I32V = ["0", "1", "2", "7", "31", "32", "0x7fffffff", "0x80000000",
         "0xffffffff", "0xfffffffe", "0xdeadbeef", "3", "255", "65535",

@@ -62,6 +62,8 @@ import subprocess
 import sys
 import tempfile
 
+import hostbuild
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILD = os.environ.get("BUILD", "build")
 WARMC = os.path.join(ROOT, BUILD, "warmc")
@@ -69,11 +71,7 @@ WASM_TOOLS = os.path.join(ROOT, BUILD, "tools", "bin", "wasm-tools")
 
 CORPUS_CAP = int(os.environ.get("WAT_CORPUS_CAP", "1500"))
 
-WABT_FLAGS = [
-    "--enable-exceptions", "--enable-function-references", "--enable-tail-call",
-    "--enable-gc", "--enable-memory64", "--enable-multi-memory",
-    "--enable-extended-const", "--enable-relaxed-simd", "--enable-annotations",
-]
+WABT_FLAGS = hostbuild.wabt_flags()
 
 TIMEOUT = float(os.environ.get("WARMC_TIMEOUT", "20"))
 
