@@ -85,11 +85,13 @@ static int simd_shift_imm(Isel *s, Ref v, uint16_t op, int sz, int x, int k) {
 }
 
 /* The relaxed i8 x i7 dot product, in the reading warmc picked for every
-   target: BOTH operands signed, with adjacent products added under signed
-   saturation.  (vpmaddubsw, the usual x86 lowering, reads its first
-   operand unsigned and answers differently for inputs outside the i7
-   range.)  Sign-extending to i16 and pair-adding into i32 cannot overflow,
-   so the saturation is exactly the pack back down.  Leaves the i16x8
+   target -- the deterministic profile's: BOTH operands signed, with adjacent
+   products added with wrap-around, as NEON's smull/smull2/addp does.
+   (vpmaddubsw, the usual x86 lowering, is the spec's other choice: its
+   first operand read unsigned and the sum saturated.)  Sign-extending to
+   i16 and pair-adding into i32 cannot overflow, so each pair sum is exact
+   there, and keeping its low half is the wrap-around: masked to 16 bits a
+   sum fits u16, so the unsigned-saturating pack truncates.  Leaves the i16x8
    result in FTMP and uses F1/F2, so both operands must be dead after it. */
 static int simd_dot_i7(Isel *s, int x, int y) {
   x64_vpmovsx(B, 0, FTMP, x);
@@ -100,7 +102,10 @@ static int simd_dot_i7(Isel *s, int x, int y) {
   x64_vpsrldq(B, F1, y, 8);
   x64_vpmovsx(B, 0, F1, F1);
   x64_vpmaddwd(B, F1, F2, F1);
-  x64_vpackssdw(B, FTMP, FTMP, F1);
+  vsplat_const(s, F2, 2, 0xffff);
+  x64_vpand(B, FTMP, FTMP, F2);
+  x64_vpand(B, F1, F1, F2);
+  x64_vpackusdw(B, FTMP, FTMP, F1);
   return FTMP;
 }
 
