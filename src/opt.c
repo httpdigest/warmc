@@ -1043,173 +1043,822 @@ static bool pass_dce(IrFunc *f) {
   return changed;
 }
 
+/* ---- escape analysis and scalar replacement ---------------------------
+
+   An allocation that never leaves the function -- never stored, passed,
+   returned, put in a global or compared with something that might be it --
+   need not exist.  Its fields become SSA values, carried round the CFG by
+   block parameters the way pass_global_ssa carries a global, and the
+   allocation, its stores and its null checks go.
+
+   What counts as one object:
+   - struct.new, and array.new / array.new_default of a constant length of at
+     most ESC_MAX_ELEMS, its elements reached at constant indices.  A longer
+     array (up to a megabyte) can still go when nothing reads its elements;
+   - ref.cast / ref.convert of one (I_REF_CONVERT), and a block parameter
+     every argument of which is the same object: a loop-carried or merged
+     alias, which shares the object's fields;
+   - a block parameter merging different objects -- `c ? new P(a) : new
+     P(b)`, or a loop variable given a fresh object each trip.  It is an
+     object of its own, its fields parameters of that block, provided each
+     object flowing in is used no more once it has: no use of one is
+     reachable from the merge without allocating it again.  That is what
+     lets the merged value own fields that nothing else can see.
+
+   What a use may be: field.get/set, array.get/set at a constant index in
+   range, array.len, a null check (it is not null), ref.is_null, ref.test
+   (its exact type is known), ref.eq/ne (nothing that is not one of its
+   aliases can be it), and flowing into a parameter as above.  Anything else
+   -- a call, being stored, returned, select -- and it escapes, together with
+   every object it merges with.
+
+   Exception edges carry no arguments, so an object whose fields would have
+   to be live into a landing pad stays an allocation. */
+
+static void edge_push_arg_at(IrFunc *f, uint32_t from, uint32_t si, Ref v);
+
+#define ESC_MAX_ELEMS  32u
+#define ESC_MAX_OBJS   256u
+#define ESC_MAX_VARS   1024u
+#define ESC_MAX_CELLS  (1u << 22)
+#define ESC_DEAD_BYTES (1u << 20)
+
+enum { ESK_STRUCT, ESK_ARRAY };
+
+enum {
+  ESW_COND = 1, ESW_RETURN, ESW_PARAM, ESW_FOREIGN, ESW_REUSED, ESW_SHAPE,
+  ESW_PAD, ESW_BUDGET, ESW_MERGED, ESW_ELEM, ESW_SHARED, ESW_OP = 1000
+};
+
+typedef struct {
+  Ref def;            /* the allocation, or the parameter that merges */
+  uint32_t block;
+  uint32_t ti;
+  uint8_t kind;
+  bool phi;
+  bool escaped;
+  bool dead_only;     /* an array too long to replace: removable unread */
+  uint16_t why;
+  uint32_t nvars, var0, len;
+  Ref fill;           /* array.new's fill value, REF_NONE for the default */
+} EsObj;
+
+typedef struct { uint32_t obj, block; } EsUse;
+typedef struct { uint32_t src, dst; } EsFlow;
+
+static const char *es_why(uint16_t w) {
+  switch (w) {
+    case ESW_COND: return "a branch condition";
+    case ESW_RETURN: return "returned";
+    case ESW_PARAM: return "flows into a parameter that is not an object";
+    case ESW_FOREIGN: return "merged with a value that is not a fresh object";
+    case ESW_REUSED: return "used again after flowing into a merge";
+    case ESW_SHAPE: return "merged with an object of another shape";
+    case ESW_PAD: return "live into a landing pad";
+    case ESW_BUDGET: return "too many fields in the function";
+    case ESW_MERGED: return "merged with an object that escapes";
+    case ESW_ELEM: return "an element at an index that is not a constant in range";
+    case ESW_SHARED: return "handed to two merges on one edge";
+    default: return "?";
+  }
+}
+
+static void es_escape(EsObj *o, uint16_t why) {
+  if (o->escaped) return;
+  o->escaped = true;
+  o->why = why;
+}
+
+/* The runtime's warmc_ref_test, for an object whose exact type is known:
+   -1 when the test is one this does not decide. */
+static int es_ref_test(const Module *m, uint32_t ti, uint64_t imm, uint64_t id) {
+  const CompType *t = &m->types[ti];
+  uint32_t depth = RTEST_DEPTH(imm);
+  switch (RTEST_KIND(imm) & ~RTK_NULLABLE) {
+    case RTK_ANY: case RTK_FUNC: case RTK_EXTERN: case RTK_EXN: return 1;
+    case RTK_NONE: case RTK_NOFUNC: case RTK_NOEXTERN: case RTK_NOEXN:
+    case RTK_I31: case RTK_CONCRETE_FUNC: return 0;
+    case RTK_EQ: return 1;
+    case RTK_STRUCT: return t->kind == CT_STRUCT;
+    case RTK_ARRAY: return t->kind == CT_ARRAY;
+    case RTK_CONCRETE_ANY:
+      return t->depth >= depth && t->display && t->display[depth] == id;
+    default: return -1;
+  }
+}
+
+/* The type a field or element is held in as an SSA value: i8 and i16 live
+   in an i32, unmasked, and a read narrows them. */
+static ValType es_var_type(const Module *m, const EsObj *o, uint32_t k) {
+  const CompType *t = &m->types[o->ti];
+  return vt_unpacked(o->kind == ESK_STRUCT ? t->fields[k].type : t->fields[0].type);
+}
+
+static ValType es_storage(const Module *m, const EsObj *o, uint32_t k) {
+  const CompType *t = &m->types[o->ti];
+  return o->kind == ESK_STRUCT ? t->fields[k].type : t->fields[0].type;
+}
+
+static void es_move_last_to(IrFunc *f, uint32_t bi, uint32_t to) {
+  Block *b = &f->blocks[bi];
+  uint32_t r = b->insts[b->ninsts - 1];
+  memmove(&b->insts[to + 1], &b->insts[to],
+          (b->ninsts - 1 - to) * sizeof(uint32_t));
+  b->insts[to] = r;
+}
+
+/* A constant at the very top of the entry block, ahead of anything that
+   could use it. */
+static Ref es_entry_const(IrFunc *f, ValType t, uint64_t lo, uint64_t hi) {
+  Ref c = ir_emit(f, f->entry, I_CONST, t, NULL, 0,
+                  (t == VT_I32 || t == VT_F32) ? (lo & 0xffffffffu) : lo, hi);
+  es_move_last_to(f, f->entry, 0);
+  return c;
+}
+
+/* array.new's fill value as the element type holds it.  ir_build splits it
+   into the two words the runtime takes, reinterpreting a float and
+   extracting a v128's lanes; this undoes that, or answers REF_NONE. */
+static Ref es_fill_value(IrFunc *f, ValType et, Ref lo, Ref hi) {
+  Inst *l = &f->insts[lo], *h = &f->insts[hi];
+  if (et == VT_F32 || et == VT_F64) {
+    if (l->op == I_REINTERPRET && l->nargs == 1 &&
+        f->insts[ir_resolve(f, ir_args(f, lo)[0])].type == et)
+      return ir_resolve(f, ir_args(f, lo)[0]);
+    if (l->op == I_CONST) return es_entry_const(f, et, l->imm, 0);
+    return REF_NONE;
+  }
+  if (et == VT_V128) {
+    if (l->op == I_CONST && h->op == I_CONST)
+      return es_entry_const(f, VT_V128, l->imm, h->imm);
+    if (l->op == I_VEXTRACTU && h->op == I_VEXTRACTU &&
+        l->nargs == 1 && h->nargs == 1 && l->imm == 0 && h->imm == 1 &&
+        ir_resolve(f, ir_args(f, lo)[0]) == ir_resolve(f, ir_args(f, hi)[0]))
+      return ir_resolve(f, ir_args(f, lo)[0]);
+    return REF_NONE;
+  }
+  return lo;
+}
+
+static uint32_t es_elem_index(IrFunc *f, const EsObj *o, Ref idx) {
+  Inst *c = &f->insts[ir_resolve(f, idx)];
+  if (c->op != I_CONST) return UINT32_MAX;
+  uint64_t k = c->imm & 0xffffffffu;
+  return k < o->len ? (uint32_t)k : UINT32_MAX;
+}
+
 static bool pass_escape(IrFunc *f) {
-  uint32_t n = f->ninsts;
-  if (!n) return false;
-  enum { CAND = 1, ESCAPED = 2 };
-  uint8_t *st = xcalloc(n, 1);
-  uint8_t *mut = xcalloc(n, 1);
-  uint8_t *rd = xcalloc(n, 1);
-  uint8_t *keep = xcalloc(n, 1);
+  uint32_t n = f->ninsts, nb = f->nblocks;
+  if (!n || !f->norder) return false;
+  Module *m = f->m;
+  bool dbg = getenv("WARMC_ESCAPE_DEBUG") != NULL;
+
+  EsObj *obj = NULL;
+  uint32_t nobj = 0, cobj = 0;
+  int32_t *own = xmalloc(n * sizeof(int32_t));
+  for (uint32_t v = 0; v < n; v++) own[v] = -1;
+  /* own[] covers the instructions there were; anything made since is not
+     an object */
+#define OWN(r_) ((uint32_t)(r_) < n ? own[(r_)] : -1)
+
+#define ES_ADD(o_) do { \
+    if (nobj == cobj) { cobj = cobj ? 2 * cobj : 16; \
+                        obj = xrealloc(obj, cobj * sizeof *obj); } \
+    obj[nobj++] = (o_); } while (0)
+
+  for (uint32_t oi = 0; oi < f->norder && nobj < ESC_MAX_OBJS; oi++) {
+    uint32_t bi = f->order[oi];
+    Block *b = &f->blocks[bi];
+    for (uint32_t i = 0; i < b->ninsts && nobj < ESC_MAX_OBJS; i++) {
+      Ref v = b->insts[i];
+      /* a fill constant lands at the top of the entry block, which moves an
+         allocation there to the next slot: seen once, it is skipped */
+      if (v >= n || own[v] >= 0) continue;
+      Inst *in = &f->insts[v];
+      EsObj o;
+      memset(&o, 0, sizeof o);
+      o.def = v; o.block = bi; o.ti = (uint32_t)in->imm; o.fill = REF_NONE;
+      if (in->op == I_STRUCT_NEW && in->nargs == 0) {
+        if (o.ti >= m->ntypes || m->types[o.ti].kind != CT_STRUCT) continue;
+        o.kind = ESK_STRUCT;
+        o.nvars = m->types[o.ti].nfields;
+      } else if (in->op == I_ARRAY_NEW && (in->nargs == 1 || in->nargs == 3)) {
+        if (o.ti >= m->ntypes || m->types[o.ti].kind != CT_ARRAY) continue;
+        Ref *a = ir_args(f, v);
+        Inst *lc = &f->insts[ir_resolve(f, a[0])];
+        if (lc->op != I_CONST) continue;
+        o.kind = ESK_ARRAY;
+        o.len = (uint32_t)(lc->imm & 0xffffffffu);
+        ValType et = m->types[o.ti].fields[0].type;
+        uint64_t bytes = (uint64_t)m->types[o.ti].hdr_size +
+                         (uint64_t)o.len * vt_width(et);
+        if (bytes > ESC_DEAD_BYTES) continue;
+        if (o.len > ESC_MAX_ELEMS) {
+          o.dead_only = true;
+        } else {
+          o.nvars = o.len;
+          if (in->nargs == 3 && o.len) {
+            o.fill = es_fill_value(f, vt_unpacked(et), ir_resolve(f, a[1]),
+                                   ir_resolve(f, a[2]));
+            if (o.fill == REF_NONE) continue;
+          }
+        }
+      } else {
+        continue;
+      }
+      own[v] = (int32_t)nobj;
+      ES_ADD(o);
+    }
+  }
+  if (!nobj) { xfree(own); xfree(obj); return false; }
+
+  IrEdgeIdx ei = ir_edge_index(f);
+
+  /* Which allocations can reach each reference parameter and conversion,
+     to a fixpoint over the CFG: a set only grows, so cycles of parameters
+     settle without guessing.  One origin and the parameter is an alias of
+     it -- SSA dominance makes it the object's current instance on every
+     edge; two or more and it is a merge, an object of its own.  Anything
+     else reaching it, and it is not an object at all. */
+  uint32_t nalloc = nobj, W = (nalloc + 63) / 64;
+  uint64_t *org = xcalloc((size_t)n * W, sizeof(uint64_t));
+  uint8_t *forg = xcalloc(n, 1);
+  for (uint32_t c = 0; c < nalloc; c++)
+    org[(size_t)obj[c].def * W + c / 64] |= 1ull << (c % 64);
+  /* the function's own parameters come from the caller */
+  for (uint32_t p = 0; p < f->blocks[f->entry].nparams; p++)
+    if (f->blocks[f->entry].params[p] < n) forg[f->blocks[f->entry].params[p]] = 1;
+#define ES_TRACKED(r_) ((r_) < n && (OWN(r_) >= 0 || f->insts[r_].op == I_PARAM || \
+                                     f->insts[r_].op == I_REF_CONVERT))
+#define ES_MERGE_IN(to_, from_) do { \
+    Ref fr_ = (from_); bool fg_; \
+    if (ES_TRACKED(fr_)) { \
+      for (uint32_t w_ = 0; w_ < W; w_++) { \
+        uint64_t nw_ = org[(size_t)(to_) * W + w_] | org[(size_t)fr_ * W + w_]; \
+        if (nw_ != org[(size_t)(to_) * W + w_]) { org[(size_t)(to_) * W + w_] = nw_; again = true; } } \
+      fg_ = forg[fr_]; \
+    } else fg_ = true; \
+    if (fg_ && !forg[(to_)]) { forg[(to_)] = 1; again = true; } } while (0)
+  for (bool again = true; again;) {
+    again = false;
+    for (uint32_t oi = 0; oi < f->norder; oi++) {
+      uint32_t bi = f->order[oi];
+      Block *b = &f->blocks[bi];
+      if (bi != f->entry)
+        for (uint32_t p = 0; p < b->nparams; p++) {
+          Ref P = b->params[p];
+          if (P >= n || !vt_is_ref(f->insts[P].type)) continue;
+          for (uint32_t k = ei.off[bi]; k < ei.off[bi + 1]; k++) {
+            Block *sb = &f->blocks[ei.src[k]];
+            if (!sb->reachable || sb->succs[ei.si[k]].eh) continue;
+            Ref a = ir_resolve(f, sb->succs[ei.si[k]].args[p]);
+            if (a != P) ES_MERGE_IN(P, a);
+          }
+        }
+      for (uint32_t i = 0; i < b->ninsts; i++) {
+        Ref v = b->insts[i];
+        if (v < n && f->insts[v].op == I_REF_CONVERT && f->insts[v].nargs == 1)
+          ES_MERGE_IN(v, ir_resolve(f, ir_args(f, v)[0]));
+      }
+    }
+  }
+#undef ES_MERGE_IN
+#undef ES_TRACKED
 
   for (uint32_t oi = 0; oi < f->norder; oi++) {
-    Block *b = &f->blocks[f->order[oi]];
+    uint32_t bi = f->order[oi];
+    Block *b = &f->blocks[bi];
+    if (bi == f->entry) continue;
+    for (uint32_t p = 0; p < b->nparams; p++) {
+      Ref P = b->params[p];
+      if (P >= n || !vt_is_ref(f->insts[P].type) || forg[P]) continue;
+      int32_t one = -1;
+      uint32_t count = 0;
+      for (uint32_t c = 0; c < nalloc; c++)
+        if (org[(size_t)P * W + c / 64] >> (c % 64) & 1) { if (one < 0) one = (int32_t)c; count++; }
+      if (!count) continue;
+      if (count == 1) { own[P] = one; continue; }
+      if (nobj >= ESC_MAX_OBJS) continue;
+      EsObj o;
+      memset(&o, 0, sizeof o);
+      o.def = P; o.block = bi; o.phi = true; o.fill = REF_NONE;
+      o.ti = obj[one].ti; o.kind = obj[one].kind;
+      o.len = obj[one].len; o.nvars = obj[one].nvars;
+      own[P] = (int32_t)nobj;
+      ES_ADD(o);
+      /* every allocation that reaches it must have its shape */
+      for (uint32_t c = 0; c < nalloc; c++)
+        if ((org[(size_t)P * W + c / 64] >> (c % 64) & 1) &&
+            (obj[c].ti != o.ti || obj[c].kind != o.kind || obj[c].len != o.len ||
+             obj[c].dead_only)) {
+          es_escape(&obj[c], ESW_SHAPE);
+          es_escape(&obj[own[P]], ESW_SHAPE);
+        }
+    }
+  }
+  /* a conversion is the object it converts, whatever that turned out to be */
+  for (bool again = true; again;) {
+    again = false;
+    for (uint32_t oi = 0; oi < f->norder; oi++) {
+      Block *b = &f->blocks[f->order[oi]];
+      for (uint32_t i = 0; i < b->ninsts; i++) {
+        Ref v = b->insts[i];
+        if (v >= n || f->insts[v].op != I_REF_CONVERT || own[v] >= 0 ||
+            f->insts[v].nargs != 1 || forg[v])
+          continue;
+        int32_t c = OWN(ir_resolve(f, ir_args(f, v)[0]));
+        if (c >= 0) { own[v] = c; again = true; }
+      }
+    }
+  }
+  xfree(org);
+
+  /* What flows where.  An object meeting a parameter that is not one
+     escapes; one flowing into a merge is recorded; and an object handed to
+     two parameters on one edge, a merge among them, would be two objects
+     sharing fields -- it escapes. */
+  EsFlow *flow = NULL;
+  uint32_t nflow = 0, cflow = 0;
+  for (uint32_t oi = 0; oi < f->norder; oi++) {
+    uint32_t bi = f->order[oi];
+    Block *b = &f->blocks[bi];
+    for (uint32_t s = 0; s < b->nsuccs; s++) {
+      Edge *e = &b->succs[s];
+      if (e->eh) continue;
+      Block *t = &f->blocks[e->target];
+      for (uint32_t j = 0; j < e->nargs && j < t->nparams; j++) {
+        Ref a = ir_resolve(f, e->args[j]);
+        int32_t c = OWN(a);
+        Ref P = t->params[j];
+        int32_t d = OWN(P);
+        if (c < 0) {
+          if (d >= 0 && a != P) es_escape(&obj[d], ESW_FOREIGN);
+          continue;
+        }
+        if (d < 0) { es_escape(&obj[c], ESW_PARAM); continue; }
+        for (uint32_t j2 = 0; j2 < j; j2++) {
+          int32_t c2 = OWN(ir_resolve(f, e->args[j2]));
+          int32_t d2 = OWN(t->params[j2]);
+          if (c2 == c && d2 >= 0 && (obj[d].phi || obj[d2].phi)) {
+            es_escape(&obj[c], ESW_SHARED);
+            es_escape(&obj[d], ESW_SHARED);
+            es_escape(&obj[d2], ESW_SHARED);
+          }
+        }
+        if (c == d) continue;
+        if (!obj[d].phi || obj[d].def != P) {
+          es_escape(&obj[c], ESW_SHAPE);
+          es_escape(&obj[d], ESW_SHAPE);
+          continue;
+        }
+        if (nflow == cflow) {
+          cflow = cflow ? 2 * cflow : 16;
+          flow = xrealloc(flow, cflow * sizeof *flow);
+        }
+        flow[nflow++] = (EsFlow){ (uint32_t)c, (uint32_t)d };
+      }
+    }
+  }
+
+  /* Every use: allowed, recorded with its block, or the object escapes. */
+  EsUse *use = NULL;
+  uint32_t nuse = 0, cuse = 0;
+#define ES_USE(c_, b_) do { \
+    if (nuse == cuse) { cuse = cuse ? 2 * cuse : 64; \
+                        use = xrealloc(use, cuse * sizeof *use); } \
+    use[nuse++] = (EsUse){ (uint32_t)(c_), (b_) }; } while (0)
+
+  for (uint32_t oi = 0; oi < f->norder; oi++) {
+    uint32_t bi = f->order[oi];
+    Block *b = &f->blocks[bi];
     for (uint32_t i = 0; i < b->ninsts; i++) {
       Ref v = b->insts[i];
       Inst *in = &f->insts[v];
-      if (in->op == I_STRUCT_NEW) st[v] = CAND;
-      else if (in->op == I_ARRAY_NEW && in->nargs == 1) {
-        Ref len = ir_resolve(f, ir_args(f, v)[0]);
-        uint32_t stride = (uint32_t)(in->imm2 & 0xff);
-        uint32_t hdr = (uint32_t)((in->imm2 >> 8) & 0xff);
-        if (f->insts[len].op == I_CONST && hdr &&
-            hdr + (f->insts[len].imm & 0xffffffffu) * (uint64_t)stride <= (1u << 20))
-          st[v] = CAND;
-      }
-    }
-  }
-
-  for (uint32_t oi = 0; oi < f->norder; oi++) {
-    Block *b = &f->blocks[f->order[oi]];
-    for (uint32_t i = 0; i < b->ninsts; i++) {
-      Ref u = b->insts[i];
-      Inst *in = &f->insts[u];
-      Ref *a = ir_args(f, u);
+      Ref *a = ir_args(f, v);
       for (uint32_t j = 0; j < in->nargs; j++) {
-        Ref r = ir_resolve(f, a[j]);
-        if (r >= n || !st[r]) continue;
-        if (j == 0 && f->insts[r].op == I_STRUCT_NEW &&
-            (in->op == I_FIELD_SET || in->op == I_FIELD_GET)) {
-          if (in->op == I_FIELD_GET) {
-            rd[r] = 1;
-            if ((1u << GCF_SIZE(in->imm2)) != vt_width((ValType)in->type))
-              keep[r] = 1;
-          } else if (!(in->imm2 & GCF_INIT)) {
-            mut[r] = 1;
-          }
-          continue;
+        int32_t c = OWN(ir_resolve(f, a[j]));
+        if (c < 0) continue;
+        EsObj *o = &obj[c];
+        bool ok = false;
+        switch (in->op) {
+          case I_FIELD_GET: case I_FIELD_SET:
+            ok = j == 0 && o->kind == ESK_STRUCT &&
+                 gc_field_of_offset(m, vt_ref(false, (HeapType)o->ti), in->imm)
+                   != UINT32_MAX;
+            break;
+          case I_ARRAY_GET: case I_ARRAY_SET:
+            if (j == 0 && o->kind == ESK_ARRAY) {
+              ok = !o->dead_only && es_elem_index(f, o, a[1]) != UINT32_MAX;
+              if (!ok) { es_escape(o, ESW_ELEM); ok = true; }
+            }
+            break;
+          case I_ARRAY_LEN: ok = j == 0 && o->kind == ESK_ARRAY; break;
+          case I_TRAP_IF: ok = in->imm == TRAP_NULL_REF && in->nargs == 1; break;
+          case I_REF_IS_NULL: case I_REF_CONVERT: ok = true; break;
+          case I_REF_TEST: ok = es_ref_test(m, o->ti, in->imm, in->imm2) >= 0; break;
+          case I_EQ: case I_NE: ok = in->nargs == 2; break;
+          default: break;
         }
-
-        if (in->op == I_TRAP_IF && in->imm == TRAP_NULL_REF && in->nargs == 1)
-          continue;
-        st[r] = ESCAPED;
+        if (ok) ES_USE(c, bi);
+        else es_escape(o, (uint16_t)(ESW_OP + in->op));
       }
     }
     if (b->term == T_BRIF || b->term == T_BRTABLE) {
-      Ref r = ir_resolve(f, b->term_arg);
-      if (r < n && st[r]) st[r] = ESCAPED;
+      int32_t c = OWN(ir_resolve(f, b->term_arg));
+      if (c >= 0) es_escape(&obj[c], ESW_COND);
     }
     for (uint32_t i = 0; i < b->nret; i++) {
-      Ref r = ir_resolve(f, b->ret_args[i]);
-      if (r < n && st[r]) st[r] = ESCAPED;
+      int32_t c = OWN(ir_resolve(f, b->ret_args[i]));
+      if (c >= 0) es_escape(&obj[c], ESW_RETURN);
     }
-    for (uint32_t s = 0; s < b->nsuccs; s++)
-      for (uint32_t j = 0; j < b->succs[s].nargs; j++) {
-        Ref r = ir_resolve(f, b->succs[s].args[j]);
-        if (r < n && st[r]) st[r] = ESCAPED;
+    for (uint32_t s = 0; s < b->nsuccs; s++) {
+      Edge *e = &b->succs[s];
+      for (uint32_t j = 0; j < e->nargs; j++) {
+        int32_t c = OWN(ir_resolve(f, e->args[j]));
+        if (c >= 0) ES_USE(c, bi);   /* the fields are needed at the edge */
+      }
+    }
+  }
+
+  /* A merge owns its fields only if what flows in is not used again: no use
+     of a source is reachable from the merge without allocating it anew.  A
+     source made in the merge's own block is made anew on every entry to it,
+     before anything there can use it, so nothing reachable can see the old
+     one -- except through the merge, which is the point.  (The same object
+     handed to both on one edge was refused above.) */
+  uint8_t *reach = xmalloc(nb ? nb : 1);
+  uint32_t *stack = xmalloc((nb ? nb : 1) * sizeof(uint32_t));
+  for (uint32_t k = 0; k < nflow; k++) {
+    EsObj *src = &obj[flow[k].src], *dst = &obj[flow[k].dst];
+    if (src->escaped || dst->escaped || src->block == dst->block) continue;
+    memset(reach, 0, nb);
+    uint32_t sp = 0;
+    reach[dst->block] = 1;
+    stack[sp++] = dst->block;
+    while (sp) {
+      Block *b = &f->blocks[stack[--sp]];
+      for (uint32_t s = 0; s < b->nsuccs; s++) {
+        uint32_t t = b->succs[s].target;
+        if (t == src->block || reach[t]) continue;
+        reach[t] = 1;
+        stack[sp++] = t;
+      }
+    }
+    for (uint32_t u = 0; u < nuse; u++)
+      if (use[u].obj == flow[k].src && reach[use[u].block]) {
+        es_escape(src, ESW_REUSED);
+        es_escape(dst, ESW_REUSED);
+        break;
       }
   }
 
-  for (uint32_t v = 0; v < n; v++) {
-    if (st[v] != CAND) continue;
-    if (rd[v] && (mut[v] || keep[v])) { st[v] = ESCAPED; continue; }
-    if (!rd[v]) continue;
-    Ref *args = ir_args(f, v);
-    (void)args;
-
-    for (uint32_t oi = 0; oi < f->norder && st[v] == CAND; oi++) {
-      Block *b = &f->blocks[f->order[oi]];
-      for (uint32_t i = 0; i < b->ninsts; i++) {
-        Inst *g = &f->insts[b->insts[i]];
-        if (g->op != I_FIELD_GET) continue;
-        if (ir_resolve(f, ir_args(f, b->insts[i])[0]) != v) continue;
-        bool found = false;
-        for (uint32_t oj = 0; oj < f->norder && !found; oj++) {
-          Block *sb = &f->blocks[f->order[oj]];
-          for (uint32_t k = 0; k < sb->ninsts; k++) {
-            Inst *s2 = &f->insts[sb->insts[k]];
-            if (s2->op == I_FIELD_SET && (s2->imm2 & GCF_INIT) &&
-                s2->imm == g->imm &&
-                ir_resolve(f, ir_args(f, sb->insts[k])[0]) == v) {
-              found = true;
-              break;
-            }
-          }
+  /* Liveness, and the parameters it asks for; an escape anywhere spreads to
+     everything it merges with, and asks the question again. */
+  uint8_t *live = xmalloc(nb ? nb : 1);
+  uint8_t *needp = xcalloc((size_t)(nb ? nb : 1) * nobj, 1);
+  for (bool again = true; again;) {
+    again = false;
+    for (bool spread = true; spread;) {
+      spread = false;
+      for (uint32_t k = 0; k < nflow; k++) {
+        EsObj *src = &obj[flow[k].src], *dst = &obj[flow[k].dst];
+        if (src->escaped != dst->escaped) {
+          es_escape(src, ESW_MERGED);
+          es_escape(dst, ESW_MERGED);
+          spread = true;
         }
-        if (!found && (ValType)g->type == VT_V128) { st[v] = ESCAPED; break; }
+      }
+    }
+    for (uint32_t c = 0; c < nobj; c++) {
+      EsObj *o = &obj[c];
+      memset(&needp[(size_t)c * nb], 0, nb);
+      if (o->escaped || !o->nvars) continue;
+      memset(live, 0, nb);
+      uint32_t sp = 0;
+      for (uint32_t u = 0; u < nuse; u++)
+        if (use[u].obj == c && use[u].block != o->block && !live[use[u].block]) {
+          live[use[u].block] = 1;
+          stack[sp++] = use[u].block;
+        }
+      while (sp) {
+        uint32_t bi = stack[--sp];
+        for (uint32_t k = ei.off[bi]; k < ei.off[bi + 1]; k++) {
+          uint32_t pb = ei.src[k];
+          if (!f->blocks[pb].reachable || pb == o->block || live[pb]) continue;
+          live[pb] = 1;
+          stack[sp++] = pb;
+        }
+      }
+      if (live[f->entry]) { es_escape(o, ESW_PAD); again = true; continue; }
+      for (uint32_t bi = 0; bi < nb && !o->escaped; bi++) {
+        if (!live[bi] || bi == o->block) continue;
+        uint32_t first = UINT32_MAX;
+        bool merge = false, eh = false;
+        for (uint32_t k = ei.off[bi]; k < ei.off[bi + 1]; k++) {
+          Block *sb = &f->blocks[ei.src[k]];
+          if (!sb->reachable) continue;
+          if (sb->succs[ei.si[k]].eh) eh = true;
+          if (first == UINT32_MAX) first = ei.src[k];
+          else if (first != ei.src[k]) merge = true;
+        }
+        if (f->blocks[bi].is_pad || eh) { es_escape(o, ESW_PAD); again = true; }
+        else if (merge) needp[(size_t)c * nb + bi] = 1;
       }
     }
   }
+
+  uint32_t V = 0;
+  for (uint32_t c = 0; c < nobj; c++) {
+    EsObj *o = &obj[c];
+    if (o->escaped) continue;
+    if (V + o->nvars > ESC_MAX_VARS || (uint64_t)(V + o->nvars) * nb > ESC_MAX_CELLS) {
+      es_escape(o, ESW_BUDGET);
+      continue;
+    }
+    o->var0 = V;
+    V += o->nvars;
+  }
+  /* a budget refusal can strand what merges with it */
+  for (bool spread = true; spread;) {
+    spread = false;
+    for (uint32_t k = 0; k < nflow; k++) {
+      EsObj *src = &obj[flow[k].src], *dst = &obj[flow[k].dst];
+      if (src->escaped != dst->escaped) {
+        es_escape(src, ESW_MERGED);
+        es_escape(dst, ESW_MERGED);
+        spread = true;
+      }
+    }
+  }
+
+  bool any = false;
+  for (uint32_t c = 0; c < nobj; c++) if (!obj[c].escaped) any = true;
+
+  if (dbg)
+    for (uint32_t c = 0; c < nobj; c++) {
+      EsObj *o = &obj[c];
+      const char *kind = o->phi ? "merge" : o->kind == ESK_STRUCT ? "struct" : "array";
+      fprintf(stderr, "escape %s v%u %s d%u: ", m->funcs[f->func_index].sym,
+              o->def, kind, f->blocks[o->block].loop_depth);
+      if (!o->escaped) fprintf(stderr, "replaced\n");
+      else if (o->why >= ESW_OP) fprintf(stderr, "escapes: use by %s\n", ir_op_name(o->why - ESW_OP));
+      else fprintf(stderr, "escapes: %s\n", es_why(o->why));
+    }
 
   bool changed = false;
-  typedef struct { Ref get; Ref val; ValType zt; } EaFwd;
-  EaFwd *fwd = xmalloc((n ? n : 1) * sizeof(EaFwd));
-  uint32_t nfwd = 0;
-  for (uint32_t oi = 0; oi < f->norder; oi++) {
-    Block *b = &f->blocks[f->order[oi]];
-    for (uint32_t i = 0; i < b->ninsts; i++) {
-      Ref u = b->insts[i];
-      Inst *in = &f->insts[u];
-      if (in->op != I_FIELD_GET) continue;
-      Ref obj = ir_resolve(f, ir_args(f, u)[0]);
-      if (obj >= n || st[obj] != CAND || !rd[obj]) continue;
-      Ref val = REF_NONE;
-      for (uint32_t oj = 0; oj < f->norder && val == REF_NONE; oj++) {
-        Block *sb = &f->blocks[f->order[oj]];
-        for (uint32_t k = 0; k < sb->ninsts; k++) {
-          Inst *s2 = &f->insts[sb->insts[k]];
-          if (s2->op == I_FIELD_SET && (s2->imm2 & GCF_INIT) &&
-              s2->imm == in->imm &&
-              ir_resolve(f, ir_args(f, sb->insts[k])[0]) == obj) {
-            val = ir_resolve(f, ir_args(f, sb->insts[k])[1]);
+  if (any) {
+    /* The constants the walk needs, at the top of the entry block.  Every
+       zero it can want is made here, before it starts: one made during it
+       would land at the top of the entry block, under the walk's feet. */
+    Ref *zero_cache = NULL; ValType *zero_type = NULL; uint32_t nzero = 0;
+#define ES_ZERO(t_, out_) do { ValType tt_ = (t_); Ref zz_ = REF_NONE; \
+      for (uint32_t z_ = 0; z_ < nzero; z_++) if (zero_type[z_] == tt_) zz_ = zero_cache[z_]; \
+      if (zz_ == REF_NONE) { zz_ = es_entry_const(f, tt_, 0, 0); \
+        zero_cache = xrealloc(zero_cache, (nzero + 1) * sizeof *zero_cache); \
+        zero_type = xrealloc(zero_type, (nzero + 1) * sizeof *zero_type); \
+        zero_type[nzero] = tt_; zero_cache[nzero++] = zz_; } \
+      (out_) = zz_; } while (0)
+    Ref mask8 = es_entry_const(f, VT_I32, 0xff, 0);
+    Ref mask16 = es_entry_const(f, VT_I32, 0xffff, 0);
+
+    ValType *vtype = xmalloc((V ? V : 1) * sizeof(ValType));
+    for (uint32_t c = 0; c < nobj; c++)
+      if (!obj[c].escaped)
+        for (uint32_t k = 0; k < obj[c].nvars; k++)
+          vtype[obj[c].var0 + k] = es_var_type(m, &obj[c], k);
+    for (uint32_t k = 0; k < V; k++) {
+      bool used = false;
+      for (uint32_t c = 0; c < nobj && !used; c++)
+        used = !obj[c].escaped && k >= obj[c].var0 && k < obj[c].var0 + obj[c].nvars;
+      if (used) { Ref z; ES_ZERO(vtype[k], z); (void)z; }
+    }
+
+    /* The fields' parameters: a merge's own at its block, and one at each
+       merge block a field is live into. */
+    size_t cells = (size_t)nb * (V ? V : 1);
+    Ref *pref = xmalloc(cells * sizeof(Ref));
+    Ref *outv = xmalloc(cells * sizeof(Ref));
+    for (size_t x = 0; x < cells; x++) { pref[x] = REF_NONE; outv[x] = REF_NONE; }
+    uint32_t *nparams0 = xmalloc((nb ? nb : 1) * sizeof(uint32_t));
+    for (uint32_t bi = 0; bi < nb; bi++) nparams0[bi] = f->blocks[bi].nparams;
+    uint32_t pv_base = f->ninsts;
+    for (uint32_t c = 0; c < nobj; c++) {
+      EsObj *o = &obj[c];
+      if (o->escaped) continue;
+      for (uint32_t bi = 0; bi < nb; bi++) {
+        if (!(o->phi && bi == o->block) && !needp[(size_t)c * nb + bi]) continue;
+        for (uint32_t k = 0; k < o->nvars; k++)
+          pref[(size_t)bi * V + o->var0 + k] = ir_add_param(f, bi, vtype[o->var0 + k]);
+      }
+    }
+    uint32_t npv = f->ninsts - pv_base;
+    uint32_t *pvar = xmalloc((npv ? npv : 1) * sizeof(uint32_t));
+    for (uint32_t bi = 0; bi < nb; bi++)
+      for (uint32_t k = 0; k < V; k++) {
+        Ref r = pref[(size_t)bi * V + k];
+        if (r != REF_NONE) pvar[r - pv_base] = k;
+      }
+
+    Ref *cur = xmalloc((V ? V : 1) * sizeof(Ref));
+    uint8_t *done = xcalloc(nb ? nb : 1, 1);
+    uint32_t forwarded = 0;
+    for (uint32_t oi = 0; oi < f->norder; oi++) {
+      uint32_t bi = f->order[oi];
+      Block *b = &f->blocks[bi];
+      uint32_t single = UINT32_MAX;
+      bool merge = false;
+      for (uint32_t k = ei.off[bi]; k < ei.off[bi + 1]; k++) {
+        if (!f->blocks[ei.src[k]].reachable) continue;
+        if (single == UINT32_MAX) single = ei.src[k];
+        else if (single != ei.src[k]) merge = true;
+      }
+      for (uint32_t k = 0; k < V; k++) {
+        Ref p = pref[(size_t)bi * V + k];
+        cur[k] = p != REF_NONE ? p
+               : (!merge && single != UINT32_MAX && done[single])
+                   ? outv[(size_t)single * V + k] : REF_NONE;
+      }
+      for (uint32_t i = 0; i < b->ninsts; i++) {
+        Ref v = b->insts[i];
+        Inst *in = &f->insts[v];
+        Ref *a = ir_args(f, v);
+        int32_t self = OWN(v);
+        if (self >= 0 && obj[self].def == v && !obj[self].escaped) {
+          EsObj *o = &obj[self];
+          for (uint32_t k = 0; k < o->nvars; k++) {
+            Ref z;
+            if (o->fill != REF_NONE) z = o->fill;
+            else ES_ZERO(vtype[o->var0 + k], z);
+            cur[o->var0 + k] = z;
+          }
+          continue;
+        }
+        int32_t c = in->nargs ? OWN(ir_resolve(f, a[0])) : -1;
+        if (in->op == I_EQ || in->op == I_NE) {
+          int32_t c1 = in->nargs == 2 ? OWN(ir_resolve(f, a[1])) : -1;
+          bool live0 = c >= 0 && !obj[c].escaped, live1 = c1 >= 0 && !obj[c1].escaped;
+          if (live0 || live1) {
+            bool same = c == c1;
+            replace_with_const(f, v, (in->op == I_EQ) == same ? 1 : 0);
+          }
+          continue;
+        }
+        if (c < 0 || obj[c].escaped) continue;
+        EsObj *o = &obj[c];
+        switch (in->op) {
+          case I_FIELD_GET: case I_ARRAY_GET: {
+            uint32_t k = in->op == I_FIELD_GET
+                       ? gc_field_of_offset(m, vt_ref(false, (HeapType)o->ti), in->imm)
+                       : es_elem_index(f, o, a[1]);
+            Ref val = ir_resolve(f, cur[o->var0 + k]);
+            if (val == REF_NONE)
+              warmc_fatal("internal: escape reads an unset field of v%u in %s",
+                          o->def, m->funcs[f->func_index].sym);
+            ValType st = es_storage(m, o, k);
+            if (st == VT_I8 || st == VT_I16) {
+              Ref nv;
+              if (in->imm2 & GCF_SIGNED)
+                nv = ir_emit(f, bi, st == VT_I8 ? I_EXT8S : I_EXT16S, VT_I32,
+                             &val, 1, 0, 0);
+              else {
+                Ref aa[2] = { val, st == VT_I8 ? mask8 : mask16 };
+                nv = ir_emit(f, bi, I_AND, VT_I32, aa, 2, 0, 0);
+              }
+              b = &f->blocks[bi];
+              es_move_last_to(f, bi, i);
+              i++;
+              val = nv;
+            }
+            in = &f->insts[v];
+            ir_replace(f, v, val);
+            in->op = I_NOP;
+            in->nargs = 0;
+            forwarded++;
             break;
           }
+          case I_FIELD_SET: case I_ARRAY_SET: {
+            uint32_t k = in->op == I_FIELD_SET
+                       ? gc_field_of_offset(m, vt_ref(false, (HeapType)o->ti), in->imm)
+                       : es_elem_index(f, o, a[1]);
+            cur[o->var0 + k] = ir_resolve(f, a[in->op == I_FIELD_SET ? 1 : 2]);
+            in->op = I_NOP;
+            in->nargs = 0;
+            break;
+          }
+          case I_ARRAY_LEN: replace_with_const(f, v, o->len); break;
+          case I_REF_IS_NULL: replace_with_const(f, v, 0); break;
+          case I_REF_TEST:
+            replace_with_const(f, v, (uint64_t)es_ref_test(m, o->ti, in->imm, in->imm2));
+            break;
+          case I_TRAP_IF: in->op = I_NOP; in->nargs = 0; break;
+          default: break;
         }
       }
-      fwd[nfwd++] = (EaFwd){ u, val, (ValType)in->type };
+      for (uint32_t k = 0; k < V; k++) outv[(size_t)bi * V + k] = cur[k];
+      done[bi] = 1;
     }
-  }
-  for (uint32_t i = 0; i < nfwd; i++) {
-    Ref val = fwd[i].val;
-    if (val == REF_NONE) {
 
-      val = ir_const(f, f->entry, fwd[i].zt, 0);
-      Block *eb = &f->blocks[f->entry];
-      if (eb->ninsts > 1) {
-        memmove(&eb->insts[1], &eb->insts[0],
-                (eb->ninsts - 1) * sizeof(uint32_t));
-        eb->insts[0] = val;
+    /* Arguments for the new parameters, on every edge into their blocks. */
+    for (uint32_t bi = 0; bi < nb; bi++) {
+      Block *b = &f->blocks[bi];
+      for (uint32_t s = 0; s < b->nsuccs; s++) {
+        Edge *e = &b->succs[s];
+        uint32_t t = e->target;
+        Block *tb = &f->blocks[t];
+        for (uint32_t j = nparams0[t]; j < tb->nparams; j++) {
+          uint32_t k = pvar[tb->params[j] - pv_base];
+          Ref val = REF_NONE;
+          for (uint32_t c = 0; c < nobj; c++) {
+            EsObj *o = &obj[c];
+            if (o->escaped || k < o->var0 || k >= o->var0 + o->nvars) continue;
+            if (o->phi && o->block == t) {
+              /* the merge's own field: whichever object came along this edge */
+              uint32_t pj = 0;
+              while (pj < nparams0[t] && tb->params[pj] != o->def) pj++;
+              int32_t sc = pj < nparams0[t] && pj < e->nargs
+                         ? OWN(ir_resolve(f, e->args[pj])) : -1;
+              if (sc >= 0 && done[bi])
+                val = outv[(size_t)bi * V + obj[sc].var0 + (k - o->var0)];
+            } else if (done[bi]) {
+              val = outv[(size_t)bi * V + k];
+            }
+            break;
+          }
+          if (val == REF_NONE) ES_ZERO(vtype[k], val);
+          edge_push_arg_at(f, bi, s, ir_resolve(f, val));
+        }
       }
     }
-    ir_replace(f, fwd[i].get, val);
-    f->insts[fwd[i].get].op = I_NOP;
-    f->insts[fwd[i].get].nargs = 0;
-    g_stats.escape_forwarded++;
+
+    /* The objects go: their aliases' parameters and their arguments, then
+       the allocations and conversions themselves. */
+    for (uint32_t bi = 0; bi < nb; bi++) {
+      Block *b = &f->blocks[bi];
+      for (uint32_t p = 0; p < b->nparams;) {
+        Ref P = b->params[p];
+        if (P >= n || OWN(P) < 0 || obj[OWN(P)].escaped) { p++; continue; }
+        for (uint32_t j = p; j + 1 < b->nparams; j++) b->params[j] = b->params[j + 1];
+        b->nparams--;
+        for (uint32_t k = ei.off[bi]; k < ei.off[bi + 1]; k++) {
+          Edge *e = &f->blocks[ei.src[k]].succs[ei.si[k]];
+          for (uint32_t j = p; j + 1 < e->nargs; j++) e->args[j] = e->args[j + 1];
+          if (e->nargs > p) e->nargs--;
+        }
+        f->insts[P].op = I_NOP;
+        f->insts[P].nargs = 0;
+      }
+    }
+    uint32_t removed = 0;
+    for (uint32_t v = 0; v < n; v++) {
+      if (own[v] < 0 || obj[own[v]].escaped) continue;
+      Inst *in = &f->insts[v];
+      if (in->op == I_STRUCT_NEW || in->op == I_ARRAY_NEW) removed++;
+      if (in->op != I_PARAM) { in->op = I_NOP; in->nargs = 0; in->type = 0; }
+    }
+    ir_apply_subst(f);
+
+    /* Nothing that can run may still name what went. */
+    for (uint32_t oi = 0; oi < f->norder; oi++) {
+      uint32_t bi = f->order[oi];
+      Block *b = &f->blocks[bi];
+      for (uint32_t i = 0; i < b->ninsts; i++) {
+        Inst *in = &f->insts[b->insts[i]];
+        Ref *a = ir_args(f, b->insts[i]);
+        for (uint32_t j = 0; j < in->nargs; j++)
+          if (a[j] < n && own[a[j]] >= 0 && !obj[own[a[j]]].escaped)
+            warmc_fatal("internal: escape left v%u using v%u in %s",
+                        b->insts[i], a[j], m->funcs[f->func_index].sym);
+      }
+      for (uint32_t s = 0; s < b->nsuccs; s++)
+        for (uint32_t j = 0; j < b->succs[s].nargs; j++) {
+          Ref r = b->succs[s].args[j];
+          if (r < n && own[r] >= 0 && !obj[own[r]].escaped)
+            warmc_fatal("internal: escape left an edge b%u->b%u passing v%u in %s",
+                        bi, b->succs[s].target, r, m->funcs[f->func_index].sym);
+        }
+      if ((b->term == T_BRIF || b->term == T_BRTABLE) && b->term_arg < n &&
+          own[b->term_arg] >= 0 && !obj[own[b->term_arg]].escaped)
+        warmc_fatal("internal: escape left b%u branching on v%u", bi, b->term_arg);
+      for (uint32_t i = 0; i < b->nret; i++)
+        if (b->ret_args[i] < n && own[b->ret_args[i]] >= 0 &&
+            !obj[own[b->ret_args[i]]].escaped)
+          warmc_fatal("internal: escape left b%u returning v%u", bi, b->ret_args[i]);
+    }
+
+    g_stats.escape_removed += removed;
+    g_stats.escape_forwarded += forwarded;
     changed = true;
+#undef ES_ZERO
+    xfree(vtype); xfree(pref); xfree(outv); xfree(nparams0); xfree(pvar);
+    xfree(cur); xfree(done); xfree(zero_cache); xfree(zero_type);
   }
-  xfree(fwd);
-  for (uint32_t oi = 0; oi < f->norder; oi++) {
-    Block *b = &f->blocks[f->order[oi]];
-    for (uint32_t i = 0; i < b->ninsts; i++) {
-      Ref u = b->insts[i];
-      Inst *in = &f->insts[u];
-      if (in->op == I_FIELD_SET ||
-          (in->op == I_TRAP_IF && in->imm == TRAP_NULL_REF && in->nargs == 1)) {
-        Ref obj = ir_resolve(f, ir_args(f, u)[0]);
-        if (obj < n && st[obj] == CAND) { in->op = I_NOP; in->nargs = 0; changed = true; }
-        continue;
-      }
-      if ((in->op == I_STRUCT_NEW || in->op == I_ARRAY_NEW) && st[u] == CAND) {
-        in->op = I_NOP;
-        in->nargs = 0;
-        in->type = 0;
-        g_stats.escape_removed++;
-        changed = true;
-      }
-    }
-  }
-  if (changed) ir_apply_subst(f);
-  xfree(st); xfree(mut); xfree(rd); xfree(keep);
+
+#undef ES_ADD
+#undef OWN
+#undef ES_USE
+  ir_edge_index_free(&ei);
+  xfree(own); xfree(obj); xfree(forg); xfree(flow); xfree(use);
+  xfree(reach); xfree(stack); xfree(live); xfree(needp);
   return changed;
 }
 
