@@ -958,8 +958,13 @@ static uint64_t struct_total_bytes(const CompType *t) {
   return tot < 16 ? 16 : tot;
 }
 
+/* An array allocation's shape: header bytes over the element stride.  The
+   stride is the element's width, as the type descriptor has it -- not
+   body_size, which is a struct's payload and 0 for every array, and which
+   left the inline allocation, labcache and escape all reading "no stride"
+   and refusing every array. */
 static uint64_t array_shape_imm(const CompType *t) {
-  return ((uint64_t)t->hdr_size << 8) | t->body_size;
+  return ((uint64_t)t->hdr_size << 8) | vt_width(t->fields[0].type);
 }
 
 static uint64_t gc_access_flags(Bld *b, Ref r, ValType field, bool signed_) {
