@@ -776,7 +776,11 @@ static u64 via_stream(WarmInstance *vm, u64 self, u64 offset, u64 ret,
   Desc *d = desc_of(self);
   /* A directory has no stream, and wasmtime says so here rather than at the
      first read: the difference is visible to a guest, which gets a stream it
-     can only fail on instead of an error it can branch on. */
+     can only fail on instead of an error it can branch on.  The code is
+     is-directory, what the kernel says for a read of one and what wasmtime
+     answers since 49 (before that it said bad-descriptor); rustc's std turns
+     it into ErrorKind::IsADirectory.  descriptor.read keeps bad-descriptor,
+     which is still wasmtime's answer there. */
   {
     u8 st[ST_SIZE];
     if (fstat(d->fd, st) < 0) {
@@ -784,7 +788,7 @@ static u64 via_stream(WarmInstance *vm, u64 self, u64 offset, u64 ret,
       return 0;
     }
     if (wasifs_filetype(st) == FT_DIR) {
-      res_err(vm, ret, 4, EC_BADF);
+      res_err(vm, ret, 4, EC_ISDIR);
       return 0;
     }
   }
