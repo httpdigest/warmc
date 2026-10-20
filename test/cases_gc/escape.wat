@@ -309,6 +309,149 @@
         (br $l)))
     (call $want (local.get $s) (local.get $exp)))
 
+  ;; ---- partial: made only where they escape -----------------------------
+  ;;
+  ;; The `pe_` objects escape on some paths only.  run_gc.sh wants an object
+  ;; in each of these functions made at its escape points, and nothing else
+  ;; left standing but those made objects themselves, which escape on every
+  ;; path.
+
+  ;; Handed to an unseen function on one iteration in seven.
+  (func (export "pe_rare_call") (param $n i32) (param $slot i32) (param $exp i64)
+    (local $i i32) (local $s i64) (local $b (ref $box))
+    (block $done
+      (loop $l
+        (br_if $done (i32.ge_s (local.get $i) (local.get $n)))
+        (local.set $b (struct.new $box (i64.extend_i32_s (local.get $i))))
+        (struct.set $box $v (local.get $b) (i64.mul (struct.get $box $v (local.get $b)) (i64.const 3)))
+        (if (i32.eq (i32.rem_u (local.get $i) (i32.const 7)) (i32.const 6))
+          (then (local.set $s (i64.add (local.get $s)
+                  (call_indirect $fns (type $take_t) (local.get $b) (local.get $slot)))))
+          (else (local.set $s (i64.add (local.get $s) (struct.get $box $v (local.get $b))))))
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br $l)))
+    (call $want (local.get $s) (local.get $exp)))
+
+  ;; Returned when found: the misses allocate nothing.
+  (func $pe_find (export "pe_find") (param $n i32) (param $k i64) (result (ref null $pt))
+    (local $i i32) (local $p (ref $pt))
+    (block $done
+      (loop $l
+        (br_if $done (i32.ge_s (local.get $i) (local.get $n)))
+        (local.set $p (struct.new $pt (i64.extend_i32_s (local.get $i))
+                                      (i64.mul (i64.extend_i32_s (local.get $i))
+                                               (i64.extend_i32_s (local.get $i)))))
+        (if (i64.eq (struct.get $pt $y (local.get $p)) (local.get $k))
+          (then (return (local.get $p))))
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br $l)))
+    (ref.null $pt))
+
+  (func (export "pe_found") (param $n i32) (param $k i64) (param $exp i64)
+    (local $r (ref null $pt))
+    (local.set $r (call $pe_find (local.get $n) (local.get $k)))
+    (call $want (if (result i64) (ref.is_null (local.get $r))
+                  (then (i64.const -1))
+                  (else (i64.add (i64.mul (struct.get $pt $x (local.get $r)) (i64.const 1000))
+                                 (struct.get $pt $y (local.get $r)))))
+                (local.get $exp)))
+
+  ;; Kept in a global only when it beats the best so far.
+  (func (export "pe_best") (param $n i32) (param $exp i64)
+    (local $i i32) (local $best i64) (local $p (ref $pt))
+    (global.set $sink (ref.null any))
+    (local.set $best (i64.const -1))
+    (block $done
+      (loop $l
+        (br_if $done (i32.ge_s (local.get $i) (local.get $n)))
+        (local.set $p (struct.new $pt (i64.extend_i32_s (local.get $i))
+          (i64.rem_u (i64.mul (i64.extend_i32_s (local.get $i)) (i64.const 7919)) (i64.const 101))))
+        (if (i64.gt_s (struct.get $pt $y (local.get $p)) (local.get $best))
+          (then (local.set $best (struct.get $pt $y (local.get $p)))
+                (global.set $sink (local.get $p))))
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br $l)))
+    (call $want (i64.add (i64.mul (struct.get $pt $x (ref.cast (ref $pt) (global.get $sink)))
+                                  (i64.const 1000))
+                         (local.get $best))
+                (local.get $exp)))
+
+  ;; Made with its elements as they stand, the zero one left to the
+  ;; allocation.
+  (func (export "pe_array") (param $c i32) (param $exp i64)
+    (local $a (ref $ai64)) (local $g (ref $ai64))
+    (local.set $a (array.new_fixed $ai64 4 (i64.const 5) (i64.const 0) (i64.const 7) (i64.const 0)))
+    (array.set $ai64 (local.get $a) (i32.const 1) (i64.const 6))
+    (if (local.get $c)
+      (then
+        (global.set $sink (local.get $a))
+        (local.set $g (ref.cast (ref $ai64) (global.get $sink)))
+        (call $want (i64.mul (i64.add (i64.add (array.get $ai64 (local.get $g) (i32.const 0))
+                                               (array.get $ai64 (local.get $g) (i32.const 1)))
+                                      (i64.add (array.get $ai64 (local.get $g) (i32.const 2))
+                                               (array.get $ai64 (local.get $g) (i32.const 3))))
+                             (i64.const 10))
+                    (local.get $exp)))
+      (else
+        (call $want (i64.add (array.get $ai64 (local.get $a) (i32.const 0))
+                             (array.get $ai64 (local.get $a) (i32.const 1)))
+                    (local.get $exp)))))
+
+  ;; Packed fields are stored at their width.
+  (func $pk_sum (param $g (ref $packed)) (result i64)
+    (i64.add (i64.mul (i64.extend_i32_s (struct.get_s $packed $b (local.get $g))) (i64.const 100000))
+             (i64.extend_i32_u (struct.get_u $packed $h (local.get $g)))))
+
+  (func (export "pe_packed") (param $c i32) (param $exp i64)
+    (local $p (ref $packed))
+    (local.set $p (struct.new $packed (i32.const -3) (i32.const 1000)))
+    (struct.set $packed $b (local.get $p) (i32.add (struct.get_s $packed $b (local.get $p)) (i32.const 1)))
+    (if (local.get $c)
+      (then (global.set $sink (local.get $p))
+            (call $want (call $pk_sum (ref.cast (ref $packed) (global.get $sink))) (local.get $exp)))
+      (else (call $want (call $pk_sum (local.get $p)) (local.get $exp)))))
+
+  ;; A merge of two objects, written, then handed over on one path.
+  (func (export "pe_merge") (param $c i32) (param $d i32) (param $exp i64)
+    (local $p (ref $pt))
+    (local.set $p (if (result (ref $pt)) (local.get $c)
+      (then (struct.new $pt (i64.const 1) (i64.const 2)))
+      (else (struct.new $pt (i64.const 3) (i64.const 4)))))
+    (struct.set $pt $x (local.get $p) (i64.add (struct.get $pt $x (local.get $p)) (i64.const 10)))
+    (if (local.get $d)
+      (then (global.set $sink (local.get $p))
+            (call $want (i64.add (struct.get $pt $x (ref.cast (ref $pt) (global.get $sink))) (i64.const 100))
+                        (local.get $exp)))
+      (else (call $want (struct.get $pt $x (local.get $p)) (local.get $exp)))))
+
+  ;; Handed to a block result that may be null, so not an object, by a
+  ;; br_if: the escape is the taken edge alone, split to make it on.
+  (func (export "pe_edge") (param $c i32) (param $exp i64)
+    (local $p (ref $box)) (local $r (ref null $box))
+    (local.set $p (struct.new $box (i64.const 3)))
+    (struct.set $box $v (local.get $p) (i64.mul (struct.get $box $v (local.get $p)) (i64.const 5)))
+    (local.set $r (block $out (result (ref null $box))
+      (drop (br_if $out (local.get $p) (local.get $c)))
+      (call $want (struct.get $box $v (local.get $p)) (i64.const 15))
+      (ref.null $box)))
+    (call $want (if (result i64) (ref.is_null (local.get $r))
+                  (then (i64.const -1))
+                  (else (struct.get $box $v (ref.as_non_null (local.get $r)))))
+                (local.get $exp)))
+
+  ;; Stored into an object that is itself replaced: made where it is
+  ;; stored, and the holder's field is what was made.
+  (func (export "pe_nested") (param $c i32) (param $exp i64)
+    (local $h (ref $holder)) (local $b (ref $box))
+    (local.set $b (struct.new $box (i64.const 7)))
+    (struct.set $box $v (local.get $b) (i64.add (struct.get $box $v (local.get $b)) (i64.const 1)))
+    (local.set $h (struct.new $holder (ref.null any)))
+    (if (local.get $c) (then (struct.set $holder $r (local.get $h) (local.get $b))))
+    (call $want (if (result i64) (ref.is_null (struct.get $holder $r (local.get $h)))
+                  (then (i64.const -1))
+                  (else (struct.get $box $v (ref.cast (ref $box) (struct.get $holder $r (local.get $h))))))
+                (local.get $exp)))
+
   ;; ---- refused, and still right -----------------------------------------
 
   ;; A box stored in a holder's field.  The holder goes first, and with it
@@ -387,4 +530,53 @@
         (br $l)))
     (struct.set $box $v (local.get $a) (i64.const 100))
     (call $want (struct.get $box $v (local.get $b)) (local.get $exp)))
+
+  ;; Written after it escapes: the write has to land in what escaped.
+  (func (export "keep_escape_write") (param $c i32) (param $exp i64)
+    (local $b (ref $box))
+    (global.set $sink (ref.null any))
+    (local.set $b (struct.new $box (i64.const 2)))
+    (struct.set $box $v (local.get $b) (i64.const 3))
+    (if (local.get $c) (then (global.set $sink (local.get $b))))
+    (struct.set $box $v (local.get $b) (i64.const 9))
+    (call $want (if (result i64) (local.get $c)
+                  (then (struct.get $box $v (ref.cast (ref $box) (global.get $sink))))
+                  (else (struct.get $box $v (local.get $b))))
+                (local.get $exp)))
+
+  ;; Compared after it escapes: what escaped is still it.
+  (func (export "keep_escape_identity") (param $c i32) (param $exp i64)
+    (local $b (ref $box))
+    (global.set $sink (ref.null any))
+    (local.set $b (struct.new $box (i64.const 1)))
+    (struct.set $box $v (local.get $b) (i64.const 4))
+    (if (local.get $c) (then (global.set $sink (local.get $b))))
+    (call $want (i64.extend_i32_u (ref.eq (ref.cast (ref null eq) (global.get $sink)) (local.get $b)))
+                (local.get $exp)))
+
+  ;; Handed over on every trip of a loop it was made before: one object,
+  ;; handed over again and again, not one made per trip.
+  (global $changes (mut i32) (i32.const 0))
+
+  (func $record (param $r (ref $box))
+    (if (i32.eqz (ref.is_null (global.get $sink)))
+      (then (if (i32.eqz (ref.eq (ref.cast (ref null eq) (global.get $sink)) (local.get $r)))
+              (then (global.set $changes (i32.add (global.get $changes) (i32.const 1)))))))
+    (global.set $sink (local.get $r)))
+
+  (func (export "keep_loop_escape") (param $n i32) (param $exp i64)
+    (local $b (ref $box)) (local $i i32)
+    (global.set $sink (ref.null any))
+    (global.set $changes (i32.const 0))
+    (local.set $b (struct.new $box (i64.const 0)))
+    (block $done
+      (loop $l
+        (br_if $done (i32.ge_s (local.get $i) (local.get $n)))
+        (struct.set $box $v (local.get $b) (i64.add (struct.get $box $v (local.get $b)) (i64.const 1)))
+        (call $record (local.get $b))
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br $l)))
+    (call $want (i64.add (i64.mul (i64.extend_i32_u (global.get $changes)) (i64.const 1000))
+                         (struct.get $box $v (ref.cast (ref $box) (global.get $sink))))
+                (local.get $exp)))
 )
