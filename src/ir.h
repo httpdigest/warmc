@@ -340,6 +340,7 @@ typedef struct {
   bool selftail;
   bool ldcomb;
   bool escape;
+  bool pescape;    /* partial: make an object only where it escapes */
   bool gloop;
   bool loopclose;
   bool cpool;
@@ -407,7 +408,7 @@ typedef struct {
   uint64_t loads_forwarded, stores_removed, checks_removed, inlined;
   uint64_t params_removed, strength_reduced, moves_coalesced, sunk, rotated;
   uint64_t insts_emitted, spills, reloads, vectorized, self_tail;
-  uint64_t escape_removed, escape_forwarded;
+  uint64_t escape_removed, escape_forwarded, escape_made;
   uint64_t loads_combined;
   uint64_t globals_promoted, loops_closed, globals_ssa;
   uint64_t reassoc;

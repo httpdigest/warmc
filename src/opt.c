@@ -1073,21 +1073,37 @@ static bool pass_dce(IrFunc *f) {
    every object it merges with.
 
    Exception edges carry no arguments, so an object whose fields would have
-   to be live into a landing pad stays an allocation. */
+   to be live into a landing pad stays an allocation.
+
+   Partial escape: a call, a store, a return or a parameter that is not an
+   object need not be the end of it.  Such a use is an escape point when it
+   is the object's last -- no use of it, the point's own included, can run
+   after it before the object is allocated anew -- and the object is then
+   made there, from its fields as they stand, and is scalars until then.  A
+   path that reaches no escape point allocates nothing, and no path
+   allocates more than once.  An object that every path hands over -- or
+   every path but one bound for a trap -- can still gain by being made
+   later, when its points need no edge split: what it is written and read
+   until then is SSA values, and the writes fold into its initialising
+   stores, which memopt knows alias nothing.  Short of that it keeps its
+   allocation where it was. */
 
 static void edge_push_arg_at(IrFunc *f, uint32_t from, uint32_t si, Ref v);
+static uint32_t gl_split_edge(IrFunc *f, uint32_t from, uint32_t si);
 
 #define ESC_MAX_ELEMS  32u
 #define ESC_MAX_OBJS   256u
 #define ESC_MAX_VARS   1024u
 #define ESC_MAX_CELLS  (1u << 22)
 #define ESC_DEAD_BYTES (1u << 20)
+#define ESC_MAX_POINTS 8u
 
 enum { ESK_STRUCT, ESK_ARRAY };
 
 enum {
   ESW_COND = 1, ESW_RETURN, ESW_PARAM, ESW_FOREIGN, ESW_REUSED, ESW_SHAPE,
-  ESW_PAD, ESW_BUDGET, ESW_MERGED, ESW_ELEM, ESW_SHARED, ESW_OP = 1000
+  ESW_PAD, ESW_BUDGET, ESW_MERGED, ESW_ELEM, ESW_SHARED, ESW_LATER, ESW_GAIN,
+  ESW_OP = 1000
 };
 
 typedef struct {
@@ -1098,13 +1114,20 @@ typedef struct {
   bool phi;
   bool escaped;
   bool dead_only;     /* an array too long to replace: removable unread */
+  bool benefit;       /* a use its fields answer, not just initialise */
   uint16_t why;
+  uint16_t pwhy;      /* what the first escape point is */
   uint32_t nvars, var0, len;
+  uint32_t npts;      /* escape points */
+  uint64_t shape;     /* the allocation's imm2, for making it again */
   Ref fill;           /* array.new's fill value, REF_NONE for the default */
 } EsObj;
 
 typedef struct { uint32_t obj, block; } EsUse;
 typedef struct { uint32_t src, dst; } EsFlow;
+/* An escape point: an instruction; with inst REF_NONE, the block's end;
+   and with succ set too, that edge alone, which is split to make room. */
+typedef struct { uint32_t obj, block; Ref inst; uint32_t succ; } EsPt;
 
 static const char *es_why(uint16_t w) {
   switch (w) {
@@ -1119,6 +1142,7 @@ static const char *es_why(uint16_t w) {
     case ESW_MERGED: return "merged with an object that escapes";
     case ESW_ELEM: return "an element at an index that is not a constant in range";
     case ESW_SHARED: return "handed to two merges on one edge";
+    case ESW_LATER: return "used again after it escapes";
     default: return "?";
   }
 }
@@ -1207,7 +1231,99 @@ static uint32_t es_elem_index(IrFunc *f, const EsObj *o, Ref idx) {
   return k < o->len ? (uint32_t)k : UINT32_MAX;
 }
 
-static bool pass_escape(IrFunc *f) {
+/* Whether argument j of v is a use the object's fields can stand in for.
+   *elem: an element access at an index this cannot place, which no
+   escape point can rescue either. */
+static bool es_use_local(IrFunc *f, const EsObj *o, Ref v, uint32_t j, bool *elem) {
+  Module *m = f->m;
+  Inst *in = &f->insts[v];
+  Ref *a = ir_args(f, v);
+  *elem = false;
+  switch (in->op) {
+    case I_FIELD_GET: case I_FIELD_SET:
+      return j == 0 && o->kind == ESK_STRUCT &&
+             gc_field_of_offset(m, vt_ref(false, (HeapType)o->ti), in->imm) != UINT32_MAX;
+    case I_ARRAY_GET: case I_ARRAY_SET:
+      if (j != 0 || o->kind != ESK_ARRAY) return false;
+      *elem = o->dead_only || es_elem_index(f, o, a[1]) == UINT32_MAX;
+      return true;
+    case I_ARRAY_LEN: return j == 0 && o->kind == ESK_ARRAY;
+    case I_TRAP_IF: return in->imm == TRAP_NULL_REF && in->nargs == 1;
+    case I_REF_IS_NULL: case I_REF_CONVERT: return true;
+    case I_REF_TEST: return es_ref_test(m, o->ti, in->imm, in->imm2) >= 0;
+    case I_EQ: case I_NE: return in->nargs == 2;
+    default: return false;
+  }
+}
+
+static void es_point(EsObj *o, EsPt **pt, uint32_t *npt, uint32_t *cpt,
+                     uint32_t c, uint32_t bi, Ref v, uint32_t succ, uint16_t why) {
+  if (!o->npts) o->pwhy = why;
+  if (o->npts > ESC_MAX_POINTS) { o->npts++; return; }   /* refused anyway */
+  for (uint32_t k = *npt; k > 0; k--) {
+    EsPt *p = &(*pt)[k - 1];
+    if (p->obj == c && p->block == bi && p->inst == v && p->succ == succ) return;
+  }
+  if (*npt == *cpt) {
+    *cpt = *cpt ? 2 * *cpt : 16;
+    *pt = xrealloc(*pt, *cpt * sizeof **pt);
+  }
+  (*pt)[(*npt)++] = (EsPt){ c, bi, v, succ };
+  o->npts++;
+}
+
+/* An edge out of a block that goes elsewhere too has an escape point of
+   its own, not the block's end, which every way out would pass. */
+static bool es_edge_alone(const Block *b) {
+  uint32_t k = 0;
+  for (uint32_t s = 0; s < b->nsuccs; s++) if (!b->succs[s].eh) k++;
+  return k > 1;
+}
+
+/* The object made real at an escape point, at position *at of block bi:
+   the allocation, then the stores of its fields as cur has them -- those
+   still zero are the allocation's already.  *at ends past what it put. */
+static Ref es_materialize(IrFunc *f, const EsObj *o, uint32_t bi, uint32_t *at,
+                          const Ref *cur) {
+  Module *m = f->m;
+  const CompType *t = &m->types[o->ti];
+  ValType rt = vt_ref(false, (HeapType)o->ti);
+  Ref r;
+  if (o->kind == ESK_STRUCT) {
+    r = ir_emit(f, bi, I_STRUCT_NEW, rt, NULL, 0, o->ti, o->shape);
+  } else {
+    Ref len = ir_const(f, bi, VT_I32, o->len);
+    es_move_last_to(f, bi, (*at)++);
+    r = ir_emit(f, bi, I_ARRAY_NEW, rt, &len, 1, o->ti, o->shape);
+  }
+  es_move_last_to(f, bi, (*at)++);
+  for (uint32_t k = 0; k < o->nvars; k++) {
+    Ref val = ir_resolve(f, cur[o->var0 + k]);
+    if (val == REF_NONE)
+      warmc_fatal("internal: escape makes v%u with an unset field in %s",
+                  o->def, m->funcs[f->func_index].sym);
+    Inst *vi = &f->insts[val];
+    if (vi->op == I_CONST && vi->imm == 0 && vi->imm2 == 0) continue;
+    /* an initialising store, as ir_build makes one: log2 of the width */
+    uint32_t w = vt_width(es_storage(m, o, k));
+    uint64_t fl = 0;
+    while ((1u << fl) < w) fl++;
+    fl |= GCF_INIT;
+    if (o->kind == ESK_STRUCT) {
+      Ref sa[2] = { r, val };
+      ir_emit(f, bi, I_FIELD_SET, 0, sa, 2, t->hdr_size + t->fields[k].offset, fl);
+    } else {
+      Ref idx = ir_const(f, bi, VT_I32, k);
+      es_move_last_to(f, bi, (*at)++);
+      Ref sa[3] = { r, idx, val };
+      ir_emit(f, bi, I_ARRAY_SET, 0, sa, 3, o->ti, fl);
+    }
+    es_move_last_to(f, bi, (*at)++);
+  }
+  return r;
+}
+
+static bool pass_escape(IrFunc *f, bool partial) {
   uint32_t n = f->ninsts, nb = f->nblocks;
   if (!n || !f->norder) return false;
   Module *m = f->m;
@@ -1238,6 +1354,7 @@ static bool pass_escape(IrFunc *f) {
       EsObj o;
       memset(&o, 0, sizeof o);
       o.def = v; o.block = bi; o.ti = (uint32_t)in->imm; o.fill = REF_NONE;
+      o.shape = in->imm2;
       if (in->op == I_STRUCT_NEW && in->nargs == 0) {
         if (o.ti >= m->ntypes || m->types[o.ti].kind != CT_STRUCT) continue;
         o.kind = ESK_STRUCT;
@@ -1343,7 +1460,7 @@ static bool pass_escape(IrFunc *f) {
       memset(&o, 0, sizeof o);
       o.def = P; o.block = bi; o.phi = true; o.fill = REF_NONE;
       o.ti = obj[one].ti; o.kind = obj[one].kind;
-      o.len = obj[one].len; o.nvars = obj[one].nvars;
+      o.len = obj[one].len; o.nvars = obj[one].nvars; o.shape = obj[one].shape;
       own[P] = (int32_t)nobj;
       ES_ADD(o);
       /* every allocation that reaches it must have its shape */
@@ -1374,11 +1491,13 @@ static bool pass_escape(IrFunc *f) {
   xfree(org);
 
   /* What flows where.  An object meeting a parameter that is not one
-     escapes; one flowing into a merge is recorded; and an object handed to
-     two parameters on one edge, a merge among them, would be two objects
-     sharing fields -- it escapes. */
+     escapes there, at the end of the edge's block; one flowing into a merge
+     is recorded; and an object handed to two parameters on one edge, a
+     merge among them, would be two objects sharing fields -- it escapes. */
   EsFlow *flow = NULL;
   uint32_t nflow = 0, cflow = 0;
+  EsPt *pt = NULL;
+  uint32_t npt = 0, cpt = 0;
   for (uint32_t oi = 0; oi < f->norder; oi++) {
     uint32_t bi = f->order[oi];
     Block *b = &f->blocks[bi];
@@ -1395,7 +1514,11 @@ static bool pass_escape(IrFunc *f) {
           if (d >= 0 && a != P) es_escape(&obj[d], ESW_FOREIGN);
           continue;
         }
-        if (d < 0) { es_escape(&obj[c], ESW_PARAM); continue; }
+        if (d < 0) {
+          es_point(&obj[c], &pt, &npt, &cpt, (uint32_t)c, bi, REF_NONE,
+                   es_edge_alone(b) ? s : UINT32_MAX, ESW_PARAM);
+          continue;
+        }
         for (uint32_t j2 = 0; j2 < j; j2++) {
           int32_t c2 = OWN(ir_resolve(f, e->args[j2]));
           int32_t d2 = OWN(t->params[j2]);
@@ -1420,7 +1543,8 @@ static bool pass_escape(IrFunc *f) {
     }
   }
 
-  /* Every use: allowed, recorded with its block, or the object escapes. */
+  /* Every use: allowed, an escape point, or the object escapes -- and the
+     first two recorded with their block. */
   EsUse *use = NULL;
   uint32_t nuse = 0, cuse = 0;
 #define ES_USE(c_, b_) do { \
@@ -1439,28 +1563,19 @@ static bool pass_escape(IrFunc *f) {
         int32_t c = OWN(ir_resolve(f, a[j]));
         if (c < 0) continue;
         EsObj *o = &obj[c];
-        bool ok = false;
-        switch (in->op) {
-          case I_FIELD_GET: case I_FIELD_SET:
-            ok = j == 0 && o->kind == ESK_STRUCT &&
-                 gc_field_of_offset(m, vt_ref(false, (HeapType)o->ti), in->imm)
-                   != UINT32_MAX;
-            break;
-          case I_ARRAY_GET: case I_ARRAY_SET:
-            if (j == 0 && o->kind == ESK_ARRAY) {
-              ok = !o->dead_only && es_elem_index(f, o, a[1]) != UINT32_MAX;
-              if (!ok) { es_escape(o, ESW_ELEM); ok = true; }
-            }
-            break;
-          case I_ARRAY_LEN: ok = j == 0 && o->kind == ESK_ARRAY; break;
-          case I_TRAP_IF: ok = in->imm == TRAP_NULL_REF && in->nargs == 1; break;
-          case I_REF_IS_NULL: case I_REF_CONVERT: ok = true; break;
-          case I_REF_TEST: ok = es_ref_test(m, o->ti, in->imm, in->imm2) >= 0; break;
-          case I_EQ: case I_NE: ok = in->nargs == 2; break;
-          default: break;
+        bool elem;
+        ES_USE(c, bi);
+        if (es_use_local(f, o, v, j, &elem)) {
+          if (elem) es_escape(o, ESW_ELEM);
+          /* an initialising store or a conversion the allocation would
+             have had to do anyway */
+          bool init = (in->op == I_FIELD_SET || in->op == I_ARRAY_SET) &&
+                      (in->imm2 & GCF_INIT);
+          if (!init && in->op != I_REF_CONVERT) o->benefit = true;
+        } else {
+          es_point(o, &pt, &npt, &cpt, (uint32_t)c, bi, v, UINT32_MAX,
+                   (uint16_t)(ESW_OP + in->op));
         }
-        if (ok) ES_USE(c, bi);
-        else es_escape(o, (uint16_t)(ESW_OP + in->op));
       }
     }
     if (b->term == T_BRIF || b->term == T_BRTABLE) {
@@ -1469,7 +1584,11 @@ static bool pass_escape(IrFunc *f) {
     }
     for (uint32_t i = 0; i < b->nret; i++) {
       int32_t c = OWN(ir_resolve(f, b->ret_args[i]));
-      if (c >= 0) es_escape(&obj[c], ESW_RETURN);
+      if (c >= 0) {
+        ES_USE(c, bi);
+        es_point(&obj[c], &pt, &npt, &cpt, (uint32_t)c, bi, REF_NONE, UINT32_MAX,
+                 ESW_RETURN);
+      }
     }
     for (uint32_t s = 0; s < b->nsuccs; s++) {
       Edge *e = &b->succs[s];
@@ -1510,6 +1629,107 @@ static bool pass_escape(IrFunc *f) {
         es_escape(dst, ESW_REUSED);
         break;
       }
+  }
+
+  /* Each escape point must be its object's last use.  Nothing after it in
+     its block may name the object -- at the block's end or on an edge,
+     nothing but the other returns and parameters that make up the same
+     point -- and no use, this one included, may be reachable from there
+     without passing the object's block, where it is made anew. */
+  for (uint32_t k = 0; k < npt; k++) {
+    EsPt *p = &pt[k];
+    EsObj *o = &obj[p->obj];
+    if (o->escaped) continue;
+    if (!partial || o->dead_only || o->npts > ESC_MAX_POINTS) { es_escape(o, o->pwhy); continue; }
+    Block *b = &f->blocks[p->block];
+    int32_t c = (int32_t)p->obj;
+    bool later = false;
+    if (p->inst != REF_NONE) {
+      uint32_t i = 0;
+      while (i < b->ninsts && b->insts[i] != p->inst) i++;
+      for (i++; i < b->ninsts && !later; i++) {
+        Inst *in = &f->insts[b->insts[i]];
+        Ref *a = ir_args(f, b->insts[i]);
+        for (uint32_t j = 0; j < in->nargs; j++)
+          if (OWN(ir_resolve(f, a[j])) == c) later = true;
+      }
+      for (uint32_t i2 = 0; i2 < b->nret; i2++)
+        if (OWN(ir_resolve(f, b->ret_args[i2])) == c) later = true;
+    }
+    for (uint32_t s = 0; s < b->nsuccs; s++) {
+      if (p->succ != UINT32_MAX && s != p->succ) continue;
+      Edge *e = &b->succs[s];
+      Block *t = &f->blocks[e->target];
+      for (uint32_t j = 0; j < e->nargs; j++)
+        if (OWN(ir_resolve(f, e->args[j])) == c &&
+            (p->inst != REF_NONE || j >= t->nparams || OWN(t->params[j]) >= 0))
+          later = true;
+    }
+    if (!later) {
+      memset(reach, 0, nb);
+      uint32_t sp = 0;
+      for (uint32_t s = 0; s < b->nsuccs; s++) {
+        uint32_t t = b->succs[s].target;
+        if (p->succ != UINT32_MAX && s != p->succ) continue;
+        if (t == o->block || reach[t]) continue;
+        reach[t] = 1;
+        stack[sp++] = t;
+      }
+      while (sp) {
+        Block *rb = &f->blocks[stack[--sp]];
+        for (uint32_t s = 0; s < rb->nsuccs; s++) {
+          uint32_t t = rb->succs[s].target;
+          if (t == o->block || reach[t]) continue;
+          reach[t] = 1;
+          stack[sp++] = t;
+        }
+      }
+      for (uint32_t u = 0; u < nuse && !later; u++)
+        if (use[u].obj == p->obj && reach[use[u].block]) later = true;
+    }
+    if (later) es_escape(o, ESW_LATER);
+  }
+
+  /* And something to gain: a path from the allocation that reaches no
+     escape point, back round to the allocation or out of the function, and
+     not into a trap; or, with no edge to split, a use its fields answer.
+     An edge split on every way out saves no allocation and costs a jump. */
+  for (uint32_t c = 0; c < nobj; c++) {
+    EsObj *o = &obj[c];
+    if (o->escaped || !o->npts) continue;
+    bool edges = false;
+    for (uint32_t k = 0; k < npt; k++)
+      if (pt[k].obj == c && pt[k].succ != UINT32_MAX) edges = true;
+    if (o->benefit && !edges) continue;
+    memset(reach, 0, nb);
+    bool avoid = !f->blocks[o->block].diverges;
+    for (uint32_t k = 0; k < npt; k++)
+      if (pt[k].obj == c && pt[k].succ == UINT32_MAX) {
+        reach[pt[k].block] = 1;
+        if (pt[k].block == o->block) avoid = false;
+      }
+    if (avoid) {
+      avoid = false;
+      uint32_t sp = 0;
+      stack[sp++] = o->block;
+      while (sp && !avoid) {
+        uint32_t rbi = stack[--sp];
+        Block *rb = &f->blocks[rbi];
+        if (!rb->nsuccs) avoid = true;
+        for (uint32_t s = 0; s < rb->nsuccs && !avoid; s++) {
+          bool cut = false;
+          for (uint32_t k = 0; k < npt && !cut; k++)
+            cut = pt[k].obj == c && pt[k].block == rbi && pt[k].succ == s;
+          if (cut) continue;
+          uint32_t t = rb->succs[s].target;
+          if (t == o->block) avoid = true;
+          if (reach[t] || f->blocks[t].diverges) continue;
+          reach[t] = 1;
+          stack[sp++] = t;
+        }
+      }
+    }
+    if (!avoid) es_escape(o, ESW_GAIN);
   }
 
   /* Liveness, and the parameters it asks for; an escape anywhere spreads to
@@ -1600,9 +1820,16 @@ static bool pass_escape(IrFunc *f) {
       const char *kind = o->phi ? "merge" : o->kind == ESK_STRUCT ? "struct" : "array";
       fprintf(stderr, "escape %s v%u %s d%u: ", m->funcs[f->func_index].sym,
               o->def, kind, f->blocks[o->block].loop_depth);
-      if (!o->escaped) fprintf(stderr, "replaced\n");
-      else if (o->why >= ESW_OP) fprintf(stderr, "escapes: use by %s\n", ir_op_name(o->why - ESW_OP));
-      else fprintf(stderr, "escapes: %s\n", es_why(o->why));
+      if (!o->escaped && o->npts)
+        fprintf(stderr, "partial: made at %u escape point%s\n", o->npts, o->npts == 1 ? "" : "s");
+      else if (!o->escaped) fprintf(stderr, "replaced\n");
+      else {
+        /* nothing to gain: the escape it was refused for, on every path */
+        uint16_t w = o->why == ESW_GAIN ? o->pwhy : o->why;
+        if (w >= ESW_OP) fprintf(stderr, "escapes: use by %s", ir_op_name(w - ESW_OP));
+        else fprintf(stderr, "escapes: %s", es_why(w));
+        fprintf(stderr, o->why == ESW_GAIN ? " on every path\n" : "\n");
+      }
     }
 
   bool changed = false;
@@ -1661,7 +1888,15 @@ static bool pass_escape(IrFunc *f) {
 
     Ref *cur = xmalloc((V ? V : 1) * sizeof(Ref));
     uint8_t *done = xcalloc(nb ? nb : 1, 1);
-    uint32_t forwarded = 0;
+    uint32_t forwarded = 0, made = 0;
+    /* where the live objects' escape points are */
+    uint8_t *ptinst = xcalloc(n, 1);
+    uint8_t *ptend = xcalloc(nb ? nb : 1, 1);
+    for (uint32_t k = 0; k < npt; k++) {
+      if (obj[pt[k].obj].escaped) continue;
+      if (pt[k].inst != REF_NONE) ptinst[pt[k].inst] = 1;
+      else if (pt[k].succ == UINT32_MAX) ptend[pt[k].block] = 1;
+    }
     for (uint32_t oi = 0; oi < f->norder; oi++) {
       uint32_t bi = f->order[oi];
       Block *b = &f->blocks[bi];
@@ -1680,6 +1915,29 @@ static bool pass_escape(IrFunc *f) {
       }
       for (uint32_t i = 0; i < b->ninsts; i++) {
         Ref v = b->insts[i];
+        if (v < n && ptinst[v]) {
+          /* an escape point: each object it hands over is made here, once,
+             and handed over instead */
+          uint32_t na = f->insts[v].nargs;
+          int32_t *mobj = xmalloc(na * sizeof(int32_t));
+          Ref *mref = xmalloc(na * sizeof(Ref));
+          for (uint32_t j = 0; j < na; j++) {
+            mobj[j] = OWN(ir_resolve(f, ir_args(f, v)[j]));
+            bool elem;
+            if (mobj[j] < 0 || obj[mobj[j]].escaped ||
+                es_use_local(f, &obj[mobj[j]], v, j, &elem)) { mobj[j] = -1; continue; }
+            mref[j] = REF_NONE;
+            for (uint32_t j2 = 0; j2 < j; j2++)
+              if (mobj[j2] == mobj[j]) mref[j] = mref[j2];
+            if (mref[j] == REF_NONE) {
+              mref[j] = es_materialize(f, &obj[mobj[j]], bi, &i, cur);
+              made++;
+            }
+            ir_args(f, v)[j] = mref[j];
+          }
+          xfree(mobj); xfree(mref);
+          b = &f->blocks[bi];
+        }
         Inst *in = &f->insts[v];
         Ref *a = ir_args(f, v);
         int32_t self = OWN(v);
@@ -1754,6 +2012,32 @@ static bool pass_escape(IrFunc *f) {
           default: break;
         }
       }
+      if (ptend[bi]) {
+        /* escape points at the block's end: what it returns, and what its
+           edges hand to parameters that are not objects -- each object made
+           once, at the end */
+        int32_t mobj[ESC_MAX_OBJS];
+        Ref mref[ESC_MAX_OBJS];
+        uint32_t nm = 0;
+#define ES_MADE(r_) do { int32_t mc_ = OWN(ir_resolve(f, (r_))); \
+          if (mc_ < 0 || obj[mc_].escaped) break; \
+          uint32_t q_ = 0; \
+          while (q_ < nm && mobj[q_] != mc_) q_++; \
+          if (q_ == nm) { \
+            uint32_t at_ = f->blocks[bi].ninsts; \
+            mobj[nm] = mc_; mref[nm++] = es_materialize(f, &obj[mc_], bi, &at_, cur); \
+            made++; } \
+          (r_) = mref[q_]; } while (0)
+        b = &f->blocks[bi];
+        for (uint32_t r = 0; r < b->nret; r++) ES_MADE(b->ret_args[r]);
+        for (uint32_t s = 0; s < b->nsuccs && !es_edge_alone(b); s++) {
+          Edge *e = &b->succs[s];
+          Block *tb = &f->blocks[e->target];
+          for (uint32_t j = 0; j < e->nargs && j < nparams0[e->target]; j++)
+            if (OWN(tb->params[j]) < 0) ES_MADE(e->args[j]);
+        }
+#undef ES_MADE
+      }
       for (uint32_t k = 0; k < V; k++) outv[(size_t)bi * V + k] = cur[k];
       done[bi] = 1;
     }
@@ -1808,6 +2092,38 @@ static bool pass_escape(IrFunc *f) {
         f->insts[P].nargs = 0;
       }
     }
+
+    /* The escape points on edges: each such edge split once, and what it
+       hands over made in the block that splits it, from the fields as the
+       edge's source left them. */
+    bool split = false;
+    for (uint32_t k = 0; k < npt; k++) {
+      EsPt *p = &pt[k];
+      if (p->succ == UINT32_MAX || obj[p->obj].escaped) continue;
+      bool seen = false;
+      for (uint32_t k2 = 0; k2 < k && !seen; k2++)
+        seen = pt[k2].block == p->block && pt[k2].succ == p->succ && !obj[pt[k2].obj].escaped;
+      if (seen) continue;
+      uint32_t sb = gl_split_edge(f, p->block, p->succ);
+      split = true;
+      int32_t mobj[ESC_MAX_OBJS];
+      Ref mref[ESC_MAX_OBJS];
+      uint32_t nm = 0;
+      for (uint32_t j = 0; j < f->blocks[sb].succs[0].nargs; j++) {
+        int32_t mc = OWN(ir_resolve(f, f->blocks[sb].succs[0].args[j]));
+        if (mc < 0 || obj[mc].escaped) continue;
+        uint32_t q = 0;
+        while (q < nm && mobj[q] != mc) q++;
+        if (q == nm) {
+          uint32_t at = f->blocks[sb].ninsts;
+          mobj[nm] = mc;
+          mref[nm++] = es_materialize(f, &obj[mc], sb, &at, &outv[(size_t)p->block * V]);
+          made++;
+        }
+        f->blocks[sb].succs[0].args[j] = mref[q];
+      }
+    }
+
     uint32_t removed = 0;
     for (uint32_t v = 0; v < n; v++) {
       if (own[v] < 0 || obj[own[v]].escaped) continue;
@@ -1816,6 +2132,7 @@ static bool pass_escape(IrFunc *f) {
       if (in->op != I_PARAM) { in->op = I_NOP; in->nargs = 0; in->type = 0; }
     }
     ir_apply_subst(f);
+    if (split) { ir_recompute_preds(f); ir_order(f); }
 
     /* Nothing that can run may still name what went. */
     for (uint32_t oi = 0; oi < f->norder; oi++) {
@@ -1847,17 +2164,19 @@ static bool pass_escape(IrFunc *f) {
 
     g_stats.escape_removed += removed;
     g_stats.escape_forwarded += forwarded;
+    g_stats.escape_made += made;
     changed = true;
 #undef ES_ZERO
     xfree(vtype); xfree(pref); xfree(outv); xfree(nparams0); xfree(pvar);
     xfree(cur); xfree(done); xfree(zero_cache); xfree(zero_type);
+    xfree(ptinst); xfree(ptend);
   }
 
 #undef ES_ADD
 #undef OWN
 #undef ES_USE
   ir_edge_index_free(&ei);
-  xfree(own); xfree(obj); xfree(forg); xfree(flow); xfree(use);
+  xfree(own); xfree(obj); xfree(forg); xfree(flow); xfree(use); xfree(pt);
   xfree(reach); xfree(stack); xfree(live); xfree(needp);
   return changed;
 }
@@ -10260,7 +10579,7 @@ void ir_optimize(IrFunc *f, const OptOpts *o) {
     if (o->bce && TP("arraybounds", pass_array_bounds(f))) changed = true;
     if (o->gcpure && TP("gcnull", pass_gc_nullchk(f))) changed = true;
 
-    if (o->escape && TP("escape", pass_escape(f))) changed = true;
+    if (o->escape && TP("escape", pass_escape(f, o->pescape))) changed = true;
     if (o->dce && TP("dce", pass_dce(f))) changed = true;
     if (TP("prune_params", prune_params(f))) changed = true;
     ir_order(f);

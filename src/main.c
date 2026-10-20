@@ -49,8 +49,8 @@ static const char *usage_text =
   "  -f[no-]PASS   enable or disable one pass: fold, dce, cse, licm, branch,\n"
   "                mem, bce, strength, inline, reassoc, rotate, addroff,\n"
   "                memptr, align, regalloc, guard-pages, vectorize, unroll,\n"
-  "                selftail, ldcomb, escape, gloop, loopclose, cpool, reach,\n"
-  "                prune, merge, devirt, closed-world, gcpure,\n"
+  "                selftail, ldcomb, escape, partial-escape, gloop, loopclose,\n"
+  "                cpool, reach, prune, merge, devirt, closed-world, gcpure,\n"
   "                labcache, barelide\n"
   "                The last two are the passes built on a loop containing\n"
   "                no safepoint, which is the only assumption the compiler\n"
@@ -233,6 +233,7 @@ int main(int argc, char **argv) {
   opt.selftail = true;
   opt.ldcomb = true;
   opt.escape = true;
+  opt.pescape = true;
   opt.gloop = true;
   opt.loopclose = true;
   opt.cpool = true;
@@ -353,6 +354,7 @@ int main(int argc, char **argv) {
       else if (!strcmp(name, "selftail")) opt.selftail = on;
       else if (!strcmp(name, "ldcomb")) opt.ldcomb = on;
       else if (!strcmp(name, "escape")) opt.escape = on;
+      else if (!strcmp(name, "partial-escape")) opt.pescape = on;
       else if (!strcmp(name, "gloop")) opt.gloop = on;
       else if (!strcmp(name, "loopclose")) opt.loopclose = on;
       else if (!strcmp(name, "cpool")) opt.cpool = on;
@@ -512,7 +514,7 @@ int main(int argc, char **argv) {
             "             ldpairs=%llu stpairs=%llu\n"
             "             reloads=%llu caller_saves=%llu csa_restores=%llu"
             " v128_spills=%llu rb_trips=%llu split_cuts=%llu split_invs=%llu\n"
-            "             escape_removed=%llu escape_forwarded=%llu gloop=%llu\n"
+            "             escape_removed=%llu escape_forwarded=%llu escape_made=%llu gloop=%llu\n"
             "             loop_closed=%llu reassoc=%llu cmp_reused=%llu gssa=%llu\n"
             "             bar_masks=%llu bar_elided=%llu\n"
             "             devirt_ref=%llu devirt_indirect=%llu"
@@ -550,6 +552,7 @@ int main(int argc, char **argv) {
             (unsigned long long)g_stats.split_invs,
             (unsigned long long)g_stats.escape_removed,
             (unsigned long long)g_stats.escape_forwarded,
+            (unsigned long long)g_stats.escape_made,
             (unsigned long long)g_stats.globals_promoted,
             (unsigned long long)g_stats.loops_closed,
             (unsigned long long)g_stats.reassoc,

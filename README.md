@@ -55,7 +55,8 @@ Hello world!
   - dominator-based CSE, LICM, loop rotation and unrolling
   - an auto-vectoriser, with runtime alias checks
   - bounds-check elimination and guard-page memory
-  - escape analysis for GC allocations
+  - escape analysis for GC allocations, partial too: an object that escapes
+    on some paths is allocated only on those
   - store-to-load forwarding
   - magic-number division
   - a linear-scan register allocator with rematerialisation
@@ -485,6 +486,7 @@ command-line order, so put them **after** `-O`.
 | `gloop`, `gssa` | keep globals in registers across loops; promote globals to SSA (`gssa` is off by default) |
 | `loopclose` | loop-closed SSA for values used after a loop |
 | `escape` | remove GC objects that never escape and forward their fields |
+| `partial-escape` | allocate a GC object that escapes on some paths only where it escapes |
 | `devirt`, `closed-world` | turn `call_ref` and `call_indirect` into direct calls; with a closed world, use vtable slots too |
 | `gcpure` | treat immutable GC fields and `array.len` as pure; drop redundant null and bounds checks |
 | `labcache`, `barelide` | keep the GC allocation buffer open, and hoist the load-barrier mask, in safepoint-free loops |
