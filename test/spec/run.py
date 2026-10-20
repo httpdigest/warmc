@@ -88,13 +88,17 @@ RUNTIME_COMMANDS = {
 
 DARWIN = platform.system() == "Darwin"
 
-WABT_FLAGS = [
-    "--enable-exceptions", "--enable-function-references", "--enable-tail-call",
-    "--enable-gc", "--enable-memory64", "--enable-multi-memory",
-    "--enable-extended-const", "--enable-relaxed-simd", "--enable-annotations",
-]
+WABT_FLAGS = hostbuild.wabt_flags()
 
-WASM_TOOLS_VERSION = "1.257.1"
+def _pinned_wasm_tools():
+    """The version the Makefile pins, so the two cannot drift apart."""
+    with open(os.path.join(ROOT, "Makefile")) as f:
+        for line in f:
+            if line.startswith("WASM_TOOLS_VERSION"):
+                return line.split(":=", 1)[1].strip()
+    raise SystemExit("spec: no WASM_TOOLS_VERSION in the Makefile")
+
+WASM_TOOLS_VERSION = _pinned_wasm_tools()
 WASM_TOOLS = os.path.join(BUILD, "tools", "bin", "wasm-tools")
 
 WARMC_TIMEOUT = float(os.environ.get("WARMC_TIMEOUT", "3"))

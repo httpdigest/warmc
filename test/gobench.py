@@ -175,6 +175,25 @@ TOOLCHAIN = {"go": ("tinygo", ["version"]), "as": ("asc", ["--version"]),
 KOTLIN_KLIB = os.path.join(ROOT, "build", "tools",
                            "kotlin-stdlib-wasm-wasi.klib")
 
+def kotlin_klib_current():
+    """Whether the stdlib `make kotlin-stdlib` fetched matches the compiler.
+
+    The compiler refuses a stdlib older than itself, and says so only after a
+    JVM start, behind its own warnings.  The Makefile stamps the version it
+    fetched; a missing stamp for this compiler means a stale or absent klib.
+    """
+    if not os.path.exists(KOTLIN_KLIB):
+        return False
+    try:
+        r = subprocess.run(["kotlinc", "-version"], capture_output=True, text=True)
+    except OSError:
+        return True
+    m = re.search(r"kotlinc-jvm ([0-9.]+)", r.stdout + r.stderr)
+    if not m:
+        return True
+    return os.path.exists(os.path.join(os.path.dirname(KOTLIN_KLIB),
+                                       ".kotlin-stdlib-" + m.group(1)))
+
 GO_WASI_ENV = {"GOOS": "wasip1", "GOARCH": "wasm"}
 
 def rust_target_installed():
@@ -326,9 +345,9 @@ def build_kotlin(name, src, wasm, stampf, stamp):
     -Xwasm-generate-wat, a .wat.  So it is pointed at a scratch directory per
     kernel and the module is moved to where the harness expects it.
     """
-    if not os.path.exists(KOTLIN_KLIB):
-        print("ktbench needs the Kotlin/Wasm standard library: run "
-              "`make kotlin-stdlib`", file=sys.stderr)
+    if not kotlin_klib_current():
+        print("ktbench needs the Kotlin/Wasm standard library matching the "
+              "compiler: run `make kotlin-stdlib`", file=sys.stderr)
         return None
     work = os.path.join(WORK, name + ".ktbuild")
     shutil.rmtree(work, ignore_errors=True)
