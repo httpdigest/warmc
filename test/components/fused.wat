@@ -65,8 +65,8 @@
         (local.get $s)))
     (core instance $i (instantiate $m))
     (func $sum (param "s" string) (result u32)
-      (canon lift (core func $i "sum") (memory $i "mem") (realloc (func $i "realloc"))
-                  (post-return (func $i "dropsum"))))
+      (canon lift (core func $i "sum") (memory (core memory $i "mem")) (realloc (core func $i "realloc"))
+                  (post-return (core func $i "dropsum"))))
     (func $flag (result bool)
       (canon lift (core func $i "seven")))
     (func $posts (result u32)
@@ -77,7 +77,7 @@
       (param "i" u32) (param "j" u32) (param "k" u32) (param "l" u32)
       (param "m" u32) (param "n" u32) (param "o" u32) (param "p" u32)
       (param "q" u32) (result u32)
-      (canon lift (core func $i "wide") (memory $i "mem") (realloc (func $i "realloc"))))
+      (canon lift (core func $i "wide") (memory (core memory $i "mem")) (realloc (core func $i "realloc"))))
     (instance $iface
       (export "sum" (func $sum))
       (export "flag" (func $flag))
@@ -119,14 +119,14 @@
         global.get $bump local.get 3 i32.add global.set $bump))
     (core instance $mi (instantiate $mem))
     (core func $lsum (canon lower (func $sum)
-      (memory $mi "mem") (realloc (func $mi "realloc"))))
+      (memory (core memory $mi "mem")) (realloc (core func $mi "realloc"))))
     ;; Neither of these needs a memory: a `bool` and a `u32` are one flat value
     ;; each and nothing is behind a pointer.  So the adapter for them imports
     ;; no memory and no allocator, which is the other shape one comes in.
     (core func $lflag (canon lower (func $flag)))
     (core func $lposts (canon lower (func $posts)))
     (core func $lwide (canon lower (func $wide)
-      (memory $mi "mem") (realloc (func $mi "realloc"))))
+      (memory (core memory $mi "mem")) (realloc (core func $mi "realloc"))))
     (core module $c
       (import "" "sum" (func $sum (param i32 i32) (result i32)))
       (import "" "flag" (func $flag (result i32)))

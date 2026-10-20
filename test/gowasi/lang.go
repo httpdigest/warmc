@@ -4,6 +4,12 @@
 // These reach the parts of a compiler that arithmetic does not -- indirect
 // calls through interface tables, a closure's captured environment, the stack
 // unwinding a recover needs, and the hashing a map does on its own.
+//
+// tinygo: -scheduler=asyncify
+//
+// Since Go 1.27 the standard library this reaches can start a goroutine
+// (time.AfterFunc's goFunc), which TinyGo refuses to build without a
+// scheduler.
 package main
 
 import (

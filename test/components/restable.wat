@@ -33,7 +33,7 @@
     (func (export "seen2") (result i32) (global.get $seen2)))
   (core instance $s (instantiate $store))
 
-  (type $r (resource (rep i32) (dtor (func $s "dtor"))))
+  (type $r (resource (rep i32) (dtor (core func $s "dtor"))))
   (core func $new (canon resource.new $r))
   (core func $drop (canon resource.drop $r))
   (core func $rep (canon resource.rep $r))
@@ -41,7 +41,7 @@
   ;; A second resource, so that the two index spaces have to stay apart.  A
   ;; table shared between them would hand the second type an index the first
   ;; already holds, and $stress reads every representation back to notice.
-  (type $r2 (resource (rep i32) (dtor (func $s "dtor2"))))
+  (type $r2 (resource (rep i32) (dtor (core func $s "dtor2"))))
   (core func $new2 (canon resource.new $r2))
   (core func $drop2 (canon resource.drop $r2))
   (core func $rep2 (canon resource.rep $r2))

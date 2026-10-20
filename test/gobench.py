@@ -96,7 +96,8 @@ RUSTC_FLAGS = ["-C", "opt-level=3", "--target", "wasm32-wasip1",
                "-C", "panic=abort", "-C", "lto=fat", "-C", "codegen-units=1"]
 RUST_TARGET = "wasm32-wasip1"
 
-KOTLIN_FLAGS = ["-Xwasm", "-Xwasm-target=wasm-wasi", "-nowarn"]
+# kotlinc-wasm compiles to wasm by itself; -Xwasm is deprecated since 2.4.0.
+KOTLIN_FLAGS = ["-Xwasm-target=wasm-wasi", "-nowarn"]
 
 FLAGS_FOR = {"go": ["-target=wasip1", "-scheduler=none"],
              "as": ASC_FLAGS, "rs": RUSTC_FLAGS,
@@ -355,7 +356,7 @@ def build_kotlin(name, src, wasm, stampf, stamp):
     lib = os.path.join(work, "lib")
     out = os.path.join(work, "out")
     r = sh(["kotlinc-wasm", src] + KOTLIN_FLAGS +
-           ["-libraries", KOTLIN_KLIB, "-Xir-produce-klib-file",
+           ["-libraries", KOTLIN_KLIB,
             "-ir-output-dir", lib, "-ir-output-name", name])
     if r.returncode != 0:
         print("kotlinc-wasm klib %s failed:\n%s" % (name, r.stderr[:400]),

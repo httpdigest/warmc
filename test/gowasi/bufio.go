@@ -4,6 +4,12 @@
 // so a file read this way becomes many small `fd_read` calls at moving
 // offsets rather than the single big one `os.ReadFile` makes -- and standard
 // input is a pipe, where a short read means what it says.
+//
+// tinygo: -scheduler=asyncify
+//
+// Since Go 1.27 the standard library this reaches can start a goroutine
+// (time.AfterFunc's goFunc), which TinyGo refuses to build without a
+// scheduler.
 package main
 
 import (

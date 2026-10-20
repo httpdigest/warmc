@@ -19,6 +19,6 @@
   (core instance $i (instantiate $m))
   (func $name (result string)
     (canon lift (core func $i "name")
-      (memory $i "mem") (realloc (func $i "cabi_realloc"))))
+      (memory (core memory $i "mem")) (realloc (core func $i "cabi_realloc"))))
   (export "name" (func $name))
 )

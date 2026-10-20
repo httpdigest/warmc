@@ -4,7 +4,7 @@
     (func (export "dtor") (param i32))
     (memory (export "mem") 1))
   (core instance $i (instantiate $m))
-  (type $r (resource (rep i32) (dtor (func $i "dtor"))))
+  (type $r (resource (rep i32) (dtor (core func $i "dtor"))))
   (type $own (own $r))
   (type $brw (borrow $r))
   (core func $new (canon resource.new $r))
