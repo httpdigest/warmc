@@ -1190,14 +1190,16 @@ static void emit_inst(Isel *s, Ref v) {
     }
 
     case I_VDOTI7: case I_VDOTI7ADD: {
+      /* The deterministic profile's reading, on every target (see
+         simd_dot_i7 in isel_x64_ops.inc): both operands signed and adjacent
+         products added with wrap-around -- smull, smull2, addp.  The i32x4
+         form widens that i16x8 stage pairwise, signed, and adds c. */
       int x = rd(s, a[0], F0), y = rd(s, a[1], F1);
 
       int c = in->op == I_VDOTI7ADD ? rd(s, a[2], F2) : -1;
       a64_vsmull(B, 0, 0, F3, x, y);
       a64_vsmull(B, 1, 0, F4, x, y);
-      a64_vuzp1(B, 1, FTMP, F3, F4);
-      a64_vuzp2(B, 1, F3, F3, F4);
-      a64_vsqadd(B, 1, FTMP, FTMP, F3);
+      a64_vaddp(B, 1, FTMP, F3, F4);
       if (in->op == I_VDOTI7ADD) {
 
         a64_vsaddlp(B, 1, FTMP, FTMP);

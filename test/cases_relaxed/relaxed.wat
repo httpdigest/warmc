@@ -178,13 +178,16 @@
                (v128.const i16x8 32767 8192 -32767 32766 0 0 0 1)))
 
   ;; ---- 0x112/0x113  the relaxed dot products ---------------------------
-  ;; Two rules, and only the first of them is relaxed:
-  ;;   - both sides of the multiply are read SIGNED (A0; the alternative
-  ;;     reads the second operand unsigned), which the -128 x -127 case below
-  ;;     separates -- signed gives +32512, unsigned-second gives -32768;
-  ;;   - adjacent products are added with SIGNED SATURATION, which the spec
-  ;;     states outright rather than leaving open, so it holds in both
-  ;;     profiles.  The -128 x -128 case is the one that saturates.
+  ;; One relaxed choice decides two things together ($R_idot in the spec):
+  ;; choice 0 reads both sides of the multiply SIGNED and adds adjacent
+  ;; products with WRAP-AROUND; choice 1 reads the second operand unsigned
+  ;; and saturates the sum.  warmc takes choice 0 in both profiles, since it
+  ;; is the deterministic one.
+  ;;   - the -128 x -127 case separates the readings of the multiply --
+  ;;     signed gives +32512, unsigned-second gives -32768;
+  ;;   - the -128 x -128 case is the one whose sum overflows i16: it wraps to
+  ;;     -32768.  (Signed AND saturated, 32767, is neither choice: the spec
+  ;;     used to read it that way, and the upstream corpus now rejects it.)
   (func (export "dot")
     (global.set $a (v128.const i8x16 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15))
     (global.set $b (v128.const i8x16 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15))
@@ -199,12 +202,12 @@
     (call $chk (i16x8.relaxed_dot_i8x16_i7x16_s
                  (global.get $a) (global.get $b))
                (v128.const i16x8 32512 0 0 0 0 0 0 0))
-    ;; (-128 * -128) * 2 = 32768, one past INT16_MAX, so the sum saturates
+    ;; (-128 * -128) * 2 = 32768, one past INT16_MAX, so the sum wraps
     (global.set $b (v128.const i8x16 -128 -128 0 0 0 0 0 0
                                      0 0 0 0 0 0 0 0))
     (call $chk (i16x8.relaxed_dot_i8x16_i7x16_s
                  (global.get $a) (global.get $b))
-               (v128.const i16x8 32767 0 0 0 0 0 0 0)))
+               (v128.const i16x8 -32768 0 0 0 0 0 0 0)))
 
   (func (export "dot_add")
     (global.set $a (v128.const i8x16 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15))
@@ -237,7 +240,16 @@
                                      0 0 0 0 0 0 0 0))
     (call $chk (i32x4.relaxed_dot_i8x16_i7x16_add_s
                  (global.get $a) (global.get $b) (global.get $c))
-               (v128.const i32x4 -65023 2 3 4)))
+               (v128.const i32x4 -65023 2 3 4))
+    ;; The i32x4 form is the i16x8 one widened, so it inherits the wrap: each
+    ;; pair of -128 * -128 is 32768, which wraps to -32768 in the i16 stage;
+    ;; two of those widen and add to -65536, and c goes on.  Summing the four
+    ;; products exactly instead would give +65537.
+    (global.set $b (v128.const i8x16 -128 -128 -128 -128 0 0 0 0
+                                     0 0 0 0 0 0 0 0))
+    (call $chk (i32x4.relaxed_dot_i8x16_i7x16_add_s
+                 (global.get $a) (global.get $b) (global.get $c))
+               (v128.const i32x4 -65535 2 3 4)))
 
   ;; ---- 0x105..0x108  relaxed_madd and relaxed_nmadd --------------------
   ;;
