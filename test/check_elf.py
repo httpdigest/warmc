@@ -3,8 +3,9 @@
 The twin of test/check_macho.py, and it exists because the two writers are not
 the same code and only one of them was ever looked at.  A Linux executable
 linked by warmc cannot be run on a Mac -- test/hostenv.sh picks the macOS
-runtime, and test/run_gowasi_linux.sh links its Linux binaries with `cc` -- so
-warmc's own ELF *executable* path had no test on this machine at all.  What it
+runtime, and test/run_gowasi_linux.sh, which does run warmc-linked images,
+needs a Linux container -- so without this file warmc's own ELF *executable*
+path has no test that `make check` runs on this machine.  What it
 was hiding: the data section's file offset was computed from the GOT's
 unpadded byte count while every relocation used the padded address, so with an
 odd number of GOT slots every stored pointer in .data came out holding the

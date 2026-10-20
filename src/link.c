@@ -1546,13 +1546,14 @@ void warmc_link_exec(TargetFmt fmt, const char *out, const char *objpath,
     }
     if (nu > 8) fprintf(stderr, "warmc: link: and %u more\n", nu - 8);
 
+    /* A Linux WASI host carries rt/linuxposix.c for the POSIX calls it makes,
+       so one that leaves them undefined is an archive built before it was. */
     if (wasi)
       fprintf(stderr,
-              "warmc: on Linux the WASI host calls libc for the filesystem, "
-              "and this link has no libc.\nwarmc: compile to an object and "
-              "link that with a compiler driver instead:\nwarmc:   warmc -c "
-              "--target linux -o P.o P.wasm\nwarmc:   cc -nostartfiles -no-pie "
-              "-u warmc_driver_hook -o P P.o %s %s\n", wasi, rt);
+              "warmc: the WASI host %s should define every POSIX call it "
+              "makes (rt/linuxposix.c);\nwarmc: an archive built before "
+              "that file existed does not -- run `make` to rebuild it\n",
+              wasi);
     warmc_fatal("link: %u undefined symbol%s", nu, nu == 1 ? "" : "s");
   }
 

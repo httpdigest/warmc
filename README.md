@@ -292,15 +292,10 @@ of its own:
 | 73 | trap, printed to stderr |
 | 74 | bad host flag |
 
-> **Linux note:** the Linux WASI host calls libc for the filesystem, so the
-> built-in linker cannot finish a `--target linux --wasi` link by itself.
-> warmc prints the recipe when this happens. Compile with `-c`, then link with
-> a C compiler driver:
->
-> ```sh
-> build/warmc --wasi -c --target linux -o app.o app.wasm
-> cc -nostartfiles -no-pie -u warmc_driver_hook -o app app.o build/warmwasi.a build/warmrt.a
-> ```
+On Linux a WASI program is a static executable with no libc, like every
+other Linux output: `rt/linuxposix.c` answers the WASI hosts' POSIX calls
+over raw system calls. It does so under names of its own (`warmc_lx_*`), so
+an embedder can still link the `-c` object into a C program that uses glibc.
 
 ### WASI 0.2 command components
 
@@ -615,8 +610,9 @@ cheaper. Functions compile in parallel and are laid out deterministically.
 
 **Runtime** (`rt/`):
 - **Platforms.** On Linux the runtime makes raw syscalls, on macOS it uses
-  libSystem, and on Windows it uses Win32. `rt/winposix.c` maps the POSIX
-  surface the WASI host needs onto Win32.
+  libSystem, and on Windows it uses Win32. The WASI hosts are written against
+  POSIX: `rt/linuxposix.c` provides it over Linux system calls, and
+  `rt/winposix.c` over Win32.
 - **Traps.** Signal or vectored exception handlers turn guard-page faults into
   wasm traps.
 - **Garbage collector.** It is concurrent and compacting:
@@ -669,7 +665,7 @@ make check-spec     # the official WebAssembly testsuite, at three optimisation 
 make conformance    # write CONFORMANCE.md: spec results grouped by proposal
 make fuzz           # random modules vs wasm-interp (FUZZ_SEED, FUZZ_COUNT)
 make gc-jitter      # GC schedule sweep with randomised collector delays
-make check-linux    # run real Linux binaries in a podman/docker arm64 container
+make check-linux    # run the TinyGo WASI corpus and GC tests as real Linux binaries (podman/docker arm64)
 ```
 
 Most of the suite is **differential**. warmc's output is compared with:
@@ -711,6 +707,7 @@ rt/             the runtime linked into every program
   start.S start_x64.S                     entry, invoke, throw and GC trampolines
   wasi.c wasifs.c wasi.wat                WASI preview 1 host
   wasip2.c                                WASI 0.2 host
+  linuxposix.c                            the WASI hosts' POSIX calls over Linux syscalls
   win.inc winposix.c                      Windows platform layer
   warm_rt.h                               the embedding API
 test/           test drivers, cases, benchmark corpora, spec harness
@@ -729,8 +726,6 @@ example/        TinyGo and Kotlin sample programs (source, .wasm and a macOS bui
 - **Components** compile only when every import is WASI 0.2 and every
   non-`run` export uses only 32-bit and 64-bit integers. The canonical ABI is
   32-bit only.
-- **Linux `--wasi` links** need an external C compiler driver (see the [Linux
-  note](#wasi-preview-1-programs)).
 - **The name section is ignored**, so functions appear as `wasm_func_N`.
 - **Exceptions** do not propagate through host (C) frames.
 - **The collector** does not run while wasm is re-entered from a host call.

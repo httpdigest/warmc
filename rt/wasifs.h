@@ -3,6 +3,57 @@
 
 #include "warm_rt.h"
 
+#if !defined(WARMC_DARWIN) && !defined(WARMC_WINDOWS)
+/* A Linux program from warmc links no libc: rt/linuxposix.c answers these
+   over raw system calls, under names of its own, so that a program which
+   does link a libc -- an embedder's driver -- keeps that libc whole rather
+   than having half of its allocator replaced.  Every declaration and call in
+   the WASI hosts goes through these, and so do linuxposix.c's definitions. */
+#define openat(...)        warmc_lx_openat(__VA_ARGS__)
+#define close(...)         warmc_lx_close(__VA_ARGS__)
+#define dup(...)           warmc_lx_dup(__VA_ARGS__)
+#define pread(...)         warmc_lx_pread(__VA_ARGS__)
+#define pwrite(...)        warmc_lx_pwrite(__VA_ARGS__)
+#define lseek(...)         warmc_lx_lseek(__VA_ARGS__)
+#define fstat(...)         warmc_lx_fstat(__VA_ARGS__)
+#define fstatat(...)       warmc_lx_fstatat(__VA_ARGS__)
+#define mkdirat(...)       warmc_lx_mkdirat(__VA_ARGS__)
+#define unlinkat(...)      warmc_lx_unlinkat(__VA_ARGS__)
+#define renameat(...)      warmc_lx_renameat(__VA_ARGS__)
+#define symlinkat(...)     warmc_lx_symlinkat(__VA_ARGS__)
+#define readlinkat(...)    warmc_lx_readlinkat(__VA_ARGS__)
+#define linkat(...)        warmc_lx_linkat(__VA_ARGS__)
+#define fsync(...)         warmc_lx_fsync(__VA_ARGS__)
+#define fdatasync(...)     warmc_lx_fdatasync(__VA_ARGS__)
+#define ftruncate(...)     warmc_lx_ftruncate(__VA_ARGS__)
+#define fcntl(...)         warmc_lx_fcntl(__VA_ARGS__)
+#define utimensat(...)     warmc_lx_utimensat(__VA_ARGS__)
+#define futimens(...)      warmc_lx_futimens(__VA_ARGS__)
+#define isatty(...)        warmc_lx_isatty(__VA_ARGS__)
+#define fdopendir(...)     warmc_lx_fdopendir(__VA_ARGS__)
+#define readdir(...)       warmc_lx_readdir(__VA_ARGS__)
+#define telldir(...)       warmc_lx_telldir(__VA_ARGS__)
+#define seekdir(...)       warmc_lx_seekdir(__VA_ARGS__)
+#define rewinddir(...)     warmc_lx_rewinddir(__VA_ARGS__)
+#define closedir(...)      warmc_lx_closedir(__VA_ARGS__)
+#define clock_gettime(...) warmc_lx_clock_gettime(__VA_ARGS__)
+#define clock_getres(...)  warmc_lx_clock_getres(__VA_ARGS__)
+#define nanosleep(...)     warmc_lx_nanosleep(__VA_ARGS__)
+#define poll(...)          warmc_lx_poll(__VA_ARGS__)
+#define signal(...)        warmc_lx_signal(__VA_ARGS__)
+#define socket(...)        warmc_lx_socket(__VA_ARGS__)
+#define bind(...)          warmc_lx_bind(__VA_ARGS__)
+#define listen(...)        warmc_lx_listen(__VA_ARGS__)
+#define accept(...)        warmc_lx_accept(__VA_ARGS__)
+#define setsockopt(...)    warmc_lx_setsockopt(__VA_ARGS__)
+#define shutdown(...)      warmc_lx_shutdown(__VA_ARGS__)
+#define send(...)          warmc_lx_send(__VA_ARGS__)
+#define recv(...)          warmc_lx_recv(__VA_ARGS__)
+#define malloc(...)        warmc_lx_malloc(__VA_ARGS__)
+#define free(...)          warmc_lx_free(__VA_ARGS__)
+#define realloc(...)       warmc_lx_realloc(__VA_ARGS__)
+#endif
+
 extern void *opendir(const char *);
 extern void *fdopendir(int);
 extern void *readdir(void *);
@@ -33,9 +84,12 @@ extern int utimensat(int, const char *, const void *, int);
 #if defined(WARMC_DARWIN)
 extern int *__error(void);
 #define h_errno (*__error())
-#else
+#elif defined(WARMC_WINDOWS)
 extern int *__errno_location(void);
 #define h_errno (*__errno_location())
+#else
+extern int *warmc_lx_errno(void);
+#define h_errno (*warmc_lx_errno())
 #endif
 
 #if defined(WARMC_DARWIN)

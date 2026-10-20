@@ -4,7 +4,6 @@ extern void *malloc(usz);
 extern void free(void *);
 extern void (*signal(int, void (*)(int)))(int);
 extern int isatty(int);
-extern char **environ;
 
 #define RT_ERROR         0
 #define RT_POLLABLE      1
@@ -126,7 +125,10 @@ static u64 guest_alloc(WarmInstance *vm, u32 align, u32 size) {
 
 static u64 put_bytes(WarmInstance *vm, const void *src, u64 n) {
   u64 p = guest_alloc(vm, 1, (u32)n);
-  if (n) __builtin_memcpy(vm->mem_base + p, src, n);
+  /* A loop, not __builtin_memcpy: a length known only at run time lowers
+     to a call to memcpy, and a Linux link of this host has no libc. */
+  const u8 *s = src;
+  for (u64 i = 0; i < n; i++) vm->mem_base[p + i] = (char)s[i];
   return p;
 }
 
@@ -511,7 +513,7 @@ static u64 p2_get_arguments(WarmInstance *vm, u64 ret) {
 }
 
 static u64 p2_get_environment(WarmInstance *vm, u64 ret) {
-  char **src = g_env_inherit ? environ : g_env;
+  char **src = g_env_inherit ? warmc_rt_environ() : g_env;
   u32 n = 0;
   if (g_env_inherit) { while (src && src[n]) n++; }
   else n = g_nenv;
