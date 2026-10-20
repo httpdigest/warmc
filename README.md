@@ -46,8 +46,8 @@ Hello world!
   **multi-memory**, and extended constant expressions. See [WebAssembly
   feature support](#webassembly-feature-support).
 - **Passes the official spec testsuite.** The pinned upstream testsuite has
-  257 `.wast` files. warmc records zero failures across 5,654 validation and
-  60,688 execution assertions, at `-O1`, at `-O2`, and at
+  257 `.wast` files. warmc records zero failures across 5,664 validation and
+  60,695 execution assertions, at `-O1`, at `-O2`, and at
   `-O2 --profile=deterministic`.
 - **Optimising compiler.** It optimises over SSA with block parameters. Passes
   include:
@@ -684,13 +684,16 @@ Most of the suite is **differential**. warmc's output is compared with:
 
 Requirements:
 - `make check` needs `python3`, `perl` and wabt (`wat2wasm`, `wasm-interp`).
-  It also needs clang's `wasm32` target with `wasm-ld`, and the pinned
-  `wasm-tools`.
-- `make wasm-tools` builds the pinned `wasm-tools` with `cargo`. `make testsuite`
-  clones the pinned spec testsuite.
+  It also needs clang's `wasm32` target with `wasm-ld`.
+- Three dependencies are pinned in the Makefile and cached under `build/`:
+  `wasm-tools` (built with `cargo` by `make wasm-tools`), the spec testsuite
+  (`make testsuite`), and the Kotlin/Wasm stdlib matching your `kotlinc`
+  (`make kotlin-stdlib`). Each cached copy is stamped with its version, so
+  bumping a pin or upgrading `kotlinc` fetches it again. `make check` brings
+  `wasm-tools` and the Kotlin stdlib up to date by itself; `make check-spec`
+  does the same for the testsuite.
 - Rows that need wasmtime, TinyGo, Go, Rust (`wasm32-wasip1` / `wasm32-wasip2`),
   Zig, `asc` or `kotlinc-wasm` skip themselves when the tool is missing.
-  `ktbench` also needs `make kotlin-stdlib`.
 
 ---
 
