@@ -177,6 +177,13 @@ static u64 p2_exit(WarmInstance *vm, u64 status) {
   return 0;
 }
 
+/* exit-with-code carries the whole u8 status; rustc's std calls it for any
+   std::process::exit code other than 0 and 1. */
+static u64 p2_exit_with_code(WarmInstance *vm, u64 code) {
+  warmc_rt_exit((int)(code & 0xff));
+  return 0;
+}
+
 static u64 p2_get_stdin(WarmInstance *vm) { return stdio_handle(0, 1); }
 static u64 p2_get_stdout(WarmInstance *vm) { return stdio_handle(1, 0); }
 static u64 p2_get_stderr(WarmInstance *vm) { return stdio_handle(2, 0); }
@@ -1036,6 +1043,7 @@ static const Binding BINDINGS[] = {
   { "wasi:cli/environment#get-environment", (void *)p2_get_environment },
   { "wasi:cli/environment#initial-cwd", (void *)p2_initial_cwd },
   { "wasi:cli/exit#exit", (void *)p2_exit },
+  { "wasi:cli/exit#exit-with-code", (void *)p2_exit_with_code },
   { "wasi:cli/stdin#get-stdin", (void *)p2_get_stdin },
   { "wasi:cli/stdout#get-stdout", (void *)p2_get_stdout },
   { "wasi:cli/stderr#get-stderr", (void *)p2_get_stderr },

@@ -317,7 +317,9 @@ The host implements `wasi:cli` (environment, exit, stdio, terminal),
 `wasi:clocks`, `wasi:filesystem` (types and preopens), `wasi:io` (error, poll
 and streams) and `wasi:random`. It accepts any `@0.2.x` interface version.
 
-The exit status is `0` or `1`, from `run`'s result. If the component calls a
+The exit status is `0` or `1`, from `run`'s result, unless the component
+calls `wasi:cli/exit`'s `exit-with-code` with another (Rust's
+`std::process::exit` does). If the component calls a
 `wasi:*` function this host does not implement, the program traps when the
 call happens and names the function. It is not refused at link time.
 
