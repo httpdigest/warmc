@@ -25,6 +25,18 @@
 #define INL_C_FRAMEONLY 6
 #define INL_C_ONCE 1000
 
+/* Escape evidence: a site that is the only way out for an allocation, into
+   a callee that keeps the object to itself, is the one inline that lets
+   pass_escape remove the allocation.  Such a site may take a callee making
+   up to INL_ESC_RETCALLS calls of its own, is taken from a cold block when
+   the object is allocated on a warm one, is scored by the allocation's loop
+   depth, and may go INL_ESC_SLACK surviving calls past the caller's cap. */
+#define INL_C_ESCAPE 24
+#define INL_ESC_RETCALLS 4
+#define INL_ESC_SLACK 8
+#define INL_ESC_MAX_ELEMS 32
+#define INL_ESC_MAX_ROOTS 256
+
 /* The 2026-08-07 cap sweeps needed a rebuild per point; every future sweep
    is an environment variable. Defaults reproduce the constants above. */
 static pthread_once_t g_inl_once = PTHREAD_ONCE_INIT;
@@ -330,6 +342,175 @@ static bool inline_flat(IrFunc *f, IrFunc *g, uint32_t bi, uint32_t at,
   return true;
 }
 
+/* Follow each root through its aliases -- conversions, and block
+   parameters every argument of which is the root or the parameter itself --
+   and sort its uses: local (a field or element access, a null check, a
+   test or comparison), an argument to a direct call, or an escape.  The
+   roots are allocations in a caller and reference parameters in a callee.
+   escaped[r] is set for a root that leaves by anything but a direct call;
+   the direct-call uses go in *calls. */
+typedef struct { Ref call; uint32_t arg, root; } InlCallUse;
+
+static void inl_escape_scan(IrFunc *g, const Ref *roots, uint32_t nroots,
+                            uint8_t *escaped, InlCallUse **calls,
+                            uint32_t *ncalls) {
+  uint32_t n = g->ninsts;
+  int32_t *own = xmalloc((n ? n : 1) * sizeof(int32_t));
+  for (uint32_t v = 0; v < n; v++) own[v] = -1;
+  for (uint32_t r = 0; r < nroots; r++) own[roots[r]] = (int32_t)r;
+#define IOWN(x_) ((uint32_t)(x_) < n ? own[(x_)] : -1)
+  IrEdgeIdx ei = ir_edge_index(g);
+  for (bool again = true; again;) {
+    again = false;
+    for (uint32_t oi = 0; oi < g->norder; oi++) {
+      uint32_t bi = g->order[oi];
+      Block *b = &g->blocks[bi];
+      if (bi != g->entry)
+        for (uint32_t p = 0; p < b->nparams; p++) {
+          Ref P = b->params[p];
+          if (P >= n || own[P] >= 0 || !vt_is_ref(g->insts[P].type)) continue;
+          int32_t one = -1;
+          bool other = false;
+          for (uint32_t k = ei.off[bi]; k < ei.off[bi + 1] && !other; k++) {
+            Block *sb = &g->blocks[ei.src[k]];
+            if (!sb->reachable || sb->succs[ei.si[k]].eh) continue;
+            Ref a = ir_resolve(g, sb->succs[ei.si[k]].args[p]);
+            if (a == P) continue;
+            int32_t c = IOWN(a);
+            if (c < 0 || (one >= 0 && c != one)) other = true;
+            else one = c;
+          }
+          if (!other && one >= 0) { own[P] = one; again = true; }
+        }
+      for (uint32_t i = 0; i < b->ninsts; i++) {
+        Ref v = b->insts[i];
+        if (v < n && own[v] < 0 && g->insts[v].op == I_REF_CONVERT &&
+            g->insts[v].nargs == 1) {
+          int32_t c = IOWN(ir_resolve(g, ir_args(g, v)[0]));
+          if (c >= 0) { own[v] = c; again = true; }
+        }
+      }
+    }
+  }
+
+  uint32_t cap = 0;
+  for (uint32_t oi = 0; oi < g->norder; oi++) {
+    uint32_t bi = g->order[oi];
+    Block *b = &g->blocks[bi];
+    for (uint32_t i = 0; i < b->ninsts; i++) {
+      Ref v = b->insts[i];
+      Inst *in = &g->insts[v];
+      Ref *a = ir_args(g, v);
+      for (uint32_t j = 0; j < in->nargs; j++) {
+        int32_t c = IOWN(ir_resolve(g, a[j]));
+        if (c < 0) continue;
+        bool local = false;
+        switch (in->op) {
+          case I_FIELD_GET: case I_FIELD_SET:
+          case I_ARRAY_GET: case I_ARRAY_SET: local = j == 0; break;
+          case I_ARRAY_LEN: case I_REF_IS_NULL: case I_REF_TEST:
+          case I_REF_CONVERT: case I_EQ: case I_NE: local = true; break;
+          case I_TRAP_IF: local = in->imm == TRAP_NULL_REF; break;
+          case I_CALL: {
+            if (*ncalls == cap) {
+              cap = cap ? 2 * cap : 16;
+              *calls = xrealloc(*calls, cap * sizeof **calls);
+            }
+            (*calls)[(*ncalls)++] = (InlCallUse){ v, j, (uint32_t)c };
+            local = true;
+            break;
+          }
+          default: break;
+        }
+        if (!local) escaped[c] = 1;
+      }
+    }
+    if (b->term == T_BRIF || b->term == T_BRTABLE) {
+      int32_t c = IOWN(ir_resolve(g, b->term_arg));
+      if (c >= 0) escaped[c] = 1;
+    }
+    for (uint32_t i = 0; i < b->nret; i++) {
+      int32_t c = IOWN(ir_resolve(g, b->ret_args[i]));
+      if (c >= 0) escaped[c] = 1;
+    }
+    for (uint32_t s = 0; s < b->nsuccs; s++) {
+      Edge *e = &b->succs[s];
+      Block *t = &g->blocks[e->target];
+      for (uint32_t j = 0; j < e->nargs && j < t->nparams; j++) {
+        int32_t c = IOWN(ir_resolve(g, e->args[j]));
+        if (c >= 0 && IOWN(t->params[j]) != c) escaped[c] = 1;
+      }
+    }
+  }
+#undef IOWN
+  ir_edge_index_free(&ei);
+  xfree(own);
+}
+
+/* Which reference parameters a callee keeps to itself: no call, store,
+   return or global sees them.  Bit p for parameter p. */
+static uint64_t inl_local_params(IrFunc *g) {
+  Block *e = &g->blocks[g->entry];
+  uint32_t np = e->nparams < 64 ? e->nparams : 64;
+  Ref roots[64];
+  uint32_t idx[64], nr = 0;
+  for (uint32_t p = 0; p < np; p++)
+    if (vt_is_ref(g->insts[e->params[p]].type)) { idx[nr] = p; roots[nr++] = e->params[p]; }
+  if (!nr) return 0;
+  uint8_t esc[64] = {0};
+  InlCallUse *calls = NULL;
+  uint32_t ncalls = 0;
+  inl_escape_scan(g, roots, nr, esc, &calls, &ncalls);
+  for (uint32_t k = 0; k < ncalls; k++) esc[calls[k].root] = 1;
+  xfree(calls);
+  uint64_t bits = 0;
+  for (uint32_t r = 0; r < nr; r++)
+    if (!esc[r]) bits |= 1ull << idx[r];
+  return bits;
+}
+
+/* The caller's side: the call sites that are the only way out for some
+   allocation made on a warm path.  Per call, which arguments those
+   allocations are and the deepest loop one is made in. */
+typedef struct { uint64_t args; uint8_t depth; } InlEsc;
+
+static InlEsc *inl_caller_evidence(IrFunc *f) {
+  Module *m = f->m;
+  Ref roots[INL_ESC_MAX_ROOTS];
+  uint32_t nr = 0;
+  for (uint32_t oi = 0; oi < f->norder && nr < INL_ESC_MAX_ROOTS; oi++) {
+    Block *b = &f->blocks[f->order[oi]];
+    if (b->diverges) continue;
+    for (uint32_t i = 0; i < b->ninsts && nr < INL_ESC_MAX_ROOTS; i++) {
+      Ref v = b->insts[i];
+      Inst *in = &f->insts[v];
+      if (in->op == I_STRUCT_NEW && in->nargs == 0) roots[nr++] = v;
+      else if (in->op == I_ARRAY_NEW && (in->nargs == 1 || in->nargs == 3) &&
+               in->imm < m->ntypes) {
+        Inst *lc = &f->insts[ir_resolve(f, ir_args(f, v)[0])];
+        if (lc->op == I_CONST && (lc->imm & 0xffffffffu) <= INL_ESC_MAX_ELEMS)
+          roots[nr++] = v;
+      }
+    }
+  }
+  if (!nr) return NULL;
+  uint8_t *esc = xcalloc(nr, 1);
+  InlCallUse *calls = NULL;
+  uint32_t ncalls = 0;
+  inl_escape_scan(f, roots, nr, esc, &calls, &ncalls);
+  InlEsc *ev = NULL;
+  for (uint32_t k = 0; k < ncalls; k++) {
+    InlCallUse *u = &calls[k];
+    if (esc[u->root] || u->arg >= 64) continue;
+    if (!ev) ev = xcalloc(f->ninsts, sizeof *ev);
+    ev[u->call].args |= 1ull << u->arg;
+    uint8_t d = (uint8_t)f->blocks[f->insts[roots[u->root]].block].loop_depth;
+    if (d > ev[u->call].depth) ev[u->call].depth = d;
+  }
+  xfree(esc); xfree(calls);
+  return ev;
+}
+
 /* One verdict and at most two IR builds per callee per caller, however many
    sites look at it. The two builds are the two shapes a site can need:
    sites without exceptional edges splice the callee as built, sites with
@@ -341,6 +522,7 @@ typedef struct {
   uint8_t verdict;
   IrFunc *plain, *split;
   uint32_t ninsts, eparams, retcalls;
+  uint64_t local_params;   /* reference parameters the callee keeps */
 } InlMemo;
 
 static IrFunc *inl_callee(IrFunc *f, const OptOpts *o, InlMemo *memo,
@@ -356,7 +538,10 @@ static IrFunc *inl_callee(IrFunc *f, const OptOpts *o, InlMemo *memo,
       inl_dbg(f, fidx, bi, "tail call");
       ir_free(g);
     } else if (g_inl.leafonly ? !callee_calls_are_cold(g)
-                              : r > g_inl.retcalls) {
+                              : r > (g_inl.retcalls > INL_ESC_RETCALLS
+                                     ? g_inl.retcalls : INL_ESC_RETCALLS)) {
+      /* up to INL_ESC_RETCALLS calls stays a candidate: whether it is
+         taken is the site's question, and only escape evidence says yes */
       g_stats.inl_rej_retcalls++;
       inl_dbg(f, fidx, bi, "returning calls");
       ir_free(g);
@@ -371,6 +556,7 @@ static IrFunc *inl_callee(IrFunc *f, const OptOpts *o, InlMemo *memo,
       e->ninsts = g->ninsts;
       e->eparams = g->blocks[g->entry].nparams;
       e->retcalls = r;
+      e->local_params = inl_local_params(g);
     }
   }
   if (e->verdict != 1) return NULL;
@@ -388,6 +574,7 @@ typedef struct {
   uint32_t charged, score;
   uint32_t rpo, idx;
   bool once;
+  bool escape;   /* the inline frees an allocation for pass_escape */
   uint16_t idepth;
   uint32_t anc[INLINE_MAX_DEPTH];
 } InlSite;
@@ -419,8 +606,9 @@ static int inl_site_cmp(const void *pa, const void *pb) {
    ever free. A transitive site carries the chain of callees it was copied
    out of; a candidate already on its own chain is a cycle. */
 static bool inl_score_site(IrFunc *f, const OptOpts *o, InlMemo *memo,
-                           Ref call, uint32_t ord1, uint32_t ord2,
-                           const InlSite *parent, InlSite *out) {
+                           const InlEsc *ev, Ref call, uint32_t ord1,
+                           uint32_t ord2, const InlSite *parent,
+                           InlSite *out) {
   Module *m = f->m;
   static const uint32_t w[4] = {1, 10, 100, 1000};
   Inst *cin = &f->insts[call];
@@ -465,6 +653,19 @@ static bool inl_score_site(IrFunc *f, const OptOpts *o, InlMemo *memo,
     return false;
   }
 
+  /* An allocation that leaves only through this call, into a parameter
+     the callee keeps to itself: inlined, nothing is left holding it. */
+  uint64_t freed = ev && call < f->ninsts ? ev[call].args & e->local_params : 0;
+  bool escape = freed != 0;
+  uint32_t nfreed = 0;
+  for (uint64_t x = freed; x; x &= x - 1) nfreed++;
+
+  if (e->retcalls > g_inl.retcalls && !escape && !g_inl.leafonly) {
+    g_stats.inl_rej_retcalls++;
+    inl_dbg(f, fidx, bi, "returning calls");
+    return false;
+  }
+
   uint32_t nconst = 0;
   Ref *a = ir_args(f, call);
   for (uint32_t j = 0; j < cin->nargs; j++)
@@ -479,7 +680,7 @@ static bool inl_score_site(IrFunc *f, const OptOpts *o, InlMemo *memo,
      this site is special -- a dying body, a folding argument, a callee
      that touches nothing. */
   if (e->retcalls) {
-    if (b->loop_depth >= 1 && !once && nconst == 0 && !fonly) {
+    if (b->loop_depth >= 1 && !once && nconst == 0 && !fonly && !escape) {
       g_stats.inl_rej_retcalls++;
       inl_dbg(f, fidx, bi, "retcall in loop without evidence");
       return false;
@@ -487,16 +688,22 @@ static bool inl_score_site(IrFunc *f, const OptOpts *o, InlMemo *memo,
     charged += e->retcalls * g_inl.retcall_cost * (b->loop_depth ? 2 : 1);
   }
 
-  if (b->diverges && charged > g_inl.tiny) {
+  /* A cold site is worth taking when what it frees is made on a warm path:
+     the allocation goes from there, not just from here. */
+  if (b->diverges && charged > g_inl.tiny && !escape) {
     g_stats.inl_rej_score++;
     inl_dbg(f, fidx, bi, "cold and not tiny");
     return false;
   }
 
   uint32_t benefit = INL_C_BASE + INL_C_CONST * nconst +
-                     (fonly ? INL_C_FRAMEONLY : 0) + (once ? INL_C_ONCE : 0);
-  uint32_t d = b->loop_depth < 3 ? b->loop_depth : 3;
-  uint32_t score = b->diverges ? 0 : w[d] * benefit * 16 / charged;
+                     (fonly ? INL_C_FRAMEONLY : 0) + (once ? INL_C_ONCE : 0) +
+                     INL_C_ESCAPE * nfreed;
+  uint32_t d = escape ? (ev[call].depth > b->loop_depth ? ev[call].depth
+                                                        : b->loop_depth)
+                      : b->loop_depth;
+  if (d > 3) d = 3;
+  uint32_t score = b->diverges && !escape ? 0 : w[d] * benefit * 16 / charged;
   if (g_inl.noscore) score = 1;
 
   memset(out, 0, sizeof(*out));
@@ -507,6 +714,7 @@ static bool inl_score_site(IrFunc *f, const OptOpts *o, InlMemo *memo,
   out->rpo = ord1;
   out->idx = ord2;
   out->once = once;
+  out->escape = escape;
   out->idepth = idepth;
   if (parent) {
     memcpy(out->anc, parent->anc, parent->idepth * sizeof(uint32_t));
@@ -516,13 +724,13 @@ static bool inl_score_site(IrFunc *f, const OptOpts *o, InlMemo *memo,
 }
 
 static void inl_collect(IrFunc *f, const OptOpts *o, InlMemo *memo,
-                        InlVec *sites) {
+                        const InlEsc *ev, InlVec *sites) {
   for (uint32_t oi = 0; oi < f->norder; oi++) {
     Block *b = &f->blocks[f->order[oi]];
     for (uint32_t k = 0; k < b->ninsts; k++) {
       InlSite s;
       if (f->insts[b->insts[k]].op != I_CALL) continue;
-      if (inl_score_site(f, o, memo, b->insts[k], oi, k, NULL, &s))
+      if (inl_score_site(f, o, memo, ev, b->insts[k], oi, k, NULL, &s))
         inl_push(sites, &s);
     }
   }
@@ -560,7 +768,8 @@ static bool inl_apply(IrFunc *f, const OptOpts *o, InlMemo *memo,
 
   /* the frame-cap pressure valve: surviving calls a caller absorbs */
   if (memo[fidx].retcalls &&
-      *retsum + memo[fidx].retcalls > g_inl.retcall_total) {
+      *retsum + memo[fidx].retcalls >
+          g_inl.retcall_total + (site->escape ? INL_ESC_SLACK : 0)) {
     g_stats.inl_rej_retcalls++;
     inl_dbg(f, fidx, bi, "caller absorbed enough calls");
     return false;
@@ -574,6 +783,7 @@ static bool inl_apply(IrFunc *f, const OptOpts *o, InlMemo *memo,
   if (site->once && memo[fidx].ninsts > g_inl.max_callee)
     g_stats.inl_once_forced++;
   if (memo[fidx].retcalls) g_stats.inl_retcall_sites++;
+  if (site->escape) g_stats.inl_escape++;
   *retsum += memo[fidx].retcalls;
 
   if (!nehe && !any_eh && g->norder == 1 && g->order[0] == g->entry &&
@@ -657,7 +867,8 @@ static bool inl_run(IrFunc *f, const OptOpts *o, uint32_t budget0) {
   Module *m = f->m;
   InlMemo *memo = xcalloc(m->nfuncs ? m->nfuncs : 1, sizeof(InlMemo));
   InlVec sites = {0};
-  inl_collect(f, o, memo, &sites);
+  InlEsc *ev = o->escape ? inl_caller_evidence(f) : NULL;
+  inl_collect(f, o, memo, ev, &sites);
   qsort(sites.v, sites.n, sizeof(InlSite), inl_site_cmp);
 
   uint32_t budget = budget0;
@@ -679,7 +890,7 @@ static bool inl_run(IrFunc *f, const OptOpts *o, uint32_t budget0) {
     for (Ref v = (Ref)before; v < (Ref)f->ninsts; v++) {
       if (f->insts[v].op != I_CALL) continue;
       InlSite ns;
-      if (inl_score_site(f, o, memo, v, f->insts[v].block, v, &site, &ns))
+      if (inl_score_site(f, o, memo, NULL, v, f->insts[v].block, v, &site, &ns))
         inl_push(&sites, &ns);
     }
     if (sites.n != had)
@@ -688,6 +899,7 @@ static bool inl_run(IrFunc *f, const OptOpts *o, uint32_t budget0) {
   }
 
   xfree(sites.v);
+  xfree(ev);
   for (uint32_t fi = 0; fi < m->nfuncs; fi++) {
     if (memo[fi].plain) ir_free(memo[fi].plain);
     if (memo[fi].split) ir_free(memo[fi].split);

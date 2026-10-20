@@ -418,7 +418,7 @@ typedef struct {
   uint64_t split_cuts, split_invs;
   uint64_t devirt_ref, devirt_indirect, devirt_null_kept;
   uint64_t inl_flat, inl_spliced, inl_once_forced, inl_retcall_sites;
-  uint64_t inl_transitive;
+  uint64_t inl_transitive, inl_escape;
   uint64_t inl_rej_size, inl_rej_budget, inl_rej_tailcall, inl_rej_retcalls;
   uint64_t inl_rej_pads, inl_rej_score, inl_rej_depth, inl_rej_recursion;
   uint64_t unrolled, unr_guarded, unr_rej_shape, unr_rej_body, unr_rej_exit;

@@ -518,7 +518,7 @@ int main(int argc, char **argv) {
             "             devirt_ref=%llu devirt_indirect=%llu"
             " devirt_null_kept=%llu\n"
             "             inl_flat=%llu inl_spliced=%llu inl_once=%llu"
-            " inl_retcall_sites=%llu inl_trans=%llu rej_size=%llu"
+            " inl_retcall_sites=%llu inl_trans=%llu inl_escape=%llu rej_size=%llu"
             " rej_budget=%llu rej_tail=%llu rej_retcalls=%llu rej_pads=%llu"
             " rej_score=%llu rej_depth=%llu rej_rec=%llu max_frame=%llu\n"
             "             unrolled=%llu unr_guarded=%llu unr_rej_shape=%llu"
@@ -565,6 +565,7 @@ int main(int argc, char **argv) {
             (unsigned long long)g_stats.inl_once_forced,
             (unsigned long long)g_stats.inl_retcall_sites,
             (unsigned long long)g_stats.inl_transitive,
+            (unsigned long long)g_stats.inl_escape,
             (unsigned long long)g_stats.inl_rej_size,
             (unsigned long long)g_stats.inl_rej_budget,
             (unsigned long long)g_stats.inl_rej_tailcall,
