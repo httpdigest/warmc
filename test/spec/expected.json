@@ -267,10 +267,10 @@
  },
  "data.wast": {
   "fail": 0,
-  "pass": 51,
+  "pass": 52,
   "run": "ok",
   "run_fail": 0,
-  "run_pass": 46
+  "run_pass": 49
  },
  "data0.wast": {
   "fail": 0,
@@ -295,10 +295,10 @@
  },
  "elem.wast": {
   "fail": 0,
-  "pass": 102,
+  "pass": 103,
   "run": "ok",
   "run_fail": 0,
-  "run_pass": 123
+  "run_pass": 126
  },
  "endianness.wast": {
   "fail": 0,
@@ -673,7 +673,7 @@
  },
  "load64.wast": {
   "fail": 0,
-  "pass": 47,
+  "pass": 48,
   "run": "ok",
   "run_fail": 0,
   "run_pass": 39
@@ -991,7 +991,7 @@
   "pass": 1,
   "run": "ok",
   "run_fail": 0,
-  "run_pass": 12
+  "run_pass": 13
  },
  "relaxed_laneselect.wast": {
   "fail": 0,
@@ -1023,21 +1023,21 @@
  },
  "return_call.wast": {
   "fail": 0,
-  "pass": 15,
+  "pass": 17,
   "run": "ok",
   "run_fail": 0,
   "run_pass": 38
  },
  "return_call_indirect.wast": {
   "fail": 0,
-  "pass": 20,
+  "pass": 22,
   "run": "ok",
   "run_fail": 0,
   "run_pass": 54
  },
  "return_call_ref.wast": {
   "fail": 0,
-  "pass": 16,
+  "pass": 18,
   "run": "ok",
   "run_fail": 0,
   "run_pass": 41
@@ -1730,7 +1730,7 @@
  },
  "type-subtyping.wast": {
   "fail": 0,
-  "pass": 82,
+  "pass": 83,
   "run": "ok",
   "run_fail": 0,
   "run_pass": 84
