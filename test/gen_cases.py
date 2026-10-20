@@ -3394,6 +3394,90 @@ def gen_vector64():
                        % (tag, n, AL + doff, AL, n, AL))
     return "".join(out)
 
+def gen_stackparams():
+    """Stack parameters whose allocated home is an incoming argument register.
+
+    AArch64 passes seven integer parameters in X1-X7 and the rest on the
+    stack.  When the register parameters' moves clash, the prologue defers
+    them to one parallel copy -- and the stack parameters used to land in
+    their homes before that copy ran, so a home in X1-X7 overwrote a register
+    parameter the copy had not read yet.  TinyGo 0.43's panic-catch wrappers
+    have exactly this shape, and parameter 0 came out holding parameter 8:
+    every program that printed an error trapped in call_indirect.
+
+    permparams never reaches it: a parameter only lives in another argument
+    register when it is also a merge, so each function here may reload all of
+    its parameters on one path (a mutable global the compiler cannot see
+    through decides which), passes them on shifted by one with parameter 0 as
+    the call's table index, and folds every parameter in again after the call
+    so all of them are live across it.  The export reaches each function
+    through call_indirect too, as TinyGo does, so -O2 cannot inline it away.
+    """
+    shapes = [
+        ("i32x9", ["i32"] * 9),
+        ("i32x11", ["i32"] * 11),
+        ("i32x12", ["i32"] * 12),
+        ("i64x11", ["i32"] + ["i64"] * 10),
+        ("mixx11", ["i32", "i64", "i32", "i64", "i32", "i64", "i32", "i64",
+                    "i32", "i64", "i32"]),
+    ]
+    out = ["  (memory 1)",
+           "  (global $sp_state (mut i32) (i32.const 0))",
+           "  (table $sp_tab %d funcref)" % (2 * len(shapes) + 1)]
+
+    def fold(i, t):
+        if t == "i32":
+            return "(i64.extend_i32_u (local.get %d))" % i
+        return "(local.get %d)" % i
+
+    def hash_all(ts, acc):
+        lines = []
+        for i, t in enumerate(ts):
+            lines.append("    (local.set %d (i64.add (i64.mul (local.get %d) "
+                         "(i64.const 1000003)) %s))" % (acc, acc, fold(i, t)))
+        return lines
+
+    for slot, (tag, ts) in enumerate(shapes, 1):
+        n = len(ts)
+        ps = " ".join(ts)
+        cs = " ".join(ts[1:])
+        out.append("  (type $sp_c_%s (func (param %s) (result i64)))" % (tag, cs))
+        out.append("  (func $sp_callee_%s (type $sp_c_%s) (local i64)" % (tag, tag))
+        out += hash_all(ts[1:], n - 1)
+        out.append("    (local.get %d))" % (n - 1))
+        out.append("  (elem (table $sp_tab) (i32.const %d) func $sp_callee_%s)"
+                   % (slot, tag))
+
+        out.append("  (type $sp_t_%s (func (param %s) (result i64)))" % (tag, ps))
+        out.append("  (elem (table $sp_tab) (i32.const %d) func $sp_target_%s)"
+                   % (slot + len(shapes), tag))
+        out.append("  (func $sp_target_%s (type $sp_t_%s) (local i64)" % (tag, tag))
+        out.append("    (if (i32.eq (global.get $sp_state) (i32.const 2))")
+        out.append("      (then")
+        for i, t in enumerate(ts):
+            ld = "i32.load" if t == "i32" else "i64.load"
+            out.append("        (local.set %d (%s offset=%d (i32.const 0)))"
+                       % (i, ld, 8 * i))
+        out.append("      ))")
+        args = " ".join("(local.get %d)" % i for i in range(1, n))
+        out.append("    (local.set %d (call_indirect $sp_tab (type $sp_c_%s) %s "
+                   "(local.get 0)))" % (n, tag, args))
+        out += hash_all(ts, n)
+        out.append("    (local.get %d))" % n)
+
+        consts = []
+        for i, t in enumerate(ts):
+            if i == 0:
+                consts.append("(i32.const %d)" % slot)
+            elif t == "i32":
+                consts.append("(i32.const %d)" % (0x01010101 * (i + 1)))
+            else:
+                consts.append("(i64.const %d)" % (0x0101010101010101 * (i + 1)))
+        out.append("  (func (export \"stackparams_%s\") (result i64)" % tag)
+        out.append("    (call_indirect $sp_tab (type $sp_t_%s) %s (i32.const %d)))"
+                   % (tag, " ".join(consts), slot + len(shapes)))
+    return "\n".join(out) + "\n"
+
 def gen_permparams():
     """Functions whose parameters have to swap registers on entry.
 
@@ -3722,6 +3806,7 @@ write("downloop", gen_downloop())
 write("bulkcopy", gen_bulkcopy())
 write("magicdiv", gen_magicdiv())
 write("permparams", gen_permparams())
+write("stackparams", gen_stackparams())
 write("bswap", gen_bswap())
 write("vector64", gen_vector64())
 write("exceptions", gen_exceptions())

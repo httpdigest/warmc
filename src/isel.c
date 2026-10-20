@@ -1242,6 +1242,14 @@ static void emit_prologue(Isel *s, Buf *b) {
         if (dst[x] == src_of[y]) { clash = true; break; }
   }
 
+  /* Two passes, as on x64.  A stack parameter's allocated home may be one of
+     the incoming argument registers (X1-X7 and V0-V7 are all in the
+     allocation pools), and with a clash the register moves are deferred to
+     one parallel copy -- so a stack parameter landing in its home before
+     that copy overwrites a register the copy has yet to read.  Pass 1 does
+     the register params (and stack params bound for spill slots, which go
+     through TMP0/FTMP and clobber nothing the copy reads); pass 2 loads the
+     remaining stack params straight into their homes. */
   int next_int = 1, next_flt = 0, stack_slot = 0;
 
   Move pmv[16];
@@ -1257,25 +1265,23 @@ static void emit_prologue(Isel *s, Buf *b) {
     bool from_stack = false;
     if (fp) {
       if (next_flt < 8) src = next_flt++;
-      else {
-        stack_slot++;
-        if (vec) a64_ldr_q(b, FTMP, RSP, at);
-        else a64_fldr_imm(b, wide ? 3 : 2, FTMP, RSP, at);
-        src = FTMP;
-        from_stack = true;
-      }
+      else { stack_slot++; src = FTMP; from_stack = true; }
     } else {
       if (next_int <= 7) src = next_int++;
-      else { stack_slot++; a64_ldr_imm(b, wide ? 3 : 2, TMP0, RSP, at); src = TMP0;
-             from_stack = true; }
+      else { stack_slot++; src = TMP0; from_stack = true; }
     }
     int l = s->loc[p];
     if (l == LOC_NONE) continue;
-    if (IS_SLOT(l)) {
+    if (from_stack) {
+      if (!IS_SLOT(l)) continue;   /* register home: pass 2 */
+      if (vec) a64_ldr_q(b, FTMP, RSP, at);
+      else if (fp) a64_fldr_imm(b, wide ? 3 : 2, FTMP, RSP, at);
+      else a64_ldr_imm(b, wide ? 3 : 2, TMP0, RSP, at);
+      slot_store(b, fp, vec, src, slot_off(s, SLOT_OF(l)));
+    } else if (IS_SLOT(l)) {
       slot_store(b, fp, vec, src, slot_off(s, SLOT_OF(l)));
     } else if (l != src) {
-
-      if (clash && !from_stack) {
+      if (clash) {
         if (npmv == (int)(sizeof pmv / sizeof pmv[0]))
           warmc_fatal("internal: more parameters in registers than there are");
         pmv[npmv++] = (Move){ src, l, (uint8_t)fp, (uint8_t)(fp ? wide : 1),
@@ -1286,6 +1292,23 @@ static void emit_prologue(Isel *s, Buf *b) {
     }
   }
   if (npmv) parallel_copy_to(s, b, pmv, npmv);
+
+  next_int = 1; next_flt = 0; stack_slot = 0;
+  for (uint32_t i = 0; i < f->sig->nparams; i++) {
+    Ref p = e->params[i];
+    ValType t = f->sig->params[i];
+    bool vec = (t == VT_V128);
+    int wide = vt_is_64(t), fp = vt_is_vec_reg(t);
+
+    if (fp) { if (next_flt < 8) { next_flt++; continue; } }
+    else    { if (next_int <= 7) { next_int++; continue; } }
+    uint32_t at = s->frame + s->saved_bytes + ARG_STACK_SLOT * (uint32_t)stack_slot++;
+    int l = s->loc[p];
+    if (l == LOC_NONE || IS_SLOT(l)) continue;
+    if (vec) a64_ldr_q(b, l, RSP, at);
+    else if (fp) a64_fldr_imm(b, wide ? 3 : 2, l, RSP, at);
+    else a64_ldr_imm(b, wide ? 3 : 2, l, RSP, at);
+  }
 
   if (s->needs_mem) {
     a64_ldr_imm(b, 3, REG_MEMBASE, REG_VMCTX, VMCTX_MEM_BASE);
