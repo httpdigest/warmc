@@ -1405,7 +1405,7 @@ u64 *warmc_global_cell(WarmInstance *inst, u32 index) {
 
 static u64 gc_heap_bytes = GC_HEAP_BYTES;
 
-static u8 *gc_base, *gc_end;
+static u8 *gc_base;
 
 #define GC_MAX_TYPES (1u << 20)
 _Static_assert(GC_MAX_TYPES <= (1u << 27),
@@ -1662,7 +1662,6 @@ static void gc_init(void) {
   gc_base += (u64)(-(long)(u64)gc_base) & (GC_GRAN - 1);
   gc_heap_bytes &= ~(GC_GRAN - 1);
   if (gc_heap_bytes < 2 * GC_GRAN) die("the managed heap is smaller than two pages");
-  gc_end = gc_base + gc_heap_bytes;
   gc_ngran = gc_heap_bytes / GC_GRAN;
 
   gc_pages = (GcPage *)sys_mmap(0, (usz)(gc_ngran * sizeof(GcPage)),
@@ -4160,6 +4159,16 @@ static void gc_report(void) {
 
   put_u64_e(gcth_stop_late);
   eputs(" exits the collector outlasted\n");
+
+  eputs("  round time: ");
+  put_u64_e(gc_t_rounds);
+  eputs(" ns answering, ");
+  put_u64_e(gc_round_max);
+  eputs(" ns longest; the collector rested ");
+  put_u64_e(gc_nrests);
+  eputs(" times, ");
+  put_u64_e(gc_nrests_late);
+  eputs(" of them unwoken until the timeout\n");
 
   eputs("  mark end: ");
   put_u64_e(gc_nrounds_held);

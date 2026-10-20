@@ -61,18 +61,6 @@ static const char *r32[16] = {
   "eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi",
   "r8d", "r9d", "r10d", "r11d", "r12d", "r13d", "r14d", "r15d"
 };
-static const char *r16[16] = {
-  "ax", "cx", "dx", "bx", "sp", "bp", "si", "di",
-  "r8w", "r9w", "r10w", "r11w", "r12w", "r13w", "r14w", "r15w"
-};
-static const char *r8[16] = {
-  "al", "cl", "dl", "bl", "spl", "bpl", "sil", "dil",
-  "r8b", "r9b", "r10b", "r11b", "r12b", "r13b", "r14b", "r15b"
-};
-static const char *xmm[16] = {
-  "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7",
-  "xmm8", "xmm9", "xmm10", "xmm11", "xmm12", "xmm13", "xmm14", "xmm15"
-};
 static const char *rw(int w, int r) { return w ? r64[r] : r32[r]; }
 
 /* condition-code suffixes in tttn order */
