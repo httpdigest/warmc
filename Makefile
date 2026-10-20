@@ -236,49 +236,71 @@ check-encoder: $(BUILD)/a64_test$(EXE) $(BUILD)/x64_test$(EXE)
 	@./test/run_a64_test.sh $(BUILD)
 	@./test/run_x64_test.sh $(BUILD)
 
-TESTSUITE_COMMIT := 65a43d2e9464b6967c98b23c8493765c4d124f4e
+# The testsuite checkout, wasm-tools and the Kotlin stdlib are cached under
+# $(BUILD), and a cached copy is only good while it is the pinned version.
+# Each rule leaves a stamp naming the version it fetched, so bumping a pin
+# (or upgrading kotlinc) fetches again instead of testing against whatever
+# an older pin left behind.
+TESTSUITE_COMMIT := 9b9fbf8260507169066bf3e8de7b01fb8c145e55
+TESTSUITE_STAMP  := $(BUILD)/testsuite/.commit-$(TESTSUITE_COMMIT)
 
-$(BUILD)/testsuite/README.md:
+$(TESTSUITE_STAMP):
 	@mkdir -p $(BUILD)
-	git clone -q https://github.com/WebAssembly/testsuite.git $(BUILD)/testsuite
-	@cd $(BUILD)/testsuite && git checkout -q $(TESTSUITE_COMMIT)
+	@test -d $(BUILD)/testsuite/.git || \
+	  git clone -q https://github.com/WebAssembly/testsuite.git $(BUILD)/testsuite
+	@cd $(BUILD)/testsuite && { git checkout -q $(TESTSUITE_COMMIT) 2>/dev/null || \
+	  { git fetch -q origin && git checkout -q $(TESTSUITE_COMMIT); }; }
+	@rm -f $(BUILD)/testsuite/.commit-*
+	@touch $@
 
-testsuite: $(BUILD)/testsuite/README.md
+testsuite: $(TESTSUITE_STAMP)
 
-WASM_TOOLS_VERSION := 1.257.1
+# test/spec/run.py reads this line to know which version to insist on.
+WASM_TOOLS_VERSION := 1.262.0
+WASM_TOOLS_STAMP   := $(BUILD)/tools/.wasm-tools-$(WASM_TOOLS_VERSION)
 
-$(BUILD)/tools/bin/wasm-tools:
+$(WASM_TOOLS_STAMP):
 	@command -v cargo >/dev/null 2>&1 || { \
 	  echo "make wasm-tools: cargo not found; it is what builds the .wast converter"; \
 	  exit 1; }
-	cargo install --root $(BUILD)/tools --locked \
+	cargo install --root $(BUILD)/tools --locked --force \
 	  --version $(WASM_TOOLS_VERSION) wasm-tools
+	@rm -f $(BUILD)/tools/.wasm-tools-*
+	@touch $@
 
-wasm-tools: $(BUILD)/tools/bin/wasm-tools
+wasm-tools: $(WASM_TOOLS_STAMP)
 
 KOTLIN_VERSION := $(shell kotlinc -version 2>&1 | sed -n 's/.*kotlinc-jvm \([0-9.]*\).*/\1/p')
 KOTLIN_WASI_KLIB := $(BUILD)/tools/kotlin-stdlib-wasm-wasi.klib
+# test/gobench.py looks for this stamp to tell a stale klib from a missing one.
+KOTLIN_STAMP     := $(BUILD)/tools/.kotlin-stdlib-$(KOTLIN_VERSION)
 
-$(KOTLIN_WASI_KLIB):
+$(KOTLIN_STAMP):
 	@command -v kotlinc-wasm >/dev/null 2>&1 || { \
 	  echo "make kotlin-stdlib: kotlinc-wasm not found (brew install kotlin)"; \
 	  exit 1; }
 	@test -n "$(KOTLIN_VERSION)" || { \
 	  echo "make kotlin-stdlib: cannot read the compiler version"; exit 1; }
 	@mkdir -p $(BUILD)/tools
-	curl -sSLf -o $@ \
+	curl -sSLf -o $(KOTLIN_WASI_KLIB) \
 	  "https://repo1.maven.org/maven2/org/jetbrains/kotlin/kotlin-stdlib-wasm-wasi/$(KOTLIN_VERSION)/kotlin-stdlib-wasm-wasi-$(KOTLIN_VERSION).klib"
+	@rm -f $(BUILD)/tools/.kotlin-stdlib-*
+	@touch $@
 
-kotlin-stdlib: $(KOTLIN_WASI_KLIB)
+kotlin-stdlib: $(KOTLIN_STAMP)
+
+# `make check` brings the pinned tools up to date first; ktbench skips itself
+# without a Kotlin compiler, so the stdlib is only fetched when there is one.
+CHECK_TOOLS := wasm-tools $(if $(KOTLIN_VERSION),kotlin-stdlib)
 
 SPEC_LEVELS ?= -O1,-O2,-O2 --profile=deterministic
 
 check-spec: $(BUILD)/warmc$(EXE) $(BUILD)/warmrt.a $(BUILD)/warmrt-macos.a \
-            $(BUILD)/testsuite/README.md $(BUILD)/tools/bin/wasm-tools
+            $(TESTSUITE_STAMP) $(WASM_TOOLS_STAMP)
 	@python3 test/spec/run.py "--levels=$(SPEC_LEVELS)"
 
 conformance: $(BUILD)/warmc$(EXE) $(BUILD)/warmrt.a $(BUILD)/warmrt-macos.a \
-             $(BUILD)/testsuite/README.md $(BUILD)/tools/bin/wasm-tools
+             $(TESTSUITE_STAMP) $(WASM_TOOLS_STAMP)
 	@{ \
 	  echo '# Conformance'; \
 	  echo; \
@@ -309,7 +331,7 @@ check-win-fixture:
 	@$(CC) -o $(BUILD)/win_fixture$(EXE) test/win_fixture.c
 	@echo "win-fixture: OK (the Win32 offsets the runtime hard-codes match windows.h)"
 
-check: all $(SAN_TARGETS) $(WIN_CHECKS) check-encoder
+check: all $(SAN_TARGETS) $(WIN_CHECKS) check-encoder $(CHECK_TOOLS)
 	@./test/run_all.sh
 
 check-linux: all
@@ -350,7 +372,7 @@ gc-jitter-full: all wasm-tools
 clean:
 	rm -rf $(BUILD)
 
-.PHONY: all asan tsan check check-linux check-encoder check-spec conformance testsuite wasm-tools fuzz clean \
-        bench-compare bench-record gc-jitter gc-jitter-full
+.PHONY: all asan tsan check check-linux check-encoder check-spec conformance testsuite wasm-tools \
+        kotlin-stdlib fuzz clean bench-compare bench-record gc-jitter gc-jitter-full
 
 -include $(WARMC_DEPS)
