@@ -581,7 +581,15 @@ int main(int argc, char **argv) {
   if (obj_only) return 0;
 
   if (!rt) warmc_fatal("no runtime specified; pass --rt or set WARMC_RT");
-  if (!ld) ld = "ld.lld";
+  /* The external linker has to speak the output's format: ld.lld is ELF
+     only, and handed the Mach-O arguments below it refuses every one. */
+  if (!ld) {
+#ifdef __APPLE__
+    ld = macho ? "ld" : "ld.lld";
+#else
+    ld = macho ? "ld64.lld" : "ld.lld";
+#endif
+  }
 
   char wasipath[4096];
   if (want_wasi) wasi = wasi_archive(rt, wasi, false, wasipath, sizeof wasipath);
