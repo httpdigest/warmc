@@ -575,10 +575,28 @@ def baseline_rows(names, variants, best, second, have_wasmtime, rss=None):
         out[k] = row
     return out
 
-def baseline_record(corpus, rows, host, variant):
-    """Write this run's figures in as the corpus's baseline."""
+def first_line(cmd):
+    """A tool's version line, or None when it will not say."""
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True)
+    except OSError:
+        return None
+    out = (r.stdout.strip() or r.stderr.strip()).splitlines()
+    return out[0] if out else None
+
+def baseline_record(corpus, rows, host, variant, lang):
+    """Write this run's figures in as the corpus's baseline.
+
+    The ratios are against one wasmtime and one producer, so both versions go
+    in beside them: a baseline that does not say what it measured cannot be
+    told stale from regressed once either tool moves.
+    """
     data = baseline_load()
-    data[corpus] = {"host": host, "variant": variant, "kernels": rows}
+    producer = (["kotlinc", "-version"] if lang == "kt"
+                else [TOOLCHAIN[lang][0]] + TOOLCHAIN[lang][1])
+    data[corpus] = {"host": host, "variant": variant, "kernels": rows,
+                    "wasmtime": first_line(["wasmtime", "--version"]),
+                    "producer": first_line(producer)}
     with open(BASELINE, "w") as f:
         json.dump(data, f, indent=2, sort_keys=True)
         f.write("\n")
@@ -891,7 +909,7 @@ def main():
         rows = baseline_rows(names, variants, best, second, have_wasmtime, rss)
         print()
         if record:
-            return baseline_record(CORPUS, rows, host, base)
+            return baseline_record(CORPUS, rows, host, base, lang)
         return baseline_compare(CORPUS, rows, host, base, threshold)
     return 0
 
