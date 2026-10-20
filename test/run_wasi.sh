@@ -119,30 +119,21 @@ build_driven() {
 }
 
 # A write to a pipe whose reader has gone has to surface as EPIPE rather than
-# as a full write that never happened.  wasmtime agrees on the exit status, so
-# this one is still differential -- it just cannot be run with stdout on a file.
+# as a full write that never happened.  It cannot be run with stdout on a file.
+#
+# The kernel says EPIPE (Win32 says ERROR_NO_DATA, which is EPIPE too) -- 64,
+# the exit this module documents as the healthy one.  wasmtime 47 reported
+# EIO for it on Windows, and since 49 its preview1 layer reports EIO on every
+# host, so the status is asserted rather than diffed; that both engines fail
+# the write at all is still differential.
 if build_driven brokenpipe; then
   "$DRIVEN_EXE" 2>/dev/null | head -1 >/dev/null
   rc_warmc=${PIPESTATUS[0]}
   "$WASMTIME" "$DRIVEN_WASM" 2>/dev/null | head -1 >/dev/null
   rc_ref=${PIPESTATUS[0]}
-  if [ "$WIN" = 1 ]; then
-    # Win32 fails the write with ERROR_NO_DATA, which is EPIPE -- 64, the
-    # exit this module documents as the healthy one.  wasmtime 47 reports
-    # EIO there instead, so on Windows the status is asserted rather than
-    # diffed; that both engines fail the write at all is still differential.
-    if [ "$rc_warmc" != 64 ] || [ "$rc_ref" = 0 ]; then
-      echo "FAIL[wasi/brokenpipe]: exit $rc_warmc (want 64)," \
-           "wasmtime exit $rc_ref (want non-zero)"
-      fail=1
-    else
-      pass=$((pass + 1))
-    fi
-  elif [ "$rc_warmc" != "$rc_ref" ]; then
-    echo "FAIL[wasi/brokenpipe]: exit $rc_warmc, wasmtime exit $rc_ref"
-    fail=1
-  elif [ "$rc_warmc" = 0 ]; then
-    echo "FAIL[wasi/brokenpipe]: both engines exited 0; the write never failed"
+  if [ "$rc_warmc" != 64 ] || [ "$rc_ref" = 0 ]; then
+    echo "FAIL[wasi/brokenpipe]: exit $rc_warmc (want 64)," \
+         "wasmtime exit $rc_ref (want non-zero)"
     fail=1
   else
     pass=$((pass + 1))

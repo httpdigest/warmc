@@ -50,7 +50,7 @@
         (i32.const 256)))
     (core instance $i (instantiate $m))
     (func $mk (param "n" u32) (result string)
-      (canon lift (core func $i "make") (memory $i "mem") (realloc (func $i "realloc"))))
+      (canon lift (core func $i "make") (memory (core memory $i "mem")) (realloc (core func $i "realloc"))))
     (instance $iface (export "make" (func $mk)))
     (export "test:fuse/gen" (instance $iface)))
 
@@ -67,7 +67,7 @@
         global.get $bump local.get 3 i32.add global.set $bump))
     (core instance $mi (instantiate $mem))
     (core func $low (canon lower (func $mk)
-      (memory $mi "mem") (realloc (func $mi "realloc"))))
+      (memory (core memory $mi "mem")) (realloc (core func $mi "realloc"))))
     (core module $c
       (import "" "mk" (func $mk (param i32 i32)))
       (import "" "mem" (memory 1))

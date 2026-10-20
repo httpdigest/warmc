@@ -20,8 +20,8 @@
       (func (export "r") (param i32 i32 i32 i32) (result i32) i32.const 16))
     (core instance $mi (instantiate $m))
     (func (export "f") (param "l" (list u8)) (result u32)
-      (canon lift (core func $mi "f") (memory $mi "mem")
-                  (realloc (func $mi "r")))))
+      (canon lift (core func $mi "f") (memory (core memory $mi "mem"))
+                  (realloc (core func $mi "r")))))
   (component $caller
     (import "f" (func $f (param "a" u32) (param "b" u32) (result u32)))
     (core func $lf (canon lower (func $f)))

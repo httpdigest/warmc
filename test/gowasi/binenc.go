@@ -5,6 +5,12 @@
 // orders, which is a different corner of the back end from arithmetic; the
 // straddling reads are what a positional read gets wrong when its offset
 // arithmetic is off by a word.
+//
+// tinygo: -scheduler=asyncify
+//
+// Since Go 1.27 the standard library this reaches can start a goroutine
+// (time.AfterFunc's goFunc), which TinyGo refuses to build without a
+// scheduler.
 package main
 
 import (
