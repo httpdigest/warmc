@@ -2,9 +2,17 @@
 
 : "${BUILD:=build}"
 
-WABT_FLAGS="--enable-exceptions --enable-function-references --enable-tail-call \
---enable-gc --enable-memory64 --enable-multi-memory --enable-extended-const \
---enable-relaxed-simd --enable-annotations"
+# wabt 1.0.42 turned most of these proposals on by default and removed their
+# --enable flags, which it now rejects; pass only the ones this wat2wasm still
+# lists.  test/hostbuild.py's wabt_flags() makes the same choice.
+WABT_FLAGS=""
+_wabt_help=$(wat2wasm --help 2>/dev/null)
+for _f in exceptions function-references tail-call gc memory64 multi-memory \
+          extended-const relaxed-simd annotations; do
+  case "$_wabt_help" in *"--enable-$_f "*) WABT_FLAGS="$WABT_FLAGS --enable-$_f" ;; esac
+done
+WABT_FLAGS=${WABT_FLAGS# }
+unset _wabt_help _f
 export WABT_FLAGS
 
 case "$(uname -s)/$(uname -m)" in

@@ -104,6 +104,29 @@ def wabt_bigstack(build):
             f.write(data)
     return outdir
 
+# The proposals every harness asks wabt for.  wabt 1.0.42 turned most of them
+# on by default and removed their --enable flags, which it now rejects, so
+# only the ones the installed wat2wasm still lists are passed.  test/hostenv.sh
+# makes the same choice for the shell runners.
+WABT_FEATURES = ("exceptions", "function-references", "tail-call", "gc",
+                 "memory64", "multi-memory", "extended-const", "relaxed-simd",
+                 "annotations")
+
+_wabt_flags = None
+
+def wabt_flags():
+    """The --enable flags for WABT_FEATURES that this wabt accepts."""
+    global _wabt_flags
+    if _wabt_flags is None:
+        import re
+        try:
+            known = set(re.findall(r"--enable-[\w-]+", sh(["wat2wasm", "--help"]).stdout))
+        except OSError:
+            known = set()
+        _wabt_flags = [f for f in ("--enable-" + x for x in WABT_FEATURES)
+                       if f in known]
+    return list(_wabt_flags)
+
 # A command line over the same two steps, for the shell runners.  They used to
 # carry their own `case $(uname -s)` with a Darwin arm and an aarch64-Linux
 # fallback, which made every one of them wrong on a third target; going through
