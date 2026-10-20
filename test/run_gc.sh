@@ -27,6 +27,7 @@ assemble test/cases_gc/gccollect.wat gccollect
 assemble test/cases_gc/constroot.wat constroot
 assemble test/cases_gc/exnpayload.wat exnpayload
 assemble test/cases_gc/devirt_vt.wat devirt_vt
+assemble test/cases_gc/escape.wat escape
 assemble "$WORK/gcgen.wat" gcgen
 
 [ "${1:-}" = --prepare ] && exit 0
@@ -242,6 +243,70 @@ expect vt_nullslot_ok     "OK"
 expect vt_nulltrap        "null reference"
 expect vt_mut             "OK"
 expect vt_dup             "OK"
+
+build_one escape
+expect sr_box_loop        "OK" 10 45
+expect sr_box_cond        "OK" 10 20
+expect sr_nested          "OK" 4 16
+expect sr_branches        "OK" 1 1002
+expect sr_branches        "OK" 0 120
+expect sr_merge           "OK" 1 34
+expect sr_merge           "OK" 0 56
+expect sr_loop_fresh      "OK" 10 55
+expect sr_loop_fresh      "OK" 0 0
+expect sr_swap            "OK" 3 21
+expect sr_swap            "OK" 4 12
+expect sr_cast            "OK" 5 12
+expect sr_eq              "OK" 2
+expect sr_array_fixed     "OK" 6 4030
+expect sr_array_default   "OK" 1 500
+expect sr_array_default   "OK" 0 7
+expect sr_array_fill      "OK" 0x3FF8000000000000 17
+expect sr_vectors         "OK" 34
+expect sr_packed          "OK" -5580025536
+expect sr_packed_array    "OK" 1422
+expect sr_ref_field       "OK" 9
+expect keep_call          "OK" 0 6
+expect keep_global        "OK" 8
+expect keep_select        "OK" 1 11
+expect keep_select        "OK" 0 22
+expect keep_oob           "out of bounds array access" 0
+expect keep_eh            "OK" 1 2
+expect keep_eh            "OK" 0 3
+expect keep_reused        "OK" 1 5
+expect keep_reused        "OK" 0 2
+expect keep_shared_edge   "OK" 0 2
+expect keep_shared_edge   "OK" 3 100
+
+# The sr_ cases are right whether or not their objects were replaced, so
+# whether they were is asked separately: at the default -O2, every
+# allocation in an sr_ function must end the pipeline replaced.
+# WARMC_ESCAPE_DEBUG names functions by index; wasm-tools maps them back.
+if [ -z "${WARMC_FLAGS:-}" ] || [ "${WARMC_FLAGS:-}" = -O2 ]; then
+  if why=$(WARMC_ESCAPE_DEBUG=1 wtimeout ./$BUILD/warmc -O2 -j1 -c -o /dev/null \
+             "$WORK/escape.wasm" 2>&1 >/dev/null |
+           python3 -c '
+import re, subprocess, sys
+names = {}
+for m in re.finditer(r"\(export \"(sr_\w+)\" \(func (\d+)\)\)",
+                     subprocess.run([sys.argv[1], "print", sys.argv[2]],
+                                    capture_output=True, text=True).stdout):
+    names[int(m.group(2))] = m.group(1)
+last = {}
+for line in sys.stdin:
+    m = re.match(r"escape wasm_func_(\d+) (v\d+) \w+ d\d+: (.*)", line.strip())
+    if m and int(m.group(1)) in names: last[(int(m.group(1)), m.group(2))] = m.group(3)
+bad = ["%s %s: %s" % (names[f], v, w) for (f, v), w in sorted(last.items()) if w != "replaced"]
+bad += ["%s: no allocation reached the pass" % n for f, n in sorted(names.items())
+        if not any(k[0] == f for k in last)]
+print("; ".join(bad))
+sys.exit(1 if bad else 0)' "$WT" "$WORK/escape.wasm"); then
+    pass=$((pass+1))
+  else
+    echo "FAIL[gc] escape: an sr_ allocation was not replaced: $why"
+    fail=$((fail+1))
+  fi
+fi
 
 build_one gccollect
 expect churn              "OK" $N
