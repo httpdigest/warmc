@@ -5,18 +5,19 @@ reference interpreter.  Driven by test/run_tests.sh, which sets the host
 variables; run directly it does the same thing.
 
 Three things this does that a loop over the cases would not, all of them
-because `make check` runs it six times over the same seventeen modules:
+because `make check` runs it six times over the same modules, one per
+test/cases/*.wat:
 
   * The interpreter's answers depend on the module alone and not on which
     warmc flags produced the binary, so they are computed once and cached
     against the module -- five of the six runs used to recompute them.
   * The modules are independent, so they are compiled and compared in
     parallel.  Everything here is a subprocess, so threads are enough.
-  * All seventeen go into *one* executable, which is then asked for a module
+  * All of them go into *one* executable, which is then asked for a module
     by name.  On macOS the first run of a freshly linked binary costs a fifth
     of a second of signature validation whatever is in it, and running the
-    suite at six flag settings meant a hundred and two of those; it is now
-    six, and each of the remaining launches costs milliseconds.
+    suite at six flag settings meant one of those per module per setting;
+    it is now six, and each of the remaining launches costs milliseconds.
 """
 import concurrent.futures
 import glob

@@ -6,15 +6,19 @@ warmc refuses for the wrong reason, or accepts when the spec says it is
 invalid, is invisible to a differential harness that only ever feeds it valid
 modules.
 
-What runs today:
+What runs:
 
   assert_malformed   the binary must be rejected as malformed  (exit 2)
   assert_invalid     the binary must be rejected as invalid    (exit 3)
   module             the module must compile
 
-Execution -- assert_return, assert_trap, register and the rest -- arrives with
-the multi-module runtime; those commands are counted as `skipped` until then
-so the totals do not silently shrink.
+and then, against the compiled modules linked into one driver (driver.c,
+with the tables test/spec/gen.py writes), the commands that execute:
+assert_return, assert_trap, assert_exhaustion, assert_exception,
+assert_uninstantiable, assert_unlinkable, register and action.  A command the
+generator cannot express -- one naming a module that did not compile -- is
+counted as `skipped` rather than dropped, so the totals do not silently
+shrink.
 
 Every file's result is compared against test/spec/expected.json, which records
 what warmc fails today.  A file that starts passing is as much of a mismatch

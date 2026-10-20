@@ -1,8 +1,9 @@
 """The Component Model decoder, tested four ways.
 
-There is no interpreter to compare answers against here -- warmc does not run
-a component yet -- so the question a test can ask is whether the *structure*
-warmc decoded is the structure that is there.  Four instruments, each seeing
+This file is about decoding, not running: the components warmc compiles are
+run against wasmtime by test/run_clink.py, and the ones it refuses are
+checked there to say why.  The question a test can ask here is whether the
+*structure* warmc decoded is the structure that is there.  Four instruments, each seeing
 something the others cannot:
 
 1. **An oracle.**  `wasm-tools objdump` reads the same bytes with a wholly

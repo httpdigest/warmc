@@ -3,8 +3,8 @@
 Both sides are normalised to unsigned hex per value so that the two
 printers' formatting differences do not matter.
 
-Importable as well as runnable: the case harness compares seventeen modules
-at several optimisation levels, and starting a Python for each of a hundred
+Importable as well as runnable: the case harness compares every case module
+at several optimisation levels, and starting a Python for each of those
 comparisons cost more than the comparing did.
 """
 import os
