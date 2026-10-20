@@ -249,10 +249,14 @@ fi
 # file reached through a stream -- and nothing
 # a tinygo guest can be made to ask for: it reaches a file with
 # descriptor.read and descriptor.write, and Rust opens a stream over the
-# descriptor instead.  test/run_rswasip2.sh covers them and makes the same
+# descriptor instead.  The eighth, exit-with-code, is not in the WIT tinygo
+# builds against at all -- the probe is embedded against that WIT too -- and
+# is how rustc's std exits with anything but 0 or 1.  test/run_rswasip2.sh
+# covers all eight (exitcode.rs for this one) and makes the same
 # check against the same table, so they are named here rather than left to
 # pass by being invisible to this one.
-RS_ONLY="wasi:io/streams#[method]input-stream.read
+RS_ONLY="wasi:cli/exit#exit-with-code
+         wasi:io/streams#[method]input-stream.read
          wasi:filesystem/types#[method]descriptor.append-via-stream
          wasi:filesystem/types#[method]descriptor.get-flags
          wasi:filesystem/types#[method]descriptor.metadata-hash
