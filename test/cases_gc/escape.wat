@@ -30,6 +30,7 @@
   (table $fns 1 funcref)
   (elem (table $fns) (i32.const 0) func $take)
   (tag $boom)
+  (tag $report (param i64))
 
   (func $want (param $got i64) (param $exp i64)
     (if (i64.ne (local.get $got) (local.get $exp)) (then unreachable)))
@@ -258,6 +259,55 @@
                   (i64.mul (i64.extend_i32_s (array.get_u $ai8 (local.get $a) (i32.const 0))) (i64.const 10)))
                   (i64.extend_i32_s (array.get_s $ai8 (local.get $a) (i32.const 1))))
                 (local.get $exp)))
+
+  ;; ---- freed by inlining (inline.c's escape evidence) ------------------
+  ;;
+  ;; The object leaves only through a call, into a callee that keeps it to
+  ;; itself.  The inliner would refuse both callees on its own terms -- one
+  ;; makes calls of its own, the other is reached from a cold block and is
+  ;; not tiny -- and takes them because the inline frees the allocation.
+
+  (func $ei_sq (param $v i64) (result i64) (i64.mul (local.get $v) (local.get $v)))
+
+  (func $ei_dist2 (param $p (ref $pt)) (result i64)
+    (i64.add (call $ei_sq (struct.get $pt $x (local.get $p)))
+             (call $ei_sq (struct.get $pt $y (local.get $p)))))
+
+  (func (export "sr_helper_loop") (param $n i32) (param $exp i64)
+    (local $i i32) (local $s i64)
+    (block $done
+      (loop $l
+        (br_if $done (i32.ge_s (local.get $i) (local.get $n)))
+        (local.set $s (i64.add (local.get $s)
+          (call $ei_dist2 (struct.new $pt (i64.extend_i32_s (local.get $i))
+                                          (i64.extend_i32_s (i32.add (local.get $i) (i32.const 1)))))))
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br $l)))
+    (call $want (local.get $s) (local.get $exp)))
+
+  ;; a failure report with enough in it not to count as tiny
+  (func $ei_fail (param $p (ref $pt))
+    (local $a i64) (local $b i64)
+    (local.set $a (i64.mul (struct.get $pt $x (local.get $p)) (i64.const 31)))
+    (local.set $b (i64.xor (struct.get $pt $y (local.get $p)) (i64.const 0x5bd1e995)))
+    (local.set $a (i64.add (i64.rotl (local.get $a) (i64.const 13)) (local.get $b)))
+    (local.set $b (i64.mul (i64.shr_u (local.get $b) (i64.const 7)) (local.get $a)))
+    (throw $report (i64.add (local.get $a) (local.get $b))))
+
+  (func (export "sr_cold_report") (param $n i32) (param $exp i64)
+    (local $i i32) (local $s i64) (local $p (ref $pt))
+    (block $done
+      (loop $l
+        (br_if $done (i32.ge_s (local.get $i) (local.get $n)))
+        (local.set $p (struct.new $pt (i64.extend_i32_s (local.get $i))
+                                      (i64.mul (i64.extend_i32_s (local.get $i)) (i64.const 3))))
+        (if (i64.gt_u (struct.get $pt $x (local.get $p)) (i64.const 0xffffffffff))
+          (then (call $ei_fail (local.get $p)) (unreachable)))
+        (local.set $s (i64.add (local.get $s)
+          (i64.add (struct.get $pt $x (local.get $p)) (struct.get $pt $y (local.get $p)))))
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br $l)))
+    (call $want (local.get $s) (local.get $exp)))
 
   ;; ---- refused, and still right -----------------------------------------
 

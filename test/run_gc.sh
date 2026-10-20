@@ -266,6 +266,8 @@ expect sr_vectors         "OK" 34
 expect sr_packed          "OK" -5580025536
 expect sr_packed_array    "OK" 1422
 expect sr_ref_field       "OK" 9
+expect sr_helper_loop     "OK" 10 670
+expect sr_cold_report     "OK" 10 180
 expect keep_call          "OK" 0 6
 expect keep_global        "OK" 8
 expect keep_select        "OK" 1 11
