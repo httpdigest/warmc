@@ -629,25 +629,29 @@ cheaper. Functions compile in parallel and are laid out deterministically.
 
 ## Performance
 
-`test/baseline.json` records warmc against wasmtime on the author's Apple
-silicon machine, at `-O2`. Each figure is the geometric mean of
-warmc time ÷ wasmtime time, so lower is better. Each engine's empty-program
-time is subtracted first, so the ratios compare steady-state generated code,
-not start-up or compile time.
+`test/baseline.json` records warmc against wasmtime 50.0.0 on the author's
+Apple silicon machine, at `-O2`, with each corpus's producer version beside
+it (TinyGo 0.43, rustc nightly 1.101, Zig 0.17, AssemblyScript 0.28.20,
+Kotlin 2.4.21). Each figure is the geometric mean of warmc time ÷ wasmtime
+time, so lower is better. Each engine's empty-program time is subtracted
+first, so the ratios compare steady-state generated code, not start-up or
+compile time.
 
 | Corpus | Source language | Kernels | warmc / wasmtime | Range | Median peak RSS (warmc / wasmtime) |
 |---|---|---:|---:|---|---|
-| `gobench` | TinyGo | 26 | 0.62 | 0.07 – 1.01 | 1.6 / 8.5 MB |
-| `vecbench` | TinyGo (vectorisable loops) | 30 | 0.15 | 0.04 – 0.96 | 1.6 / 8.5 MB |
-| `asbench` | AssemblyScript | 25 | 0.62 | 0.13 – 1.03 | 1.6 / 8.4 MB |
-| `rsbench` | Rust | 28 | 0.71 | 0.34 – 1.00 | 1.6 / 170 MB |
-| `zigbench` | Zig | 9 | 0.68 | 0.41 – 1.00 | 1.6 / 8.4 MB |
-| `ktbench` | Kotlin (Wasm GC) | 12 | 0.19 | 0.006 – 0.55 | 8.8 / 20.6 MB |
+| `gobench` | TinyGo | 26 | 0.64 | 0.07 – 1.06 | 1.9 / 8.9 MB |
+| `vecbench` | TinyGo (vectorisable loops) | 30 | 0.15 | 0.04 – 0.94 | 1.9 / 8.9 MB |
+| `asbench` | AssemblyScript | 25 | 0.68 | 0.19 – 1.62 | 1.9 / 8.7 MB |
+| `rsbench` | Rust | 28 | 0.72 | 0.35 – 1.00 | 1.9 / 9.1 MB |
+| `zigbench` | Zig | 9 | 0.69 | 0.40 – 0.99 | 1.9 / 8.8 MB |
+| `ktbench` | Kotlin (Wasm GC) | 12 | 0.15 | 0.006 – 0.53 | 9.2 / 20.6 MB |
 
-Over all 130 kernels the geometric mean is **0.42**. Four kernels are slower
-than wasmtime, by at most 3%. The baseline does not record the wasmtime
-version, so re-run the comparison on your own machine before relying on these
-numbers:
+Over all 130 kernels the geometric mean is **0.42**. Six kernels are slower
+than wasmtime. Five of them are within 6%; the sixth, `asbench/arrpush`
+(growing an array by `push`), runs at 1.62×. That kernel was 0.94× against
+wasmtime 49, and warmc's own time did not change, so wasmtime 50 is what got
+faster there. Re-run the comparison on your own machine before relying on
+these numbers:
 
 ```sh
 python3 test/gobench.py --corpus rsbench --rounds 5     # one corpus
