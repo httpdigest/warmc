@@ -161,7 +161,10 @@ $(BUILD)/rt/wasi-stub-windows.o: rt/wasi.wat $(BUILD)/warmc$(EXE)
 	$(BUILD)/warmc$(EXE) -O2 -c --target=windows --symbol-prefix=warmc_wasi_stub \
 	  -o $@ rt/wasi.wat
 
-WASI_OBJS := $(BUILD)/rt/wasi.o $(BUILD)/rt/wasifs.o $(BUILD)/rt/wasi-stub.o
+# A Linux program links no libc, so the Linux hosts carry rt/linuxposix.c:
+# the POSIX surface rt/wasi.c and rt/wasifs.c call, over raw system calls.
+WASI_OBJS := $(BUILD)/rt/wasi.o $(BUILD)/rt/wasifs.o $(BUILD)/rt/linuxposix.o \
+             $(BUILD)/rt/wasi-stub.o
 WASI_MOBJS := $(BUILD)/rt/wasi-macos.o $(BUILD)/rt/wasifs-macos.o \
               $(BUILD)/rt/wasi-stub-macos.o
 # Windows has no libc behind the POSIX names rt/wasi.c and rt/wasifs.c call,
@@ -181,7 +184,7 @@ $(BUILD)/warmwasi-windows.a: $(WASI_WOBJS)
 	@rm -f $@
 	llvm-ar rcs $@ $(WASI_WOBJS)
 
-P2_OBJS := $(BUILD)/rt/wasip2.o $(BUILD)/rt/wasifs.o
+P2_OBJS := $(BUILD)/rt/wasip2.o $(BUILD)/rt/wasifs.o $(BUILD)/rt/linuxposix.o
 P2_MOBJS := $(BUILD)/rt/wasip2-macos.o $(BUILD)/rt/wasifs-macos.o
 
 $(BUILD)/warmwasip2.a: $(P2_OBJS)

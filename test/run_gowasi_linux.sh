@@ -29,6 +29,13 @@ fi
 
 cp "$BUILD/warmrt.a" "$BUILD/warmwasi.a" "$WORK/" || exit 1
 
+# Each program is linked for Linux twice.  `.st` is warmc's own link: a static
+# ELF with no libc, the WASI host's POSIX calls answered by rt/linuxposix.c
+# over raw system calls -- what `warmc --wasi --target linux` gives a user.
+# `.lx` is the object linked by gcc against glibc, the way an embedder's driver
+# would be: the host must keep to its own warmc_lx_* names and leave that
+# libc's malloc and stdio alone.  Both have to match the macOS run.
+
 printf 'alpha\nbeta\ngamma\n' > "$WORK/stdin.txt"
 printf 'secret\n' > "$WORK/escape.secret"
 
@@ -62,6 +69,32 @@ for src in test/gowasi/*.go; do
       -o "$WORK/$name.o" "$WORK/$name.wasm" 2>"$WORK/$name.lx.err" || {
     echo "FAIL[gowasi-linux/$name]: warmc could not build for Linux"
     sed 's/^/    /' "$WORK/$name.lx.err"; exit 1; }
+  ./$BUILD/warmc --wasi -O2 --target=linux --rt "$BUILD/warmrt.a" \
+      -o "$WORK/$name.st" "$WORK/$name.wasm" 2>"$WORK/$name.st.err" || {
+    echo "FAIL[gowasi-linux/$name]: warmc could not link it for Linux itself"
+    sed 's/^/    /' "$WORK/$name.st.err"; exit 1; }
+  names+=("$name")
+done
+
+# The WASI 0.2 host carries the same POSIX layer, so the tinygo wasip2 corpus
+# runs through it too -- linked by warmc alone, as a component has no -c path
+# that a C driver could take over.
+for src in test/wasip2/*.go; do
+  name=p2-$(basename "$src" .go)
+  if ! tinygo build -o "$WORK/$name.wasm" -target=wasip2 "$src" \
+       2>"$WORK/$name.tinygo.err"; then
+    echo "FAIL[gowasi-linux/$name]: tinygo could not build it"
+    sed 's/^/    /' "$WORK/$name.tinygo.err"
+    exit 1
+  fi
+  ./$BUILD/warmc --wasi -O2 --target=macos --rt "$BUILD/warmrt-macos.a" \
+      -o "$WORK/$name.mac" "$WORK/$name.wasm" 2>"$WORK/$name.mac.err" || {
+    echo "FAIL[gowasi-linux/$name]: warmc could not build for macOS"
+    sed 's/^/    /' "$WORK/$name.mac.err"; exit 1; }
+  ./$BUILD/warmc --wasi -O2 --target=linux --rt "$BUILD/warmrt.a" \
+      -o "$WORK/$name.st" "$WORK/$name.wasm" 2>"$WORK/$name.st.err" || {
+    echo "FAIL[gowasi-linux/$name]: warmc could not link it for Linux itself"
+    sed 's/^/    /' "$WORK/$name.st.err"; exit 1; }
   names+=("$name")
 done
 
@@ -79,16 +112,19 @@ cd /w
 for o in *.o; do
   n=$(basename "$o" .o)
   gcc -nostartfiles -no-pie -u warmc_driver_hook -o "$n.lx" "$o" \
-      warmwasi.a warmrt.a || { echo "LINKFAIL $n"; continue; }
-  rm -rf "$n.lx.dir"; mkdir -p "$n.lx.dir"; printf 'seed\n' > "$n.lx.dir/seed.txt"
-  env -i "./$n.lx" --dir="$n.lx.dir::/d" \
-    >"$n.lx.out" 2>"$n.lx.err2" <stdin.txt
-  echo "exit=$?" >> "$n.lx.out"
+      warmwasi.a warmrt.a || echo "LINKFAIL $n"
+done
+for exe in *.lx *.st; do
+  [ -x "$exe" ] || continue
+  rm -rf "$exe.dir"; mkdir -p "$exe.dir"; printf 'seed\n' > "$exe.dir/seed.txt"
+  env -i "./$exe" --dir="$exe.dir::/d" \
+    >"$exe.out" 2>"$exe.err2" <stdin.txt
+  echo "exit=$?" >> "$exe.out"
 
-  ( cd "$n.lx.dir" && find . | LC_ALL=C sort && echo -- &&
+  ( cd "$exe.dir" && find . | LC_ALL=C sort && echo -- &&
     find . -type f | LC_ALL=C sort | while read -r f; do
       echo "== $f"; cat "$f"
-    done ) > "$n.lx.tree" 2>/dev/null
+    done ) > "$exe.tree" 2>/dev/null
 done
 EOF
 if ! "$PODMAN" run --rm -v "$PWD/$WORK:/w:Z" "$IMAGE" \
@@ -101,28 +137,33 @@ fi
 fail=0
 pass=0
 for name in "${names[@]}"; do
-  bad=""
-  [ -f "$WORK/$name.lx.out" ] || { echo "FAIL[gowasi-linux/$name]: did not run"; fail=1; continue; }
-  cmp -s "$WORK/$name.mac.out"  "$WORK/$name.lx.out"  || bad="$bad stdout"
-  cmp -s "$WORK/$name.mac.err2" "$WORK/$name.lx.err2" || bad="$bad stderr"
-  cmp -s "$WORK/$name.mac.tree" "$WORK/$name.lx.tree" || bad="$bad tree"
-  if [ -n "$bad" ]; then
-    echo "FAIL[gowasi-linux/$name]: differs from the macOS run:$bad"
-    for k in $bad; do
-      case $k in
-        stdout) diff "$WORK/$name.mac.out"  "$WORK/$name.lx.out"  | head -8 ;;
-        stderr) diff "$WORK/$name.mac.err2" "$WORK/$name.lx.err2" | head -8 ;;
-        tree)   diff "$WORK/$name.mac.tree" "$WORK/$name.lx.tree" | head -8 ;;
-      esac
-    done | sed 's/^/    /'
-    fail=1
-  else
-    pass=$((pass + 1))
-  fi
+  variants="st"
+  [ -f "$WORK/$name.o" ] && variants="st lx"
+  for v in $variants; do
+    x="$WORK/$name.$v"
+    bad=""
+    [ -f "$x.out" ] || { echo "FAIL[gowasi-linux/$name.$v]: did not run"; fail=1; continue; }
+    cmp -s "$WORK/$name.mac.out"  "$x.out"  || bad="$bad stdout"
+    cmp -s "$WORK/$name.mac.err2" "$x.err2" || bad="$bad stderr"
+    cmp -s "$WORK/$name.mac.tree" "$x.tree" || bad="$bad tree"
+    if [ -n "$bad" ]; then
+      echo "FAIL[gowasi-linux/$name.$v]: differs from the macOS run:$bad"
+      for k in $bad; do
+        case $k in
+          stdout) diff "$WORK/$name.mac.out"  "$x.out"  | head -8 ;;
+          stderr) diff "$WORK/$name.mac.err2" "$x.err2" | head -8 ;;
+          tree)   diff "$WORK/$name.mac.tree" "$x.tree" | head -8 ;;
+        esac
+      done | sed 's/^/    /'
+      fail=1
+    else
+      pass=$((pass + 1))
+    fi
+  done
 done
 
 if [ "$fail" != 0 ]; then
   echo "gowasi-linux: FAILED"
   exit 1
 fi
-echo "gowasi-linux: $pass program(s) agree with the macOS run"
+echo "gowasi-linux: $pass Linux build(s) agree with the macOS run"
