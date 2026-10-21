@@ -5,7 +5,9 @@
    parallel-copy solver, and the pre-isel function analyses.  Machine
    specifics enter only through the hook declarations below. */
 
-typedef struct { int src, dst; uint8_t fp, wide, vec; } Move;
+/* remat: src is no location -- rv is a constant (or another value warmc
+   rematerialises) made straight into dst once every other move is done. */
+typedef struct { int src, dst; uint8_t fp, wide, vec, remat; Ref rv; } Move;
 
 #define LOC_NONE  0x7fffffff
 #define SLOT(n)   (-((int)(n) + 1))
@@ -201,6 +203,7 @@ static void slot_store(Buf *bf, int fp, int vec, int reg, uint32_t off);
 static void emit_reg_move(Buf *out, int dst, int src, int fp, int wide,
                           int vec);
 static int isel_break_reg(int bank);
+static int rd(Isel *s, Ref v, int scratch);
 static int isel_cs_index(int reg);
 static bool isel_fp_remat_ok(Isel *s, const Inst *in);
 static bool skip_location(Isel *s, Ref v);
@@ -353,11 +356,28 @@ static bool same_place(int a, bool abank, int b, bool bbank) {
   return IS_SLOT(a) || abank == bbank;
 }
 
+static void emit_remat_move(Isel *s, Buf *out, const Move *m) {
+  if (out != B)
+    warmc_fatal("internal: a rematerialised move outside the function body");
+  if (IS_SLOT(m->dst)) {
+    rc_kill_slot(s, SLOT_OF(m->dst));
+    int r = rd(s, m->rv, (m->fp || m->vec) ? FTMP : TMP0);
+    slot_store(out, m->fp, m->vec, r, slot_off(s, SLOT_OF(m->dst)));
+  } else {
+    int r = rd(s, m->rv, m->dst);
+    if (r != m->dst) emit_reg_move(out, m->dst, r, m->fp, m->wide, m->vec);
+  }
+}
+
+/* Rematerialised sources read no location, so they never block a move and
+   are never part of a cycle; they go last, after every register and slot
+   has been read, which also keeps their scratch use clear of a value the
+   cycle breaker has parked. */
 static void parallel_copy_to(Isel *s, Buf *out, Move *mv, int n) {
   uint8_t *done = xcalloc(n ? n : 1, 1);
   int remaining = 0;
   for (int i = 0; i < n; i++) {
-    if (mv[i].src == mv[i].dst) done[i] = 1;
+    if (mv[i].remat || mv[i].src == mv[i].dst) done[i] = 1;
     else remaining++;
   }
   while (remaining > 0) {
@@ -394,6 +414,8 @@ static void parallel_copy_to(Isel *s, Buf *out, Move *mv, int n) {
       warmc_fatal("internal: %d moves left with no cycle to break", remaining);
   }
   xfree(done);
+  for (int i = 0; i < n; i++)
+    if (mv[i].remat) emit_remat_move(s, out, &mv[i]);
 }
 
 static void parallel_copy(Isel *s, Move *mv, int n) {
@@ -413,6 +435,8 @@ static int edge_moves(Isel *s, Edge *e, Move *mv) {
     mv[n].fp = is_fp_value(f, dstv);
     mv[n].wide = is64(f, dstv);
     mv[n].vec = is_vec_value(f, dstv);
+    mv[n].remat = s->loc[srcv] == LOC_NONE;
+    mv[n].rv = srcv;
     n++;
   }
   return n;

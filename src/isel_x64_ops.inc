@@ -2724,7 +2724,11 @@ static void emit_block(Isel *s, uint32_t bi, uint32_t next_bi) {
       Move *hm = xmalloc((tcap < ecap ? tcap : ecap) * sizeof(Move));
       for (int i = 0; i < tn; i++)
         for (int j = 0; j < en; j++)
-          if (tm[i].src == em[j].src && tm[i].dst == em[j].dst &&
+          /* A rematerialised move stays on its edge: hoisted, it would
+             land between the compare and the branch, and x64 zeroes a
+             register with an xor that rewrites the flags. */
+          if (!tm[i].remat && !em[j].remat &&
+              tm[i].src == em[j].src && tm[i].dst == em[j].dst &&
               tm[i].fp == em[j].fp && tm[i].wide == em[j].wide &&
               tm[i].vec == em[j].vec) {
             hm[hoist++] = tm[i];
