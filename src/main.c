@@ -50,7 +50,7 @@ static const char *usage_text =
   "                thread, nodesplit, mem, bce, strength, inline, reassoc,\n"
   "                rotate, addroff, memptr, align, regalloc, guard-pages,\n"
   "                vectorize, unroll, selftail, ldcomb, escape, partial-escape,\n"
-  "                gloop, loopclose, cpool, reach, prune, merge, devirt,\n"
+  "                gloop, gssa, loopclose, cpool, reach, prune, merge, devirt,\n"
   "                reinline, throw-jump, closed-world, gcpure, labcache,\n"
   "                barelide\n"
   "                The last two are the passes built on a loop containing\n"
@@ -62,11 +62,14 @@ static const char *usage_text =
   "                test/run_nobar.sh uses it to show that a module without\n"
   "                them compiles to the same bytes either way\n"
   "  -fgssa        turn a global a function uses as a variable into SSA\n"
-  "                values, with a parameter at each merge.  Off by default:\n"
-  "                correct, and a net loss -- a global load is one instruction\n"
-  "                off the instance, and keeping the value live instead costs\n"
-  "                edge copies and register pressure.  asbench/mapint -6.9%\n"
-  "                and instof -4.5%, against bintree +4.0%, virtual +4.6%\n"
+  "                values, with a parameter at each merge, where that does\n"
+  "                fewer memory operations on it, counted by loop depth, or\n"
+  "                where a loop touches it five times on a way round with no\n"
+  "                call that can see it.  -fgssa-all does it for every such\n"
+  "                global: a net loss, since a global load is one instruction\n"
+  "                off the instance and a live value costs edge copies and\n"
+  "                register pressure (asbench/bintree, cbench/printf and\n"
+  "                hsbench/fib 4-11% slower)\n"
   "  --validate-only  validate and stop; exit 2 malformed, 3 invalid\n"
   "  --dump-component  print a component's structure, one line per definition\n"
   "  --dump-canon      print what the canonical ABI makes of each of its types\n"
@@ -222,6 +225,7 @@ int main(int argc, char **argv) {
   opt.level = 2;
   opt.fold = opt.dce = opt.cse = opt.licm = opt.branch = true;
   opt.thread = opt.nodesplit = true;
+  opt.gssa = true;
   opt.memopt = opt.bce = opt.strength = true;
 
   opt.inl = true;
@@ -365,6 +369,7 @@ int main(int argc, char **argv) {
       else if (!strcmp(name, "loopclose")) opt.loopclose = on;
       else if (!strcmp(name, "cpool")) opt.cpool = on;
       else if (!strcmp(name, "gssa")) opt.gssa = on;
+      else if (!strcmp(name, "gssa-all")) opt.gssa = opt.gssa_all = on;
       else if (!strcmp(name, "labcache")) opt.labcache = on;
       else if (!strcmp(name, "barelide")) opt.barelide = on;
       else if (!strcmp(name, "merge")) codegen_set_merge(on);

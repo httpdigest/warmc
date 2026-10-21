@@ -6466,6 +6466,7 @@ static bool pass_bar_elide(IrFunc *f) {
 }
 
 #define GS_MAX_BLOCKS 2048
+#define GS_MV_UNKNOWN ((Ref)0xfffffffeu)
 
 static bool gl_opaque(uint32_t op);
 
@@ -6488,16 +6489,41 @@ static bool gs_observes(IrFunc *f, const OptOpts *o, Ref v, uint32_t gidx,
   return (fx->gmask & ((uint64_t)1 << gidx)) != 0;
 }
 
+static uint64_t gs_weight(const Block *b) {
+  if (b->cold) return 0;
+  uint32_t d = b->loop_depth < 4 ? b->loop_depth : 4;
+  return (uint64_t)1 << (3 * d);
+}
+
+
+/* Values the dry run stands in for what it does not create: numbered past
+   every instruction, so no real value compares equal to one. */
+#define GS_TOKEN(n) ((Ref)(0x80000000u + (n)))
+static Ref gs_res(IrFunc *f, Ref r) {
+  return r != REF_NONE && r < f->ninsts ? ir_resolve(f, r) : r;
+}
+
+/* With dry set, change nothing and answer in *dry the memory operations the
+   promotion would add -- the load on entry, the stores and reloads around
+   calls, the stores at returns -- weighted 8^loop-depth. */
 static bool gs_promote_one(IrFunc *f, const OptOpts *o, uint32_t gidx,
-                           ValType gt) {
+                           ValType gt, uint64_t *dry) {
   uint32_t nb = f->nblocks;
+  uint32_t ntok = 0;
   Ref *param = xmalloc(nb * sizeof(Ref));
   Ref *outv = xmalloc(nb * sizeof(Ref));
+  Ref *memv = xmalloc((nb ? nb : 1) * sizeof(Ref));
   uint8_t *done = xcalloc(nb ? nb : 1, 1);
   for (uint32_t i = 0; i < nb; i++) { param[i] = REF_NONE; outv[i] = REF_NONE; }
 
-  Ref seed = ir_emit(f, f->entry, I_GLOBAL_GET, gt, NULL, 0, gidx, 0);
-  gs_move_to(f, f->entry, 0);
+  Ref seed;
+  if (dry) {
+    seed = GS_TOKEN(ntok++);
+    *dry = gs_weight(&f->blocks[f->entry]);
+  } else {
+    seed = ir_emit(f, f->entry, I_GLOBAL_GET, gt, NULL, 0, gidx, 0);
+    gs_move_to(f, f->entry, 0);
+  }
 
   uint8_t *gneed = xcalloc(nb ? nb : 1, 1);
   for (bool again = true; again;) {
@@ -6541,8 +6567,10 @@ static bool gs_promote_one(IrFunc *f, const OptOpts *o, uint32_t gidx,
   }
   for (uint32_t oi = 0; oi < f->norder; oi++) {
     uint32_t bi = f->order[oi];
-    if (bi != f->entry && f->blocks[bi].npreds >= 2 && sreach[bi])
-      param[bi] = ir_add_param(f, bi, gt);
+    if (bi != f->entry && f->blocks[bi].npreds >= 2 && sreach[bi]) {
+      if (dry) param[bi] = GS_TOKEN(ntok++);
+      else param[bi] = ir_add_param(f, bi, gt);
+    }
   }
   xfree(sreach);
 
@@ -6552,27 +6580,46 @@ static bool gs_promote_one(IrFunc *f, const OptOpts *o, uint32_t gidx,
     Ref cur = bi == f->entry ? seed
             : param[bi] != REF_NONE ? param[bi]
             : outv[b->preds[0]];
+    /* What memory holds, which is the entry value only until the first
+       write before a call: the value left for the return and the next call
+       is compared with that, not with the entry value, or a function that
+       restores its frame pointer after a call returns with the callee's. */
+    Ref mv = GS_MV_UNKNOWN;
+    if (bi == f->entry) mv = seed;
+    else {
+      for (uint32_t p = 0; p < b->npreds; p++) {
+        uint32_t pb = b->preds[p];
+        Ref pm = done[pb] ? memv[pb] : GS_MV_UNKNOWN;
+        if (p == 0) mv = pm;
+        else if (pm != mv) mv = GS_MV_UNKNOWN;
+      }
+    }
     for (uint32_t i = 0; i < b->ninsts; i++) {
       Ref r = b->insts[i];
 
       if (r == seed) continue;
       uint16_t op = f->insts[r].op;
       if (op == I_GLOBAL_GET && (uint32_t)f->insts[r].imm == gidx) {
-        if (cur == REF_NONE) { cur = r; continue; }
+        if (cur == REF_NONE) { cur = r; mv = r; continue; }
+        if (dry) continue;
         ir_replace(f, r, cur);
         f->insts[r].op = I_NOP;
       } else if (op == I_GLOBAL_SET && (uint32_t)f->insts[r].imm == gidx) {
         cur = ir_args(f, r)[0];
-        f->insts[r].op = I_NOP;
+        if (!dry) f->insts[r].op = I_NOP;
       } else if (gl_opaque(op)) {
         bool tail = false;
         if (!gs_observes(f, o, r, gidx, &tail)) continue;
 
-        if (cur != REF_NONE && ir_resolve(f, cur) != seed) {
-          Ref v = ir_resolve(f, cur);
-          ir_emit(f, bi, I_GLOBAL_SET, 0, &v, 1, gidx, 0);
-          gs_move_to(f, bi, i);
-          i++;
+        if (cur != REF_NONE &&
+            (mv == GS_MV_UNKNOWN || gs_res(f, cur) != gs_res(f, mv))) {
+          if (dry) *dry += gs_weight(b);
+          else {
+            Ref v = ir_resolve(f, cur);
+            ir_emit(f, bi, I_GLOBAL_SET, 0, &v, 1, gidx, 0);
+            gs_move_to(f, bi, i);
+            i++;
+          }
         }
         bool later = false;
         for (uint32_t k = i + 1; k < b->ninsts && !later; k++)
@@ -6580,18 +6627,24 @@ static bool gs_promote_one(IrFunc *f, const OptOpts *o, uint32_t gidx,
               (uint32_t)f->insts[b->insts[k]].imm == gidx) later = true;
         for (uint32_t sx = 0; sx < b->nsuccs && !later; sx++)
           if (b->succs[sx].target < nb && gneed[b->succs[sx].target]) later = true;
-        if (!tail && later) {
+        if (!tail && later && dry) {
+          *dry += gs_weight(b);
+          cur = mv = GS_TOKEN(ntok++);
+        } else if (!tail && later) {
           ir_emit(f, bi, I_GLOBAL_GET, gt, NULL, 0, gidx, 0);
           gs_move_to(f, bi, i + 1);
           cur = f->blocks[bi].insts[i + 1];
+          mv = cur;
           i++;
         } else {
 
           cur = REF_NONE;
+          mv = GS_MV_UNKNOWN;
         }
       }
     }
     outv[bi] = cur;
+    memv[bi] = mv;
     done[bi] = 1;
   }
 
@@ -6601,6 +6654,10 @@ static bool gs_promote_one(IrFunc *f, const OptOpts *o, uint32_t gidx,
       uint32_t t = b->succs[s].target;
       if (t >= nb || param[t] == REF_NONE) continue;
       Ref av = done[bi] ? outv[bi] : seed;
+      if (dry) {
+        if (av == REF_NONE) *dry += gs_weight(b);
+        continue;
+      }
       if (av == REF_NONE) {
 
         av = ir_emit(f, bi, I_GLOBAL_GET, gt, NULL, 0, gidx, 0);
@@ -6612,19 +6669,129 @@ static bool gs_promote_one(IrFunc *f, const OptOpts *o, uint32_t gidx,
   for (uint32_t bi = 0; bi < nb; bi++) {
     if (!done[bi] || f->blocks[bi].term != T_RETURN) continue;
     if (outv[bi] == REF_NONE) continue;
-    Ref v = ir_resolve(f, outv[bi]);
-    if (v == seed) continue;
+    Ref v = gs_res(f, outv[bi]);
+    if (memv[bi] != GS_MV_UNKNOWN && v == gs_res(f, memv[bi])) continue;
+    if (dry) { *dry += gs_weight(&f->blocks[bi]); continue; }
     ir_emit(f, bi, I_GLOBAL_SET, 0, &v, 1, gidx, 0);
   }
 
-  xfree(param); xfree(outv); xfree(done); xfree(gneed);
+  xfree(param); xfree(outv); xfree(memv); xfree(done); xfree(gneed);
+  if (dry) return true;
   ir_apply_subst(f);
   g_stats.globals_ssa++;
   return true;
 }
 
+/* Whether making g a value pays, by counting memory operations on it, each
+   weighted 8^loop-depth for how often its block runs: every global.get and
+   global.set the promotion removes, against what a dry run of it adds -- the
+   load on entry, a store before and a reload after the calls that need
+   them, a store at each return.  The merges it makes are register copies
+   and cost nothing measurable; charging them, even a quarter of a memory
+   operation each, left stdgo/deferred 27% slower than promoting.  Go wins:
+   it writes its stack pointer twice before every call, for the frame and
+   for the return address, and the two become one (stdgo/recurse 17%
+   faster, deferred 27%).  A shadow stack pointer that LLVM or
+   AssemblyScript pushes at entry and pops at exit, around calls, is no
+   fewer operations as a value, only the copies and the register that carry
+   it, so it stays in memory: asbench/bintree, cbench/printf and hsbench/fib
+   were 4-11% slower with every global promoted.
+
+   A loop that goes round without such a call and touches g five times on
+   the way pays however the totals fall: that is the shadow stack around
+   AssemblyScript's Array#push, a store forwarded to the next load several
+   times an iteration, where the calls are the rare growth path the counts
+   cannot tell from the hot one (asbench/arrpush twice as fast). */
+#define GS_MIN_CYCLE_USES 5
+
+static bool gs_pays(IrFunc *f, const OptOpts *o, uint32_t gidx) {
+  uint32_t nb = f->nblocks;
+  uint8_t *callb = xcalloc(nb ? nb : 1, 1);
+  uint32_t *touch = xcalloc(nb ? nb : 1, sizeof(uint32_t));
+  uint8_t *fwd = xmalloc(nb ? nb : 1), *bwd = xmalloc(nb ? nb : 1);
+  uint32_t *stk = xmalloc((nb ? nb : 1) * sizeof(uint32_t));
+  uint64_t saves = 0, costs = 0;
+  for (uint32_t oi = 0; oi < f->norder; oi++) {
+    uint32_t bi = f->order[oi];
+    Block *b = &f->blocks[bi];
+    uint64_t w = gs_weight(b);
+    for (uint32_t i = 0; i < b->ninsts; i++) {
+      Ref r = b->insts[i];
+      uint16_t op = f->insts[r].op;
+      bool tail;
+      if ((op == I_GLOBAL_GET || op == I_GLOBAL_SET) && (uint32_t)f->insts[r].imm == gidx) {
+        touch[bi]++;
+        saves += w;
+      } else if (gl_opaque(op) && gs_observes(f, o, r, gidx, &tail)) {
+        callb[bi] = 1;
+      }
+    }
+  }
+  gs_promote_one(f, o, gidx, (ValType)f->m->globals[gidx].type, &costs);
+  bool pays = saves > costs;
+  uint32_t best = 0;
+  for (uint32_t oi = 0; oi < f->norder && !pays; oi++) {
+    uint32_t h = f->order[oi];
+    Block *hb = &f->blocks[h];
+    if (callb[h]) continue;
+    bool header = false;
+    for (uint32_t p = 0; p < hb->npreds; p++)
+      if (dominates(f, h, hb->preds[p])) header = true;
+    if (!header) continue;
+    /* Forward from the header through call-free blocks it dominates, then
+       back from its latches within those: what is left lies on a cycle. */
+    memset(fwd, 0, nb);
+    memset(bwd, 0, nb);
+    uint32_t sp = 0;
+    fwd[h] = 1;
+    stk[sp++] = h;
+    while (sp) {
+      Block *xb = &f->blocks[stk[--sp]];
+      for (uint32_t s = 0; s < xb->nsuccs; s++) {
+        uint32_t t = xb->succs[s].target;
+        if (fwd[t] || callb[t] || !dominates(f, h, t)) continue;
+        fwd[t] = 1;
+        stk[sp++] = t;
+      }
+    }
+    for (uint32_t p = 0; p < hb->npreds; p++) {
+      uint32_t l = hb->preds[p];
+      if (fwd[l] && !bwd[l]) { bwd[l] = 1; stk[sp++] = l; }
+    }
+    while (sp) {
+      Block *xb = &f->blocks[stk[--sp]];
+      for (uint32_t p = 0; p < xb->npreds; p++) {
+        uint32_t q = xb->preds[p];
+        if (!fwd[q] || bwd[q]) continue;
+        bwd[q] = 1;
+        stk[sp++] = q;
+      }
+    }
+    uint32_t uses = 0;
+    for (uint32_t x = 0; x < nb; x++)
+      if (fwd[x] && bwd[x]) uses += touch[x];
+    if (uses > best) best = uses;
+    if (uses >= GS_MIN_CYCLE_USES) pays = true;
+  }
+  if (getenv("WARMC_GSSA_DEBUG"))
+    fprintf(stderr, "gssa %s g%u: saves %llu costs %llu cycle uses %u -> %s\n",
+            f->m->funcs[f->func_index].sym ? f->m->funcs[f->func_index].sym : "?",
+            gidx, (unsigned long long)saves, (unsigned long long)costs, best,
+            pays ? "promote" : "leave");
+  xfree(callb); xfree(touch); xfree(fwd); xfree(bwd); xfree(stk);
+  return pays;
+}
+
 static bool pass_global_ssa(IrFunc *f, const OptOpts *o) {
   if (!f->m->nglobals || f->m->ntags || f->npads) return false;
+  {
+    /* WARMC_GSSA_FUNCS=lo-hi limits the pass to those function indices, to
+       bisect a module down to the function it changes. */
+    const char *r = getenv("WARMC_GSSA_FUNCS");
+    unsigned lo = 0, hi = ~0u;
+    if (r && sscanf(r, "%u-%u", &lo, &hi) >= 1 &&
+        (f->func_index < lo || f->func_index > hi)) return false;
+  }
   if (f->nblocks > GS_MAX_BLOCKS || !f->norder) return false;
 
   uint8_t *seen = xcalloc(f->nblocks, 1);
@@ -6660,7 +6827,8 @@ static bool pass_global_ssa(IrFunc *f, const OptOpts *o) {
   bool changed = false;
   for (uint32_t g = 0; g < FX_GBITS; g++) {
     if (!(want & ((uint64_t)1 << g))) continue;
-    if (gs_promote_one(f, o, g, f->m->globals[g].type)) changed = true;
+    if (!o->gssa_all && !gs_pays(f, o, g)) continue;
+    if (gs_promote_one(f, o, g, f->m->globals[g].type, NULL)) changed = true;
   }
   if (changed) {
     ir_order(f);
