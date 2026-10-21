@@ -388,6 +388,7 @@ static void compute_liveness_now(Isel *s, uint64_t **livein_out,
   uint64_t *liveout = xcalloc((size_t)f->nblocks * W + 1, sizeof(uint64_t));
 
   uint64_t *out = xmalloc((W ? W : 1) * sizeof(uint64_t));
+  uint64_t *edge = xmalloc((W ? W : 1) * sizeof(uint64_t));
   bool changed = true;
   while (changed) {
     changed = false;
@@ -395,15 +396,18 @@ static void compute_liveness_now(Isel *s, uint64_t **livein_out,
       uint32_t bi = f->order[oi];
       Block *b = &f->blocks[bi];
       memset(out, 0, W * sizeof(uint64_t));
+      /* Each edge on its own: a target's params are defined on its edges,
+         not live across them, but the same values may be live into another
+         successor -- a loop header that is its own br_table default keeps
+         its params live into every case it dispatches to. */
       for (uint32_t sidx = 0; sidx < b->nsuccs; sidx++) {
         uint32_t t = b->succs[sidx].target;
         Block *tb = &f->blocks[t];
-        const uint64_t *ti = &livein[(size_t)t * W];
-        for (size_t w = 0; w < W; w++) out[w] |= ti[w];
-
-        for (uint32_t p = 0; p < tb->nparams; p++) lv_clr(out, tb->params[p]);
+        memcpy(edge, &livein[(size_t)t * W], W * sizeof(uint64_t));
+        for (uint32_t p = 0; p < tb->nparams; p++) lv_clr(edge, tb->params[p]);
         for (uint32_t j = 0; j < b->succs[sidx].nargs; j++)
-          lv_set(out, b->succs[sidx].args[j]);
+          lv_set(edge, b->succs[sidx].args[j]);
+        for (size_t w = 0; w < W; w++) out[w] |= edge[w];
       }
       if (b->term == T_BRIF && s->fused && s->fused[b->term_arg]) {
         uint32_t ne = eff_uses(s, f, b->term_arg, eu, eucap);
@@ -435,6 +439,7 @@ static void compute_liveness_now(Isel *s, uint64_t **livein_out,
     }
   }
   xfree(out);
+  xfree(edge);
   xfree(eu);
   *livein_out = livein;
   *liveout_out = liveout;
