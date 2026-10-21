@@ -108,6 +108,11 @@ typedef struct {
   uint8_t *zx_fuse;
   uint8_t *no_remat;
   uint8_t *paired;
+  /* (base, offset) of every 32-bit raw-pointer load, sorted; built on the
+     first store pair that asks (see narrow_reloaded). */
+  struct NarrowLoad { Ref base; int64_t off; } *nl;
+  uint32_t nnl;
+  bool nl_built;
   bool no_ldpair;
   /* one-entry cache: the fused-address scratch holds mem_base(t1_mem) +
      zx(t1_aa), set by the fused-address emissions, cleared at every other

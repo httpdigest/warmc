@@ -1562,7 +1562,7 @@ give_up:
   xfree(s->relocs); xfree(s->loc); xfree(s->cls); xfree(s->block_off);
   xfree(s->mem_valid_in); xfree(s->prof_site); xfree(s->prof_start);
   xfree(s->imm_fold); xfree(s->fused); xfree(s->addr_fuse); xfree(s->ptr_fuse);
-  xfree(s->zx_fuse); xfree(s->no_remat); xfree(s->paired); xfree(s->pool);
+  xfree(s->zx_fuse); xfree(s->no_remat); xfree(s->paired); xfree(s->nl); xfree(s->pool);
   xfree(s->vpool);
   xfree(s->folded); xfree(s->uses); xfree(s->bfx); xfree(s->pinned);
   xfree(s->sites); xfree(s->clauses);
