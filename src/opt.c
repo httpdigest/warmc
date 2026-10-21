@@ -2937,6 +2937,625 @@ static bool pass_branch(IrFunc *f) {
   return changed;
 }
 
+/* Jump threading through a dispatch block.  Go's back end compiles every
+   function to a loop around a br_table over the function's resume points,
+   and sends each jump inside the function -- a loop's back edge among them --
+   through that dispatch with a constant index.  Left alone, every iteration
+   of every loop is an indirect branch, and every block that jumps is in the
+   one loop the dispatch heads, which is all the layout and the loop passes
+   get to see.
+
+   A block that does nothing but switch on one of its parameters, reached by
+   an edge that hands that parameter a constant, is bypassed: the edge goes
+   to a fresh block that takes the dispatch's parameters and jumps straight
+   to the case the constant picks.  The dispatch's parameters can be read
+   beyond its own edges -- Go's stack pointer is one -- and every such read
+   was dominated by the dispatch, which it no longer is.  So each of those
+   parameters is put back into SSA form: the dispatch and the fresh blocks
+   define it, block parameters merge it at the iterated dominance frontier
+   of those, and a walk down the dominator tree renames every read.
+   prune_params removes the merges that turn out trivial, and with them the
+   fresh blocks' parameters, which leaves those blocks for pass_branch.
+
+   The dispatch still enters the function at any of its cases, so a loop
+   that was threaded can have a second way in, into its middle.  Every loop
+   pass finds that cycle and turns it down. */
+typedef struct { uint32_t *v; uint32_t n, cap; } TdVec;
+
+static void td_push(TdVec *x, uint32_t b) {
+  if (x->n == x->cap) {
+    x->cap = x->cap ? x->cap * 2 : 4;
+    x->v = xrealloc(x->v, x->cap * sizeof(uint32_t));
+  }
+  x->v[x->n++] = b;
+}
+
+/* Dominance frontiers, and the dominator tree as child lists, of the CFG
+   ir_order last saw. */
+typedef struct { TdVec *df; uint32_t *kids_at, *kids, nb; } TdDom;
+
+static void td_dom_build(IrFunc *f, TdDom *d) {
+  uint32_t nb = d->nb = f->nblocks;
+  d->df = xcalloc(nb, sizeof(TdVec));
+  uint32_t *last = xmalloc(nb * sizeof(uint32_t));
+  for (uint32_t i = 0; i < nb; i++) last[i] = UINT32_MAX;
+  for (uint32_t y = 0; y < nb; y++) {
+    Block *yb = &f->blocks[y];
+    if (!yb->reachable || yb->npreds < 2) continue;
+    for (uint32_t pp = 0; pp < yb->npreds; pp++) {
+      uint32_t r = yb->preds[pp];
+      while (f->blocks[r].reachable && r != yb->idom) {
+        if (last[r] != y) { last[r] = y; td_push(&d->df[r], y); }
+        if (r == f->entry) break;
+        r = f->blocks[r].idom;
+      }
+    }
+  }
+  xfree(last);
+  d->kids_at = xcalloc(nb + 1, sizeof(uint32_t));
+  d->kids = xmalloc((nb ? nb : 1) * sizeof(uint32_t));
+  for (uint32_t x = 0; x < nb; x++)
+    if (f->blocks[x].reachable && x != f->entry) d->kids_at[f->blocks[x].idom + 1]++;
+  for (uint32_t x = 0; x < nb; x++) d->kids_at[x + 1] += d->kids_at[x];
+  uint32_t *fill = xmalloc((nb ? nb : 1) * sizeof(uint32_t));
+  memcpy(fill, d->kids_at, nb * sizeof(uint32_t));
+  for (uint32_t x = 0; x < nb; x++)
+    if (f->blocks[x].reachable && x != f->entry) d->kids[fill[f->blocks[x].idom]++] = x;
+  xfree(fill);
+}
+
+static void td_dom_free(TdDom *d) {
+  for (uint32_t i = 0; i < d->nb; i++) xfree(d->df[i].v);
+  xfree(d->df); xfree(d->kids_at); xfree(d->kids);
+}
+
+/* Put value p back into SSA form once more than one block defines it:
+   defval[b] is what block b defines it as, and REF_NONE elsewhere.  Merges
+   go at the iterated dominance frontier of the defining blocks, and a walk
+   down the dominator tree renames every read of p outside them to the
+   value that reaches it.  A merge can also be reached on a path that never
+   defined p, where nothing reads it either; that path brings a zero, which
+   is why p has to be a number.
+
+   use[] lists the blocks that read p, other than the defining ones.  A
+   merge goes only where p is live: one at every frontier would merge p
+   into each loop header above a definition, and those merges, reading only
+   each other, are more than prune_params can see is dead. */
+static void td_repair(IrFunc *f, Ref p, const Ref *defval, const uint32_t *use,
+                      uint32_t nuse, const TdDom *d) {
+  uint32_t nb = d->nb;
+  ValType t = (ValType)f->insts[p].type;
+  Ref *phi = xmalloc(nb * sizeof(Ref));
+  uint8_t *inwl = xcalloc(nb, 1), *live = xcalloc(nb, 1);
+  uint32_t *wl = xmalloc(nb * sizeof(uint32_t)), nwl = 0;
+  for (uint32_t i = 0; i < nuse; i++) {
+    uint32_t x = use[i];
+    if (x < nb && !live[x] && defval[x] == REF_NONE) { live[x] = 1; wl[nwl++] = x; }
+  }
+  while (nwl) {
+    Block *xb = &f->blocks[wl[--nwl]];
+    for (uint32_t q = 0; q < xb->npreds; q++) {
+      uint32_t y = xb->preds[q];
+      if (live[y] || defval[y] != REF_NONE) continue;
+      live[y] = 1;
+      wl[nwl++] = y;
+    }
+  }
+  for (uint32_t i = 0; i < nb; i++) {
+    phi[i] = REF_NONE;
+    if (defval[i] != REF_NONE && f->blocks[i].reachable) { inwl[i] = 1; wl[nwl++] = i; }
+  }
+  while (nwl) {
+    uint32_t x = wl[--nwl];
+    for (uint32_t k = 0; k < d->df[x].n; k++) {
+      uint32_t y = d->df[x].v[k];
+      if (!live[y] || defval[y] != REF_NONE || phi[y] != REF_NONE) continue;
+      phi[y] = ir_add_param(f, y, t);
+      if (!inwl[y]) { inwl[y] = 1; wl[nwl++] = y; }
+    }
+  }
+  xfree(live);
+
+  Ref undef = REF_NONE;
+  Ref *cur = xmalloc(nb * sizeof(Ref));
+  uint32_t *stk = xmalloc(nb * sizeof(uint32_t)), sp = 0;
+  stk[sp++] = f->entry;
+  while (sp) {
+    uint32_t x = stk[--sp];
+    Block *xb = &f->blocks[x];
+    Ref c = phi[x] != REF_NONE ? phi[x]
+          : x == f->entry ? REF_NONE : cur[xb->idom];
+    if (defval[x] != REF_NONE) c = defval[x];
+    else if (c != REF_NONE) {
+      for (uint32_t i = 0; i < xb->ninsts; i++) {
+        Ref *a = ir_args(f, xb->insts[i]);
+        for (uint32_t q = 0; q < f->insts[xb->insts[i]].nargs; q++)
+          if (a[q] == p) a[q] = c;
+      }
+      if ((xb->term == T_BRIF || xb->term == T_BRTABLE) && xb->term_arg == p)
+        xb->term_arg = c;
+      for (uint32_t q = 0; q < xb->nret; q++)
+        if (xb->ret_args[q] == p) xb->ret_args[q] = c;
+      for (uint32_t s = 0; s < xb->nsuccs; s++) {
+        Edge *e = &xb->succs[s];
+        for (uint32_t q = 0; q < e->nargs; q++)
+          if (e->args[q] == p) e->args[q] = c;
+      }
+    }
+    cur[x] = c;
+    for (uint32_t s = 0; s < xb->nsuccs; s++) {
+      uint32_t y = xb->succs[s].target;
+      if (phi[y] == REF_NONE) continue;
+      if (c == REF_NONE && undef == REF_NONE)
+        undef = ir_emit(f, f->entry, I_CONST, t, NULL, 0, 0, 0);
+      edge_push_arg_at(f, x, s, c != REF_NONE ? c : undef);
+    }
+    for (uint32_t k = d->kids_at[x]; k < d->kids_at[x + 1]; k++) stk[sp++] = d->kids[k];
+  }
+  /* Edges the walk never reached, from unreachable blocks, still need an
+     argument for every merge they lead to. */
+  for (uint32_t x = 0; x < nb; x++) {
+    Block *xb = &f->blocks[x];
+    for (uint32_t s = 0; s < xb->nsuccs; s++) {
+      uint32_t y = xb->succs[s].target;
+      if (y >= nb || phi[y] == REF_NONE || xb->succs[s].nargs >= f->blocks[y].nparams)
+        continue;
+      if (undef == REF_NONE) undef = ir_emit(f, f->entry, I_CONST, t, NULL, 0, 0, 0);
+      edge_push_arg_at(f, x, s, undef);
+    }
+  }
+  xfree(phi); xfree(inwl); xfree(wl); xfree(cur); xfree(stk);
+}
+
+static bool td_numeric(ValType t) {
+  return t == VT_I32 || t == VT_I64 || t == VT_F32 || t == VT_F64 || t == VT_V128;
+}
+
+static bool thread_dispatch(IrFunc *f, uint32_t B) {
+  Block *b = &f->blocks[B];
+  if (!b->reachable || b->is_pad || b->ninsts || B == f->entry) return false;
+  if (b->term != T_BRTABLE && b->term != T_BRIF) return false;
+  if (ir_block_has_eh(f, B)) return false;
+  uint32_t k = UINT32_MAX;
+  for (uint32_t q = 0; q < b->nparams; q++)
+    if (b->params[q] == b->term_arg) k = q;
+  if (k == UINT32_MAX) return false;
+  /* The repair needs a zero of each parameter's type; see td_repair. */
+  for (uint32_t q = 0; q < b->nparams; q++)
+    if (!td_numeric((ValType)f->insts[b->params[q]].type)) return false;
+
+  TdVec made = {0};
+  uint32_t nb0 = f->nblocks;
+  for (uint32_t pi = 0; pi < nb0; pi++) {
+    if (!f->blocks[pi].reachable || pi == B) continue;
+    for (uint32_t s = 0; s < f->blocks[pi].nsuccs; s++) {
+      Edge *e = &f->blocks[pi].succs[s];
+      Block *bb = &f->blocks[B];
+      uint64_t c;
+      if (e->target != B || e->eh || e->nargs != bb->nparams) continue;
+      if (!is_const(f, e->args[k], &c)) continue;
+      uint32_t pick;
+      if (bb->term == T_BRIF) pick = c ? 0 : 1;
+      else pick = c < bb->nsuccs - 1 ? (uint32_t)c : bb->nsuccs - 1;
+      uint32_t t = bb->succs[pick].target;
+      if (t == B || bb->succs[pick].eh || f->blocks[t].is_pad) continue;
+
+      uint32_t x = ir_new_block(f);
+      for (uint32_t q = 0; q < f->blocks[B].nparams; q++)
+        ir_add_param(f, x, (ValType)f->insts[f->blocks[B].params[q]].type);
+      bb = &f->blocks[B];
+      const Edge *ce = &bb->succs[pick];
+      Ref *na = ce->nargs ? xmalloc(ce->nargs * sizeof(Ref)) : NULL;
+      for (uint32_t a = 0; a < ce->nargs; a++) {
+        Ref r = ce->args[a];
+        if (f->insts[r].op == I_PARAM && f->insts[r].block == B)
+          for (uint32_t q = 0; q < bb->nparams; q++)
+            if (bb->params[q] == r) { r = f->blocks[x].params[q]; break; }
+        na[a] = r;
+      }
+      f->blocks[x].term = T_JUMP;
+      ir_add_edge(f, x, t, na, ce->nargs);
+      xfree(na);
+      f->blocks[x].reachable = true;
+      f->blocks[pi].succs[s].target = x;
+      td_push(&made, x);
+      g_stats.branch_simplified++;
+    }
+  }
+  if (!made.n) return false;
+  if (getenv("WARMC_THREAD_STATS"))
+    fprintf(stderr, "thread %s b%u: %s on a parameter, %u edge(s)\n",
+            f->m->funcs[f->func_index].sym ? f->m->funcs[f->func_index].sym : "?", B,
+            f->blocks[B].term == T_BRIF ? "brif" : "br_table", made.n);
+  ir_order(f);
+
+  uint32_t nb = f->nblocks, np = f->blocks[B].nparams;
+  uint8_t *fresh = xcalloc(nb, 1);
+  for (uint32_t i = 0; i < made.n; i++) fresh[made.v[i]] = 1;
+  uint8_t *need = xcalloc(np ? np : 1, 1);
+  TdVec *uses = xcalloc(np ? np : 1, sizeof(TdVec));
+  bool any = false;
+#define TD_READ(r) do {                                                       \
+    Ref r_ = (r);                                                             \
+    if (r_ != REF_NONE && f->insts[r_].op == I_PARAM && f->insts[r_].block == B) \
+      for (uint32_t q = 0; q < np; q++)                                       \
+        if (f->blocks[B].params[q] == r_) {                                   \
+          need[q] = 1; any = true;                                            \
+          if (!uses[q].n || uses[q].v[uses[q].n - 1] != x) td_push(&uses[q], x); \
+          break;                                                              \
+        }                                                                     \
+  } while (0)
+  for (uint32_t x = 0; x < nb; x++) {
+    Block *xb = &f->blocks[x];
+    if (x == B || fresh[x] || !xb->reachable) continue;
+    for (uint32_t i = 0; i < xb->ninsts; i++) {
+      const Ref *a = ir_args(f, xb->insts[i]);
+      for (uint32_t q = 0; q < f->insts[xb->insts[i]].nargs; q++) TD_READ(a[q]);
+    }
+    if (xb->term == T_BRIF || xb->term == T_BRTABLE) TD_READ(xb->term_arg);
+    for (uint32_t q = 0; q < xb->nret; q++) TD_READ(xb->ret_args[q]);
+    for (uint32_t s = 0; s < xb->nsuccs; s++)
+      for (uint32_t q = 0; q < xb->succs[s].nargs; q++) TD_READ(xb->succs[s].args[q]);
+  }
+#undef TD_READ
+
+  if (any) {
+    TdDom d;
+    td_dom_build(f, &d);
+    Ref *defval = xmalloc(nb * sizeof(Ref));
+    for (uint32_t q = 0; q < np; q++) {
+      if (!need[q]) continue;
+      for (uint32_t i = 0; i < nb; i++)
+        defval[i] = i == B ? f->blocks[B].params[q] : fresh[i] ? f->blocks[i].params[q] : REF_NONE;
+      td_repair(f, f->blocks[B].params[q], defval, uses[q].v, uses[q].n, &d);
+    }
+    xfree(defval);
+    td_dom_free(&d);
+  }
+  for (uint32_t q = 0; q < np; q++) xfree(uses[q].v);
+  xfree(uses);
+  xfree(fresh); xfree(need); xfree(made.v);
+  return true;
+}
+
+static bool pass_thread(IrFunc *f) {
+  if (f->npads) return false;
+  bool changed = false;
+  for (uint32_t bi = 0, n = f->nblocks; bi < n; bi++)
+    if (thread_dispatch(f, bi)) {
+      changed = true;
+      if (getenv("WARMC_THREAD_DEBUG")) { ir_print(f, "thread"); ir_verify(f, "thread"); }
+    }
+  if (changed) {
+    prune_params(f);
+    ir_order(f);
+  }
+  return changed;
+}
+
+/* Copy the blocks in[] marks, all below nb0: blocks first, then their
+   contents, then every copied read pointed at the copy of what it read.
+   bcopy[b] is b's copy, or UINT32_MAX, and map[v] the copy of value v below
+   ni0, or REF_NONE.  A copy's edge goes to the copy of a marked target and
+   to the target itself otherwise; nothing yet goes to a copy. */
+static void clone_blocks(IrFunc *f, const uint8_t *in, uint32_t nb0, uint32_t ni0,
+                         uint32_t *bcopy, Ref *map) {
+  for (uint32_t i = 0; i < ni0; i++) map[i] = REF_NONE;
+  for (uint32_t x = 0; x < nb0; x++) bcopy[x] = in[x] ? ir_new_block(f) : UINT32_MAX;
+  Ref tmp[64];
+  for (uint32_t x = 0; x < nb0; x++) {
+    if (!in[x]) continue;
+    uint32_t y = bcopy[x];
+    for (uint32_t q = 0; q < f->blocks[x].nparams; q++) {
+      Ref op = f->blocks[x].params[q];
+      map[op] = ir_add_param(f, y, (ValType)f->insts[op].type);
+    }
+    for (uint32_t i = 0; i < f->blocks[x].ninsts; i++) {
+      Ref v = f->blocks[x].insts[i];
+      Inst src = f->insts[v];
+      if (src.op == I_NOP) continue;
+      Ref *heap = src.nargs > 64 ? xmalloc(src.nargs * sizeof(Ref)) : NULL;
+      Ref *args = heap ? heap : tmp;
+      memcpy(args, ir_args(f, v), src.nargs * sizeof(Ref));
+      Ref nv = ir_emit(f, y, (IrOp)src.op, (ValType)src.type, args, src.nargs,
+                       src.imm, src.imm2);
+      f->insts[nv].flags = src.flags;
+      map[v] = nv;
+      xfree(heap);
+    }
+    Block *xb = &f->blocks[x], *yb = &f->blocks[y];
+    yb->term = xb->term;
+    yb->term_arg = xb->term_arg;
+    yb->term_imm = xb->term_imm;
+    yb->diverges = xb->diverges;
+    yb->sealed = xb->sealed;
+    yb->filled = xb->filled;
+    yb->reachable = true;
+    if (xb->nret) {
+      yb->ret_args = ir_alloc(f, xb->nret * sizeof(Ref));
+      memcpy(yb->ret_args, xb->ret_args, xb->nret * sizeof(Ref));
+      yb->nret = yb->cap_ret = xb->nret;
+    }
+    for (uint32_t s = 0; s < f->blocks[x].nsuccs; s++) {
+      Edge e = f->blocks[x].succs[s];
+      uint32_t t = e.target < nb0 && in[e.target] ? bcopy[e.target] : e.target;
+      ir_add_edge(f, y, t, e.args, e.nargs);
+      f->blocks[y].succs[f->blocks[y].nsuccs - 1].eh = e.eh;
+    }
+  }
+#define CB_MAP(r) ((r) != REF_NONE && (r) < ni0 && map[r] != REF_NONE ? map[r] : (r))
+  for (uint32_t x = 0; x < nb0; x++) {
+    if (!in[x]) continue;
+    Block *yb = &f->blocks[bcopy[x]];
+    for (uint32_t i = 0; i < yb->ninsts; i++) {
+      Ref *a = ir_args(f, yb->insts[i]);
+      for (uint32_t q = 0; q < f->insts[yb->insts[i]].nargs; q++) a[q] = CB_MAP(a[q]);
+    }
+    if (yb->term == T_BRIF || yb->term == T_BRTABLE) yb->term_arg = CB_MAP(yb->term_arg);
+    for (uint32_t q = 0; q < yb->nret; q++) yb->ret_args[q] = CB_MAP(yb->ret_args[q]);
+    for (uint32_t s = 0; s < yb->nsuccs; s++)
+      for (uint32_t q = 0; q < yb->succs[s].nargs; q++)
+        yb->succs[s].args[q] = CB_MAP(yb->succs[s].args[q]);
+  }
+#undef CB_MAP
+}
+
+/* Values defined in the blocks in[] marks and read anywhere else
+   reachable: esc[v] set, slot[v] its index into use[], which lists the
+   blocks reading it.  Returns how many. */
+static uint32_t escaping_values(IrFunc *f, const uint8_t *in, uint32_t nb0, uint32_t ni0,
+                                uint8_t *esc, uint32_t *slot, TdVec **use) {
+  uint32_t n = 0;
+  TdVec *u = NULL;
+#define EV_READ(r) do {                                                       \
+    Ref r_ = (r);                                                             \
+    if (r_ != REF_NONE && r_ < ni0 && f->insts[r_].block < nb0 &&             \
+        in[f->insts[r_].block]) {                                             \
+      if (!esc[r_]) {                                                         \
+        esc[r_] = 1; slot[r_] = n++;                                          \
+        u = xrealloc(u, n * sizeof(TdVec));                                   \
+        memset(&u[n - 1], 0, sizeof(TdVec));                                  \
+      }                                                                       \
+      TdVec *v_ = &u[slot[r_]];                                               \
+      if (!v_->n || v_->v[v_->n - 1] != x) td_push(v_, x);                    \
+    }                                                                         \
+  } while (0)
+  for (uint32_t x = 0; x < nb0; x++) {
+    Block *xb = &f->blocks[x];
+    if (in[x] || !xb->reachable) continue;
+    for (uint32_t i = 0; i < xb->ninsts; i++) {
+      const Ref *a = ir_args(f, xb->insts[i]);
+      for (uint32_t q = 0; q < f->insts[xb->insts[i]].nargs; q++) EV_READ(a[q]);
+    }
+    if (xb->term == T_BRIF || xb->term == T_BRTABLE) EV_READ(xb->term_arg);
+    for (uint32_t q = 0; q < xb->nret; q++) EV_READ(xb->ret_args[q]);
+    for (uint32_t s = 0; s < xb->nsuccs; s++)
+      for (uint32_t q = 0; q < xb->succs[s].nargs; q++) EV_READ(xb->succs[s].args[q]);
+  }
+#undef EV_READ
+  *use = u;
+  return n;
+}
+
+/* After the copies are wired in: merge each value escaping[] marks, defined
+   once in the original and once in its copy. */
+static void repair_copies(IrFunc *f, uint32_t ni0, const uint8_t *esc, const uint32_t *slot,
+                          const TdVec *use, const uint32_t *bcopy, const Ref *map) {
+  TdDom d;
+  td_dom_build(f, &d);
+  Ref *defval = xmalloc(f->nblocks * sizeof(Ref));
+  for (uint32_t i = 0; i < f->nblocks; i++) defval[i] = REF_NONE;
+  for (uint32_t v = 0; v < ni0; v++) {
+    if (!esc[v] || map[v] == REF_NONE) continue;
+    uint32_t ob = f->insts[v].block, cb = bcopy[ob];
+    defval[ob] = v;
+    defval[cb] = map[v];
+    td_repair(f, v, defval, use[slot[v]].v, use[slot[v]].n, &d);
+    defval[ob] = defval[cb] = REF_NONE;
+  }
+  xfree(defval);
+  td_dom_free(&d);
+}
+
+/* Node splitting, for a cycle with more than one way in.  After jump
+   threading, a Go function's dispatch still enters it at every case, and so
+   in the middle of every loop: each loop has its preheader, and the
+   dispatch beside it reaching any of its blocks.  No loop pass takes such a
+   cycle, and every block the dispatch reaches carries a merge of all the
+   values live there, one more for each way in.
+
+   So the dispatch is given a copy of the code it enters: every block on a
+   cycle that is reachable from where it enters, up to the first block on no
+   cycle, which is where the copy rejoins the original.  The originals are
+   left with the one way in their own predecessors give them, and are loops
+   again; the copy is entered only from the dispatch, which in Go means only
+   when a goroutine resumes, and keeps the shape the dispatch gave it.  A
+   value the copied blocks define and something past a rejoining block reads
+   is defined twice now, and td_repair merges it.
+
+   A cycle is split only when one of the ways into it is a block that enters
+   it at one place, which is then its header, and every other way in comes
+   from a block on no cycle.  The budget is a copy no larger than the function
+   was. */
+#define NS_MAX_COPY 50000u
+
+/* Tarjan's strongly connected components over the reachable blocks,
+   without recursion; comp[b] numbers b's component. */
+static uint32_t ns_scc(IrFunc *f, uint32_t *comp) {
+  uint32_t nb = f->nblocks, counter = 0, ncomp = 0, sp = 0, csp = 0;
+  uint32_t *idx = xmalloc(nb * sizeof(uint32_t)), *low = xmalloc(nb * sizeof(uint32_t));
+  uint32_t *stk = xmalloc(nb * sizeof(uint32_t));
+  uint32_t *cs = xmalloc(nb * sizeof(uint32_t)), *ci = xmalloc(nb * sizeof(uint32_t));
+  uint8_t *on = xcalloc(nb, 1);
+  for (uint32_t i = 0; i < nb; i++) { idx[i] = UINT32_MAX; comp[i] = UINT32_MAX; }
+  for (uint32_t root = 0; root < nb; root++) {
+    if (!f->blocks[root].reachable || idx[root] != UINT32_MAX) continue;
+    cs[csp] = root; ci[csp] = 0; csp++;
+    idx[root] = low[root] = counter++;
+    stk[sp++] = root; on[root] = 1;
+    while (csp) {
+      uint32_t v = cs[csp - 1];
+      Block *vb = &f->blocks[v];
+      if (ci[csp - 1] < vb->nsuccs) {
+        uint32_t w = vb->succs[ci[csp - 1]++].target;
+        if (idx[w] == UINT32_MAX) {
+          idx[w] = low[w] = counter++;
+          stk[sp++] = w; on[w] = 1;
+          cs[csp] = w; ci[csp] = 0; csp++;
+        } else if (on[w] && idx[w] < low[v]) {
+          low[v] = idx[w];
+        }
+        continue;
+      }
+      csp--;
+      if (csp && low[v] < low[cs[csp - 1]]) low[cs[csp - 1]] = low[v];
+      if (low[v] == idx[v]) {
+        uint32_t w;
+        do { w = stk[--sp]; on[w] = 0; comp[w] = ncomp; } while (w != v);
+        ncomp++;
+      }
+    }
+  }
+  xfree(idx); xfree(low); xfree(stk); xfree(cs); xfree(ci); xfree(on);
+  return ncomp;
+}
+
+static bool pass_nodesplit(IrFunc *f) {
+  if (f->npads) return false;
+  uint32_t nb0 = f->nblocks, ni0 = f->ninsts;
+  uint32_t *comp = xmalloc((nb0 ? nb0 : 1) * sizeof(uint32_t));
+  uint32_t ncomp = ns_scc(f, comp);
+
+  /* A block is on a cycle when its component has another block or it
+     branches to itself. */
+  uint32_t *csize = xcalloc(ncomp ? ncomp : 1, sizeof(uint32_t));
+  uint8_t *cyc = xcalloc(nb0 ? nb0 : 1, 1);
+  for (uint32_t b = 0; b < nb0; b++) if (comp[b] != UINT32_MAX) csize[comp[b]]++;
+  for (uint32_t b = 0; b < nb0; b++) {
+    if (comp[b] == UINT32_MAX) continue;
+    if (csize[comp[b]] > 1) cyc[b] = 1;
+    for (uint32_t s = 0; s < f->blocks[b].nsuccs; s++)
+      if (f->blocks[b].succs[s].target == b) cyc[b] = 1;
+  }
+
+  /* Per cycle: the header a block entering at one place names, and whether
+     every other way in can be redirected. */
+  uint32_t *hdr = xmalloc((ncomp ? ncomp : 1) * sizeof(uint32_t));
+  uint8_t *bad = xcalloc(ncomp ? ncomp : 1, 1);
+  for (uint32_t c = 0; c < ncomp; c++) hdr[c] = UINT32_MAX;
+  for (uint32_t p = 0; p < nb0; p++) {
+    Block *pb = &f->blocks[p];
+    if (!pb->reachable) continue;
+    for (uint32_t s = 0; s < pb->nsuccs; s++) {
+      uint32_t t = pb->succs[s].target, c = comp[t];
+      if (!cyc[t] || comp[p] == c) continue;
+      bool one = true;
+      for (uint32_t s2 = 0; s2 < pb->nsuccs; s2++) {
+        uint32_t t2 = pb->succs[s2].target;
+        if (comp[t2] == c && t2 != t) one = false;
+      }
+      if (!one || cyc[p]) continue;
+      if (hdr[c] == UINT32_MAX) hdr[c] = t;
+      else if (hdr[c] != t) bad[c] = 1;
+    }
+  }
+  /* Which edges move to the copy: every way into a cycle that is not its
+     header's own, from a block that enters the cycle somewhere else too or
+     at a block other than the header. */
+  uint8_t *moves = xcalloc(nb0 ? nb0 : 1, 1);
+  uint8_t *inR = xcalloc(nb0 ? nb0 : 1, 1);
+  uint32_t *wl = xmalloc((nb0 ? nb0 : 1) * sizeof(uint32_t)), nwl = 0;
+  bool any = false;
+  for (uint32_t p = 0; p < nb0; p++) {
+    Block *pb = &f->blocks[p];
+    if (!pb->reachable) continue;
+    for (uint32_t s = 0; s < pb->nsuccs; s++) {
+      uint32_t t = pb->succs[s].target, c = comp[t];
+      if (!cyc[t] || comp[p] == c || bad[c] || hdr[c] == UINT32_MAX) continue;
+      bool side = false;
+      for (uint32_t s2 = 0; s2 < pb->nsuccs; s2++) {
+        uint32_t t2 = pb->succs[s2].target;
+        if (comp[t2] == c && t2 != hdr[c]) side = true;
+      }
+      if (!side) continue;
+      if (cyc[p] || pb->succs[s].eh) { bad[c] = 1; continue; }
+      moves[p] = 1;
+      any = true;
+    }
+  }
+  if (any) {
+    /* The copied region: closed over successors on a cycle. */
+    for (uint32_t p = 0; p < nb0; p++) {
+      if (!moves[p]) continue;
+      Block *pb = &f->blocks[p];
+      for (uint32_t s = 0; s < pb->nsuccs; s++) {
+        uint32_t t = pb->succs[s].target, c = comp[t];
+        if (!cyc[t] || comp[p] == c || bad[c] || hdr[c] == UINT32_MAX) continue;
+        if (!inR[t]) { inR[t] = 1; wl[nwl++] = t; }
+      }
+    }
+    uint32_t nR = 0, ncopy = 0;
+    while (nwl) {
+      uint32_t x = wl[--nwl];
+      nR++;
+      ncopy += f->blocks[x].ninsts + f->blocks[x].nparams;
+      Block *xb = &f->blocks[x];
+      for (uint32_t s = 0; s < xb->nsuccs; s++) {
+        uint32_t t = xb->succs[s].target;
+        if (cyc[t] && !inR[t]) { inR[t] = 1; wl[nwl++] = t; }
+      }
+    }
+    if (ncopy > NS_MAX_COPY || ncopy > ni0) any = false;
+    (void)nR;
+  }
+
+  /* The values the region defines and something outside it reads, which
+     will need merging; each has to be a number for td_repair. */
+  uint8_t *esc = NULL;
+  uint32_t *eslot = NULL, nesc = 0;
+  TdVec *euse = NULL;
+  if (any) {
+    esc = xcalloc(ni0 ? ni0 : 1, 1);
+    eslot = xmalloc((ni0 ? ni0 : 1) * sizeof(uint32_t));
+    nesc = escaping_values(f, inR, nb0, ni0, esc, eslot, &euse);
+    for (uint32_t v = 0; v < ni0 && any; v++)
+      if (esc[v] && !td_numeric((ValType)f->insts[v].type)) any = false;
+  }
+  if (!any) {
+    for (uint32_t i = 0; i < nesc; i++) xfree(euse[i].v);
+    xfree(comp); xfree(csize); xfree(cyc); xfree(hdr); xfree(bad);
+    xfree(moves); xfree(inR); xfree(wl); xfree(esc); xfree(eslot); xfree(euse);
+    return false;
+  }
+
+  Ref *map = xmalloc(ni0 * sizeof(Ref));
+  uint32_t *bcopy = xmalloc(nb0 * sizeof(uint32_t));
+  clone_blocks(f, inR, nb0, ni0, bcopy, map);
+  for (uint32_t x = 0; x < nb0; x++)
+    if (inR[x]) f->blocks[bcopy[x]].cold = true;
+
+  /* The ways in that move. */
+  for (uint32_t p = 0; p < nb0; p++) {
+    if (!moves[p]) continue;
+    Block *pb = &f->blocks[p];
+    for (uint32_t s = 0; s < pb->nsuccs; s++) {
+      uint32_t t = pb->succs[s].target;
+      if (t < nb0 && inR[t]) pb->succs[s].target = bcopy[t];
+    }
+  }
+  ir_order(f);
+  repair_copies(f, ni0, esc, eslot, euse, bcopy, map);
+  for (uint32_t i = 0; i < nesc; i++) xfree(euse[i].v);
+  xfree(eslot); xfree(euse);
+  g_stats.branch_simplified++;
+
+  xfree(comp); xfree(csize); xfree(cyc); xfree(hdr); xfree(bad);
+  xfree(moves); xfree(inR); xfree(wl); xfree(esc); xfree(map); xfree(bcopy);
+  prune_params(f);
+  ir_order(f);
+  return true;
+}
+
 typedef struct {
   Ref addr; uint64_t off; uint32_t size; uint32_t mem; Ref value; bool sgn;
   bool valid; bool pending; uint32_t origin; uint8_t vtype;
@@ -9041,6 +9660,14 @@ static bool vectorize_one(IrFunc *f, uint32_t hb, uint8_t *reach, uint8_t *inloo
       cur = mrg;
     }
   }
+  /* A body block entered from outside the loop is no body the vector loop
+     can stand in for.  Jump threading leaves such a block wherever a
+     dispatch can resume into the middle of a loop. */
+  for (uint32_t i = 1; i < nbl; i++) {
+    const Block *bb = &f->blocks[bl[i]];
+    for (uint32_t p = 0; p < bb->npreds; p++)
+      if (!inloop[bb->preds[p]]) VREJ("a body block has a second way in");
+  }
 
   Block *lb = &f->blocks[latch];
   bool taken_continues;
@@ -9991,6 +10618,11 @@ static bool vs_match(IrFunc *f, uint32_t hb, uint8_t *inloop, VSearch *S) {
   for (uint32_t b = 0; b < f->nblocks; b++)
     inloop[b] = f->blocks[b].reachable && f->blocks[b].rpo >= h->rpo &&
                 f->blocks[b].rpo <= lrpo;
+  for (uint32_t b = 0; b < f->nblocks; b++) {
+    if (!inloop[b] || b == hb) continue;
+    for (uint32_t p = 0; p < f->blocks[b].npreds; p++)
+      if (!inloop[f->blocks[b].preds[p]]) VSREJ("a body block has a second way in");
+  }
 
   uint32_t t = h->succs[0].target, e = h->succs[1].target;
   uint32_t cont;
@@ -11545,6 +12177,8 @@ static void opt_cleanup(IrFunc *f, const OptOpts *o) {
     if (o->throwjump && TP("throwjump", pass_local_throw(f))) changed = true;
     if (o->fold && TP("fold", pass_fold(f, o))) changed = true;
     if (o->branch && TP("branch", pass_branch(f))) changed = true;
+    if (o->thread && TP("thread", pass_thread(f))) changed = true;
+    if (o->thread && o->nodesplit && TP("nodesplit", pass_nodesplit(f))) changed = true;
     if (o->cse && TP("cse", pass_cse(f, o))) changed = true;
     if (o->memopt && TP("memopt", pass_memopt(f, o))) changed = true;
 

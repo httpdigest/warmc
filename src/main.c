@@ -47,11 +47,12 @@ static const char *usage_text =
   "                measurements that decided both.  Options apply in order,\n"
   "                so a -f flag goes after the -O it amends\n"
   "  -f[no-]PASS   enable or disable one pass: fold, dce, cse, licm, branch,\n"
-  "                mem, bce, strength, inline, reassoc, rotate, addroff,\n"
-  "                memptr, align, regalloc, guard-pages, vectorize, unroll,\n"
-  "                selftail, ldcomb, escape, partial-escape, gloop, loopclose,\n"
-  "                cpool, reach, prune, merge, devirt, reinline, throw-jump,\n"
-  "                closed-world, gcpure, labcache, barelide\n"
+  "                thread, nodesplit, mem, bce, strength, inline, reassoc,\n"
+  "                rotate, addroff, memptr, align, regalloc, guard-pages,\n"
+  "                vectorize, unroll, selftail, ldcomb, escape, partial-escape,\n"
+  "                gloop, loopclose, cpool, reach, prune, merge, devirt,\n"
+  "                reinline, throw-jump, closed-world, gcpure, labcache,\n"
+  "                barelide\n"
   "                The last two are the passes built on a loop containing\n"
   "                no safepoint, which is the only assumption the compiler\n"
   "                makes about the collector: turning them off says whether\n"
@@ -220,6 +221,7 @@ int main(int argc, char **argv) {
   memset(&opt, 0, sizeof opt);
   opt.level = 2;
   opt.fold = opt.dce = opt.cse = opt.licm = opt.branch = true;
+  opt.thread = opt.nodesplit = true;
   opt.memopt = opt.bce = opt.strength = true;
 
   opt.inl = true;
@@ -341,6 +343,8 @@ int main(int argc, char **argv) {
       else if (!strcmp(name, "cse")) opt.cse = on;
       else if (!strcmp(name, "licm")) opt.licm = on;
       else if (!strcmp(name, "branch")) opt.branch = on;
+      else if (!strcmp(name, "thread")) opt.thread = on;
+      else if (!strcmp(name, "nodesplit")) opt.nodesplit = on;
       else if (!strcmp(name, "mem")) opt.memopt = on;
       else if (!strcmp(name, "bce")) opt.bce = on;
       else if (!strcmp(name, "strength")) opt.strength = on;
