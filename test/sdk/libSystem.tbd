@@ -5,7 +5,7 @@ install-name: '/usr/lib/libSystem.B.dylib'
 exports:
   - targets: [ arm64-macos ]
     symbols: [ _write, _read, _mmap, _munmap, _mprotect, _madvise, _exit, _sigaction,
-               _memmove,
+               _memmove, _memset,
                dyld_stub_binder,
                ___stack_chk_guard, ___stack_chk_fail,
                _arc4random_buf,

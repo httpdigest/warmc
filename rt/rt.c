@@ -675,6 +675,9 @@ extern void *memmove(void *, const void *, usz);
 #define PLATFORM_MEMMOVE_FROM 65536u
 
 #define PLATFORM_MEMMOVE_OVERLAP 512u
+
+extern void *memset(void *, int, usz);
+#define PLATFORM_MEMSET_FROM 1024u
 #endif
 
 static int overlaps(const u8 *d, const u8 *s, u64 n) {
@@ -775,6 +778,12 @@ static void mem_move(u8 *d, const u8 *s, u64 n) {
 }
 
 static void mem_set(u8 *d, u8 val, u64 n) {
+#if defined(WARMC_DARWIN)
+  /* Darwin's memset zeroes a cache line per instruction (dc zva) once the
+     range is long enough, and a zero fill is what an allocator makes of
+     every fresh object: AssemblyScript's __new clears what it hands out. */
+  if (n >= PLATFORM_MEMSET_FROM) { memset(d, val, n); return; }
+#endif
   u64 w = (u64)val * 0x0101010101010101ull;
   if (n < 16) {
     if (n >= 8) { __builtin_memcpy(d, &w, 8); __builtin_memcpy(d + n - 8, &w, 8); return; }
