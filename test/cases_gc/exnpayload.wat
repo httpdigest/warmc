@@ -18,11 +18,17 @@
 ;;
 ;; Both payload values are freshly allocated and referenced by nothing else, and
 ;; they are read back *after* the catch, so losing either is an answer and not a
-;; crash.
+;; crash.  The throw goes through a funcref in a mutable global, a call the
+;; optimiser cannot see into: thrown where it is caught, the throw would be a
+;; jump, and there would be no exception object to allocate.
 
 (module
   (type $box (struct (field i32)))
   (tag $t (param (ref $box)) (param (ref $box)))
+  (type $raise_t (func (param (ref $box)) (param (ref $box))))
+  (global $raise (mut (ref null $raise_t)) (ref.func $raise))
+  (func $raise (type $raise_t) (param $a (ref $box)) (param $b (ref $box))
+    (throw $t (local.get $a) (local.get $b)))
 
   (func (export "payload_survives") (local $s i32) (local $i i32)
     (local $a (ref null $box)) (local $b (ref null $box))
@@ -31,8 +37,9 @@
         (br_if $done (i32.ge_u (local.get $i) (i32.const 2000)))
         (block $caught (result (ref $box) (ref $box))
           (try_table (catch $t $caught)
-            (throw $t (struct.new $box (i32.const 3))
-                      (struct.new $box (i32.const 4))))
+            (call_ref $raise_t (struct.new $box (i32.const 3))
+                               (struct.new $box (i32.const 4))
+                               (global.get $raise)))
           unreachable)
         (local.set $b) (local.set $a)
         (local.set $s (i32.add (local.get $s)
