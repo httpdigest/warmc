@@ -66,7 +66,7 @@ Hello world!
 
   Functions compile in parallel and are laid out in a deterministic order.
 - **Fast code.** Across 130 benchmark kernels compiled from TinyGo, Rust, Zig,
-  AssemblyScript and Kotlin, warmc's steady-state code takes 0.42× wasmtime's
+  AssemblyScript and Kotlin, warmc's steady-state code takes 0.40× wasmtime's
   time (geometric mean), with much lower peak memory. See
   [Performance](#performance).
 - **Runtime for modern languages:**
@@ -646,16 +646,16 @@ compile time.
 
 | Corpus | Source language | Kernels | warmc / wasmtime | Range | Median peak RSS (warmc / wasmtime) |
 |---|---|---:|---:|---|---|
-| `gobench` | TinyGo | 26 | 0.64 | 0.07 – 1.06 | 1.9 / 8.9 MB |
-| `vecbench` | TinyGo (vectorisable loops) | 30 | 0.15 | 0.04 – 0.94 | 1.9 / 8.9 MB |
-| `asbench` | AssemblyScript | 25 | 0.68 | 0.19 – 1.62 | 1.9 / 8.7 MB |
+| `gobench` | TinyGo | 26 | 0.62 | 0.07 – 1.05 | 1.9 / 8.9 MB |
+| `vecbench` | TinyGo (vectorisable loops) | 30 | 0.15 | 0.04 – 0.95 | 1.9 / 8.9 MB |
+| `asbench` | AssemblyScript | 25 | 0.68 | 0.18 – 1.61 | 1.9 / 8.7 MB |
 | `rsbench` | Rust | 28 | 0.72 | 0.35 – 1.00 | 1.9 / 9.1 MB |
-| `zigbench` | Zig | 9 | 0.69 | 0.40 – 0.99 | 1.9 / 8.8 MB |
-| `ktbench` | Kotlin (Wasm GC) | 12 | 0.15 | 0.006 – 0.53 | 9.2 / 20.6 MB |
+| `zigbench` | Zig | 9 | 0.70 | 0.40 – 1.00 | 1.9 / 8.8 MB |
+| `ktbench` | Kotlin (Wasm GC) | 12 | 0.09 | 0.003 – 0.48 | 3.5 / 20.6 MB |
 
-Over all 130 kernels the geometric mean is **0.42**. Six kernels are slower
+Over all 130 kernels the geometric mean is **0.40**. Six kernels are slower
 than wasmtime. Five of them are within 6%; the sixth, `asbench/arrpush`
-(growing an array by `push`), runs at 1.62×. That kernel was 0.94× against
+(growing an array by `push`), runs at 1.61×. That kernel was 0.94× against
 wasmtime 49, and warmc's own time did not change, so wasmtime 50 is what got
 faster there. Re-run the comparison on your own machine before relying on
 these numbers:
