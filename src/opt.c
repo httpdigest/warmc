@@ -5468,6 +5468,7 @@ static bool pass_memopt(IrFunc *f, const OptOpts *o) {
             if (same_access(f, ent[k].addr, ent[k].off, ent[k].size, ent[k].mem,
                             a[0], in->imm, size, mem)) {
               ent[k].value = a[1]; ent[k].valid = true; ent[k].pending = false;
+              ent[k].sgn = false;
               found = true;
             }
           if (!found && nent < MEMOPT_ENTS)
