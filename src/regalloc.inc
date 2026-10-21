@@ -113,6 +113,11 @@ static void regalloc_naive(Isel *s) {
 static int op_tied_arg(uint16_t op) {
   switch (op) {
     case I_VSEL: return 0;
+    /* A wrap whose source dies here can stay in the source's register,
+       where it costs nothing when the high half is already zero -- the
+       count of a clz or popcnt, the 32-bit result Go and TinyGo keep in an
+       i64 -- and one in-place uxtw otherwise. */
+    case I_WRAP: return 0;
     default: return -1;
   }
 }
