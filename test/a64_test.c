@@ -405,6 +405,14 @@ int main(int argc, char **argv) {
    * `immh` on the shifts, where an off-by-one is a different lane width
    * rather than an invalid instruction. */
   CASE("ldr q0, [x1]", a64_ldr_q(b, 0, R1, 0));
+  CASE("ldp q16, q17, [x1]", a64_ldp_q(b, 16, 17, R1, 0));
+  CASE("ldp q30, q31, [x16, #1008]", a64_ldp_q(b, 30, 31, R16, 1008));
+  CASE("stp q18, q19, [x17, #-1024]", a64_stp_q(b, 18, 19, R17, -1024));
+  CASE("stp q0, q1, [x2, #32]", a64_stp_q(b, 0, 1, R2, 32));
+  CASE("ldur q20, [x3, #-16]", a64_ldur_q(b, 20, R3, -16));
+  CASE("ldur q21, [x4, #255]", a64_ldur_q(b, 21, R4, 255));
+  CASE("stur q22, [x5, #-256]", a64_stur_q(b, 22, R5, -256));
+  CASE("stur q23, [x6, #47]", a64_stur_q(b, 23, R6, 47));
   CASE("ldr q31, [x2, #4080]", a64_ldr_q(b, 31, R2, 4080));
   CASE("str q3, [x4, #16]", a64_str_q(b, 3, R4, 16));
   CASE("str q17, [sp, #65520]", a64_str_q(b, 17, RSP, 65520));

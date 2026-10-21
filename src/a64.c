@@ -569,6 +569,21 @@ void a64_ldr_q_reg(Buf *b, int rt, int rn, int rm, int option, int s) {
   W(0x3CE00800u | (M5(rm) << 16) | ((uint32_t)(option & 7) << 13) |
     ((uint32_t)(s & 1) << 12) | (M5(rn) << 5) | M5(rt));
 }
+static void ldst_pair_q(Buf *b, uint32_t op, int rt, int rt2, int rn, int off) {
+  if (off & 15) enc_fail("unaligned pair offset", off);
+  uint32_t imm7 = FITS("pair offset", off / 16, -64, 63) & 0x7f;
+  W(op | (imm7 << 15) | (M5(rt2) << 10) | (M5(rn) << 5) | M5(rt));
+}
+void a64_ldp_q(Buf *b, int rt, int rt2, int rn, int off) { ldst_pair_q(b, 0xAD400000u, rt, rt2, rn, off); }
+void a64_stp_q(Buf *b, int rt, int rt2, int rn, int off) { ldst_pair_q(b, 0xAD000000u, rt, rt2, rn, off); }
+void a64_ldur_q(Buf *b, int rt, int rn, int off) {
+  W(0x3CC00000u | ((FITS("unscaled offset", off, -256, 255) & 0x1ffu) << 12) |
+    (M5(rn) << 5) | M5(rt));
+}
+void a64_stur_q(Buf *b, int rt, int rn, int off) {
+  W(0x3C800000u | ((FITS("unscaled offset", off, -256, 255) & 0x1ffu) << 12) |
+    (M5(rn) << 5) | M5(rt));
+}
 void a64_str_q_reg(Buf *b, int rt, int rn, int rm, int option, int s) {
   W(0x3CA00800u | (M5(rm) << 16) | ((uint32_t)(option & 7) << 13) |
     ((uint32_t)(s & 1) << 12) | (M5(rn) << 5) | M5(rt));
