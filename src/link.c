@@ -406,7 +406,20 @@ static void split_subsections(InObj *o) {
       d->name = xstrndup(is->name, strlen(is->name));
       d->data = is->data ? is->data + from : NULL;
       d->size = to - from;
+      /* A function keeps the alignment its start had in the section: warmc
+         pads a function or loop to 64 bytes within its object, and placing
+         each one at the section's alignment after whatever dead stripping
+         left before it would undo that.  A variable gets the section's whole
+         alignment, as every atom used to: the runtime's .bss is 128-aligned,
+         so that puts each of its variables on cache lines of its own, which
+         is what keeps the collector thread and the program from writing to
+         one line -- packed the way the object has them, ktbench/list ran in
+         130 ms instead of 70. */
       d->align = is->align;
+      if (is->kind == K_TEXT) {
+        d->align = from ? (from & -from) : is->align;
+        if (d->align > is->align) d->align = is->align;
+      }
       d->kind = is->kind;
     }
     xfree(is->name);
