@@ -1310,6 +1310,32 @@ static void analyse_immediates(Isel *s) {
     }
   }
 
+  s->csinc = xcalloc(n ? n : 1, 1);
+  for (uint32_t oi = 0; oi < f->norder; oi++) {
+    uint32_t bi = f->order[oi];
+    Block *b = &f->blocks[bi];
+    for (uint32_t i = 0; i < b->ninsts; i++) {
+      Ref u = b->insts[i];
+      Inst *in = &f->insts[u];
+      if (in->op != I_SELECT || in->nargs != 3 || is_fp_value(f, u) || is_vec_value(f, u))
+        continue;
+      Ref *a = ir_args(f, u);
+      for (int slot = 0; slot < 2; slot++) {
+        Ref cand = a[slot];
+        Inst *ci = &f->insts[cand];
+        if (ci->op != I_ADD || ci->nargs != 2 || ci->type != in->type) continue;
+        if (uses[cand] != 1 || blocked[cand] || s->folded[cand] || ci->block != bi) continue;
+        Ref *ca = ir_args(f, cand);
+        if (ca[0] != a[slot ^ 1] || f->insts[ca[1]].op != I_CONST ||
+            (f->insts[ca[1]].imm & (vt_is_64((ValType)in->type) ? ~0ull : 0xffffffffull)) != 1)
+          continue;
+        s->folded[cand] = 1;
+        s->csinc[u] = (uint8_t)(slot + 1);
+        break;
+      }
+    }
+  }
+
   if (!getenv("WARMC_NO_MASKSEL"))
   for (uint32_t oi = 0; oi < f->norder; oi++) {
     uint32_t bi = f->order[oi];
@@ -1978,7 +2004,7 @@ give_up:
   xfree(s->mem_valid_in); xfree(s->prof_site); xfree(s->prof_start);
   xfree(s->imm_fold); xfree(s->fused); xfree(s->addr_fuse); xfree(s->ptr_fuse);
   xfree(s->zx_fuse); xfree(s->no_remat); xfree(s->paired); xfree(s->nl); xfree(s->pool);
-  xfree(s->folded); xfree(s->uses); xfree(s->bfx); xfree(s->pinned);
+  xfree(s->folded); xfree(s->uses); xfree(s->bfx); xfree(s->pinned); xfree(s->csinc);
   xfree(s->sites); xfree(s->clauses);
   xfree(s->gcsites); xfree(s->gcroots);
   xfree(s->sp_first); xfree(s->sp_n); xfree(s->sp_vals);

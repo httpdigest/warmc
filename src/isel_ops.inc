@@ -732,6 +732,18 @@ static void emit_inst(Isel *s, Ref v) {
       } else if (xc && yc && xv == 0 && (yv == 1 || yv == m)) {
         if (yv == 1) a64_cset(B, sf, d, cc_invert(cc));
         else a64_csetm(B, sf, d, cc_invert(cc));
+      } else if (s->csinc && s->csinc[v]) {
+        /* c ? k + 1 : k is k, or k + 1 where c holds: csinc increments
+           where its condition fails. */
+        int slot = s->csinc[v] - 1;
+        int k = rd(s, a[slot ^ 1], S0);
+        a64_csinc(B, sf, d, k, k, slot == 0 ? cc_invert(cc) : cc);
+      } else if (xc && yc && (xv == ((yv + 1) & m) || yv == ((xv + 1) & m))) {
+        /* two constants a step apart: one of them and a csinc */
+        bool up = xv == ((yv + 1) & m);
+        uint64_t lo = up ? yv : xv;
+        int k = lo == 0 ? RZR : rd(s, a[up ? 1 : 0], S0);
+        a64_csinc(B, sf, d, k, k, up ? cc_invert(cc) : cc);
       } else {
         int x = (xc && xv == 0) ? RZR : rd(s, a[0], S0);
         int y = (yc && yv == 0) ? RZR : rd(s, a[1], S1);
