@@ -97,11 +97,15 @@ ZIG_FLAGS = ["-target", "wasm32-wasi", "-O", "ReleaseFast",
 # exceptions on, which takes the standard (exnref) encoding and the copy of
 # libc++ built for it, and C with setjmp/longjmp lowered onto the same
 # proposal; a kernel that never throws or jumps pays nothing for either.
+# --no-wasm-opt because clang otherwise runs whatever wasm-opt it finds on
+# PATH over its output: the corpus would be LLVM's code on one machine and
+# binaryen's rewrite of it on the next, and the pass also drops the name
+# section that maps a profile's wasm_func_N back to a C function.
 WASI_SDK_BIN = os.path.join(ROOT, "build", "tools", "wasi-sdk", "bin")
-C_FLAGS = ["-O3", "-mllvm", "-wasm-enable-sjlj", "-mllvm",
+C_FLAGS = ["-O3", "--no-wasm-opt", "-mllvm", "-wasm-enable-sjlj", "-mllvm",
            "-wasm-use-legacy-eh=false", "-lsetjmp"]
-CXX_FLAGS = ["-O3", "-std=c++20", "-fwasm-exceptions", "-mllvm",
-             "-wasm-use-legacy-eh=false", "-lunwind"]
+CXX_FLAGS = ["-O3", "--no-wasm-opt", "-std=c++20", "-fwasm-exceptions",
+             "-mllvm", "-wasm-use-legacy-eh=false", "-lunwind"]
 
 # GHC's wasm backend, wherever ghc-wasm-meta's setup.sh put it: on PATH after
 # `source ~/.ghc-wasm/env`, or in its default prefix.
