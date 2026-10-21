@@ -65,10 +65,10 @@ Hello world!
   - a linear-scan register allocator with rematerialisation
 
   Functions compile in parallel and are laid out in a deterministic order.
-- **Fast code.** Across 173 benchmark kernels compiled from TinyGo, Rust, Zig,
-  AssemblyScript, Kotlin, C, C++ and Haskell, warmc's steady-state code takes
-  0.46× wasmtime's time (geometric mean), with much lower peak memory. See
-  [Performance](#performance).
+- **Fast code.** Across 207 benchmark kernels compiled from Go, TinyGo, Rust,
+  Zig, AssemblyScript, Kotlin, C, C++ and Haskell, warmc's steady-state code
+  takes 0.52× wasmtime's time (geometric mean), with much lower peak memory.
+  See [Performance](#performance).
 - **Runtime for modern languages:**
   - a concurrent, compacting, ZGC-style collector with coloured pointers,
     precise stack maps and load barriers
@@ -645,8 +645,8 @@ cheaper. Functions compile in parallel and are laid out deterministically.
 
 `test/baseline.json` records warmc against wasmtime 50.0.0 on the author's
 Apple silicon machine, at `-O2`, with each corpus's producer version beside
-it (TinyGo 0.43, rustc nightly 1.101, Zig 0.17, AssemblyScript 0.28.20,
-Kotlin 2.4.21, wasi-sdk 34 with clang 23.1, GHC 9.14). Each figure is the
+it (TinyGo 0.43, Go 1.27.3, rustc nightly 1.101, Zig 0.17, AssemblyScript
+0.28.20, Kotlin 2.4.21, wasi-sdk 34 with clang 23.1, GHC 9.14). Each figure is the
 geometric mean of warmc time ÷ wasmtime time, so lower is better. Each
 engine's empty-program time is subtracted first, so the ratios compare
 steady-state generated code, not start-up or compile time.
@@ -654,6 +654,7 @@ steady-state generated code, not start-up or compile time.
 | Corpus | Source language | Kernels | warmc / wasmtime | Range | Median peak RSS (warmc / wasmtime) |
 |---|---|---:|---:|---|---|
 | `gobench` | TinyGo | 26 | 0.61 | 0.07 – 1.04 | 1.9 / 8.9 MB |
+| `stdgo` | Go | 34 | 0.98 | 0.23 – 2.22 | 7.3 / 27.2 MB |
 | `vecbench` | TinyGo (vectorisable loops) | 30 | 0.15 | 0.04 – 0.94 | 1.9 / 8.9 MB |
 | `asbench` | AssemblyScript | 25 | 0.68 | 0.18 – 1.40 | 1.9 / 8.7 MB |
 | `rsbench` | Rust | 28 | 0.72 | 0.34 – 1.00 | 2.0 / 9.1 MB |
@@ -663,12 +664,21 @@ steady-state generated code, not start-up or compile time.
 | `cppbench` | C++ | 14 | 0.70 | 0.23 – 1.00 | 2.5 / 9.7 MB |
 | `hsbench` | Haskell | 15 | 0.65 | 0.41 – 0.89 | 10.2 / 32.3 MB |
 
-Over all 173 kernels the geometric mean is **0.46** (0.40 over the 130 outside
-the C, C++ and Haskell corpora). Ten kernels are slower than wasmtime, and nine
-of them are within 5%. The tenth, `asbench/arrpush` (growing an array by
-`push`), runs at 1.40×. That kernel was 0.94× against wasmtime 49, so wasmtime
-50 is what got faster there; warmc has since come down from 1.61×, and
-compiles its hot loop to nearly the same instructions as wasmtime does.
+Over all 207 kernels the geometric mean is **0.52**, and 0.46 without
+`stdgo`. Outside `stdgo`, ten kernels are slower than wasmtime, and nine of
+them are within 5%. The tenth, `asbench/arrpush` (growing an array by `push`),
+runs at 1.40×. That kernel was 0.94× against wasmtime 49, so wasmtime 50 is
+what got faster there; warmc has since come down from 1.61×, and compiles its
+hot loop to nearly the same instructions as wasmtime does.
+
+`stdgo` is Go built by Go's own compiler, and it is where warmc is weakest:
+14 of its 34 kernels are slower than wasmtime, up to 2.22× for
+`stdgo/multiret`. That back end is not LLVM. It compiles every function to a
+loop around a `br_table` over the function's resume points, so that a
+goroutine switch can unwind the wasm stack and re-enter the function where it
+left off, and it sends a loop's back edge through that dispatch with a
+constant index. warmc does not yet thread such a jump straight to its target,
+so in `multiret`'s hot loop every iteration pays an indirect branch.
 Re-run the comparison on your own machine before relying on these numbers:
 
 ```sh
