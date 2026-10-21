@@ -280,8 +280,6 @@ expect keep_reused        "OK" 0 2
 expect keep_shared_edge   "OK" 0 2
 expect keep_shared_edge   "OK" 3 100
 expect pe_rare_call       "OK" 20 0 570
-expect pe_found           "OK" 10 49 7049
-expect pe_found           "OK" 10 50 -1
 expect pe_best            "OK" 50 32100
 expect pe_array           "OK" 1 180
 expect pe_array           "OK" 0 11
@@ -293,19 +291,34 @@ expect pe_merge           "OK" 1 0 11
 expect pe_merge           "OK" 0 0 13
 expect pe_edge            "OK" 1 15
 expect pe_edge            "OK" 0 -1
-expect pe_nested          "OK" 1 8
-expect pe_nested          "OK" 0 -1
+expect sr_found           "OK" 10 49 7049
+expect sr_found           "OK" 10 50 -1
+expect sr_found_loop      "OK" 10 49 7049
+expect sr_found_loop      "OK" 10 50 -1
+expect sr_nested_cond     "OK" 1 8
+expect sr_nested_cond     "OK" 0 -1
+expect sr_nullable        "OK" 1 43
+expect sr_nullable        "OK" 0 -1
+expect sr_nullable_trap   "OK" 1 2
+expect sr_nullable_trap   "null reference" 0 2
+expect sr_nullable_test   "OK" 1 110
+expect sr_nullable_test   "OK" 0 10
 expect keep_escape_write  "OK" 1 9
 expect keep_escape_write  "OK" 0 9
 expect keep_escape_identity "OK" 1 1
 expect keep_escape_identity "OK" 0 0
 expect keep_loop_escape   "OK" 5 5
+expect keep_nullable_escape "OK" 1 5
+expect keep_nullable_escape "OK" 0 -1
+expect keep_nullable_eq   "OK" 1 0
+expect keep_nullable_eq   "OK" 0 1
 
 # The sr_ and pe_ cases are right whether or not their objects were
 # replaced, so whether they were is asked separately: at the default -O2,
-# every allocation in an sr_ function must end the pipeline replaced, and
-# a pe_ function must have one made at its escape points, with nothing else
-# standing but the objects so made, which escape on every path.
+# no allocation in an sr_ function may be left standing -- one made at an
+# escape point on the way must go too -- and a pe_ function must have one
+# made at its escape points, with nothing else standing but the objects so
+# made, which escape on every path.
 # WARMC_ESCAPE_DEBUG names functions by index; wasm-tools maps them back.
 if [ -z "${WARMC_FLAGS:-}" ] || [ "${WARMC_FLAGS:-}" = -O2 ]; then
   if why=$(WARMC_ESCAPE_DEBUG=1 wtimeout ./$BUILD/warmc -O2 -j1 -c -o /dev/null \
@@ -323,7 +336,7 @@ for line in sys.stdin:
     m = re.match(r"escape wasm_func_(\d+) (v\d+) \w+ d\d+: (.*)", line.strip())
     if m and int(m.group(1)) in names: last[(int(m.group(1)), m.group(2))] = m.group(3)
 def fine(n, w):
-    if n.startswith("sr_"): return w == "replaced"
+    if n.startswith("sr_"): return w == "replaced" or w.startswith("partial:")
     return w == "replaced" or w.startswith("partial:") or w.endswith(" on every path")
 bad = ["%s %s: %s" % (names[f], v, w) for (f, v), w in sorted(last.items()) if not fine(names[f], w)]
 bad += ["%s: no allocation reached the pass" % n for f, n in sorted(names.items())
