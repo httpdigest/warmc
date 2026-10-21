@@ -646,18 +646,19 @@ compile time.
 
 | Corpus | Source language | Kernels | warmc / wasmtime | Range | Median peak RSS (warmc / wasmtime) |
 |---|---|---:|---:|---|---|
-| `gobench` | TinyGo | 26 | 0.62 | 0.07 – 1.05 | 1.9 / 8.9 MB |
-| `vecbench` | TinyGo (vectorisable loops) | 30 | 0.15 | 0.04 – 0.95 | 1.9 / 8.9 MB |
-| `asbench` | AssemblyScript | 25 | 0.68 | 0.18 – 1.61 | 1.9 / 8.7 MB |
+| `gobench` | TinyGo | 26 | 0.61 | 0.07 – 1.04 | 1.9 / 8.9 MB |
+| `vecbench` | TinyGo (vectorisable loops) | 30 | 0.15 | 0.04 – 0.94 | 1.9 / 8.9 MB |
+| `asbench` | AssemblyScript | 25 | 0.67 | 0.18 – 1.38 | 1.9 / 8.7 MB |
 | `rsbench` | Rust | 28 | 0.72 | 0.35 – 1.00 | 1.9 / 9.1 MB |
-| `zigbench` | Zig | 9 | 0.70 | 0.40 – 1.00 | 1.9 / 8.8 MB |
-| `ktbench` | Kotlin (Wasm GC) | 12 | 0.09 | 0.003 – 0.48 | 3.5 / 20.6 MB |
+| `zigbench` | Zig | 9 | 0.70 | 0.42 – 1.00 | 1.9 / 8.7 MB |
+| `ktbench` | Kotlin (Wasm GC) | 12 | 0.09 | 0.004 – 0.49 | 3.5 / 20.6 MB |
 
-Over all 130 kernels the geometric mean is **0.40**. Six kernels are slower
-than wasmtime. Five of them are within 6%; the sixth, `asbench/arrpush`
-(growing an array by `push`), runs at 1.61×. That kernel was 0.94× against
-wasmtime 49, and warmc's own time did not change, so wasmtime 50 is what got
-faster there. Re-run the comparison on your own machine before relying on
+Over all 130 kernels the geometric mean is **0.40**. Seven kernels are slower
+than wasmtime. Six of them are within 5%; the seventh, `asbench/arrpush`
+(growing an array by `push`), runs at 1.38×. That kernel was 0.94× against
+wasmtime 49, so wasmtime 50 is what got faster there; warmc has since come
+down from 1.61×, and compiles its hot loop to nearly the same instructions as
+wasmtime does. Re-run the comparison on your own machine before relying on
 these numbers:
 
 ```sh
