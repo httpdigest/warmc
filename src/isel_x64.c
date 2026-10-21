@@ -411,7 +411,7 @@ static void emit_call_args_core(Isel *s, const Ref *args, uint32_t nargs,
       int l = s->loc[v];
       if (pos < 4) {
         mv[nmv++] = (Move){ l, fp ? pos : ARG_GPR[pos], (uint8_t)fp,
-                            (uint8_t)(fp ? wide : 1), 0 };
+                            (uint8_t)(fp ? wide : 1), 0, 0, 0 };
         continue;
       }
       int32_t at = base_disp + 32 + 8 * (pos - 4);
@@ -458,14 +458,14 @@ static void emit_call_args_core(Isel *s, const Ref *args, uint32_t nargs,
       int l = s->loc[v];
       if (fp) {
         if (next_flt >= 4) { next_flt++; continue; }
-        mv[nmv++] = (Move){ l, next_flt++, 1, (uint8_t)wide, (uint8_t)vec };
+        mv[nmv++] = (Move){ l, next_flt++, 1, (uint8_t)wide, (uint8_t)vec, 0, 0 };
       } else {
         if (next_int > 3) { next_int++; continue; }
-        mv[nmv++] = (Move){ l, ARG_GPR[next_int++], 0, (uint8_t)wide, 0 };
+        mv[nmv++] = (Move){ l, ARG_GPR[next_int++], 0, (uint8_t)wide, 0, 0, 0 };
       }
     }
   }
-  if (want_vmctx) mv[nmv++] = (Move){ REG_VMCTX, X_RCX, 0, 1, 0 };
+  if (want_vmctx) mv[nmv++] = (Move){ REG_VMCTX, X_RCX, 0, 1, 0, 0, 0 };
   parallel_copy(s, mv, nmv);
 }
 
@@ -842,6 +842,7 @@ static void analyse_immediates(Isel *s) {
     if (f->insts[i].op == I_CONST && fits_gpr(f, i))
       s->imm_fold[i] = 1;
 
+  bool no_edge_remat = getenv("WARMC_NO_EDGE_REMAT") != NULL;
   for (uint32_t oi = 0; oi < f->norder; oi++) {
     uint32_t bi = f->order[oi];
     Block *b = &f->blocks[bi];
@@ -875,7 +876,11 @@ static void analyse_immediates(Isel *s) {
       for (uint32_t j = 0; j < b->succs[sidx].nargs; j++) {
         uses[b->succs[sidx].args[j]]++;
         blocked[b->succs[sidx].args[j]] = 1;
-        s->no_remat[b->succs[sidx].args[j]] = 1;
+        /* An edge makes a rematerialised argument in its target's location
+           (see parallel_copy_to); a landing pad's are stored before the
+           call, where the scratch registers may still be in use. */
+        if (b->succs[sidx].eh || no_edge_remat)
+          s->no_remat[b->succs[sidx].args[j]] = 1;
       }
   }
   for (uint32_t i = 0; i < n; i++) if (blocked[i]) s->imm_fold[i] = 0;
@@ -1150,7 +1155,7 @@ static void emit_prologue(Isel *s, Buf *b) {
         if (npmv == (int)(sizeof pmv / sizeof pmv[0]))
           warmc_fatal("internal: more parameters in registers than there are");
         pmv[npmv++] = (Move){ src, l, (uint8_t)fp, (uint8_t)(fp ? wide : 1),
-                              (uint8_t)vec };
+                              (uint8_t)vec, 0, 0 };
       } else {
         emit_reg_move(b, l, src, fp, wide, vec);
       }
