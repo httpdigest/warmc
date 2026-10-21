@@ -887,6 +887,37 @@ static void emit_small_memop_done(Isel *s) {
   s->smo_ndone = 0;
 }
 
+#define SMALL_LOOP_INSTS 12u
+
+/* Whether the natural loop headed by h is small: its blocks, found back
+   from the latches, hold at most SMALL_LOOP_INSTS IR instructions and
+   terminators -- about what fits in 64 bytes once lowered. */
+static bool small_loop(IrFunc *f, uint32_t h) {
+  uint32_t nb = f->nblocks, n = 0, sp = 0;
+  uint8_t *in = xcalloc(nb ? nb : 1, 1);
+  uint32_t *stk = xmalloc((nb ? nb : 1) * sizeof(uint32_t));
+  Block *hb = &f->blocks[h];
+  in[h] = 1;
+  n += hb->ninsts + 1;
+  for (uint32_t p = 0; p < hb->npreds; p++) {
+    uint32_t l = hb->preds[p];
+    if (f->blocks[l].rpo >= hb->rpo && !in[l]) { in[l] = 1; stk[sp++] = l; }
+  }
+  bool ok = true;
+  while (sp && ok) {
+    uint32_t x = stk[--sp];
+    Block *xb = &f->blocks[x];
+    n += xb->ninsts + 1;
+    if (n > SMALL_LOOP_INSTS || x == f->entry) ok = false;
+    for (uint32_t p = 0; p < xb->npreds && ok; p++) {
+      uint32_t q = xb->preds[p];
+      if (!in[q]) { in[q] = 1; stk[sp++] = q; }
+    }
+  }
+  xfree(in); xfree(stk);
+  return ok && n <= SMALL_LOOP_INSTS;
+}
+
 static void emit_teardown(Isel *s);
 static void emit_epilogue(Isel *s);
 static void emit_block(Isel *s, uint32_t bi, uint32_t next_bi);
@@ -1734,6 +1765,14 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
   const char *lal_s = getenv("WARMC_LOOP_ALIGN");
   uint32_t lalign = lal_s ? (uint32_t)strtoul(lal_s, NULL, 0) : 16;
   if (lalign != 16 && lalign != 32) lalign = 0;
+  /* A loop small enough to fit in one 64-byte fetch block is aligned to
+     one, so it never straddles two: asbench/sum's 11-instruction loop, 16-
+     aligned at ...1ff0, crossed 0x2000 and ran 43% slower than the same
+     instructions at ...2020.  The size is estimated from the IR before the
+     loop is emitted, at most SMALL_LOOP_INSTS instructions; more than four
+     nops of padding become a branch over them, so a loop entered often pays
+     one taken branch, not a row of nops. */
+  bool small_align = lalign && opt->small_loop_align;
 
   for (uint32_t oi = 0; oi < f->norder; oi++) {
     uint32_t bi = f->order[oi];
@@ -1742,8 +1781,19 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
       bool header = false;
       for (uint32_t p = 0; p < lb->npreds && !header; p++)
         if (f->blocks[lb->preds[p]].rpo >= lb->rpo) header = true;
-      if (header)
-        while ((pro.len + B->len) & (lalign - 1)) a64_nop(B);
+      uint32_t want = lalign;
+      if (header && small_align && small_loop(f, bi)) want = 64;
+      if (header) {
+        uint32_t pad = (want - ((pro.len + B->len) & (want - 1))) & (want - 1);
+        if (pad > 16) {
+          size_t site = B->len;
+          a64_b(B, 0);
+          while ((pro.len + B->len) & (want - 1)) a64_nop(B);
+          patch_b26_checked(s, site, B->len);
+        } else {
+          while ((pro.len + B->len) & (want - 1)) a64_nop(B);
+        }
+      }
     }
     s->block_off[bi] = (uint32_t)B->len;
     s->mem_valid = s->mem_valid_in[bi] != 0;

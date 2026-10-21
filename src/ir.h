@@ -338,6 +338,7 @@ typedef struct {
   bool fold, dce, cse, licm, branch, memopt, bce, inl, strength;
   bool thread, nodesplit;
   bool gssa_all;
+  bool small_loop_align;
 
   bool reassoc;
   bool rotate;
