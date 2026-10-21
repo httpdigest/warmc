@@ -657,6 +657,8 @@ static bool is_associative(uint16_t op) {
   return op == I_ADD || op == I_MUL || op == I_AND || op == I_OR || op == I_XOR;
 }
 
+static bool gc_fold_known(IrFunc *f, Ref v);
+
 static bool fold_block(IrFunc *f, uint32_t bi, const OptOpts *o, const uint32_t *uses) {
   Block *b = &f->blocks[bi];
   bool changed = false;
@@ -668,6 +670,19 @@ static bool fold_block(IrFunc *f, uint32_t bi, const OptOpts *o, const uint32_t 
     uint64_t x = 0, y = 0, r;
 
     if (in->op == I_CONST || in->op == I_NOP) continue;
+
+    switch (in->op) {
+      case I_FIELD_GET: case I_ARRAY_GET: case I_ARRAY_LEN: case I_REF_TEST:
+      case I_REF_IS_NULL: case I_TRAP_IF:
+        if (gc_fold_known(f, v)) {
+          g_stats.folded++;
+          changed = true;
+          continue;
+        }
+        break;
+      default:
+        break;
+    }
 
     if (in->nargs == 2 && !vt_is_float((ValType)f->insts[a[0]].type) &&
         is_const(f, a[0], &x) && is_const(f, a[1], &y)) {
@@ -1040,6 +1055,174 @@ static bool pass_dce(IrFunc *f) {
     b->ninsts = k;
   }
   xfree(live); xfree(work);
+  return changed;
+}
+
+/* ---- throws caught where they are thrown ---------------------------------
+
+   A throw whose first matching handler is a pad of its own function, one
+   that catches the tag -- or anything -- without taking the exnref, is a
+   jump: the pad would only unpack the values the throw packs.  Inlining is
+   what puts a callee's throw beside its caller's catch, and once it is a
+   jump what was thrown no longer escapes.  The unwinder tries the clauses in
+   edge order and matches a tag by identity, so a clause for another tag
+   index is passed over only when neither tag is imported: two imports may
+   be one tag.  What the pad unpacks may be read past it directly, once the
+   block it jumps to has lost its parameters to it; that block then gets a
+   parameter again, which the pad and the jump each fill with their own. */
+static bool lt_pad_simple(IrFunc *f, uint32_t pad) {
+  Block *p = &f->blocks[pad];
+  if (p->pad_kind == 1 || p->pad_kind == 3) return false;
+  if (p->term == T_JUMP) {
+    if (p->nsuccs != 1 || p->succs[0].eh) return false;
+  } else if (p->term != T_RETURN) {
+    return false;
+  }
+  for (uint32_t i = 0; i < p->ninsts; i++) {
+    uint16_t op = f->insts[p->insts[i]].op;
+    if (op != I_EXN_OBJ && op != I_EXN_PAYLOAD && op != I_NOP) return false;
+  }
+  return true;
+}
+
+/* What a value the pad defines is once the throw jumps instead: a payload
+   is the value thrown, a parameter -- a local's value at the raise -- what
+   the throw's own edge brings it.  REF_NONE for the exnref, which there is
+   no making; a value from outside the pad is itself. */
+static Ref lt_value(IrFunc *f, uint32_t pad, Ref r, const Ref *vals,
+                    uint32_t nvals, const Edge *in) {
+  r = ir_resolve(f, r);
+  Inst *ri = &f->insts[r];
+  if (ri->block != pad) return r;
+  if (ri->op == I_EXN_PAYLOAD) return ri->imm < nvals ? vals[ri->imm] : REF_NONE;
+  if (ri->op == I_PARAM) {
+    Block *p = &f->blocks[pad];
+    for (uint32_t k = 0; k < p->nparams; k++)
+      if (p->params[k] == r) return k < in->nargs ? ir_resolve(f, in->args[k]) : REF_NONE;
+    return REF_NONE;
+  }
+  return ri->op == I_EXN_OBJ ? REF_NONE : r;
+}
+
+/* Every read of v outside the pad, redirected to r when r is not
+   REF_NONE; whether there was one. */
+static bool lt_past(IrFunc *f, uint32_t pad, Ref v, Ref r) {
+  bool seen = false;
+#define LT_SEE(x_) do { if (ir_resolve(f, (x_)) == v) { seen = true; \
+    if (r != REF_NONE) (x_) = r; } } while (0)
+  for (uint32_t oi = 0; oi < f->norder; oi++) {
+    uint32_t bi = f->order[oi];
+    if (bi == pad) continue;
+    Block *b = &f->blocks[bi];
+    for (uint32_t i = 0; i < b->ninsts; i++) {
+      Inst *in = &f->insts[b->insts[i]];
+      Ref *a = ir_args(f, b->insts[i]);
+      for (uint32_t j = 0; j < in->nargs; j++) LT_SEE(a[j]);
+    }
+    if (b->term == T_BRIF || b->term == T_BRTABLE) LT_SEE(b->term_arg);
+    for (uint32_t i = 0; i < b->nret; i++) LT_SEE(b->ret_args[i]);
+    for (uint32_t s = 0; s < b->nsuccs; s++)
+      for (uint32_t j = 0; j < b->succs[s].nargs; j++) LT_SEE(b->succs[s].args[j]);
+  }
+#undef LT_SEE
+  return seen;
+}
+
+static void edge_push_arg_at(IrFunc *f, uint32_t from, uint32_t si, Ref v);
+
+static bool pass_local_throw(IrFunc *f) {
+  if (!f->npads) return false;
+  const Module *m = f->m;
+  bool changed = false;
+  Ref *out = NULL;
+  uint32_t cap = 0;
+  for (uint32_t oi = 0; oi < f->norder; oi++) {
+    uint32_t bi = f->order[oi];
+    Block *b = &f->blocks[bi];
+    if (b->term != T_TRAP || !b->ninsts) continue;
+    Ref t = b->insts[b->ninsts - 1];
+    if (f->insts[t].op != I_THROW) continue;
+    uint32_t tag = (uint32_t)f->insts[t].imm, pad = UINT32_MAX, via = 0;
+    for (uint32_t s = 0; s < b->nsuccs; s++) {
+      if (!b->succs[s].eh) continue;
+      const Block *p = &f->blocks[b->succs[s].target];
+      if (p->pad_kind >= 2 || p->pad_tag == tag) {
+        pad = b->succs[s].target;
+        via = s;
+        break;
+      }
+      if (tag < m->nimported_tags || p->pad_tag < m->nimported_tags) break;
+    }
+    if (pad == UINT32_MAX || !lt_pad_simple(f, pad)) continue;
+
+    /* what the pad hands on, as the throw has it */
+    Block *p = &f->blocks[pad];
+    const Edge *in = &b->succs[via];
+    bool jump = p->term == T_JUMP;
+    uint32_t n = jump ? p->succs[0].nargs : p->nret;
+    const Ref *from = jump ? p->succs[0].args : p->ret_args;
+    if (n > cap) {
+      cap = n * 2;
+      out = xrealloc(out, cap * sizeof(Ref));
+    }
+    const Ref *vals = ir_args(f, t);
+    uint32_t nvals = f->insts[t].nargs;
+    bool ok = true;
+    for (uint32_t j = 0; j < n && ok; j++) {
+      out[j] = lt_value(f, pad, from[j], vals, nvals, in);
+      ok = out[j] != REF_NONE;
+    }
+    if (!ok) continue;
+
+    /* the pad's values read past it: the block it jumps to, which only
+       the pad reaches if anything past it can read them, takes each as a
+       parameter instead */
+    Ref past[16];
+    uint32_t npast = 0;
+    for (uint32_t k = 0; k < p->nparams + p->ninsts && ok; k++) {
+      Ref v = k < p->nparams ? p->params[k] : p->insts[k - p->nparams];
+      uint16_t op = f->insts[v].op;
+      if (op != I_PARAM && op != I_EXN_PAYLOAD && op != I_EXN_OBJ) continue;
+      if (!lt_past(f, pad, v, REF_NONE)) continue;
+      ok = jump && npast < 16 && f->blocks[p->succs[0].target].npreds == 1 &&
+           lt_value(f, pad, v, vals, nvals, in) != REF_NONE;
+      if (ok) past[npast++] = v;
+    }
+    if (!ok) continue;
+    if (n + npast > cap) {
+      cap = (n + npast) * 2;
+      out = xrealloc(out, cap * sizeof(Ref));
+    }
+    for (uint32_t k = 0; k < npast; k++) {
+      uint32_t to = p->succs[0].target;
+      Ref P = ir_add_param(f, to, (ValType)f->insts[past[k]].type);
+      edge_push_arg_at(f, pad, 0, past[k]);
+      lt_past(f, pad, past[k], P);
+      out[n++] = lt_value(f, pad, past[k], vals, nvals, in);
+    }
+
+    f->insts[t].op = I_NOP;
+    f->insts[t].nargs = 0;
+    b->ninsts--;
+    b->nsuccs = 0;
+    if (jump) {
+      b->term = T_JUMP;
+      ir_add_edge(f, bi, p->succs[0].target, out, n);
+    } else {
+      b->term = T_RETURN;
+      b->ret_args = ir_alloc(f, (n ? n : 1) * sizeof(Ref));
+      memcpy(b->ret_args, out, n * sizeof(Ref));
+      b->nret = b->cap_ret = n;
+    }
+    g_stats.throw_jumps++;
+    changed = true;
+  }
+  xfree(out);
+  if (changed) {
+    ir_apply_subst(f);
+    ir_recompute_preds(f);
+    ir_order(f);
+  }
   return changed;
 }
 
@@ -2729,6 +2912,13 @@ static VtSlot *fx_vt;
 static uint32_t *fx_vtbase;
 static uint32_t *fx_gfunc;
 static uint32_t *fx_ncallers;
+
+/* Constant objects: per immutable global whose expression indexes, where
+   its instructions' entries start in fx_cg_first (FX_CG_NONE otherwise);
+   per instruction, where its operands start in fx_cg_opnd; and the
+   operands, as instruction indices in the same expression. */
+#define FX_CG_NONE 0xffffffffu
+static uint32_t *fx_cg_at, *fx_cg_first, *fx_cg_opnd;
 static bool fx_vt_poisoned;
 static uint32_t fx_nfuncs;
 
@@ -2774,6 +2964,9 @@ void opt_effects_begin(Module *m, const OptOpts *o) {
   xfree(fx_vtbase); fx_vtbase = NULL;
   xfree(fx_gfunc); fx_gfunc = NULL;
   xfree(fx_ncallers); fx_ncallers = NULL;
+  xfree(fx_cg_at); fx_cg_at = NULL;
+  xfree(fx_cg_first); fx_cg_first = NULL;
+  xfree(fx_cg_opnd); fx_cg_opnd = NULL;
   fx_vt_poisoned = false;
   fx_mod = m;
   fx_opts = o;
@@ -3314,8 +3507,374 @@ bool opt_call_frame_only(const Module *m, uint32_t fi) {
   return fx_func[fi].state == 2 && fx_func[fi].frame_only;
 }
 
+/* ---- constant objects ---------------------------------------------------
+
+   An immutable global initialised by struct.new or array.new holds one
+   object for the instance's life, and an immutable field or element of that
+   object holds what the constant expression put there: a number, a null, a
+   function, another global, or an object built inside the same expression.
+   A read through such an object folds to it.  Kotlin builds its vtables and
+   itables this way, so this is what resolves a virtual or interface call on
+   an object whose class is known: the vtable read off an allocation is the
+   one it was made with (gc_init_value), and the rest of the dispatch reads
+   through that. */
+
+/* The operands a constant-expression instruction takes; UINT32_MAX for one
+   the index does not cover. */
+static uint32_t fx_cg_pops(const Module *m, const InitInsn *p) {
+  switch (p->op) {
+    case IOP_I32_CONST: case IOP_I64_CONST: case IOP_F32_CONST:
+    case IOP_F64_CONST: case IOP_V128_CONST: case IOP_GLOBAL_GET:
+    case IOP_REF_NULL: case IOP_REF_FUNC: case IOP_STRUCT_NEW_DEFAULT:
+      return 0;
+    case IOP_REF_I31: case IOP_REF_CONVERT: case IOP_ARRAY_NEW_DEFAULT:
+      return 1;
+    case IOP_I32_ADD: case IOP_I32_SUB: case IOP_I32_MUL:
+    case IOP_I64_ADD: case IOP_I64_SUB: case IOP_I64_MUL: case IOP_ARRAY_NEW:
+      return 2;
+    case IOP_ARRAY_NEW_FIXED: return (uint32_t)p->hi;
+    case IOP_STRUCT_NEW:
+      return p->lo < m->ntypes && m->types[p->lo].kind == CT_STRUCT
+                 ? m->types[p->lo].nfields
+                 : UINT32_MAX;
+    default: return UINT32_MAX;
+  }
+}
+
+static void fx_cg_build(const Module *m) {
+  uint64_t total = 0;
+  uint32_t deepest = 1;
+  for (uint32_t gi = 0; gi < m->nglobals; gi++) {
+    const Global *g = &m->globals[gi];
+    if (g->imported || g->mutable_) continue;
+    total += g->init.n;
+    if (g->init.n > deepest) deepest = g->init.n;
+  }
+  fx_cg_at = xmalloc((m->nglobals ? m->nglobals : 1) * sizeof(uint32_t));
+  fx_cg_first = xmalloc((total ? total : 1) * sizeof(uint32_t));
+  fx_cg_opnd = xmalloc((total ? total : 1) * sizeof(uint32_t));
+  uint32_t *stack = xmalloc(deepest * sizeof(uint32_t));
+  uint32_t nf = 0, no = 0;
+  for (uint32_t gi = 0; gi < m->nglobals; gi++) {
+    fx_cg_at[gi] = FX_CG_NONE;
+    const Global *g = &m->globals[gi];
+    if (g->imported || g->mutable_ || !g->init.n) continue;
+    uint32_t sp = 0, no0 = no;
+    bool ok = true;
+    for (uint32_t i = 0; i < g->init.n; i++) {
+      uint32_t pops = fx_cg_pops(m, &g->init.ins[i]);
+      if (pops == UINT32_MAX || pops > sp) { ok = false; break; }
+      fx_cg_first[nf + i] = no;
+      sp -= pops;
+      memcpy(&fx_cg_opnd[no], &stack[sp], pops * sizeof(uint32_t));
+      no += pops;
+      stack[sp++] = i;
+    }
+    if (!ok || sp != 1) { no = no0; continue; }
+    fx_cg_at[gi] = nf;
+    nf += g->init.n;
+  }
+  xfree(stack);
+}
+
+static bool cg_indexed(const Module *m, uint32_t g) {
+  return fx_cg_at && g < m->nglobals && fx_cg_at[g] != FX_CG_NONE;
+}
+
+static const uint32_t *cg_ops(uint32_t g, uint32_t n) {
+  return &fx_cg_opnd[fx_cg_first[fx_cg_at[g] + n]];
+}
+
+/* Follow an expression node through global.get and conversions to the
+   allocation it is. */
+static bool cg_object(const Module *m, uint32_t *g, uint32_t *n) {
+  for (int d = 0; d < 16; d++) {
+    const InitInsn *p = &m->globals[*g].init.ins[*n];
+    switch (p->op) {
+      case IOP_STRUCT_NEW: case IOP_STRUCT_NEW_DEFAULT: case IOP_ARRAY_NEW:
+      case IOP_ARRAY_NEW_DEFAULT: case IOP_ARRAY_NEW_FIXED:
+        return true;
+      case IOP_REF_CONVERT:
+        *n = cg_ops(*g, *n)[0];
+        continue;
+      case IOP_GLOBAL_GET:
+        if (!cg_indexed(m, (uint32_t)p->lo)) return false;
+        *g = (uint32_t)p->lo;
+        *n = m->globals[*g].init.n - 1;
+        continue;
+      default:
+        return false;
+    }
+  }
+  return false;
+}
+
+static bool cg_obj_of(IrFunc *f, Ref r, uint32_t *g, uint32_t *n, int depth);
+
+/* The expression node an immutable field or element read yields when the
+   object read is a constant one, or *zero for a default value. */
+static bool cg_read(IrFunc *f, Ref v, uint32_t *g, uint32_t *n, bool *zero,
+                    int depth) {
+  const Module *m = f->m;
+  Inst *in = &f->insts[v];
+  if ((in->op != I_FIELD_GET && in->op != I_ARRAY_GET) || !in->nargs)
+    return false;
+  uint32_t og, on;
+  if (!cg_obj_of(f, ir_args(f, v)[0], &og, &on, depth + 1)) return false;
+  const InitInsn *p = &m->globals[og].init.ins[on];
+  if (p->lo >= m->ntypes) return false;
+  const CompType *t = &m->types[p->lo];
+  const uint32_t *ops = cg_ops(og, on);
+  *g = og;
+  *zero = false;
+  if (in->op == I_FIELD_GET) {
+    if (t->kind != CT_STRUCT) return false;
+    uint32_t j = 0;
+    while (j < t->nfields &&
+           (uint64_t)t->hdr_size + t->fields[j].offset != in->imm)
+      j++;
+    if (j == t->nfields || t->fields[j].mutable_ ||
+        vt_is_packed(t->fields[j].type))
+      return false;
+    if (p->op == IOP_STRUCT_NEW_DEFAULT) *zero = true;
+    else *n = ops[j];
+    return true;
+  }
+  if (t->kind != CT_ARRAY || t->fields[0].mutable_ ||
+      vt_is_packed(t->fields[0].type))
+    return false;
+  uint64_t idx;
+  if (!is_const(f, ir_args(f, v)[1], &idx)) return false;
+  idx &= 0xffffffffu;
+  if (p->op == IOP_ARRAY_NEW_FIXED) {
+    if (idx >= p->hi) return false;
+    *n = ops[idx];
+    return true;
+  }
+  if (p->op != IOP_ARRAY_NEW && p->op != IOP_ARRAY_NEW_DEFAULT) return false;
+  const InitInsn *len =
+      &m->globals[og].init.ins[ops[p->op == IOP_ARRAY_NEW ? 1 : 0]];
+  if (len->op != IOP_I32_CONST || idx >= (uint32_t)len->lo) return false;
+  if (p->op == IOP_ARRAY_NEW_DEFAULT) *zero = true;
+  else *n = ops[0];
+  return true;
+}
+
+/* The constant object an IR value is: a global.get of an indexed global,
+   or an immutable read off another constant object, through conversions. */
+static bool cg_obj_of(IrFunc *f, Ref r, uint32_t *g, uint32_t *n, int depth) {
+  const Module *m = f->m;
+  if (fx_mod != m || !fx_resolved || !fx_cg_at || depth > 16) return false;
+  for (int d = 0; d < 16; d++) {
+    r = ir_resolve(f, r);
+    Inst *in = &f->insts[r];
+    if (in->op == I_REF_CONVERT && in->nargs == 1) {
+      r = ir_args(f, r)[0];
+      continue;
+    }
+    if (in->op == I_GLOBAL_GET) {
+      if (!cg_indexed(m, (uint32_t)in->imm)) return false;
+      *g = (uint32_t)in->imm;
+      *n = m->globals[*g].init.n - 1;
+      return cg_object(m, g, n);
+    }
+    bool zero;
+    if (!cg_read(f, r, g, n, &zero, depth) || zero) return false;
+    return cg_object(m, g, n);
+  }
+  return false;
+}
+
+bool opt_const_object(IrFunc *f, Ref r) {
+  uint32_t g, n;
+  return cg_obj_of(f, r, &g, &n, 0);
+}
+
+/* The exact type of a value that is one known object -- a fresh allocation
+   or a constant object, through conversions -- which is never null. */
+static bool gc_exact_type(IrFunc *f, Ref r, uint32_t *ti) {
+  const Module *m = f->m;
+  for (int d = 0; d < 16; d++) {
+    r = ir_resolve(f, r);
+    Inst *in = &f->insts[r];
+    if (in->op == I_REF_CONVERT && in->nargs == 1) {
+      r = ir_args(f, r)[0];
+      continue;
+    }
+    if (in->op == I_STRUCT_NEW || in->op == I_ARRAY_NEW) {
+      if (in->imm >= m->ntypes) return false;
+      *ti = (uint32_t)in->imm;
+      return true;
+    }
+    uint32_t g, n;
+    if (!cg_obj_of(f, r, &g, &n, 0)) return false;
+    uint64_t t = m->globals[g].init.ins[n].lo;
+    if (t >= m->ntypes) return false;
+    *ti = (uint32_t)t;
+    return true;
+  }
+  return false;
+}
+
+/* The value an immutable field read off a fresh allocation yields: what
+   the allocation's initialising store put there, which nothing after it can
+   change -- the store follows the allocation in its block, before anything
+   can read the object.  A field it does not store is left alone. */
+static Ref gc_init_value(IrFunc *f, Ref v) {
+  const Module *m = f->m;
+  Inst *in = &f->insts[v];
+  if (in->op != I_FIELD_GET || !in->nargs) return REF_NONE;
+  Ref r = ir_args(f, v)[0];
+  for (int d = 0; d < 16; d++) {
+    r = ir_resolve(f, r);
+    if (f->insts[r].op != I_REF_CONVERT || f->insts[r].nargs != 1) break;
+    r = ir_args(f, r)[0];
+  }
+  Inst *ai = &f->insts[r];
+  if (ai->op != I_STRUCT_NEW || ai->imm >= m->ntypes) return REF_NONE;
+  const CompType *t = &m->types[ai->imm];
+  if (t->kind != CT_STRUCT) return REF_NONE;
+  uint32_t j = 0;
+  while (j < t->nfields && (uint64_t)t->hdr_size + t->fields[j].offset != in->imm)
+    j++;
+  if (j == t->nfields || t->fields[j].mutable_ || vt_is_packed(t->fields[j].type))
+    return REF_NONE;
+  Block *b = &f->blocks[ai->block];
+  for (uint32_t i = 0; i < b->ninsts; i++) {
+    Ref sv = b->insts[i];
+    Inst *st = &f->insts[sv];
+    if (st->op == I_FIELD_SET && st->nargs >= 2 && (st->imm2 & GCF_INIT) &&
+        st->imm == in->imm && ir_resolve(f, ir_args(f, sv)[0]) == r)
+      return ir_resolve(f, ir_args(f, sv)[1]);
+  }
+  return REF_NONE;
+}
+
+/* An access to a known object is never to null, and an element of a
+   constant array at a constant index it has is in bounds: a read left
+   standing without its checks is one DCE can drop. */
+static bool gc_known_checks(IrFunc *f, Ref v) {
+  Inst *in = &f->insts[v];
+  uint32_t ti;
+  if (!in->nargs || !gc_exact_type(f, ir_args(f, v)[0], &ti)) return false;
+  uint64_t was = in->imm2;
+  in->imm2 &= ~(uint64_t)GCF_NULLCHK;
+  uint32_t g, n;
+  uint64_t idx;
+  if (in->op == I_ARRAY_GET && cg_obj_of(f, ir_args(f, v)[0], &g, &n, 0) &&
+      is_const(f, ir_args(f, v)[1], &idx)) {
+    const Module *m = f->m;
+    const InitInsn *p = &m->globals[g].init.ins[n];
+    uint64_t len = UINT64_MAX;
+    if (p->op == IOP_ARRAY_NEW_FIXED) {
+      len = p->hi;
+    } else if (p->op == IOP_ARRAY_NEW || p->op == IOP_ARRAY_NEW_DEFAULT) {
+      const InitInsn *l =
+          &m->globals[g].init.ins[cg_ops(g, n)[p->op == IOP_ARRAY_NEW ? 1 : 0]];
+      if (l->op == IOP_I32_CONST) len = (uint32_t)l->lo;
+    }
+    if (len != UINT64_MAX && (idx & 0xffffffffu) < len) in->imm2 |= GCF_NOBOUND;
+  }
+  if (in->imm2 == was) return false;
+  g_stats.checks_removed++;
+  return true;
+}
+
+/* Reads through constant objects and immutable reads off fresh ones, and
+   what a known object answers: its tests, its null check and its length. */
+static bool gc_fold_known(IrFunc *f, Ref v) {
+  const Module *m = f->m;
+  Inst *in = &f->insts[v];
+  uint32_t ti;
+  switch (in->op) {
+    case I_FIELD_GET: case I_ARRAY_GET: {
+      uint32_t g, n;
+      bool zero;
+      Ref init = gc_init_value(f, v);
+      if (init != REF_NONE) {
+        ir_replace(f, v, init);
+        in->op = I_NOP;
+        in->nargs = 0;
+        g_stats.loads_forwarded++;
+        return true;
+      }
+      if (!cg_read(f, v, &g, &n, &zero, 0)) return gc_known_checks(f, v);
+      if (zero) {
+        if (in->type == VT_V128) return false;
+        replace_with_const(f, v, 0);
+      } else {
+        const InitInsn *p = &m->globals[g].init.ins[n];
+        switch (p->op) {
+          case IOP_I32_CONST: case IOP_I64_CONST: case IOP_F32_CONST:
+          case IOP_F64_CONST:
+            replace_with_const(f, v, p->lo);
+            break;
+          case IOP_REF_NULL:
+            replace_with_const(f, v, 0);
+            break;
+          case IOP_REF_FUNC: case IOP_GLOBAL_GET:
+            in->op = p->op == IOP_REF_FUNC ? I_REF_FUNC : I_GLOBAL_GET;
+            in->nargs = 0;
+            in->imm = p->lo;
+            in->imm2 = 0;
+            break;
+          default:
+            return gc_known_checks(f, v);
+        }
+      }
+      g_stats.const_reads++;
+      return true;
+    }
+    case I_ARRAY_LEN: {
+      uint32_t g, n;
+      if (!in->nargs || !cg_obj_of(f, ir_args(f, v)[0], &g, &n, 0))
+        return gc_known_checks(f, v);
+      const InitInsn *p = &m->globals[g].init.ins[n];
+      uint64_t len;
+      if (p->op == IOP_ARRAY_NEW_FIXED) {
+        len = p->hi;
+      } else if (p->op == IOP_ARRAY_NEW || p->op == IOP_ARRAY_NEW_DEFAULT) {
+        const InitInsn *l =
+            &m->globals[g].init.ins[cg_ops(g, n)[p->op == IOP_ARRAY_NEW ? 1 : 0]];
+        if (l->op != IOP_I32_CONST) return false;
+        len = (uint32_t)l->lo;
+      } else {
+        return false;
+      }
+      replace_with_const(f, v, len);
+      g_stats.const_reads++;
+      return true;
+    }
+    case I_REF_TEST: {
+      if (in->nargs != 1 || !gc_exact_type(f, ir_args(f, v)[0], &ti)) return false;
+      int r = es_ref_test(m, ti, in->imm, in->imm2);
+      if (r < 0) return false;
+      replace_with_const(f, v, (uint64_t)r);
+      return true;
+    }
+    case I_REF_IS_NULL:
+      if (in->nargs != 1 || !gc_exact_type(f, ir_args(f, v)[0], &ti)) return false;
+      replace_with_const(f, v, 0);
+      return true;
+    case I_TRAP_IF: {
+      if (in->nargs != 1) return false;
+      uint64_t c;
+      bool never = (is_const(f, ir_args(f, v)[0], &c) && c != 0) ||
+                   (in->imm == TRAP_NULL_REF &&
+                    gc_exact_type(f, ir_args(f, v)[0], &ti));
+      if (!never) return false;
+      in->op = I_NOP;
+      in->nargs = 0;
+      return true;
+    }
+    default:
+      return false;
+  }
+}
+
 static void fx_facts_build(Module *m) {
   fx_count_callers(m);
+  fx_cg_build(m);
   fx_gfunc = xmalloc((m->nglobals ? m->nglobals : 1) * sizeof(uint32_t));
   for (uint32_t gi = 0; gi < m->nglobals; gi++) {
     const Global *g = &m->globals[gi];
@@ -3485,9 +4044,10 @@ static bool devirt_abi_ok(const Module *m, uint32_t site_ti, uint32_t fi) {
 }
 
 /* Follow the funcref operand of a call_ref to a compile-time-known target:
-   ref.func directly, global.get of an immutable ref.func global, or a load
-   from a monomorphic vtable slot, looking through ref casts, which pass the
-   value unchanged. The first two provenances are non-null by construction;
+   ref.func directly, global.get of an immutable ref.func global, a read
+   through a constant object, or a load from a monomorphic vtable slot,
+   looking through ref casts, which pass the value unchanged. The first
+   three provenances are non-null by construction;
    a vtable slot is non-null only when no creation site ever left it null.
    The slot rung needs the closed world: another instance's structs carry
    another instance's funcref cells, and a direct call would pass this one's
@@ -3506,6 +4066,15 @@ static uint32_t devirt_ref_target(IrFunc *f, const OptOpts *o, Ref callee,
     if (in->op == I_GLOBAL_GET) {
       uint32_t gi = (uint32_t)in->imm;
       return gi < f->m->nglobals ? fx_gfunc[gi] : FX_GFUNC_NONE;
+    }
+    uint32_t cg, cn;
+    bool zero;
+    if (cg_read(f, r, &cg, &cn, &zero, 0) && !zero) {
+      const InitInsn *p = &f->m->globals[cg].init.ins[cn];
+      if (p->op == IOP_REF_FUNC) return (uint32_t)p->lo;
+      if (p->op == IOP_GLOBAL_GET && p->lo < f->m->nglobals)
+        return fx_gfunc[p->lo];
+      return FX_GFUNC_NONE;
     }
     if (in->op == I_FIELD_GET && (g_dv.rungs & DV_RUNG_VT) &&
         o->closed_world && !fx_vt_poisoned && fx_vt) {
@@ -3554,6 +4123,7 @@ static void devirt_rewrite(IrFunc *f, Ref v, uint32_t fi, bool tail) {
   in->imm = fi;
   in->imm2 = 0;
   in->nargs -= 1;
+  in->flags |= IRF_DEVIRT;
 }
 
 static bool pass_devirt(IrFunc *f, const OptOpts *o) {
@@ -4004,7 +4574,11 @@ static bool pass_memopt(IrFunc *f, const OptOpts *o) {
             continue;
           ValType et = ent[k].pending ? (ValType)ent[k].vtype
                                       : (ValType)f->insts[ent[k].value].type;
-          if (et != (ValType)in->type) continue;
+          /* the reference stored is the one read back, however much more
+             its static type knows than the reader's view of the field */
+          if (et != (ValType)in->type &&
+              !(vt_is_ref(et) && vt_is_ref((ValType)in->type)))
+            continue;
           if (ent[k].pending) {
             Ref p = materialise_param(f, st, &ent[k]);
             if (p == REF_NONE) { ent[k].valid = false; continue; }
@@ -10673,6 +11247,39 @@ static void pt_init(void) {
   ir_dom_check_on = getenv("WARMC_CHECK_DOM") != NULL;
 }
 
+/* The cleanup rounds every inline is followed by: folding, forwarding and
+   escape analysis until they stop finding work. */
+static void opt_cleanup(IrFunc *f, const OptOpts *o) {
+  for (int round = 0; round < 6; round++) {
+    bool changed = false;
+    if (o->throwjump && TP("throwjump", pass_local_throw(f))) changed = true;
+    if (o->fold && TP("fold", pass_fold(f, o))) changed = true;
+    if (o->branch && TP("branch", pass_branch(f))) changed = true;
+    if (o->cse && TP("cse", pass_cse(f, o))) changed = true;
+    if (o->memopt && TP("memopt", pass_memopt(f, o))) changed = true;
+
+    if (o->ldcomb && TP("ldcomb", pass_load_combine(f, o))) changed = true;
+    if (o->bce && TP("bce", pass_bce(f, f->m))) changed = true;
+
+    if (o->bce && TP("arraybounds", pass_array_bounds(f))) changed = true;
+    if (o->gcpure && TP("gcnull", pass_gc_nullchk(f))) changed = true;
+
+    if (o->escape && TP("escape", pass_escape(f, o->pescape))) changed = true;
+    if (o->dce && TP("dce", pass_dce(f))) changed = true;
+    if (TP("prune_params", prune_params(f))) changed = true;
+    ir_order(f);
+    if (!changed) break;
+  }
+}
+
+/* Inlining, devirtualization and escape analysis feed one another: an
+   inlined callee shows a dispatch the class of its receiver, the direct
+   call that dispatch becomes is inlined in turn, and an allocation handed
+   down a chain of calls goes only once the last of them is inlined.  Each
+   further round looks only at the direct calls devirtualization made and
+   at the calls an allocation leaves by. */
+#define OPT_INLINE_ROUNDS 4
+
 void ir_optimize(IrFunc *f, const OptOpts *o) {
   pthread_once(&g_pt_once, pt_init);
   if (o->level == 0) return;
@@ -10695,24 +11302,17 @@ void ir_optimize(IrFunc *f, const OptOpts *o) {
       ir_verify(f, "post-devirt2");
   }
 
-  for (int round = 0; round < 6; round++) {
-    bool changed = false;
-    if (o->fold && TP("fold", pass_fold(f, o))) changed = true;
-    if (o->branch && TP("branch", pass_branch(f))) changed = true;
-    if (o->cse && TP("cse", pass_cse(f, o))) changed = true;
-    if (o->memopt && TP("memopt", pass_memopt(f, o))) changed = true;
+  opt_cleanup(f, o);
 
-    if (o->ldcomb && TP("ldcomb", pass_load_combine(f, o))) changed = true;
-    if (o->bce && TP("bce", pass_bce(f, f->m))) changed = true;
-
-    if (o->bce && TP("arraybounds", pass_array_bounds(f))) changed = true;
-    if (o->gcpure && TP("gcnull", pass_gc_nullchk(f))) changed = true;
-
-    if (o->escape && TP("escape", pass_escape(f, o->pescape))) changed = true;
-    if (o->dce && TP("dce", pass_dce(f))) changed = true;
-    if (TP("prune_params", prune_params(f))) changed = true;
+  for (int r = 0; o->inl && o->reinline && r < OPT_INLINE_ROUNDS; r++) {
+    if (o->devirt) TP("devirt", pass_devirt(f, o));
+    if (!pass_inline_more(f, o)) break;
+    prune_params(f);
     ir_order(f);
-    if (!changed) break;
+    ir_verify(f, "post-inline-more");
+    if (o->devirt && TP("devirt", pass_devirt(f, o)))
+      ir_verify(f, "post-devirt-more");
+    opt_cleanup(f, o);
   }
 
   if (o->inl && pass_inline_round2(f, o)) {

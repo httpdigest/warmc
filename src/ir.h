@@ -181,7 +181,7 @@ typedef enum {
 
 typedef struct {
   uint16_t op;
-  uint8_t flags;
+  uint8_t flags;   /* IRF_* */
   ValType type;
   uint32_t nargs;
   uint32_t args_off;
@@ -189,6 +189,9 @@ typedef struct {
   uint64_t imm2;
   uint32_t block;
 } Inst;
+
+/* a direct call pass_devirt made, which a later inline round looks at */
+#define IRF_DEVIRT 1u
 
 typedef struct {
   uint32_t target;
@@ -355,6 +358,8 @@ typedef struct {
   bool prune;
 
   bool devirt;
+  bool reinline;   /* inline again what devirtualization and escape expose */
+  bool throwjump;  /* a throw caught in its own function becomes a jump */
 
   bool unroll;
 
@@ -400,6 +405,8 @@ void compile_module(Module *m, ObjBuilder *o, const OptOpts *opts);
 void compile_set_jobs(long n);
 bool pass_inline(IrFunc *f, const OptOpts *o);
 bool pass_inline_round2(IrFunc *f, const OptOpts *o);
+bool pass_inline_more(IrFunc *f, const OptOpts *o);
+bool opt_const_object(IrFunc *f, Ref r);
 uint32_t opt_direct_callsite_count(const Module *m, uint32_t fi);
 bool opt_call_frame_only(const Module *m, uint32_t fi);
 
@@ -418,6 +425,7 @@ typedef struct {
   uint64_t caller_saves, csa_restores, spills_v128_xcall, range_budget_trips;
   uint64_t split_cuts, split_invs;
   uint64_t devirt_ref, devirt_indirect, devirt_null_kept;
+  uint64_t const_reads, throw_jumps, inl_more;
   uint64_t inl_flat, inl_spliced, inl_once_forced, inl_retcall_sites;
   uint64_t inl_transitive, inl_escape;
   uint64_t inl_rej_size, inl_rej_budget, inl_rej_tailcall, inl_rej_retcalls;

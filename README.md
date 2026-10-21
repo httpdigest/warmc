@@ -51,7 +51,9 @@ Hello world!
   `-O2 --profile=deterministic`.
 - **Optimising compiler.** It optimises over SSA with block parameters. Passes
   include:
-  - inlining and devirtualisation
+  - inlining and devirtualisation, repeated as each exposes more: a call on
+    an object whose class is known resolves through its constant vtable, and
+    a throw inlined beside its catch becomes a jump
   - dominator-based CSE, LICM, loop rotation and unrolling
   - an auto-vectoriser, with runtime alias checks
   - bounds-check elimination and guard-page memory
@@ -488,7 +490,9 @@ command-line order, so put them **after** `-O`.
 | `loopclose` | loop-closed SSA for values used after a loop |
 | `escape` | remove GC objects that never escape and forward their fields |
 | `partial-escape` | allocate a GC object that escapes on some paths only where it escapes |
-| `devirt`, `closed-world` | turn `call_ref` and `call_indirect` into direct calls; with a closed world, use vtable slots too |
+| `devirt`, `closed-world` | turn `call_ref` and `call_indirect` into direct calls, also through vtables in immutable globals; with a closed world, use vtable slots too |
+| `reinline` | after the cleanup passes, inline again what devirtualisation made direct and the calls an allocation leaves by |
+| `throw-jump` | a `throw` caught in its own function, without the exnref, becomes a jump to the catch |
 | `gcpure` | treat immutable GC fields and `array.len` as pure; drop redundant null and bounds checks |
 | `labcache`, `barelide` | keep the GC allocation buffer open, and hoist the load-barrier mask, in safepoint-free loops |
 | `reach`, `prune`, `merge` | module-wide reachability; skip unreachable bodies; share byte-identical functions |
