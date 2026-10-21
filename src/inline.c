@@ -37,6 +37,12 @@
 #define INL_ESC_MAX_ELEMS 32
 #define INL_ESC_MAX_ROOTS 256
 
+/* A parameter is followed this far down the direct calls a callee hands it
+   to; a dispatch on one is recorded for the first INL_DISP_PARAMS. */
+#define INL_KEEP_DEPTH 3
+#define INL_DISP_PARAMS 8
+#define INL_NO_DISP 0xffffffffu
+
 /* The 2026-08-07 cap sweeps needed a rebuild per point; every future sweep
    is an environment variable. Defaults reproduce the constants above. */
 static pthread_once_t g_inl_once = PTHREAD_ONCE_INIT;
@@ -343,16 +349,55 @@ static bool inline_flat(IrFunc *f, IrFunc *g, uint32_t bi, uint32_t at,
 }
 
 /* Follow each root through its aliases -- conversions, and block
-   parameters every argument of which is the root or the parameter itself --
-   and sort its uses: local (a field or element access, a null check, a
-   test or comparison), an argument to a direct call, or an escape.  The
-   roots are allocations in a caller and reference parameters in a callee.
-   escaped[r] is set for a root that leaves by anything but a direct call;
-   the direct-call uses go in *calls. */
+   parameters every argument of which is the root, the parameter itself, a
+   null, a fresh allocation or what a pad caught -- and sort its uses:
+   local (a field or element access, a null check, a test or comparison),
+   an argument to a direct call, or an escape.  The roots are allocations
+   in a caller and reference parameters in a callee.  escaped[r] is set for
+   a root that leaves by anything but a direct call; the direct-call uses
+   go in *calls.  Given returned[], a return sets that instead of
+   escaped[]; given disp[], so does a call_ref whose target is loaded off
+   the root, which is a dispatch on it: disp[r] is the offset of the read
+   nearest the root, its vtable.  With cold, a use on a path that never
+   returns is no escape, though a direct call there is still a call use:
+   partial escape analysis makes the object there, and the warm path goes
+   without it. */
 typedef struct { Ref call; uint32_t arg, root; } InlCallUse;
 
+/* A value a root may merge with and still leave by the merge's uses only:
+   a null, another fresh allocation -- a constructor's `this ?: new` -- or
+   the payload of a pad, an exception thrown by a call that inlining the
+   root's constructors takes away. */
+static bool inl_mergeable(IrFunc *g, Ref a) {
+  Inst *in = &g->insts[a];
+  if (in->op == I_EXN_PAYLOAD) return g->blocks[in->block].is_pad;
+  if (in->op == I_STRUCT_NEW || in->op == I_ARRAY_NEW) return true;
+  return vt_is_ref((ValType)in->type) &&
+         (in->op == I_REF_NULL || (in->op == I_CONST && in->imm == 0));
+}
+
+static bool inl_dispatch_off(IrFunc *g, Ref r, const int32_t *own, uint32_t n,
+                             int32_t c, uint32_t *off) {
+  for (int d = 0; d < 8; d++) {
+    r = ir_resolve(g, r);
+    Inst *in = &g->insts[r];
+    if ((in->op != I_FIELD_GET && in->op != I_ARRAY_GET &&
+         in->op != I_REF_CONVERT) || !in->nargs)
+      return false;
+    Ref x = ir_resolve(g, ir_args(g, r)[0]);
+    if (x < n && own[x] == c) {
+      if (in->op != I_FIELD_GET) return false;
+      *off = (uint32_t)in->imm;
+      return true;
+    }
+    r = x;
+  }
+  return false;
+}
+
 static void inl_escape_scan(IrFunc *g, const Ref *roots, uint32_t nroots,
-                            uint8_t *escaped, InlCallUse **calls,
+                            uint8_t *escaped, uint8_t *returned,
+                            uint32_t *disp, bool cold, InlCallUse **calls,
                             uint32_t *ncalls) {
   uint32_t n = g->ninsts;
   int32_t *own = xmalloc((n ? n : 1) * sizeof(int32_t));
@@ -377,6 +422,7 @@ static void inl_escape_scan(IrFunc *g, const Ref *roots, uint32_t nroots,
             Ref a = ir_resolve(g, sb->succs[ei.si[k]].args[p]);
             if (a == P) continue;
             int32_t c = IOWN(a);
+            if (c < 0 && inl_mergeable(g, a)) continue;
             if (c < 0 || (one >= 0 && c != one)) other = true;
             else one = c;
           }
@@ -397,6 +443,7 @@ static void inl_escape_scan(IrFunc *g, const Ref *roots, uint32_t nroots,
   for (uint32_t oi = 0; oi < g->norder; oi++) {
     uint32_t bi = g->order[oi];
     Block *b = &g->blocks[bi];
+    bool lenient = cold && b->diverges;
     for (uint32_t i = 0; i < b->ninsts; i++) {
       Ref v = b->insts[i];
       Inst *in = &g->insts[v];
@@ -420,18 +467,28 @@ static void inl_escape_scan(IrFunc *g, const Ref *roots, uint32_t nroots,
             local = true;
             break;
           }
+          case I_CALL_REF: {
+            uint32_t off;
+            if (disp && j + 1 < in->nargs &&
+                inl_dispatch_off(g, a[in->nargs - 1], own, n, c, &off)) {
+              if (disp[c] == INL_NO_DISP) disp[c] = off;
+              local = disp[c] == off;
+            }
+            break;
+          }
           default: break;
         }
-        if (!local) escaped[c] = 1;
+        if (!local && !lenient) escaped[c] = 1;
       }
     }
+    if (lenient) continue;
     if (b->term == T_BRIF || b->term == T_BRTABLE) {
       int32_t c = IOWN(ir_resolve(g, b->term_arg));
       if (c >= 0) escaped[c] = 1;
     }
     for (uint32_t i = 0; i < b->nret; i++) {
       int32_t c = IOWN(ir_resolve(g, b->ret_args[i]));
-      if (c >= 0) escaped[c] = 1;
+      if (c >= 0) (returned ? returned : escaped)[c] = 1;
     }
     for (uint32_t s = 0; s < b->nsuccs; s++) {
       Edge *e = &b->succs[s];
@@ -447,27 +504,31 @@ static void inl_escape_scan(IrFunc *g, const Ref *roots, uint32_t nroots,
   xfree(own);
 }
 
-/* Which reference parameters a callee keeps to itself: no call, store,
-   return or global sees them.  Bit p for parameter p. */
-static uint64_t inl_local_params(IrFunc *g) {
-  Block *e = &g->blocks[g->entry];
-  uint32_t np = e->nparams < 64 ? e->nparams : 64;
-  Ref roots[64];
-  uint32_t idx[64], nr = 0;
-  for (uint32_t p = 0; p < np; p++)
-    if (vt_is_ref(g->insts[e->params[p]].type)) { idx[nr] = p; roots[nr++] = e->params[p]; }
-  if (!nr) return 0;
-  uint8_t esc[64] = {0};
-  InlCallUse *calls = NULL;
-  uint32_t ncalls = 0;
-  inl_escape_scan(g, roots, nr, esc, &calls, &ncalls);
-  for (uint32_t k = 0; k < ncalls; k++) esc[calls[k].root] = 1;
-  xfree(calls);
-  uint64_t bits = 0;
-  for (uint32_t r = 0; r < nr; r++)
-    if (!esc[r]) bits |= 1ull << idx[r];
-  return bits;
+/* Whether anything reads v: an instruction, an edge, a branch or a return. */
+static bool inl_value_used(IrFunc *f, Ref v) {
+  for (uint32_t oi = 0; oi < f->norder; oi++) {
+    Block *b = &f->blocks[f->order[oi]];
+    for (uint32_t i = 0; i < b->ninsts; i++) {
+      Inst *in = &f->insts[b->insts[i]];
+      Ref *a = ir_args(f, b->insts[i]);
+      for (uint32_t j = 0; j < in->nargs; j++)
+        if (ir_resolve(f, a[j]) == v) return true;
+    }
+    if ((b->term == T_BRIF || b->term == T_BRTABLE) &&
+        ir_resolve(f, b->term_arg) == v)
+      return true;
+    for (uint32_t i = 0; i < b->nret; i++)
+      if (ir_resolve(f, b->ret_args[i]) == v) return true;
+    for (uint32_t s = 0; s < b->nsuccs; s++)
+      for (uint32_t j = 0; j < b->succs[s].nargs; j++)
+        if (ir_resolve(f, b->succs[s].args[j]) == v) return true;
+  }
+  return false;
 }
+
+/* A direct call a callee hands reference parameter `param` to, as argument
+   `arg`, and whether the call's result is read. */
+typedef struct { uint32_t param, callee, arg; bool used; } InlPass;
 
 /* The caller's side: the call sites that are the only way out for some
    allocation made on a warm path.  Per call, which arguments those
@@ -497,7 +558,7 @@ static InlEsc *inl_caller_evidence(IrFunc *f) {
   uint8_t *esc = xcalloc(nr, 1);
   InlCallUse *calls = NULL;
   uint32_t ncalls = 0;
-  inl_escape_scan(f, roots, nr, esc, &calls, &ncalls);
+  inl_escape_scan(f, roots, nr, esc, NULL, NULL, true, &calls, &ncalls);
   InlEsc *ev = NULL;
   for (uint32_t k = 0; k < ncalls; k++) {
     InlCallUse *u = &calls[k];
@@ -522,8 +583,55 @@ typedef struct {
   uint8_t verdict;
   IrFunc *plain, *split;
   uint32_t ninsts, eparams, retcalls;
-  uint64_t local_params;   /* reference parameters the callee keeps */
+  /* What the callee does with each reference parameter, bit p for p:
+     keeps it to itself (no call, store, return or global sees it), lets it
+     out by anything but a direct call or a return, returns it, or
+     dispatches on it -- through the field at disp_off[p]. */
+  bool summed;
+  uint64_t local_params, esc_params, ret_params, disp_params;
+  uint32_t disp_off[INL_DISP_PARAMS];
+  InlPass *pass;
+  uint32_t npass;
 } InlMemo;
+
+static void inl_summarize(InlMemo *e, IrFunc *g) {
+  e->summed = true;
+  for (uint32_t p = 0; p < INL_DISP_PARAMS; p++) e->disp_off[p] = INL_NO_DISP;
+  Block *en = &g->blocks[g->entry];
+  uint32_t np = en->nparams < 64 ? en->nparams : 64;
+  Ref roots[64];
+  uint32_t idx[64], nr = 0;
+  for (uint32_t p = 0; p < np; p++)
+    if (vt_is_ref(g->insts[en->params[p]].type)) { idx[nr] = p; roots[nr++] = en->params[p]; }
+  if (!nr) return;
+  uint8_t esc[64] = {0}, ret[64] = {0};
+  uint32_t disp[64];
+  for (uint32_t r = 0; r < nr; r++) disp[r] = INL_NO_DISP;
+  InlCallUse *calls = NULL;
+  uint32_t ncalls = 0;
+  inl_escape_scan(g, roots, nr, esc, ret, disp, false, &calls, &ncalls);
+  uint64_t called = 0;
+  if (ncalls) e->pass = xmalloc(ncalls * sizeof(InlPass));
+  for (uint32_t k = 0; k < ncalls; k++) {
+    called |= 1ull << idx[calls[k].root];
+    e->pass[e->npass++] = (InlPass){ idx[calls[k].root],
+                                     (uint32_t)g->insts[calls[k].call].imm,
+                                     calls[k].arg,
+                                     inl_value_used(g, calls[k].call) };
+  }
+  xfree(calls);
+  for (uint32_t r = 0; r < nr; r++) {
+    uint64_t bit = 1ull << idx[r];
+    if (esc[r]) e->esc_params |= bit;
+    if (ret[r]) e->ret_params |= bit;
+    if (disp[r] != INL_NO_DISP) {
+      e->disp_params |= bit;
+      if (idx[r] < INL_DISP_PARAMS) e->disp_off[idx[r]] = disp[r];
+    }
+    if (!esc[r] && !ret[r] && disp[r] == INL_NO_DISP && !(called & bit))
+      e->local_params |= bit;
+  }
+}
 
 static IrFunc *inl_callee(IrFunc *f, const OptOpts *o, InlMemo *memo,
                           uint32_t fidx, uint32_t bi, bool want_split) {
@@ -532,6 +640,7 @@ static IrFunc *inl_callee(IrFunc *f, const OptOpts *o, InlMemo *memo,
   if (e->verdict == 0) {
     e->verdict = 2;
     IrFunc *g = ir_build(m, fidx, o);
+    inl_summarize(e, g);
     uint32_t r = warm_returning_calls(g);
     if (has_tail_call(g)) {
       g_stats.inl_rej_tailcall++;
@@ -556,7 +665,6 @@ static IrFunc *inl_callee(IrFunc *f, const OptOpts *o, InlMemo *memo,
       e->ninsts = g->ninsts;
       e->eparams = g->blocks[g->entry].nparams;
       e->retcalls = r;
-      e->local_params = inl_local_params(g);
     }
   }
   if (e->verdict != 1) return NULL;
@@ -566,6 +674,58 @@ static IrFunc *inl_callee(IrFunc *f, const OptOpts *o, InlMemo *memo,
     split_at_raising_sites(e->split);
   }
   return e->split;
+}
+
+/* Whether callee fidx keeps reference parameter p to itself, the direct
+   calls it hands p to included: each must keep it too, and must not hand
+   it back by returning it into a result that is read.  At the top, a
+   dispatch on p is allowed when `disp` says the dispatch will resolve. */
+static bool inl_keeps(IrFunc *f, const OptOpts *o, InlMemo *memo,
+                      uint32_t fidx, uint32_t p, uint32_t bi, bool disp,
+                      int depth) {
+  Module *m = f->m;
+  if (p >= 64 || depth > INL_KEEP_DEPTH || fidx >= m->nfuncs ||
+      fidx == f->func_index || m->funcs[fidx].imported || !m->funcs[fidx].body)
+    return false;
+  InlMemo *e = &memo[fidx];
+  if (!e->summed) inl_callee(f, o, memo, fidx, bi, false);
+  if (!e->summed) return false;
+  uint64_t bit = 1ull << p;
+  if ((e->esc_params & bit) || ((e->disp_params & bit) && !disp)) return false;
+  for (uint32_t k = 0; k < e->npass; k++) {
+    InlPass q = e->pass[k];
+    if (q.param != p) continue;
+    if (!inl_keeps(f, o, memo, q.callee, q.arg, bi, false, depth + 1))
+      return false;
+    if (q.used && (memo[q.callee].ret_params >> q.arg & 1)) return false;
+  }
+  return true;
+}
+
+/* Whether a dispatch through the field at `off` resolves on argument a: a
+   fresh allocation whose initialising store there is a constant object,
+   a vtable the module built. */
+static bool inl_const_dispatch(IrFunc *f, Ref a, uint32_t off) {
+  for (int d = 0; d < 8; d++) {
+    a = ir_resolve(f, a);
+    Inst *in = &f->insts[a];
+    if (in->op == I_REF_CONVERT && in->nargs == 1) {
+      a = ir_args(f, a)[0];
+      continue;
+    }
+    if (in->op != I_STRUCT_NEW) return false;
+    Block *b = &f->blocks[in->block];
+    for (uint32_t i = 0; i < b->ninsts; i++) {
+      Ref v = b->insts[i];
+      Inst *st = &f->insts[v];
+      if (st->op != I_FIELD_SET || st->nargs < 2 || !(st->imm2 & GCF_INIT) ||
+          st->imm != off || ir_resolve(f, ir_args(f, v)[0]) != a)
+        continue;
+      return opt_const_object(f, ir_args(f, v)[1]);
+    }
+    return false;
+  }
+  return false;
 }
 
 typedef struct {
@@ -654,8 +814,24 @@ static bool inl_score_site(IrFunc *f, const OptOpts *o, InlMemo *memo,
   }
 
   /* An allocation that leaves only through this call, into a parameter
-     the callee keeps to itself: inlined, nothing is left holding it. */
-  uint64_t freed = ev && call < f->ninsts ? ev[call].args & e->local_params : 0;
+     the callee keeps to itself: inlined, nothing is left holding it.  Kept
+     counts the calls the callee hands it on to, when they keep it too, and
+     a return of it nobody reads; and a dispatch on it, when the vtable the
+     allocation was made with resolves the dispatch. */
+  uint64_t want = ev && call < f->ninsts ? ev[call].args : 0;
+  uint64_t freed = want & e->local_params;
+  int used = -1;
+  for (uint64_t x = want & ~freed; x; x &= x - 1) {
+    uint32_t p = (uint32_t)__builtin_ctzll(x);
+    bool disp = p < INL_DISP_PARAMS && (e->disp_params >> p & 1) &&
+                inl_const_dispatch(f, ir_args(f, call)[p], e->disp_off[p]);
+    if (!inl_keeps(f, o, memo, fidx, p, bi, disp, 0)) continue;
+    if (e->ret_params >> p & 1) {
+      if (used < 0) used = inl_value_used(f, call);
+      if (used) continue;
+    }
+    freed |= 1ull << p;
+  }
   bool escape = freed != 0;
   uint32_t nfreed = 0;
   for (uint64_t x = freed; x; x &= x - 1) nfreed++;
@@ -723,14 +899,21 @@ static bool inl_score_site(IrFunc *f, const OptOpts *o, InlMemo *memo,
   return true;
 }
 
+/* A later round takes only the calls pass_devirt has made since, and the
+   calls an allocation leaves by. */
 static void inl_collect(IrFunc *f, const OptOpts *o, InlMemo *memo,
-                        const InlEsc *ev, InlVec *sites) {
+                        const InlEsc *ev, InlVec *sites, bool more) {
   for (uint32_t oi = 0; oi < f->norder; oi++) {
     Block *b = &f->blocks[f->order[oi]];
     for (uint32_t k = 0; k < b->ninsts; k++) {
       InlSite s;
-      if (f->insts[b->insts[k]].op != I_CALL) continue;
-      if (inl_score_site(f, o, memo, ev, b->insts[k], oi, k, NULL, &s))
+      Ref v = b->insts[k];
+      Inst *in = &f->insts[v];
+      if (in->op != I_CALL) continue;
+      bool fresh = (in->flags & IRF_DEVIRT) != 0;
+      in->flags &= (uint8_t)~IRF_DEVIRT;
+      if (more && !fresh && !(ev && ev[v].args)) continue;
+      if (inl_score_site(f, o, memo, ev, v, oi, k, NULL, &s))
         inl_push(sites, &s);
     }
   }
@@ -863,12 +1046,12 @@ static bool inl_apply(IrFunc *f, const OptOpts *o, InlMemo *memo,
   return true;
 }
 
-static bool inl_run(IrFunc *f, const OptOpts *o, uint32_t budget0) {
+static bool inl_run(IrFunc *f, const OptOpts *o, uint32_t budget0, bool more) {
   Module *m = f->m;
   InlMemo *memo = xcalloc(m->nfuncs ? m->nfuncs : 1, sizeof(InlMemo));
   InlVec sites = {0};
   InlEsc *ev = o->escape ? inl_caller_evidence(f) : NULL;
-  inl_collect(f, o, memo, ev, &sites);
+  inl_collect(f, o, memo, ev, &sites, more);
   qsort(sites.v, sites.n, sizeof(InlSite), inl_site_cmp);
 
   uint32_t budget = budget0;
@@ -882,6 +1065,7 @@ static bool inl_run(IrFunc *f, const OptOpts *o, uint32_t budget0) {
     if (!inl_apply(f, o, memo, &site, &budget, &retsum)) continue;
     any = true;
     events++;
+    if (more) g_stats.inl_more++;
     if (site.idepth) g_stats.inl_transitive++;
 
     /* the splice may have copied calls in; they are sites too */
@@ -903,6 +1087,7 @@ static bool inl_run(IrFunc *f, const OptOpts *o, uint32_t budget0) {
   for (uint32_t fi = 0; fi < m->nfuncs; fi++) {
     if (memo[fi].plain) ir_free(memo[fi].plain);
     if (memo[fi].split) ir_free(memo[fi].split);
+    xfree(memo[fi].pass);
   }
   xfree(memo);
   return any;
@@ -912,7 +1097,7 @@ bool pass_inline(IrFunc *f, const OptOpts *o) {
   pthread_once(&g_inl_once, inl_init);
   if (g_inl.only >= 0 && f->func_index != (uint32_t)g_inl.only) return false;
   if (g_inl.upto >= 0 && f->func_index > (uint32_t)g_inl.upto) return false;
-  return inl_run(f, o, g_inl.growth);
+  return inl_run(f, o, g_inl.growth, false);
 }
 
 /* A second, smaller helping after the first fold rounds: constant
@@ -924,5 +1109,14 @@ bool pass_inline_round2(IrFunc *f, const OptOpts *o) {
   if (!g_inl.round2) return false;
   if (g_inl.only >= 0 && f->func_index != (uint32_t)g_inl.only) return false;
   if (g_inl.upto >= 0 && f->func_index > (uint32_t)g_inl.upto) return false;
-  return inl_run(f, o, g_inl.round2_growth);
+  return inl_run(f, o, g_inl.round2_growth, false);
+}
+
+/* The rounds after the cleanup: what devirtualization made direct, and
+   what escape analysis says an allocation is held by. */
+bool pass_inline_more(IrFunc *f, const OptOpts *o) {
+  pthread_once(&g_inl_once, inl_init);
+  if (g_inl.only >= 0 && f->func_index != (uint32_t)g_inl.only) return false;
+  if (g_inl.upto >= 0 && f->func_index > (uint32_t)g_inl.upto) return false;
+  return inl_run(f, o, g_inl.round2_growth, true);
 }

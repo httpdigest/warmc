@@ -50,8 +50,8 @@ static const char *usage_text =
   "                mem, bce, strength, inline, reassoc, rotate, addroff,\n"
   "                memptr, align, regalloc, guard-pages, vectorize, unroll,\n"
   "                selftail, ldcomb, escape, partial-escape, gloop, loopclose,\n"
-  "                cpool, reach, prune, merge, devirt, closed-world, gcpure,\n"
-  "                labcache, barelide\n"
+  "                cpool, reach, prune, merge, devirt, reinline, throw-jump,\n"
+  "                closed-world, gcpure, labcache, barelide\n"
   "                The last two are the passes built on a loop containing\n"
   "                no safepoint, which is the only assumption the compiler\n"
   "                makes about the collector: turning them off says whether\n"
@@ -243,6 +243,8 @@ int main(int argc, char **argv) {
   opt.reach = true;
   opt.prune = true;
   opt.devirt = true;
+  opt.reinline = true;
+  opt.throwjump = true;
   opt.unroll = true;
   opt.gcpure = true;
   opt.closed_world = true;
@@ -365,6 +367,8 @@ int main(int argc, char **argv) {
       else if (!strcmp(name, "reach")) opt.reach = on;
       else if (!strcmp(name, "prune")) opt.prune = on;
       else if (!strcmp(name, "devirt")) opt.devirt = on;
+      else if (!strcmp(name, "reinline")) opt.reinline = on;
+      else if (!strcmp(name, "throw-jump")) opt.throwjump = on;
       else if (!strcmp(name, "unroll")) opt.unroll = on;
       else if (!strcmp(name, "gcpure")) opt.gcpure = on;
       else if (!strcmp(name, "closed-world")) opt.closed_world = on;
@@ -518,7 +522,8 @@ int main(int argc, char **argv) {
             "             loop_closed=%llu reassoc=%llu cmp_reused=%llu gssa=%llu\n"
             "             bar_masks=%llu bar_elided=%llu\n"
             "             devirt_ref=%llu devirt_indirect=%llu"
-            " devirt_null_kept=%llu\n"
+            " devirt_null_kept=%llu const_reads=%llu throw_jumps=%llu"
+            " inl_more=%llu\n"
             "             inl_flat=%llu inl_spliced=%llu inl_once=%llu"
             " inl_retcall_sites=%llu inl_trans=%llu inl_escape=%llu rej_size=%llu"
             " rej_budget=%llu rej_tail=%llu rej_retcalls=%llu rej_pads=%llu"
@@ -563,6 +568,9 @@ int main(int argc, char **argv) {
             (unsigned long long)g_stats.devirt_ref,
             (unsigned long long)g_stats.devirt_indirect,
             (unsigned long long)g_stats.devirt_null_kept,
+            (unsigned long long)g_stats.const_reads,
+            (unsigned long long)g_stats.throw_jumps,
+            (unsigned long long)g_stats.inl_more,
             (unsigned long long)g_stats.inl_flat,
             (unsigned long long)g_stats.inl_spliced,
             (unsigned long long)g_stats.inl_once_forced,
