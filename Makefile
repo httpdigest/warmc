@@ -289,9 +289,38 @@ $(KOTLIN_STAMP):
 
 kotlin-stdlib: $(KOTLIN_STAMP)
 
+# clang, wasm-ld and a WASI sysroot for test/cbench and test/cppbench.  The
+# release, not a distribution's packages: its C++ library comes built both with
+# and without exceptions, and the kernels that throw need the former.
+WASI_SDK_VERSION := 34
+WASI_SDK_HOST    := $(strip \
+  $(if $(filter Darwin-arm64,$(UNAME_S)-$(UNAME_M)),arm64-macos) \
+  $(if $(filter Darwin-x86_64,$(UNAME_S)-$(UNAME_M)),x86_64-macos) \
+  $(if $(filter Linux-aarch64 Linux-arm64,$(UNAME_S)-$(UNAME_M)),arm64-linux) \
+  $(if $(filter Linux-x86_64,$(UNAME_S)-$(UNAME_M)),x86_64-linux))
+# Versioned, so raising WASI_SDK_VERSION replaces the old release.
+WASI_SDK_STAMP   := $(BUILD)/tools/.wasi-sdk-$(WASI_SDK_VERSION)
+
+$(WASI_SDK_STAMP):
+	@test -n "$(WASI_SDK_HOST)" || { \
+	  echo "make wasi-sdk: wasi-sdk publishes no release for this host"; exit 1; }
+	@mkdir -p $(BUILD)/tools
+	@rm -rf $(BUILD)/tools/wasi-sdk
+	curl -sSLf -o $(BUILD)/tools/wasi-sdk.tar.gz \
+	  "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-$(WASI_SDK_VERSION)/wasi-sdk-$(WASI_SDK_VERSION).0-$(WASI_SDK_HOST).tar.gz"
+	@mkdir -p $(BUILD)/tools/wasi-sdk
+	@tar xzf $(BUILD)/tools/wasi-sdk.tar.gz -C $(BUILD)/tools/wasi-sdk --strip-components=1
+	@rm -f $(BUILD)/tools/wasi-sdk.tar.gz $(BUILD)/tools/.wasi-sdk-*
+	@touch $@
+
+wasi-sdk: $(WASI_SDK_STAMP)
+
 # `make check` brings the pinned tools up to date first; ktbench skips itself
-# without a Kotlin compiler, so the stdlib is only fetched when there is one.
-CHECK_TOOLS := wasm-tools $(if $(KOTLIN_VERSION),kotlin-stdlib)
+# without a Kotlin compiler, so the stdlib is only fetched when there is one,
+# and wasi-sdk only where it publishes a release.  hsbench's GHC is not
+# fetched: ghc-wasm-meta installs it, and the corpus skips itself without.
+CHECK_TOOLS := wasm-tools $(if $(KOTLIN_VERSION),kotlin-stdlib) \
+               $(if $(WASI_SDK_HOST),wasi-sdk)
 
 SPEC_LEVELS ?= -O1,-O2,-O2 --profile=deterministic
 
@@ -337,7 +366,8 @@ check: all $(SAN_TARGETS) $(WIN_CHECKS) check-encoder $(CHECK_TOOLS)
 check-linux: all
 	@rc=0; ./test/run_gowasi_linux.sh || rc=1; ./test/run_gc_linux.sh || rc=1; exit $$rc
 
-BENCH_CORPORA = gobench vecbench asbench rsbench ktbench zigbench
+BENCH_CORPORA = gobench vecbench asbench rsbench ktbench zigbench cbench cppbench \
+                hsbench
 
 bench-compare: all
 	@rc=0; t=$$(mktemp); for c in $(BENCH_CORPORA); do \
@@ -373,6 +403,6 @@ clean:
 	rm -rf $(BUILD)
 
 .PHONY: all asan tsan check check-linux check-encoder check-spec conformance testsuite wasm-tools \
-        kotlin-stdlib fuzz clean bench-compare bench-record gc-jitter gc-jitter-full
+        kotlin-stdlib wasi-sdk fuzz clean bench-compare bench-record gc-jitter gc-jitter-full
 
 -include $(WARMC_DEPS)

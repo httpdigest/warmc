@@ -27,7 +27,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILD = os.environ.get("BUILD", os.path.join(ROOT, "build"))
 WARMC = os.path.join(BUILD, "warmc")
 
-CORPORA = ["ktbench", "asbench", "rsbench", "gobench", "vecbench", "zigbench"]
+CORPORA = ["ktbench", "asbench", "rsbench", "gobench", "vecbench", "zigbench",
+           "cbench", "cppbench", "hsbench"]
 
 def flags_for(path):
     """`--wasi` for a module that imports the preview1 host, nothing otherwise.

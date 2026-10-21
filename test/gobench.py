@@ -81,7 +81,8 @@ CORPUS = "gobench"
 WORK = os.path.join(ROOT, BUILD, "gobench")
 
 LANGS = {"main.go": "go", "main.ts": "as", "main.rs": "rs",
-         "main.kt": "kt", "main.zig": "zig"}
+         "main.kt": "kt", "main.zig": "zig", "main.c": "c", "main.cpp": "cpp",
+         "Main.hs": "hs"}
 
 CORPUS_LANG = {"stdgo": "gostd"}
 KDIR = os.path.join(ROOT, "test", "gobench")
@@ -91,6 +92,22 @@ ASC_FLAGS = ["-O3", "--exportStart", "_start", "--use", "abort=",
 
 ZIG_FLAGS = ["-target", "wasm32-wasi", "-O", "ReleaseFast",
              "-mcpu=baseline+tail_call+simd128"]
+
+# wasi-sdk's clang, which `make wasi-sdk` fetches.  C++ is compiled with
+# exceptions on, which takes the standard (exnref) encoding and the copy of
+# libc++ built for it, and C with setjmp/longjmp lowered onto the same
+# proposal; a kernel that never throws or jumps pays nothing for either.
+WASI_SDK_BIN = os.path.join(ROOT, "build", "tools", "wasi-sdk", "bin")
+C_FLAGS = ["-O3", "-mllvm", "-wasm-enable-sjlj", "-mllvm",
+           "-wasm-use-legacy-eh=false", "-lsetjmp"]
+CXX_FLAGS = ["-O3", "-std=c++20", "-fwasm-exceptions", "-mllvm",
+             "-wasm-use-legacy-eh=false", "-lunwind"]
+
+# GHC's wasm backend, wherever ghc-wasm-meta's setup.sh put it: on PATH after
+# `source ~/.ghc-wasm/env`, or in its default prefix.
+GHC_WASM = (shutil.which("wasm32-wasi-ghc") or
+            os.path.expanduser("~/.ghc-wasm/wasm32-wasi-ghc/bin/wasm32-wasi-ghc"))
+GHC_FLAGS = ["-O2"]
 
 RUSTC_FLAGS = ["-C", "opt-level=3", "--target", "wasm32-wasip1",
                "-C", "panic=abort", "-C", "lto=fat", "-C", "codegen-units=1"]
@@ -102,12 +119,13 @@ KOTLIN_FLAGS = ["-Xwasm-target=wasm-wasi", "-nowarn"]
 FLAGS_FOR = {"go": ["-target=wasip1", "-scheduler=none"],
              "as": ASC_FLAGS, "rs": RUSTC_FLAGS,
              "gostd": ["GOOS=wasip1", "GOARCH=wasm"],
-             "kt": KOTLIN_FLAGS, "zig": ZIG_FLAGS}
+             "kt": KOTLIN_FLAGS, "zig": ZIG_FLAGS,
+             "c": C_FLAGS, "cpp": CXX_FLAGS, "hs": GHC_FLAGS}
 
 def set_corpus(name):
     """Point the harness at another directory of kernels.
 
-    Six of them, and each is a different selection rather than more of the
+    Ten of them, and each is a different selection rather than more of the
     same.  `test/gobench` is ordinary Go, chosen to be what programs actually
     look like.  `test/vecbench` is the opposite selection -- loops written to be
     vectorisable -- so a summary over the two mixed together would mean nothing.
@@ -118,9 +136,18 @@ def set_corpus(name):
     scheduler, so a loop arrives as the loop that was written.  `test/stdgo` is
     Go through Go's own compiler, which is not LLVM at all.  `test/ktbench` is
     Kotlin/Wasm, and it is the one producer that does not use linear memory for
-    its objects: they are wasm GC structs the engine owns, so what the other five
+    its objects: they are wasm GC structs the engine owns, so what the other
     corpora measure as a load is a `struct.get` here and what they measure as a
-    virtual call is a `ref.cast` and a `call_ref`.
+    virtual call is a `ref.cast` and a `call_ref`.  `test/zigbench` is Zig,
+    LLVM again but built with tail calls and SIMD enabled.  `test/cbench` and
+    `test/cppbench` are C and C++ through wasi-sdk's clang, with the C library
+    compiled into every module -- malloc, stdio, qsort -- and, for C++, libc++
+    built with exceptions on, so a throw is wasm's own `throw` under libc++abi's
+    unwinder and C's setjmp/longjmp are lowered onto the same proposal.
+    `test/hsbench` is Haskell through GHC's wasm backend, which shares nothing
+    with the rest: GHC keeps its heap and its stack in linear memory, every
+    function returns the next one to a trampoline in the RTS, and laziness makes
+    most of a program closures entered through `call_indirect`.
 
     Separate corpora over one harness rather than one corpus, because what is
     worth averaging is what a corpus was selected for.
@@ -165,13 +192,27 @@ EMPTY = {
     "kt": ("empty.kt", "fun main() {}\n"),
 
     "zig": ("empty.zig", "pub fn main() void {}\n"),
+
+    "c": ("empty.c", "int main(void) { return 0; }\n"),
+
+    "cpp": ("empty.cpp", "int main() { return 0; }\n"),
+
+    "hs": ("empty.hs", "main :: IO ()\nmain = return ()\n"),
 }
 
 TOOLCHAIN = {"go": ("tinygo", ["version"]), "as": ("asc", ["--version"]),
              "rs": ("rustc", ["--version"]), "gostd": ("go", ["version"]),
 
              "kt": ("kotlinc-wasm", ["-help"]),
-             "zig": ("zig", ["version"])}
+             "zig": ("zig", ["version"]),
+             "c": (os.path.join(WASI_SDK_BIN, "clang"), ["--version"]),
+             "cpp": (os.path.join(WASI_SDK_BIN, "clang++"), ["--version"]),
+             "hs": (GHC_WASM, ["--version"])}
+
+# What to run when a corpus's producer is missing, for the ones that are not
+# simply a package to install.
+TOOLCHAIN_HINT = {"c": "make wasi-sdk", "cpp": "make wasi-sdk",
+                  "hs": "ghc-wasm-meta's bootstrap.sh, see the README"}
 
 KOTLIN_KLIB = os.path.join(ROOT, "build", "tools",
                            "kotlin-stdlib-wasm-wasi.klib")
@@ -320,6 +361,14 @@ def build_wasm(name, lang):
             cmd += ["-Mroot=" + src]
         else:
             cmd += ["--dep", "wasi", "-Mroot=" + src, "-Mwasi=" + helper]
+    elif lang in ("c", "cpp"):
+        cmd = [TOOLCHAIN[lang][0], src, "-o", out] + FLAGS_FOR[lang]
+    elif lang == "hs":
+        # GHC writes its .hi and .o files beside the source unless told
+        # otherwise, and the source directory is the repository's.
+        hwork = os.path.join(WORK, name + ".hsbuild")
+        shutil.rmtree(hwork, ignore_errors=True)
+        cmd = [GHC_WASM, src, "-o", out, "-outputdir", hwork] + GHC_FLAGS
     elif lang == "kt":
         return build_kotlin(name, src, wasm, stampf, stamp)
     else:
@@ -818,8 +867,9 @@ def main():
 
     tool, probe = TOOLCHAIN[lang]
     if not have([tool] + probe):
-        print("%s: %s not installed, skipping" % (CORPUS, tool),
-              file=sys.stderr)
+        hint = TOOLCHAIN_HINT.get(lang)
+        print("%s: %s not installed, skipping%s" % (CORPUS, tool,
+              " (%s)" % hint if hint else ""), file=sys.stderr)
         return 0
     if lang == "rs" and not rust_target_installed():
         print("%s: rustc has no %s std, skipping "
