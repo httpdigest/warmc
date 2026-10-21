@@ -617,6 +617,10 @@ cheaper. Functions compile in parallel and are laid out deterministically.
   in-process.
 - Windows: a PE32+ whose DLL imports come from a curated table, so no SDK is
   needed.
+- On Linux and macOS the executable keeps its function names, local ones
+  included: each compiled wasm function is `wasm_func_N` (its index in the
+  module), next to the runtime's own functions, so `perf`, Instruments,
+  `sample` and debuggers can name the code they land in.
 
 **Runtime** (`rt/`):
 - **Platforms.** On Linux the runtime makes raw syscalls, on macOS it uses

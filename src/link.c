@@ -1426,6 +1426,128 @@ void emit_secs(Buf *b, Linker *L, SecKind k, uint64_t seg_addr, uint64_t seg_off
   }
 }
 
+typedef struct { const char *name; uint64_t addr, size; bool global; } TextSym;
+
+static int cmp_textsym(const void *a, const void *b) {
+  const TextSym *x = a, *y = b;
+  return x->addr < y->addr ? -1 : x->addr > y->addr;
+}
+
+/* Every symbol that names code which survived dead stripping, the local ones
+   included: a compiled module's functions (wasm_func_N) and the runtime's
+   static functions are all local, and without them a profiler or a debugger
+   can only say an address.  Labels the assembler makes for itself are not
+   functions and stay out -- on Mach-O those are the names that start with
+   'l' or 'L' (a C name starts with '_'), on ELF the ".L" ones and AArch64's
+   mapping symbols ($x, $d), which mark where instructions and literals start.
+   Sorted by address, and each one's size runs to the next address up. */
+static TextSym *text_syms(Linker *L, bool locals_only, uint32_t *count) {
+  uint32_t n = 0, cap = 256;
+  TextSym *v = xmalloc(cap * sizeof *v);
+  for (uint32_t oi = 0; oi < L->nobjs; oi++) {
+    InObj *o = &L->objs[oi];
+    for (uint32_t si = 0; si < o->nsyms; si++) {
+      InSym *sy = &o->syms[si];
+      if (sy->common || sy->sec < 0 || (uint32_t)sy->sec >= o->nsecs) continue;
+      if (o->secs[sy->sec].kind != K_TEXT) continue;
+      const char *nm = sy->name;
+      if (!nm[0]) continue;
+      if (L->fmt == TGT_MACHO ? (nm[0] == 'l' || nm[0] == 'L')
+                              : (nm[0] == '$' || (nm[0] == '.' && nm[1] == 'L')))
+        continue;
+      if (sy->global) {
+        if (locals_only) continue;
+        int32_t g = gs_find(L, nm);
+        if (g < 0 || L->gsyms[g].obj != (int32_t)oi || L->gsyms[g].sym != (int32_t)si)
+          continue;
+      }
+      if (n == cap) { cap *= 2; v = xrealloc(v, cap * sizeof *v); }
+      v[n].name = nm;
+      v[n].addr = o->secs[sy->sec].addr + sy->value;
+      v[n].global = sy->global;
+      n++;
+    }
+  }
+  qsort(v, n, sizeof *v, cmp_textsym);
+  uint64_t end = L->text_addr + L->text_size;
+  for (uint32_t i = n; i-- > 0;) {
+    uint64_t next = end;
+    for (uint32_t j = i + 1; j < n; j++)
+      if (v[j].addr > v[i].addr) { next = v[j].addr; break; }
+    v[i].size = next > v[i].addr ? next - v[i].addr : 0;
+  }
+  *count = n;
+  return v;
+}
+
+#define SHT_PROGBITS_E 1
+#define SHT_SYMTAB_E   2
+#define SHT_STRTAB_E   3
+#define SHF_ALLOC_E    0x2
+#define SHF_EXEC_E     0x4
+
+static void wr16(uint8_t *p, uint16_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); }
+
+/* Section headers for the function names and nothing else: the loader reads
+   only the program headers, but perf, gdb and objdump find symbols through
+   .symtab, and a symbol is code to them only if its section is executable,
+   so .text gets a header too. */
+static void elf_append_symbols(Linker *L, Buf *out) {
+  uint32_t n;
+  TextSym *v = text_syms(L, false, &n);
+
+  Buf str; memset(&str, 0, sizeof str);
+  buf_u8(&str, 0);
+  Buf sym; memset(&sym, 0, sizeof sym);
+  for (int i = 0; i < 24; i++) buf_u8(&sym, 0);
+  uint32_t nlocal = 1;
+  for (int pass = 0; pass < 2; pass++)
+    for (uint32_t i = 0; i < n; i++) {
+      if (v[i].global != (pass == 1)) continue;
+      buf_u32(&sym, (uint32_t)str.len);
+      buf_bytes(&str, v[i].name, strlen(v[i].name) + 1);
+      buf_u8(&sym, (uint8_t)(((v[i].global ? 1 : 0) << 4) | 2));
+      buf_u8(&sym, 0);
+      buf_u16(&sym, 1);
+      buf_u64(&sym, v[i].addr);
+      buf_u64(&sym, v[i].size);
+      if (!v[i].global) nlocal++;
+    }
+  xfree(v);
+
+  static const char shstr[] = "\0.text\0.symtab\0.strtab\0.shstrtab";
+  while (out->len & 7) buf_u8(out, 0);
+  uint64_t sym_off = out->len;
+  buf_bytes(out, sym.data, sym.len);
+  uint64_t str_off = out->len;
+  buf_bytes(out, str.data, str.len);
+  uint64_t shstr_off = out->len;
+  buf_bytes(out, shstr, sizeof shstr);
+  while (out->len & 7) buf_u8(out, 0);
+  uint64_t sh_off = out->len;
+
+  struct { uint32_t name, type; uint64_t flags, addr, off, size;
+           uint32_t link, info; uint64_t align, entsize; } sh[5] = {
+    { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+    { 1, SHT_PROGBITS_E, SHF_ALLOC_E | SHF_EXEC_E, L->text_addr,
+      64 + 2 * 56, L->text_size, 0, 0, 16, 0 },
+    { 7, SHT_SYMTAB_E, 0, 0, sym_off, sym.len, 3, nlocal, 8, 24 },
+    { 15, SHT_STRTAB_E, 0, 0, str_off, str.len, 0, 0, 1, 0 },
+    { 23, SHT_STRTAB_E, 0, 0, shstr_off, sizeof shstr, 0, 0, 1, 0 },
+  };
+  for (int i = 0; i < 5; i++) {
+    buf_u32(out, sh[i].name); buf_u32(out, sh[i].type);
+    buf_u64(out, sh[i].flags); buf_u64(out, sh[i].addr);
+    buf_u64(out, sh[i].off); buf_u64(out, sh[i].size);
+    buf_u32(out, sh[i].link); buf_u32(out, sh[i].info);
+    buf_u64(out, sh[i].align); buf_u64(out, sh[i].entsize);
+  }
+  wr64(out->data + 0x28, sh_off);
+  wr16(out->data + 0x3c, 5);
+  wr16(out->data + 0x3e, 4);
+  xfree(sym.data); xfree(str.data);
+}
+
 static void write_elf_exec(Linker *L, const char *path, uint64_t entry) {
   Buf out; memset(&out, 0, sizeof out);
 
@@ -1466,6 +1588,7 @@ static void write_elf_exec(Linker *L, const char *path, uint64_t entry) {
   while (out.len < rw_off) buf_u8(&out, 0);
   for (uint32_t i = 0; i < L->ngot; i++) buf_u64(&out, L->gsyms[L->got[i]].addr);
   emit_secs(&out, L, K_DATA, L->data_addr, data_off);
+  elf_append_symbols(L, &out);
 
   FILE *f = fopen(path, "wb");
   if (!f) warmc_fatal("link: cannot write %s", path);
@@ -1731,7 +1854,7 @@ static uint64_t macho_hdr_size(void) {
   uint64_t n = 32;
   n += 4 * 72;
   n += 6 * 80;
-  n += 48 + 24 + 80 + 24 + 24 + 16;
+  n += 48 + 24 + 80 + 24 + 24 + 24 + 16;
 
   n += align_up(12 + strlen(MACHO_DYLD) + 1, 8);
   n += align_up(24 + strlen(MACHO_DYLIB) + 1, 8);
@@ -1782,6 +1905,7 @@ static void lc_str16(Buf *b, const char *s) {
 
 #define LC_REQ_DYLD 0x80000000u
 #define LC_SYMTAB_C       0x02
+#define LC_UUID_C         0x1b
 #define LC_DYSYMTAB       0x0b
 #define LC_LOAD_DYLIB     0x0c
 #define LC_LOAD_DYLINKER  0x0e
@@ -1902,7 +2026,21 @@ static void write_macho_exec(Linker *L, const char *path, uint64_t entry) {
   Buf strt; memset(&strt, 0, sizeof strt);
   buf_u8(&strt, 0);
   Buf symt; memset(&symt, 0, sizeof symt);
-  uint32_t ndef = 0, nundef = 0;
+  uint32_t nlocal = 0, ndef = 0, nundef = 0;
+  {
+    uint32_t n;
+    TextSym *v = text_syms(L, true, &n);
+    for (uint32_t i = 0; i < n; i++) {
+      buf_u32(&symt, (uint32_t)strt.len);
+      buf_bytes(&strt, v[i].name, strlen(v[i].name) + 1);
+      buf_u8(&symt, N_SECT);
+      buf_u8(&symt, (uint8_t)macho_sect_of(L, v[i].addr));
+      buf_u16(&symt, 0);
+      buf_u64(&symt, v[i].addr);
+      nlocal++;
+    }
+    xfree(v);
+  }
   for (uint32_t i = 0; i < L->ngsyms; i++) {
     GSym *g = &L->gsyms[i];
     if (!g->defined || g->imported) continue;
@@ -1974,14 +2112,14 @@ static void write_macho_exec(Linker *L, const char *path, uint64_t entry) {
   ncmds++;
 
   buf_u32(&lc, LC_SYMTAB_C); buf_u32(&lc, 24);
-  buf_u32(&lc, (uint32_t)sym_off); buf_u32(&lc, ndef + nundef);
+  buf_u32(&lc, (uint32_t)sym_off); buf_u32(&lc, nlocal + ndef + nundef);
   buf_u32(&lc, (uint32_t)str_off); buf_u32(&lc, (uint32_t)strt.len);
   ncmds++;
 
   buf_u32(&lc, LC_DYSYMTAB); buf_u32(&lc, 80);
-  buf_u32(&lc, 0); buf_u32(&lc, 0);
-  buf_u32(&lc, 0); buf_u32(&lc, ndef);
-  buf_u32(&lc, ndef); buf_u32(&lc, nundef);
+  buf_u32(&lc, 0); buf_u32(&lc, nlocal);
+  buf_u32(&lc, nlocal); buf_u32(&lc, ndef);
+  buf_u32(&lc, nlocal + ndef); buf_u32(&lc, nundef);
   for (int i = 0; i < 12; i++) buf_u32(&lc, 0);
   ncmds++;
 
@@ -1998,6 +2136,15 @@ static void write_macho_exec(Linker *L, const char *path, uint64_t entry) {
 
   buf_u32(&lc, LC_MAIN); buf_u32(&lc, 24);
   buf_u64(&lc, entry - MACHO_BASE); buf_u64(&lc, 0);
+  ncmds++;
+
+  /* Filled in below from a hash of the image.  Instruments, dsymutil and the
+     crash reporter pair a binary with its symbols by this; without it every
+     executable warmc links has the same placeholder identity, and a profile
+     stays a column of addresses. */
+  buf_u32(&lc, LC_UUID_C); buf_u32(&lc, 24);
+  size_t uuid_at = 32 + lc.len;
+  for (int i = 0; i < 16; i++) buf_u8(&lc, 0);
   ncmds++;
 
   uint32_t dylibsz = (uint32_t)align_up(24 + strlen(dylib) + 1, 8);
@@ -2060,6 +2207,19 @@ static void write_macho_exec(Linker *L, const char *path, uint64_t entry) {
   buf_bytes(&out, symt.data, symt.len);
   buf_bytes(&out, strt.data, strt.len);
   while (out.len < sig_off) buf_u8(&out, 0);
+
+  {
+    uint8_t h[32];
+#ifdef SHA_HW
+    CC_SHA256(out.data, (CC_LONG)out.len, h);
+#else
+    Sha256 s;
+    sha_init(&s); sha_update(&s, out.data, out.len); sha_final(&s, h);
+#endif
+    h[6] = (uint8_t)((h[6] & 0x0f) | 0x50);
+    h[8] = (uint8_t)((h[8] & 0x3f) | 0x80);
+    memcpy(out.data + uuid_at, h, 16);
+  }
 
   uint64_t code_limit = sig_off;
   uint32_t npages = (uint32_t)((code_limit + 4095) / 4096);
