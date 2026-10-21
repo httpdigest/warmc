@@ -1127,6 +1127,286 @@
     "variant": "-O2",
     "wasmtime": "wasmtime 50.0.0 (ebe5e8df1 2026-10-20)"
   },
+  "stdgo": {
+    "host": "native-macos",
+    "kernels": {
+      "alloc": {
+        "noise": 0.67,
+        "ratio": 1.0248,
+        "rss_kb": 23488,
+        "rss_kb_wasmtime": 44144,
+        "warmc": 0.14393,
+        "wasmtime": 0.14044
+      },
+      "appendgrow": {
+        "noise": 0.4,
+        "ratio": 0.9734,
+        "rss_kb": 12512,
+        "rss_kb_wasmtime": 32672,
+        "warmc": 0.09757,
+        "wasmtime": 0.10024
+      },
+      "bigstruct": {
+        "noise": 0.6,
+        "ratio": 1.2325,
+        "rss_kb": 7264,
+        "rss_kb_wasmtime": 27648,
+        "warmc": 0.16719,
+        "wasmtime": 0.13565
+      },
+      "bintree": {
+        "noise": 1.44,
+        "ratio": 0.8636,
+        "rss_kb": 13136,
+        "rss_kb_wasmtime": 33280,
+        "warmc": 0.10358,
+        "wasmtime": 0.11995
+      },
+      "bitops": {
+        "noise": 0.44,
+        "ratio": 0.8858,
+        "rss_kb": 7248,
+        "rss_kb_wasmtime": 27632,
+        "warmc": 0.09656,
+        "wasmtime": 0.10901
+      },
+      "chans": {
+        "noise": 0.14,
+        "ratio": 0.8522,
+        "rss_kb": 7728,
+        "rss_kb_wasmtime": 28080,
+        "warmc": 0.1088,
+        "wasmtime": 0.12767
+      },
+      "closures": {
+        "noise": 0.69,
+        "ratio": 0.9032,
+        "rss_kb": 7248,
+        "rss_kb_wasmtime": 27632,
+        "warmc": 0.0953,
+        "wasmtime": 0.10551
+      },
+      "deferred": {
+        "noise": 0.62,
+        "ratio": 0.8566,
+        "rss_kb": 7264,
+        "rss_kb_wasmtime": 27648,
+        "warmc": 0.10493,
+        "wasmtime": 0.1225
+      },
+      "div64": {
+        "noise": 0.05,
+        "ratio": 0.7955,
+        "rss_kb": 7280,
+        "rss_kb_wasmtime": 27664,
+        "warmc": 0.1262,
+        "wasmtime": 0.15864
+      },
+      "divmod": {
+        "noise": 23.39,
+        "ratio": 0.9661,
+        "rss_kb": 7280,
+        "rss_kb_wasmtime": 27664,
+        "warmc": 0.07421,
+        "wasmtime": 0.07681
+      },
+      "dot": {
+        "noise": 0.01,
+        "ratio": 1.2972,
+        "rss_kb": 7536,
+        "rss_kb_wasmtime": 27904,
+        "warmc": 0.11014,
+        "wasmtime": 0.08491
+      },
+      "generics": {
+        "noise": 0.32,
+        "ratio": 0.8933,
+        "rss_kb": 7296,
+        "rss_kb_wasmtime": 27696,
+        "warmc": 0.15431,
+        "wasmtime": 0.17275
+      },
+      "goroutines": {
+        "noise": 0.51,
+        "ratio": 0.8306,
+        "rss_kb": 13120,
+        "rss_kb_wasmtime": 33040,
+        "warmc": 0.15588,
+        "wasmtime": 0.18768
+      },
+      "iface": {
+        "noise": 1.21,
+        "ratio": 0.228,
+        "rss_kb": 7280,
+        "rss_kb_wasmtime": 27744,
+        "warmc": 0.14601,
+        "wasmtime": 0.64044
+      },
+      "json": {
+        "noise": 0.63,
+        "ratio": 0.9271,
+        "rss_kb": 15312,
+        "rss_kb_wasmtime": 41840,
+        "warmc": 0.11119,
+        "wasmtime": 0.11992
+      },
+      "maphash": {
+        "noise": 1.41,
+        "ratio": 0.8552,
+        "rss_kb": 7712,
+        "rss_kb_wasmtime": 28048,
+        "warmc": 0.11529,
+        "wasmtime": 0.13481
+      },
+      "mathfn": {
+        "noise": 0.08,
+        "ratio": 0.9533,
+        "rss_kb": 7520,
+        "rss_kb_wasmtime": 27936,
+        "warmc": 0.16434,
+        "wasmtime": 0.1724
+      },
+      "matrix": {
+        "noise": 8.3,
+        "ratio": 1.2867,
+        "rss_kb": 7408,
+        "rss_kb_wasmtime": 27808,
+        "warmc": 0.11535,
+        "wasmtime": 0.08965
+      },
+      "memcpy": {
+        "noise": 6.08,
+        "ratio": 1.1516,
+        "rss_kb": 7600,
+        "rss_kb_wasmtime": 27952,
+        "warmc": 0.63534,
+        "wasmtime": 0.55172
+      },
+      "mix": {
+        "noise": 0.18,
+        "ratio": 1.1313,
+        "rss_kb": 7264,
+        "rss_kb_wasmtime": 27632,
+        "warmc": 0.13416,
+        "wasmtime": 0.11859
+      },
+      "multiret": {
+        "noise": 0.1,
+        "ratio": 2.2204,
+        "rss_kb": 7280,
+        "rss_kb_wasmtime": 27648,
+        "warmc": 0.15948,
+        "wasmtime": 0.07182
+      },
+      "recover": {
+        "noise": 0.21,
+        "ratio": 1.0735,
+        "rss_kb": 8448,
+        "rss_kb_wasmtime": 28816,
+        "warmc": 0.06864,
+        "wasmtime": 0.06394
+      },
+      "recurse": {
+        "noise": 1.27,
+        "ratio": 1.1549,
+        "rss_kb": 7248,
+        "rss_kb_wasmtime": 27632,
+        "warmc": 0.09406,
+        "wasmtime": 0.08144
+      },
+      "select": {
+        "noise": 0.9,
+        "ratio": 0.852,
+        "rss_kb": 7584,
+        "rss_kb_wasmtime": 27888,
+        "warmc": 0.09958,
+        "wasmtime": 0.11688
+      },
+      "sha256": {
+        "noise": 0.19,
+        "ratio": 1.2674,
+        "rss_kb": 7552,
+        "rss_kb_wasmtime": 29008,
+        "warmc": 0.18664,
+        "wasmtime": 0.14726
+      },
+      "sortints": {
+        "noise": 0.07,
+        "ratio": 1.0055,
+        "rss_kb": 7312,
+        "rss_kb_wasmtime": 27808,
+        "warmc": 0.10664,
+        "wasmtime": 0.10606
+      },
+      "sprintf": {
+        "noise": 0.37,
+        "ratio": 0.9276,
+        "rss_kb": 12560,
+        "rss_kb_wasmtime": 32592,
+        "warmc": 0.13306,
+        "wasmtime": 0.14345
+      },
+      "strbuild": {
+        "noise": 0.12,
+        "ratio": 0.906,
+        "rss_kb": 7552,
+        "rss_kb_wasmtime": 27920,
+        "warmc": 0.11017,
+        "wasmtime": 0.1216
+      },
+      "strsum": {
+        "noise": 0.0,
+        "ratio": 1.3064,
+        "rss_kb": 7296,
+        "rss_kb_wasmtime": 27680,
+        "warmc": 0.17532,
+        "wasmtime": 0.1342
+      },
+      "structs": {
+        "noise": 1.08,
+        "ratio": 0.8511,
+        "rss_kb": 7680,
+        "rss_kb_wasmtime": 28048,
+        "warmc": 0.08291,
+        "wasmtime": 0.09741
+      },
+      "sum": {
+        "noise": 0.13,
+        "ratio": 0.9828,
+        "rss_kb": 7280,
+        "rss_kb_wasmtime": 27664,
+        "warmc": 0.14309,
+        "wasmtime": 0.14559
+      },
+      "typeswitch": {
+        "noise": 0.38,
+        "ratio": 1.213,
+        "rss_kb": 7232,
+        "rss_kb_wasmtime": 27616,
+        "warmc": 0.16297,
+        "wasmtime": 0.13435
+      },
+      "utf8scan": {
+        "noise": 1.26,
+        "ratio": 1.5464,
+        "rss_kb": 9696,
+        "rss_kb_wasmtime": 30064,
+        "warmc": 0.09184,
+        "wasmtime": 0.05939
+      },
+      "variadic": {
+        "noise": 0.59,
+        "ratio": 0.8224,
+        "rss_kb": 7248,
+        "rss_kb_wasmtime": 27616,
+        "warmc": 0.14497,
+        "wasmtime": 0.17627
+      }
+    },
+    "producer": "go version go1.27.3 darwin/arm64",
+    "variant": "-O2",
+    "wasmtime": "wasmtime 50.0.0 (ebe5e8df1 2026-10-20)"
+  },
   "vecbench": {
     "host": "native-macos",
     "kernels": {
