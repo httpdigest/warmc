@@ -27,6 +27,7 @@
   (type $take_t (func (param (ref $box)) (result i64)))
 
   (global $sink (mut anyref) (ref.null any))
+  (global $gbox (mut (ref null $box)) (ref.null $box))
   (table $fns 1 funcref)
   (elem (table $fns) (i32.const 0) func $take)
   (tag $boom)
@@ -347,15 +348,6 @@
         (br $l)))
     (ref.null $pt))
 
-  (func (export "pe_found") (param $n i32) (param $k i64) (param $exp i64)
-    (local $r (ref null $pt))
-    (local.set $r (call $pe_find (local.get $n) (local.get $k)))
-    (call $want (if (result i64) (ref.is_null (local.get $r))
-                  (then (i64.const -1))
-                  (else (i64.add (i64.mul (struct.get $pt $x (local.get $r)) (i64.const 1000))
-                                 (struct.get $pt $y (local.get $r)))))
-                (local.get $exp)))
-
   ;; Kept in a global only when it beats the best so far.
   (func (export "pe_best") (param $n i32) (param $exp i64)
     (local $i i32) (local $best i64) (local $p (ref $pt))
@@ -424,8 +416,9 @@
                         (local.get $exp)))
       (else (call $want (struct.get $pt $x (local.get $p)) (local.get $exp)))))
 
-  ;; Handed to a block result that may be null, so not an object, by a
-  ;; br_if: the escape is the taken edge alone, split to make it on.
+  ;; Handed by a br_if to a block result that is otherwise whatever a
+  ;; global holds, so not an object: the escape is the taken edge alone,
+  ;; split to make it on.
   (func (export "pe_edge") (param $c i32) (param $exp i64)
     (local $p (ref $box)) (local $r (ref null $box))
     (local.set $p (struct.new $box (i64.const 3)))
@@ -433,15 +426,50 @@
     (local.set $r (block $out (result (ref null $box))
       (drop (br_if $out (local.get $p) (local.get $c)))
       (call $want (struct.get $box $v (local.get $p)) (i64.const 15))
-      (ref.null $box)))
+      (global.get $gbox)))
     (call $want (if (result i64) (ref.is_null (local.get $r))
                   (then (i64.const -1))
                   (else (struct.get $box $v (ref.as_non_null (local.get $r)))))
                 (local.get $exp)))
 
-  ;; Stored into an object that is itself replaced: made where it is
-  ;; stored, and the holder's field is what was made.
-  (func (export "pe_nested") (param $c i32) (param $exp i64)
+  ;; ---- merges that may be null ------------------------------------------
+  ;;
+  ;; A merge with null among what flows in carries a flag beside its fields.
+  ;; These are `sr_`: nothing in them may be left allocated, though an object
+  ;; may be made at an escape point on the way and go a round later.
+
+  ;; The search above, inlined: what it returns is the object or null.
+  (func (export "sr_found") (param $n i32) (param $k i64) (param $exp i64)
+    (local $r (ref null $pt))
+    (local.set $r (call $pe_find (local.get $n) (local.get $k)))
+    (call $want (if (result i64) (ref.is_null (local.get $r))
+                  (then (i64.const -1))
+                  (else (i64.add (i64.mul (struct.get $pt $x (local.get $r)) (i64.const 1000))
+                                 (struct.get $pt $y (local.get $r)))))
+                (local.get $exp)))
+
+  ;; The same with a loop variable that starts null.
+  (func (export "sr_found_loop") (param $n i32) (param $k i64) (param $exp i64)
+    (local $i i32) (local $p (ref $pt)) (local $r (ref null $pt))
+    (block $done
+      (loop $l
+        (br_if $done (i32.ge_s (local.get $i) (local.get $n)))
+        (local.set $p (struct.new $pt (i64.extend_i32_s (local.get $i))
+                                      (i64.mul (i64.extend_i32_s (local.get $i))
+                                               (i64.extend_i32_s (local.get $i)))))
+        (if (i64.eq (struct.get $pt $y (local.get $p)) (local.get $k))
+          (then (local.set $r (local.get $p)) (br $done)))
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br $l)))
+    (call $want (if (result i64) (ref.is_null (local.get $r))
+                  (then (i64.const -1))
+                  (else (i64.add (i64.mul (struct.get $pt $x (local.get $r)) (i64.const 1000))
+                                 (struct.get $pt $y (local.get $r)))))
+                (local.get $exp)))
+
+  ;; Stored into a holder on one path only: the holder's field is the box or
+  ;; null, and both go.
+  (func (export "sr_nested_cond") (param $c i32) (param $exp i64)
     (local $h (ref $holder)) (local $b (ref $box))
     (local.set $b (struct.new $box (i64.const 7)))
     (struct.set $box $v (local.get $b) (i64.add (struct.get $box $v (local.get $b)) (i64.const 1)))
@@ -450,6 +478,41 @@
     (call $want (if (result i64) (ref.is_null (struct.get $holder $r (local.get $h)))
                   (then (i64.const -1))
                   (else (struct.get $box $v (ref.cast (ref $box) (struct.get $holder $r (local.get $h))))))
+                (local.get $exp)))
+
+  ;; Read and written through a nullable local: a read that checks for null
+  ;; checks the flag.
+  (func (export "sr_nullable") (param $c i32) (param $exp i64)
+    (local $p (ref null $pt))
+    (local.set $p (if (result (ref null $pt)) (local.get $c)
+      (then (struct.new $pt (i64.const 1) (i64.const 2)))
+      (else (ref.null $pt))))
+    (if (i32.eqz (ref.is_null (local.get $p)))
+      (then (struct.set $pt $y (local.get $p) (i64.add (struct.get $pt $y (local.get $p)) (i64.const 40)))))
+    (call $want (if (result i64) (ref.is_null (local.get $p))
+                  (then (i64.const -1))
+                  (else (i64.add (struct.get $pt $x (local.get $p)) (struct.get $pt $y (local.get $p)))))
+                (local.get $exp)))
+
+  ;; A read of null still traps.
+  (func (export "sr_nullable_trap") (param $c i32) (param $exp i64)
+    (local $p (ref null $pt))
+    (local.set $p (if (result (ref null $pt)) (local.get $c)
+      (then (struct.new $pt (i64.const 1) (i64.const 2)))
+      (else (ref.null $pt))))
+    (call $want (struct.get $pt $y (local.get $p)) (local.get $exp)))
+
+  ;; Tests and casts: what a test answers for null depends on whether it
+  ;; takes null.
+  (func (export "sr_nullable_test") (param $c i32) (param $exp i64)
+    (local $p (ref null $pt))
+    (local.set $p (if (result (ref null $pt)) (local.get $c)
+      (then (struct.new $pt (i64.const 1) (i64.const 2)))
+      (else (ref.null $pt))))
+    (call $want (i64.extend_i32_u
+                  (i32.add (i32.add (i32.mul (ref.test (ref $pt) (local.get $p)) (i32.const 100))
+                                    (i32.mul (ref.test (ref null $pt) (local.get $p)) (i32.const 10)))
+                           (ref.test (ref $box) (local.get $p))))
                 (local.get $exp)))
 
   ;; ---- refused, and still right -----------------------------------------
@@ -579,4 +642,27 @@
     (call $want (i64.add (i64.mul (i64.extend_i32_u (global.get $changes)) (i64.const 1000))
                          (struct.get $box $v (ref.cast (ref $box) (global.get $sink))))
                 (local.get $exp)))
+
+  ;; A merge that may be null, handed over: no merge after all, and what
+  ;; flows into it is made on its edge.
+  (func (export "keep_nullable_escape") (param $c i32) (param $exp i64)
+    (local $p (ref null $pt))
+    (global.set $sink (ref.null any))
+    (local.set $p (if (result (ref null $pt)) (local.get $c)
+      (then (struct.new $pt (i64.const 4) (i64.const 5)))
+      (else (ref.null $pt))))
+    (global.set $sink (local.get $p))
+    (call $want (if (result i64) (ref.is_null (global.get $sink))
+                  (then (i64.const -1))
+                  (else (struct.get $pt $y (ref.cast (ref $pt) (global.get $sink)))))
+                (local.get $exp)))
+
+  ;; Compared: whether it is null is the answer, which the flag could give,
+  ;; but a comparison is not followed.
+  (func (export "keep_nullable_eq") (param $c i32) (param $exp i64)
+    (local $p (ref null $pt))
+    (local.set $p (if (result (ref null $pt)) (local.get $c)
+      (then (struct.new $pt (i64.const 4) (i64.const 5)))
+      (else (ref.null $pt))))
+    (call $want (i64.extend_i32_u (ref.eq (local.get $p) (ref.null eq))) (local.get $exp)))
 )
