@@ -366,7 +366,7 @@ check: all $(SAN_TARGETS) $(WIN_CHECKS) check-encoder $(CHECK_TOOLS)
 check-linux: all
 	@rc=0; ./test/run_gowasi_linux.sh || rc=1; ./test/run_gc_linux.sh || rc=1; exit $$rc
 
-BENCH_CORPORA = gobench vecbench asbench rsbench ktbench zigbench cbench cppbench \
+BENCH_CORPORA = gobench stdgo vecbench asbench rsbench ktbench zigbench cbench cppbench \
                 hsbench
 
 bench-compare: all
