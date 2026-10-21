@@ -5306,6 +5306,7 @@ bool ir_op_is_gc_safepoint(uint16_t op) {
   switch (op) {
     case I_CALL: case I_CALL_INDIRECT: case I_CALL_REF:
     case I_STRUCT_NEW: case I_ARRAY_NEW: case I_ARRAY_NEW_SEG:
+    case I_THROW:
       return true;
     default:
       return false;

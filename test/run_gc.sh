@@ -234,6 +234,7 @@ expect global_get_shared  "OK"
 
 build_one exnpayload
 expect payload_survives   "OK"
+expect pad_keeps_ref      "OK"
 
 build_one devirt_vt
 expect vt_mono            "OK"
