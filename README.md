@@ -480,7 +480,7 @@ command-line order, so put them **after** `-O`.
 | `branch` | constant-branch folding and block merging |
 | `thread` | jump threading through a block that only switches on a parameter, such as the dispatch Go's compiler puts around every function, when an edge passes that parameter a constant |
 | `nodesplit` | copy the part of a loop that a switch outside it enters in the middle, so that the loop has one way in again and the loop passes can take it |
-| `mem` | store-to-load forwarding and dead-store removal, using per-function effect summaries |
+| `mem` | store-to-load forwarding, also of bytes stored as one type and loaded as another, and dead-store removal, also of a store of the value the slot already holds, using per-function effect summaries |
 | `bce` | bounds-check elimination by value range and dominating checks |
 | `strength` | strength reduction: induction variables, shifts, magic-number division |
 | `inline` | call-site-scored inlining (on by default only at `-O2`) |
@@ -655,20 +655,20 @@ steady-state generated code, not start-up or compile time.
 
 | Corpus | Source language | Kernels | warmc / wasmtime | Range | Median peak RSS (warmc / wasmtime) |
 |---|---|---:|---:|---|---|
-| `gobench` | TinyGo | 26 | 0.61 | 0.07 – 1.06 | 1.9 / 8.9 MB |
-| `stdgo` | Go | 34 | 0.65 | 0.06 – 1.05 | 7.1 / 27.2 MB |
+| `gobench` | TinyGo | 26 | 0.61 | 0.07 – 1.05 | 1.9 / 8.9 MB |
+| `stdgo` | Go | 34 | 0.65 | 0.06 – 1.06 | 7.2 / 27.2 MB |
 | `vecbench` | TinyGo (vectorisable loops) | 30 | 0.15 | 0.04 – 0.94 | 1.9 / 8.9 MB |
-| `asbench` | AssemblyScript | 25 | 0.64 | 0.19 – 0.99 | 1.9 / 8.7 MB |
-| `rsbench` | Rust | 28 | 0.71 | 0.34 – 1.00 | 1.9 / 9.1 MB |
-| `zigbench` | Zig | 9 | 0.70 | 0.41 – 1.00 | 1.9 / 8.7 MB |
-| `ktbench` | Kotlin (Wasm GC) | 12 | 0.09 | 0.004 – 0.48 | 3.4 / 20.6 MB |
-| `cbench` | C | 14 | 0.84 | 0.32 – 1.05 | 2.0 / 8.9 MB |
-| `cppbench` | C++ | 14 | 0.69 | 0.23 – 1.01 | 2.5 / 9.7 MB |
-| `hsbench` | Haskell | 15 | 0.65 | 0.40 – 0.89 | 10.2 / 32.3 MB |
+| `asbench` | AssemblyScript | 25 | 0.62 | 0.17 – 0.97 | 1.9 / 8.7 MB |
+| `rsbench` | Rust | 28 | 0.71 | 0.34 – 0.99 | 2.0 / 9.1 MB |
+| `zigbench` | Zig | 9 | 0.70 | 0.40 – 1.01 | 1.9 / 8.7 MB |
+| `ktbench` | Kotlin (Wasm GC) | 12 | 0.09 | 0.004 – 0.49 | 3.5 / 20.7 MB |
+| `cbench` | C | 14 | 0.83 | 0.32 – 1.05 | 2.0 / 9.0 MB |
+| `cppbench` | C++ | 14 | 0.69 | 0.23 – 1.00 | 2.6 / 9.8 MB |
+| `hsbench` | Haskell | 15 | 0.65 | 0.39 – 0.90 | 10.2 / 32.3 MB |
 
 Over all 207 kernels the geometric mean is **0.48**, and 0.45 without
-`stdgo`. Eight kernels are slower than wasmtime, all within 6%, and five of
-them within 1.5%. Of the other three, `stdgo/memcpy` spends its time in the
+`stdgo`. Five kernels are slower than wasmtime, all within 6%, and two of
+them within 1%. Of the other three, `stdgo/memcpy` spends its time in the
 platform's memmove under both engines, `cbench/nbody`'s pair loop compiles to
 nearly the same instructions in both, and `gobench/bitops` pays a register
 move after each population count that wasmtime does without.
