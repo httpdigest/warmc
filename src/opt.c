@@ -1063,12 +1063,19 @@ static bool pass_dce(IrFunc *f) {
      object of its own, its fields parameters of that block, provided each
      object flowing in is used no more once it has: no use of one is
      reachable from the merge without allocating it again.  That is what
-     lets the merged value own fields that nothing else can see.
+     lets the merged value own fields that nothing else can see;
+   - such a merge with null among what flows in -- `c ? new P(a) : null`,
+     or a field of a replaced object that only some paths store an object
+     in.  Beside its fields it carries a flag, 1 for an object and 0 for
+     null, which its null checks and tests read, and everything it merges
+     with carries one too.  One that escapes is no merge after all: the
+     question is asked again with it a parameter like any other.
 
    What a use may be: field.get/set, array.get/set at a constant index in
    range, array.len, a null check (it is not null), ref.is_null, ref.test
    (its exact type is known), ref.eq/ne (nothing that is not one of its
-   aliases can be it), and flowing into a parameter as above.  Anything else
+   aliases can be it -- unless it may be null), and flowing into a
+   parameter as above.  Anything else
    -- a call, being stored, returned, select -- and it escapes, together with
    every object it merges with.
 
@@ -1115,6 +1122,8 @@ typedef struct {
   bool escaped;
   bool dead_only;     /* an array too long to replace: removable unread */
   bool benefit;       /* a use its fields answer, not just initialise */
+  bool nullable;      /* a merge with null among what flows in */
+  bool flagged;       /* carries the flag that says which: in such a group */
   uint16_t why;
   uint16_t pwhy;      /* what the first escape point is */
   uint32_t nvars, var0, len;
@@ -1125,6 +1134,9 @@ typedef struct {
 
 typedef struct { uint32_t obj, block; } EsUse;
 typedef struct { uint32_t src, dst; } EsFlow;
+/* An object's variables: its fields, then the flag if it has one. */
+#define ES_NV(o_) ((o_)->nvars + ((o_)->flagged ? 1u : 0u))
+
 /* An escape point: an instruction; with inst REF_NONE, the block's end;
    and with succ set too, that edge alone, which is split to make room. */
 typedef struct { uint32_t obj, block; Ref inst; uint32_t succ; } EsPt;
@@ -1251,7 +1263,7 @@ static bool es_use_local(IrFunc *f, const EsObj *o, Ref v, uint32_t j, bool *ele
     case I_TRAP_IF: return in->imm == TRAP_NULL_REF && in->nargs == 1;
     case I_REF_IS_NULL: case I_REF_CONVERT: return true;
     case I_REF_TEST: return es_ref_test(m, o->ti, in->imm, in->imm2) >= 0;
-    case I_EQ: case I_NE: return in->nargs == 2;
+    case I_EQ: case I_NE: return in->nargs == 2 && !o->nullable;
     default: return false;
   }
 }
@@ -1390,30 +1402,43 @@ static bool pass_escape(IrFunc *f, bool partial) {
   if (!nobj) { xfree(own); xfree(obj); return false; }
 
   IrEdgeIdx ei = ir_edge_index(f);
+  /* merges that could be null but escaped anyway: parameters like any
+     other, on the next try */
+  uint8_t *demote = xcalloc(n, 1);
+  uint32_t nalloc = nobj, tries = 0;
+#define ES_ISNULL(r_) ((r_) < n && vt_is_ref(f->insts[r_].type) && \
+                       (f->insts[r_].op == I_REF_NULL || \
+                        (f->insts[r_].op == I_CONST && f->insts[r_].imm == 0)))
+restart:;
 
   /* Which allocations can reach each reference parameter and conversion,
      to a fixpoint over the CFG: a set only grows, so cycles of parameters
      settle without guessing.  One origin and the parameter is an alias of
      it -- SSA dominance makes it the object's current instance on every
-     edge; two or more and it is a merge, an object of its own.  Anything
-     else reaching it, and it is not an object at all. */
-  uint32_t nalloc = nobj, W = (nalloc + 63) / 64;
+     edge; two or more, or null too, and it is a merge, an object of its
+     own.  Anything else reaching it, and it is not an object at all. */
+  uint32_t W = (nalloc + 63) / 64;
   uint64_t *org = xcalloc((size_t)n * W, sizeof(uint64_t));
   uint8_t *forg = xcalloc(n, 1);
+  uint8_t *nul = xcalloc(n, 1);
   for (uint32_t c = 0; c < nalloc; c++)
     org[(size_t)obj[c].def * W + c / 64] |= 1ull << (c % 64);
   /* the function's own parameters come from the caller */
   for (uint32_t p = 0; p < f->blocks[f->entry].nparams; p++)
     if (f->blocks[f->entry].params[p] < n) forg[f->blocks[f->entry].params[p]] = 1;
+  for (uint32_t v = 0; v < n; v++) if (demote[v]) forg[v] = 1;
 #define ES_TRACKED(r_) ((r_) < n && (OWN(r_) >= 0 || f->insts[r_].op == I_PARAM || \
                                      f->insts[r_].op == I_REF_CONVERT))
 #define ES_MERGE_IN(to_, from_) do { \
-    Ref fr_ = (from_); bool fg_; \
-    if (ES_TRACKED(fr_)) { \
+    Ref fr_ = (from_); bool fg_ = false; \
+    if (ES_ISNULL(fr_)) { \
+      if (!nul[(to_)]) { nul[(to_)] = 1; again = true; } \
+    } else if (ES_TRACKED(fr_)) { \
       for (uint32_t w_ = 0; w_ < W; w_++) { \
         uint64_t nw_ = org[(size_t)(to_) * W + w_] | org[(size_t)fr_ * W + w_]; \
         if (nw_ != org[(size_t)(to_) * W + w_]) { org[(size_t)(to_) * W + w_] = nw_; again = true; } } \
       fg_ = forg[fr_]; \
+      if (nul[fr_] && !nul[(to_)]) { nul[(to_)] = 1; again = true; } \
     } else fg_ = true; \
     if (fg_ && !forg[(to_)]) { forg[(to_)] = 1; again = true; } } while (0)
   for (bool again = true; again;) {
@@ -1442,6 +1467,17 @@ static bool pass_escape(IrFunc *f, bool partial) {
 #undef ES_MERGE_IN
 #undef ES_TRACKED
 
+  /* a parameter or conversion only ever null -- a loop variable that starts
+     null and is not set round the loop -- is as good as a null constant */
+  uint8_t *nullonly = xcalloc(n, 1);
+  for (uint32_t v = 0; v < n; v++) {
+    if (!nul[v] || forg[v]) continue;
+    bool none = true;
+    for (uint32_t w = 0; w < W && none; w++) none = !org[(size_t)v * W + w];
+    nullonly[v] = none;
+  }
+#define ES_NULLV(r_) (ES_ISNULL(r_) || ((r_) < n && nullonly[(r_)]))
+
   for (uint32_t oi = 0; oi < f->norder; oi++) {
     uint32_t bi = f->order[oi];
     Block *b = &f->blocks[bi];
@@ -1454,11 +1490,12 @@ static bool pass_escape(IrFunc *f, bool partial) {
       for (uint32_t c = 0; c < nalloc; c++)
         if (org[(size_t)P * W + c / 64] >> (c % 64) & 1) { if (one < 0) one = (int32_t)c; count++; }
       if (!count) continue;
-      if (count == 1) { own[P] = one; continue; }
+      if (count == 1 && !nul[P]) { own[P] = one; continue; }
       if (nobj >= ESC_MAX_OBJS) continue;
       EsObj o;
       memset(&o, 0, sizeof o);
       o.def = P; o.block = bi; o.phi = true; o.fill = REF_NONE;
+      o.nullable = nul[P];
       o.ti = obj[one].ti; o.kind = obj[one].kind;
       o.len = obj[one].len; o.nvars = obj[one].nvars; o.shape = obj[one].shape;
       own[P] = (int32_t)nobj;
@@ -1488,7 +1525,7 @@ static bool pass_escape(IrFunc *f, bool partial) {
       }
     }
   }
-  xfree(org);
+  xfree(org); xfree(nul);
 
   /* What flows where.  An object meeting a parameter that is not one
      escapes there, at the end of the edge's block; one flowing into a merge
@@ -1511,7 +1548,8 @@ static bool pass_escape(IrFunc *f, bool partial) {
         Ref P = t->params[j];
         int32_t d = OWN(P);
         if (c < 0) {
-          if (d >= 0 && a != P) es_escape(&obj[d], ESW_FOREIGN);
+          if (d >= 0 && a != P && !(obj[d].nullable && ES_NULLV(a)))
+            es_escape(&obj[d], ESW_FOREIGN);
           continue;
         }
         if (d < 0) {
@@ -1640,7 +1678,10 @@ static bool pass_escape(IrFunc *f, bool partial) {
     EsPt *p = &pt[k];
     EsObj *o = &obj[p->obj];
     if (o->escaped) continue;
-    if (!partial || o->dead_only || o->npts > ESC_MAX_POINTS) { es_escape(o, o->pwhy); continue; }
+    if (!partial || o->nullable || o->dead_only || o->npts > ESC_MAX_POINTS) {
+      es_escape(o, o->pwhy);
+      continue;
+    }
     Block *b = &f->blocks[p->block];
     int32_t c = (int32_t)p->obj;
     bool later = false;
@@ -1732,6 +1773,17 @@ static bool pass_escape(IrFunc *f, bool partial) {
     if (!avoid) es_escape(o, ESW_GAIN);
   }
 
+  /* The flag a merge that may be null carries, and so everything that
+     merges with it, so that each edge has one to hand on. */
+  for (uint32_t c = 0; c < nobj; c++) obj[c].flagged = obj[c].nullable;
+  for (bool more = true; more;) {
+    more = false;
+    for (uint32_t k = 0; k < nflow; k++) {
+      EsObj *src = &obj[flow[k].src], *dst = &obj[flow[k].dst];
+      if (src->flagged != dst->flagged) { src->flagged = dst->flagged = true; more = true; }
+    }
+  }
+
   /* Liveness, and the parameters it asks for; an escape anywhere spreads to
      everything it merges with, and asks the question again. */
   uint8_t *live = xmalloc(nb ? nb : 1);
@@ -1752,7 +1804,7 @@ static bool pass_escape(IrFunc *f, bool partial) {
     for (uint32_t c = 0; c < nobj; c++) {
       EsObj *o = &obj[c];
       memset(&needp[(size_t)c * nb], 0, nb);
-      if (o->escaped || !o->nvars) continue;
+      if (o->escaped || !ES_NV(o)) continue;
       memset(live, 0, nb);
       uint32_t sp = 0;
       for (uint32_t u = 0; u < nuse; u++)
@@ -1791,12 +1843,12 @@ static bool pass_escape(IrFunc *f, bool partial) {
   for (uint32_t c = 0; c < nobj; c++) {
     EsObj *o = &obj[c];
     if (o->escaped) continue;
-    if (V + o->nvars > ESC_MAX_VARS || (uint64_t)(V + o->nvars) * nb > ESC_MAX_CELLS) {
+    if (V + ES_NV(o) > ESC_MAX_VARS || (uint64_t)(V + ES_NV(o)) * nb > ESC_MAX_CELLS) {
       es_escape(o, ESW_BUDGET);
       continue;
     }
     o->var0 = V;
-    V += o->nvars;
+    V += ES_NV(o);
   }
   /* a budget refusal can strand what merges with it */
   for (bool spread = true; spread;) {
@@ -1811,13 +1863,41 @@ static bool pass_escape(IrFunc *f, bool partial) {
     }
   }
 
+  /* A merge that could be null and escapes anyway would take what flows
+     into it down too, where on its own each would at worst have been made
+     on its edge.  It goes back to being a parameter, which is how the
+     question is asked again -- every merge of the kind, should the tries
+     run out. */
+  bool redo = false;
+  for (uint32_t c = 0; c < nobj; c++)
+    if (obj[c].phi && obj[c].nullable && (obj[c].escaped || tries >= 8)) {
+      demote[obj[c].def] = 1;
+      redo = true;
+    }
+  if (redo) {
+    tries++;
+    xfree(forg); xfree(nullonly); xfree(flow); xfree(use); xfree(pt);
+    xfree(reach); xfree(stack); xfree(live); xfree(needp);
+    for (uint32_t v = 0; v < n; v++) own[v] = -1;
+    nobj = nalloc;
+    for (uint32_t c = 0; c < nalloc; c++) {
+      EsObj *o = &obj[c];
+      o->escaped = o->benefit = o->flagged = false;
+      o->why = o->pwhy = 0;
+      o->npts = o->var0 = 0;
+      own[o->def] = (int32_t)c;
+    }
+    goto restart;
+  }
+
   bool any = false;
   for (uint32_t c = 0; c < nobj; c++) if (!obj[c].escaped) any = true;
 
   if (dbg)
     for (uint32_t c = 0; c < nobj; c++) {
       EsObj *o = &obj[c];
-      const char *kind = o->phi ? "merge" : o->kind == ESK_STRUCT ? "struct" : "array";
+      const char *kind = o->nullable ? "nullable" : o->phi ? "merge"
+                       : o->kind == ESK_STRUCT ? "struct" : "array";
       fprintf(stderr, "escape %s v%u %s d%u: ", m->funcs[f->func_index].sym,
               o->def, kind, f->blocks[o->block].loop_depth);
       if (!o->escaped && o->npts)
@@ -1847,16 +1927,19 @@ static bool pass_escape(IrFunc *f, bool partial) {
       (out_) = zz_; } while (0)
     Ref mask8 = es_entry_const(f, VT_I32, 0xff, 0);
     Ref mask16 = es_entry_const(f, VT_I32, 0xffff, 0);
+    Ref one = es_entry_const(f, VT_I32, 1, 0);
 
     ValType *vtype = xmalloc((V ? V : 1) * sizeof(ValType));
     for (uint32_t c = 0; c < nobj; c++)
-      if (!obj[c].escaped)
+      if (!obj[c].escaped) {
         for (uint32_t k = 0; k < obj[c].nvars; k++)
           vtype[obj[c].var0 + k] = es_var_type(m, &obj[c], k);
+        if (obj[c].flagged) vtype[obj[c].var0 + obj[c].nvars] = VT_I32;
+      }
     for (uint32_t k = 0; k < V; k++) {
       bool used = false;
       for (uint32_t c = 0; c < nobj && !used; c++)
-        used = !obj[c].escaped && k >= obj[c].var0 && k < obj[c].var0 + obj[c].nvars;
+        used = !obj[c].escaped && k >= obj[c].var0 && k < obj[c].var0 + ES_NV(&obj[c]);
       if (used) { Ref z; ES_ZERO(vtype[k], z); (void)z; }
     }
 
@@ -1874,7 +1957,7 @@ static bool pass_escape(IrFunc *f, bool partial) {
       if (o->escaped) continue;
       for (uint32_t bi = 0; bi < nb; bi++) {
         if (!(o->phi && bi == o->block) && !needp[(size_t)c * nb + bi]) continue;
-        for (uint32_t k = 0; k < o->nvars; k++)
+        for (uint32_t k = 0; k < ES_NV(o); k++)
           pref[(size_t)bi * V + o->var0 + k] = ir_add_param(f, bi, vtype[o->var0 + k]);
       }
     }
@@ -1949,6 +2032,7 @@ static bool pass_escape(IrFunc *f, bool partial) {
             else ES_ZERO(vtype[o->var0 + k], z);
             cur[o->var0 + k] = z;
           }
+          if (o->flagged) cur[o->var0 + o->nvars] = one;   /* an object, not null */
           continue;
         }
         int32_t c = in->nargs ? OWN(ir_resolve(f, a[0])) : -1;
@@ -1963,6 +2047,35 @@ static bool pass_escape(IrFunc *f, bool partial) {
         }
         if (c < 0 || obj[c].escaped) continue;
         EsObj *o = &obj[c];
+        /* A merge that may be null: its flag answers for its null checks,
+           and an access that would have trapped on null traps on that. */
+        Ref flag = REF_NONE;
+        if (o->nullable) {
+          flag = ir_resolve(f, cur[o->var0 + o->nvars]);
+          if (flag == REF_NONE)
+            warmc_fatal("internal: escape has no flag for v%u in %s",
+                        o->def, m->funcs[f->func_index].sym);
+          bool access = in->op == I_FIELD_GET || in->op == I_FIELD_SET ||
+                        in->op == I_ARRAY_GET || in->op == I_ARRAY_SET ||
+                        in->op == I_ARRAY_LEN;
+          if (access && (in->imm2 & GCF_NULLCHK)) {
+            ir_emit(f, bi, I_TRAP_IF, VT_BOT, &flag, 1, TRAP_NULL_REF, 0);
+            b = &f->blocks[bi];
+            es_move_last_to(f, bi, i);
+            i++;
+            in = &f->insts[v];
+            a = ir_args(f, v);
+          }
+        }
+#define ES_IS_NULL_OF_FLAG() do { \
+          Ref z_ = ir_emit(f, bi, I_EQZ, VT_I32, &flag, 1, 0, 0); \
+          b = &f->blocks[bi]; \
+          es_move_last_to(f, bi, i); \
+          i++; \
+          in = &f->insts[v]; \
+          ir_replace(f, v, z_); \
+          in->op = I_NOP; \
+          in->nargs = 0; } while (0)
         switch (in->op) {
           case I_FIELD_GET: case I_ARRAY_GET: {
             uint32_t k = in->op == I_FIELD_GET
@@ -2004,13 +2117,26 @@ static bool pass_escape(IrFunc *f, bool partial) {
             break;
           }
           case I_ARRAY_LEN: replace_with_const(f, v, o->len); break;
-          case I_REF_IS_NULL: replace_with_const(f, v, 0); break;
-          case I_REF_TEST:
-            replace_with_const(f, v, (uint64_t)es_ref_test(m, o->ti, in->imm, in->imm2));
+          case I_REF_IS_NULL:
+            if (o->nullable) ES_IS_NULL_OF_FLAG();
+            else replace_with_const(f, v, 0);
             break;
-          case I_TRAP_IF: in->op = I_NOP; in->nargs = 0; break;
+          case I_REF_TEST: {
+            /* what it answers for the object, and for null */
+            int r1 = es_ref_test(m, o->ti, in->imm, in->imm2);
+            int r0 = (RTEST_KIND(in->imm) & RTK_NULLABLE) ? 1 : 0;
+            if (!o->nullable || r1 == r0) replace_with_const(f, v, (uint64_t)r1);
+            else if (r1) { ir_replace(f, v, flag); in->op = I_NOP; in->nargs = 0; }
+            else ES_IS_NULL_OF_FLAG();
+            break;
+          }
+          case I_TRAP_IF:
+            if (o->nullable) a[0] = flag;
+            else { in->op = I_NOP; in->nargs = 0; }
+            break;
           default: break;
         }
+#undef ES_IS_NULL_OF_FLAG
       }
       if (ptend[bi]) {
         /* escape points at the block's end: what it returns, and what its
@@ -2054,7 +2180,7 @@ static bool pass_escape(IrFunc *f, bool partial) {
           Ref val = REF_NONE;
           for (uint32_t c = 0; c < nobj; c++) {
             EsObj *o = &obj[c];
-            if (o->escaped || k < o->var0 || k >= o->var0 + o->nvars) continue;
+            if (o->escaped || k < o->var0 || k >= o->var0 + ES_NV(o)) continue;
             if (o->phi && o->block == t) {
               /* the merge's own field: whichever object came along this edge */
               uint32_t pj = 0;
@@ -2175,8 +2301,11 @@ static bool pass_escape(IrFunc *f, bool partial) {
 #undef ES_ADD
 #undef OWN
 #undef ES_USE
+#undef ES_ISNULL
+#undef ES_NULLV
   ir_edge_index_free(&ei);
-  xfree(own); xfree(obj); xfree(forg); xfree(flow); xfree(use); xfree(pt);
+  xfree(own); xfree(obj); xfree(forg); xfree(flow); xfree(use); xfree(pt); xfree(demote);
+  xfree(nullonly);
   xfree(reach); xfree(stack); xfree(live); xfree(needp);
   return changed;
 }
