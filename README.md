@@ -56,7 +56,8 @@ Hello world!
   - an auto-vectoriser, with runtime alias checks
   - bounds-check elimination and guard-page memory
   - escape analysis for GC allocations, partial too: an object that escapes
-    on some paths is allocated only on those
+    on some paths is allocated only on those, and one merged with null
+    becomes its fields and a flag
   - store-to-load forwarding
   - magic-number division
   - a linear-scan register allocator with rematerialisation
