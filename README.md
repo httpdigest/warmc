@@ -67,7 +67,7 @@ Hello world!
   Functions compile in parallel and are laid out in a deterministic order.
 - **Fast code.** Across 207 benchmark kernels compiled from Go, TinyGo, Rust,
   Zig, AssemblyScript, Kotlin, C, C++ and Haskell, warmc's steady-state code
-  takes 0.52× wasmtime's time (geometric mean), with much lower peak memory.
+  takes 0.48× wasmtime's time (geometric mean), with much lower peak memory.
   See [Performance](#performance).
 - **Runtime for modern languages:**
   - a concurrent, compacting, ZGC-style collector with coloured pointers,
@@ -478,6 +478,8 @@ command-line order, so put them **after** `-O`.
 | `cse` | common-subexpression elimination over dominators |
 | `licm` | loop-invariant code motion, including hoisting invariant stores and trap guards |
 | `branch` | constant-branch folding and block merging |
+| `thread` | jump threading through a block that only switches on a parameter, such as the dispatch Go's compiler puts around every function, when an edge passes that parameter a constant |
+| `nodesplit` | copy the part of a loop that a switch outside it enters in the middle, so that the loop has one way in again and the loop passes can take it |
 | `mem` | store-to-load forwarding and dead-store removal, using per-function effect summaries |
 | `bce` | bounds-check elimination by value range and dominating checks |
 | `strength` | strength reduction: induction variables, shifts, magic-number division |
@@ -489,7 +491,7 @@ command-line order, so put them **after** `-O`.
 | `addroff`, `memptr` | fold address arithmetic into displacements; compute a native pointer once per base |
 | `ldcomb` | merge byte-assembling loads into one wide load |
 | `selftail` | turn self `return_call` into a loop |
-| `gloop`, `gssa` | keep globals in registers across loops; promote globals to SSA (`gssa` is off by default) |
+| `gloop`, `gssa` | keep globals in registers across loops; promote a global to SSA where that does fewer memory operations on it, such as Go's stack pointer or a shadow stack pointer moved in a loop (`-fgssa-all` promotes every one, which costs more than it saves) |
 | `loopclose` | loop-closed SSA for values used after a loop |
 | `escape` | remove GC objects that never escape and forward their fields |
 | `partial-escape` | allocate a GC object that escapes on some paths only where it escapes |
@@ -653,32 +655,36 @@ steady-state generated code, not start-up or compile time.
 
 | Corpus | Source language | Kernels | warmc / wasmtime | Range | Median peak RSS (warmc / wasmtime) |
 |---|---|---:|---:|---|---|
-| `gobench` | TinyGo | 26 | 0.61 | 0.07 – 1.04 | 1.9 / 8.9 MB |
-| `stdgo` | Go | 34 | 0.98 | 0.23 – 2.22 | 7.3 / 27.2 MB |
+| `gobench` | TinyGo | 26 | 0.61 | 0.07 – 1.06 | 1.9 / 8.9 MB |
+| `stdgo` | Go | 34 | 0.65 | 0.06 – 1.05 | 7.1 / 27.2 MB |
 | `vecbench` | TinyGo (vectorisable loops) | 30 | 0.15 | 0.04 – 0.94 | 1.9 / 8.9 MB |
-| `asbench` | AssemblyScript | 25 | 0.68 | 0.18 – 1.40 | 1.9 / 8.7 MB |
-| `rsbench` | Rust | 28 | 0.72 | 0.34 – 1.00 | 2.0 / 9.1 MB |
-| `zigbench` | Zig | 9 | 0.70 | 0.40 – 1.00 | 1.9 / 8.7 MB |
-| `ktbench` | Kotlin (Wasm GC) | 12 | 0.09 | 0.003 – 0.50 | 3.4 / 20.7 MB |
-| `cbench` | C | 14 | 0.83 | 0.33 – 1.05 | 2.0 / 9.0 MB |
-| `cppbench` | C++ | 14 | 0.70 | 0.23 – 1.00 | 2.5 / 9.7 MB |
-| `hsbench` | Haskell | 15 | 0.65 | 0.41 – 0.89 | 10.2 / 32.3 MB |
+| `asbench` | AssemblyScript | 25 | 0.64 | 0.19 – 0.99 | 1.9 / 8.7 MB |
+| `rsbench` | Rust | 28 | 0.71 | 0.34 – 1.00 | 1.9 / 9.1 MB |
+| `zigbench` | Zig | 9 | 0.70 | 0.41 – 1.00 | 1.9 / 8.7 MB |
+| `ktbench` | Kotlin (Wasm GC) | 12 | 0.09 | 0.004 – 0.48 | 3.4 / 20.6 MB |
+| `cbench` | C | 14 | 0.84 | 0.32 – 1.05 | 2.0 / 8.9 MB |
+| `cppbench` | C++ | 14 | 0.69 | 0.23 – 1.01 | 2.5 / 9.7 MB |
+| `hsbench` | Haskell | 15 | 0.65 | 0.40 – 0.89 | 10.2 / 32.3 MB |
 
-Over all 207 kernels the geometric mean is **0.52**, and 0.46 without
-`stdgo`. Outside `stdgo`, ten kernels are slower than wasmtime, and nine of
-them are within 5%. The tenth, `asbench/arrpush` (growing an array by `push`),
-runs at 1.40×. That kernel was 0.94× against wasmtime 49, so wasmtime 50 is
-what got faster there; warmc has since come down from 1.61×, and compiles its
-hot loop to nearly the same instructions as wasmtime does.
+Over all 207 kernels the geometric mean is **0.48**, and 0.45 without
+`stdgo`. Eight kernels are slower than wasmtime, all within 6%, and five of
+them within 1.5%. Of the other three, `stdgo/memcpy` spends its time in the
+platform's memmove under both engines, `cbench/nbody`'s pair loop compiles to
+nearly the same instructions in both, and `gobench/bitops` pays a register
+move after each population count that wasmtime does without.
 
-`stdgo` is Go built by Go's own compiler, and it is where warmc is weakest:
-14 of its 34 kernels are slower than wasmtime, up to 2.22× for
-`stdgo/multiret`. That back end is not LLVM. It compiles every function to a
-loop around a `br_table` over the function's resume points, so that a
-goroutine switch can unwind the wasm stack and re-enter the function where it
-left off, and it sends a loop's back edge through that dispatch with a
-constant index. warmc does not yet thread such a jump straight to its target,
-so in `multiret`'s hot loop every iteration pays an indirect branch.
+`stdgo` is Go built by Go's own compiler, which is not LLVM. It compiles
+every function to a loop around a `br_table` over the function's resume
+points, so that a goroutine switch can unwind the wasm stack and re-enter the
+function where it left off, and it sends each jump inside the function -- a
+loop's back edge among them -- through that dispatch with a constant index.
+warmc threads those jumps to their targets (`thread`), gives the dispatch a
+cold copy of the loops it can enter in the middle so that the originals have
+one way in again (`nodesplit`), and keeps Go's stack pointer in a register
+between calls (`gssa`). With the loops back, the vectoriser takes Go's
+64-bit address arithmetic too: `stdgo/strsum` runs at 0.06× and `stdgo/sum`
+at 0.15×, where they were 1.31× and 0.98×.
+
 Re-run the comparison on your own machine before relying on these numbers:
 
 ```sh
