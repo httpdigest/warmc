@@ -168,14 +168,19 @@ start cases-farbr env WARMC_FAR_BRANCH=1 WARMC_FLAGS=-O2 ./test/run_tests.sh
 start traps-farbr env WARMC_FAR_BRANCH=1 ./test/run_traps.sh
 start gc-farbr    env WARMC_FAR_BRANCH=1 ./test/run_gc.sh
 
-# Three lowerings that had no coverage outside one generated module.  -fgssa
-# is a whole pass that nothing ran; the naive allocator and the explicit
-# bounds checks were exercised only by run_pressure.sh.  The naive allocator
-# gives every value its own slot, so the three widest fixtures in test/cases
-# ask for a frame past the addressing limit and it runs on the other two
-# suites instead.
-start cases-gssa  env WARMC_FLAGS="-O2 -fgssa" ./test/run_tests.sh
-start gc-gssa     env WARMC_FLAGS="-O2 -fgssa" ./test/run_gc.sh
+# Three lowerings that had no coverage outside one generated module.
+# -fgssa-all is the global promotion -O2 makes only where a loop pays for
+# it, applied to every global a function reads and writes; the naive
+# allocator and the explicit bounds checks were exercised only by
+# run_pressure.sh.  The naive allocator gives every value its own slot, so
+# the three widest fixtures in test/cases ask for a frame past the
+# addressing limit and it runs on the other two suites instead.  The
+# promotion also gets a real program: it once passed every hand-written
+# case and returned from TinyGo's runtime with the stack pointer of the
+# last call it made.
+start cases-gssa  env WARMC_FLAGS="-O2 -fgssa-all" ./test/run_tests.sh
+start gc-gssa     env WARMC_FLAGS="-O2 -fgssa-all" ./test/run_gc.sh
+start gobench-gssa python3 test/gobench.py --corpus gobench --check --variant '-O2 -fgssa-all'
 start traps-naive env WARMC_FLAGS="-O2 -fno-regalloc" ./test/run_traps.sh
 start gc-naive    env WARMC_FLAGS="-O2 -fno-regalloc" ./test/run_gc.sh
 start cases-noguard env WARMC_FLAGS="-O2 -fno-guard-pages" ./test/run_tests.sh

@@ -337,6 +337,7 @@ typedef struct {
   int level;
   bool fold, dce, cse, licm, branch, memopt, bce, inl, strength;
   bool thread, nodesplit;
+  bool gssa_all;
 
   bool reassoc;
   bool rotate;
