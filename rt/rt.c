@@ -944,6 +944,7 @@ static void register_desc(const ModuleDesc *md) {
 
 static u32 gc_no_collect;
 static void *exn_alloc(Instance *in, u32 tag);
+static void *exn_safepoint(void *e, WarmRegs *regs, u64 sp, u64 pc);
 
 static const FuncUnwind *find_unwind_in(u64 pc, const ModuleDesc **owner) {
   for (u32 i = 0; i < ndescs; i++) {
@@ -1040,7 +1041,9 @@ void warmc_throw_c(WarmInstance *v, u32 tag, const u64 *payload, u32 nvals,
   ew->nvals = nvals;
 
   for (u32 i = 0; i < 2u * nvals; i++) ew->vals[i] = payload[i];
-  unwind(e, pc, sp, *snap);
+  WarmRegs regs = *snap;
+  e = exn_safepoint(e, &regs, sp, pc);
+  unwind(e, pc, sp, regs);
 }
 
 void warmc_throw_ref_c(WarmExn *exn, const WarmRegs *snap, u64 sp, u64 pc) {
@@ -2988,6 +2991,26 @@ static void gc_mark_copied(u64 *dst, u64 n) {
   }
 }
 
+static void gc_collect_if_due(void) {
+  if (!gc_may_collect() || !(gc_opt_stress || gc_alloc_since >= gc_trigger))
+    return;
+  if (gc_opt_conc && !gc_conc_tried) gc_conc_start();
+
+  if (__atomic_load_n(&gc_conc_on, __ATOMIC_ACQUIRE)) {
+
+    if (__atomic_load_n(&gc_phase, __ATOMIC_ACQUIRE) == GCPH_IDLE) gcth_nudge();
+    if (gc_opt_assist && gc_alloc_since >= gc_opt_assist * gc_trigger)
+      gc_assist();
+  } else if (!__atomic_load_n(&gcth_started, __ATOMIC_ACQUIRE)) {
+
+    gc_collect();
+  } else {
+
+    if (gc_opt_assist && gc_alloc_since >= gc_opt_assist * gc_trigger)
+      gc_assist();
+  }
+}
+
 static void *gc_alloc(u32 type_id, const GcTypeInfo *ti, u64 payload, u64 len) {
   gc_init();
 
@@ -3000,23 +3023,7 @@ static void *gc_alloc(u32 type_id, const GcTypeInfo *ti, u64 payload, u64 len) {
   if (total < GC_UNIT) total = GC_UNIT;
   total = (total + (GC_UNIT - 1)) & ~(u64)(GC_UNIT - 1);
 
-  if (gc_may_collect() && (gc_opt_stress || gc_alloc_since >= gc_trigger)) {
-    if (gc_opt_conc && !gc_conc_tried) gc_conc_start();
-
-    if (__atomic_load_n(&gc_conc_on, __ATOMIC_ACQUIRE)) {
-
-      if (__atomic_load_n(&gc_phase, __ATOMIC_ACQUIRE) == GCPH_IDLE) gcth_nudge();
-      if (gc_opt_assist && gc_alloc_since >= gc_opt_assist * gc_trigger)
-        gc_assist();
-    } else if (!__atomic_load_n(&gcth_started, __ATOMIC_ACQUIRE)) {
-
-      gc_collect();
-    } else {
-
-      if (gc_opt_assist && gc_alloc_since >= gc_opt_assist * gc_trigger)
-        gc_assist();
-    }
-  }
+  gc_collect_if_due();
 
   for (u32 round = 0; ; round++) {
     u8 *p = gc_alloc_raw(total);
@@ -3055,6 +3062,38 @@ static void *exn_alloc(Instance *in, u32 tag) {
   void *p = gc_alloc(in->exntype_base + tag, ti, ti->body_size, 0);
   gc_no_collect--;
   return p;
+}
+
+/* exn_alloc cannot collect: the payload is still in the throw area, which no
+   stack map describes.  Once it has been copied into the object the throw
+   site is a safepoint like any call -- the compiler records the references
+   live into its pads -- and this is where the collection the allocation put
+   off happens.  Without it, a program that puts nothing else on the
+   collector's heap (C++, whose every throw allocates one of these) would
+   never collect at all and keep every exception it ever threw.  The frame
+   walk can move what the throwing frame's callee-saved registers point at,
+   so they come back through regs for the unwinder to restore. */
+static void *exn_safepoint(void *e, WarmRegs *regs, u64 sp, u64 pc) {
+  u32 saved = gc_from_wasm;
+  gc_from_wasm = 1;
+  if (!gc_may_collect() || !(gc_opt_stress || gc_alloc_since >= gc_trigger ||
+                             __atomic_load_n(&gc_poll, __ATOMIC_RELAXED))) {
+    gc_from_wasm = saved;
+    return e;
+  }
+  for (u32 i = 0; i < 10; i++) warmc_gc_ctx.gpr[i] = regs->gpr[i];
+  warmc_gc_ctx.sp = sp;
+  warmc_gc_ctx.pc = pc;
+  u64 slot = (u64)(uptr)e;
+  GcRoots hold;
+  warmc_gc_hold(&slot, &gc_one, &hold);
+  gc_lab_sync();
+  if (__atomic_load_n(&gc_poll, __ATOMIC_RELAXED)) gc_service_round();
+  gc_collect_if_due();
+  gc_from_wasm = saved;
+  warmc_gc_release(&hold);
+  for (u32 i = 0; i < 10; i++) regs->gpr[i] = warmc_gc_ctx.gpr[i];
+  return (void *)(uptr)gc_heal_ptr(slot);
 }
 
 void warmc_gc_hold(u64 *base, const u32 *n, void *slot) {

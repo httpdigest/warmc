@@ -17,10 +17,14 @@ static bool op_clobbers_caller_saved(uint16_t op) {
   }
 }
 
+/* A throw allocates the exception on the collector's heap, and once its
+   payload is in the object the runtime may collect there -- in a program that
+   allocates nothing else on that heap, nowhere else would. */
 static bool op_is_safepoint(uint16_t op) {
   switch (op) {
     case I_CALL: case I_CALL_INDIRECT: case I_CALL_REF:
     case I_STRUCT_NEW: case I_ARRAY_NEW: case I_ARRAY_NEW_SEG:
+    case I_THROW:
       return true;
     default:
       return false;

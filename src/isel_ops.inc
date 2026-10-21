@@ -1711,6 +1711,7 @@ static void emit_inst(Isel *s, Ref v) {
       isel_reloc(s, REL_CALL26, B->len, sym, 0);
       a64_bl(B, 0);
       note_site(s);
+      note_safepoint(s, v);
       a64_brk(B, 0);
       s->tail_done = true;
       break;

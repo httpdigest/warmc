@@ -2278,6 +2278,7 @@ static void emit_inst(Isel *s, Ref v) {
       x64_mov_ri(B, 0, X_R9, in->nargs);
       emit_call_sym(s, "warmc_throw");
       note_site(s);
+      note_safepoint(s, v);
       x64_int3(B);
       s->tail_done = true;
       break;
