@@ -14,8 +14,11 @@ typedef struct { int src, dst; uint8_t fp, wide, vec; } Move;
 
 struct Bfx { bool ok, sign; int immr, imms; Ref src; };
 
+/* is19: 0 a 26-bit branch, 1 a 19-bit one, BRFIX_TABLE a br_table word that
+   holds the target's offset from the table at base. */
+#define BRFIX_TABLE 2
 typedef struct BrFix {
-  size_t site;
+  size_t site, base;
   int is19;
   uint32_t target;
   struct BrFix *next;
@@ -214,8 +217,14 @@ static void isel_reloc(Isel *s, RelKind kind, uint64_t off, uint32_t sym, int64_
 
 static void add_fix(Isel *s, size_t site, int is19, uint32_t target) {
   BrFix *fx = xmalloc(sizeof *fx);
-  fx->site = site; fx->is19 = is19; fx->target = target; fx->next = s->fixups;
+  fx->site = site; fx->base = 0; fx->is19 = is19; fx->target = target;
+  fx->next = s->fixups;
   s->fixups = fx;
+}
+
+static void add_table_fix(Isel *s, size_t site, size_t base, uint32_t target) {
+  add_fix(s, site, BRFIX_TABLE, target);
+  s->fixups->base = base;
 }
 
 static uint32_t slot_off(Isel *s, uint32_t slot) { return s->slots_off + 8u * slot; }
@@ -416,6 +425,15 @@ static void emit_edge(Isel *s, Edge *e) {
   int n = edge_moves(s, e, mv);
   parallel_copy(s, mv, n);
   xfree(mv);
+}
+
+static bool edge_has_moves(Isel *s, Edge *e) {
+  Block *t = &s->f->blocks[e->target];
+  if (t->nparams == 0) return false;
+  Move *mv = xmalloc(t->nparams * sizeof(Move));
+  int n = edge_moves(s, e, mv);
+  xfree(mv);
+  return n != 0;
 }
 
 static void note_site(Isel *s) {

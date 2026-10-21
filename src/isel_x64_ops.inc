@@ -2831,7 +2831,10 @@ static void emit_block(Isel *s, uint32_t bi, uint32_t next_bi) {
       int idx = rd(s, b->term_arg, S0);
       x64_mov_rr(B, 0, S1, idx);
       x64_cmp_ri(B, 0, S1, (int32_t)n);
+      Edge *de = &b->succs[n];
       size_t to_default = br_cc(s, 0, XCC_AE, 0, 0);
+      bool default_moves = edge_has_moves(s, de);
+      if (!default_moves) add_fix(s, to_default, 0, de->target);
       x64_lea(B, 1, TMP0, X64_RIPREL, X64_NOIDX, 0, 0);
       size_t lea_site = B->len;
       x64_load32sx(B, TMP1, TMP0, S1, 2, 0);
@@ -2841,18 +2844,26 @@ static void emit_block(Isel *s, uint32_t bi, uint32_t next_bi) {
       size_t table_base = B->len;
       x64_patch_rel32(B, lea_site - 4, table_base);
       for (uint32_t i = 0; i < n; i++) buf_u32(B, 0);
+      /* As on arm64: an edge with no moves has its entry name the target. */
       for (uint32_t i = 0; i < n; i++) {
+        Edge *e = &b->succs[i];
+        if (!edge_has_moves(s, e)) {
+          add_table_fix(s, table_base + 4 * i, table_base, e->target);
+          continue;
+        }
         size_t stub = B->len;
         uint32_t w = (uint32_t)(int32_t)(stub - table_base);
         memcpy(B->data + table_base + 4 * i, &w, 4);
-        emit_edge(s, &b->succs[i]);
+        emit_edge(s, e);
         x64_jmp_rel32(B);
-        add_fix(s, B->len, 0, b->succs[i].target);
+        add_fix(s, B->len, 0, e->target);
       }
-      br_patch(s, to_default, B->len);
-      emit_edge(s, &b->succs[n]);
-      x64_jmp_rel32(B);
-      add_fix(s, B->len, 0, b->succs[n].target);
+      if (default_moves) {
+        br_patch(s, to_default, B->len);
+        emit_edge(s, de);
+        x64_jmp_rel32(B);
+        add_fix(s, B->len, 0, de->target);
+      }
       break;
     }
     case T_RETURN: emit_return(s, b); break;
