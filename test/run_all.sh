@@ -140,6 +140,9 @@ start rsbench  python3 test/gobench.py --corpus rsbench --check
 start stdgo    python3 test/gobench.py --corpus stdgo --check
 start ktbench  python3 test/gobench.py --corpus ktbench --check
 start zigbench python3 test/gobench.py --corpus zigbench --check
+start cbench   python3 test/gobench.py --corpus cbench --check
+start cppbench python3 test/gobench.py --corpus cppbench --check
+start hsbench  python3 test/gobench.py --corpus hsbench --check
 
 start wasi     ./test/run_wasi.sh
 
