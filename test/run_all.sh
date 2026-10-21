@@ -72,7 +72,7 @@ start() {
 
 start cases-O0 env WARMC_FLAGS=-O0 ./test/run_tests.sh
 start cases-O1 env WARMC_FLAGS=-O1 ./test/run_tests.sh
-start cases-O2 env WARMC_VERIFY_RA=1 WARMC_FLAGS=-O2 ./test/run_tests.sh
+start cases-O2 env WARMC_VERIFY_RA=1 WARMC_VERIFY_SSA=1 WARMC_FLAGS=-O2 ./test/run_tests.sh
 
 # A second, independent engine over the same corpus; the row skips itself
 # politely where wasmtime is not installed.

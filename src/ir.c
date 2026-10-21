@@ -1,6 +1,7 @@
 #include "ir.h"
 #include "target.h"
 
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1136,11 +1137,23 @@ void ir_print(IrFunc *f, const char *stage) {
       fprintf(stderr, "\n");
     }
     switch (b->term) {
-      case T_JUMP: fprintf(stderr, "    jump b%u\n", b->succs[0].target); break;
-      case T_BRIF: fprintf(stderr, "    brif v%u -> b%u, b%u\n", b->term_arg,
-                           b->succs[0].target, b->succs[1].target); break;
-      case T_BRTABLE: fprintf(stderr, "    br_table v%u (%u targets)\n",
-                              b->term_arg, b->nsuccs); break;
+      case T_JUMP: fprintf(stderr, "    jump"); break;
+      case T_BRIF: fprintf(stderr, "    brif v%u ->", b->term_arg); break;
+      case T_BRTABLE: fprintf(stderr, "    br_table v%u ->", b->term_arg); break;
+      default: break;
+    }
+    if (b->term == T_JUMP || b->term == T_BRIF || b->term == T_BRTABLE) {
+      for (uint32_t s = 0; s < b->nsuccs; s++) {
+        const Edge *e = &b->succs[s];
+        if (e->eh) continue;
+        fprintf(stderr, "%s b%u", s ? "," : "", e->target);
+        for (uint32_t j = 0; j < e->nargs; j++)
+          fprintf(stderr, "%sv%u%s", j ? " " : "(", e->args[j], j + 1 == e->nargs ? ")" : "");
+      }
+      fprintf(stderr, "\n");
+    }
+    switch (b->term) {
+      case T_JUMP: case T_BRIF: case T_BRTABLE: break;
       case T_RETURN: fprintf(stderr, "    return");
                      for (uint32_t i = 0; i < b->nret; i++) fprintf(stderr, " v%u", b->ret_args[i]);
                      fprintf(stderr, "\n"); break;
@@ -1189,7 +1202,58 @@ static uint32_t ir_vec_arity(uint16_t op) {
   }
 }
 
+/* Every use is dominated by its definition: an argument by an earlier
+   instruction or a param of its own block, or by a block dominating it; an
+   edge's arguments and a terminator's operands likewise at the end of the
+   block they leave.  Off unless WARMC_VERIFY_SSA is set -- it is what finds
+   the pass that moved a definition away from a use it left behind. */
+static void ir_verify_ssa(IrFunc *f, const char *stage) {
+  int32_t *pos = xmalloc((f->ninsts ? f->ninsts : 1) * sizeof(int32_t));
+  for (uint32_t v = 0; v < f->ninsts; v++) pos[v] = -1;
+  for (uint32_t bi = 0; bi < f->nblocks; bi++) {
+    Block *b = &f->blocks[bi];
+    if (!b->reachable) continue;
+    for (uint32_t p = 0; p < b->nparams; p++) pos[b->params[p]] = 0;
+    for (uint32_t i = 0; i < b->ninsts; i++) pos[b->insts[i]] = (int32_t)i + 1;
+  }
+#define SSA_SEE(use_, bi_, at_, what_) do {                                     \
+    Ref d_ = ir_resolve(f, (use_));                                           \
+    uint32_t db_ = f->insts[d_].block;                                        \
+    bool ok_ = pos[d_] >= 0 &&                                                \
+               (db_ == (bi_) ? pos[d_] < (at_)                                \
+                             : ir_dominates_checked(f, db_, (bi_)));          \
+    if (!ok_)                                                                 \
+      warmc_fatal("ir_verify(%s): %s in b%u of %s uses v%u, which b%u does "  \
+                  "not have by then", stage, (what_), (bi_),                  \
+                  f->m->funcs[f->func_index].sym, d_, (bi_));                 \
+  } while (0)
+  for (uint32_t oi = 0; oi < f->norder; oi++) {
+    uint32_t bi = f->order[oi];
+    Block *b = &f->blocks[bi];
+    for (uint32_t i = 0; i < b->ninsts; i++) {
+      Inst *in = &f->insts[b->insts[i]];
+      Ref *a = ir_args(f, b->insts[i]);
+      for (uint32_t j = 0; j < in->nargs; j++)
+        SSA_SEE(a[j], bi, (int32_t)i + 1, ir_op_name(in->op));
+    }
+    int32_t end = (int32_t)b->ninsts + 1;
+    if (b->term == T_BRIF || b->term == T_BRTABLE) SSA_SEE(b->term_arg, bi, end, "a branch");
+    for (uint32_t i = 0; i < b->nret; i++) SSA_SEE(b->ret_args[i], bi, end, "a return");
+    for (uint32_t s = 0; s < b->nsuccs; s++)
+      for (uint32_t j = 0; j < b->succs[s].nargs; j++)
+        SSA_SEE(b->succs[s].args[j], bi, end, "an edge");
+  }
+#undef SSA_SEE
+  xfree(pos);
+}
+
+static bool g_verify_ssa;
+static pthread_once_t g_verify_ssa_once = PTHREAD_ONCE_INIT;
+static void verify_ssa_init(void) { g_verify_ssa = getenv("WARMC_VERIFY_SSA") != NULL; }
+
 void ir_verify(IrFunc *f, const char *stage) {
+  pthread_once(&g_verify_ssa_once, verify_ssa_init);
+  if (g_verify_ssa) ir_verify_ssa(f, stage);
 
   /* Landing pads are only created, never destroyed, so the count must
      reconcile; and a result must still name a call that lives in a block --
