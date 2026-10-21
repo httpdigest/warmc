@@ -3684,6 +3684,28 @@ static bool may_alias(IrFunc *f, Ref addr_a, uint64_t imm_a, uint32_t size_a,
   return true;
 }
 
+/* An address as root + arith + imm: arith the constants added to the root
+   in its own width, wrapping, and imm the offsets an access adds without
+   wrapping.  Two accesses with one root are at one address for every value
+   of it exactly when the ariths agree in that width and the imms agree. */
+static void access_parts(IrFunc *f, Ref addr, Ref *root, uint64_t *arith,
+                         uint64_t *imm, bool *wide) {
+  Ref base;
+  access_base(f, addr, &base, imm);
+  *arith = 0;
+  *wide = base != REF_NONE && vt_is_64((ValType)f->insts[base].type);
+  for (int step = 0; step < ADDR_WALK_DEPTH && base != REF_NONE; step++) {
+    Inst *in = &f->insts[base];
+    if (in->nargs != 2 || (in->op != I_ADD && in->op != I_SUB)) break;
+    Ref *a = ir_args(f, base);
+    if (f->insts[a[1]].op != I_CONST) break;
+    uint64_t c = f->insts[a[1]].imm;
+    *arith += in->op == I_ADD ? c : (uint64_t)0 - c;
+    base = a[0];
+  }
+  *root = base;
+}
+
 static bool same_access(IrFunc *f, Ref addr_a, uint64_t imm_a, uint32_t size_a,
                         uint32_t mem_a,
                         Ref addr_b, uint64_t imm_b, uint32_t size_b,
@@ -3693,7 +3715,17 @@ static bool same_access(IrFunc *f, Ref addr_a, uint64_t imm_a, uint32_t size_a,
   uint64_t oa, ob;
   access_base(f, addr_a, &ba, &oa);
   access_base(f, addr_b, &bb, &ob);
-  return ba == bb && oa + imm_a == ob + imm_b;
+  if (ba == bb && oa + imm_a == ob + imm_b) return true;
+  /* Go's stack slots, once a call is inlined: the callee stores its result
+     at (sp - 8) + 24 and the caller loads it from sp + 16. */
+  Ref ra, rb;
+  uint64_t ca, cb, ia, ib;
+  bool wa, wb;
+  access_parts(f, addr_a, &ra, &ca, &ia, &wa);
+  access_parts(f, addr_b, &rb, &cb, &ib, &wb);
+  if (ra == REF_NONE || ra != rb || wa != wb) return false;
+  uint64_t mask = wa ? ~0ull : 0xffffffffull;
+  return ((ca - cb) & mask) == 0 && ia + imm_a == ib + imm_b;
 }
 
 #define FRAME_SPAN ((int64_t)1 << 30)
