@@ -2285,6 +2285,43 @@ static void pair_emit(Isel *s, Ref vi, Ref vj, const PairShape *si,
   }
 }
 
+static int nl_cmp(const void *a, const void *b) {
+  const struct NarrowLoad *x = a, *y = b;
+  if (x->base != y->base) return x->base < y->base ? -1 : 1;
+  return (x->off > y->off) - (x->off < y->off);
+}
+
+/* Does this function load 32 bits from base+off anywhere?  A later load of
+   one half of a store pair cannot be forwarded the pair's data: the load
+   waits for the stp to reach the cache, and a coroutine whose state is two
+   adjacent words, stored together and read back one at a time on the next
+   resume, ran 40% slower for it (cppbench/coroutine).  Stores that are only
+   written here -- an object being initialised -- still pair. */
+static bool narrow_reloaded(Isel *s, Ref base, int64_t off) {
+  IrFunc *f = s->f;
+  if (!s->nl_built) {
+    s->nl_built = true;
+    uint32_t cap = 16;
+    s->nl = xmalloc(cap * sizeof *s->nl);
+    for (uint32_t bi = 0; bi < f->nblocks; bi++) {
+      Block *b = &f->blocks[bi];
+      for (uint32_t i = 0; i < b->ninsts; i++) {
+        Ref v = b->insts[i];
+        PairShape ps;
+        if (f->insts[v].op != I_LOAD || !pair_shape(s, v, &ps)) continue;
+        if (ps.kind != 0 || ps.size != 2) continue;
+        if (s->nnl == cap) { cap *= 2; s->nl = xrealloc(s->nl, cap * sizeof *s->nl); }
+        s->nl[s->nnl].base = ps.base;
+        s->nl[s->nnl].off = ps.off;
+        s->nnl++;
+      }
+    }
+    qsort(s->nl, s->nnl, sizeof *s->nl, nl_cmp);
+  }
+  struct NarrowLoad key = { base, off };
+  return bsearch(&key, s->nl, s->nnl, sizeof *s->nl, nl_cmp) != NULL;
+}
+
 static bool maybe_pair(Isel *s, Block *b, uint32_t idx) {
   IrFunc *f = s->f;
   Ref vi = b->insts[idx];
@@ -2301,6 +2338,7 @@ static bool maybe_pair(Isel *s, Block *b, uint32_t idx) {
      excluded, and every other row's win survives the exclusion.  Stores
      pair in all three shapes. */
   if (!st && si.kind == 0) return false;
+  bool narrow_st = st && si.kind == 0 && si.size == 2;
   if (st ? !pair_reg(s, ir_args(f, vi)[1]) : !pair_reg(s, vi)) return false;
   uint32_t lim = idx + 9;
   if (lim > b->ninsts) lim = b->ninsts;
@@ -2318,6 +2356,8 @@ static bool maybe_pair(Isel *s, Block *b, uint32_t idx) {
         int64_t hi = si.off < sj.off ? sj.off : si.off;
         if (hi - lo == step && (lo % step) == 0 && lo / step >= -64 &&
             lo / step <= 63 &&
+            !(narrow_st && (narrow_reloaded(s, si.base, lo) ||
+                            narrow_reloaded(s, si.base, hi))) &&
             (st ? pair_store_ok(s, b, idx, j) : pair_load_ok(s, b, idx, j))) {
           pair_emit(s, vi, vj, &si, &sj, st);
           s->paired[vj] = 1;
