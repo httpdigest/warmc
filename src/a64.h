@@ -200,6 +200,10 @@ void a64_addv_8b(Buf *b, int rd, int rn);
 void a64_ldr_q(Buf *b, int rt, int rn, uint32_t off);
 void a64_str_q(Buf *b, int rt, int rn, uint32_t off);
 void a64_ldr_q_reg(Buf *b, int rt, int rn, int rm, int option, int s);
+void a64_ldp_q(Buf *b, int rt, int rt2, int rn, int off);
+void a64_stp_q(Buf *b, int rt, int rt2, int rn, int off);
+void a64_ldur_q(Buf *b, int rt, int rn, int off);
+void a64_stur_q(Buf *b, int rt, int rn, int off);
 void a64_str_q_reg(Buf *b, int rt, int rn, int rm, int option, int s);
 
 void a64_vmov(Buf *b, int rd, int rn);
