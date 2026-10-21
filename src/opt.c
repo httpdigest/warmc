@@ -6131,6 +6131,7 @@ static bool pass_global_loop(IrFunc *f, const OptOpts *o) {
       for (uint32_t p = 0; p < c->npreds; p++)
         if (!inloop[c->preds[p]]) { inloop[c->preds[p]] = 1; stack[sp++] = c->preds[p]; }
     }
+    if (inloop[f->entry]) continue;
 
     bool clear = true;
     uint64_t callmask = 0;
@@ -6360,6 +6361,10 @@ static bool pass_loop_close(IrFunc *f) {
           lblk[nlbl++] = c->preds[p];
           stack[sp++] = c->preds[p];
         }
+    }
+    if (inloop[f->entry]) {
+      for (uint32_t i = 0; i < nlbl; i++) inloop[lblk[i]] = 0;
+      continue;
     }
 
     Ref carried[LC_MAX_PARAMS];
@@ -6749,6 +6754,12 @@ static bool pass_loop_hoist(IrFunc *f) {
           stack[sp++] = c->preds[p];
         }
     }
+    /* A cycle with a second way in floods out of itself, and hoisting
+       into the preheader would then take values from before the loop. */
+    if (inloop[f->entry]) {
+      for (uint32_t i = 0; i < nlbl; i++) inloop[lblk[i]] = 0;
+      continue;
+    }
     qsort(lblk, nlbl, sizeof(uint32_t), lc_u32_cmp);
 
     bool has_call = false;
@@ -7053,6 +7064,18 @@ static bool rotate_one(IrFunc *f, uint32_t hb) {
       if (!inl[b->preds[p]]) { inl[b->preds[p]] = 1; lst[lsp++] = b->preds[p]; }
   }
   xfree(lst);
+  if (inl[f->entry]) { xfree(inl); RJ("cycle has a second way in"); }
+
+  /* Rotation copies the header's test into the latch, which keeps one way
+     into the loop only if the test leaves it on one side.  A header whose
+     successors both stay inside -- an if/else at the top of the body --
+     would give the loop a second entry, and every loop pass after this one
+     finds its body by flooding back from the latch to the header, which
+     from a second entry runs on out of the loop. */
+  uint32_t nstay = 0;
+  for (uint32_t s = 0; s < h->nsuccs; s++)
+    if (inl[h->succs[s].target]) nstay++;
+  if (nstay != 1) { xfree(inl); RJ("header test does not leave the loop"); }
   bool body_calls = false, body_mem = false;
   for (uint32_t bi = 0; bi < nb; bi++) {
     if (!inl[bi] || !f->blocks[bi].reachable) continue;
@@ -7430,7 +7453,7 @@ static bool pass_iv_strength(IrFunc *f) {
       for (uint32_t p = 0; p < c->npreds; p++)
         if (!inloop[c->preds[p]]) { inloop[c->preds[p]] = 1; stack[sp++] = c->preds[p]; }
     }
-    if (inloop[pre]) continue;
+    if (inloop[pre] || inloop[f->entry]) continue;
 
     Edge *pe = iv_edge(f, pre, hb), *le = iv_edge(f, latch, hb);
     if (!pe || !le) continue;
