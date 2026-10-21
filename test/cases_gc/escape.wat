@@ -25,6 +25,19 @@
   (type $ai8 (array (mut i8)))
   (type $av (array (mut v128)))
   (type $take_t (func (param (ref $box)) (result i64)))
+  ;; a closure in Kotlin's shape, and its boxed Int
+  (type $itabs (array anyref))
+  (type $vt (struct (field $itables (ref $itabs))))
+  (type $obj (sub (struct (field $vtable (ref $vt)))))
+  (type $fn1 (func (param (ref null $obj)) (param anyref) (result anyref)))
+  (type $fn1_it (struct (field $invoke (ref $fn1))))
+  (type $adder (sub final $obj (struct (field $vtable (ref $vt)) (field $k (mut i32)))))
+  (type $doubler (sub final $obj (struct (field $vtable (ref $vt)))))
+  (type $ibox (struct (field $iv i32)))
+  ;; an exception in Kotlin's shape
+  (type $err (sub (struct (field $msg (mut anyref)) (field $cause (mut anyref)))))
+  (type $myerr (sub final $err (struct (field $msg (mut anyref)) (field $cause (mut anyref))
+                                       (field $code (mut i32)))))
 
   (global $sink (mut anyref) (ref.null any))
   (global $gbox (mut (ref null $box)) (ref.null $box))
@@ -32,6 +45,18 @@
   (elem (table $fns) (i32.const 0) func $take)
   (tag $boom)
   (tag $report (param i64))
+  (tag $two (param (ref $box)) (param (ref $box)))
+  (tag $exn (param (ref null $err)))
+
+  ;; vtables as Kotlin builds them: immutable globals, the interface method
+  ;; found in an array of interface tables
+  (global $adder_vt (ref $vt)
+    (struct.new $vt (array.new_fixed $itabs 2 (ref.null any)
+                      (struct.new $fn1_it (ref.func $adder_invoke)))))
+  (global $doubler_vt (ref $vt)
+    (struct.new $vt (array.new_fixed $itabs 2 (ref.null any)
+                      (struct.new $fn1_it (ref.func $doubler_invoke)))))
+  (global $adder_vt_mut (mut (ref $vt)) (global.get $adder_vt))
 
   (func $want (param $got i64) (param $exp i64)
     (if (i64.ne (local.get $got) (local.get $exp)) (then unreachable)))
@@ -306,6 +331,153 @@
           (then (call $ei_fail (local.get $p)) (unreachable)))
         (local.set $s (i64.add (local.get $s)
           (i64.add (struct.get $pt $x (local.get $p)) (struct.get $pt $y (local.get $p)))))
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br $l)))
+    (call $want (local.get $s) (local.get $exp)))
+
+  ;; ---- freed once a dispatch resolves -----------------------------------
+  ;;
+  ;; The higher-order function dispatches on its argument, so only inlining
+  ;; it shows the dispatch the closure's class.  Then the vtable read off the
+  ;; fresh closure is the one it was made with, the reads through that
+  ;; constant global fold to the method, the call made direct inlines, and
+  ;; nothing is left of the closure or the boxes.  Two classes share the
+  ;; interface slot, so no one-implementation rule resolves it alone; the
+  ;; adder is made by a constructor in Kotlin's shape, whose inline is what
+  ;; puts the allocation in sight of the call that dispatches on it.
+
+  (func $adder_invoke (type $fn1) (param $this (ref null $obj)) (param $x anyref) (result anyref)
+    (struct.new $ibox (i32.add (struct.get $ibox $iv (ref.cast (ref $ibox) (local.get $x)))
+                               (struct.get $adder $k (ref.cast (ref $adder) (local.get $this))))))
+
+  (func $doubler_invoke (type $fn1) (param $this (ref null $obj)) (param $x anyref) (result anyref)
+    (struct.new $ibox (i32.shl (struct.get $ibox $iv (ref.cast (ref $ibox) (local.get $x)))
+                               (i32.const 1))))
+
+  (func $adder_init (param $this (ref null $adder)) (param $k i32) (result (ref $adder))
+    (if (ref.is_null (local.get $this))
+      (then (local.set $this (struct.new $adder (global.get $adder_vt) (i32.const 0)))))
+    (struct.set $adder $k (local.get $this) (local.get $k))
+    (ref.as_non_null (local.get $this)))
+
+  (func $apply_n (param $n i32) (param $f (ref null $obj)) (result i64)
+    (local $i i32) (local $s i64)
+    (block $done
+      (loop $l
+        (br_if $done (i32.ge_s (local.get $i) (local.get $n)))
+        (local.set $s (i64.add (local.get $s) (i64.extend_i32_s
+          (struct.get $ibox $iv (ref.cast (ref $ibox)
+            (call_ref $fn1 (local.get $f) (struct.new $ibox (local.get $i))
+              (struct.get $fn1_it $invoke (ref.cast (ref $fn1_it)
+                (array.get $itabs (struct.get $vt $itables (struct.get $obj $vtable (local.get $f)))
+                                  (i32.const 1))))))))))
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br $l)))
+    (local.get $s))
+
+  (func (export "sr_closure_dispatch") (param $n i32) (param $k i32) (param $exp i64)
+    (local $r i32) (local $s i64)
+    (block $done
+      (loop $l
+        (br_if $done (i32.ge_s (local.get $r) (i32.const 2)))
+        (local.set $s (i64.add (local.get $s)
+          (i64.add (call $apply_n (local.get $n)
+                     (call $adder_init (ref.null $adder) (i32.add (local.get $k) (local.get $r))))
+                   (call $apply_n (local.get $n) (struct.new $doubler (global.get $doubler_vt))))))
+        (local.set $r (i32.add (local.get $r) (i32.const 1)))
+        (br $l)))
+    (call $want (local.get $s) (local.get $exp)))
+
+  ;; ---- freed by catching where it is thrown -----------------------------
+  ;;
+  ;; A throw inlined beside the catch that takes it, without the exnref, is a
+  ;; jump to the catch, and what it threw no longer escapes.  The exception
+  ;; is made by constructors in Kotlin's shape -- each allocates when handed
+  ;; null, hands `this` up to its superclass's, and returns it -- which the
+  ;; inliner takes because they keep the object to themselves.
+
+  (func $throwable_init (param $this (ref null $err)) (result (ref null $err))
+    (struct.set $err $msg (local.get $this) (ref.null any))
+    (struct.set $err $cause (local.get $this) (ref.null any))
+    (local.get $this))
+  (func $err_body (param $this (ref null $err)) (result (ref null $err))
+    (local.get $this))
+  (func $err_init (param $this (ref null $err)) (result (ref null $err))
+    (if (ref.is_null (local.get $this))
+      (then (local.set $this (struct.new $err (ref.null any) (ref.null any)))))
+    (drop (call $throwable_init (local.get $this)))
+    (drop (call $err_body (local.get $this)))
+    (local.get $this))
+  (func $myerr_init (param $this (ref null $myerr)) (param $code i32) (result (ref null $myerr))
+    (if (ref.is_null (local.get $this))
+      (then (local.set $this (struct.new $myerr (ref.null any) (ref.null any) (i32.const 0)))))
+    (drop (call $err_init (local.get $this)))
+    (struct.set $myerr $code (local.get $this) (local.get $code))
+    (local.get $this))
+
+  (func $step (param $i i32) (result i32)
+    (if (i32.eqz (i32.and (local.get $i) (i32.const 7)))
+      (then (throw $exn (call $myerr_init (ref.null $myerr) (local.get $i)))))
+    (i32.and (local.get $i) (i32.const 3)))
+
+  (func (export "sr_caught") (param $n i32) (param $exp i64)
+    (local $i i32) (local $s i64) (local $e (ref null $err))
+    (block $done
+      (loop $l
+        (br_if $done (i32.ge_s (local.get $i) (local.get $n)))
+        (block $next
+          (local.set $e
+            (block $h (result (ref null $err))
+              (try_table (catch $exn $h)
+                (local.set $s (i64.add (local.get $s)
+                  (i64.extend_i32_s (call $step (local.get $i)))))
+                (br $next))
+              unreachable))
+          (local.set $s (i64.add (local.get $s) (i64.extend_i32_s
+            (struct.get $myerr $code (ref.cast (ref $myerr) (local.get $e)))))))
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br $l)))
+    (call $want (local.get $s) (local.get $exp)))
+
+  ;; Two values thrown and caught in place: the catch's block takes them
+  ;; straight from the pad, which the jump stands in for.
+  (func (export "sr_throw_two") (param $n i32) (param $exp i64)
+    (local $i i32) (local $s i64) (local $a (ref null $box)) (local $b (ref null $box))
+    (block $done
+      (loop $l
+        (br_if $done (i32.ge_s (local.get $i) (local.get $n)))
+        (block $h (result (ref $box) (ref $box))
+          (try_table (catch $two $h)
+            (throw $two (struct.new $box (i64.extend_i32_s (local.get $i)))
+                        (struct.new $box (i64.extend_i32_s (i32.shl (local.get $i) (i32.const 1))))))
+          unreachable)
+        (local.set $b)
+        (local.set $a)
+        (local.set $s (i64.add (local.get $s)
+          (i64.add (struct.get $box $v (local.get $a)) (struct.get $box $v (local.get $b)))))
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br $l)))
+    (call $want (local.get $s) (local.get $exp)))
+
+  ;; The first clause is for another tag: the jump goes to the second.
+  (func (export "sr_throw_clause") (param $n i32) (param $exp i64)
+    (local $i i32) (local $s i64) (local $a (ref null $box)) (local $b (ref null $box))
+    (block $done
+      (loop $l
+        (br_if $done (i32.ge_s (local.get $i) (local.get $n)))
+        (block $wrong
+          (block $h (result (ref $box) (ref $box))
+            (try_table (catch $boom $wrong) (catch $two $h)
+              (throw $two (struct.new $box (i64.extend_i32_s (local.get $i)))
+                          (struct.new $box (i64.const 1))))
+            unreachable)
+          (local.set $b)
+          (local.set $a)
+          (local.set $s (i64.add (local.get $s)
+            (i64.add (struct.get $box $v (local.get $a)) (struct.get $box $v (local.get $b)))))
+          (local.set $i (i32.add (local.get $i) (i32.const 1)))
+          (br $l))
+        (local.set $s (i64.add (local.get $s) (i64.const 1000)))
         (local.set $i (i32.add (local.get $i) (i32.const 1)))
         (br $l)))
     (call $want (local.get $s) (local.get $exp)))
@@ -665,4 +837,25 @@
       (then (struct.new $pt (i64.const 4) (i64.const 5)))
       (else (ref.null $pt))))
     (call $want (i64.extend_i32_u (ref.eq (local.get $p) (ref.null eq))) (local.get $exp)))
+;; The exnref is taken, so the throw stays one.
+  (func (export "keep_caught_ref") (param $x i64) (param $exp i64)
+    (local $a (ref null $box)) (local $b (ref null $box)) (local $e exnref)
+    (block $h (result (ref $box) (ref $box) exnref)
+      (try_table (catch_ref $two $h)
+        (throw $two (struct.new $box (local.get $x)) (struct.new $box (i64.const 2))))
+      unreachable)
+    (local.set $e)
+    (local.set $b)
+    (local.set $a)
+    (call $want (i64.add (struct.get $box $v (local.get $a)) (struct.get $box $v (local.get $b)))
+                (local.get $exp)))
+
+  ;; The vtable comes from a mutable global, which folds to nothing: the
+  ;; dispatch stays one, and the answer is the same.
+  (func (export "keep_dispatch_mutable") (param $n i32) (param $k i32) (param $exp i64)
+    (call $want (i64.add (call $apply_n (local.get $n)
+                           (struct.new $adder (global.get $adder_vt_mut) (local.get $k)))
+                         (call $apply_n (local.get $n)
+                           (struct.new $adder (global.get $adder_vt_mut) (local.get $k))))
+                (local.get $exp)))
 )

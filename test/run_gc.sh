@@ -268,6 +268,11 @@ expect sr_packed_array    "OK" 1422
 expect sr_ref_field       "OK" 9
 expect sr_helper_loop     "OK" 10 670
 expect sr_cold_report     "OK" 10 180
+expect sr_closure_dispatch "OK" 10 3 340
+expect sr_caught          "OK" 20 54
+expect sr_caught          "OK" 1 0
+expect sr_throw_two       "OK" 10 135
+expect sr_throw_clause    "OK" 10 55
 expect keep_call          "OK" 0 6
 expect keep_global        "OK" 8
 expect keep_select        "OK" 1 11
@@ -312,6 +317,8 @@ expect keep_nullable_escape "OK" 1 5
 expect keep_nullable_escape "OK" 0 -1
 expect keep_nullable_eq   "OK" 1 0
 expect keep_nullable_eq   "OK" 0 1
+expect keep_caught_ref    "OK" 5 7
+expect keep_dispatch_mutable "OK" 10 3 150
 
 # The sr_ and pe_ cases are right whether or not their objects were
 # replaced, so whether they were is asked separately: at the default -O2,

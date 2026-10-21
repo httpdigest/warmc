@@ -49,6 +49,13 @@
   (tag $boxed (param (ref $node)))
   (tag $plain (param i32))
 
+  ;; Throws the cases below need made at run time go through a funcref in a
+  ;; mutable global, a call the optimiser cannot see into: a throw it can see
+  ;; caught in its own function becomes a jump, and makes no exception object.
+  (type $raise_t (func (param i32)))
+  (global $raise_boxed (mut (ref null $raise_t)) (ref.func $raise))
+  (global $raise_plain (mut (ref null $raise_t)) (ref.func $raise_i32))
+
   (global $keep (mut (ref null $node)) (ref.null $node))
   (global $keep2 (mut (ref null eq)) (ref.null eq))
 
@@ -950,12 +957,15 @@
 
   ;; An exception is a heap object, and its payload is a reference the
   ;; collector reaches only through it.
-  (func $raise (param $v i32) (throw $boxed (struct.new $node (ref.null $node) (local.get $v))))
+  (func $raise (type $raise_t) (param $v i32)
+    (throw $boxed (struct.new $node (ref.null $node) (local.get $v))))
+  (func $raise_i32 (type $raise_t) (param $v i32) (throw $plain (local.get $v)))
 
   (func (export "exn_payload") (param $n i32)
     (local $o (ref null $node))
     (block $h (result (ref $node))
-      (try_table (catch $boxed $h) (call $raise (i32.const 555)))
+      (try_table (catch $boxed $h)
+        (call_ref $raise_t (i32.const 555) (global.get $raise_boxed)))
       (call $fail)
       (return))
     (local.set $o)
@@ -991,7 +1001,8 @@
       (br_if $done (i32.eqz (local.get $n)))
       (loop $l
         (block $h (result (ref $node))
-          (try_table (catch $boxed $h) (call $raise (local.get $i)))
+          (try_table (catch $boxed $h)
+            (call_ref $raise_t (local.get $i) (global.get $raise_boxed)))
           (call $fail)
           (return))
         (drop)
@@ -1008,7 +1019,7 @@
     (block $h (result i32)
       (try_table (catch $plain $h)
         (call $churn (local.get $n))
-        (throw $plain (i32.const 1)))
+        (call_ref $raise_t (i32.const 1) (global.get $raise_plain)))
       (unreachable))
     (drop)
     (call $churn (local.get $n))
@@ -2659,7 +2670,8 @@
   ;; lower.  Left raised, it is `oom_recover` below that fails.
   (func (export "oom_throw") (result i32)
     (block $h (result i32)
-      (try_table (catch $plain $h) (throw $plain (i32.const 9)))
+      (try_table (catch $plain $h)
+        (call_ref $raise_t (i32.const 9) (global.get $raise_plain)))
       (unreachable)))
 
   ;; And carrying on, which is deliberately an ordinary case: null the global
