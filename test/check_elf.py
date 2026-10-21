@@ -112,6 +112,30 @@ for i in range(nfuncrefs):
     assert any(v <= code < v + f for v, o, f, m in loads), \
         "funcref %d points at %#x, which is not mapped" % (i, code)
 
+# The function names the linker keeps for perf and gdb: a .symtab whose FUNC
+# symbols sit in an executable section, wasm functions among them.
+e_shoff, = struct.unpack_from("<Q", buf, 0x28)
+e_shentsize, e_shnum = struct.unpack_from("<HH", buf, 0x3a)
+assert e_shnum and e_shentsize == 64, "no section headers, so no symbol table"
+shs = [struct.unpack_from("<IIQQQQIIQQ", buf, e_shoff + i * 64) for i in range(e_shnum)]
+tabs = [s for s in shs if s[1] == 2]
+assert len(tabs) == 1, "%d symbol tables" % len(tabs)
+_, _, _, _, symoff, symsize, link, _, _, _ = tabs[0]
+stroff = shs[link][4]
+funcs = []
+for i in range(1, symsize // 24):
+    st_name, st_info, _, st_shndx, st_value, st_size = \
+        struct.unpack_from("<IBBHQQ", buf, symoff + i * 24)
+    nm = buf[stroff + st_name:buf.index(b"\0", stroff + st_name)].decode()
+    if st_info & 0xF != 2:
+        continue
+    assert st_shndx < e_shnum and shs[st_shndx][2] & 4, \
+        "%s is not in an executable section" % nm
+    funcs.append(nm)
+assert "warmc_trap" in funcs, "the runtime's functions have no names"
+if nfuncrefs or nexport:
+    assert any(n.startswith("wasm_func_") for n in funcs), "the module's functions have no names"
+
 print("check_elf: %s ok (%d export%s: %s; %d funcref%s)"
       % (module, nexport, "" if nexport == 1 else "s", ", ".join(names) or "-",
          nfuncrefs, "" if nfuncrefs == 1 else "s"))

@@ -19,6 +19,8 @@ assert cputype == 0x0100000C, "not arm64: %#x" % cputype
 segments = []
 sections = {}
 symbols = {}
+local_text = []
+uuid = None
 off = 32
 for _ in range(ncmds):
     cmd, cmdsize = struct.unpack_from("<II", buf, off)
@@ -39,8 +41,20 @@ for _ in range(ncmds):
             e = symoff + 16 * i
             strx, ntype, nsect, ndesc, value = struct.unpack_from("<IBBHQ", buf, e)
             end = buf.index(b"\0", stroff + strx)
-            symbols[buf[stroff + strx:end].decode()] = value
+            name = buf[stroff + strx:end].decode()
+            symbols[name] = value
+            if ntype == 0x0E and nsect == 1:
+                local_text.append(name)
+    elif cmd == 0x1B:
+        uuid = buf[off + 8:off + 24]
     off += cmdsize
+
+# The executable keeps its function names, the local ones included, so a
+# profiler can name the code it samples -- and carries a UUID, without which
+# Instruments will not match those names to the binary at all.
+assert uuid and uuid != bytes(16), "no LC_UUID"
+assert any(n.startswith("_wasm_func_") for n in local_text), \
+    "no wasm function names among %d local text symbols" % len(local_text)
 
 def read(addr, n):
     for vmaddr, vmsize, fileoff, filesize in segments:
