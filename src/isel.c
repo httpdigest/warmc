@@ -304,6 +304,8 @@ static void emit_call_args_core(Isel *s, const Ref *args, uint32_t nargs,
   int next_int = first_int, next_flt = 0, stack_slot = 0;
   Move mv[24];
   int nmv = 0;
+  Ref late[24];
+  int late_dst[24], nlate = 0;
 
   int ints = 0, flts = 0;
   for (uint32_t i = 0; i < nargs; i++) {
@@ -315,13 +317,16 @@ static void emit_call_args_core(Isel *s, const Ref *args, uint32_t nargs,
     if (!on_stack) continue;
     uint32_t at = (uint32_t)stack_slot++ * ARG_STACK_SLOT;
     if (vec) {
-      int r = IS_SLOT(l) ? (slot_load(B, 1, 1, FTMP, slot_off(s, SLOT_OF(l))), FTMP) : l;
+      int r = l == LOC_NONE ? rd(s, v, FTMP)
+              : IS_SLOT(l) ? (slot_load(B, 1, 1, FTMP, slot_off(s, SLOT_OF(l))), FTMP) : l;
       a64_str_q(B, r, stack_base, at);
     } else if (fp) {
-      int r = IS_SLOT(l) ? (slot_load(B, 1, 0, FTMP, slot_off(s, SLOT_OF(l))), FTMP) : l;
+      int r = l == LOC_NONE ? rd(s, v, FTMP)
+              : IS_SLOT(l) ? (slot_load(B, 1, 0, FTMP, slot_off(s, SLOT_OF(l))), FTMP) : l;
       a64_fstr_imm(B, wide ? 3 : 2, r, stack_base, at);
     } else {
-      int r = IS_SLOT(l) ? (slot_load(B, 0, 0, TMP0, slot_off(s, SLOT_OF(l))), TMP0) : l;
+      int r = l == LOC_NONE ? rd(s, v, TMP0)
+              : IS_SLOT(l) ? (slot_load(B, 0, 0, TMP0, slot_off(s, SLOT_OF(l))), TMP0) : l;
       a64_str_imm(B, wide ? 3 : 2, r, stack_base, at);
     }
   }
@@ -332,14 +337,20 @@ static void emit_call_args_core(Isel *s, const Ref *args, uint32_t nargs,
     int l = s->loc[v];
     if (fp) {
       if (next_flt >= 8) { next_flt++; continue; }
+      if (l == LOC_NONE) { late[nlate] = v; late_dst[nlate++] = next_flt++; continue; }
       mv[nmv++] = (Move){ l, next_flt++, 1, (uint8_t)wide, (uint8_t)vec };
     } else {
       if (next_int > 7) { next_int++; continue; }
+      if (l == LOC_NONE) { late[nlate] = v; late_dst[nlate++] = next_int++; continue; }
       mv[nmv++] = (Move){ l, next_int++, 0, (uint8_t)wide, 0 };
     }
   }
   if (want_vmctx) mv[nmv++] = (Move){ REG_VMCTX, R0, 0, 1, 0 };
   parallel_copy(s, mv, nmv);
+
+  /* A rematerialised argument has no location to move from: it is made in
+     its own register, once every move has read the register it lands in. */
+  for (int k = 0; k < nlate; k++) rd(s, late[k], late_dst[k]);
 }
 
 static void emit_call_args_to(Isel *s, const Ref *args, uint32_t nargs,
@@ -847,10 +858,9 @@ static void analyse_immediates(Isel *s) {
       Inst *in = &f->insts[u];
       Ref *a = ir_args(f, u);
 
-      bool via_moves = (in->op == I_CALL || in->op == I_CALL_INDIRECT ||
-                        in->op == I_CALL_REF || in->op == I_RETURN_CALL_REF ||
-                        in->op == I_RETURN_CALL || in->op == I_RETURN_CALL_INDIRECT ||
-                        in->op == I_MEM_GROW || in->op == I_MEM_COPY ||
+      /* Calls make a rematerialised argument in place (see
+         emit_call_args_core); the rest move every operand from a location. */
+      bool via_moves = (in->op == I_MEM_GROW || in->op == I_MEM_COPY ||
                         in->op == I_MEM_FILL || in->op == I_MEM_INIT ||
                         in->op == I_TABLE_GET || in->op == I_TABLE_SET ||
                         in->op == I_TABLE_GROW || in->op == I_TABLE_FILL ||
