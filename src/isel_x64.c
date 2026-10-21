@@ -1427,7 +1427,10 @@ static int produce_body_x64(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
 
   for (BrFix *fx = s->fixups; fx;) {
     BrFix *n = fx->next;
-    br_patch(s, fx->site, s->block_off[fx->target]);
+    if (fx->is19 == BRFIX_TABLE) {
+      int32_t w = (int32_t)((int64_t)s->block_off[fx->target] - (int64_t)fx->base);
+      memcpy(B->data + fx->site, &w, 4);
+    } else br_patch(s, fx->site, s->block_off[fx->target]);
     xfree(fx);
     fx = n;
   }

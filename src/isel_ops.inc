@@ -2514,38 +2514,53 @@ static void emit_block(Isel *s, uint32_t bi, uint32_t next_bi) {
     }
     case T_BRTABLE: {
       uint32_t n = b->nsuccs - 1;
+      /* The index is only read -- by the compare and, zero-extended in the
+         address, by the table load -- so it stays where it is: neither the
+         adr nor the load writes a register a value can live in. */
       int idx = rd(s, b->term_arg, S0);
-      a64_mov_reg(B, SF32, S1, idx);
 
       if (n <= 0xfff) {
-        a64_cmp_imm(B, SF32, S1, n);
+        a64_cmp_imm(B, SF32, idx, n);
       } else {
         a64_load_imm(B, SF32, TMP0, n);
-        a64_cmp_reg(B, SF32, S1, TMP0);
+        a64_cmp_reg(B, SF32, idx, TMP0);
       }
+      Edge *de = &b->succs[n];
       size_t to_default = br_cc(s, 0, CC_HS, 0, 0);
+      bool default_moves = edge_has_moves(s, de);
+      if (!default_moves) add_fix(s, to_default, !s->far_br, de->target);
       a64_adr(B, TMP0, 0);
       size_t adr_site = B->len - 4;
-      a64_uxtw(B, S1, S1);
-      a64_ldrs_reg(B, 2, 1, TMP1, TMP0, S1, 3, 1);
+      a64_ldrs_reg(B, 2, 1, TMP1, TMP0, idx, 2, 1);
       a64_add_reg(B, SF64, TMP0, TMP0, TMP1);
       a64_br(B, TMP0);
       buf_align(B, 4);
       size_t table_base = B->len;
       a64_patch_adr(B, adr_site, table_base);
       for (uint32_t i = 0; i < n; i++) buf_u32(B, 0);
+      /* An edge with nothing to move needs no code of its own, so its entry
+         names the target block and the dispatch is one indirect branch; only
+         an edge with moves gets a stub that makes them and branches on. */
+      bool direct = !getenv("WARMC_NO_DIRECT_BRTABLE");
       for (uint32_t i = 0; i < n; i++) {
+        Edge *e = &b->succs[i];
+        if (direct && !edge_has_moves(s, e)) {
+          add_table_fix(s, table_base + 4 * i, table_base, e->target);
+          continue;
+        }
         size_t stub = B->len;
         uint32_t w = (uint32_t)(int32_t)(stub - table_base);
         memcpy(B->data + table_base + 4 * i, &w, 4);
-        emit_edge(s, &b->succs[i]);
-        add_fix(s, B->len, 0, b->succs[i].target);
+        emit_edge(s, e);
+        add_fix(s, B->len, 0, e->target);
         a64_b(B, 0);
       }
-      br_patch(s, to_default, B->len);
-      emit_edge(s, &b->succs[n]);
-      add_fix(s, B->len, 0, b->succs[n].target);
-      a64_b(B, 0);
+      if (default_moves) {
+        br_patch(s, to_default, B->len);
+        emit_edge(s, de);
+        add_fix(s, B->len, 0, de->target);
+        a64_b(B, 0);
+      }
       break;
     }
     case T_RETURN: emit_return(s, b); break;
