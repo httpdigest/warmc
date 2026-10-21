@@ -1247,6 +1247,9 @@ static int produce_body_x64(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
     s->cls[i] = (uint8_t)(is_fp_value(f, i) ? 1 : 0);
   }
 
+  /* No inline memory.copy/fill on x64 yet: its output only runs on
+     Windows, where the suite that would check such a path runs. */
+  s->no_small_memop = true;
   analyse_function(s);
 
   s->lab_reg = 0;

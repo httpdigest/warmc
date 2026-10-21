@@ -691,6 +691,115 @@ static void call_helper_imm2(Isel *s, const char *name, const Ref *args, uint32_
   csa_restore(s, s->cur_inst);
 }
 
+/* memory.copy and memory.fill of at most 16 bytes, inline.  libc's memcpy and
+   memset are these instructions, so every short string or struct copy a C
+   program makes reached the runtime through a call, and nearly all of them
+   are a few bytes: snprintf's pieces, a hash table's keys, a Go or Rust
+   string builder's appends.  Both ranges are checked before anything is
+   written, as the instruction requires, and the bytes are moved with
+   overlapping accesses that read everything before writing anything, so an
+   overlapping copy is still a memmove.  Anything longer or out of bounds
+   takes the call, which copies or traps exactly as before.  The op stays a
+   call site to the allocator, so no live value is in a register the fast
+   path could disturb, and it uses only scratch.  Returns the site of the
+   fast path's branch past the call, or (size_t)-1 when there is none. */
+static size_t emit_small_memop(Isel *s, const Inst *in, const Ref *a, bool fill) {
+  if (!small_memop_ok(s, in, fill)) return (size_t)-1;
+
+  int d = rd(s, a[0], S0);
+  int x = rd(s, a[1], S1);
+  int n = rd(s, a[2], S2);
+  size_t slow[3];
+  int nslow = 0;
+  a64_cmp_imm(B, SF32, n, 16);
+  slow[nslow++] = br_cc(s, 0, CC_HI, 0, 0);
+  a64_ldr_imm(B, 3, TMP0, REG_VMCTX, VMCTX_MEM_SIZE);
+  a64_uxtw(B, S3, d);
+  a64_add_uxtw(B, S3, S3, n, 0);
+  a64_cmp_reg(B, SF64, S3, TMP0);
+  slow[nslow++] = br_cc(s, 0, CC_HI, 0, 0);
+  if (!fill) {
+    a64_uxtw(B, S3, x);
+    a64_add_uxtw(B, S3, S3, n, 0);
+    a64_cmp_reg(B, SF64, S3, TMP0);
+    slow[nslow++] = br_cc(s, 0, CC_HI, 0, 0);
+  }
+
+  size_t done[5];
+  int ndone = 0;
+  /* TMP0 the destination and S0 its end; for a copy TMP1 the source and S3
+     its end, for a fill S1 the byte in every lane.  d and x are read before
+     anything they may share a scratch register with is written. */
+  a64_add_uxtw(B, TMP0, REG_MEMBASE, d, 0);
+  if (fill) {
+    a64_uxtb(B, S1, x);
+    a64_load_imm(B, SF64, S3, 0x0101010101010101ull);
+    a64_mul(B, SF64, S1, S1, S3);
+  } else {
+    a64_add_uxtw(B, TMP1, REG_MEMBASE, x, 0);
+    a64_add_uxtw(B, S3, TMP1, n, 0);
+  }
+  a64_add_uxtw(B, S0, TMP0, n, 0);
+
+  for (int size = 3; size >= 2; size--) {
+    int w = 1 << size;
+    a64_cmp_imm(B, SF32, n, (uint32_t)w);
+    size_t smaller = br_cc(s, 0, CC_LO, 0, 0);
+    if (fill) {
+      a64_str_imm(B, size, S1, TMP0, 0);
+      a64_stur(B, size, S1, S0, -w);
+    } else {
+      a64_ldr_imm(B, size, S1, TMP1, 0);
+      a64_ldur(B, size, S2, S3, -w);
+      a64_str_imm(B, size, S1, TMP0, 0);
+      a64_stur(B, size, S2, S0, -w);
+    }
+    done[ndone++] = B->len;
+    a64_b(B, 0);
+    br_patch(s, smaller, B->len);
+  }
+  /* Two or three bytes are two overlapping halfwords and one byte is one,
+     every address known before the length is looked at again: a store whose
+     address waits on arithmetic over n makes the loads after it guess, and
+     gobench/strbuild lost 5% to a first/middle/last-byte version that did. */
+  s->smo_cond_zero = ndone;
+  done[ndone++] = br_cc(s, 1, 0, SF32, n);
+  a64_cmp_imm(B, SF32, n, 2);
+  size_t one = br_cc(s, 0, CC_LO, 0, 0);
+  if (fill) {
+    a64_str_imm(B, 1, S1, TMP0, 0);
+    a64_stur(B, 1, S1, S0, -2);
+  } else {
+    a64_ldr_imm(B, 1, S1, TMP1, 0);
+    a64_ldur(B, 1, S2, S3, -2);
+    a64_str_imm(B, 1, S1, TMP0, 0);
+    a64_stur(B, 1, S2, S0, -2);
+  }
+  done[ndone++] = B->len;
+  a64_b(B, 0);
+  br_patch(s, one, B->len);
+  if (!fill) a64_ldr_imm(B, 0, S1, TMP1, 0);
+  a64_str_imm(B, 0, S1, TMP0, 0);
+  size_t out = B->len;
+  a64_b(B, 0);
+
+  for (int i = 0; i < nslow; i++) br_patch(s, slow[i], B->len);
+  /* The branches to the end are taken after the call is emitted; record
+     them in the order emit_small_memop_done expects. */
+  s->smo_ndone = 0;
+  for (int i = 0; i < ndone; i++) s->smo_done[s->smo_ndone++] = done[i];
+  s->smo_done[s->smo_ndone++] = out;
+  return out;
+}
+
+static void emit_small_memop_done(Isel *s) {
+  for (uint32_t i = 0; i < s->smo_ndone; i++) {
+    if ((int)i == s->smo_cond_zero) br_patch(s, s->smo_done[i], B->len);
+    else patch_b26_checked(s, s->smo_done[i], B->len);
+  }
+  s->smo_ndone = 0;
+}
+
 static void emit_teardown(Isel *s);
 static void emit_epilogue(Isel *s);
 static void emit_block(Isel *s, uint32_t bi, uint32_t next_bi);
@@ -1391,6 +1500,7 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
     s->cls[i] = (uint8_t)(is_fp_value(f, i) ? 1 : 0);
   }
 
+  s->no_small_memop = getenv("WARMC_NO_SMALL_MEMOP") != NULL;
   analyse_function(s);
 
   s->lab_reg = 0;

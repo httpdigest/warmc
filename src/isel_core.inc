@@ -114,6 +114,11 @@ typedef struct {
   uint32_t nnl;
   bool nl_built;
   bool no_ldpair;
+  /* The inline memory.copy/fill fast path's branches to past its call. */
+  bool no_small_memop;
+  size_t smo_done[6];
+  uint32_t smo_ndone;
+  int smo_cond_zero;
   /* one-entry cache: the fused-address scratch holds mem_base(t1_mem) +
      zx(t1_aa), set by the fused-address emissions, cleared at every other
      instruction */
@@ -654,6 +659,16 @@ static void compute_mem_validity(Isel *s) {
   xfree(out);
 }
 
+/* The inline memory.copy/fill path (emit_small_memop) handles memory 0 when
+   it has 32-bit addresses, and it reads the memory base, so a function that
+   uses it needs one set up even if it has no other memory access. */
+static bool small_memop_ok(Isel *s, const Inst *in, bool fill) {
+  IrFunc *f = s->f;
+  if (s->no_small_memop) return false;
+  if (in->imm != 0 || (!fill && in->imm2 != 0)) return false;
+  return f->m->nmemories && !f->m->memories[0].index64;
+}
+
 static void analyse_function(Isel *s) {
   IrFunc *f = s->f;
   s->has_call = false;
@@ -716,7 +731,12 @@ static void analyse_function(Isel *s) {
         case I_RETURN_CALL: case I_RETURN_CALL_INDIRECT: case I_RETURN_CALL_REF:
           touches_instance = true;
           break;
-        case I_MEM_GROW: case I_MEM_COPY: case I_MEM_FILL: case I_MEM_INIT:
+        case I_MEM_COPY: case I_MEM_FILL:
+          if (small_memop_ok(s, in, in->op == I_MEM_FILL)) s->needs_mem = true;
+          s->has_call = true;
+          touches_instance = true;
+          break;
+        case I_MEM_GROW: case I_MEM_INIT:
         case I_DATA_DROP: case I_TABLE_GET: case I_TABLE_SET:
         case I_TABLE_GROW: case I_TABLE_FILL: case I_TABLE_COPY:
         case I_TABLE_INIT: case I_ELEM_DROP:
