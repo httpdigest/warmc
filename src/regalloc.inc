@@ -1110,9 +1110,14 @@ static void regalloc_linear(Isel *s) {
     if (!no_tie) {
       Ref ta = tied_operand_of(f, cur->value);
       int tl = ta == REF_NONE ? LOC_NONE : s->loc[ta];
+      /* The operand's own interval has to end here; the register's end can
+         be later, when the operand sat in a hole of a value that lives on
+         past it -- the occupancy check below finds whether this one fits
+         in that hole too.  A popcount that a running sum lent its register
+         to is that: the wrap of the count found the sum's end there. */
       if (ta != REF_NONE && tl != LOC_NONE && !IS_SLOT(tl) && tl >= 0 &&
           owner[tl] >= 0 && sorted[owner[tl]].value == ta &&
-          ends[tl] == cur->start) {
+          sorted[owner[tl]].end == cur->start) {
         bool cs = !v128 &&
                   (cur->cls ? fpr_is_callee_saved(tl) : gpr_is_callee_saved(tl));
         bool in_pool = false;
