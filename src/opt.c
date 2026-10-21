@@ -3811,6 +3811,9 @@ static bool pass_nodesplit(IrFunc *f) {
 typedef struct {
   Ref addr; uint64_t off; uint32_t size; uint32_t mem; Ref value; bool sgn;
   bool valid; bool pending; uint32_t origin; uint8_t vtype;
+  /* only the value's low 1 << size bytes are what memory holds: an i64
+     stored as 4 bytes, whose high half nothing knows */
+  bool low;
 } MemEnt;
 typedef struct {
   Ref addr; uint64_t off; uint32_t size; uint32_t mem; Ref inst;
@@ -3867,7 +3870,7 @@ static bool memstate_same(const MemState *a, const MemState *b) {
         x->mem != y->mem ||
         x->value != y->value || x->sgn != y->sgn || x->valid != y->valid ||
         x->pending != y->pending || x->origin != y->origin ||
-        x->vtype != y->vtype)
+        x->vtype != y->vtype || x->low != y->low)
       return false;
   }
   for (uint32_t i = 0; i < a->npend; i++) {
@@ -5524,7 +5527,8 @@ static Ref materialise_param(IrFunc *f, MemState *st, const MemEnt *e) {
       if (!same_access(f, pe->addr, pe->off, pe->size, pe->mem,
                        e->addr, e->off, e->size, e->mem))
         continue;
-      if (f->insts[pe->value].type == e->vtype && pe->sgn == e->sgn)
+      if (f->insts[pe->value].type == e->vtype && pe->sgn == e->sgn &&
+          pe->low == e->low)
         got = pe->value;
       break;
     }
@@ -5542,6 +5546,45 @@ static Ref materialise_param(IrFunc *f, MemState *st, const MemEnt *e) {
 static bool clear_of_frame(int64_t rel, uint32_t size, int64_t lo, int64_t hi) {
   if (rel > FRAME_SPAN || rel < -FRAME_SPAN) return false;
   return rel >= hi || rel + (int64_t)size <= lo;
+}
+
+/* What a load of (lt, size, sgn) reads from a slot an entry says holds
+   e->value: the same bits under another type, as Go's math.Float64bits and
+   Float32frombits leave them -- a float stored and its bits loaded back, or
+   the other way round.  1 when the entry's value is the load's, 2 when a
+   conversion makes it, 0 when neither. */
+static int mem_pun(const IrFunc *f, const MemEnt *e, ValType lt, uint32_t size,
+                   bool sgn) {
+  ValType et = e->pending ? (ValType)e->vtype : (ValType)f->insts[e->value].type;
+  if (et == lt && e->sgn == sgn && !e->low) return 1;
+  if (e->pending) return 0;
+  if (size == 3)
+    return (et == VT_I64 && lt == VT_F64) || (et == VT_F64 && lt == VT_I64) ? 2 : 0;
+  if (size != 2) return 0;
+  if (et == VT_I64) return lt == VT_I32 || lt == VT_F32 || lt == VT_I64 ? 2 : 0;
+  if (et == VT_I32 || et == VT_F32)
+    return lt == VT_I32 || lt == VT_F32 || lt == VT_I64 ? 2 : 0;
+  return 0;
+}
+
+static Ref mem_pun_emit(IrFunc *f, uint32_t bi, uint32_t *idx, Ref x, ValType lt,
+                        uint32_t size, bool sgn) {
+  ValType et = (ValType)f->insts[x].type;
+  if (size == 3) return emit_before(f, bi, idx, I_REINTERPRET, lt, &x, 1, et);
+  if (et == VT_I64) { x = emit_before(f, bi, idx, I_WRAP, VT_I32, &x, 1, 0); et = VT_I32; }
+  if (et == VT_F32 && lt != VT_F32) { x = emit_before(f, bi, idx, I_REINTERPRET, VT_I32, &x, 1, VT_F32); et = VT_I32; }
+  if (lt == VT_F32 && et == VT_I32) return emit_before(f, bi, idx, I_REINTERPRET, VT_F32, &x, 1, VT_I32);
+  if (lt == VT_I64) return emit_before(f, bi, idx, sgn ? I_EXTENDS : I_EXTENDU, VT_I64, &x, 1, 0);
+  return x;
+}
+
+/* An entry made invalid keeps its slot until the table fills; the slots then
+   go to the accesses still to come. */
+static uint32_t memopt_compact(MemEnt *ent, uint32_t nent) {
+  uint32_t kept = 0;
+  for (uint32_t k = 0; k < nent; k++)
+    if (ent[k].valid) ent[kept++] = ent[k];
+  return kept;
 }
 
 static bool pass_memopt(IrFunc *f, const OptOpts *o) {
@@ -5608,7 +5651,7 @@ static bool pass_memopt(IrFunc *f, const OptOpts *o) {
                                ps->ent[j].mem,
                                cand.addr, cand.off, cand.size, cand.mem)) continue;
               found = f->insts[ps->ent[j].value].type == f->insts[cand.value].type &&
-                      ps->ent[j].sgn == cand.sgn;
+                      ps->ent[j].sgn == cand.sgn && ps->ent[j].low == cand.low;
               if (found && ps->ent[j].value != cand.value) agree = false;
               break;
             }
@@ -5662,10 +5705,8 @@ static bool pass_memopt(IrFunc *f, const OptOpts *o) {
                            a[0], in->imm, size, mem))
             continue;
 
-          ValType et = ent[k].pending ? (ValType)ent[k].vtype
-                                      : (ValType)f->insts[ent[k].value].type;
-          if (et != (ValType)in->type) continue;
-          if (ent[k].sgn != sgn) continue;
+          int pun = mem_pun(f, &ent[k], (ValType)in->type, size, sgn);
+          if (!pun) continue;
           if (ent[k].pending) {
             Ref p = materialise_param(f, st, &ent[k]);
             if (p == REF_NONE) { ent[k].valid = false; continue; }
@@ -5675,7 +5716,10 @@ static bool pass_memopt(IrFunc *f, const OptOpts *o) {
             a = ir_args(f, v);
           }
           if (apply) {
-            ir_replace(f, v, ent[k].value);
+            Ref nv = ent[k].value;
+            if (pun == 2) nv = mem_pun_emit(f, bi, &i, nv, (ValType)in->type, size, sgn);
+            in = &f->insts[v];
+            ir_replace(f, v, nv);
             in->op = I_NOP;
             g_stats.loads_forwarded++;
             changed = true;
@@ -5683,12 +5727,30 @@ static bool pass_memopt(IrFunc *f, const OptOpts *o) {
           have = true;
           break;
         }
+        if (!have && nent == MEMOPT_ENTS) nent = memopt_compact(ent, nent);
         if (!have && nent < MEMOPT_ENTS) {
-          ent[nent++] = (MemEnt){ a[0], in->imm, size, mem, v, sgn, true, false, 0, 0 };
+          ent[nent++] = (MemEnt){ a[0], in->imm, size, mem, v, sgn, true, false, 0, 0, false };
         }
       } else if (in->op == I_STORE) {
         uint32_t size = (uint32_t)MEMF_SIZE(in->imm2);
         uint32_t mem = MEMF_MEM(in->imm2);
+
+        /* A store of what the slot is known to hold writes nothing new, as
+           GHC's code does when it puts back a register it loaded; an access
+           of the same size there came first, so it traps where that did. */
+        bool holds = false;
+        for (uint32_t k = 0; k < nent && !holds; k++)
+          holds = ent[k].valid && !ent[k].pending && ent[k].value == a[1] &&
+                  same_access(f, ent[k].addr, ent[k].off, ent[k].size, ent[k].mem,
+                              a[0], in->imm, size, mem);
+        if (holds) {
+          if (apply) {
+            in->op = I_NOP;
+            g_stats.stores_removed++;
+            changed = true;
+          }
+          continue;
+        }
 
         for (uint32_t k = 0; k < npend; k++) {
           if (!same_access(f, pend[k].addr, pend[k].off, pend[k].size, pend[k].mem,
@@ -5714,17 +5776,19 @@ static bool pass_memopt(IrFunc *f, const OptOpts *o) {
         if (!whole && aw < 8 &&
             (ir_known_bits(f, a[1], KB_DEPTH) >> (8u * aw)) == 0)
           whole = true;
-        if (whole) {
+        bool low = !whole && aw == 4 && vw == 8;
+        if (whole || low) {
           bool found = false;
           for (uint32_t k = 0; k < nent; k++)
             if (same_access(f, ent[k].addr, ent[k].off, ent[k].size, ent[k].mem,
                             a[0], in->imm, size, mem)) {
               ent[k].value = a[1]; ent[k].valid = true; ent[k].pending = false;
-              ent[k].sgn = false;
+              ent[k].sgn = false; ent[k].low = low;
               found = true;
             }
+          if (!found && nent == MEMOPT_ENTS) nent = memopt_compact(ent, nent);
           if (!found && nent < MEMOPT_ENTS)
-            ent[nent++] = (MemEnt){ a[0], in->imm, size, mem, a[1], false, true, false, 0, 0 };
+            ent[nent++] = (MemEnt){ a[0], in->imm, size, mem, a[1], false, true, false, 0, 0, low };
         }
       } else if (o->gcpure && in->op == I_FIELD_GET &&
                  vt_width((ValType)in->type) == (1u << GCF_SIZE(in->imm2))) {
@@ -5768,7 +5832,7 @@ static bool pass_memopt(IrFunc *f, const OptOpts *o) {
         }
         if (!have && nent < MEMOPT_ENTS)
           ent[nent++] = (MemEnt){ root, in->imm, size, GC_FIELD_MEM, v,
-                                  false, true, false, 0, 0 };
+                                  false, true, false, 0, 0, false };
       } else if (o->gcpure && in->op == I_FIELD_SET) {
         /* No dead-store elimination here: dropping an earlier set past a
            potentially trapping op would change post-trap state, which
@@ -5795,7 +5859,7 @@ static bool pass_memopt(IrFunc *f, const OptOpts *o) {
             }
           if (!found && nent < MEMOPT_ENTS)
             ent[nent++] = (MemEnt){ root, in->imm, size, GC_FIELD_MEM, a[1],
-                                    false, true, false, 0, 0 };
+                                    false, true, false, 0, 0, false };
         }
       } else if (in->op == I_GLOBAL_GET) {
         uint32_t g = (uint32_t)in->imm;
@@ -12809,6 +12873,8 @@ void ir_optimize(IrFunc *f, const OptOpts *o) {
     if (o->fold) pass_fold(f, o);
     if (o->branch) pass_branch(f);
     if (o->cse) pass_cse(f, o);
+    /* the copies of a body read what the copy before them read or wrote */
+    if (o->memopt) TP("memopt", pass_memopt(f, o));
     if (o->bce) pass_bce(f, f->m);
     if (o->dce) pass_dce(f);
     prune_params(f);
