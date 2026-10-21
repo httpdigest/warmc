@@ -2404,6 +2404,7 @@ static void emit_block(Isel *s, uint32_t bi, uint32_t next_bi) {
       if (s->cmp_ref != b->insts[i]) s->cmp_ref = REF_NONE;
       continue;
     }
+    s->cur_pos = i;
     emit_inst(s, b->insts[i]);
 
     /* A cache entry made while emitting this instruction -- an operand rd()

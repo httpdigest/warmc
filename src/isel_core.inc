@@ -92,6 +92,7 @@ typedef struct {
   GcSite *gcsites; uint32_t ngcsites, cap_gcsites;
   uint32_t *gcroots; uint32_t ngcroots, cap_gcroots;
   uint32_t cur_block;
+  uint32_t cur_pos;   /* the instruction's index in cur_block */
 
   Ref cur_inst;
 
@@ -116,6 +117,7 @@ typedef struct {
   bool no_ldpair;
   /* The inline memory.copy/fill fast path's branches to past its call. */
   bool no_small_memop;
+  bool no_rc_def;    /* WARMC_NO_RC_DEF: commit does not fill the reload cache */
   size_t smo_done[6];
   uint32_t smo_ndone;
   int smo_cond_zero;
@@ -276,6 +278,40 @@ static void rc_kill_slot(Isel *s, uint32_t slot) {
   for (int i = 0; i < 2; i++) if (s->rc_slot[i] == slot + 1) s->rc_slot[i] = 0;
 }
 
+/* Is v read again in this block within a few instructions, with no call
+   between to clear the reload cache?  Most reads of a value that lives in a
+   slot come right after its definition -- a quarter of all stack reloads did,
+   in every corpus -- so commit keeps such a value in a cache register too. */
+static bool used_soon(Isel *s, Ref v) {
+  IrFunc *f = s->f;
+  Block *b = &f->blocks[s->cur_block];
+  uint32_t end = s->cur_pos + 13;
+  if (end > b->ninsts) end = b->ninsts;
+  for (uint32_t i = s->cur_pos + 1; i < end; i++) {
+    Ref u = b->insts[i];
+    Inst *in = &f->insts[u];
+    Ref *a = ir_args(f, u);
+    for (uint32_t j = 0; j < in->nargs; j++) if (a[j] == v) return true;
+    if (op_clobbers_caller_saved(in->op)) return false;
+  }
+  return end == b->ninsts && b->term_arg == v &&
+         (b->term == T_BRIF || b->term == T_BRTABLE);
+}
+
+static void rc_put(Isel *s, uint32_t slot, int reg) {
+  int pick = -1;
+  for (int i = 0; i < 2 && pick < 0; i++)
+    if (!s->rc_slot[i] && !s->rc_used[i]) pick = i;
+  for (int k = 0; k < 2 && pick < 0; k++) {
+    int i = (s->rc_next + k) & 1;
+    if (!s->rc_used[i]) pick = i;
+  }
+  if (pick < 0) return;
+  emit_reg_move(B, s->rc_reg[pick], reg, 0, 1, 0);
+  s->rc_slot[pick] = slot + 1;
+  s->rc_next = (uint8_t)((pick + 1) & 1);
+}
+
 static int wr(Isel *s, Ref v, int scratch) {
   int l = s->loc[v];
   return IS_SLOT(l) ? scratch : l;
@@ -294,6 +330,9 @@ static void commit(Isel *s, Ref v, int reg) {
   }
   slot_store(B, is_fp_value(s->f, v), is_vec_value(s->f, v), reg,
              slot_off(s, SLOT_OF(l)));
+  if (s->rc_reg[0] && !s->no_rc_def && !is_fp_value(s->f, v) &&
+      !is_vec_value(s->f, v) && used_soon(s, v))
+    rc_put(s, SLOT_OF(l), reg);
 }
 
 /* A value the allocator marked caller-saved-around-call keeps its register
