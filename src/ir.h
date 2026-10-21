@@ -218,6 +218,11 @@ typedef struct {
 
   bool diverges;
 
+  /* Code that runs only on a path the compiler made rare: the copy node
+     splitting gives a dispatch, which Go enters only when a goroutine
+     resumes.  Its loop depth is the copied loop's, but its uses are not hot. */
+  bool cold;
+
   bool is_pad;
   uint8_t pad_kind;
   uint32_t pad_tag;
@@ -331,6 +336,7 @@ bool ir_has_result(const Inst *in);
 typedef struct {
   int level;
   bool fold, dce, cse, licm, branch, memopt, bce, inl, strength;
+  bool thread, nodesplit;
 
   bool reassoc;
   bool rotate;

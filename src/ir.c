@@ -353,7 +353,7 @@ static int layout_score_of(const IrFunc *f, const Block *b, uint32_t si) {
   const Block *t = &f->blocks[e->target];
   if (e->eh || t->is_pad) return -1000;
 
-  if (t->diverges) return -100;
+  if (t->diverges || t->cold) return -100;
   int score = 4 * (int)(t->loop_depth < 8 ? t->loop_depth : 8);
   int bias = branch_bias(f, b);
   if (bias) score += (si == 0) ? bias : -bias;

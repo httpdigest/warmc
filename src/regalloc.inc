@@ -929,6 +929,11 @@ static void regalloc_linear(Isel *s) {
     uint32_t d = f->blocks[bi].loop_depth;
     double w = 1.0;
     for (uint32_t k = 0; k < d && k < 8; k++) w *= 10.0;
+    /* A cold block's references are what its loop depth says they would be
+       once in a while, not every time round: the resume copy of a Go loop
+       carries the same values the loop does, and pricing its uses like the
+       loop's gave those values the registers the loop needed. */
+    if (f->blocks[bi].cold) w = 0.01;
     lseg++;
     for (uint32_t i = 0; i < b->ninsts; i++) {
       Ref r2 = b->insts[i];
