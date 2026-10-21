@@ -12862,6 +12862,9 @@ void ir_optimize(IrFunc *f, const OptOpts *o) {
   }
   if (o->vectorize && o->guard_pages && TP("vectorize", pass_vectorize(f))) {
     ir_order(f);
+    /* the guards a vector loop is entered by are often constants */
+    if (o->fold) pass_fold(f, o);
+    if (o->branch) pass_branch(f);
     if (o->dce) pass_dce(f);
     ir_order(f);
     ir_verify(f, "post-vectorize");
