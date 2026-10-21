@@ -1501,6 +1501,7 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
   }
 
   s->no_small_memop = getenv("WARMC_NO_SMALL_MEMOP") != NULL;
+  s->no_rc_def = getenv("WARMC_NO_RC_DEF") != NULL;
   analyse_function(s);
 
   s->lab_reg = 0;
