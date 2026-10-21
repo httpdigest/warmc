@@ -8791,6 +8791,11 @@ static bool v_affine(IrFunc *f, const uint8_t *inloop, Ref iv, Ref v, int depth,
   if (is_const(f, v, &c)) { *base = REF_NONE; *coeff = 0; *off = c & amask; return true; }
   Inst *in = &f->insts[v];
   if (!inloop[in->block]) { *base = v; *coeff = 0; *off = 0; return true; }
+  /* Go computes an address in 64 bits and wraps it to the 32 the memory
+     takes: the same affine form, mod 2^32, with a 64-bit base the vector
+     code wraps in turn. */
+  if (in->op == I_WRAP && in->nargs == 1 && amask == 0xffffffffu && depth > 0)
+    return v_affine(f, inloop, iv, ir_args(f, v)[0], depth - 1, amask, base, coeff, off);
   if (depth <= 0 || in->nargs != 2) return false;
   Ref *a = ir_args(f, v);
   Ref b0, b1;
@@ -9719,7 +9724,7 @@ static bool vectorize_one(IrFunc *f, uint32_t hb, uint8_t *reach, uint8_t *inloo
       case I_LEU: case I_LES: case I_GEU: case I_GES: case I_EQZ:
       case I_SELECT:
 
-      case I_EXTENDU: case I_EXTENDS:
+      case I_EXTENDU: case I_EXTENDS: case I_WRAP:
       case I_NOP: case I_PARAM:
         break;
       default: VREJ_OP("body op", in->op);
@@ -9784,7 +9789,8 @@ static bool vectorize_one(IrFunc *f, uint32_t hb, uint8_t *reach, uint8_t *inloo
   for (uint32_t i = 0; i < nacc; i++) {
     bool found = false;
     for (uint32_t p = 0; p < np && !found; p++) {
-      if (!isiv[p] || (ValType)f->insts[hparam[p]].type != at) continue;
+      ValType ivt = (ValType)f->insts[hparam[p]].type;
+      if (!isiv[p] || (ivt != at && !(at == VT_I32 && ivt == VT_I64))) continue;
       Ref b;
       uint64_t cf, of;
       if (!v_access_addr(f, inloop, hparam[p], acc[i].inst, VEC_DEPTH, amask,
@@ -10252,13 +10258,18 @@ static bool vectorize_one(IrFunc *f, uint32_t hb, uint8_t *reach, uint8_t *inloo
       cst = (cst + coeff * p0v) & amask;
     } else {
       a0 = p0;
+      if ((ValType)f->insts[a0].type != at)
+        a0 = vemit(f, vguard, I_WRAP, at, a0, REF_NONE, 0, 0);
       if (coeff != 1)
         a0 = vemit(f, vguard, I_MUL, at, a0,
                    ir_emit(f, vguard, I_CONST, at, NULL, 0, coeff, 0), 0, 0);
     }
-    if (G->base != REF_NONE)
-      a0 = a0 == REF_NONE ? G->base
-                          : vemit(f, vguard, I_ADD, at, a0, G->base, 0, 0);
+    if (G->base != REF_NONE) {
+      Ref gb = G->base;
+      if ((ValType)f->insts[gb].type != at)
+        gb = vemit(f, vguard, I_WRAP, at, gb, REF_NONE, 0, 0);
+      a0 = a0 == REF_NONE ? gb : vemit(f, vguard, I_ADD, at, a0, gb, 0, 0);
+    }
 
     if (backward) cst = (cst + Sa - W) & amask;
     if (cst || a0 == REF_NONE) {
