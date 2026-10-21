@@ -1449,16 +1449,34 @@ static u32 gc_opt_reloc = 4;
 static u64 gc_opt_release;
 
 static u64 gc_live, gc_marked, gc_trigger;
-__attribute__((aligned(64))) static u64 gc_alloc_since;
+
+/* What the program writes on its allocation, barrier and mark-queue paths,
+   and what the collector thread writes for every object it marks, each in
+   cache lines of their own.  A line is 128 bytes on Apple silicon (and x86
+   fetches lines in adjacent pairs), so the 64-byte alignment these counters
+   had left a hot counter of one side beside the other side's; which ones met
+   moved with the size of the code linked in front of them, and ktbench/list
+   ran in 70 ms or 130 ms depending on it. */
+#define GC_LINE 128u
+static struct {
+  u64 alloc_since, bytes_alloc, fast_bytes, barrier_slow;
+} __attribute__((aligned(GC_LINE))) gc_mut;
+/* The program's end of the mark queue: head moves with every object a
+   barrier shades, and the collector polls pub while it waits for work, so
+   the pair is kept off the counters' line as well. */
+static struct {
+  u64 head, pub;
+} __attribute__((aligned(GC_LINE))) gc_mqp;
+static struct {
+  u64 ngrey, mark_conc_objs, mark_wait_took, mq_tail;
+} __attribute__((aligned(GC_LINE))) gc_col;
 
 static u64 gc_full_req, gc_full_done, gc_cycle_serves;
 
 static u64 gc_ncycles, gc_npages_opened, gc_npages_freed;
 
-__attribute__((aligned(64))) static u64 gc_barrier_slow;
-
-static u64 gc_mark_end_took, gc_mark_conc_objs, gc_ncycles_stw;
-static u64 gc_bytes_alloc, gc_released, gc_nreleases;
+static u64 gc_mark_end_took, gc_ncycles_stw;
+static u64 gc_released, gc_nreleases;
 static u64 gc_t_total, gc_pause_count, gc_pause_max, gc_pause_hist[5];
 
 #define GC_GRAN_SHIFT 16u
@@ -1552,19 +1570,15 @@ static u64 *gc_markbits;
 static u32 *gc_page_epoch;
 
 static u8 **gc_grey;
-static u64 gc_ngrey, gc_capgrey;
+static u64 gc_capgrey;
 static u64 gc_cycle_no = 1;
 
 static u8 **gc_mq;
 
-__attribute__((aligned(64))) static u64 gc_mq_head;
-static u64 gc_mq_pub;
-
-__attribute__((aligned(64))) static u64 gc_mq_tail;
 #define GC_MQ_BATCH 32u
 
 enum { GCPH_IDLE = 0, GCPH_MARK = 1, GCPH_RELOC = 2 };
-__attribute__((aligned(64))) static u32 gc_phase;
+__attribute__((aligned(GC_LINE))) static u32 gc_phase;
 
 static u32 gc_conc_on, gc_conc_tried, gc_opt_conc = 1;
 
@@ -1656,6 +1670,10 @@ static void gc_release_pages(u32 h, u32 n) {
 
 static void gc_init(void) {
   if (gc_base) return;
+
+  /* Their addresses escape here, or the optimiser splits each struct into
+     separate scalars and lays them out as it likes -- padding and line gone. */
+  __asm__ volatile("" : : "r"(&gc_mut), "r"(&gc_mqp), "r"(&gc_col) : "memory");
 
   gc_base = (u8 *)sys_mmap(0, (usz)(gc_heap_bytes + GC_GRAN),
                            PROT_READ | PROT_WRITE,
@@ -1820,10 +1838,12 @@ static u64 gc_page_room(u32 h) {
   return (u64)(gc_gran_addr(h) + (u64)gc_pages[h].ngran * GC_GRAN - gc_pages[h].top);
 }
 
-static u64 gc_lab_cell[2];
+/* [0] the cursor, [1] the end; compiled code bumps [0] on every inline
+   allocation through vmctx, so the cell has a line to itself. */
+static u64 gc_lab_cell[GC_LINE / 8] __attribute__((aligned(GC_LINE)));
 static u8 *gc_lab_start;
 static u32 gc_opt_lab = 1;
-static u64 gc_nlabs, gc_fast_bytes;
+static u64 gc_nlabs;
 #define GC_LAB_CAP (16u << 10)
 
 #define GC_LAB_MIN_TAIL 256u
@@ -1832,8 +1852,8 @@ static u64 gc_lab_sync(void) {
   if (!gc_lab_start) return 0;
   u64 used = GC_ADDR(gc_lab_cell[0]) - (u64)(uptr)gc_lab_start;
   gc_lab_start = (u8 *)(uptr)GC_ADDR(gc_lab_cell[0]);
-  gc_alloc_since += used;
-  gc_fast_bytes += used;
+  gc_mut.alloc_since += used;
+  gc_mut.fast_bytes += used;
   return used;
 }
 
@@ -1894,7 +1914,7 @@ static u8 *gc_alloc_raw(u64 total) {
 
 static void gc_lab_refill(void) {
   if (!gc_opt_lab || gc_opt_stress) return;
-  u64 q = gc_trigger > gc_alloc_since ? gc_trigger - gc_alloc_since : 0;
+  u64 q = gc_trigger > gc_mut.alloc_since ? gc_trigger - gc_mut.alloc_since : 0;
   if (q > GC_LAB_CAP) q = GC_LAB_CAP;
   q &= ~(u64)(GC_UNIT - 1);
   if (q < 2 * GC_LAB_MIN_TAIL) return;
@@ -1928,8 +1948,8 @@ static void gc_mark_word(u64 v) {
   u8 *p = (u8 *)(uptr)GC_CANON(v);
   u32 h = gc_page_head(g);
   gc_add_live(h, gc_object_bytes((const GcHeader *)p));
-  if (gc_ngrey >= gc_capgrey) die("the collector's mark stack overflowed");
-  gc_grey[gc_ngrey++] = p;
+  if (gc_col.ngrey >= gc_capgrey) die("the collector's mark stack overflowed");
+  gc_grey[gc_col.ngrey++] = p;
 }
 
 static void gc_mark_ref(u64 v) {
@@ -1940,10 +1960,10 @@ static void gc_mark_ref(u64 v) {
   u8 *p = (u8 *)(uptr)GC_CANON(v);
   u32 h = gc_page_head(g);
   gc_add_live(h, gc_object_bytes((const GcHeader *)p));
-  gc_mq[gc_mq_head++] = p;
+  gc_mq[gc_mqp.head++] = p;
 
-  if (gc_mq_head - gc_mq_pub >= GC_MQ_BATCH)
-    __atomic_store_n(&gc_mq_pub, gc_mq_head, __ATOMIC_RELEASE);
+  if (gc_mqp.head - gc_mqp.pub >= GC_MQ_BATCH)
+    __atomic_store_n(&gc_mqp.pub, gc_mqp.head, __ATOMIC_RELEASE);
 }
 
 enum {
@@ -1991,15 +2011,15 @@ static void gc_scan_object(u8 *p) {
 }
 
 static void gc_drain(void) {
-  while (gc_ngrey) gc_scan_object(gc_grey[--gc_ngrey]);
+  while (gc_col.ngrey) gc_scan_object(gc_grey[--gc_col.ngrey]);
 }
 
 static u64 gc_take_queue(void) {
-  u64 pub = __atomic_load_n(&gc_mq_pub, __ATOMIC_ACQUIRE);
-  u64 n = pub - gc_mq_tail;
-  while (gc_mq_tail < pub) {
-    if (gc_ngrey >= gc_capgrey) die("the collector's mark stack overflowed");
-    gc_grey[gc_ngrey++] = gc_mq[gc_mq_tail++];
+  u64 pub = __atomic_load_n(&gc_mqp.pub, __ATOMIC_ACQUIRE);
+  u64 n = pub - gc_col.mq_tail;
+  while (gc_col.mq_tail < pub) {
+    if (gc_col.ngrey >= gc_capgrey) die("the collector's mark stack overflowed");
+    gc_grey[gc_col.ngrey++] = gc_mq[gc_col.mq_tail++];
   }
   return n;
 }
@@ -2339,7 +2359,7 @@ static void gc_verify(void);
 static u64 gc_poll;
 static GcthGate gc_round_done;
 
-__attribute__((aligned(64))) static GcthGate gc_mut_wait;
+__attribute__((aligned(GC_LINE))) static GcthGate gc_mut_wait;
 static u32 gc_round_ok;
 static u32 gcth_stopping, gcth_started;
 static GcthGate gcth_stopped;
@@ -2531,11 +2551,11 @@ static u32 gc_round(u32 kind) {
   return __atomic_load_n(&gc_round_ok, __ATOMIC_RELAXED);
 }
 
-static u64 gc_nrounds_held, gc_nrounds_collided, gc_nmark_rests, gc_mark_wait_took;
+static u64 gc_nrounds_held, gc_nrounds_collided, gc_nmark_rests;
 
 static u32 gc_queue_pending(void) {
-  return __atomic_load_n(&gc_mq_pub, __ATOMIC_ACQUIRE) !=
-         __atomic_load_n(&gc_mq_tail, __ATOMIC_RELAXED);
+  return __atomic_load_n(&gc_mqp.pub, __ATOMIC_ACQUIRE) !=
+         __atomic_load_n(&gc_col.mq_tail, __ATOMIC_RELAXED);
 }
 
 #define GC_MARK_END_POLL_NS 100000ull
@@ -2568,10 +2588,10 @@ static u32 gc_round_mark_end(void) {
       }
       gc_nrounds_held++;
 
-      gc_mark_wait_took += gc_take_queue();
-      while (gc_ngrey) {
-        gc_scan_object(gc_grey[--gc_ngrey]);
-        gc_mark_conc_objs++;
+      gc_col.mark_wait_took += gc_take_queue();
+      while (gc_col.ngrey) {
+        gc_scan_object(gc_grey[--gc_col.ngrey]);
+        gc_col.mark_conc_objs++;
       }
       gc_jitter(GCJ_MARK);
       gc_round_repost(GCR_MARK_END, n);
@@ -2750,9 +2770,9 @@ static void gc_mark_start(void) {
 
   gc_lab_close();
   gc_cycle_no++;
-  gc_ngrey = 0;
-  gc_mq_head = gc_mq_tail = 0;
-  __atomic_store_n(&gc_mq_pub, (u64)0, __ATOMIC_RELAXED);
+  gc_col.ngrey = 0;
+  gc_mqp.head = gc_col.mq_tail = 0;
+  __atomic_store_n(&gc_mqp.pub, (u64)0, __ATOMIC_RELAXED);
 
   for (u32 h = 0; h < gc_gran_hwm; h++) {
     if (gc_pages[h].kind == GCP_FREE) continue;
@@ -2764,13 +2784,13 @@ static void gc_mark_start(void) {
   gc_publish_colour();
 
   gc_cycle_serves = __atomic_load_n(&gc_full_req, __ATOMIC_ACQUIRE);
-  gc_alloc_since = 0;
+  gc_mut.alloc_since = 0;
   __atomic_store_n(&gc_phase, GCPH_MARK, __ATOMIC_RELEASE);
   gc_visit_strong_roots(gc_mark_slot);
 }
 
 static void gc_mark_finish(void) {
-  __atomic_store_n(&gc_mq_pub, gc_mq_head, __ATOMIC_RELEASE);
+  __atomic_store_n(&gc_mqp.pub, gc_mqp.head, __ATOMIC_RELEASE);
   gc_mark_end_took += gc_take_queue();
   gc_drain();
   __atomic_store_n(&gc_phase, GCPH_IDLE, __ATOMIC_RELEASE);
@@ -2851,9 +2871,9 @@ static void gc_collect(void) {
 
 static void gc_mark_conc(void) {
   for (;;) {
-    while (gc_ngrey) {
-      gc_scan_object(gc_grey[--gc_ngrey]);
-      gc_mark_conc_objs++;
+    while (gc_col.ngrey) {
+      gc_scan_object(gc_grey[--gc_col.ngrey]);
+      gc_col.mark_conc_objs++;
     }
     gc_jitter(GCJ_MARK);
     if (!gc_take_queue()) return;
@@ -2898,7 +2918,7 @@ static u32 gc_cycle_wanted(void) {
       __atomic_load_n(&gc_full_done, __ATOMIC_ACQUIRE))
     return 1;
   u64 trig = __atomic_load_n(&gc_trigger, __ATOMIC_RELAXED);
-  return trig && __atomic_load_n(&gc_alloc_since, __ATOMIC_RELAXED) >= trig;
+  return trig && __atomic_load_n(&gc_mut.alloc_since, __ATOMIC_RELAXED) >= trig;
 }
 
 #define GC_PACE_POLL_NS 10000000ull
@@ -2965,7 +2985,7 @@ static void gc_assist(void) {
 }
 
 u64 warmc_gc_load_barrier(u64 ref, u64 *slot) {
-  gc_barrier_slow++;
+  gc_mut.barrier_slow++;
   u64 good = gc_heal_reloc(ref);
   if (slot) *slot = good;
 
@@ -2992,21 +3012,21 @@ static void gc_mark_copied(u64 *dst, u64 n) {
 }
 
 static void gc_collect_if_due(void) {
-  if (!gc_may_collect() || !(gc_opt_stress || gc_alloc_since >= gc_trigger))
+  if (!gc_may_collect() || !(gc_opt_stress || gc_mut.alloc_since >= gc_trigger))
     return;
   if (gc_opt_conc && !gc_conc_tried) gc_conc_start();
 
   if (__atomic_load_n(&gc_conc_on, __ATOMIC_ACQUIRE)) {
 
     if (__atomic_load_n(&gc_phase, __ATOMIC_ACQUIRE) == GCPH_IDLE) gcth_nudge();
-    if (gc_opt_assist && gc_alloc_since >= gc_opt_assist * gc_trigger)
+    if (gc_opt_assist && gc_mut.alloc_since >= gc_opt_assist * gc_trigger)
       gc_assist();
   } else if (!__atomic_load_n(&gcth_started, __ATOMIC_ACQUIRE)) {
 
     gc_collect();
   } else {
 
-    if (gc_opt_assist && gc_alloc_since >= gc_opt_assist * gc_trigger)
+    if (gc_opt_assist && gc_mut.alloc_since >= gc_opt_assist * gc_trigger)
       gc_assist();
   }
 }
@@ -3028,8 +3048,8 @@ static void *gc_alloc(u32 type_id, const GcTypeInfo *ti, u64 payload, u64 len) {
   for (u32 round = 0; ; round++) {
     u8 *p = gc_alloc_raw(total);
     if (p) {
-      gc_alloc_since += total;
-      gc_bytes_alloc += total;
+      gc_mut.alloc_since += total;
+      gc_mut.bytes_alloc += total;
       GcHeader *h = (GcHeader *)p;
       h->w = type_id;
       h->len = (u32)len;
@@ -3076,7 +3096,7 @@ static void *exn_alloc(Instance *in, u32 tag) {
 static void *exn_safepoint(void *e, WarmRegs *regs, u64 sp, u64 pc) {
   u32 saved = gc_from_wasm;
   gc_from_wasm = 1;
-  if (!gc_may_collect() || !(gc_opt_stress || gc_alloc_since >= gc_trigger ||
+  if (!gc_may_collect() || !(gc_opt_stress || gc_mut.alloc_since >= gc_trigger ||
                              __atomic_load_n(&gc_poll, __ATOMIC_RELAXED))) {
     gc_from_wasm = saved;
     return e;
@@ -4125,7 +4145,7 @@ static void gc_report(void) {
   eputs(" cycles, ");
   put_u64_e(gc_live);
   eputs(" bytes live, ");
-  put_u64_e(gc_bytes_alloc);
+  put_u64_e(gc_mut.bytes_alloc);
   eputs(" bytes allocated, ");
   put_u64_e(gc_gran_used * GC_GRAN);
   eputs(" bytes of pages (peak ");
@@ -4137,7 +4157,7 @@ static void gc_report(void) {
   eputs(" freed, ");
   put_u64_e(gc_nlabs);
   eputs(" regions, ");
-  put_u64_e(gc_fast_bytes);
+  put_u64_e(gc_mut.fast_bytes);
   eputs(" bytes fast-allocated, ");
 
   put_u64_e(__atomic_load_n(&gc_trigger, __ATOMIC_RELAXED));
@@ -4167,15 +4187,15 @@ static void gc_report(void) {
   eputs(" claims lost\n");
 
   eputs("  barrier: ");
-  put_u64_e(gc_barrier_slow);
+  put_u64_e(gc_mut.barrier_slow);
   eputs(" loads healed\n");
 
   eputs("  mark: ");
-  put_u64_e(gc_mark_conc_objs);
+  put_u64_e(gc_col.mark_conc_objs);
   eputs(" objects scanned beside the program, ");
   put_u64_e(gc_mark_end_took);
   eputs(" taken at mark end, ");
-  put_u64_e(gc_mark_wait_took);
+  put_u64_e(gc_col.mark_wait_took);
   eputs(" taken waiting for it, ");
   put_u64_e(gc_born_skipped);
   eputs(" still being born, ");
