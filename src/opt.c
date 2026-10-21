@@ -511,6 +511,109 @@ static Ref emit_before(IrFunc *f, uint32_t bi, uint32_t *idx, IrOp op, ValType t
   return r;
 }
 
+/* A value a loop carries round, made by a chain of one associative op --
+   acc = ((acc + a) + b) + c -- waits on every link of the chain each
+   iteration, so the loop runs no faster than one op per link.  The same sum
+   as ((a + b) + c) + acc waits on one: the other terms are added among
+   themselves, where the chain added them before, so they are consumed when
+   they always were, while the previous iteration finishes.  LLVM writes
+   n += popcount(v) + clz(v) as (n + clz) + popcount, and an unrolled copy of
+   the body makes the chain four times as long.  Integer ops only, which are
+   associative and commutative mod 2^n. */
+#define RC_LINKS 64
+static uint32_t rc_path(IrFunc *f, Ref v, Ref p, uint16_t op, uint8_t ty,
+                        const uint32_t *uses, uint32_t lo, Ref *link, uint32_t n) {
+  if (n == RC_LINKS) return 0;
+  link[n] = v;
+  Ref *a = ir_args(f, v);
+  if (a[0] == p || a[1] == p) return n + 1;
+  for (int k = 0; k < 2; k++) {
+    Inst *in = &f->insts[a[k]];
+    /* a link computed before the loop, its invariant part, stays a term */
+    if (in->op != op || in->type != ty || in->nargs != 2 || uses[a[k]] != 1 ||
+        f->blocks[in->block].rpo < lo)
+      continue;
+    uint32_t m = rc_path(f, a[k], p, op, ty, uses, lo, link, n + 1);
+    if (m) return m;
+  }
+  return 0;
+}
+
+static bool pass_reassoc_carried(IrFunc *f) {
+  uint32_t *uses = count_uses(f);
+  bool changed = false;
+  for (uint32_t oi = 0; oi < f->norder; oi++) {
+    uint32_t lb = f->order[oi];
+    for (uint32_t s = 0; s < f->blocks[lb].nsuccs; s++) {
+      uint32_t h = f->blocks[lb].succs[s].target;
+      if (f->blocks[h].rpo > f->blocks[lb].rpo) continue;
+      for (uint32_t j = 0; j < f->blocks[lb].succs[s].nargs && j < f->blocks[h].nparams; j++) {
+        Ref r = f->blocks[lb].succs[s].args[j], p = f->blocks[h].params[j];
+        Inst *ri = &f->insts[r];
+        uint16_t op = ri->op;
+        ValType ty = (ValType)ri->type;
+        if (op != I_ADD && op != I_MUL && op != I_AND && op != I_OR && op != I_XOR) continue;
+        if (ri->nargs != 2 || (ty != VT_I32 && ty != VT_I64)) continue;
+        /* link[0] is r, link[n - 1] the one that reads p */
+        Ref link[RC_LINKS], term[RC_LINKS];
+        uint32_t n = rc_path(f, r, p, op, ty, uses, f->blocks[h].rpo, link, 0);
+        if (n < 2) continue;
+        bool twice = false;
+        for (uint32_t k = 0; k < n; k++) {
+          Ref *a = ir_args(f, link[k]);
+          Ref below = k + 1 < n ? link[k + 1] : p;
+          term[k] = a[0] == below ? a[1] : a[0];
+          if (term[k] == p) twice = true;
+        }
+        if (twice) continue;
+
+        /* the constants among the terms are one constant: an unrolled
+           counter's steps are */
+        uint64_t kv = 0, c;
+        bool have_k = false;
+        for (uint32_t k = 0; k < n; k++)
+          if (is_const(f, term[k], &c)) {
+            if (!have_k) kv = c;
+            else fold_int_binop(op, ty, kv, c, &kv);
+            have_k = true;
+          }
+        uint64_t ident = op == I_MUL ? 1 : op == I_AND ? trunc_to(ty, ~0ull) : 0;
+
+        Ref acc = REF_NONE;
+        for (uint32_t k = n; k-- > 1;) {
+          if (is_const(f, term[k], &c)) continue;
+          if (acc == REF_NONE) { acc = term[k]; continue; }
+          Ref *a = ir_args(f, link[k]);
+          a[0] = acc;
+          a[1] = term[k];
+          acc = link[k];
+        }
+        uint32_t rb = ri->block, at = 0;
+        Block *b = &f->blocks[rb];
+        while (at < b->ninsts && b->insts[at] != r) at++;
+        if (at == b->ninsts) continue;
+        if (!is_const(f, term[0], &c)) {
+          Ref pr[2] = { acc, term[0] };
+          acc = acc == REF_NONE ? term[0] : emit_before(f, rb, &at, (IrOp)op, ty, pr, 2, 0);
+        }
+        if (have_k && (trunc_to(ty, kv) != ident || acc == REF_NONE)) {
+          Ref kc = emit_before(f, rb, &at, I_CONST, ty, NULL, 0, trunc_to(ty, kv));
+          Ref pr[2] = { acc, kc };
+          acc = acc == REF_NONE ? kc : emit_before(f, rb, &at, (IrOp)op, ty, pr, 2, 0);
+        }
+        Ref *ra = ir_args(f, r);
+        bool kl = is_const(f, acc, &c);
+        ra[0] = kl ? p : acc;
+        ra[1] = kl ? acc : p;
+        changed = true;
+        g_stats.reassoc++;
+      }
+    }
+  }
+  xfree(uses);
+  return changed;
+}
+
 static Magic magic_u32(uint32_t d) {
   Magic mg = { 0, 0, 0 };
   uint32_t nc, delta, q1, r1, q2, r2;
@@ -12890,6 +12993,7 @@ void ir_optimize(IrFunc *f, const OptOpts *o) {
 
   if (o->loopclose && TP("loop_close", pass_loop_close(f))) ir_order(f);
   if (o->reassoc) TP("reassoc", pass_reassoc(f));
+  if (o->reassoc && TP("reassoc_carried", pass_reassoc_carried(f)) && o->dce) pass_dce(f);
 
   if (o->barelide) TP("bar_elide", pass_bar_elide(f));
   if (o->print_ir) ir_print(f, "optimised");
