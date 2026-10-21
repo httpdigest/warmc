@@ -109,7 +109,7 @@ void write_elf64(ObjBuilder *o, const char *path) {
   struct { uint32_t name, type; uint64_t flags; const Buf *data;
            uint32_t link, info; uint64_t align, entsize; } sh[10] = {
     { 0, 0, 0, NULL, 0, 0, 0, 0 },
-    { n_text,     SHT_PROGBITS, SHF_ALLOC | SHF_EXECINSTR, &o->text,   0, 0, 16, 0 },
+    { n_text,     SHT_PROGBITS, SHF_ALLOC | SHF_EXECINSTR, &o->text,   0, 0, 64, 0 },
     { n_rtext,    SHT_RELA,     SHF_INFO_LINK,             &rela[0],   7, 1, 8, 24 },
     { n_rodata,   SHT_PROGBITS, SHF_ALLOC,                 &o->rodata, 0, 0, 16, 0 },
     { n_rrodata,  SHT_RELA,     SHF_INFO_LINK,             &rela[1],   7, 3, 8, 24 },
