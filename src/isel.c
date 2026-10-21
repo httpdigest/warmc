@@ -1336,6 +1336,44 @@ static void analyse_immediates(Isel *s) {
     }
   }
 
+  /* A wrap leaves an i32 whose high half is whatever its i64 had.  Every
+     reader below takes the low half only -- a w-register op, a 4-byte or
+     narrower store, an index extended in its address -- so for those the
+     uxtw a tied wrap would otherwise make is nothing to do: Go's code wraps
+     every i64 it loads before using it as an i32. */
+  s->lowonly = xcalloc(n ? n : 1, 1);
+  for (uint32_t i = 0; i < n; i++)
+    if (f->insts[i].op == I_WRAP) s->lowonly[i] = 1;
+  for (uint32_t oi = 0; oi < f->norder; oi++) {
+    Block *b = &f->blocks[f->order[oi]];
+    for (uint32_t i = 0; i < b->ninsts; i++) {
+      Ref u = b->insts[i];
+      Inst *in = &f->insts[u];
+      Ref *a = ir_args(f, u);
+      for (uint32_t j = 0; j < in->nargs; j++) {
+        if (!s->lowonly[a[j]]) continue;
+        bool low;
+        switch (in->op) {
+          case I_ADD: case I_SUB: case I_MUL: case I_AND: case I_OR: case I_XOR:
+          case I_SHL: case I_SHRU: case I_SHRS: case I_ROTL: case I_ROTR:
+          case I_EQ: case I_NE: case I_LTS: case I_LTU: case I_GTS: case I_GTU:
+          case I_LES: case I_LEU: case I_GES: case I_GEU: case I_EQZ:
+          case I_CLZ: case I_CTZ: case I_POPCNT: case I_EXT8S: case I_EXT16S:
+          case I_EXTENDU: case I_EXTENDS: case I_CONVERTS: case I_CONVERTU:
+          case I_REINTERPRET: case I_SELECT: case I_GLOBAL_SET:
+            low = true; break;
+          case I_STORE: low = j == 1 && MEMF_SIZE(in->imm2) <= 2; break;
+          case I_MEM_ADDR: case I_MEM_PTR: low = j == 0; break;
+          default: low = false; break;
+        }
+        if (!low) s->lowonly[a[j]] = 0;
+      }
+    }
+    for (uint32_t r = 0; r < b->nret; r++) s->lowonly[b->ret_args[r]] = 0;
+    for (uint32_t e = 0; e < b->nsuccs; e++)
+      for (uint32_t j = 0; j < b->succs[e].nargs; j++) s->lowonly[b->succs[e].args[j]] = 0;
+  }
+
   if (!getenv("WARMC_NO_MASKSEL"))
   for (uint32_t oi = 0; oi < f->norder; oi++) {
     uint32_t bi = f->order[oi];
@@ -2005,6 +2043,7 @@ give_up:
   xfree(s->imm_fold); xfree(s->fused); xfree(s->addr_fuse); xfree(s->ptr_fuse);
   xfree(s->zx_fuse); xfree(s->no_remat); xfree(s->paired); xfree(s->nl); xfree(s->pool);
   xfree(s->folded); xfree(s->uses); xfree(s->bfx); xfree(s->pinned); xfree(s->csinc);
+  xfree(s->lowonly);
   xfree(s->sites); xfree(s->clauses);
   xfree(s->gcsites); xfree(s->gcroots);
   xfree(s->sp_first); xfree(s->sp_n); xfree(s->sp_vals);

@@ -110,6 +110,8 @@ typedef struct {
   /* select(c, k + 1, k), either way round: 1 + the arm that is the add,
      which is folded, and the select is a csinc of k */
   uint8_t *csinc;
+  /* a wrap all of whose readers read only the low half of a register */
+  uint8_t *lowonly;
   uint8_t *no_remat;
   uint8_t *paired;
   /* (base, offset) of every 32-bit raw-pointer load, sorted; built on the
