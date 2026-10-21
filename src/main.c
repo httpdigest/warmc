@@ -52,7 +52,7 @@ static const char *usage_text =
   "                vectorize, unroll, selftail, ldcomb, escape, partial-escape,\n"
   "                gloop, gssa, loopclose, cpool, reach, prune, merge, devirt,\n"
   "                reinline, throw-jump, closed-world, gcpure, labcache,\n"
-  "                barelide\n"
+  "                barelide, small-loop-align\n"
   "                The last two are the passes built on a loop containing\n"
   "                no safepoint, which is the only assumption the compiler\n"
   "                makes about the collector: turning them off says whether\n"
@@ -226,6 +226,7 @@ int main(int argc, char **argv) {
   opt.fold = opt.dce = opt.cse = opt.licm = opt.branch = true;
   opt.thread = opt.nodesplit = true;
   opt.gssa = true;
+  opt.small_loop_align = true;
   opt.memopt = opt.bce = opt.strength = true;
 
   opt.inl = true;
@@ -370,6 +371,7 @@ int main(int argc, char **argv) {
       else if (!strcmp(name, "cpool")) opt.cpool = on;
       else if (!strcmp(name, "gssa")) opt.gssa = on;
       else if (!strcmp(name, "gssa-all")) opt.gssa = opt.gssa_all = on;
+      else if (!strcmp(name, "small-loop-align")) opt.small_loop_align = on;
       else if (!strcmp(name, "labcache")) opt.labcache = on;
       else if (!strcmp(name, "barelide")) opt.barelide = on;
       else if (!strcmp(name, "merge")) codegen_set_merge(on);
