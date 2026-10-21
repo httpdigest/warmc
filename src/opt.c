@@ -609,6 +609,17 @@ static bool is_pow2(uint64_t v, int *log2out) {
   return true;
 }
 
+/* The compare that takes its operands the other way round. */
+static uint16_t cmp_mirror(uint16_t op) {
+  switch (op) {
+    case I_LTS: return I_GTS;  case I_GTS: return I_LTS;
+    case I_LES: return I_GES;  case I_GES: return I_LES;
+    case I_LTU: return I_GTU;  case I_GTU: return I_LTU;
+    case I_LEU: return I_GEU;  case I_GEU: return I_LEU;
+    default: return 0;
+  }
+}
+
 static uint16_t cmp_inverse(uint16_t op) {
   switch (op) {
     case I_EQ:  return I_NE;   case I_NE:  return I_EQ;
@@ -659,8 +670,114 @@ static bool is_associative(uint16_t op) {
 
 static bool gc_fold_known(IrFunc *f, Ref v);
 
-/* eq or ne of a widened i32 against a constant the widening could have made
-   is the same compare at i32, and ne(b, 0) of a bool b is b itself. */
+/* Whether v leaves block bi as a successor argument. */
+static bool passed_on(const IrFunc *f, uint32_t bi, Ref v) {
+  const Block *b = &f->blocks[bi];
+  for (uint32_t s = 0; s < b->nsuccs; s++)
+    for (uint32_t j = 0; j < b->succs[s].nargs; j++)
+      if (b->succs[s].args[j] == v) return true;
+  return false;
+}
+
+/* Whether a test may read the operands of in0 in place of in0 itself: always
+   when nothing else needs in0, and when something does only within its block
+   and not when in0 is what the block hands on, so that i + 1 < n stays a test
+   of the counter the loop carries -- the vectoriser and the unroller look for
+   that -- and the operands live a few instructions longer at most. */
+static bool test_may_look_through(const IrFunc *f, uint32_t bi, Ref in0,
+                                  const uint32_t *uses) {
+  if (!uses) return false;
+  if (uses[in0] == 1) return true;
+  return f->insts[in0].block == bi && !passed_on(f, bi, in0);
+}
+
+/* A shift reads only the low log2(w) bits of its amount, so masking them
+   first, as Rust's wrapping shifts and C's rotates do, does nothing. */
+static bool fold_shift_mask(IrFunc *f, Ref v) {
+  Ref *a = ir_args(f, v);
+  const Inst *ai = &f->insts[a[1]];
+  uint64_t m, w = vt_is_64((ValType)f->insts[v].type) ? 64u : 32u;
+  if (ai->op != I_AND || ai->nargs != 2 || !is_const(f, ir_args(f, a[1])[1], &m))
+    return false;
+  if ((m & (w - 1)) != w - 1) return false;
+  a[1] = ir_args(f, a[1])[0];
+  return true;
+}
+
+/* x + (0 - y) is x - y, and x - (0 - y) is x + y. */
+static bool fold_add_neg(IrFunc *f, Ref v) {
+  Inst *in = &f->insts[v];
+  Ref *a = ir_args(f, v);
+  for (int k = in->op == I_ADD ? 0 : 1; k < 2; k++) {
+    const Inst *ni = &f->insts[a[k]];
+    uint64_t z;
+    if (ni->op != I_SUB || ni->nargs != 2 || !is_const(f, ir_args(f, a[k])[0], &z) ||
+        trunc_to((ValType)in->type, z) != 0)
+      continue;
+    Ref y = ir_args(f, a[k])[1];
+    if (k == 0) a[0] = a[1];
+    a[1] = y;
+    in->op = in->op == I_ADD ? I_SUB : I_ADD;
+    return true;
+  }
+  return false;
+}
+
+/* A compare of two i32s widened the same way is the compare of the i32s:
+   both sign-extended keep every order, and both zero-extended are never
+   negative, so a signed test of them is the unsigned test of the i32s. */
+static bool fold_cmp_widened(IrFunc *f, Ref v) {
+  Inst *in = &f->insts[v];
+  Ref *a = ir_args(f, v);
+  if (in->nargs != 2) return false;
+  uint16_t e = f->insts[a[0]].op;
+  if ((e != I_EXTENDU && e != I_EXTENDS) || f->insts[a[1]].op != e) return false;
+  if (f->insts[a[0]].nargs != 1 || f->insts[a[1]].nargs != 1) return false;
+  if (e == I_EXTENDU) {
+    switch (in->op) {
+      case I_LTS: in->op = I_LTU; break;
+      case I_GTS: in->op = I_GTU; break;
+      case I_LES: in->op = I_LEU; break;
+      case I_GES: in->op = I_GEU; break;
+      default: break;
+    }
+  }
+  a[0] = ir_args(f, a[0])[0];
+  a[1] = ir_args(f, a[1])[0];
+  return true;
+}
+
+/* eq or ne of x + c1, x - c1 or x ^ c1 against c2 is the same test of x
+   against one constant, and of x - y or x ^ y against zero the test of x
+   against y: each is a bijection on the integers mod 2^n, so nothing is lost.
+   When nothing else needs the arithmetic it goes; when something does, as
+   with GHC's stack and heap pointers, the test still stops waiting on it,
+   and 0 - y != 0 becomes a cbnz on y. */
+static bool fold_cmp_arith(IrFunc *f, uint32_t bi, uint32_t *idx, Ref v,
+                           const uint32_t *uses) {
+  Ref *a = ir_args(f, v);
+  uint64_t c2, c1;
+  if (f->insts[v].nargs != 2 || !is_const(f, a[1], &c2)) return false;
+  Ref in0 = a[0];
+  const Inst *ii = &f->insts[in0];
+  if (ii->nargs != 2 || (ii->op != I_ADD && ii->op != I_SUB && ii->op != I_XOR)) return false;
+  if (!test_may_look_through(f, bi, in0, uses)) return false;
+  ValType t = (ValType)ii->type;
+  Ref x = ir_args(f, in0)[0], y = ir_args(f, in0)[1];
+  if (is_const(f, y, &c1)) {
+    uint64_t c = ii->op == I_ADD ? c2 - c1 : ii->op == I_SUB ? c2 + c1 : c2 ^ c1;
+    Ref k = emit_before(f, bi, idx, I_CONST, t, NULL, 0, trunc_to(t, c));
+    a = ir_args(f, v);
+    a[0] = x;
+    a[1] = k;
+    return true;
+  }
+  if (trunc_to(t, c2) != 0 || ii->op == I_ADD) return false;
+  a[0] = x;
+  a[1] = y;
+  return true;
+}
+
 /* eq or ne of a bool -- a value only bit 0 of which can be set -- against 0
    or 1: the bool itself, or its eqz. */
 static bool fold_bool_cmp(IrFunc *f, Ref v) {
@@ -681,6 +798,8 @@ static bool fold_bool_cmp(IrFunc *f, Ref v) {
   return true;
 }
 
+/* eq or ne of a widened i32 against a constant the widening could have made
+   is the same compare at i32, and ne(b, 0) of a bool b is b itself. */
 static bool fold_ext_cmp(IrFunc *f, uint32_t bi, uint32_t *idx, Ref v) {
   Ref *a = ir_args(f, v);
   const Inst *si = &f->insts[a[0]];
@@ -825,6 +944,14 @@ static bool fold_block(IrFunc *f, uint32_t bi, const OptOpts *o, const uint32_t 
       Ref tmp = a[0]; a[0] = a[1]; a[1] = tmp;
       changed = true;
     }
+    /* c < x is x > c, so the constant can be an immediate: Go tests a
+       length with 0 > n, GHC's code with c > x. */
+    if (in->nargs == 2 && cmp_mirror(in->op) &&
+        is_const(f, a[0], &x) && !is_const(f, a[1], &y)) {
+      Ref tmp = a[0]; a[0] = a[1]; a[1] = tmp;
+      in->op = cmp_mirror(in->op);
+      changed = true;
+    }
 
     if (in->nargs == 2 && is_associative(in->op) && is_const(f, a[1], &y) &&
         f->insts[a[0]].op == in->op && f->insts[a[0]].nargs == 2 &&
@@ -902,6 +1029,10 @@ static bool fold_block(IrFunc *f, uint32_t bi, const OptOpts *o, const uint32_t 
              64 - Len64, and Len64 as 64 - clz. */
           ir_replace(f, v, sub_cancels(f, in->op, a));
           in->op = I_NOP;
+          changed = true;
+          g_stats.folded++;
+        }
+        else if ((in->op == I_SUB || in->op == I_ADD) && in->nargs == 2 && fold_add_neg(f, v)) {
           changed = true;
           g_stats.folded++;
         }
@@ -1012,7 +1143,22 @@ static bool fold_block(IrFunc *f, uint32_t bi, const OptOpts *o, const uint32_t 
         }
         break;
       case I_SHL: case I_SHRU: case I_SHRS: case I_ROTL: case I_ROTR:
-        if (has_c1 && (y % (uint64_t)(t == VT_I64 ? 64 : 32)) == 0) {
+        if (!has_c1 && in->nargs == 2 && fold_shift_mask(f, v)) {
+          changed = true;
+          g_stats.folded++;
+        } else if (in->op == I_SHL && has_c1 && uses && uses[a[0]] == 1 &&
+                   f->insts[a[0]].op == I_MUL && f->insts[a[0]].nargs == 2 &&
+                   is_const(f, ir_args(f, a[0])[1], &x)) {
+          /* (x * c1) << c2 is x * (c1 << c2), one multiply. */
+          Ref x0 = ir_args(f, a[0])[0];
+          uint64_t w = vt_is_64(t) ? 64u : 32u;
+          Ref k = emit_before(f, bi, &i, I_CONST, t, NULL, 0, trunc_to(t, x << (y % w)));
+          in = &f->insts[v]; a = ir_args(f, v);
+          a[0] = x0; a[1] = k;
+          in->op = I_MUL;
+          changed = true;
+          g_stats.folded++;
+        } else if (has_c1 && (y % (uint64_t)(t == VT_I64 ? 64 : 32)) == 0) {
           ir_replace(f, v, a[0]); in->op = I_NOP; changed = true; g_stats.folded++;
         } else if (in->op == I_SHRU && has_c1 &&
                    (ir_known_bits(f, a[0], KB_DEPTH) >> (y % (vt_is_64(t) ? 64u : 32u))) == 0) {
@@ -1028,6 +1174,28 @@ static bool fold_block(IrFunc *f, uint32_t bi, const OptOpts *o, const uint32_t 
             in = &f->insts[v]; a = ir_args(f, v);
             a[0] = src; a[1] = mc;
             in->op = I_AND;
+            changed = true;
+            g_stats.folded++;
+          }
+        } else if ((in->op == I_SHL || in->op == I_SHRU || in->op == I_SHRS) && has_c1 &&
+                   uses && (uses[a[0]] == 1 || f->insts[a[0]].block == bi) &&
+                   f->insts[a[0]].op == in->op &&
+                   f->insts[a[0]].nargs == 2) {
+          /* Two shifts the same way by constants are one, or all of x gone:
+             zero for a logical shift, the sign everywhere for an arithmetic
+             one. */
+          uint64_t c1, w = vt_is_64(t) ? 64u : 32u;
+          Ref x0 = ir_args(f, a[0])[0];
+          if (is_const(f, ir_args(f, a[0])[1], &c1)) {
+            uint64_t tot = (c1 % w) + (y % w);
+            if (tot >= w && in->op != I_SHRS) {
+              replace_with_const(f, v, 0);
+            } else {
+              Ref k = emit_before(f, bi, &i, I_CONST, t, NULL, 0, tot < w ? tot : w - 1);
+              in = &f->insts[v]; a = ir_args(f, v);
+              a[0] = x0;
+              a[1] = k;
+            }
             changed = true;
             g_stats.folded++;
           }
@@ -1092,7 +1260,43 @@ static bool fold_block(IrFunc *f, uint32_t bi, const OptOpts *o, const uint32_t 
           }
         }
         break;
-      case I_EXTENDU:
+      case I_EXT8S: case I_EXT16S: case I_EXT32S: {
+        /* The sign extension of a narrow unsigned load is the signed load:
+           ldrsb where there was ldrb and sxtb. */
+        Inst *li = &f->insts[a[0]];
+        uint32_t want = in->op == I_EXT8S ? 0u : in->op == I_EXT16S ? 1u : 2u;
+        if (li->op == I_LOAD && uses && uses[a[0]] == 1 && li->type == in->type &&
+            MEMF_SIZE(li->imm2) == want && !(li->imm2 & MEMF_SIGNED)) {
+          li->imm2 |= MEMF_SIGNED;
+          ir_replace(f, v, a[0]);
+          in->op = I_NOP;
+          changed = true;
+          g_stats.folded++;
+        }
+        break;
+      }
+      case I_EXTENDS: case I_EXTENDU: {
+        /* An i32 load widened is the i64 load of the same bytes: ldrsw
+           where there was ldr and sxtw.  A narrow signed load zero-extended
+           has no such load. */
+        Inst *li = &f->insts[a[0]];
+        if (li->op == I_LOAD && uses && uses[a[0]] == 1 && li->type == VT_I32 &&
+            MEMF_SIZE(li->imm2) <= 2) {
+          bool sg = (li->imm2 & MEMF_SIGNED) != 0;
+          bool two = MEMF_SIZE(li->imm2) == 2;
+          if (in->op == I_EXTENDS || !sg) {
+            if (two) li->imm2 = (li->imm2 & ~(uint64_t)MEMF_SIGNED) |
+                                (in->op == I_EXTENDS ? MEMF_SIGNED : 0);
+            li->type = VT_I64;
+            ir_replace(f, v, a[0]);
+            in->op = I_NOP;
+            changed = true;
+            g_stats.folded++;
+            break;
+          }
+        }
+        if (in->op == I_EXTENDS) break;
+      }
         if (f->insts[a[0]].op == I_WRAP && f->insts[a[0]].nargs == 1) {
           Ref x0 = ir_args(f, a[0])[0];
           if (f->insts[x0].type == VT_I64 &&
@@ -1138,6 +1342,26 @@ static bool fold_block(IrFunc *f, uint32_t bi, const OptOpts *o, const uint32_t 
           changed = true;
           g_stats.folded++;
           break;
+        }
+        if ((sop == I_SUB || sop == I_XOR || sop == I_ADD) && f->insts[src].nargs == 2 &&
+            test_may_look_through(f, bi, src, uses)) {
+          /* eqz(x - y) and eqz(x ^ y) are x == y; eqz(x + c) is x == -c. */
+          Ref x0 = ir_args(f, src)[0], y0 = ir_args(f, src)[1];
+          uint64_t cc;
+          bool k = is_const(f, y0, &cc);
+          if (sop != I_ADD || k) {
+            ValType st = (ValType)f->insts[src].type;
+            if (sop == I_ADD)
+              y0 = emit_before(f, bi, &i, I_CONST, st, NULL, 0, trunc_to(st, (uint64_t)0 - cc));
+            Ref ea[2] = { x0, y0 };
+            Ref nv = emit_before(f, bi, &i, I_EQ, VT_I32, ea, 2, 0);
+            ir_replace(f, v, nv);
+            in = &f->insts[v]; a = ir_args(f, v);
+            in->op = I_NOP;
+            changed = true;
+            g_stats.folded++;
+            break;
+          }
         }
         if (sop == I_EQZ && f->insts[src].nargs == 1) {
           Ref inner = ir_args(f, src)[0];
@@ -1233,7 +1457,22 @@ static bool fold_block(IrFunc *f, uint32_t bi, const OptOpts *o, const uint32_t 
       }
       case I_EQ: case I_LES: case I_LEU: case I_GES: case I_GEU:
         if (in->nargs == 2 && a[0] == a[1]) { replace_with_const(f, v, 1); changed = true; g_stats.folded++; }
+        else if (fold_cmp_widened(f, v)) { changed = true; g_stats.folded++; }
         else if (in->op == I_EQ && fold_bool_cmp(f, v)) { changed = true; g_stats.folded++; }
+        else if (in->op == I_EQ && fold_cmp_arith(f, bi, &i, v, uses)) {
+          in = &f->insts[v]; a = ir_args(f, v);
+          changed = true; g_stats.folded++;
+        }
+        else if (in->op == I_LEU && has_c1 && trunc_to((ValType)f->insts[a[0]].type, y) == 0) {
+          /* x <=u 0 is x == 0, a cbz. */
+          in->op = I_EQZ; in->nargs = 1; changed = true; g_stats.folded++;
+        }
+        else if (in->op == I_GEU && has_c1 && trunc_to((ValType)f->insts[a[0]].type, y) == 1) {
+          /* x >=u 1 is x != 0, a cbnz. */
+          Ref z = emit_before(f, bi, &i, I_CONST, (ValType)f->insts[a[0]].type, NULL, 0, 0);
+          in = &f->insts[v]; a = ir_args(f, v);
+          in->op = I_NE; a[1] = z; changed = true; g_stats.folded++;
+        }
         else if (in->op == I_EQ && fold_ext_cmp(f, bi, &i, v)) {
           in = &f->insts[v]; a = ir_args(f, v);
           changed = true; g_stats.folded++;
@@ -1241,7 +1480,20 @@ static bool fold_block(IrFunc *f, uint32_t bi, const OptOpts *o, const uint32_t 
         break;
       case I_NE: case I_LTS: case I_LTU: case I_GTS: case I_GTU:
         if (in->nargs == 2 && a[0] == a[1]) { replace_with_const(f, v, 0); changed = true; g_stats.folded++; }
+        else if (fold_cmp_widened(f, v)) { changed = true; g_stats.folded++; }
         else if (in->op == I_NE && fold_bool_cmp(f, v)) { changed = true; g_stats.folded++; }
+        else if (in->op == I_NE && fold_cmp_arith(f, bi, &i, v, uses)) {
+          in = &f->insts[v]; a = ir_args(f, v);
+          changed = true; g_stats.folded++;
+        }
+        else if (in->op == I_LTU && has_c1 && trunc_to((ValType)f->insts[a[0]].type, y) == 1) {
+          /* x <u 1 is x == 0. */
+          in->op = I_EQZ; in->nargs = 1; changed = true; g_stats.folded++;
+        }
+        else if (in->op == I_GTU && has_c1 && trunc_to((ValType)f->insts[a[0]].type, y) == 0) {
+          /* x >u 0 is x != 0. */
+          in->op = I_NE; changed = true; g_stats.folded++;
+        }
         else if (in->op == I_NE && fold_ext_cmp(f, bi, &i, v)) {
           in = &f->insts[v]; a = ir_args(f, v);
           changed = true; g_stats.folded++;
