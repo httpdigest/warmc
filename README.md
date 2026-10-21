@@ -65,9 +65,9 @@ Hello world!
   - a linear-scan register allocator with rematerialisation
 
   Functions compile in parallel and are laid out in a deterministic order.
-- **Fast code.** Across 130 benchmark kernels compiled from TinyGo, Rust, Zig,
-  AssemblyScript and Kotlin, warmc's steady-state code takes 0.40× wasmtime's
-  time (geometric mean), with much lower peak memory. See
+- **Fast code.** Across 173 benchmark kernels compiled from TinyGo, Rust, Zig,
+  AssemblyScript, Kotlin, C, C++ and Haskell, warmc's steady-state code takes
+  0.47× wasmtime's time (geometric mean), with much lower peak memory. See
   [Performance](#performance).
 - **Runtime for modern languages:**
   - a concurrent, compacting, ZGC-style collector with coloured pointers,
@@ -259,6 +259,9 @@ warmc compiles directly:
 | Zig | `zig build-exe -target wasm32-wasi -O ReleaseFast main.zig` |
 | AssemblyScript | `asc main.ts -O3 --exportStart _start --use abort= -o app.wasm` (with a WASI shim; see `test/asbench/wasi.ts`) |
 | Kotlin/Wasm | `kotlinc-wasm -Xwasm -Xwasm-target=wasm-wasi …` (two steps, klib then module; see `build_kotlin` in `test/gobench.py`) |
+| C | `clang -O3 main.c -o app.wasm` with [wasi-sdk](https://github.com/WebAssembly/wasi-sdk)'s clang (`make wasi-sdk` fetches the pinned release); add `-mllvm -wasm-enable-sjlj -lsetjmp` for `setjmp`/`longjmp` |
+| C++ | `clang++ -O3 -fwasm-exceptions -mllvm -wasm-use-legacy-eh=false main.cpp -lunwind -o app.wasm` (wasi-sdk), or without the exception flags for code that never throws |
+| Haskell | `wasm32-wasi-ghc -O2 Main.hs -o app.wasm`, with GHC's wasm backend from [ghc-wasm-meta](https://gitlab.haskell.org/haskell-wasm/ghc-wasm-meta) |
 
 Then compile it:
 
@@ -639,10 +642,10 @@ cheaper. Functions compile in parallel and are laid out deterministically.
 `test/baseline.json` records warmc against wasmtime 50.0.0 on the author's
 Apple silicon machine, at `-O2`, with each corpus's producer version beside
 it (TinyGo 0.43, rustc nightly 1.101, Zig 0.17, AssemblyScript 0.28.20,
-Kotlin 2.4.21). Each figure is the geometric mean of warmc time ÷ wasmtime
-time, so lower is better. Each engine's empty-program time is subtracted
-first, so the ratios compare steady-state generated code, not start-up or
-compile time.
+Kotlin 2.4.21, wasi-sdk 34 with clang 23.1, GHC 9.14). Each figure is the
+geometric mean of warmc time ÷ wasmtime time, so lower is better. Each
+engine's empty-program time is subtracted first, so the ratios compare
+steady-state generated code, not start-up or compile time.
 
 | Corpus | Source language | Kernels | warmc / wasmtime | Range | Median peak RSS (warmc / wasmtime) |
 |---|---|---:|---:|---|---|
@@ -652,14 +655,19 @@ compile time.
 | `rsbench` | Rust | 28 | 0.72 | 0.35 – 1.00 | 1.9 / 9.1 MB |
 | `zigbench` | Zig | 9 | 0.70 | 0.42 – 1.00 | 1.9 / 8.7 MB |
 | `ktbench` | Kotlin (Wasm GC) | 12 | 0.09 | 0.004 – 0.49 | 3.5 / 20.6 MB |
+| `cbench` | C | 14 | 0.90 | 0.43 – 1.18 | 2.0 / 8.9 MB |
+| `cppbench` | C++ | 14 | 0.75 | 0.26 – 1.02 | 2.5 / 9.5 MB |
+| `hsbench` | Haskell | 15 | 0.65 | 0.40 – 0.89 | 10.2 / 32.3 MB |
 
-Over all 130 kernels the geometric mean is **0.40**. Seven kernels are slower
-than wasmtime. Six of them are within 5%; the seventh, `asbench/arrpush`
-(growing an array by `push`), runs at 1.38×. That kernel was 0.94× against
-wasmtime 49, so wasmtime 50 is what got faster there; warmc has since come
-down from 1.61×, and compiles its hot loop to nearly the same instructions as
-wasmtime does. Re-run the comparison on your own machine before relying on
-these numbers:
+Over all 173 kernels the geometric mean is **0.47** (0.40 over the 130 outside
+the C, C++ and Haskell corpora). Thirteen kernels are slower than wasmtime.
+Eight of them are within 5%. Four are in the C corpus and not yet looked into:
+`cbench/printf` (1.18×), `interp` (1.17×), `hashtab` (1.11×) and `malloc`
+(1.09×). The last, `asbench/arrpush` (growing an array by `push`), runs at
+1.38×. That kernel was 0.94× against wasmtime 49, so wasmtime 50 is what got
+faster there; warmc has since come down from 1.61×, and compiles its hot loop
+to nearly the same instructions as wasmtime does. Re-run the comparison on
+your own machine before relying on these numbers:
 
 ```sh
 python3 test/gobench.py --corpus rsbench --rounds 5     # one corpus
@@ -685,23 +693,28 @@ Most of the suite is **differential**. warmc's output is compared with:
   `-O` level and with individual passes turned off)
 - wasmtime, for WASI preview 1 and 0.2 programs (stdout, stderr, exit code and
   the resulting directory tree)
-- wasmtime, for the benchmark corpora in Go, Rust, Zig, AssemblyScript and
-  Kotlin
+- wasmtime, for the benchmark corpora in Go, Rust, Zig, AssemblyScript,
+  Kotlin, C, C++ and Haskell
 - `wasm-tools`, for component, WIT and WAT handling
 - the Component Model's reference `definitions.py`, for canonical-ABI layout
 
 Requirements:
 - `make check` needs `python3`, `perl` and wabt (`wat2wasm`, `wasm-interp`).
   It also needs clang's `wasm32` target with `wasm-ld`.
-- Three dependencies are pinned in the Makefile and cached under `build/`:
+- Four dependencies are pinned in the Makefile and cached under `build/`:
   `wasm-tools` (built with `cargo` by `make wasm-tools`), the spec testsuite
-  (`make testsuite`), and the Kotlin/Wasm stdlib matching your `kotlinc`
-  (`make kotlin-stdlib`). Each cached copy is stamped with its version, so
-  bumping a pin or upgrading `kotlinc` fetches it again. `make check` brings
-  `wasm-tools` and the Kotlin stdlib up to date by itself; `make check-spec`
-  does the same for the testsuite.
+  (`make testsuite`), the Kotlin/Wasm stdlib matching your `kotlinc`
+  (`make kotlin-stdlib`), and wasi-sdk, the clang and sysroot the C and C++
+  corpora are built with (`make wasi-sdk`). Each cached copy is stamped with
+  its version, so bumping a pin or upgrading `kotlinc` fetches it again.
+  `make check` brings `wasm-tools`, wasi-sdk and the Kotlin stdlib up to date
+  by itself; `make check-spec` does the same for the testsuite.
 - Rows that need wasmtime, TinyGo, Go, Rust (`wasm32-wasip1` / `wasm32-wasip2`),
-  Zig, `asc` or `kotlinc-wasm` skip themselves when the tool is missing.
+  Zig, `asc`, `kotlinc-wasm` or `wasm32-wasi-ghc` skip themselves when the tool
+  is missing. GHC's wasm backend is not fetched by the Makefile: install it
+  with ghc-wasm-meta's `bootstrap.sh` (the `hsbench` corpus was recorded with
+  `FLAVOUR=9.14`), which puts it in `~/.ghc-wasm`, where `test/gobench.py`
+  finds it without `~/.ghc-wasm/env` being sourced.
 
 ---
 
