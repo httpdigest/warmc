@@ -631,7 +631,8 @@ static void emit_inst(Isel *s, Ref v) {
     }
 
     case I_WRAP: { int x = rd(s, a[0], S0); int d = wr(s, v, S0);
-                   if (d != x || (ir_known_bits(f, a[0], 4) >> 32) != 0)
+                   if (d != x || ((ir_known_bits(f, a[0], 4) >> 32) != 0 &&
+                                  !(s->lowonly && s->lowonly[v])))
                      a64_uxtw(B, d, x);
                    commit(s, v, d); break; }
     case I_EXTENDS: { int x = rd(s, a[0], S0); int d = wr(s, v, S0);
