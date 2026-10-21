@@ -67,7 +67,7 @@ Hello world!
   Functions compile in parallel and are laid out in a deterministic order.
 - **Fast code.** Across 173 benchmark kernels compiled from TinyGo, Rust, Zig,
   AssemblyScript, Kotlin, C, C++ and Haskell, warmc's steady-state code takes
-  0.47× wasmtime's time (geometric mean), with much lower peak memory. See
+  0.46× wasmtime's time (geometric mean), with much lower peak memory. See
   [Performance](#performance).
 - **Runtime for modern languages:**
   - a concurrent, compacting, ZGC-style collector with coloured pointers,
@@ -655,23 +655,24 @@ steady-state generated code, not start-up or compile time.
 |---|---|---:|---:|---|---|
 | `gobench` | TinyGo | 26 | 0.61 | 0.07 – 1.04 | 1.9 / 8.9 MB |
 | `vecbench` | TinyGo (vectorisable loops) | 30 | 0.15 | 0.04 – 0.94 | 1.9 / 8.9 MB |
-| `asbench` | AssemblyScript | 25 | 0.67 | 0.18 – 1.38 | 1.9 / 8.7 MB |
-| `rsbench` | Rust | 28 | 0.72 | 0.35 – 1.00 | 1.9 / 9.1 MB |
-| `zigbench` | Zig | 9 | 0.70 | 0.42 – 1.00 | 1.9 / 8.7 MB |
-| `ktbench` | Kotlin (Wasm GC) | 12 | 0.09 | 0.004 – 0.49 | 3.5 / 20.6 MB |
-| `cbench` | C | 14 | 0.90 | 0.43 – 1.18 | 2.0 / 8.9 MB |
-| `cppbench` | C++ | 14 | 0.75 | 0.26 – 1.02 | 2.5 / 9.5 MB |
-| `hsbench` | Haskell | 15 | 0.65 | 0.40 – 0.89 | 10.2 / 32.3 MB |
+| `asbench` | AssemblyScript | 25 | 0.67 | 0.19 – 1.36 | 1.9 / 8.7 MB |
+| `rsbench` | Rust | 28 | 0.72 | 0.35 – 1.01 | 2.0 / 9.1 MB |
+| `zigbench` | Zig | 9 | 0.70 | 0.41 – 1.00 | 1.9 / 8.7 MB |
+| `ktbench` | Kotlin (Wasm GC) | 12 | 0.09 | 0.003 – 0.49 | 3.4 / 20.6 MB |
+| `cbench` | C | 14 | 0.84 | 0.32 – 1.05 | 2.0 / 9.0 MB |
+| `cppbench` | C++ | 14 | 0.72 | 0.23 – 1.12 | 2.5 / 9.7 MB |
+| `hsbench` | Haskell | 15 | 0.65 | 0.40 – 0.89 | 10.2 / 32.2 MB |
 
-Over all 173 kernels the geometric mean is **0.47** (0.40 over the 130 outside
-the C, C++ and Haskell corpora). Thirteen kernels are slower than wasmtime.
-Eight of them are within 5%. Four are in the C corpus and not yet looked into:
-`cbench/printf` (1.18×), `interp` (1.17×), `hashtab` (1.11×) and `malloc`
-(1.09×). The last, `asbench/arrpush` (growing an array by `push`), runs at
-1.38×. That kernel was 0.94× against wasmtime 49, so wasmtime 50 is what got
-faster there; warmc has since come down from 1.61×, and compiles its hot loop
-to nearly the same instructions as wasmtime does. Re-run the comparison on
-your own machine before relying on these numbers:
+Over all 173 kernels the geometric mean is **0.46** (0.40 over the 130 outside
+the C, C++ and Haskell corpora). Eleven kernels are slower than wasmtime, and
+nine of them are within 5%. `cppbench/coroutine` (C++20 coroutines, resumed
+through function pointers stored in their frames) runs at 1.12×; it was 1.02×
+while clang still ran the module through whatever binaryen it found, which the
+corpus no longer allows. `asbench/arrpush` (growing an array by `push`) runs
+at 1.36×. That kernel was 0.94× against wasmtime 49, so wasmtime 50 is what
+got faster there; warmc has since come down from 1.61×, and compiles its hot
+loop to nearly the same instructions as wasmtime does. Re-run the comparison
+on your own machine before relying on these numbers:
 
 ```sh
 python3 test/gobench.py --corpus rsbench --rounds 5     # one corpus
