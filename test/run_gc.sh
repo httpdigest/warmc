@@ -89,6 +89,10 @@ expect i31_range         "OK"
 expect i31_not_null      "OK"
 expect const_struct      "OK"
 expect const_widths      "OK"
+expect licm_guard_null   "OK" 5
+expect licm_guard_test   "OK" 5
+expect licm_guard_vtable "OK" 5
+expect licm_guard_array  "OK" 5
 expect get_null          "null reference"
 expect set_null          "null reference"
 expect i31_get_null      "null reference"

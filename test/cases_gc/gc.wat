@@ -1140,6 +1140,74 @@
     (call $eq64 (i64x2.extract_lane 1 (struct.get $cw $u (global.get $gw)))
                 (i64.const 0x0102030405060708)))
 
+  ;; ---- loop-invariant reads behind a guard ------------------------------
+  ;;
+  ;; A read whose null or bounds check a dominating test answered carries no
+  ;; check any more, and LICM took that as leave to lift it out of the loop --
+  ;; above the test, when the test was inside the loop too.  Each loop here
+  ;; reads an object only where a test says it may, and the object is null,
+  ;; so the read never happens; lifted, it loaded from null and faulted:
+  ;; Kotlin's joinToString reading a vtable.  Called with a trip count.
+  (type $lg_box (struct (field i32)))
+  (type $lg_vt (struct (field i32)))
+  (type $lg_obj (struct (field (ref $lg_vt))))
+  (type $lg_arr (array i32))
+  (global $lg_gbox (mut (ref null $lg_box)) (ref.null $lg_box))
+  (global $lg_gany (mut anyref) (ref.null any))
+  (global $lg_gobj (mut (ref null $lg_obj)) (ref.null $lg_obj))
+  (global $lg_garr (mut (ref null $lg_arr)) (ref.null $lg_arr))
+
+  (func (export "licm_guard_null") (param $n i32)
+    (local $x (ref null $lg_box)) (local $i i32) (local $s i32)
+    (local.set $x (global.get $lg_gbox))
+    (loop $l
+      (if (i32.eqz (ref.is_null (local.get $x)))
+        (then (local.set $s (i32.add (local.get $s)
+                                     (struct.get $lg_box 0 (local.get $x))))))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br_if $l (i32.lt_u (local.get $i) (local.get $n))))
+    (call $eq32 (local.get $s) (i32.const 0)))
+
+  ;; through the cast the test already answered: its convert is pure and
+  ;; lifts on its own, typed non-null
+  (func (export "licm_guard_test") (param $n i32)
+    (local $x anyref) (local $i i32) (local $s i32)
+    (local.set $x (global.get $lg_gany))
+    (loop $l
+      (if (ref.test (ref $lg_box) (local.get $x))
+        (then (local.set $s (i32.add (local.get $s)
+                (struct.get $lg_box 0 (ref.cast (ref $lg_box) (local.get $x)))))))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br_if $l (i32.lt_u (local.get $i) (local.get $n))))
+    (call $eq32 (local.get $s) (i32.const 0)))
+
+  ;; obj.vtable.slot: the outer read is of a non-null field, but its object
+  ;; is not
+  (func (export "licm_guard_vtable") (param $n i32)
+    (local $x (ref null $lg_obj)) (local $i i32) (local $s i32)
+    (local.set $x (global.get $lg_gobj))
+    (loop $l
+      (if (i32.eqz (ref.is_null (local.get $x)))
+        (then (local.set $s (i32.add (local.get $s)
+                (struct.get $lg_vt 0 (struct.get $lg_obj 0 (local.get $x)))))))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br_if $l (i32.lt_u (local.get $i) (local.get $n))))
+    (call $eq32 (local.get $s) (i32.const 0)))
+
+  ;; array.len and an element behind a null test and a bounds test
+  (func (export "licm_guard_array") (param $n i32)
+    (local $x (ref null $lg_arr)) (local $i i32) (local $s i32)
+    (local.set $x (global.get $lg_garr))
+    (loop $l
+      (block $skip
+        (br_if $skip (ref.is_null (local.get $x)))
+        (br_if $skip (i32.ge_u (local.get $i) (array.len (local.get $x))))
+        (local.set $s (i32.add (local.get $s)
+                               (array.get $lg_arr (local.get $x) (i32.const 0)))))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br_if $l (i32.lt_u (local.get $i) (local.get $n))))
+    (call $eq32 (local.get $s) (i32.const 0)))
+
   ;; ---- escape analysis --------------------------------------------------
   ;;
   ;; The pass itself, from both sides.  The ea_* objects below stay inside

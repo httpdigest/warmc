@@ -7207,6 +7207,58 @@ static bool access_dominates(IrFunc *f, AccList *acc, Ref addr, uint64_t imm,
   return false;
 }
 
+/* Whether a GC read moved to the end of block target still has the checks
+   it was let off answered there.  Where it stood, a guard inside the loop
+   may have answered them; at target they hold if its object is non-null by
+   type all the way to its root -- a cast's convert hoists without its test
+   -- or if an access to that root dominates target, which ran and so
+   proved it not null, and for an element, read at the same index, in
+   bounds.  A field or a length also takes pass_gc_nullchk's branch facts:
+   the non-null arm of a null test or a ref.test above target. */
+static bool gc_checks_hold_at(IrFunc *f, Ref v, uint32_t target) {
+  Inst *in = &f->insts[v];
+  Ref r = gc_ref_root(f, ir_args(f, v)[0]);
+  Ref idx = in->op == I_ARRAY_GET ? ir_resolve(f, ir_args(f, v)[1]) : REF_NONE;
+  ValType rt = (ValType)f->insts[r].type;
+  if (idx == REF_NONE && vt_is_ref(rt) && !vt_nullable(rt)) return true;
+  uint32_t budget = 4096;
+  for (uint32_t bi = target; bi != REF_NONE; bi = f->blocks[bi].idom) {
+    Block *b = &f->blocks[bi];
+    Block *p = b->npreds == 1 ? &f->blocks[b->preds[0]] : NULL;
+    if (idx == REF_NONE && p && p->term == T_BRIF && p->nsuccs >= 2 &&
+        p->succs[0].target != p->succs[1].target) {
+      bool taken = p->succs[0].target == bi;
+      Ref cond = ir_resolve(f, p->term_arg);
+      while (f->insts[cond].op == I_EQZ && f->insts[cond].nargs == 1) {
+        cond = ir_resolve(f, ir_args(f, cond)[0]);
+        taken = !taken;
+      }
+      Inst *ci = &f->insts[cond];
+      if ((ci->op == I_REF_IS_NULL || ci->op == I_REF_TEST) && ci->nargs == 1 &&
+          gc_ref_root(f, ir_args(f, cond)[0]) == r) {
+        if (ci->op == I_REF_IS_NULL && !taken) return true;
+        /* null passes a nullable test and fails any other */
+        if (ci->op == I_REF_TEST &&
+            taken != ((RTEST_KIND(ci->imm) & RTK_NULLABLE) != 0))
+          return true;
+      }
+    }
+    for (uint32_t i = 0; i < b->ninsts; i++) {
+      if (!budget--) return false;
+      Ref u = b->insts[i];
+      uint16_t op = f->insts[u].op;
+      bool elem = op == I_ARRAY_GET || op == I_ARRAY_SET;
+      if (!elem && op != I_FIELD_GET && op != I_FIELD_SET && op != I_ARRAY_LEN)
+        continue;
+      if (gc_ref_root(f, ir_args(f, u)[0]) != r) continue;
+      if (idx == REF_NONE || (elem && ir_resolve(f, ir_args(f, u)[1]) == idx))
+        return true;
+    }
+    if (bi == f->entry) break;
+  }
+  return false;
+}
+
 /* lblk lists the loop's blocks, in index order: the stores a load must not
    alias are looked for there, not in a scan of every block per load. */
 static bool inst_hoistable(IrFunc *f, Ref v, bool reach_mem, bool reach_any,
@@ -7280,10 +7332,20 @@ static bool inst_hoistable(IrFunc *f, Ref v, bool reach_mem, bool reach_any,
      array elements cannot alias each other.  Traps ride the same rule as
      the divides below -- only from a position the loop always reaches.
      Kotlin's array wrappers re-read their storage field, with its null
-     check and load barrier, on every iteration; this is that lever. */
+     check and load barrier, on every iteration; this is that lever.
+     A check the access no longer carries was answered by a dominating
+     proof, and past the header's always-reached stretch that proof may be
+     a guard inside the loop -- the access in the non-null arm of a test --
+     so there it moves only where the preheader answers the same checks
+     (gc_checks_hold_at).  Kotlin's joinToString read a vtable from null. */
   if (gcpure && (in->op == I_ARRAY_LEN || in->op == I_FIELD_GET ||
                  in->op == I_ARRAY_GET)) {
     if (gc_op_traps(in) && !reach_any) return false;
+    if (!reach_any) {
+      for (uint32_t j = 0; j < in->nargs; j++)
+        if (inloop[f->insts[ir_args(f, v)[j]].block]) return false;
+      if (!gc_checks_hold_at(f, v, preheader)) return false;
+    }
     if (in->op == I_ARRAY_LEN) return true;
     if (in->op == I_FIELD_GET)
       return gc_field_immutable(f, v) ||
