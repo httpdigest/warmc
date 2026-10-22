@@ -20,6 +20,13 @@ void *xcalloc(size_t n, size_t sz);
 void *xrealloc(void *p, size_t n);
 void xfree(void *p);
 void xcache_release(void);
+/* The most an xmalloc of n bytes can hold without costing more memory: n
+   rounded up to fill its size class. */
+size_t xmalloc_fit(size_t n);
+/* The process's peak resident memory so far, in MB; 0 where unknown. */
+double peak_rss_mb(void);
+/* getenv for the WARMC_ switches, from a copy taken on first use (util.c). */
+const char *warmc_getenv(const char *name);
 char *xstrndup(const char *s, size_t n);
 
 typedef int32_t HeapType;

@@ -2064,7 +2064,7 @@ static void emit_inst(Isel *s, Ref v) {
       uint32_t lo, hi, nslots;
       bool exact;
       if ((RTEST_KIND(in->imm) & ~RTK_NULLABLE) == RTK_CONCRETE_ANY &&
-          !getenv("WARMC_NO_RTEST_FAST") &&
+          !warmc_getenv("WARMC_NO_RTEST_FAST") &&
           rtest_slots(f->m, in->imm, in->imm2, &lo, &hi, &exact, &nslots)) {
         int x = rd(s, a[0], S0);
         bool nullable = (RTEST_KIND(in->imm) & RTK_NULLABLE) != 0;
@@ -2729,7 +2729,7 @@ static void emit_block(Isel *s, uint32_t bi, uint32_t next_bi) {
       /* An edge with nothing to move needs no code of its own, so its entry
          names the target block and the dispatch is one indirect branch; only
          an edge with moves gets a stub that makes them and branches on. */
-      bool direct = !getenv("WARMC_NO_DIRECT_BRTABLE");
+      bool direct = !warmc_getenv("WARMC_NO_DIRECT_BRTABLE");
       for (uint32_t i = 0; i < n; i++) {
         Edge *e = &b->succs[i];
         if (direct && !edge_has_moves(s, e)) {

@@ -317,23 +317,44 @@ static void occ_rebuild(OccHeap *h, const uint8_t *gone, int32_t floor_) {
   }
 }
 
+/* An interval's ranges are sorted and disjoint (the hole pass merges them),
+   so their ends rise too: the only one that can meet [lo, hi] is the first
+   that ends at or after lo.  A long-lived value in a large function has
+   thousands, and this is asked once per range a register holds. */
 static bool occ_hits(const Interval *cur, const Range *R, int32_t lo, int32_t hi) {
   if (!cur->rcount) return cur->start <= hi && lo <= cur->end;
-  for (uint32_t i = 0; i < cur->rcount; i++) {
-    const Range *x = &R[cur->rfirst + i];
-    if (x->lo > hi) break;
-    if (x->lo <= hi && lo <= x->hi) return true;
+  const Range *x = &R[cur->rfirst];
+  uint32_t n = cur->rcount;
+  if (n <= 8) {
+    for (uint32_t i = 0; i < n; i++) {
+      if (x[i].lo > hi) break;
+      if (lo <= x[i].hi) return true;
+    }
+    return false;
   }
-  return false;
+  uint32_t a = 0, b = n;
+  while (a < b) {
+    uint32_t m = a + (b - a) / 2;
+    if (x[m].hi < lo) a = m + 1; else b = m;
+  }
+  return a < n && x[a].lo <= hi;
 }
 
 /* 0 = free, 1 = exactly one interval conflicts (in *victim), 2 = more.
    Ranges whose hi is behind cur, and ranges of an interval that has since been
    spilled, are dead: they are skipped here and dropped by the next rebuild. */
+typedef struct { uint32_t *v; uint32_t cap; } OStack;
+
 static int occ_conflicts(OccHeap *h, const Interval *cur, const Range *R,
-                         const uint8_t *gone, uint32_t *stack, int32_t *victim) {
+                         const uint8_t *gone, OStack *os, int32_t *victim) {
   *victim = -1;
   if (!h->n) return 0;
+  /* each heap node goes on the stack at most once */
+  if (os->cap < h->n + 1) {
+    os->cap = h->n * 2 + 2;
+    os->v = xrealloc(os->v, os->cap * sizeof(uint32_t));
+  }
+  uint32_t *stack = os->v;
   uint32_t sp = 0, seen_dead = 0;
   stack[sp++] = 0;
   int found = 0;
@@ -407,32 +428,38 @@ typedef struct {
    their pinned slots) needs no save; a table.size on memory 0 lowers inline
    with no call at all.  Both get empty lists, keeping the built-equals-
    emitted accounting exact. */
-static void csa_list_sites(Isel *s, IrFunc *f, Ref site, const uint64_t *live,
-                           size_t W, void *vctx) {
+static void csa_list_sites(Isel *s, IrFunc *f, Ref site, const Ref *live,
+                           uint32_t nlive, void *vctx) {
   CsaListCtx *ctx = vctx;
   uint16_t op = f->insts[site].op;
   if (op == I_THROW || op == I_THROW_REF) return;
   if (op == I_TABLE_SIZE && f->insts[site].imm == 0) return;
   uint32_t stamp = ++ctx->stamp_ctr;
   uint32_t first = s->ncsa_vals;
-  for (size_t w = 0; w < W; w++) {
-    uint64_t bits = live[w];
-    while (bits) {
-      uint32_t v = (uint32_t)(w * 64 + (unsigned)__builtin_ctzll(bits));
-      bits &= bits - 1;
-      if (v == site) continue;
-      uint32_t rep = ctx->web[v];
-      if (!s->csa_on[rep] || ctx->stamp[rep] == stamp) continue;
-      ctx->stamp[rep] = stamp;
-      if (s->ncsa_vals == s->cap_csa_vals) {
-        s->cap_csa_vals = s->cap_csa_vals ? s->cap_csa_vals * 2 : 16;
-        s->csa_vals = xrealloc(s->csa_vals, s->cap_csa_vals * sizeof(Ref));
-      }
-      s->csa_vals[s->ncsa_vals++] = rep;
+  for (uint32_t k = 0; k < nlive; k++) {
+    uint32_t v = live[k];
+    if (v == site) continue;
+    uint32_t rep = ctx->web[v];
+    if (!s->csa_on[rep] || ctx->stamp[rep] == stamp) continue;
+    ctx->stamp[rep] = stamp;
+    if (s->ncsa_vals == s->cap_csa_vals) {
+      s->cap_csa_vals = s->cap_csa_vals ? s->cap_csa_vals * 2 : 16;
+      s->csa_vals = xrealloc(s->csa_vals, s->cap_csa_vals * sizeof(Ref));
     }
+    s->csa_vals[s->ncsa_vals++] = rep;
   }
   s->csa_first[site] = first;
   s->csa_n[site] = s->ncsa_vals - first;
+}
+
+/* One block's range for one value, filed under the value's web. */
+typedef struct { uint32_t rep; int32_t lo, hi; } BlkRange;
+
+static int blk_range_cmp(const void *a, const void *b) {
+  const BlkRange *x = a, *y = b;
+  if (x->rep != y->rep) return x->rep < y->rep ? -1 : 1;
+  if (x->lo != y->lo) return x->lo < y->lo ? -1 : 1;
+  return x->hi < y->hi ? -1 : x->hi > y->hi;
 }
 
 static int interval_cmp(const void *a, const void *b) {
@@ -475,128 +502,269 @@ static uint32_t eff_use_cap(IrFunc *f) {
   uint32_t maxargs = 4;
   for (uint32_t i = 0; i < f->ninsts; i++)
     if (f->insts[i].nargs > maxargs) maxargs = f->insts[i].nargs;
+  if (f->made_maxargs > maxargs) maxargs = f->made_maxargs;
   return maxargs * 8 + 32;
 }
 
-#define LV_WORDS(n) (((size_t)(n) + 63) / 64)
-static inline void lv_set(uint64_t *s, uint32_t v) { s[v >> 6] |= 1ull << (v & 63); }
-static inline void lv_clr(uint64_t *s, uint32_t v) { s[v >> 6] &= ~(1ull << (v & 63)); }
+/* Live-in and live-out sets: per block, a sorted array of the values live on
+   entry and on exit, in s->lv_in and s->lv_out at the offsets s->lv_in_off
+   and s->lv_out_off give (nblocks + 1 each; blocks outside the order get
+   empty sets).
 
-static void compute_liveness_now(Isel *s, uint64_t **livein_out,
-                                 uint64_t **liveout_out) {
-  IrFunc *f = s->f;
-  uint32_t n = f->ninsts;
-  size_t W = LV_WORDS(n);
-  uint32_t eucap = eff_use_cap(f);
-  Ref *eu = xmalloc(eucap * sizeof(Ref));
-  uint64_t *livein = xcalloc((size_t)f->nblocks * W + 1, sizeof(uint64_t));
-  uint64_t *liveout = xcalloc((size_t)f->nblocks * W + 1, sizeof(uint64_t));
+   Most values die in the block that defines them, so these are small beside
+   the function -- a generated adapter of 78,000 blocks has 1.3 values live
+   into each on average -- while bit vectors of every value per block cost
+   blocks times values in memory and again in every sweep: 2.6 GB and most of
+   a second there.  So each value is followed up from each of its uses to its
+   definition instead (path exploration), and the work is the size of the
+   sets.  Values are taken in increasing order, so each block's array comes
+   out sorted, the order a bit vector would give them in.
 
-  uint64_t *out = xmalloc((W ? W : 1) * sizeof(uint64_t));
-  uint64_t *edge = xmalloc((W ? W : 1) * sizeof(uint64_t));
-  bool changed = true;
-  while (changed) {
-    changed = false;
-    for (int32_t oi = (int32_t)f->norder - 1; oi >= 0; oi--) {
-      uint32_t bi = f->order[oi];
-      Block *b = &f->blocks[bi];
-      memset(out, 0, W * sizeof(uint64_t));
-      /* Each edge on its own: a target's params are defined on its edges,
-         not live across them, but the same values may be live into another
-         successor -- a loop header that is its own br_table default keeps
-         its params live into every case it dispatches to. */
-      for (uint32_t sidx = 0; sidx < b->nsuccs; sidx++) {
-        uint32_t t = b->succs[sidx].target;
-        Block *tb = &f->blocks[t];
-        memcpy(edge, &livein[(size_t)t * W], W * sizeof(uint64_t));
-        for (uint32_t p = 0; p < tb->nparams; p++) lv_clr(edge, tb->params[p]);
-        for (uint32_t j = 0; j < b->succs[sidx].nargs; j++)
-          lv_set(edge, b->succs[sidx].args[j]);
-        for (size_t w = 0; w < W; w++) out[w] |= edge[w];
-      }
-      if (b->term == T_BRIF && s->fused && s->fused[b->term_arg]) {
-        uint32_t ne = eff_uses(s, f, b->term_arg, eu, eucap);
-        for (uint32_t j = 0; j < ne; j++) lv_set(out, eff_arg(s, f, eu[j]));
-      } else if (b->term == T_BRIF || b->term == T_BRTABLE) {
-        lv_set(out, b->term_arg);
-      }
-      for (uint32_t i = 0; i < b->nret; i++) lv_set(out, b->ret_args[i]);
+   The uses are the ones the bit-vector form counted: each instruction's
+   effective operands at its index, and at the block's end the branch's
+   operand (a fused compare's own operands), the returned values and each
+   edge's arguments.  A param is defined on entry to its block, so it is
+   never live into it. */
+#define LV_END UINT32_MAX
 
-      uint64_t *lo = &liveout[(size_t)bi * W];
-      for (size_t w = 0; w < W; w++) {
-        uint64_t add = out[w] & ~lo[w];
-        if (add) { lo[w] |= add; changed = true; }
-      }
+typedef struct { Ref v; uint32_t b, pos; } LvUse;
 
-      for (int32_t i = (int32_t)b->ninsts - 1; i >= 0; i--) {
-        Ref r2 = b->insts[i];
-        lv_clr(out, r2);
-        uint32_t ne = eff_uses(s, f, r2, eu, eucap);
-        for (uint32_t j = 0; j < ne; j++) lv_set(out, eu[j]);
-      }
-      for (uint32_t p = 0; p < b->nparams; p++) lv_clr(out, b->params[p]);
-
-      uint64_t *li = &livein[(size_t)bi * W];
-      for (size_t w = 0; w < W; w++) {
-        uint64_t add = out[w] & ~li[w];
-        if (add) { li[w] |= add; changed = true; }
-      }
-    }
+static void lv_note_use(LvUse **u, uint32_t *nu, uint32_t *cap, Ref v,
+                        uint32_t b, uint32_t pos) {
+  if (*nu == *cap) {
+    *cap = *cap ? *cap * 2 : 256;
+    *u = xrealloc(*u, *cap * sizeof(LvUse));
   }
-  xfree(out);
-  xfree(edge);
-  xfree(eu);
-  *livein_out = livein;
-  *liveout_out = liveout;
+  (*u)[(*nu)++] = (LvUse){ v, b, pos };
 }
 
-static void compute_liveness(Isel *s, uint64_t **livein_out,
-                             uint64_t **liveout_out) {
-  if (!s->lv_in) compute_liveness_now(s, &s->lv_in, &s->lv_out);
-  *livein_out = s->lv_in;
-  *liveout_out = s->lv_out;
-}
-
-/* Backward walk over the emission order invoking fn at every instruction that
-   clobbers the caller-saved registers, with the values live across it (the
-   site's own def is still in the set; callers exclude it). */
-static void for_each_clobber_site(Isel *s, IrFunc *f, const uint64_t *liveout,
-                                  size_t W,
-                                  void (*fn)(Isel *, IrFunc *, Ref,
-                                             const uint64_t *, size_t, void *),
-                                  void *ctx) {
+static void compute_liveness_now(Isel *s) {
+  IrFunc *f = s->f;
+  uint32_t n = f->ninsts, nb = f->nblocks;
   uint32_t eucap = eff_use_cap(f);
   Ref *eu = xmalloc(eucap * sizeof(Ref));
-  uint64_t *live = xmalloc((W ? W : 1) * sizeof(uint64_t));
+
+  /* Where each value is defined: its block and its index there, -1 for a
+     param.  A value no block in the order defines stays UINT32_MAX and is
+     live all the way up to the entry, as it was in the bit vectors. */
+  uint32_t *dblk = xmalloc((n ? n : 1) * sizeof(uint32_t));
+  int32_t *dpos = xmalloc((n ? n : 1) * sizeof(int32_t));
+  for (uint32_t i = 0; i < n; i++) dblk[i] = UINT32_MAX;
+  uint32_t *poff = xcalloc((size_t)nb + 1, sizeof(uint32_t));
+  LvUse *use = NULL;
+  uint32_t nuse = 0, capuse = 0;
   for (uint32_t oi = 0; oi < f->norder; oi++) {
     uint32_t bi = f->order[oi];
     Block *b = &f->blocks[bi];
-    memcpy(live, &liveout[(size_t)bi * W], W * sizeof(uint64_t));
-    for (int32_t i = (int32_t)b->ninsts - 1; i >= 0; i--) {
+    for (uint32_t p = 0; p < b->nparams; p++) {
+      dblk[b->params[p]] = bi;
+      dpos[b->params[p]] = -1;
+    }
+    for (uint32_t i = 0; i < b->ninsts; i++) {
       Ref r2 = b->insts[i];
-      if (op_clobbers_caller_saved(f->insts[r2].op))
-        fn(s, f, r2, live, W, ctx);
-      lv_clr(live, r2);
       uint32_t ne = eff_uses(s, f, r2, eu, eucap);
-      for (uint32_t j = 0; j < ne; j++) lv_set(live, eu[j]);
+      for (uint32_t j = 0; j < ne; j++) lv_note_use(&use, &nuse, &capuse, eu[j], bi, i);
+      dblk[r2] = bi;
+      dpos[r2] = (int32_t)i;
+    }
+    if (b->term == T_BRIF && s->fused && s->fused[b->term_arg]) {
+      uint32_t ne = eff_uses(s, f, b->term_arg, eu, eucap);
+      for (uint32_t j = 0; j < ne; j++)
+        lv_note_use(&use, &nuse, &capuse, eff_arg(s, f, eu[j]), bi, LV_END);
+    } else if (b->term == T_BRIF || b->term == T_BRTABLE) {
+      lv_note_use(&use, &nuse, &capuse, b->term_arg, bi, LV_END);
+    }
+    for (uint32_t i = 0; i < b->nret; i++)
+      lv_note_use(&use, &nuse, &capuse, b->ret_args[i], bi, LV_END);
+    for (uint32_t k = 0; k < b->nsuccs; k++) {
+      poff[b->succs[k].target + 1]++;
+      for (uint32_t j = 0; j < b->succs[k].nargs; j++)
+        lv_note_use(&use, &nuse, &capuse, b->succs[k].args[j], bi, LV_END);
     }
   }
-  xfree(live);
+
+  /* Predecessors along the order's edges, one entry per edge. */
+  for (uint32_t i = 0; i < nb; i++) poff[i + 1] += poff[i];
+  uint32_t *pred = xmalloc((poff[nb] ? poff[nb] : 1) * sizeof(uint32_t));
+  uint32_t *pcur = xmalloc(((size_t)nb + 1) * sizeof(uint32_t));
+  memcpy(pcur, poff, ((size_t)nb + 1) * sizeof(uint32_t));
+  for (uint32_t oi = 0; oi < f->norder; oi++) {
+    uint32_t bi = f->order[oi];
+    Block *b = &f->blocks[bi];
+    for (uint32_t k = 0; k < b->nsuccs; k++) pred[pcur[b->succs[k].target]++] = bi;
+  }
+
+  /* The uses filed by value, in the order they were met. */
+  uint32_t *uoff = xcalloc((size_t)n + 1, sizeof(uint32_t));
+  for (uint32_t k = 0; k < nuse; k++) uoff[use[k].v + 1]++;
+  for (uint32_t i = 0; i < n; i++) uoff[i + 1] += uoff[i];
+  LvUse *byv = xmalloc((nuse ? nuse : 1) * sizeof(LvUse));
+  uint32_t *ucur = xmalloc(((size_t)n + 1) * sizeof(uint32_t));
+  memcpy(ucur, uoff, ((size_t)n + 1) * sizeof(uint32_t));
+  for (uint32_t k = 0; k < nuse; k++) byv[ucur[use[k].v]++] = use[k];
+  xfree(use); xfree(ucur);
+
+  /* Two walks of the same paths: the first counts each block's sets, the
+     second fills them. */
+  uint32_t *in_mark = xmalloc((nb ? nb : 1) * sizeof(uint32_t));
+  uint32_t *out_mark = xmalloc((nb ? nb : 1) * sizeof(uint32_t));
+  uint32_t *in_off = xcalloc((size_t)nb + 1, sizeof(uint32_t));
+  uint32_t *out_off = xcalloc((size_t)nb + 1, sizeof(uint32_t));
+  uint32_t *in_cur = NULL, *out_cur = NULL;
+  Ref *in = NULL, *out = NULL;
+  uint32_t *stack = xmalloc((nb ? nb : 1) * sizeof(uint32_t));
+  for (int pass = 0; pass < 2; pass++) {
+    if (pass == 1) {
+      for (uint32_t i = 0; i < nb; i++) {
+        in_off[i + 1] += in_off[i];
+        out_off[i + 1] += out_off[i];
+      }
+      in = xmalloc((in_off[nb] ? in_off[nb] : 1) * sizeof(Ref));
+      out = xmalloc((out_off[nb] ? out_off[nb] : 1) * sizeof(Ref));
+      in_cur = xmalloc(((size_t)nb + 1) * sizeof(uint32_t));
+      out_cur = xmalloc(((size_t)nb + 1) * sizeof(uint32_t));
+      memcpy(in_cur, in_off, ((size_t)nb + 1) * sizeof(uint32_t));
+      memcpy(out_cur, out_off, ((size_t)nb + 1) * sizeof(uint32_t));
+    }
+    for (uint32_t i = 0; i < nb; i++) in_mark[i] = out_mark[i] = UINT32_MAX;
+
+#define LV_IN(b_)  do { if (pass) in[in_cur[b_]++] = v; else in_off[(b_) + 1]++; } while (0)
+#define LV_OUT(b_) do { if (pass) out[out_cur[b_]++] = v; else out_off[(b_) + 1]++; } while (0)
+    for (uint32_t v = 0; v < n; v++) {
+      for (uint32_t k = uoff[v]; k < uoff[v + 1]; k++) {
+        uint32_t ub = byv[k].b, sp = 0;
+        bool exposed;
+        if (byv[k].pos == LV_END) {
+          if (out_mark[ub] != v) { out_mark[ub] = v; LV_OUT(ub); }
+          exposed = dblk[v] != ub;
+        } else {
+          exposed = dblk[v] != ub || dpos[v] >= (int32_t)byv[k].pos;
+        }
+        if (!exposed || in_mark[ub] == v) continue;
+        in_mark[ub] = v;
+        stack[sp++] = ub;
+        while (sp) {
+          uint32_t bb = stack[--sp];
+          LV_IN(bb);
+          for (uint32_t q = poff[bb]; q < poff[bb + 1]; q++) {
+            uint32_t pb = pred[q];
+            if (out_mark[pb] != v) { out_mark[pb] = v; LV_OUT(pb); }
+            if (dblk[v] != pb && in_mark[pb] != v) {
+              in_mark[pb] = v;
+              stack[sp++] = pb;
+            }
+          }
+        }
+      }
+    }
+#undef LV_IN
+#undef LV_OUT
+  }
+
+  xfree(stack); xfree(in_mark); xfree(out_mark); xfree(in_cur); xfree(out_cur);
+  xfree(byv); xfree(uoff); xfree(pred); xfree(pcur); xfree(poff);
+  xfree(dblk); xfree(dpos); xfree(eu);
+  s->lv_in_off = in_off; s->lv_in = in;
+  s->lv_out_off = out_off; s->lv_out = out;
+}
+
+static void compute_liveness(Isel *s) {
+  if (!s->lv_in_off) compute_liveness_now(s);
+}
+
+static bool live_in_has(const Isel *s, uint32_t bi, Ref v) {
+  uint32_t a = s->lv_in_off[bi], b = s->lv_in_off[bi + 1];
+  while (a < b) {
+    uint32_t m = a + (b - a) / 2;
+    if (s->lv_in[m] < v) a = m + 1; else b = m;
+  }
+  return a < s->lv_in_off[bi + 1] && s->lv_in[a] == v;
+}
+
+/* The values live at each point of a block, walked backwards from its
+   live-out set: a sparse set, so starting a block costs its live-out set
+   rather than the function's size, with the members handed out sorted. */
+typedef struct {
+  uint32_t *idx;
+  Ref *mem, *sorted;
+  uint32_t nmem;
+} LiveWalk;
+
+static inline bool lw_has(const LiveWalk *w, Ref v) {
+  uint32_t k = w->idx[v];
+  return k < w->nmem && w->mem[k] == v;
+}
+
+static inline void lw_add(LiveWalk *w, Ref v) {
+  if (lw_has(w, v)) return;
+  w->idx[v] = w->nmem;
+  w->mem[w->nmem++] = v;
+}
+
+static inline void lw_del(LiveWalk *w, Ref v) {
+  if (!lw_has(w, v)) return;
+  uint32_t k = w->idx[v];
+  Ref last = w->mem[--w->nmem];
+  w->mem[k] = last;
+  w->idx[last] = k;
+}
+
+static int ref_cmp(const void *a, const void *b) {
+  Ref x = *(const Ref *)a, y = *(const Ref *)b;
+  return x < y ? -1 : x > y;
+}
+
+static const Ref *lw_sorted(LiveWalk *w) {
+  memcpy(w->sorted, w->mem, w->nmem * sizeof(Ref));
+  qsort(w->sorted, w->nmem, sizeof(Ref), ref_cmp);
+  return w->sorted;
+}
+
+/* Backward walk over the emission order invoking fn at every instruction
+   want(op) picks, with the values live across it in increasing order (the
+   site's own def is still among them; callers exclude it). */
+static void for_each_live_site(Isel *s, IrFunc *f, bool (*want)(uint16_t),
+                               void (*fn)(Isel *, IrFunc *, Ref, const Ref *,
+                                          uint32_t, void *),
+                               void *ctx) {
+  uint32_t n = f->ninsts;
+  compute_liveness(s);
+  uint32_t eucap = eff_use_cap(f);
+  Ref *eu = xmalloc(eucap * sizeof(Ref));
+  LiveWalk w = { xcalloc(n ? n : 1, sizeof(uint32_t)),
+                 xmalloc((n ? n : 1) * sizeof(Ref)),
+                 xmalloc((n ? n : 1) * sizeof(Ref)), 0 };
+  for (uint32_t oi = 0; oi < f->norder; oi++) {
+    uint32_t bi = f->order[oi];
+    Block *b = &f->blocks[bi];
+    w.nmem = 0;
+    for (uint32_t k = s->lv_out_off[bi]; k < s->lv_out_off[bi + 1]; k++)
+      lw_add(&w, s->lv_out[k]);
+    for (int32_t i = (int32_t)b->ninsts - 1; i >= 0; i--) {
+      Ref r2 = b->insts[i];
+      if (want(f->insts[r2].op)) fn(s, f, r2, lw_sorted(&w), w.nmem, ctx);
+      lw_del(&w, r2);
+      uint32_t ne = eff_uses(s, f, r2, eu, eucap);
+      for (uint32_t j = 0; j < ne; j++) lw_add(&w, eu[j]);
+    }
+  }
+  xfree(w.idx); xfree(w.mem); xfree(w.sorted);
   xfree(eu);
 }
 
+static void for_each_clobber_site(Isel *s, IrFunc *f,
+                                  void (*fn)(Isel *, IrFunc *, Ref, const Ref *,
+                                             uint32_t, void *),
+                                  void *ctx) {
+  for_each_live_site(s, f, op_clobbers_caller_saved, fn, ctx);
+}
+
 static void mark_crosses_call(Isel *s, IrFunc *f, Ref site,
-                              const uint64_t *live, size_t W, void *ctx) {
+                              const Ref *live, uint32_t nlive, void *ctx) {
   Interval *iv = ctx;
   (void)s; (void)f;
-  for (size_t w = 0; w < W; w++) {
-    uint64_t bits = live[w];
-    while (bits) {
-      uint32_t v = (uint32_t)(w * 64 + (unsigned)__builtin_ctzll(bits));
-      bits &= bits - 1;
-      if (v != site) iv[v].crosses_call = 1;
-    }
-  }
+  for (uint32_t k = 0; k < nlive; k++)
+    if (live[k] != site) iv[live[k]].crosses_call = 1;
 }
 
 #define SPLIT_BUDGET ((uint64_t)8 * 1024 * 1024)
@@ -786,28 +954,18 @@ static void regalloc_linear(Isel *s) {
     }
   }
 
-  uint64_t *livein, *liveout;
-  compute_liveness(s, &livein, &liveout);
-  size_t W = LV_WORDS(n);
+  compute_liveness(s);
+  const uint32_t *lin_off = s->lv_in_off, *lout_off = s->lv_out_off;
+  const Ref *lin = s->lv_in, *lout = s->lv_out;
   for (uint32_t bi = 0; bi < f->nblocks; bi++) {
     if (!f->blocks[bi].reachable) continue;
-
-    const uint64_t *li = &livein[(size_t)bi * W], *lo = &liveout[(size_t)bi * W];
-    for (size_t w = 0; w < W; w++) {
-      uint64_t bits = li[w];
-      while (bits) {
-        extend(&iv[w * 64 + (unsigned)__builtin_ctzll(bits)], blk_start[bi]);
-        bits &= bits - 1;
-      }
-      bits = lo[w];
-      while (bits) {
-        extend(&iv[w * 64 + (unsigned)__builtin_ctzll(bits)], blk_end[bi]);
-        bits &= bits - 1;
-      }
-    }
+    for (uint32_t k = lin_off[bi]; k < lin_off[bi + 1]; k++)
+      extend(&iv[lin[k]], blk_start[bi]);
+    for (uint32_t k = lout_off[bi]; k < lout_off[bi + 1]; k++)
+      extend(&iv[lout[k]], blk_end[bi]);
   }
 
-  for_each_clobber_site(s, f, liveout, W, mark_crosses_call, iv);
+  for_each_clobber_site(s, f, mark_crosses_call, iv);
 
   int32_t *hint = xmalloc(n * sizeof(int32_t));
   for (uint32_t i = 0; i < n; i++) hint[i] = -1;
@@ -859,12 +1017,12 @@ static void regalloc_linear(Isel *s) {
   (void)find;
 #define FIND(x) ({ uint32_t _r = (x); while (web[_r] != _r) _r = web[_r]; _r; })
 
-  const char *co_only = getenv("WARMC_COALESCE_ONLY");
-  const char *co_upto = getenv("WARMC_COALESCE_UPTO");
-  const char *co_max_s = getenv("WARMC_COALESCE_MAX");
+  const char *co_only = warmc_getenv("WARMC_COALESCE_ONLY");
+  const char *co_upto = warmc_getenv("WARMC_COALESCE_UPTO");
+  const char *co_max_s = warmc_getenv("WARMC_COALESCE_MAX");
   int co_max = co_max_s ? atoi(co_max_s) : -1, co_done = 0;
-  bool co_dbg = getenv("WARMC_COALESCE_DEBUG") != NULL;
-  bool co_ok = !getenv("WARMC_NO_COALESCE");
+  bool co_dbg = warmc_getenv("WARMC_COALESCE_DEBUG") != NULL;
+  bool co_ok = !warmc_getenv("WARMC_NO_COALESCE");
   if (co_ok && co_only) co_ok = (uint32_t)atoi(co_only) == f->func_index;
   if (co_ok && co_upto) co_ok = f->func_index <= (uint32_t)atoi(co_upto);
   if (co_ok)
@@ -946,13 +1104,16 @@ static void regalloc_linear(Isel *s) {
 
   Range *R = NULL;
   uint32_t nR = 0;
-  if (!getenv("WARMC_NO_HOLES")) {
+  if (!warmc_getenv("WARMC_NO_HOLES")) {
     int32_t *fpos = xmalloc(n * sizeof(int32_t));
     int32_t *lpos = xmalloc(n * sizeof(int32_t));
     uint32_t *stamp = xcalloc(n ? n : 1, sizeof(uint32_t));
     uint32_t *touched = xmalloc(n * sizeof(uint32_t));
     uint32_t *rcnt = xcalloc(n ? n : 1, sizeof(uint32_t));
     uint32_t *roff = xmalloc((n + 1) * sizeof(uint32_t));
+    int32_t *tail = xmalloc((n ? n : 1) * sizeof(int32_t));
+    uint32_t *rstamp = xcalloc(n ? n : 1, sizeof(uint32_t));
+    BlkRange *bent = xmalloc((n ? n : 1) * sizeof(BlkRange));
     uint64_t budget = 0;
     uint32_t stamp_ctr = 0;
     bool over_budget = false;
@@ -1006,64 +1167,62 @@ static void regalloc_linear(Isel *s) {
             if (num[b->succs[sidx].args[j]] >= 0)
               TOUCH(b->succs[sidx].args[j], blk_end[bi]);
 
-        const uint64_t *li = &livein[(size_t)bi * W], *lo = &liveout[(size_t)bi * W];
-        for (size_t w = 0; w < W; w++) {
-          uint64_t bits = li[w];
-          while (bits) {
-            uint32_t v = (uint32_t)(w * 64 + (unsigned)__builtin_ctzll(bits));
-            bits &= bits - 1;
-            if (num[v] >= 0) TOUCH(v, blk_start[bi]);
-          }
-          bits = lo[w];
-          while (bits) {
-            uint32_t v = (uint32_t)(w * 64 + (unsigned)__builtin_ctzll(bits));
-            bits &= bits - 1;
-            if (num[v] >= 0) TOUCH(v, blk_end[bi]);
-          }
-        }
+        for (uint32_t k = lin_off[bi]; k < lin_off[bi + 1]; k++)
+          if (num[lin[k]] >= 0) TOUCH(lin[k], blk_start[bi]);
+        for (uint32_t k = lout_off[bi]; k < lout_off[bi + 1]; k++)
+          if (num[lout[k]] >= 0) TOUCH(lout[k], blk_end[bi]);
 #undef TOUCH
 
+        /* The block's range for each value, merged on to its web's last
+           range as it comes: blocks come in position order, so only a web
+           with two values here can have ranges out of order, and those are
+           sorted first.  The budget still counts every range. */
+        uint32_t ne = 0;
+        bool dup = false;
         for (uint32_t t = 0; t < nt; t++) {
           uint32_t v = touched[t], rep = web[v] < n ? web[v] : v;
           if (iv[rep].end < 0) continue;
-          if (pass == 0) {
-            rcnt[rep]++;
-            if (++budget > RANGE_BUDGET) {
-              over_budget = true;
-              g_stats.range_budget_trips++;
-              break;
-            }
+          if (pass == 0 && ++budget > RANGE_BUDGET) {
+            over_budget = true;
+            g_stats.range_budget_trips++;
+            break;
           }
-          else {
-            Range *slot_r = &R[roff[rep] + rcnt[rep]++];
-            slot_r->lo = fpos[v]; slot_r->hi = lpos[v];
+          if (rstamp[rep] == cur_stamp) dup = true;
+          rstamp[rep] = cur_stamp;
+          bent[ne++] = (BlkRange){ rep, fpos[v], lpos[v] };
+        }
+        if (over_budget) break;
+        if (dup) qsort(bent, ne, sizeof(BlkRange), blk_range_cmp);
+        for (uint32_t k = 0; k < ne; k++) {
+          uint32_t rep = bent[k].rep;
+          int32_t lo = bent[k].lo, hi = bent[k].hi;
+          if (pass == 0) {
+            if (rcnt[rep] && lo <= tail[rep] + 1) {
+              if (hi > tail[rep]) tail[rep] = hi;
+            } else {
+              rcnt[rep]++;
+              tail[rep] = hi;
+            }
+          } else {
+            Range *last = rcnt[rep] ? &R[roff[rep] + rcnt[rep] - 1] : NULL;
+            if (last && lo <= last->hi + 1) {
+              if (hi > last->hi) last->hi = hi;
+            } else {
+              R[roff[rep] + rcnt[rep]++] = (Range){ lo, hi };
+            }
           }
         }
       }
     }
 
-    if (R) {
-      for (uint32_t i = 0; i < n; i++) {
-        uint32_t c = rcnt[i];
-        if (!c) continue;
-        Range *rr = &R[roff[i]];
-        for (uint32_t x = 1; x < c; x++) {
-          Range key = rr[x];
-          uint32_t y = x;
-          while (y && (rr[y - 1].lo > key.lo)) { rr[y] = rr[y - 1]; y--; }
-          rr[y] = key;
+    if (R)
+      for (uint32_t i = 0; i < n; i++)
+        if (rcnt[i]) {
+          iv[i].rfirst = roff[i];
+          iv[i].rcount = rcnt[i];
         }
-        uint32_t m = 0;
-        for (uint32_t x = 1; x < c; x++) {
-          if (rr[x].lo <= rr[m].hi + 1) {
-            if (rr[x].hi > rr[m].hi) rr[m].hi = rr[x].hi;
-          } else rr[++m] = rr[x];
-        }
-        iv[i].rfirst = roff[i];
-        iv[i].rcount = m + 1;
-      }
-    }
     xfree(fpos); xfree(lpos); xfree(stamp); xfree(touched); xfree(rcnt); xfree(roff);
+    xfree(tail); xfree(rstamp); xfree(bent);
 
   }
 
@@ -1195,8 +1354,7 @@ static void regalloc_linear(Isel *s) {
   memset(gpr_occ, 0, sizeof gpr_occ);
   memset(fpr_occ, 0, sizeof fpr_occ);
   uint8_t *gone = xcalloc(ns ? ns : 1, 1);
-  uint32_t ostack_cap = (nR > ns ? nR : ns) + 2;
-  uint32_t *ostack = xmalloc(ostack_cap * sizeof(uint32_t));
+  OStack ostack = { NULL, 0 };
   for (int i = 0; i < 32; i++) {
     gpr_end[i] = -1; fpr_end[i] = -1;
     gpr_owner[i] = -1; fpr_owner[i] = -1;
@@ -1274,21 +1432,21 @@ static void regalloc_linear(Isel *s) {
     if (hint[v] >= 0 && web[v] < n && web_hint[web[v]] < 0)
       web_hint[web[v]] = hint[v];
 
-  bool no_tie = getenv("WARMC_NO_TIE") != NULL;
-  bool no_hint = getenv("WARMC_NO_HINT") != NULL;
-  bool no_evict = getenv("WARMC_NO_EVICT") != NULL;
+  bool no_tie = warmc_getenv("WARMC_NO_TIE") != NULL;
+  bool no_hint = warmc_getenv("WARMC_NO_HINT") != NULL;
+  bool no_evict = warmc_getenv("WARMC_NO_EVICT") != NULL;
 
-  const char *csa_only = getenv("WARMC_CSA_ONLY");
-  const char *csa_upto = getenv("WARMC_CSA_UPTO");
-  const char *csa_max_s = getenv("WARMC_CSA_MAX");
+  const char *csa_only = warmc_getenv("WARMC_CSA_ONLY");
+  const char *csa_upto = warmc_getenv("WARMC_CSA_UPTO");
+  const char *csa_max_s = warmc_getenv("WARMC_CSA_MAX");
   int csa_max = csa_max_s ? atoi(csa_max_s) : -1, csa_done = 0;
-  bool csa_dbg = getenv("WARMC_CSA_DEBUG") != NULL;
-  const char *cold_div_s = getenv("WARMC_CSA_COLD_DIV");
+  bool csa_dbg = warmc_getenv("WARMC_CSA_DEBUG") != NULL;
+  const char *cold_div_s = warmc_getenv("WARMC_CSA_COLD_DIV");
   double csa_cold_div = cold_div_s ? atof(cold_div_s) : 1.0;
-  const char *margin_s = getenv("WARMC_CSA_MARGIN");
+  const char *margin_s = warmc_getenv("WARMC_CSA_MARGIN");
   double csa_margin = margin_s ? atof(margin_s) : 1.0;
-  bool csa_lat = !getenv("WARMC_CSA_NO_LAT");
-  bool csa_ok = !getenv("WARMC_NO_CSA");
+  bool csa_lat = !warmc_getenv("WARMC_CSA_NO_LAT");
+  bool csa_ok = !warmc_getenv("WARMC_NO_CSA");
   if (csa_ok && csa_only) csa_ok = (uint32_t)atoi(csa_only) == f->func_index;
   if (csa_ok && csa_upto) csa_ok = f->func_index <= (uint32_t)atoi(csa_upto);
   uint64_t csa_work = 0;
@@ -1304,15 +1462,8 @@ static void regalloc_linear(Isel *s) {
     for (uint32_t bi = 0; bi < f->nblocks; bi++) {
       Block *b = &f->blocks[bi];
       if (!b->reachable || !b->is_pad) continue;
-      const uint64_t *li = &livein[(size_t)bi * W];
-      for (size_t w = 0; w < W; w++) {
-        uint64_t bits = li[w];
-        while (bits) {
-          uint32_t v = (uint32_t)(w * 64 + (unsigned)__builtin_ctzll(bits));
-          bits &= bits - 1;
-          inelig[web[v]] = 1;
-        }
-      }
+      for (uint32_t k = lin_off[bi]; k < lin_off[bi + 1]; k++)
+        inelig[web[lin[k]]] = 1;
     }
   }
 
@@ -1337,9 +1488,9 @@ static void regalloc_linear(Isel *s) {
     { EV_WDENSITY, EV_DENSITY }, { EV_CONTESTED, EV_DENSITY },
     { EV_DENSITY, EV_DENSITY },
   };
-  int ntrial = getenv("WARMC_NO_RA_TRIALS")
+  int ntrial = warmc_getenv("WARMC_NO_RA_TRIALS")
                    ? 0 : (int)(sizeof trial_rule / sizeof trial_rule[0]);
-  bool trial_dbg = getenv("WARMC_RA_TRIAL_DEBUG") != NULL;
+  bool trial_dbg = warmc_getenv("WARMC_RA_TRIAL_DEBUG") != NULL;
   uint32_t slot0 = slot;
   uint32_t used_gcs0 = s->used_gpr_cs, used_fcs0 = s->used_fpr_cs;
   uint64_t st_cs0 = g_stats.caller_saves, st_sp0 = g_stats.spills,
@@ -1408,14 +1559,14 @@ static void regalloc_linear(Isel *s) {
                     (cur->cls ? fpr_is_callee_saved(tl) : gpr_is_callee_saved(tl));
           bool in_pool = false;
           for (int k = 0; k < npool; k++) if (pool[k] == tl) { in_pool = true; break; }
-          int nc = occ_conflicts(&heaps[tl], cur, R, gone, ostack, &vic);
+          int nc = occ_conflicts(&heaps[tl], cur, R, gone, &ostack, &vic);
           bool only_tied = nc == 0 || (nc == 1 && sorted[vic].value == ta);
           if (in_pool && only_tied && (!cur->crosses_call || cs)) chosen = tl;
         }
       }
       int want = no_hint ? -1 : hint[cur->value];
       if (chosen < 0 && want >= 0 &&
-          occ_conflicts(&heaps[want], cur, R, gone, ostack, &vic) == 0) {
+          occ_conflicts(&heaps[want], cur, R, gone, &ostack, &vic) == 0) {
         bool cs = !v128 && (cur->cls ? fpr_is_callee_saved(want)
                                      : gpr_is_callee_saved(want));
         bool in_pool = false;
@@ -1431,7 +1582,7 @@ static void regalloc_linear(Isel *s) {
           if ((spare >> rr) & 1 && !cur->cls) continue;
           bool want_cs = cur->crosses_call ? true : (pass == 1);
           if (cs != want_cs) continue;
-          if (occ_conflicts(&heaps[rr], cur, R, gone, ostack, &vic) != 0) continue;
+          if (occ_conflicts(&heaps[rr], cur, R, gone, &ostack, &vic) != 0) continue;
           chosen = rr;
           break;
         }
@@ -1457,7 +1608,7 @@ static void regalloc_linear(Isel *s) {
           if (cur->crosses_call && (v128 || !cs)) continue;
           if ((barred >> rr) & 1) continue;
           int32_t cand;
-          if (occ_conflicts(&heaps[rr], cur, R, gone, ostack, &cand) != 1) continue;
+          if (occ_conflicts(&heaps[rr], cur, R, gone, &ostack, &cand) != 1) continue;
           const Interval *V = &sorted[cand];
           double w = weight[V->value];
           double r = no_evict ? 0
@@ -1474,7 +1625,7 @@ static void regalloc_linear(Isel *s) {
           for (int k = 0; k < npool && spare_reg < 0; k++) {
             int rr = pool[k];
             if ((spare >> rr) & 1 &&
-                occ_conflicts(&heaps[rr], cur, R, gone, ostack, &vic) == 0)
+                occ_conflicts(&heaps[rr], cur, R, gone, &ostack, &vic) == 0)
               spare_reg = rr;
           }
         /* A call-crossing value the callee-saved registers cannot hold may
@@ -1493,7 +1644,7 @@ static void regalloc_linear(Isel *s) {
           csa_cost = csa_crossing_cost(cur, R, num[cur->value], call_pos,
                                        call_depth, call_cold, NULL, ncalls,
                                        csa_cold_div, &csa_work, NULL);
-          if (csa_cost * csa_margin < price || getenv("WARMC_CSA_FORCE"))
+          if (csa_cost * csa_margin < price || warmc_getenv("WARMC_CSA_FORCE"))
             for (int k = 0; k < npool; k++) {
               int rr = pool[k];
 
@@ -1504,7 +1655,7 @@ static void regalloc_linear(Isel *s) {
                       ? fpr_is_callee_saved(rr)
                       : (gpr_is_callee_saved(rr) || rr == RA_ALLOC_RES_REG))
                 continue;
-              if (occ_conflicts(&heaps[rr], cur, R, gone, ostack, &vic) != 0)
+              if (occ_conflicts(&heaps[rr], cur, R, gone, &ostack, &vic) != 0)
                 continue;
               csa_reg = rr;
               break;
@@ -1537,7 +1688,7 @@ static void regalloc_linear(Isel *s) {
           s->loc[cur->value] = SLOT(take_slot(s, cur->value, &slot));
           g_stats.spills++;
           if (cur->crosses_call && v128) g_stats.spills_v128_xcall++;
-          if (getenv("WARMC_SPILL_DEBUG"))
+          if (warmc_getenv("WARMC_SPILL_DEBUG"))
             spill_debug(s, "self", cur, weight[cur->value]);
           continue;
         } else {
@@ -1559,7 +1710,7 @@ static void regalloc_linear(Isel *s) {
                 SLOT(reuse >= 0 ? (uint32_t)reuse
                                 : take_slot(s, victim->value, &slot));
             g_stats.spills++;
-            if (getenv("WARMC_SPILL_DEBUG"))
+            if (warmc_getenv("WARMC_SPILL_DEBUG"))
               spill_debug(s, "evict", victim, weight[victim->value]);
           }
           chosen = victim_reg;
@@ -1590,7 +1741,7 @@ static void regalloc_linear(Isel *s) {
        heaps still hold under the register it lost, and not a spare register,
        which only a value read in a loop may take. */
     {
-      bool no_refill = getenv("WARMC_NO_REFILL") != NULL;
+      bool no_refill = warmc_getenv("WARMC_NO_REFILL") != NULL;
       RList rl[2][32];
       memset(rl, 0, sizeof rl);
       RefillCand *rc = xmalloc((ns ? ns : 1) * sizeof(RefillCand));
@@ -1819,12 +1970,12 @@ static void regalloc_linear(Isel *s) {
      function does not already save. */
   bool pc_fn_ok = true;
   {
-    const char *r = getenv("WARMC_PIECES_FUNCS");
+    const char *r = warmc_getenv("WARMC_PIECES_FUNCS");
     unsigned lo = 0, hi = ~0u;
     if (r && sscanf(r, "%u-%u", &lo, &hi) >= 1 &&
         (f->func_index < lo || f->func_index > hi)) pc_fn_ok = false;
   }
-  if (pc_fn_ok && RA_HAVE_PIECES && !getenv("WARMC_NO_PIECES")) {
+  if (pc_fn_ok && RA_HAVE_PIECES && !warmc_getenv("WARMC_NO_PIECES")) {
     /* every register's assignment, as the vacating pass left it */
     RList rl[2][32];
     memset(rl, 0, sizeof rl);
@@ -1978,18 +2129,18 @@ static void regalloc_linear(Isel *s) {
      held one, and that is what the opt-in plan measured losing. */
   if (s->split_collect && s->split_sc) {
     SplitCtl *sc = s->split_sc;
-    const char *sp_only = getenv("WARMC_SPLIT_ONLY");
-    const char *sp_upto = getenv("WARMC_SPLIT_UPTO");
-    const char *sp_max_s = getenv("WARMC_SPLIT_MAX");
-    const char *sp_rungs_s = getenv("WARMC_SPLIT_RUNGS");
-    const char *sp_clob_s = getenv("WARMC_SPLIT_CLOB");
+    const char *sp_only = warmc_getenv("WARMC_SPLIT_ONLY");
+    const char *sp_upto = warmc_getenv("WARMC_SPLIT_UPTO");
+    const char *sp_max_s = warmc_getenv("WARMC_SPLIT_MAX");
+    const char *sp_rungs_s = warmc_getenv("WARMC_SPLIT_RUNGS");
+    const char *sp_clob_s = warmc_getenv("WARMC_SPLIT_CLOB");
     int sp_max = sp_max_s ? atoi(sp_max_s) : -1, sp_done = 0;
     int sp_rungs = sp_rungs_s ? atoi(sp_rungs_s) : sc->full ? 3 : 1;
     int sp_clob = sp_clob_s ? atoi(sp_clob_s) : sc->full ? -1 : 0;
-    bool sp_mand = getenv("WARMC_SPLIT_MAND") != NULL;
-    const char *sp_room_s = getenv("WARMC_SPLIT_HEADROOM");
+    bool sp_mand = warmc_getenv("WARMC_SPLIT_MAND") != NULL;
+    const char *sp_room_s = warmc_getenv("WARMC_SPLIT_HEADROOM");
     int sp_room = sp_room_s ? atoi(sp_room_s) : 0;
-    bool sp_dbg = getenv("WARMC_SPLIT_DEBUG") != NULL;
+    bool sp_dbg = warmc_getenv("WARMC_SPLIT_DEBUG") != NULL;
     bool sp_ok = true;
     if (sp_only) sp_ok = (uint32_t)atoi(sp_only) == f->func_index;
     if (sp_ok && sp_upto) sp_ok = f->func_index <= (uint32_t)atoi(sp_upto);
@@ -2070,7 +2221,7 @@ static void regalloc_linear(Isel *s) {
            callee-saved registers the function already saves (no new
            prologue pair).  Racing said no as a default: the losers it was
            built for did not move and other rows reshuffled. */
-        bool csonly = getenv("WARMC_SPLIT_CSONLY") != NULL;
+        bool csonly = warmc_getenv("WARMC_SPLIT_CSONLY") != NULL;
         int nfree[2] = { 0, 0 };
         for (int k = 0; k < ngpool; k++) {
           int rr = gpool[k];
@@ -2223,8 +2374,7 @@ static void regalloc_linear(Isel *s) {
           uint32_t rep = web[x];
           if (iv[rep].end < 0 || !IS_SLOT(s->loc[rep])) continue;
           if ((ValType)f->insts[x].type == VT_V128 && lclob) continue;
-          if (!(livein[(size_t)hb * W + (x >> 6)] & (1ull << (x & 63))))
-            continue;
+          if (!live_in_has(s, hb, x)) continue;
           if (ncand == cap_cand) {
             cap_cand = cap_cand ? cap_cand * 2 : 16;
             cand = xrealloc(cand, cap_cand * sizeof(SplitCand));
@@ -2302,34 +2452,30 @@ static void regalloc_linear(Isel *s) {
   xfree(cumc[0]); xfree(cumc[1]);
 
 
-  if (getenv("WARMC_VERIFY_RA")) {
+  if (warmc_getenv("WARMC_VERIFY_RA")) {
 
     for (uint32_t oi = 0; oi < f->norder; oi++) {
       uint32_t bi = f->order[oi];
       Block *b = &f->blocks[bi];
       if (!b->reachable) continue;
-      const uint64_t *vli = &livein[(size_t)bi * W], *vlo = &liveout[(size_t)bi * W];
       for (int side = 0; side < 2; side++) {
-        const uint64_t *bits_at = side ? vlo : vli;
+        const uint32_t *off = side ? lout_off : lin_off;
+        const Ref *set = side ? lout : lin;
         int32_t want = side ? blk_end[bi] : blk_start[bi];
-        for (size_t w = 0; w < W; w++) {
-          uint64_t bits = bits_at[w];
-          while (bits) {
-            uint32_t v = (uint32_t)(w * 64 + (unsigned)__builtin_ctzll(bits));
-            bits &= bits - 1;
-            if (num[v] < 0) continue;
-            uint32_t rep = web[v];
-            if (iv[rep].end < 0 || !iv[rep].rcount) continue;
-            bool covered = false;
-            for (uint32_t y = 0; y < iv[rep].rcount && !covered; y++)
-              covered = want >= R[iv[rep].rfirst + y].lo &&
-                        want <= R[iv[rep].rfirst + y].hi;
-            if (!covered)
-              warmc_fatal("regalloc: v%u (web v%u) is live %s block %u at %d, "
-                          "which none of its %u ranges covers, in %s",
-                          v, rep, side ? "out of" : "into", bi, want,
-                          iv[rep].rcount, f->m->funcs[f->func_index].sym);
-          }
+        for (uint32_t k = off[bi]; k < off[bi + 1]; k++) {
+          uint32_t v = set[k];
+          if (num[v] < 0) continue;
+          uint32_t rep = web[v];
+          if (iv[rep].end < 0 || !iv[rep].rcount) continue;
+          bool covered = false;
+          for (uint32_t y = 0; y < iv[rep].rcount && !covered; y++)
+            covered = want >= R[iv[rep].rfirst + y].lo &&
+                      want <= R[iv[rep].rfirst + y].hi;
+          if (!covered)
+            warmc_fatal("regalloc: v%u (web v%u) is live %s block %u at %d, "
+                        "which none of its %u ranges covers, in %s",
+                        v, rep, side ? "out of" : "into", bi, want,
+                        iv[rep].rcount, f->m->funcs[f->func_index].sym);
         }
       }
       for (uint32_t p = 0; p < b->nparams; p++) {
@@ -2457,7 +2603,7 @@ static void regalloc_linear(Isel *s) {
       sc->nfailed_new = 0;
       if (sc->nadd && !sc->inv_fail) sc->inv_fail = xcalloc(sc->cap_add, 1);
       if (sc->ncut && !sc->cut_fail) sc->cut_fail = xcalloc(sc->cap_cut, 1);
-      bool sdbg = getenv("WARMC_SPLIT_DEBUG") != NULL;
+      bool sdbg = warmc_getenv("WARMC_SPLIT_DEBUG") != NULL;
       for (uint32_t k = 0; k < sc->nadd; k++) {
         Ref p = sc->addp[k];
         sc->inv_fail[k] = p < n && IS_SLOT(s->loc[p]);
@@ -2490,7 +2636,7 @@ static void regalloc_linear(Isel *s) {
         if (IS_SLOT(s->loc[p])) {
           bool can = IS_SLOT(s->loc[v]) && web[v] == v && !multi[v];
           if (can) s->loc[p] = s->loc[v];
-          if (getenv("WARMC_SPLIT_DEBUG"))
+          if (warmc_getenv("WARMC_SPLIT_DEBUG"))
             fprintf(stderr, "split[%u] FAILED v%u -> p%u (p slot, v %s)\n",
                     f->func_index, v, p,
                     can                      ? "slot (aliased)"
@@ -2510,7 +2656,7 @@ static void regalloc_linear(Isel *s) {
       s->csa_first = xcalloc(n ? n : 1, sizeof(uint32_t));
       s->csa_n = xcalloc(n ? n : 1, sizeof(uint32_t));
       CsaListCtx ctx = { web, xcalloc(n ? n : 1, sizeof(uint32_t)), 0 };
-      for_each_clobber_site(s, f, liveout, W, csa_list_sites, &ctx);
+      for_each_clobber_site(s, f, csa_list_sites, &ctx);
       xfree(ctx.stamp);
     }
   }
@@ -2519,13 +2665,31 @@ static void regalloc_linear(Isel *s) {
 
   xfree(web); xfree(mem_head); xfree(mem_tail); xfree(mem_next);
   for (int i = 0; i < 32; i++) { xfree(gpr_occ[i].v); xfree(fpr_occ[i].v); }
-  xfree(gone); xfree(ostack); xfree(R);
+  xfree(gone); xfree(ostack.v); xfree(R);
   (void)maxpos;
   xfree(eu);
   xfree(num); xfree(iv); xfree(sorted); xfree(blk_start); xfree(blk_end);
   xfree(call_pos); xfree(call_depth); xfree(call_cold); xfree(inelig);
   xfree(call_share); xfree(bshare);
   xfree(hint); xfree(web_hint);
+}
+
+/* The references live across one safepoint, its own result excluded. */
+static void list_safepoint(Isel *s, IrFunc *f, Ref site, const Ref *live,
+                           uint32_t nlive, void *ctx) {
+  (void)ctx;
+  uint32_t first = s->nsp_vals;
+  for (uint32_t k = 0; k < nlive; k++) {
+    Ref v = live[k];
+    if (v == site || !vt_is_ref((ValType)f->insts[v].type)) continue;
+    if (s->nsp_vals == s->cap_sp_vals) {
+      s->cap_sp_vals = s->cap_sp_vals ? s->cap_sp_vals * 2 : 16;
+      s->sp_vals = xrealloc(s->sp_vals, s->cap_sp_vals * sizeof(Ref));
+    }
+    s->sp_vals[s->nsp_vals++] = v;
+  }
+  s->sp_first[site] = first;
+  s->sp_n[site] = s->nsp_vals - first;
 }
 
 static void compute_safepoints(Isel *s) {
@@ -2550,47 +2714,9 @@ static void compute_safepoints(Isel *s) {
     }
     if (vt_is_ref((ValType)f->insts[i].type)) any_ref = true;
   }
+  if (f->ghost_safepoint) any_site = true;
+  if (f->ghost_ref) any_ref = true;
   if (!any_site || !any_ref) return;
 
-  uint64_t *livein, *liveout;
-  compute_liveness(s, &livein, &liveout);
-  size_t W = LV_WORDS(n);
-  (void)livein;
-
-  uint32_t eucap = eff_use_cap(f);
-  Ref *eu = xmalloc(eucap * sizeof(Ref));
-
-  uint64_t *live = xmalloc((W ? W : 1) * sizeof(uint64_t));
-  for (uint32_t oi = 0; oi < f->norder; oi++) {
-    uint32_t bi = f->order[oi];
-    Block *b = &f->blocks[bi];
-    memcpy(live, &liveout[(size_t)bi * W], W * sizeof(uint64_t));
-    for (int32_t i = (int32_t)b->ninsts - 1; i >= 0; i--) {
-      Ref r = b->insts[i];
-      if (op_is_safepoint(f->insts[r].op)) {
-        uint32_t first = s->nsp_vals;
-        for (size_t w = 0; w < W; w++) {
-          uint64_t bits = live[w];
-          while (bits) {
-            uint32_t v = (uint32_t)(w * 64 + (unsigned)__builtin_ctzll(bits));
-            bits &= bits - 1;
-            if (v == r) continue;
-            if (!vt_is_ref((ValType)f->insts[v].type)) continue;
-            if (s->nsp_vals == s->cap_sp_vals) {
-              s->cap_sp_vals = s->cap_sp_vals ? s->cap_sp_vals * 2 : 16;
-              s->sp_vals = xrealloc(s->sp_vals, s->cap_sp_vals * sizeof(Ref));
-            }
-            s->sp_vals[s->nsp_vals++] = v;
-          }
-        }
-        s->sp_first[r] = first;
-        s->sp_n[r] = s->nsp_vals - first;
-      }
-      lv_clr(live, r);
-      uint32_t ne = eff_uses(s, f, r, eu, eucap);
-      for (uint32_t j = 0; j < ne; j++) lv_set(live, eu[j]);
-    }
-  }
-  xfree(live);
-  xfree(eu);
+  for_each_live_site(s, f, op_is_safepoint, list_safepoint, NULL);
 }

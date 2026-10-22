@@ -4,6 +4,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
+#ifndef _WIN32
+#include <sys/resource.h>
+#include <sys/mman.h>
+#endif
 
 __attribute__((noreturn))
 static void diag(const char *tag, int code, const char *fmt, va_list ap) {
@@ -40,18 +45,50 @@ typedef struct { size_t size; size_t bucket; } XHdr;
 #define XB_MIN 5
 #define XB_MAX 22
 
+/* Blocks of 256 KB and up are mapped for themselves and unmapped when freed.
+   The system allocator keeps what it is given back for reuse, so a compile's
+   footprint was its passes' peaks added up rather than the largest of them:
+   a third of it for a large function, at no measurable cost in time.  A
+   mapped block past the size classes keeps its mapping's length in bucket,
+   which is then above XB_MAX; bucket 0 is a block from malloc. */
+#ifdef _WIN32
+#define XB_MAP (XB_MAX + 1)
+#else
+#define XB_MAP 18
+#endif
+
+static void *xmap(size_t len) {
+#ifdef _WIN32
+  (void)len;
+  return NULL;
+#else
+  void *p = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+  if (p == MAP_FAILED) warmc_fatal("out of memory");
+  return p;
+#endif
+}
+
+static void xunmap(void *p, size_t len) {
+#ifdef _WIN32
+  (void)p; (void)len;
+#else
+  munmap(p, len);
+#endif
+}
+
 _Static_assert(sizeof(XHdr) <= XHDR, "allocation header must fit its padding");
 
-static _Thread_local void *g_xcache[XB_MAX + 1];
-static _Thread_local size_t g_xheld;
+/* One thread-local for the cache and its count: on macOS each is reached
+   through a call, and every allocation and free touches both. */
+typedef struct { void *cache[XB_MAX + 1]; size_t held; } XCache;
+static _Thread_local XCache g_xc;
 
 #define XHOLD_MAX ((size_t)1 << 20)
 
 static unsigned xbucket(size_t need) {
   if (need > ((size_t)1 << XB_MAX)) return 0;
-  unsigned b = XB_MIN;
-  while (((size_t)1 << b) < need) b++;
-  return b;
+  if (need <= ((size_t)1 << XB_MIN)) return XB_MIN;
+  return 64u - (unsigned)__builtin_clzll((unsigned long long)need - 1);
 }
 
 void *xmalloc(size_t n) {
@@ -60,10 +97,18 @@ void *xmalloc(size_t n) {
   if (need < n) warmc_fatal("out of memory");
   unsigned b = xbucket(need);
   XHdr *h;
-  if (b && g_xcache[b]) {
-    h = g_xcache[b];
-    g_xcache[b] = *(void **)((char *)h + XHDR);
-    g_xheld -= (size_t)1 << b;
+  XCache *xc = &g_xc;
+  if (b && b < XB_MAP && xc->cache[b]) {
+    h = xc->cache[b];
+    xc->cache[b] = *(void **)((char *)h + XHDR);
+    xc->held -= (size_t)1 << b;
+  } else if (b >= XB_MAP) {
+    h = xmap((size_t)1 << b);
+  } else if (!b && XB_MAP <= XB_MAX) {
+    h = xmap(need);
+    h->size = n;
+    h->bucket = need;
+    return (char *)h + XHDR;
   } else {
     h = malloc(b ? ((size_t)1 << b) : need);
     if (!h) warmc_fatal("out of memory");
@@ -77,11 +122,20 @@ void xfree(void *p) {
   if (!p) return;
   XHdr *h = (XHdr *)((char *)p - XHDR);
   if (!h->bucket) { free(h); return; }
+  if (h->bucket > XB_MAX) { xunmap(h, h->bucket); return; }
   size_t sz = (size_t)1 << h->bucket;
-  if (g_xheld + sz > XHOLD_MAX) { free(h); return; }
-  g_xheld += sz;
-  *(void **)((char *)h + XHDR) = g_xcache[h->bucket];
-  g_xcache[h->bucket] = h;
+  if (h->bucket >= XB_MAP) { xunmap(h, sz); return; }
+  XCache *xc = &g_xc;
+  if (xc->held + sz > XHOLD_MAX) { free(h); return; }
+  xc->held += sz;
+  *(void **)((char *)h + XHDR) = xc->cache[h->bucket];
+  xc->cache[h->bucket] = h;
+}
+
+size_t xmalloc_fit(size_t n) {
+  if (n + XHDR < n) return n;
+  unsigned b = xbucket(n + XHDR);
+  return b ? ((size_t)1 << b) - XHDR : n;
 }
 
 void *xcalloc(size_t n, size_t sz) {
@@ -89,7 +143,7 @@ void *xcalloc(size_t n, size_t sz) {
   if (!sz) sz = 1;
   if (n > (size_t)-1 / sz) warmc_fatal("out of memory");
   size_t bytes = n * sz;
-  if (bytes + XHDR > ((size_t)1 << XB_MAX)) {
+  if (bytes + XHDR > ((size_t)1 << XB_MAX) && XB_MAP > XB_MAX) {
     XHdr *h = calloc(1, bytes + XHDR);
     if (!h) warmc_fatal("out of memory");
     h->size = bytes;
@@ -97,7 +151,9 @@ void *xcalloc(size_t n, size_t sz) {
     return (char *)h + XHDR;
   }
   void *p = xmalloc(bytes);
-  memset(p, 0, bytes);
+  /* a fresh mapping is zero already, and its pages stay untouched */
+  if (xbucket(bytes + XHDR) < XB_MAP && bytes + XHDR <= ((size_t)1 << XB_MAX))
+    memset(p, 0, bytes);
   return p;
 }
 
@@ -105,10 +161,17 @@ void *xrealloc(void *p, size_t n) {
   if (!p) return xmalloc(n);
   if (!n) n = 1;
   XHdr *h = (XHdr *)((char *)p - XHDR);
-  size_t cap = h->bucket ? ((size_t)1 << h->bucket) - XHDR : h->size;
+  size_t cap = h->bucket > XB_MAX ? h->bucket - XHDR
+             : h->bucket ? ((size_t)1 << h->bucket) - XHDR : h->size;
   if (n <= cap) {
     h->size = n;
     return p;
+  }
+  if (h->bucket > XB_MAX) {
+    void *q = xmalloc(n);
+    memcpy(q, p, h->size);
+    xfree(p);
+    return q;
   }
 
   /* Callers grow arrays through here assuming realloc's amortization; a
@@ -128,17 +191,64 @@ void *xrealloc(void *p, size_t n) {
   return q;
 }
 
+/* The WARMC_ switches, copied out of the environment once: getenv takes a
+   lock and walks every variable, and the switches are asked about per
+   function and per pass, which came to 2% of a compile with none set.
+   Nothing in the compiler changes its environment. */
+static const char **g_wenv;
+static size_t g_nwenv;
+static pthread_once_t g_wenv_once = PTHREAD_ONCE_INIT;
+
+static void wenv_init(void) {
+#ifdef _WIN32
+  char **env = _environ;
+#else
+  extern char **environ;
+  char **env = environ;
+#endif
+  size_t n = 0;
+  for (char **e = env; e && *e; e++)
+    if (!strncmp(*e, "WARMC_", 6)) n++;
+  g_wenv = malloc((n ? n : 1) * sizeof(char *));
+  if (!g_wenv) return;
+  for (char **e = env; e && *e; e++)
+    if (!strncmp(*e, "WARMC_", 6)) g_wenv[g_nwenv++] = *e;
+}
+
+const char *warmc_getenv(const char *name) {
+  pthread_once(&g_wenv_once, wenv_init);
+  size_t len = strlen(name);
+  for (size_t i = 0; i < g_nwenv; i++)
+    if (!strncmp(g_wenv[i], name, len) && g_wenv[i][len] == '=')
+      return g_wenv[i] + len + 1;
+  return NULL;
+}
+
+double peak_rss_mb(void) {
+#ifdef _WIN32
+  return 0;
+#else
+  struct rusage ru;
+  if (getrusage(RUSAGE_SELF, &ru) != 0) return 0;
+#ifdef __APPLE__
+  return (double)ru.ru_maxrss / (1024.0 * 1024.0);
+#else
+  return (double)ru.ru_maxrss / 1024.0;
+#endif
+#endif
+}
+
 void xcache_release(void) {
   for (unsigned b = 0; b <= XB_MAX; b++) {
-    void *p = g_xcache[b];
+    void *p = g_xc.cache[b];
     while (p) {
       void *next = *(void **)((char *)p + XHDR);
       free(p);
       p = next;
     }
-    g_xcache[b] = NULL;
+    g_xc.cache[b] = NULL;
   }
-  g_xheld = 0;
+  g_xc.held = 0;
 }
 char *xstrndup(const char *s, size_t n) {
   char *p = xmalloc(n + 1);

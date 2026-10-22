@@ -358,7 +358,8 @@ static void pool_load(Isel *s, int ft, int fr, uint64_t bits) {
 }
 
 static bool pool_in_reach(const IrFunc *f) {
-  uint64_t bound = (uint64_t)f->ninsts * 128 + (uint64_t)f->nblocks * 128;
+  uint32_t ni = f->made_insts ? f->made_insts : f->ninsts;
+  uint64_t bound = (uint64_t)ni * 128 + (uint64_t)f->nblocks * 128;
   return bound + 65536 < (1u << 20);
 }
 
@@ -1231,8 +1232,8 @@ static void analyse_immediates(Isel *s) {
   s->imm_fold = xcalloc(n ? n : 1, 1);
   s->fused = xcalloc(n ? n : 1, 1);
   s->pool_ok = s->opt->cpool && !s->far_br && pool_in_reach(f);
-  s->remat_fp = !getenv("WARMC_NO_REMAT_FP");
-  s->remat_v128 = !getenv("WARMC_NO_REMAT_V128");
+  s->remat_fp = !warmc_getenv("WARMC_NO_REMAT_FP");
+  s->remat_v128 = !warmc_getenv("WARMC_NO_REMAT_V128");
   {
     /* Longest movz+movk chain a constant may cost and still rematerialise
        instead of taking a frame slot.  1 restores the historic single-move
@@ -1247,31 +1248,31 @@ static void analyse_immediates(Isel *s) {
        accepted cost gobench/iface +4.2% (small call-crossing constants in
        the dispatch-lookup loops; denying all call-crossing rematerialisation
        recovers half of it but forfeits the strbuild and vecgrow wins). */
-    const char *rc = getenv("WARMC_REMAT_COST");
+    const char *rc = warmc_getenv("WARMC_REMAT_COST");
     s->remat_cost = rc ? atoi(rc) : 2;
     if (s->remat_cost < 1) s->remat_cost = 1;
     if (s->remat_cost > 4) s->remat_cost = 4;
-    const char *rw = getenv("WARMC_REMAT2_W");
+    const char *rw = warmc_getenv("WARMC_REMAT2_W");
     s->remat2_w = rw ? atof(rw) : 0.5;
-    const char *rs = getenv("WARMC_REMAT2_SEG");
+    const char *rs = warmc_getenv("WARMC_REMAT2_SEG");
     s->remat2_seg = rs ? atof(rs) : 2.0;
-    s->remat_glob = !getenv("WARMC_NO_REMAT_GLOBAL");
+    s->remat_glob = !warmc_getenv("WARMC_NO_REMAT_GLOBAL");
   }
   s->no_remat = xcalloc(n ? n : 1, 1);
   s->paired = xcalloc(n ? n : 1, 1);
-  s->no_ldpair = getenv("WARMC_NO_LDPAIR") != NULL;
+  s->no_ldpair = warmc_getenv("WARMC_NO_LDPAIR") != NULL;
   s->folded = xcalloc(n ? n : 1, 1);
   uint32_t *uses = xcalloc(n ? n : 1, sizeof(uint32_t));
   s->uses = uses;
   uint8_t *blocked = xcalloc(n ? n : 1, 1);
 
-  s->no_imm = getenv("WARMC_NO_IMM") != NULL;
+  s->no_imm = warmc_getenv("WARMC_NO_IMM") != NULL;
   if (!s->no_imm)
   for (uint32_t i = 0; i < n; i++)
     if (f->insts[i].op == I_CONST && fits_gpr(f, i))
       s->imm_fold[i] = 1;
 
-  bool no_edge_remat = getenv("WARMC_NO_EDGE_REMAT") != NULL;
+  bool no_edge_remat = warmc_getenv("WARMC_NO_EDGE_REMAT") != NULL;
   for (uint32_t oi = 0; oi < f->norder; oi++) {
     uint32_t bi = f->order[oi];
     Block *b = &f->blocks[bi];
@@ -1358,7 +1359,7 @@ static void analyse_immediates(Isel *s) {
       bool ok = (off == 0) ||
                 ((off & ((1u << size) - 1)) == 0 && (off >> size) <= 0xfff);
       if (!ok) continue;
-      if (!getenv("WARMC_NO_ADDRFUSE")) { s->addr_fuse[ea] = 1; s->folded[ea] = 1; }
+      if (!warmc_getenv("WARMC_NO_ADDRFUSE")) { s->addr_fuse[ea] = 1; s->folded[ea] = 1; }
     }
   }
   xfree(addr_only);
@@ -1416,7 +1417,7 @@ static void analyse_immediates(Isel *s) {
     }
   }
 
-  if (!getenv("WARMC_NO_NOTFUSE"))
+  if (!warmc_getenv("WARMC_NO_NOTFUSE"))
   for (uint32_t oi = 0; oi < f->norder; oi++) {
     uint32_t bi = f->order[oi];
     Block *b = &f->blocks[bi];
@@ -1440,7 +1441,7 @@ static void analyse_immediates(Isel *s) {
   }
 
   s->bfx = xcalloc(n ? n : 1, sizeof *s->bfx);
-  if (!getenv("WARMC_NO_BFX"))
+  if (!warmc_getenv("WARMC_NO_BFX"))
   for (uint32_t oi = 0; oi < f->norder; oi++) {
     Block *b = &f->blocks[f->order[oi]];
     for (uint32_t i = 0; i < b->ninsts; i++) {
@@ -1494,7 +1495,7 @@ static void analyse_immediates(Isel *s) {
     }
   }
 
-  if (!getenv("WARMC_NO_OPFUSE"))
+  if (!warmc_getenv("WARMC_NO_OPFUSE"))
   for (uint32_t oi = 0; oi < f->norder; oi++) {
     uint32_t bi = f->order[oi];
     Block *b = &f->blocks[bi];
@@ -1585,7 +1586,7 @@ static void analyse_immediates(Isel *s) {
     }
   }
 
-  if (!getenv("WARMC_NO_FUSE"))
+  if (!warmc_getenv("WARMC_NO_FUSE"))
   for (uint32_t oi = 0; oi < f->norder; oi++) {
     uint32_t bi = f->order[oi];
     Block *b = &f->blocks[bi];
@@ -1665,7 +1666,7 @@ static void analyse_immediates(Isel *s) {
       for (uint32_t j = 0; j < b->succs[e].nargs; j++) s->lowonly[b->succs[e].args[j]] = 0;
   }
 
-  if (!getenv("WARMC_NO_MASKSEL"))
+  if (!warmc_getenv("WARMC_NO_MASKSEL"))
   for (uint32_t oi = 0; oi < f->norder; oi++) {
     uint32_t bi = f->order[oi];
     Block *b = &f->blocks[bi];
@@ -1705,10 +1706,10 @@ static void analyse_immediates(Isel *s) {
     if (f->insts[c].block != bi) continue;
     uint16_t op = f->insts[c].op;
     bool cmpish = (op >= I_EQ && op <= I_EQZ) || (op >= I_FEQ && op <= I_FGE);
-    if (cmpish && !getenv("WARMC_NO_FUSE")) s->fused[c] = 1;
+    if (cmpish && !warmc_getenv("WARMC_NO_FUSE")) s->fused[c] = 1;
   }
 
-  if (!getenv("WARMC_NO_TSTFUSE"))
+  if (!warmc_getenv("WARMC_NO_TSTFUSE"))
   for (uint32_t oi = 0; oi < f->norder; oi++) {
     uint32_t bi = f->order[oi];
     Block *b = &f->blocks[bi];
@@ -1959,6 +1960,94 @@ static int ra_cs_frame_ops(Isel *s) {
 
 #include "regalloc.inc"
 
+/* What the allocation leaves on the Isel, moved to the function when the
+   first emission asks to run again to place its loops: nothing the second
+   run's allocation reads differs from the first's -- only where the loops
+   land does -- so the second takes these back instead of allocating again,
+   and adds the counters the first one's allocation added.  For a function
+   of 140,000 instructions that was a second of allocation repeated. */
+typedef struct {
+  int *loc;
+  uint32_t nslots, used_gpr_cs, used_fpr_cs;
+  int32_t *csa_slot;
+  uint8_t *csa_on, *no_remat;
+  uint32_t *csa_first, *csa_n;
+  Ref *csa_vals;
+  uint32_t ncsa_vals, cap_csa_vals;
+  struct Piece *pc;
+  uint32_t npc;
+  uint32_t *pc_bfirst, *pc_bn;
+  int32_t *pc_head, *pc_next;
+  uint32_t *sp_first, *sp_n;
+  Ref *sp_vals;
+  uint32_t nsp_vals, cap_sp_vals;
+  uint32_t *lv_in_off, *lv_out_off;
+  Ref *lv_in, *lv_out;
+  OptStats added;
+} RaKeep;
+
+static void ra_keep_drop(void *p) {
+  RaKeep *k = p;
+  xfree(k->loc); xfree(k->csa_slot); xfree(k->csa_on); xfree(k->no_remat);
+  xfree(k->csa_first); xfree(k->csa_n); xfree(k->csa_vals);
+  xfree(k->pc); xfree(k->pc_bfirst); xfree(k->pc_bn); xfree(k->pc_head);
+  xfree(k->pc_next);
+  xfree(k->sp_first); xfree(k->sp_n); xfree(k->sp_vals);
+  xfree(k->lv_in_off); xfree(k->lv_out_off); xfree(k->lv_in); xfree(k->lv_out);
+  xfree(k);
+}
+
+/* The counters src added since base, added to acc. */
+static void stats_delta_add(OptStats *acc, const OptStats *base, const OptStats *now) {
+  uint64_t *a = (uint64_t *)acc;
+  const uint64_t *b = (const uint64_t *)base, *c = (const uint64_t *)now;
+  for (size_t i = 0; i < sizeof *acc / sizeof(uint64_t); i++) a[i] += c[i] - b[i];
+}
+
+static void ra_keep_save(Isel *s, const OptStats *added) {
+  RaKeep *k = xcalloc(1, sizeof *k);
+#define MOVE(fld) do { k->fld = s->fld; s->fld = NULL; } while (0)
+  MOVE(loc); MOVE(csa_slot); MOVE(csa_on); MOVE(no_remat);
+  MOVE(csa_first); MOVE(csa_n); MOVE(csa_vals);
+  MOVE(pc); MOVE(pc_bfirst); MOVE(pc_bn); MOVE(pc_head); MOVE(pc_next);
+  MOVE(sp_first); MOVE(sp_n); MOVE(sp_vals);
+  MOVE(lv_in_off); MOVE(lv_out_off); MOVE(lv_in); MOVE(lv_out);
+#undef MOVE
+  k->nslots = s->nslots;
+  k->used_gpr_cs = s->used_gpr_cs;
+  k->used_fpr_cs = s->used_fpr_cs;
+  k->ncsa_vals = s->ncsa_vals; k->cap_csa_vals = s->cap_csa_vals;
+  k->npc = s->npc;
+  k->nsp_vals = s->nsp_vals; k->cap_sp_vals = s->cap_sp_vals;
+  k->added = *added;
+  s->f->ra_keep = k;
+  s->f->ra_keep_drop = ra_keep_drop;
+}
+
+static void ra_keep_take(Isel *s) {
+  RaKeep *k = s->f->ra_keep;
+  s->f->ra_keep = NULL;
+  xfree(s->loc);
+  xfree(s->no_remat);
+#define MOVE(fld) do { s->fld = k->fld; k->fld = NULL; } while (0)
+  MOVE(loc); MOVE(csa_slot); MOVE(csa_on); MOVE(no_remat);
+  MOVE(csa_first); MOVE(csa_n); MOVE(csa_vals);
+  MOVE(pc); MOVE(pc_bfirst); MOVE(pc_bn); MOVE(pc_head); MOVE(pc_next);
+  MOVE(sp_first); MOVE(sp_n); MOVE(sp_vals);
+  MOVE(lv_in_off); MOVE(lv_out_off); MOVE(lv_in); MOVE(lv_out);
+#undef MOVE
+  s->nslots = k->nslots;
+  s->used_gpr_cs = k->used_gpr_cs;
+  s->used_fpr_cs = k->used_fpr_cs;
+  s->ncsa_vals = k->ncsa_vals; s->cap_csa_vals = k->cap_csa_vals;
+  s->npc = k->npc;
+  s->nsp_vals = k->nsp_vals; s->cap_sp_vals = k->cap_sp_vals;
+  OptStats zero;
+  memset(&zero, 0, sizeof zero);
+  stats_delta_add(&g_stats, &zero, &k->added);
+  ra_keep_drop(k);
+}
+
 /* 1 = emitted, 0 = a conditional branch needs the far layout, 2 = the
    allocation filed a split plan; the caller applies it and retries, 4 = the
    loops it aligned are measured; the caller runs it again to place them. */
@@ -1976,7 +2065,7 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
   s->split_sc = sc;
   s->split_collect = split_collect;
   s->out_bytes = out_bytes;
-  s->far_br = far || getenv("WARMC_FAR_BRANCH") != NULL;
+  s->far_br = far || warmc_getenv("WARMC_FAR_BRANCH") != NULL;
   s->naive = !opt->regalloc;
 
   s->loc = xmalloc(f->ninsts * sizeof(int));
@@ -1986,8 +2075,8 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
     s->cls[i] = (uint8_t)(is_fp_value(f, i) ? 1 : 0);
   }
 
-  s->no_small_memop = getenv("WARMC_NO_SMALL_MEMOP") != NULL;
-  s->no_rc_def = getenv("WARMC_NO_RC_DEF") != NULL;
+  s->no_small_memop = warmc_getenv("WARMC_NO_SMALL_MEMOP") != NULL;
+  s->no_rc_def = warmc_getenv("WARMC_NO_RC_DEF") != NULL;
   analyse_function(s);
 
   s->lab_reg = 0;
@@ -2090,8 +2179,16 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
       for (uint32_t p = 0; p < b->nparams; p++) s->pinned[b->params[p]] = 1;
     }
 
+  OptStats ra_added, ra_base;
+  memset(&ra_added, 0, sizeof ra_added);
+  bool ra_taken = false;
   if (s->naive) regalloc_naive(s);
-  else regalloc_linear(s);
+  else if (f->ra_keep) { ra_keep_take(s); ra_taken = true; }
+  else {
+    ra_base = g_stats;
+    regalloc_linear(s);
+    stats_delta_add(&ra_added, &ra_base, &g_stats);
+  }
 
   if (sc && s->split_collect && sc->nflagged) { split_ret = 2; goto give_up; }
   if (sc && !s->split_collect && !sc->accept && sc->nfailed_new) {
@@ -2103,7 +2200,11 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
   /* F3 and F4 are scratch for a few vector sequences only, which drop what
      they hold (emit_inst), and F3 breaks move cycles, which drops it too. */
   if (!s->naive) { s->frc_reg[0] = F3; s->frc_reg[1] = F4; }
-  compute_safepoints(s);
+  if (!ra_taken) {
+    ra_base = g_stats;
+    compute_safepoints(s);
+    stats_delta_add(&ra_added, &ra_base, &g_stats);
+  }
 
   s->slots_off = out_bytes;
 
@@ -2145,7 +2246,7 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
      +7.5% (rsbench/dyntrait), the accepted side of the trade -- padding
      only never-executed dead space fixed dyntrait but left every
      fall-through-entered loop, sum included, in the cliff lottery. */
-  const char *lal_s = getenv("WARMC_LOOP_ALIGN");
+  const char *lal_s = warmc_getenv("WARMC_LOOP_ALIGN");
   uint32_t lalign = lal_s ? (uint32_t)strtoul(lal_s, NULL, 0) : 16;
   if (lalign != 16 && lalign != 32) lalign = 0;
   /* A loop small enough to fit in one 64-byte fetch block is aligned to
@@ -2310,12 +2411,16 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
   for (uint32_t i = 0; i < f->nblocks && !has_loop; i++)
     if (f->blocks[i].reachable && f->blocks[i].loop_depth > 0) has_loop = true;
 
-  if (getenv("WARMC_VERIFY_RA") && s->csa_consumed != s->ncsa_vals)
+  if (warmc_getenv("WARMC_VERIFY_RA") && s->csa_consumed != s->ncsa_vals)
     warmc_fatal("internal: %u caller-save entries built but %u emitted in %s",
                 s->ncsa_vals, s->csa_consumed, f->m->funcs[f->func_index].sym);
 
   if (s->far_br_needed) goto give_up;
-  if (refit) { split_ret = 4; goto give_up; }
+  if (refit) {
+    if (!s->naive) ra_keep_save(s, &ra_added);
+    split_ret = 4;
+    goto give_up;
+  }
 
   memset(fout, 0, sizeof *fout);
   fout->want_align = opt->align && has_loop;
@@ -2419,7 +2524,7 @@ give_up:
   xfree(s->sp_first); xfree(s->sp_n); xfree(s->sp_vals);
   xfree(s->csa_slot); xfree(s->csa_on);
   xfree(s->csa_first); xfree(s->csa_n); xfree(s->csa_vals);
-  xfree(s->lv_in); xfree(s->lv_out);
+  xfree(s->lv_in); xfree(s->lv_out); xfree(s->lv_in_off); xfree(s->lv_out_off);
   if (split_ret) return split_ret;
   return s->far_br_needed ? 0 : 1;
 }

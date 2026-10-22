@@ -152,7 +152,7 @@ static void split_unapply_adds(IrFunc *f, SplitCtl *sc) {
    Grant counters follow the survivors -- --stats reports what the emitted
    code carries, not what was asked for. */
 static void split_prune_plan(IrFunc *f, SplitCtl *sc) {
-  bool dbg = getenv("WARMC_SPLIT_DEBUG") != NULL;
+  bool dbg = warmc_getenv("WARMC_SPLIT_DEBUG") != NULL;
   uint32_t w = 0;
   for (uint32_t k = 0; k < sc->nadd; k++) {
     if (sc->inv_fail && sc->inv_fail[k]) {
@@ -218,6 +218,10 @@ static int produce_once(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
   if (r == 4)
     r = g_target->produce_body(f, obj, opt, out_bytes, fout, far, sc, collect);
   f->loop_bytes = NULL;
+  if (f->ra_keep) {
+    f->ra_keep_drop(f->ra_keep);
+    f->ra_keep = NULL;
+  }
   return r;
 }
 
@@ -242,7 +246,8 @@ void ir_produce_function(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
      The one row it costs, cppbench/algorithms at 2%, runs fewer
      instructions: an insertion sort's previous index left a stack slot
      for a register and its loads now issue early. */
-  sc.full = getenv("WARMC_SPLIT") != NULL;
+  if (opt->regalloc) ir_compact(f);
+  sc.full = warmc_getenv("WARMC_SPLIT") != NULL;
   bool collect = opt->regalloc && (opt->split || sc.full);
   int r = produce_once(f, obj, opt, out_bytes, fout, false, &sc, collect);
   if (r == 2) {

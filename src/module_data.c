@@ -1009,7 +1009,7 @@ void codegen_emit_module_data(Module *m, ObjBuilder *o) {
   RoTmp pool = { NULL, 0, 0 };
   uint32_t *run = NULL, run_cap = 0;
   root_pool_reset();
-  g_check_roots = getenv("WARMC_CHECK_ROOTS") != NULL;
+  g_check_roots = warmc_getenv("WARMC_CHECK_ROOTS") != NULL;
   for (uint32_t i = 0; i < g_nunwind; i++) {
     const FuncUnwind *u = &g_unwind[i];
     if (!(u->saved & UW_HAS_LR) || !u->ngcsites) continue;
@@ -1240,7 +1240,7 @@ void codegen_emit_module_data(Module *m, ObjBuilder *o) {
   if (pool_have) data_ptr(o, 1, pool_off);
   else buf_u64(&o->data, 0);
 
-  if (getenv("WARMC_TABLE_STATS")) {
+  if (warmc_getenv("WARMC_TABLE_STATS")) {
     uint64_t dead_bytes = 0;
     uint32_t dead_segs = 0;
     for (uint32_t i = 0; i < m->ndatas; i++)

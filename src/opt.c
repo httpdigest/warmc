@@ -421,12 +421,24 @@ static void replace_with_const(IrFunc *f, Ref v, uint64_t bits) {
   if (in->type == VT_I32 || in->type == VT_F32) in->imm &= 0xffffffffu;
 }
 
+/* Rounds until no param is trivial or dead.  A round reads only the use
+   counts and the edges' arguments as the previous round left them, so after
+   the first (whose ir_apply_subst also settles what the caller left
+   pending) the counts are kept as a recount would find them and the edges'
+   arguments resolved in place, and the rest of the function is resolved
+   once at the end: a recount and a full ir_apply_subst every round was
+   rounds times the function, and a Go function can take hundreds. */
 static bool prune_params(IrFunc *f) {
-  bool any = false, changed = true;
+  bool any = false, changed = true, lazy = false, lazy_changed = false;
   IrEdgeIdx ei = ir_edge_index(f);
+  uint32_t *uses = NULL;
+  uint8_t *inord = NULL;
+  Ref *gone = NULL, *dropped = NULL;
+  uint32_t ngone = 0, capgone = 0, ndropped = 0, capdropped = 0;
   while (changed) {
     changed = false;
-    uint32_t *uses = count_uses(f);
+    if (!uses) uses = count_uses(f);
+    ngone = ndropped = 0;
     for (uint32_t oi = 0; oi < f->norder; oi++) {
       uint32_t bi = f->order[oi];
       Block *b = &f->blocks[bi];
@@ -451,12 +463,26 @@ static bool prune_params(IrFunc *f) {
         if (!dead) {
           if (same == param) { p++; continue; }
           ir_replace(f, param, same);
+          if (lazy) {
+            if (ngone == capgone) {
+              capgone = capgone ? capgone * 2 : 16;
+              gone = xrealloc(gone, capgone * sizeof(Ref));
+            }
+            gone[ngone++] = param;
+          }
         }
 
         for (uint32_t j = p; j + 1 < b->nparams; j++) b->params[j] = b->params[j + 1];
         b->nparams--;
         for (uint32_t k = ei.off[bi]; k < ei.off[bi + 1]; k++) {
           Edge *e = &f->blocks[ei.src[k]].succs[ei.si[k]];
+          if (lazy && e->nargs && inord[ei.src[k]]) {
+            if (ndropped == capdropped) {
+              capdropped = capdropped ? capdropped * 2 : 16;
+              dropped = xrealloc(dropped, capdropped * sizeof(Ref));
+            }
+            dropped[ndropped++] = e->args[p < e->nargs ? p : e->nargs - 1];
+          }
           for (uint32_t j = p; j + 1 < e->nargs; j++) e->args[j] = e->args[j + 1];
           if (e->nargs) e->nargs--;
         }
@@ -464,9 +490,36 @@ static bool prune_params(IrFunc *f) {
         changed = any = true;
       }
     }
-    xfree(uses);
-    if (changed) ir_apply_subst(f);
+    if (!changed) break;
+    if (!lazy) {
+      ir_apply_subst(f);
+      xfree(uses);
+      uses = NULL;
+      lazy = true;
+      inord = xcalloc(f->nblocks ? f->nblocks : 1, 1);
+      for (uint32_t oi = 0; oi < f->norder; oi++) inord[f->order[oi]] = 1;
+      continue;
+    }
+    /* the counts and edge arguments ir_apply_subst and count_uses would
+       leave: the removed arguments uncounted, a replaced param's uses its
+       replacement's */
+    lazy_changed = true;
+    for (uint32_t k = 0; k < ndropped; k++) uses[dropped[k]]--;
+    for (uint32_t k = 0; k < ngone; k++) {
+      Ref g = gone[k], to = ir_resolve(f, g);
+      uses[to] += uses[g];
+      uses[g] = 0;
+    }
+    for (uint32_t bi = 0; bi < f->nblocks; bi++) {
+      Block *b = &f->blocks[bi];
+      for (uint32_t k = 0; k < b->nsuccs; k++) {
+        Edge *e = &b->succs[k];
+        for (uint32_t j = 0; j < e->nargs; j++) e->args[j] = ir_resolve(f, e->args[j]);
+      }
+    }
   }
+  if (lazy_changed) ir_apply_subst(f);
+  xfree(uses); xfree(inord); xfree(gone); xfree(dropped);
   ir_edge_index_free(&ei);
   return any;
 }
@@ -1438,7 +1491,7 @@ static bool fold_block(IrFunc *f, uint32_t bi, const OptOpts *o, const uint32_t 
 
           Magic mgd = opt_magic_unsigned(dc, vt_is_64(t));
           if (dc > 2 && !is_pow2(dc, &k) && !(dc >> (vt_is_64(t) ? 63 : 31)) &&
-              (getenv("WARMC_MAGIC_ALL") || magic_worth_it(&mgd, vt_is_64(t)))) {
+              (warmc_getenv("WARMC_MAGIC_ALL") || magic_worth_it(&mgd, vt_is_64(t)))) {
             Ref q = emit_magic_udiv(f, bi, &i, a[0], t, dc);
             in = &f->insts[v]; a = ir_args(f, v);
             ir_replace(f, v, q);
@@ -1622,7 +1675,7 @@ static bool fold_block(IrFunc *f, uint32_t bi, const OptOpts *o, const uint32_t 
 
           Magic mgr = opt_magic_unsigned(dc, vt_is_64(t));
           if (dc > 2 && !is_pow2(dc, &k) && !(dc >> (vt_is_64(t) ? 63 : 31)) &&
-              (getenv("WARMC_MAGIC_ALL") || magic_worth_it(&mgr, vt_is_64(t)))) {
+              (warmc_getenv("WARMC_MAGIC_ALL") || magic_worth_it(&mgr, vt_is_64(t)))) {
             Ref q = emit_magic_udiv(f, bi, &i, a[0], t, dc);
             Ref dcv = emit_before(f, bi, &i, I_CONST, t, NULL, 0, dc);
             Ref mula[2] = { q, dcv };
@@ -2259,7 +2312,7 @@ static bool pass_escape(IrFunc *f, bool partial) {
   uint32_t n = f->ninsts, nb = f->nblocks;
   if (!n || !f->norder) return false;
   Module *m = f->m;
-  bool dbg = getenv("WARMC_ESCAPE_DEBUG") != NULL;
+  bool dbg = warmc_getenv("WARMC_ESCAPE_DEBUG") != NULL;
 
   EsObj *obj = NULL;
   uint32_t nobj = 0, cobj = 0;
@@ -3277,9 +3330,20 @@ static bool cse_candidate(IrFunc *f, Ref v, bool gcpure) {
   return in->type != 0;
 }
 
+/* The instructions in the order's blocks: what a table of them needs room
+   for, where f->ninsts counts every instruction ever made. */
+static uint32_t live_insts(const IrFunc *f) {
+  uint32_t n = 0;
+  for (uint32_t oi = 0; oi < f->norder; oi++) n += f->blocks[f->order[oi]].ninsts;
+  return n;
+}
+
+/* The table is sized by what can go in it.  Entries of one hash lie along
+   its probe path in the order they went in, so a lookup finds the first
+   that matches and dominates whatever the table's size. */
 static bool pass_cse(IrFunc *f, const OptOpts *o) {
   uint32_t cap = 1;
-  while (cap < f->ninsts * 2 + 16) cap *= 2;
+  while (cap < live_insts(f) * 2 + 16) cap *= 2;
   CseEnt *tab = xcalloc(cap, sizeof(CseEnt));
   bool changed = false;
 
@@ -3500,6 +3564,11 @@ static void td_repair(IrFunc *f, Ref p, const Ref *defval, const uint32_t *use,
   ValType t = (ValType)f->insts[p].type;
   Ref *phi = xmalloc(nb * sizeof(Ref));
   uint8_t *inwl = xcalloc(nb, 1), *live = xcalloc(nb, 1);
+  /* use[] lists every block outside the definitions that reads p, so only
+     those need their instructions searched for it */
+  uint8_t *reads = xcalloc(nb, 1);
+  for (uint32_t i = 0; i < nuse; i++)
+    if (use[i] < nb) reads[use[i]] = 1;
   uint32_t *wl = xmalloc(nb * sizeof(uint32_t)), nwl = 0;
   for (uint32_t i = 0; i < nuse; i++) {
     uint32_t x = use[i];
@@ -3539,7 +3608,7 @@ static void td_repair(IrFunc *f, Ref p, const Ref *defval, const uint32_t *use,
     Ref c = phi[x] != REF_NONE ? phi[x]
           : x == f->entry ? REF_NONE : cur[xb->idom];
     if (defval[x] != REF_NONE) c = defval[x];
-    else if (c != REF_NONE) {
+    else if (c != REF_NONE && reads[x]) {
       for (uint32_t i = 0; i < xb->ninsts; i++) {
         Ref *a = ir_args(f, xb->insts[i]);
         for (uint32_t q = 0; q < f->insts[xb->insts[i]].nargs; q++)
@@ -3577,7 +3646,7 @@ static void td_repair(IrFunc *f, Ref p, const Ref *defval, const uint32_t *use,
       edge_push_arg_at(f, x, s, undef);
     }
   }
-  xfree(phi); xfree(inwl); xfree(wl); xfree(cur); xfree(stk);
+  xfree(phi); xfree(inwl); xfree(wl); xfree(cur); xfree(stk); xfree(reads);
 }
 
 static bool td_numeric(ValType t) {
@@ -3671,7 +3740,7 @@ static bool thread_dispatch(IrFunc *f, uint32_t B, const uint32_t *nread,
     }
   }
   if (!made.n) return false;
-  if (getenv("WARMC_THREAD_STATS"))
+  if (warmc_getenv("WARMC_THREAD_STATS"))
     fprintf(stderr, "thread %s b%u: %s on a parameter, %u edge(s)\n",
             f->m->funcs[f->func_index].sym ? f->m->funcs[f->func_index].sym : "?", B,
             f->blocks[B].term == T_BRIF ? "brif" : "br_table", made.n);
@@ -3733,7 +3802,7 @@ static bool pass_thread(IrFunc *f) {
   for (uint32_t bi = 0, n = f->nblocks; bi < n; bi++)
     if (thread_dispatch(f, bi, nread, nnread)) {
       changed = true;
-      if (getenv("WARMC_THREAD_DEBUG")) { ir_print(f, "thread"); ir_verify(f, "thread"); }
+      if (warmc_getenv("WARMC_THREAD_DEBUG")) { ir_print(f, "thread"); ir_verify(f, "thread"); }
     }
   xfree(nread);
   if (changed) {
@@ -4092,38 +4161,33 @@ typedef struct {
 
 #define MAX_TRACKED_GLOBALS 64
 
+/* A block's memory state at its end.  Entries and pending stores take arrays
+   of their own size, the tracked globals a mask and, once one is held, an
+   array of values: a fixed-size state was 4.5 KB a block, and keeping one
+   per block and a copy of each for the sweep test cost a function of 50,000
+   blocks 450 MB, most of it copied and compared every sweep. */
 typedef struct {
-  MemEnt ent[MEMOPT_ENTS];
-  uint32_t nent;
-  PendStore pend[MEMOPT_ENTS];
-  uint32_t npend;
-  Ref gval[MAX_TRACKED_GLOBALS];
-  bool gok[MAX_TRACKED_GLOBALS];
+  MemEnt *ent;
+  PendStore *pend;
+  Ref *gval;
+  uint32_t nent, npend, cap_ent, cap_pend;
+  uint64_t gok;
   bool valid;
 } MemState;
+_Static_assert(MAX_TRACKED_GLOBALS <= 64, "MemState.gok is a 64-bit mask");
 
-static void memstate_copy(MemState *d, const MemState *s) {
-  d->valid = s->valid;
-  d->nent = s->nent;
-  d->npend = s->npend;
-  if (s->nent) memcpy(d->ent, s->ent, s->nent * sizeof(MemEnt));
-  if (s->npend) memcpy(d->pend, s->pend, s->npend * sizeof(PendStore));
-  memcpy(d->gval, s->gval, sizeof d->gval);
-  memcpy(d->gok, s->gok, sizeof d->gok);
+static void memstate_free(MemState *s) {
+  xfree(s->ent); xfree(s->pend); xfree(s->gval);
 }
 
-static void memstate_init(MemState *s) {
-  s->valid = false;
-  s->nent = 0;
-  s->npend = 0;
-  memset(s->gok, 0, sizeof s->gok);
-}
-
-static bool memstate_same(const MemState *a, const MemState *b) {
-  if (a->valid != b->valid || a->nent != b->nent || a->npend != b->npend)
-    return false;
-  for (uint32_t i = 0; i < a->nent; i++) {
-    const MemEnt *x = &a->ent[i], *y = &b->ent[i];
+/* Whether a block's end state, as the scan's arrays now hold it, is the one
+   the block ended with last sweep. */
+static bool memstate_same(const MemState *a, const MemEnt *ent, uint32_t nent,
+                          const PendStore *pend, uint32_t npend,
+                          const Ref *gval, uint64_t gok) {
+  if (!a->valid || a->nent != nent || a->npend != npend) return false;
+  for (uint32_t i = 0; i < nent; i++) {
+    const MemEnt *x = &a->ent[i], *y = &ent[i];
     if (x->addr != y->addr || x->off != y->off || x->size != y->size ||
         x->mem != y->mem ||
         x->value != y->value || x->sgn != y->sgn || x->valid != y->valid ||
@@ -4131,17 +4195,39 @@ static bool memstate_same(const MemState *a, const MemState *b) {
         x->vtype != y->vtype || x->low != y->low)
       return false;
   }
-  for (uint32_t i = 0; i < a->npend; i++) {
-    const PendStore *x = &a->pend[i], *y = &b->pend[i];
+  for (uint32_t i = 0; i < npend; i++) {
+    const PendStore *x = &a->pend[i], *y = &pend[i];
     if (x->addr != y->addr || x->off != y->off || x->size != y->size ||
         x->mem != y->mem || x->inst != y->inst)
       return false;
   }
-  for (uint32_t g = 0; g < MAX_TRACKED_GLOBALS; g++) {
-    if (a->gok[g] != b->gok[g]) return false;
-    if (a->gok[g] && a->gval[g] != b->gval[g]) return false;
-  }
+  if (a->gok != gok) return false;
+  for (uint32_t g = 0; g < MAX_TRACKED_GLOBALS; g++)
+    if ((gok >> g) & 1 && a->gval[g] != gval[g]) return false;
   return true;
+}
+
+static void memstate_store(MemState *d, const MemEnt *ent, uint32_t nent,
+                           const PendStore *pend, uint32_t npend,
+                           const Ref *gval, uint64_t gok) {
+  if (nent > d->cap_ent) {
+    d->cap_ent = nent;
+    d->ent = xrealloc(d->ent, nent * sizeof(MemEnt));
+  }
+  if (nent) memcpy(d->ent, ent, nent * sizeof(MemEnt));
+  d->nent = nent;
+  if (npend > d->cap_pend) {
+    d->cap_pend = npend;
+    d->pend = xrealloc(d->pend, npend * sizeof(PendStore));
+  }
+  if (npend) memcpy(d->pend, pend, npend * sizeof(PendStore));
+  d->npend = npend;
+  if (gok) {
+    if (!d->gval) d->gval = xmalloc(MAX_TRACKED_GLOBALS * sizeof(Ref));
+    memcpy(d->gval, gval, MAX_TRACKED_GLOBALS * sizeof(Ref));
+  }
+  d->gok = gok;
+  d->valid = true;
 }
 
 static void access_base(IrFunc *f, Ref addr, Ref *base, uint64_t *off) {
@@ -5387,7 +5473,7 @@ static void fx_facts_build(Module *m) {
     d->nvtst = d->capvtst = 0;
   }
 
-  if (getenv("WARMC_DEVIRT_DEBUG")) {
+  if (warmc_getenv("WARMC_DEVIRT_DEBUG")) {
     uint32_t mono = 0, poly = 0, nulls = 0;
     for (uint32_t i = 0; i < total; i++) {
       if (fx_vt[i].state == FX_VT_MONO) mono++;
@@ -5456,13 +5542,13 @@ static struct {
 } g_dv;
 
 static void dv_init(void) {
-  g_dv.off = getenv("WARMC_NO_DEVIRT") != NULL;
-  g_dv.dbg = getenv("WARMC_DEVIRT_DEBUG") != NULL;
-  const char *e = getenv("WARMC_DEVIRT_RUNGS");
+  g_dv.off = warmc_getenv("WARMC_NO_DEVIRT") != NULL;
+  g_dv.dbg = warmc_getenv("WARMC_DEVIRT_DEBUG") != NULL;
+  const char *e = warmc_getenv("WARMC_DEVIRT_RUNGS");
   g_dv.rungs = e ? (uint32_t)strtoul(e, NULL, 0) : 0xffffffffu;
-  e = getenv("WARMC_DEVIRT_ONLY");
+  e = warmc_getenv("WARMC_DEVIRT_ONLY");
   g_dv.only = e ? atol(e) : -1;
-  e = getenv("WARMC_DEVIRT_UPTO");
+  e = warmc_getenv("WARMC_DEVIRT_UPTO");
   g_dv.upto = e ? atol(e) : -1;
 }
 
@@ -5860,14 +5946,10 @@ static bool pass_memopt(IrFunc *f, const OptOpts *o) {
   PendStore pend[MEMOPT_ENTS];
   uint32_t npend = 0;
   Ref gval[MAX_TRACKED_GLOBALS];
-  bool gok[MAX_TRACKED_GLOBALS];
-  MemState *st = xmalloc((f->nblocks ? f->nblocks : 1) * sizeof(MemState));
-  for (uint32_t i = 0; i < f->nblocks; i++) memstate_init(&st[i]);
+  uint64_t gok;   /* bit g: gval[g] is what global g holds */
+  MemState *st = xcalloc(f->nblocks ? f->nblocks : 1, sizeof(MemState));
   uint8_t *reach = xmalloc(f->nblocks ? f->nblocks : 1);
   uint32_t *rstack = xmalloc((f->nblocks ? f->nblocks : 1) * sizeof(uint32_t));
-
-  MemState *prev = xmalloc((f->nblocks ? f->nblocks : 1) * sizeof(MemState));
-  for (uint32_t i = 0; i < f->nblocks; i++) memstate_init(&prev[i]);
   bool apply = false;
   for (int sweep = 0; ; sweep++) {
     bool moved = false;
@@ -5877,21 +5959,20 @@ static bool pass_memopt(IrFunc *f, const OptOpts *o) {
     uint32_t nent = 0;
     npend = 0;
 
-    memset(ent, 0, sizeof ent);
-    memset(gok, 0, sizeof gok);
+    gok = 0;
 
     if (b->is_pad) {  }
     else if (b->npreds == 1 && st[b->preds[0]].valid &&
         f->blocks[b->preds[0]].rpo < b->rpo) {
       MemState *p = &st[b->preds[0]];
-      memcpy(ent, p->ent, p->nent * sizeof(MemEnt));
+      if (p->nent) memcpy(ent, p->ent, p->nent * sizeof(MemEnt));
       nent = p->nent;
-      memcpy(gval, p->gval, sizeof gval);
-      memcpy(gok, p->gok, sizeof gok);
+      if (p->gok) memcpy(gval, p->gval, sizeof gval);
+      gok = p->gok;
 
       Block *pb = &f->blocks[b->preds[0]];
       if (pb->nsuccs == 1 && pb->term == T_JUMP) {
-        memcpy(pend, p->pend, p->npend * sizeof(PendStore));
+        if (p->npend) memcpy(pend, p->pend, p->npend * sizeof(PendStore));
         npend = p->npend;
       }
     } else if (b->npreds > 1) {
@@ -5936,18 +6017,30 @@ static bool pass_memopt(IrFunc *f, const OptOpts *o) {
         }
       }
 
-      for (uint32_t g = 0; g < MAX_TRACKED_GLOBALS; g++) {
-        bool have = false, all = true;
-        Ref gv = REF_NONE;
-        for (uint32_t p = 0; p < b->npreds && all; p++) {
-          MemState *ps = &st[b->preds[p]];
-          if (!f->blocks[b->preds[p]].reachable) continue;
-          if (!ps->valid) continue;
-          if (!ps->gok[g]) { all = false; break; }
-          if (!have) { have = true; gv = ps->gval[g]; }
-          else if (ps->gval[g] != gv) all = false;
+      /* a global every reachable, settled predecessor holds, with one
+         value among them all */
+      const MemState *base = NULL;
+      uint64_t held = ~(uint64_t)0;
+      for (uint32_t p = 0; p < b->npreds; p++) {
+        const MemState *ps = &st[b->preds[p]];
+        if (!f->blocks[b->preds[p]].reachable || !ps->valid) continue;
+        if (!base) base = ps;
+        held &= ps->gok;
+      }
+      if (base && held) {
+        for (uint32_t p = 0; p < b->npreds; p++) {
+          const MemState *ps = &st[b->preds[p]];
+          if (!f->blocks[b->preds[p]].reachable || !ps->valid || ps == base) continue;
+          for (uint64_t m = held; m; m &= m - 1) {
+            uint32_t g = (uint32_t)__builtin_ctzll(m);
+            if (ps->gval[g] != base->gval[g]) held &= ~((uint64_t)1 << g);
+          }
         }
-        if (all && have) { gok[g] = true; gval[g] = gv; }
+        for (uint64_t m = held; m; m &= m - 1) {
+          uint32_t g = (uint32_t)__builtin_ctzll(m);
+          gval[g] = base->gval[g];
+        }
+        gok |= held;
       }
     }
     for (uint32_t i = 0; i < b->ninsts; i++) {
@@ -6131,7 +6224,7 @@ static bool pass_memopt(IrFunc *f, const OptOpts *o) {
       } else if (in->op == I_GLOBAL_GET) {
         uint32_t g = (uint32_t)in->imm;
         if (g < MAX_TRACKED_GLOBALS) {
-          if (gok[g] && f->insts[gval[g]].type == in->type) {
+          if ((gok >> g) & 1 && f->insts[gval[g]].type == in->type) {
             if (apply) {
               ir_replace(f, v, gval[g]);
               in->op = I_NOP;
@@ -6139,12 +6232,12 @@ static bool pass_memopt(IrFunc *f, const OptOpts *o) {
               changed = true;
             }
           } else {
-            gval[g] = v; gok[g] = true;
+            gval[g] = v; gok |= (uint64_t)1 << g;
           }
         }
       } else if (in->op == I_GLOBAL_SET) {
         uint32_t g = (uint32_t)in->imm;
-        if (g < MAX_TRACKED_GLOBALS) { gval[g] = a[0]; gok[g] = true; }
+        if (g < MAX_TRACKED_GLOBALS) { gval[g] = a[0]; gok |= (uint64_t)1 << g; }
       } else if (is_call_op(in->op) ||
                  in->op == I_MEM_GROW || in->op == I_MEM_COPY ||
                  in->op == I_MEM_FILL || in->op == I_MEM_INIT) {
@@ -6165,28 +6258,21 @@ static bool pass_memopt(IrFunc *f, const OptOpts *o) {
         nent = kept;
         npend = 0;
         if (fx) {
-          if (fx->gany) memset(gok, 0, sizeof gok);
-          else if (fx->writes_globals)
-            for (uint32_t g = 0; g < MAX_TRACKED_GLOBALS; g++)
-              if (fx->gmask & ((uint64_t)1 << g)) gok[g] = false;
+          if (fx->gany) gok = 0;
+          else if (fx->writes_globals) gok &= ~fx->gmask;
         }
       }
     }
-    memcpy(st[bi].ent, ent, nent * sizeof(MemEnt));
-    st[bi].nent = nent;
-    memcpy(st[bi].pend, pend, npend * sizeof(PendStore));
-    st[bi].npend = npend;
-    memcpy(st[bi].gval, gval, sizeof gval);
-    memcpy(st[bi].gok, gok, sizeof gok);
-    st[bi].valid = true;
-    if (!apply && !memstate_same(&prev[bi], &st[bi])) moved = true;
-    if (!apply) memstate_copy(&prev[bi], &st[bi]);
+    if (!apply && !memstate_same(&st[bi], ent, nent, pend, npend, gval, gok))
+      moved = true;
+    memstate_store(&st[bi], ent, nent, pend, npend, gval, gok);
   }
     if (apply) break;
 
     if (!moved || sweep + 1 >= MEMOPT_SWEEPS) apply = true;
   }
-  xfree(st); xfree(prev); xfree(reach); xfree(rstack);
+  for (uint32_t i = 0; i < f->nblocks; i++) memstate_free(&st[i]);
+  xfree(st); xfree(reach); xfree(rstack);
   if (changed) ir_apply_subst(f);
   return changed;
 }
@@ -6808,6 +6894,16 @@ static bool pass_gc_nullchk(IrFunc *f) {
 static bool pass_bce(IrFunc *f, Module *m) {
   bool changed = false;
 
+  /* Nothing to do without a check, which with guard pages is most
+     functions; a set is read only below its count. */
+  bool any = false;
+  for (uint32_t oi = 0; oi < f->norder && !any; oi++) {
+    const Block *b = &f->blocks[f->order[oi]];
+    for (uint32_t i = 0; i < b->ninsts && !any; i++)
+      any = f->insts[b->insts[i]].op == I_BOUNDS_CHECK;
+  }
+  if (!any) return false;
+
   ChkEnt **sets = xcalloc(f->nblocks, sizeof(ChkEnt *));
   uint32_t *counts = xcalloc(f->nblocks, sizeof(uint32_t));
   const uint32_t CAP = 64;
@@ -6815,7 +6911,7 @@ static bool pass_bce(IrFunc *f, Module *m) {
   for (uint32_t oi = 0; oi < f->norder; oi++) {
     uint32_t bi = f->order[oi];
     Block *b = &f->blocks[bi];
-    sets[bi] = xcalloc(CAP, sizeof(ChkEnt));
+    sets[bi] = xmalloc(CAP * sizeof(ChkEnt));
     counts[bi] = 0;
     uint32_t d = b->idom;
     if (bi != f->entry && d != REF_NONE && sets[d]) {
@@ -7035,25 +7131,87 @@ static bool stops_with_other_code(const Inst *in) {
   }
 }
 
-static bool access_dominates(IrFunc *f, Ref addr, uint64_t imm, uint32_t size,
-                             uint32_t mem, uint32_t target) {
+/* An access as same_access compares it: both of its tests need the access's
+   offset from its base (s), and then either the same base or the same root,
+   width and arithmetic.  Worked out once per access instead of once per
+   pair, since a load's question goes to every access up the dominator tree. */
+typedef struct {
+  uint64_t s, c;
+  Ref b, r;
+  uint32_t size, mem;
+  bool w;
+} AccKey;
+
+typedef struct {
+  AccKey *k;
+  uint32_t n, cap;
+  bool built;
+} AccList;
+
+static AccKey acc_key(IrFunc *f, Ref addr, uint64_t imm, uint32_t size,
+                      uint32_t mem) {
+  AccKey k;
+  uint64_t off, ia;
+  access_base(f, addr, &k.b, &off);
+  k.s = off + imm;
+  access_parts(f, addr, &k.r, &k.c, &ia, &k.w);
+  k.size = size;
+  k.mem = mem;
+  return k;
+}
+
+static AccKey acc_key_of(IrFunc *f, Ref v) {
+  Inst *in = &f->insts[v];
+  return acc_key(f, ir_args(f, v)[0], in->imm, (uint32_t)MEMF_SIZE(in->imm2),
+                 MEMF_MEM(in->imm2));
+}
+
+/* same_access(x, q), from their keys. */
+static bool acc_key_same(const AccKey *x, const AccKey *q) {
+  if (x->size != q->size || x->mem != q->mem || x->s != q->s) return false;
+  if (x->b == q->b) return true;
+  if (x->r == REF_NONE || x->r != q->r || x->w != q->w) return false;
+  uint64_t mask = x->w ? ~0ull : 0xffffffffull;
+  return ((x->c - q->c) & mask) == 0;
+}
+
+static void acc_push(AccList *L, AccKey k) {
+  if (L->n == L->cap) {
+    L->cap = L->cap ? L->cap * 2 : 4;
+    L->k = xrealloc(L->k, L->cap * sizeof(AccKey));
+  }
+  L->k[L->n++] = k;
+}
+
+/* Is the access the same as a load or store in a block dominating target?
+   acc caches each block's accesses; the caller drops a block's list when
+   its instructions change and adds to it what it hoists in. */
+static bool access_dominates(IrFunc *f, AccList *acc, Ref addr, uint64_t imm,
+                             uint32_t size, uint32_t mem, uint32_t target) {
+  AccKey q = acc_key(f, addr, imm, size, mem);
   for (uint32_t bi = target; bi != REF_NONE; bi = f->blocks[bi].idom) {
-    Block *b = &f->blocks[bi];
-    for (uint32_t i = 0; i < b->ninsts; i++) {
-      Inst *in = &f->insts[b->insts[i]];
-      if (in->op != I_LOAD && in->op != I_STORE) continue;
-      if (same_access(f, ir_args(f, b->insts[i])[0], in->imm,
-                      (uint32_t)MEMF_SIZE(in->imm2), MEMF_MEM(in->imm2),
-                      addr, imm, size, mem))
-        return true;
+    AccList *L = &acc[bi];
+    if (!L->built) {
+      Block *b = &f->blocks[bi];
+      L->n = 0;
+      for (uint32_t i = 0; i < b->ninsts; i++) {
+        uint16_t op = f->insts[b->insts[i]].op;
+        if (op == I_LOAD || op == I_STORE) acc_push(L, acc_key_of(f, b->insts[i]));
+      }
+      L->built = true;
     }
+    for (uint32_t i = 0; i < L->n; i++)
+      if (acc_key_same(&L->k[i], &q)) return true;
     if (bi == f->entry) break;
   }
   return false;
 }
 
+/* lblk lists the loop's blocks, in index order: the stores a load must not
+   alias are looked for there, not in a scan of every block per load. */
 static bool inst_hoistable(IrFunc *f, Ref v, bool reach_mem, bool reach_any,
                            const LoopFx *lf, const uint8_t *inloop,
+                           const uint32_t *lblk, uint32_t nlbl, AccList *acc,
                            const uint32_t *const_reg_use, uint32_t preheader,
                            bool gcpure) {
   bool writes_mem = lf->writes_mem;
@@ -7079,13 +7237,12 @@ static bool inst_hoistable(IrFunc *f, Ref v, bool reach_mem, bool reach_any,
     Ref laddr = ir_args(f, v)[0];
 
     if (!reach_mem &&
-        !access_dominates(f, laddr, in->imm, lsz, MEMF_MEM(in->imm2), preheader))
+        !access_dominates(f, acc, laddr, in->imm, lsz, MEMF_MEM(in->imm2), preheader))
       return false;
     if (writes_anywhere) return false;
     if (!writes_mem) return true;
-    for (uint32_t bi = 0; bi < f->nblocks; bi++) {
-      if (!inloop[bi]) continue;
-      Block *lb = &f->blocks[bi];
+    for (uint32_t li = 0; li < nlbl; li++) {
+      Block *lb = &f->blocks[lblk[li]];
       for (uint32_t i = 0; i < lb->ninsts; i++) {
         Inst *si = &f->insts[lb->insts[i]];
         if (si->op != I_STORE) continue;
@@ -7771,7 +7928,7 @@ static bool gs_pays(IrFunc *f, const OptOpts *o, uint32_t gidx) {
     if (uses > best) best = uses;
     if (uses >= GS_MIN_CYCLE_USES) pays = true;
   }
-  if (getenv("WARMC_GSSA_DEBUG"))
+  if (warmc_getenv("WARMC_GSSA_DEBUG"))
     fprintf(stderr, "gssa %s g%u: saves %llu costs %llu cycle uses %u -> %s\n",
             f->m->funcs[f->func_index].sym ? f->m->funcs[f->func_index].sym : "?",
             gidx, (unsigned long long)saves, (unsigned long long)costs, best,
@@ -7785,7 +7942,7 @@ static bool pass_global_ssa(IrFunc *f, const OptOpts *o) {
   {
     /* WARMC_GSSA_FUNCS=lo-hi limits the pass to those function indices, to
        bisect a module down to the function it changes. */
-    const char *r = getenv("WARMC_GSSA_FUNCS");
+    const char *r = warmc_getenv("WARMC_GSSA_FUNCS");
     unsigned lo = 0, hi = ~0u;
     if (r && sscanf(r, "%u-%u", &lo, &hi) >= 1 &&
         (f->func_index < lo || f->func_index > hi)) return false;
@@ -8018,6 +8175,7 @@ static bool pass_licm(IrFunc *f, const OptOpts *o) {
   uint64_t *lord = xmalloc(f->nblocks * sizeof(uint64_t));
   uint32_t *const_reg_use = xcalloc(f->ninsts ? f->ninsts : 1, sizeof(uint32_t));
   uint32_t *cru_touched = xmalloc((f->ninsts ? f->ninsts : 1) * sizeof(uint32_t));
+  AccList *acc = xcalloc(f->nblocks ? f->nblocks : 1, sizeof(AccList));
   SpInfo spi;
   sp_reset(&spi, f, reach, rstack);
 
@@ -8098,7 +8256,7 @@ static bool pass_licm(IrFunc *f, const OptOpts *o) {
         if (stop_any) reach_any = false;
         if (stop_other) reach_mem = false;
         if (guarded_pre && in->op != I_CONST) { b->insts[k++] = v; continue; }
-        if (!inst_hoistable(f, v, m, any, &lf, inloop,
+        if (!inst_hoistable(f, v, m, any, &lf, inloop, lblk, nlbl, acc,
                             const_reg_use, preheader, o->gcpure)) {
           b->insts[k++] = v; continue; }
         Ref *a = ir_args(f, v);
@@ -8115,14 +8273,21 @@ static bool pass_licm(IrFunc *f, const OptOpts *o) {
         }
         pre->insts[pre->ninsts++] = v;
         in->block = preheader;
+        if (acc[preheader].built && (in->op == I_LOAD || in->op == I_STORE))
+          acc_push(&acc[preheader], acc_key_of(f, v));
         g_stats.licm_hoisted++;
         changed = true;
       }
       b->ninsts = k;
     }
     for (uint32_t i = 0; i < cru_nt; i++) const_reg_use[cru_touched[i]] = 0;
-    for (uint32_t i = 0; i < nlbl; i++) inloop[lblk[i]] = 0;
+    for (uint32_t i = 0; i < nlbl; i++) {
+      inloop[lblk[i]] = 0;
+      acc[lblk[i]].built = false;
+    }
   }
+  for (uint32_t i = 0; i < f->nblocks; i++) xfree(acc[i].k);
+  xfree(acc);
   xfree(inloop); xfree(reach); xfree(stack); xfree(rstack);
   xfree(lblk); xfree(lord); xfree(const_reg_use); xfree(cru_touched);
   return changed;
@@ -8272,7 +8437,7 @@ static bool gl_promote_one(IrFunc *f, uint32_t hb, uint32_t pre,
 
   if (!round) {
     if (!ok || !may_carry || !nback) {
-      if (getenv("WARMC_GL_DEBUG"))
+      if (warmc_getenv("WARMC_GL_DEBUG"))
         fprintf(stderr, "gl %s b%u g%u: no round trip%s\n",
                 f->m->funcs[f->func_index].sym, hb, gidx,
                 may_carry ? " and the walk declined" : " and carrying is off");
@@ -8294,7 +8459,7 @@ static bool gl_promote_one(IrFunc *f, uint32_t hb, uint32_t pre,
       uint32_t nb = gl_split_edge(f, out[i].from, out[i].succ);
       ir_emit(f, nb, I_GLOBAL_SET, 0, &v, 1, gidx, 0);
     }
-    if (getenv("WARMC_GL_DEBUG"))
+    if (warmc_getenv("WARMC_GL_DEBUG"))
       fprintf(stderr, "gl %s b%u g%u: carried, %u back %u out\n",
               f->m->funcs[f->func_index].sym, hb, gidx, nback, nout);
     xfree(cur); xfree(subst);
@@ -8387,7 +8552,7 @@ static bool pass_global_loop(IrFunc *f, const OptOpts *o) {
         gset[ngset++] = g;
       }
     }
-    if (getenv("WARMC_GL_DEBUG"))
+    if (warmc_getenv("WARMC_GL_DEBUG"))
       fprintf(stderr, "gl %s b%u: clear=%d ngset=%u callmask=%llx\n",
               f->m->funcs[f->func_index].sym, hb, (int)clear, ngset,
               (unsigned long long)callmask);
@@ -8881,11 +9046,11 @@ static bool lh_kill_redundant(IrFunc *f, uint32_t hb, uint32_t pre,
         }
       }
       if (!clear) {
-        if (getenv("WARMC_LH_DEBUG"))
+        if (warmc_getenv("WARMC_LH_DEBUG"))
           fprintf(stderr, "lh   store v%u established but clobbered in loop\n", r);
         continue;
       }
-      if (getenv("WARMC_LH_DEBUG"))
+      if (warmc_getenv("WARMC_LH_DEBUG"))
         fprintf(stderr, "lh   store v%u already made in b%u\n", r, pre);
       in->op = I_NOP;
       in->nargs = 0;
@@ -9089,7 +9254,7 @@ static bool pass_loop_hoist(IrFunc *f) {
                               MEMF_MEM(oi->imm2))) {
               continue;
             }
-            if (getenv("WARMC_LH_DEBUG"))
+            if (warmc_getenv("WARMC_LH_DEBUG"))
               fprintf(stderr, "lh   store v%u blocked by store v%u\n", r, o);
             clear = false; break;
           }
@@ -9107,7 +9272,7 @@ static bool pass_loop_hoist(IrFunc *f) {
             bool ours = false;
             for (uint32_t k = 0; k < nmv; k++) if (mv[k] == o) ours = true;
             if (!ours) {
-              if (getenv("WARMC_LH_DEBUG"))
+              if (warmc_getenv("WARMC_LH_DEBUG"))
                 fprintf(stderr, "lh   store v%u has memory ahead of it (v%u)\n", r, o);
               clear = false;
             }
@@ -9146,7 +9311,7 @@ static bool pass_loop_hoist(IrFunc *f) {
       for (uint32_t k = gsave; k < nchain; k++) moved[chain[k]] = 0;
       nchain = gsave;
     }
-    if (getenv("WARMC_LH_DEBUG"))
+    if (warmc_getenv("WARMC_LH_DEBUG"))
       fprintf(stderr, "lh %s b%u: call=%d stores=%u guard=%d term=%d\n",
               f->m->funcs[f->func_index].sym, hb, (int)has_call, nmv,
               trap_s != REF_NONE, (int)f->blocks[hb].term);
@@ -9299,7 +9464,7 @@ static uint32_t nback_of(IrFunc *f, uint32_t hb) {
 static uint32_t g_rot_esc_cap;
 
 void opt_init_tunables(void) {
-  const char *e = getenv("WARMC_ROT_ESC");
+  const char *e = warmc_getenv("WARMC_ROT_ESC");
   g_rot_esc_cap = e ? (uint32_t)atoi(e) : 16;
   if (g_rot_esc_cap > ROT_MAX_ESCAPES) g_rot_esc_cap = ROT_MAX_ESCAPES;
 }
@@ -9311,9 +9476,9 @@ static uint32_t rot_esc_cap(void) {
 
 static bool rotate_one(IrFunc *f, uint32_t hb) {
   Block *h = &f->blocks[hb];
-#define RJ(w) do { if (getenv("WARMC_ROT_DEBUG")) fprintf(stderr, "rot %s b%u reject: %s\n", f->m->funcs[f->func_index].sym, hb, w); return false; } while (0)
+#define RJ(w) do { if (warmc_getenv("WARMC_ROT_DEBUG")) fprintf(stderr, "rot %s b%u reject: %s\n", f->m->funcs[f->func_index].sym, hb, w); return false; } while (0)
 
-#define RJ_OP(w, op) do { if (getenv("WARMC_ROT_DEBUG")) \
+#define RJ_OP(w, op) do { if (warmc_getenv("WARMC_ROT_DEBUG")) \
     fprintf(stderr, "rot %s b%u reject: %s %s\n", \
             f->m->funcs[f->func_index].sym, hb, w, ir_op_name(op)); \
     return false; } while (0)
@@ -9377,7 +9542,7 @@ static bool rotate_one(IrFunc *f, uint32_t hb) {
   }
   xfree(inl);
 
-  bool rot_all = getenv("WARMC_ROT_ALL") != NULL;
+  bool rot_all = warmc_getenv("WARMC_ROT_ALL") != NULL;
   if (body_calls && !rot_all) RJ("body makes a call");
 
   if (!body_mem && !rot_all) RJ("body touches no memory");
@@ -9777,10 +9942,24 @@ static bool pass_postdec_test(IrFunc *f) {
 
 typedef struct { Ref addr; Ref iv; Ref entry; uint64_t step; uint16_t sop; } IvCand;
 
+static int u64_cmp(const void *a, const void *b) {
+  uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+  return x < y ? -1 : x > y;
+}
+
+/* Per loop, the work is the loop's: its body is listed as it is walked (and
+   cleared from that list), its blocks visited in order by sorting the list
+   by RPO, and the use counts taken again only after a loop that changed the
+   function -- clearing a block map, scanning the whole order per header
+   param and recounting every use per header made this blocks times loops. */
 static bool pass_iv_strength(IrFunc *f) {
   bool changed = false;
-  uint8_t *inloop = xmalloc(f->nblocks ? f->nblocks : 1);
+  uint8_t *inloop = xcalloc(f->nblocks ? f->nblocks : 1, 1);
   uint32_t *stack = xmalloc((f->nblocks ? f->nblocks : 1) * sizeof(uint32_t));
+  uint32_t *body = xmalloc((f->nblocks ? f->nblocks : 1) * sizeof(uint32_t));
+  uint64_t *walk = xmalloc((f->nblocks ? f->nblocks : 1) * sizeof(uint64_t));
+  uint32_t nbody = 0;
+  uint32_t *uses = NULL;
   IvCand *cand = NULL;
   uint32_t ncand = 0, capcand = 0;
 
@@ -9801,14 +9980,20 @@ static bool pass_iv_strength(IrFunc *f) {
     if (ir_block_has_eh(f, pre) || ir_block_has_eh(f, latch) ||
         f->blocks[hb].is_pad) continue;
 
-    memset(inloop, 0, f->nblocks);
+    for (uint32_t j = 0; j < nbody; j++) inloop[body[j]] = 0;
+    nbody = 0;
     inloop[hb] = 1;
+    body[nbody++] = hb;
     uint32_t sp = 0;
-    if (!inloop[latch]) { inloop[latch] = 1; stack[sp++] = latch; }
+    if (!inloop[latch]) { inloop[latch] = 1; body[nbody++] = latch; stack[sp++] = latch; }
     while (sp) {
       Block *c = &f->blocks[stack[--sp]];
       for (uint32_t p = 0; p < c->npreds; p++)
-        if (!inloop[c->preds[p]]) { inloop[c->preds[p]] = 1; stack[sp++] = c->preds[p]; }
+        if (!inloop[c->preds[p]]) {
+          inloop[c->preds[p]] = 1;
+          body[nbody++] = c->preds[p];
+          stack[sp++] = c->preds[p];
+        }
     }
     if (inloop[pre] || inloop[f->entry]) continue;
 
@@ -9816,7 +10001,16 @@ static bool pass_iv_strength(IrFunc *f) {
     if (!pe || !le) continue;
     if (pe->nargs != h->nparams || le->nargs != h->nparams) continue;
 
-    uint32_t *uses = count_uses(f);
+    /* the body's blocks in the order, as a scan of the order would meet them */
+    uint32_t nwalk = 0;
+    for (uint32_t j = 0; j < nbody; j++) {
+      uint32_t r = f->blocks[body[j]].rpo;
+      if (r < f->norder && f->order[r] == body[j])
+        walk[nwalk++] = (uint64_t)r << 32 | body[j];
+    }
+    qsort(walk, nwalk, sizeof(uint64_t), u64_cmp);
+
+    if (!uses) uses = count_uses(f);
     ncand = 0;
     for (uint32_t k = 0; k < h->nparams; k++) {
       Ref p = h->params[k], back = le->args[k], entry = pe->args[k];
@@ -9828,9 +10022,8 @@ static bool pass_iv_strength(IrFunc *f) {
       if (ba[0] != p || !is_const(f, ba[1], &step)) continue;
       if (inloop[f->insts[entry].block]) continue;
 
-      for (uint32_t bo = 0; bo < f->norder; bo++) {
-        uint32_t bi = f->order[bo];
-        if (!inloop[bi]) continue;
+      for (uint32_t bo = 0; bo < nwalk; bo++) {
+        uint32_t bi = (uint32_t)walk[bo];
         Block *b = &f->blocks[bi];
         for (uint32_t i = 0; i < b->ninsts; i++) {
           Ref u = b->insts[i];
@@ -9855,13 +10048,12 @@ static bool pass_iv_strength(IrFunc *f) {
         }
       }
     }
-    xfree(uses);
 
     uint32_t bodysz = 0;
-    for (uint32_t bi = 0; bi < f->nblocks; bi++)
-      if (inloop[bi]) bodysz += f->blocks[bi].ninsts;
+    for (uint32_t j = 0; j < nbody; j++) bodysz += f->blocks[body[j]].ninsts;
     if (ncand < 2 || bodysz < IV_MIN_BODY ||
         f->blocks[hb].loop_depth < IV_MIN_DEPTH) ncand = 0;
+    if (ncand) { xfree(uses); uses = NULL; }
     for (uint32_t c = 0; c < ncand; c++) {
       Ref v = cand[c].addr, p = cand[c].iv, entry = cand[c].entry;
       ValType vt = (ValType)f->insts[v].type;
@@ -9889,7 +10081,7 @@ static bool pass_iv_strength(IrFunc *f) {
       Ref inc = ir_emit(f, latch, I_ADD, vt, ia, 2, 0, 0);
       edge_push_arg(f, pre, hb, b0);
       edge_push_arg(f, latch, hb, inc);
-      if (getenv("WARMC_IV_DEBUG"))
+      if (warmc_getenv("WARMC_IV_DEBUG"))
         fprintf(stderr, "iv: fn=%s hdr=b%u depth=%u body=%u ncand=%u v=v%u\n",
                 f->m->funcs[f->func_index].sym ? f->m->funcs[f->func_index].sym : "?",
                 hb, f->blocks[hb].loop_depth, bodysz, ncand, v);
@@ -9898,7 +10090,7 @@ static bool pass_iv_strength(IrFunc *f) {
       changed = true;
     }
   }
-  xfree(cand); xfree(inloop); xfree(stack);
+  xfree(cand); xfree(inloop); xfree(stack); xfree(body); xfree(walk); xfree(uses);
   if (changed) ir_apply_subst(f);
   return changed;
 }
@@ -11120,14 +11312,14 @@ static Ref guard_trip_count(IrFunc *f, uint32_t gb, ValType ct, IrOp rel,
 }
 
 static bool vectorize_one(IrFunc *f, uint32_t hb, uint8_t *reach, uint8_t *inloop) {
-#define VREJ(w) do { if (getenv("WARMC_VEC_DEBUG")) \
+#define VREJ(w) do { if (warmc_getenv("WARMC_VEC_DEBUG")) \
     fprintf(stderr, "vec %s b%u reject: %s\n", \
             f->m->funcs[f->func_index].sym, hb, w); return false; } while (0)
 
-#define VREJ_OP2(w, w2) do { if (getenv("WARMC_VEC_DEBUG")) \
+#define VREJ_OP2(w, w2) do { if (warmc_getenv("WARMC_VEC_DEBUG")) \
     fprintf(stderr, "vec %s b%u reject: %s: %s\n", \
             f->m->funcs[f->func_index].sym, hb, w, w2); return false; } while (0)
-#define VREJ_OP(w, op) do { if (getenv("WARMC_VEC_DEBUG")) \
+#define VREJ_OP(w, op) do { if (warmc_getenv("WARMC_VEC_DEBUG")) \
     fprintf(stderr, "vec %s b%u reject: %s %s\n", \
             f->m->funcs[f->func_index].sym, hb, w, ir_op_name(op)); \
     return false; } while (0)
@@ -11203,7 +11395,7 @@ static bool vectorize_one(IrFunc *f, uint32_t hb, uint8_t *reach, uint8_t *inloo
                  (by->term != T_JUMP || by->nsuccs != 1)) {
           Block *bad = (bx->term != T_JUMP || bx->nsuccs != 1) ? bx : by;
           static const char *tn[] = {"none","jump","brif","brtable","return","trap"};
-          if (getenv("WARMC_VEC_DEBUG"))
+          if (warmc_getenv("WARMC_VEC_DEBUG"))
             fprintf(stderr, "vec %s b%u reject: body arm ends in %s (nsuccs=%u)\n",
                     f->m->funcs[f->func_index].sym, hb,
                     bad->term <= T_TRAP ? tn[bad->term] : "?", bad->nsuccs);
@@ -11485,7 +11677,7 @@ static bool vectorize_one(IrFunc *f, uint32_t hb, uint8_t *reach, uint8_t *inloo
     }
   }
 
-  if (getenv("WARMC_VEC_DEBUG2")) {
+  if (warmc_getenv("WARMC_VEC_DEBUG2")) {
     fprintf(stderr, "vec %s b%u: Sb=%llu U=%u nvec=%u mpv=%u width=%u groups=%u\n",
             f->m->funcs[f->func_index].sym, hb, (unsigned long long)Sa,
             U, nvec, mpv, width, ctx.ngrp);
@@ -12381,7 +12573,7 @@ static bool vectorize_one(IrFunc *f, uint32_t hb, uint8_t *reach, uint8_t *inloo
   f->blocks[vexit].term = T_JUMP;
   ir_add_edge(f, vexit, hb, exit_args, np);
 
-  if (getenv("WARMC_VEC_DEBUG"))
+  if (warmc_getenv("WARMC_VEC_DEBUG"))
     fprintf(stderr, "vec: fn=%s b%u lane=%u width=%u k=%u U=%u groups=%u red=%u\n",
             f->m->funcs[f->func_index].sym, hb, lane, width, k, U, ctx.ngrp, nred);
   g_stats.vectorized++;
@@ -12435,7 +12627,7 @@ static bool vs_invariant(IrFunc *f, const uint8_t *inloop, Ref r) {
   return b < f->nblocks && !inloop[b];
 }
 
-#define VSREJ(w) do { if (getenv("WARMC_VEC_DEBUG")) \
+#define VSREJ(w) do { if (warmc_getenv("WARMC_VEC_DEBUG")) \
     fprintf(stderr, "vecsearch %s b%u reject: %s\n", \
             f->m->funcs[f->func_index].sym, hb, w); return false; } while (0)
 
@@ -12673,7 +12865,7 @@ static bool pass_vec_search(IrFunc *f) {
     if (f->nblocks > lcap) { lcap = f->nblocks; inloop = xrealloc(inloop, lcap); }
     VSearch S;
     if (!vs_match(f, hb, inloop, &S)) continue;
-    if (getenv("WARMC_VEC_DEBUG"))
+    if (warmc_getenv("WARMC_VEC_DEBUG"))
       fprintf(stderr, "vecsearch %s b%u: width=%u lanes=%u\n",
               f->m->funcs[f->func_index].sym, hb, S.width, 16u / S.width);
     vs_emit(f, hb, &S);
@@ -12744,21 +12936,21 @@ static struct {
 } g_unr;
 
 static void unr_init(void) {
-  g_unr.off = getenv("WARMC_NO_UNROLL") != NULL;
-  g_unr.noguard = getenv("WARMC_NO_UNROLL_GUARD") != NULL;
-  g_unr.nocanon = getenv("WARMC_NO_UNROLL_ADDRCANON") != NULL;
-  g_unr.dbg = getenv("WARMC_UNROLL_DEBUG") != NULL;
-  const char *e = getenv("WARMC_UNROLL_K");
+  g_unr.off = warmc_getenv("WARMC_NO_UNROLL") != NULL;
+  g_unr.noguard = warmc_getenv("WARMC_NO_UNROLL_GUARD") != NULL;
+  g_unr.nocanon = warmc_getenv("WARMC_NO_UNROLL_ADDRCANON") != NULL;
+  g_unr.dbg = warmc_getenv("WARMC_UNROLL_DEBUG") != NULL;
+  const char *e = warmc_getenv("WARMC_UNROLL_K");
   g_unr.k = e ? (uint32_t)strtoul(e, NULL, 0) : UNROLL_K;
   if (g_unr.k < 2 || g_unr.k > 16) g_unr.k = UNROLL_K;
-  e = getenv("WARMC_UNROLL_MAX_BODY");
+  e = warmc_getenv("WARMC_UNROLL_MAX_BODY");
   g_unr.max_body = e ? (uint32_t)strtoul(e, NULL, 0) : UNROLL_MAX_BODY;
-  e = getenv("WARMC_UNROLL_MAX_PARAMS");
+  e = warmc_getenv("WARMC_UNROLL_MAX_PARAMS");
   g_unr.max_params = e ? (uint32_t)strtoul(e, NULL, 0) : UNROLL_MAX_PARAMS;
   if (g_unr.max_params > 16) g_unr.max_params = 16;
-  e = getenv("WARMC_UNROLL_ONLY");
+  e = warmc_getenv("WARMC_UNROLL_ONLY");
   g_unr.only = e ? atol(e) : -1;
-  e = getenv("WARMC_UNROLL_UPTO");
+  e = warmc_getenv("WARMC_UNROLL_UPTO");
   g_unr.upto = e ? atol(e) : -1;
 }
 
@@ -13326,7 +13518,7 @@ typedef struct {
 static UacAdds uac_adds_build(IrFunc *f) {
   UacAdds m;
   uint32_t cap = 64;
-  while (cap < f->ninsts * 2) cap <<= 1;
+  while (cap < live_insts(f) * 2) cap <<= 1;
   m.key = xcalloc(cap, sizeof(uint64_t));
   m.add = xmalloc(cap * sizeof(Ref));
   m.mask = cap - 1;
@@ -13677,7 +13869,7 @@ static bool unroll_nest_one(IrFunc *f, uint32_t hb) {
     return false;
   }
 
-  if (getenv("WARMC_UNROLL_DEBUG"))
+  if (warmc_getenv("WARMC_UNROLL_DEBUG"))
     fprintf(stderr, "unroll %s b%u: nest trip=%llu body=%u\n",
             f->m->funcs[f->func_index].sym, hb, (unsigned long long)trip, ninst);
   uint32_t *bc = xmalloc((size_t)trip * nb0 * sizeof(uint32_t));
@@ -13725,7 +13917,7 @@ static bool unroll_nest_one(IrFunc *f, uint32_t hb) {
 }
 
 static bool pass_unroll_nest(IrFunc *f) {
-  if (f->npads || getenv("WARMC_NO_UNROLL_NEST")) return false;
+  if (f->npads || warmc_getenv("WARMC_NO_UNROLL_NEST")) return false;
   bool changed = false;
   /* one loop per round: the rest of the orders, depths and preds are stale */
   for (uint32_t oi = 0; oi < f->norder; oi++)
@@ -14235,35 +14427,45 @@ void opt_passtime_report(void) {
 
 static pthread_once_t g_pt_once = PTHREAD_ONCE_INIT;
 static void pt_init(void) {
-  g_pt_on = getenv("WARMC_PASSTIME") != NULL;
-  ir_dom_check_on = getenv("WARMC_CHECK_DOM") != NULL;
+  g_pt_on = warmc_getenv("WARMC_PASSTIME") != NULL;
+  ir_dom_check_on = warmc_getenv("WARMC_CHECK_DOM") != NULL;
 }
 
 /* The cleanup rounds every inline is followed by: folding, forwarding and
    escape analysis until they stop finding work. */
+/* A pass that finds nothing to do finds nothing again while the function is
+   as it left it -- none of them changes the function when it reports no
+   change -- so a round runs only the passes something has changed under
+   since: ver counts the changes, the passes' and a reordering's, and done
+   holds the change each pass last ran clean at.  The round that confirms a
+   cleanup is finished used to run every pass once more. */
 static void opt_cleanup(IrFunc *f, const OptOpts *o) {
+  uint32_t ver = 1, done[16] = {0};
+#define RUN(i, nm, call) \
+  (done[i] != ver && (TP(nm, call) ? (ver++, true) : (done[i] = ver, false)))
   for (int round = 0; round < 6; round++) {
     bool changed = false;
-    if (o->throwjump && TP("throwjump", pass_local_throw(f))) changed = true;
-    if (o->fold && TP("fold", pass_fold(f, o))) changed = true;
-    if (o->branch && TP("branch", pass_branch(f))) changed = true;
-    if (o->thread && TP("thread", pass_thread(f))) changed = true;
-    if (o->thread && o->nodesplit && TP("nodesplit", pass_nodesplit(f))) changed = true;
-    if (o->cse && TP("cse", pass_cse(f, o))) changed = true;
-    if (o->memopt && TP("memopt", pass_memopt(f, o))) changed = true;
+    if (o->throwjump && RUN(0, "throwjump", pass_local_throw(f))) changed = true;
+    if (o->fold && RUN(1, "fold", pass_fold(f, o))) changed = true;
+    if (o->branch && RUN(2, "branch", pass_branch(f))) changed = true;
+    if (o->thread && RUN(3, "thread", pass_thread(f))) changed = true;
+    if (o->thread && o->nodesplit && RUN(4, "nodesplit", pass_nodesplit(f))) changed = true;
+    if (o->cse && RUN(5, "cse", pass_cse(f, o))) changed = true;
+    if (o->memopt && RUN(6, "memopt", pass_memopt(f, o))) changed = true;
 
-    if (o->ldcomb && TP("ldcomb", pass_load_combine(f, o))) changed = true;
-    if (o->bce && TP("bce", pass_bce(f, f->m))) changed = true;
+    if (o->ldcomb && RUN(7, "ldcomb", pass_load_combine(f, o))) changed = true;
+    if (o->bce && RUN(8, "bce", pass_bce(f, f->m))) changed = true;
 
-    if (o->bce && TP("arraybounds", pass_array_bounds(f))) changed = true;
-    if (o->gcpure && TP("gcnull", pass_gc_nullchk(f))) changed = true;
+    if (o->bce && RUN(9, "arraybounds", pass_array_bounds(f))) changed = true;
+    if (o->gcpure && RUN(10, "gcnull", pass_gc_nullchk(f))) changed = true;
 
-    if (o->escape && TP("escape", pass_escape(f, o->pescape))) changed = true;
-    if (o->dce && TP("dce", pass_dce(f))) changed = true;
-    if (TP("prune_params", prune_params(f))) changed = true;
-    ir_order(f);
+    if (o->escape && RUN(11, "escape", pass_escape(f, o->pescape))) changed = true;
+    if (o->dce && RUN(12, "dce", pass_dce(f))) changed = true;
+    if (RUN(13, "prune_params", prune_params(f))) changed = true;
+    if (ir_order_changed(f)) ver++;
     if (!changed) break;
   }
+#undef RUN
 }
 
 /* Inlining, devirtualization and escape analysis feed one another: an
