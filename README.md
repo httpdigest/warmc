@@ -721,6 +721,14 @@ Most of the suite is **differential**. warmc's output is compared with:
   the resulting directory tree)
 - wasmtime, for the benchmark corpora in Go, Rust, Zig, AssemblyScript,
   Kotlin, C, C++ and Haskell
+- wasmtime, at `-O0`, `-O1` and `-O2`, for 310 test programs that are not
+  benchmarks: `test/ctests` (C, 36), `cpptests` (C++, 40), `rstests` (Rust,
+  34), `gotests` (TinyGo, 36), `stdgotests` (Go, 44), `astests`
+  (AssemblyScript, 40), `kttests` (Kotlin, 22), `zigtests` (Zig, 35) and
+  `hstests` (Haskell, 23). Each one covers a single language area: integer
+  and float edge cases, strings, collections, closures, exceptions, generics,
+  the GC and the runtime library. Each prints only results that wasm fixes
+  exactly; for example, it prints no arithmetic NaN bits.
 - `wasm-tools`, for component, WIT and WAT handling
 - the Component Model's reference `definitions.py`, for canonical-ABI layout
 
