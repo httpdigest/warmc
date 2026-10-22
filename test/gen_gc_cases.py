@@ -28,6 +28,22 @@ took a second bit, which is exactly the kind of number that is only ever right
 by accident: `$manytypes` puts six hundred struct types in a module and
 allocates from the last one, so the wide form is emitted and its object is
 read back after a collection.
+
+And the *reach of the literal pool*.  A float constant normally loads from a
+pool behind the function, but where the function could outgrow the 1 MB reach
+of a literal load -- a few thousand instructions, at the estimate's 128 bytes
+apiece -- the constant is built through x16 instead (rax on x64).  array.set
+held the element's address in that same register while it read the value, so a
+constant rebuilt at the store sent the store wherever the constant's bits
+pointed: Kotlin's doubleArrayOf in a long main.  The `farpool_*` functions open
+with eight thousand memory.fills to put their pools out of reach -- fills of
+the same three locals, which make no value the naive allocator would give a
+slot of its own -- and keep a dozen doubles live across a call in the loop,
+more than the callee-saved registers hold, so -inf is rebuilt at its store
+instead of keeping a register.  One stores into an array element, the other
+into a struct field past the reach of a scaled offset, whose address goes into
+x16 too.  Each function holds a single store: two would earn the constant a
+register of its own.
 """
 import os
 import sys
@@ -163,6 +179,60 @@ def gen():
     A("    (call $eq64 (struct.get $t%d $v%d (local.get $o)) (i64.const 4242))"
       % (NT - 1, NT - 1))
     A("  )")
+
+    NP = 12
+    FARF = LIMITS["i64"] // 16
+    A("  (type $adbl (array (mut f64)))")
+    A("  (type $farf (struct")
+    A("    " + " ".join("(field v128)" for _ in range(FARF)) + " (field (mut f64))))")
+    A("  (type $v (func))")
+    A("  (memory 1)")
+    A("  (table 2 funcref)")
+    A("  (elem (i32.const 0) $tick $tock)")
+    A("  (global $gk (mut i32) (i32.const 0))")
+    A("  (global $gi (mut i32) (i32.const 1))")
+    A("  (global $gs (mut f64) (f64.const 0))")
+    A("  (global $gdbl (mut (ref null $adbl)) (ref.null $adbl))")
+    A("  (global $gfar (mut (ref null $farf)) (ref.null $farf))")
+    A("  (func $tick (global.set $gk (i32.add (global.get $gk) (i32.const 1))))")
+    A("  (func $tock (global.set $gk (i32.add (global.get $gk) (i32.const 2))))")
+
+    def farpool(name, make, store, load):
+        A('  (func (export "%s")' % name)
+        A("    (local $i i32) (local $p i32) "
+          + " ".join("(local $p%d f64)" % k for k in range(NP)))
+        A("    (local.set $p (global.get $gk))")
+        A("    (local.set $i (global.get $gi))")
+        for _ in range(8000):
+            A("    (memory.fill (local.get $p) (local.get $i) (local.get $i))")
+        A("    (local.set $i (i32.const 0))")
+        A("    " + make)
+        for k in range(NP):
+            A("    (local.set $p%d (f64.convert_i32_s (global.get $gi)))" % k)
+        A("    (loop $l")
+        A("      (call_indirect (type $v) (global.get $gi))")
+        for k in range(NP):
+            A("      (local.set $p%d (f64.add (local.get $p%d) (f64.const %d.5)))"
+              % (k, k, k))
+        A("      " + store)
+        A("      (local.set $i (i32.add (local.get $i) (i32.const 1)))")
+        A("      (br_if $l (i32.lt_u (local.get $i) (i32.const 8))))")
+        total = "(f64.const 0)"
+        for k in range(NP):
+            total = "(f64.add %s (local.get $p%d))" % (total, k)
+        A("    (global.set $gs %s)" % total)
+        A("    (call $eq64 (i64.reinterpret_f64 %s) (i64.const 0xfff0000000000000))"
+          % load)
+        A("  )")
+
+    farpool("farpool_array",
+            "(global.set $gdbl (array.new $adbl (f64.const 0) (i32.const 8)))",
+            "(array.set $adbl (global.get $gdbl) (local.get $i) (f64.const -inf))",
+            "(array.get $adbl (global.get $gdbl) (i32.const 3))")
+    farpool("farpool_field",
+            "(global.set $gfar (struct.new_default $farf))",
+            "(struct.set $farf %d (global.get $gfar) (f64.const -inf))" % FARF,
+            "(struct.get $farf %d (global.get $gfar))" % FARF)
     A(")")
     return "\n".join(L) + "\n"
 
