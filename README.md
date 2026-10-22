@@ -62,12 +62,14 @@ Hello world!
     becomes its fields and a flag
   - store-to-load forwarding
   - magic-number division
-  - a linear-scan register allocator with rematerialisation
+  - a linear-scan register allocator that runs under several spill rules and
+    keeps the cheapest, with rematerialisation, a second-chance pass and
+    live-range splitting at loop boundaries
 
   Functions compile in parallel and are laid out in a deterministic order.
-- **Fast code.** Across 207 benchmark kernels compiled from Go, TinyGo, Rust,
+- **Fast code.** Across 335 benchmark kernels compiled from Go, TinyGo, Rust,
   Zig, AssemblyScript, Kotlin, C, C++ and Haskell, warmc's steady-state code
-  takes 0.48× wasmtime's time (geometric mean), with much lower peak memory.
+  takes 0.51× wasmtime's time (geometric mean), with much lower peak memory.
   See [Performance](#performance).
 - **Runtime for modern languages:**
   - a concurrent, compacting, ZGC-style collector with coloured pointers,
@@ -473,21 +475,21 @@ command-line order, so put them **after** `-O`.
 
 | Pass | What it does |
 |---|---|
-| `fold` | constant folding and algebraic simplification |
+| `fold` | constant folding and algebraic simplification, including a constant reinterpreted between integer and float and two xor-shifts that cancel |
 | `dce` | dead-code elimination |
 | `cse` | common-subexpression elimination over dominators |
 | `licm` | loop-invariant code motion, including hoisting invariant stores and trap guards |
 | `branch` | constant-branch folding and block merging |
-| `thread` | jump threading through a block that only switches on a parameter, such as the dispatch Go's compiler puts around every function, when an edge passes that parameter a constant |
+| `thread` | jump threading through a block that only switches on a parameter, such as the dispatch Go's compiler puts around every function, or only compares one with a constant, when an edge passes that parameter a constant |
 | `nodesplit` | copy the part of a loop that a switch outside it enters in the middle, so that the loop has one way in again and the loop passes can take it |
 | `mem` | store-to-load forwarding, also of bytes stored as one type and loaded as another, and dead-store removal, also of a store of the value the slot already holds, using per-function effect summaries |
 | `bce` | bounds-check elimination by value range and dominating checks |
-| `strength` | strength reduction: induction variables, shifts, magic-number division |
+| `strength` | strength reduction: induction variables, shifts, magic-number division; division by a loop-invariant divisor through a reciprocal made before the loop; the remainder of a division just made as a multiply-subtract; a post-decrement loop test on the new count |
 | `inline` | call-site-scored inlining (on by default only at `-O2`) |
-| `reassoc` | rebalance associative integer chains for latency, and add the value a loop carries round last in its chain, so that an iteration waits on one op of it |
-| `rotate` | loop rotation |
+| `reassoc` | rebalance associative integer chains for latency, also through a wrap to 32 bits, and add the value a loop carries round last in its chain, so that an iteration waits on one op of it |
+| `rotate` | loop rotation, of loops whose latch ends in an unconditional jump |
 | `unroll` | 4× unrolling of constant-trip-count loops; complete unrolling of short ones, and of a loop nest whose outer loop runs at most 8 times; a loop that runs once loses its back edge |
-| `vectorize` | auto-vectoriser: contiguous and interleaved accesses, if-converted bodies, integer and widening reductions, search loops; with runtime alias checks and a scalar fallback |
+| `vectorize` | auto-vectoriser: contiguous and interleaved accesses, if-converted bodies, integer, widening and float min/max reductions, argmin and argmax (an index kept beside a min or max), search loops; with runtime alias checks and a scalar fallback |
 | `addroff`, `memptr` | fold address arithmetic into displacements; compute a native pointer once per base, and once per block for constant addresses too large for a displacement |
 | `ldcomb` | merge byte-assembling loads into one wide load |
 | `selftail` | turn self `return_call` into a loop |
@@ -498,9 +500,10 @@ command-line order, so put them **after** `-O`.
 | `devirt`, `closed-world` | turn `call_ref` and `call_indirect` into direct calls, also through vtables in immutable globals; with a closed world, use vtable slots too |
 | `reinline` | after the cleanup passes, inline again what devirtualisation made direct and the calls an allocation leaves by |
 | `throw-jump` | a `throw` caught in its own function, without the exnref, becomes a jump to the catch |
-| `gcpure` | treat immutable GC fields and `array.len` as pure; drop redundant null and bounds checks |
+| `gcpure` | treat immutable GC fields and `array.len` as pure; drop redundant null and bounds checks, and casts and type tests that a dominating `ref.test` or cast already decides |
 | `labcache`, `barelide` | keep the GC allocation buffer open, and hoist the load-barrier mask, in safepoint-free loops |
 | `reach`, `prune`, `merge` | module-wide reachability; skip unreachable bodies; share byte-identical functions |
+| `split` | live-range splitting at loop boundaries in loops that make no call, so a value the loop carries keeps a register inside it although it is spilled outside |
 | `align`, `cpool`, `regalloc`, `guard-pages` | code alignment; constant pools; the real register allocator (off: every value lives in a stack slot); guard-page bounds checking |
 
 `-j N` (or `WARMC_JOBS`) caps the number of compile threads. By default warmc
@@ -655,24 +658,28 @@ steady-state generated code, not start-up or compile time.
 
 | Corpus | Source language | Kernels | warmc / wasmtime | Range | Median peak RSS (warmc / wasmtime) |
 |---|---|---:|---:|---|---|
-| `gobench` | TinyGo | 26 | 0.59 | 0.07 – 1.00 | 1.9 / 8.9 MB |
-| `stdgo` | Go | 34 | 0.65 | 0.06 – 1.00 | 7.2 / 27.3 MB |
-| `vecbench` | TinyGo (vectorisable loops) | 30 | 0.15 | 0.04 – 0.95 | 1.9 / 8.9 MB |
-| `asbench` | AssemblyScript | 25 | 0.62 | 0.17 – 1.00 | 1.9 / 8.7 MB |
-| `rsbench` | Rust | 28 | 0.69 | 0.34 – 0.98 | 2.0 / 9.1 MB |
-| `zigbench` | Zig | 9 | 0.71 | 0.42 – 1.00 | 1.9 / 8.7 MB |
-| `ktbench` | Kotlin (Wasm GC) | 12 | 0.09 | 0.004 – 0.49 | 3.5 / 20.6 MB |
-| `cbench` | C | 14 | 0.83 | 0.33 – 1.01 | 2.0 / 9.0 MB |
-| `cppbench` | C++ | 14 | 0.69 | 0.23 – 0.99 | 2.6 / 9.8 MB |
-| `hsbench` | Haskell | 15 | 0.64 | 0.39 – 0.87 | 10.1 / 32.3 MB |
+| `gobench` | TinyGo | 39 | 0.61 | 0.07 – 0.99 | 1.9 / 8.9 MB |
+| `stdgo` | Go | 49 | 0.65 | 0.06 – 1.01 | 7.4 / 27.4 MB |
+| `vecbench` | TinyGo (vectorisable loops) | 43 | 0.20 | 0.04 – 1.04 | 1.9 / 8.9 MB |
+| `asbench` | AssemblyScript | 37 | 0.61 | 0.17 – 0.97 | 1.9 / 8.7 MB |
+| `rsbench` | Rust | 39 | 0.74 | 0.34 – 1.04 | 2.0 / 9.1 MB |
+| `zigbench` | Zig | 22 | 0.82 | 0.41 – 1.15 | 2.0 / 8.9 MB |
+| `ktbench` | Kotlin (Wasm GC) | 25 | 0.11 | 0.003 – 0.74 | 3.5 / 20.8 MB |
+| `cbench` | C | 27 | 0.84 | 0.32 – 0.99 | 2.0 / 9.0 MB |
+| `cppbench` | C++ | 26 | 0.71 | 0.23 – 1.01 | 2.4 / 9.6 MB |
+| `hsbench` | Haskell | 28 | 0.66 | 0.38 – 0.95 | 10.2 / 32.6 MB |
 
-Over all 207 kernels the geometric mean is **0.48**, and 0.45 without
-`stdgo`. Six kernels are slower than wasmtime, none by more than 1%:
-`asbench/div64`, `cbench/hashtab` and `cbench/sha256`, `gobench/mathfn`,
-`stdgo/bitops` and `zigbench/sortints`. Those are ties, and which of them
-lands just above 1.0 changes between recordings. `cbench/nbody`, which was
-5% slower, runs at 0.91× now that warmc unrolls its five-body loop nest
-completely and keeps the velocities in registers.
+Over all 335 kernels the geometric mean is **0.51**, and 0.49 without
+`stdgo`. Seven kernels are slower than wasmtime. Four of them are within 2.5%:
+`cppbench/bitset` (which was 3.19 before the register allocator learned to
+price its spill choices), `stdgo/memcpy` (the platform's memmove under both
+engines), `zigbench/optional` and `zigbench/arena`. The other three:
+
+| Kernel | warmc / wasmtime | What is known |
+|---|---:|---|
+| `zigbench/wordfreq` | 1.15 | LICM hoists some 250 cheap invariants to the function's entry, where the registers they hold leave the hot inner loops to spill; gating LICM on register pressure fixes it but costs other kernels |
+| `rsbench/itadapt` | 1.04 | `chunk_minmax`'s min and max loops, already unrolled by LLVM, are unrolled again behind a guard, and with chunks of five they run at most once |
+| `vecbench/condsum` | 1.04 | a masked sum LLVM turns into two nested loops, which neither engine vectorises |
 
 `stdgo` is Go built by Go's own compiler, which is not LLVM. It compiles
 every function to a loop around a `br_table` over the function's resume
