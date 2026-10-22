@@ -137,6 +137,48 @@ static int32_t arg_stack_at(int32_t *cursor, bool vec) {
 
 static void emit_teardown(Isel *s);
 static void emit_epilogue(Isel *s);
+
+/* The stack arguments this function's own calls write past the shadow
+   space, sized by them rather than by the module's widest signature: a wasm
+   call's class by class as emit_call_args_core places them, RDX-R9 and
+   XMM0-3 first; a runtime helper's by position, the first three taken by
+   the instance and immediates at worst.  One that calls a wasm function at
+   all also makes room for the stack arguments of any tail call (tail_bytes),
+   which the callee writes where its own arrived. */
+static uint32_t call_out_bytes(IrFunc *f, uint32_t tail_bytes) {
+  uint32_t need = 0;
+  bool wasm_call = false;
+  for (uint32_t oi = 0; oi < f->norder; oi++) {
+    Block *b = &f->blocks[f->order[oi]];
+    for (uint32_t i = 0; i < b->ninsts; i++) {
+      Ref v = b->insts[i];
+      uint16_t op = f->insts[v].op;
+      if (!op_clobbers_caller_saved(op) || op == I_RETURN_CALL ||
+          op == I_RETURN_CALL_INDIRECT || op == I_RETURN_CALL_REF)
+        continue;
+      bool wc = op == I_CALL || op == I_CALL_INDIRECT || op == I_CALL_REF;
+      wasm_call |= wc;
+      uint32_t nargs = f->insts[v].nargs, bytes = 0;
+      if (wc) {
+        int32_t cursor = 0;
+        uint32_t ints = 0, flts = 0;
+        for (uint32_t j = 0; j < nargs; j++) {
+          Ref a = ir_args(f, v)[j];
+          bool fp = is_fp_value(f, a), vec = is_vec_value(f, a);
+          bool on_stack = fp ? flts >= 4 : ints >= 3;
+          if (fp) flts++; else ints++;
+          if (on_stack) bytes = (uint32_t)(arg_stack_at(&cursor, vec) +
+                                           (vec ? 16 : (int32_t)X64_ARG_SLOT));
+        }
+      } else if (3 + nargs > 4) {
+        bytes = 8u * (3 + nargs - 4);
+      }
+      if (bytes > need) need = bytes;
+    }
+  }
+  if (wasm_call && tail_bytes > need) need = tail_bytes;
+  return (need + 15u) & ~15u;
+}
 static void emit_block(Isel *s, uint32_t bi, uint32_t next_bi);
 
 /* ---- relocations, branches, traps ----------------------------------- */
@@ -424,6 +466,9 @@ static void emit_call_args_core(Isel *s, const Ref *args, uint32_t nargs,
         continue;
       }
       int32_t at = base_disp + 32 + 8 * (pos - 4);
+      if (!base_disp && (uint32_t)at + 8u > s->out_bytes)
+        warmc_fatal("internal: a stack argument past %s's outgoing area",
+                    f->m->funcs[f->func_index].sym);
       if (fp) {
         int r = IS_SLOT(l)
             ? (slot_load(s, B, 1, 0, FTMP, slot_off(s, SLOT_OF(l))), FTMP) : l;
@@ -446,6 +491,9 @@ static void emit_call_args_core(Isel *s, const Ref *args, uint32_t nargs,
       if (fp) flts++; else ints++;
       if (!on_stack) continue;
       int32_t at = base_disp + 32 + arg_stack_at(&cursor, vec);
+      if (!base_disp && (uint32_t)at + (vec ? 16u : X64_ARG_SLOT) > s->out_bytes)
+        warmc_fatal("internal: a stack argument past %s's outgoing area",
+                    f->m->funcs[f->func_index].sym);
       if (vec) {
         int r = IS_SLOT(l)
             ? (slot_load(s, B, 1, 1, FTMP, slot_off(s, SLOT_OF(l))), FTMP) : l;
@@ -1255,6 +1303,7 @@ static int produce_body_x64(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
      shadow space at the caller's [rsp, rsp+32), and MS-positional helper
      immediates can spill to 8-byte slots above it; the fixed 32-byte
      floor under the wasm out-area covers both. */
+  out_bytes = call_out_bytes(f, out_bytes);
   if (out_bytes < 32) out_bytes = 32;
   s->out_bytes = out_bytes + 32;
 

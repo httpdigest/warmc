@@ -598,7 +598,7 @@ void compile_module(Module *m, ObjBuilder *o, const OptOpts *opts) {
       else m->type_slot = slot;
     }
   }
-  uint32_t out_bytes = codegen_out_bytes(m);
+  uint32_t out_bytes = codegen_tail_out_bytes(m);
 
   bool tm = warmc_getenv("WARMC_TIME") != NULL;
 

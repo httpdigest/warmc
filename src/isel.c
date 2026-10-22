@@ -497,6 +497,12 @@ static void emit_call_args_core(Isel *s, const Ref *args, uint32_t nargs,
     if (fp) flts++; else ints++;
     if (!on_stack) continue;
     uint32_t at = (uint32_t)stack_slot++ * ARG_STACK_SLOT;
+    /* a tail call's go where the function's own arrived, which a frameless
+       one reaches from sp too */
+    if (stack_base == RSP && !s->tail_args &&
+        at + ARG_STACK_SLOT > s->out_bytes)
+      warmc_fatal("internal: a stack argument past %s's outgoing area",
+                  f->m->funcs[f->func_index].sym);
     if (vec) {
       int r = l == LOC_NONE ? rd(s, v, FTMP)
               : IS_SLOT(l) ? (slot_load(s, B, 1, 1, FTMP, slot_off(s, SLOT_OF(l))), FTMP) : l;
@@ -540,7 +546,9 @@ static void emit_call_args_core(Isel *s, const Ref *args, uint32_t nargs,
 
 static void emit_call_args_to(Isel *s, const Ref *args, uint32_t nargs,
                               int stack_base) {
+  s->tail_args = true;
   emit_call_args_core(s, args, nargs, stack_base, 1, true);
+  s->tail_args = false;
 }
 
 static void emit_call_args(Isel *s, const Ref *args, uint32_t nargs) {
@@ -2088,6 +2096,42 @@ static void ra_keep_take(Isel *s) {
 /* 1 = emitted, 0 = a conditional branch needs the far layout, 2 = the
    allocation filed a split plan; the caller applies it and retries, 4 = the
    loops it aligned are measured; the caller runs it again to place them. */
+/* The outgoing argument area this function's own calls write, sized by
+   them rather than by the module's widest signature: each call's stack
+   arguments as emit_call_args_core places them -- x1-x7 and v0-v7 first,
+   then 16-byte slots -- a runtime helper's with x1 and x2 taken by its
+   immediates.  One that calls a wasm function at all also makes room for
+   the stack arguments of any tail call (tail_bytes), which the callee
+   writes where its own arrived.  A function that calls nothing has none. */
+static uint32_t call_out_bytes(IrFunc *f, uint32_t tail_bytes) {
+  uint32_t need = 0;
+  bool wasm_call = false;
+  for (uint32_t oi = 0; oi < f->norder; oi++) {
+    Block *b = &f->blocks[f->order[oi]];
+    for (uint32_t i = 0; i < b->ninsts; i++) {
+      Ref v = b->insts[i];
+      uint16_t op = f->insts[v].op;
+      if (!op_clobbers_caller_saved(op) || op == I_RETURN_CALL ||
+          op == I_RETURN_CALL_INDIRECT || op == I_RETURN_CALL_REF)
+        continue;
+      bool wc = op == I_CALL || op == I_CALL_INDIRECT || op == I_CALL_REF;
+      wasm_call |= wc;
+      uint32_t ints = 0, flts = 0, slots = 0;
+      for (uint32_t j = 0; j < f->insts[v].nargs; j++) {
+        Ref a = ir_args(f, v)[j];
+        if (is_fp_value(f, a) || is_vec_value(f, a)) {
+          if (flts++ >= 8) slots++;
+        } else if (ints++ >= (wc ? 7u : 5u)) {
+          slots++;
+        }
+      }
+      if (slots * ARG_STACK_SLOT > need) need = slots * ARG_STACK_SLOT;
+    }
+  }
+  if (wasm_call && tail_bytes > need) need = tail_bytes;
+  return (need + 15u) & ~15u;
+}
+
 static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
                         uint32_t out_bytes, FuncOut *fout, bool far,
                         SplitCtl *sc, bool split_collect) {
@@ -2101,7 +2145,7 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
   s->f = f; s->o = obj; s->opt = opt;
   s->split_sc = sc;
   s->split_collect = split_collect;
-  s->out_bytes = out_bytes;
+  s->out_bytes = call_out_bytes(f, out_bytes);
   s->far_br = far || warmc_getenv("WARMC_FAR_BRANCH") != NULL;
   s->naive = !opt->regalloc;
 
@@ -2243,9 +2287,9 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
     stats_delta_add(&ra_added, &ra_base, &g_stats);
   }
 
-  s->slots_off = out_bytes;
+  s->slots_off = s->out_bytes;
 
-  s->retarea_off = (out_bytes + 8u * s->nslots + 15u) & ~15u;
+  s->retarea_off = (s->out_bytes + 8u * s->nslots + 15u) & ~15u;
   uint32_t maxres = s->needs_retarea ? module_max_results(f->m) : 0;
   s->retptr_slot = s->retarea_off + RESULT_SLOT_SIZE * maxres;
   s->fpsave_off = s->retptr_slot + (f->sig->nresults > 1 ? 8u : 0u);
@@ -2263,8 +2307,8 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
      may run into. */
   s->far_frame = s->frame > 32000;
   if (s->far_frame) {
-    s->far_save = out_bytes;
-    s->retarea_off = (out_bytes + 8u + 15u) & ~15u;
+    s->far_save = s->out_bytes;
+    s->retarea_off = (s->out_bytes + 8u + 15u) & ~15u;
     s->retptr_slot = s->retarea_off + RESULT_SLOT_SIZE * maxres;
     s->fpsave_off = s->retptr_slot + (f->sig->nresults > 1 ? 8u : 0u);
     s->exn_slot = s->fpsave_off + 8u * nfp;

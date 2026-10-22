@@ -59,6 +59,8 @@ typedef struct {
      borrows in (sp_access) */
   bool far_frame;
   uint32_t far_save;
+  /* placing a tail call's stack arguments, in the incoming area */
+  bool tail_args;
 
   uint32_t *block_off;
   BrFix *fixups;

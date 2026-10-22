@@ -537,7 +537,7 @@ void codegen_emit_component(const struct LinkPlan *p, ObjBuilder *o);
 
 uint64_t wasm_type_hash(const CompType *t);
 void codegen_emit_module_data(Module *m, ObjBuilder *o);
-uint32_t codegen_out_bytes(Module *m);
+uint32_t codegen_tail_out_bytes(Module *m);
 extern bool g_guard_pages;
 
 extern bool g_det_profile;
