@@ -363,8 +363,8 @@ static void validate_body(V *v) {
       case 0x0b: {
         Frame f = pop_ctrl(v);
 
-        if (f.op == 0x04 && !(f.nin == f.nout &&
-                              !memcmp(f.in, f.out, f.nin * sizeof(ValType))))
+        if (f.op == 0x04 && !(f.nin == f.nout && (!f.nin ||
+                              !memcmp(f.in, f.out, f.nin * sizeof(ValType)))))
           invalid(v, "type mismatch: if without else must not change the stack");
         push_many(v, f.out, f.nout);
         if (v->nctl == 0) ended = true;

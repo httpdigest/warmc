@@ -101,6 +101,7 @@ Hello world!
 |---|---|
 | **clang** with the AArch64 and X86 backends (a recent LLVM; Homebrew's works) | builds `warmc` and cross-compiles the three runtimes |
 | **llvm-ar** | archives the runtimes (Linux archives fall back to `ar`) |
+| **lld** (Linux) | links the ThinLTO build, whose objects GNU ld cannot read |
 | GNU **make** | the build |
 
 Supported build hosts:
@@ -706,6 +707,7 @@ make bench-compare                                      # all corpora vs the rec
 
 ```sh
 make check          # the full differential test suite (rows run in parallel; logs in build/checklogs)
+make smoke          # a few of its rows that reach most of warmc in seconds; what CI runs on every push
 make check-encoder  # AArch64 and x64 encoders against llvm-mc
 make check-spec     # the official WebAssembly testsuite, at three optimisation settings
 make conformance    # write CONFORMANCE.md: spec results grouped by proposal

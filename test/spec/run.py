@@ -78,7 +78,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 BUILD = os.environ.get("BUILD", os.path.join(ROOT, "build"))
 SUITE = os.environ.get("WASM_TESTSUITE", os.path.join(BUILD, "testsuite"))
 WORK = os.path.join(BUILD, "spec")
-WARMC = os.path.join(BUILD, "warmc")
+WARMC = os.path.join(BUILD, "warmc") + (".exe" if os.name == "nt" else "")
 EXPECTED = os.path.join(ROOT, "test", "spec", "expected.json")
 
 EXIT_MALFORMED = 2
@@ -103,7 +103,8 @@ def _pinned_wasm_tools():
     raise SystemExit("spec: no WASM_TOOLS_VERSION in the Makefile")
 
 WASM_TOOLS_VERSION = _pinned_wasm_tools()
-WASM_TOOLS = os.path.join(BUILD, "tools", "bin", "wasm-tools")
+WASM_TOOLS = os.path.join(BUILD, "tools", "bin",
+                          "wasm-tools.exe" if os.name == "nt" else "wasm-tools")
 
 WARMC_TIMEOUT = float(os.environ.get("WARMC_TIMEOUT", "3"))
 RUN_TIMEOUT = float(os.environ.get("WARMC_RUN_TIMEOUT", "120"))

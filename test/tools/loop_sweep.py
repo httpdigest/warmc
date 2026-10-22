@@ -48,7 +48,7 @@ import sys
 import os
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-WARMC = os.path.join(ROOT, os.environ.get("BUILD", "build"), "warmc")
+WARMC = os.path.join(ROOT, os.environ.get("BUILD", "build"), "warmc") + (".exe" if os.name == "nt" else "")
 
 INSN = re.compile(r"^\s+([0-9a-f]+):\s+[0-9a-f]{8}\s+(\S+)\s*(.*)$")
 FUNC = re.compile(r"^([0-9a-f]+)\s+<([^>]+)>:")
@@ -157,7 +157,8 @@ def wasm_names(wasm):
     warmc names its symbols `wasm_func_N` by index, so the module's own name
     section is what turns a sweep into something a person can act on.
     """
-    wt = os.path.join(ROOT, "build", "tools", "bin", "wasm-tools")
+    wt = os.path.join(ROOT, "build", "tools", "bin",
+                      "wasm-tools.exe" if os.name == "nt" else "wasm-tools")
     if not os.path.exists(wt):
         wt = "wasm-tools"
     try:

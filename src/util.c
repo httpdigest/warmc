@@ -396,6 +396,7 @@ void buf_u16(Buf *b, uint16_t v) { buf_u8(b, v & 0xff); buf_u8(b, v >> 8); }
 void buf_u32(Buf *b, uint32_t v) { buf_u16(b, v & 0xffff); buf_u16(b, v >> 16); }
 void buf_u64(Buf *b, uint64_t v) { buf_u32(b, (uint32_t)v); buf_u32(b, (uint32_t)(v >> 32)); }
 void buf_bytes(Buf *b, const void *p, size_t n) {
+  if (!n) return;
   buf_reserve(b, n); memcpy(b->data + b->len, p, n); b->len += n;
 }
 void buf_zero(Buf *b, size_t n) {

@@ -300,7 +300,6 @@ void *ir_grow(IrFunc *f, void *p, size_t oldn, size_t newn);
 bool ir_dom_range(const IrFunc *f, uint32_t a, uint32_t b);
 bool ir_dom_walk(const IrFunc *f, uint32_t a, uint32_t b);
 bool ir_dominates_checked(const IrFunc *f, uint32_t a, uint32_t b);
-extern bool ir_dom_check_on;
 
 IrFunc *ir_new(Module *m, uint32_t func_index);
 void ir_free(IrFunc *f);

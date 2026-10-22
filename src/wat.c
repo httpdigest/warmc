@@ -72,6 +72,7 @@ static void wb_byte(WBuf *b, uint8_t v) {
 }
 
 static void wb_raw(WBuf *b, const void *p, size_t n) {
+  if (!n) return;
   wb_need(b, n);
   memcpy(b->p + b->n, p, n);
   b->n += n;
@@ -1081,8 +1082,8 @@ static uint32_t intern_functype(P *p, const ValType *ps, uint32_t np,
   t->nresults = nr;
   t->params = arena_alloc(p->a, (np ? np : 1) * sizeof(ValType));
   t->results = arena_alloc(p->a, (nr ? nr : 1) * sizeof(ValType));
-  memcpy(t->params, ps, np * sizeof(ValType));
-  memcpy(t->results, rs, nr * sizeof(ValType));
+  if (np) memcpy(t->params, ps, np * sizeof(ValType));
+  if (nr) memcpy(t->results, rs, nr * sizeof(ValType));
 
   WBuf s = {0};
   wb_byte(&s, 0x60);

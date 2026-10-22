@@ -59,6 +59,9 @@ run_case() {
   env -i WARMC_WASI_PROBE=secret "$WASMTIME" --dir "$dr::/d" "$wasm" "${ARGS[@]}" \
     >"$WORK/$name.ref.out" 2>"$WORK/$name.ref.err" <"$WORK/stdin.txt"
   local rc_ref=$?
+  # wasmtime sleeps in whole Windows timer ticks, so it rounds nap's 100us up
+  # and says `slow`; there warmc is held to what nap.wat promises instead.
+  if [ "$WIN" = 1 ] && [ "$name" = nap ]; then printf 'ok\n' > "$WORK/$name.ref.out"; fi
 
   local bad=0
   if ! cmp -s "$WORK/$name.warmc.out" "$WORK/$name.ref.out"; then

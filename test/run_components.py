@@ -37,8 +37,14 @@ os.chdir(ROOT)
 BUILD = os.environ.get("BUILD", "build")
 
 WARMC = os.path.join(BUILD, "warmc-asan" if os.environ.get("COMPONENT_ASAN")
-                     else "warmc")
-WASM_TOOLS = os.path.join(BUILD, "tools", "bin", "wasm-tools")
+                     else "warmc") + (".exe" if os.name == "nt" else "")
+WASM_TOOLS = os.path.join(BUILD, "tools", "bin",
+                          "wasm-tools.exe" if os.name == "nt" else "wasm-tools")
+# The limits below are generous for a workstation; a machine slow enough to
+# have been given a longer WARMC_TIMEOUT -- CI's runners -- gets that instead.
+def limit(seconds):
+    return max(seconds, float(os.environ.get("WARMC_TIMEOUT", "0")))
+
 SRC = "test/components"
 WORK = os.path.join(BUILD, "components")
 GOLDEN = os.path.join(SRC, "expected")
@@ -78,8 +84,28 @@ def ok():
         npass += 1
 
 def run(cmd):
-    p = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    p = subprocess.run(cmd, capture_output=True, text=True, timeout=limit(30))
     return p.returncode, p.stdout, p.stderr
+
+def staged(path):
+    """Where to write `path` before renaming it into place.
+
+    run_all.sh runs the clink and asan rows beside this one, and both read
+    build/components while this rebuilds it; written in place, a file is
+    empty from the moment it is opened until it is finished, and the readers
+    took it for a module too short to be one.  Not a .wasm name, so a reader
+    listing the directory does not pick it up either.
+    """
+    return "%s.%d.tmp" % (path, os.getpid())
+
+def publish(*paths):
+    for path in paths:
+        os.replace(staged(path), path)
+
+def unstage(*paths):
+    for path in paths:
+        if os.path.exists(staged(path)):
+            os.remove(staged(path))
 
 def objdump_counts(path):
     """Section counts from the oracle, at the top level and over the whole tree.
@@ -149,10 +175,12 @@ def warmc_counts(dump):
 def check_valid(stem):
     src = os.path.join(SRC, stem + ".wat")
     wasm = os.path.join(WORK, stem + ".wasm")
-    rc, out, err = run([WASM_TOOLS, "parse", src, "-o", wasm])
+    rc, out, err = run([WASM_TOOLS, "parse", src, "-o", staged(wasm)])
     if rc != 0:
+        unstage(wasm)
         fail("%s: wasm-tools could not assemble it: %s" % (stem, err.strip()))
         return
+    publish(wasm)
     rc, dump, err = run([WARMC, "--validate-only", "--dump-component", wasm])
     if rc != 0:
         fail("%s: warmc rejected a valid component (rc=%d): %s"
@@ -214,17 +242,20 @@ def build_wit_case():
     emb = os.path.join(WORK, "calc_embed.wasm")
     out = os.path.join(WORK, "calc.wasm")
     steps = [
-        [WASM_TOOLS, "parse", os.path.join(d, "core.wat"), "-o", core],
-        [WASM_TOOLS, "component", "embed", d, core, "-o", emb, "--world", "calc"],
-        [WASM_TOOLS, "component", "new", emb, "-o", out],
+        [WASM_TOOLS, "parse", os.path.join(d, "core.wat"), "-o", staged(core)],
+        [WASM_TOOLS, "component", "embed", d, staged(core), "-o", staged(emb),
+         "--world", "calc"],
+        [WASM_TOOLS, "component", "new", staged(emb), "-o", staged(out)],
     ]
     for cmd in steps:
         rc, so, se = run(cmd)
         if rc != 0:
+            unstage(core, emb, out)
             print("components: skipping the WIT case, %s failed: %s"
                   % (cmd[1] if cmd[1] != "component" else "component " + cmd[2],
                      se.strip().splitlines()[0] if se.strip() else "?"))
             return None
+    publish(core, emb, out)
     return out
 
 def check_built(stem, wasm):
@@ -357,7 +388,7 @@ def check_rejects():
         for flag in ("--dump-canon", "--dump-adapter"):
             try:
                 subprocess.run([WARMC, flag, path], capture_output=True,
-                               text=True, timeout=20)
+                               text=True, timeout=limit(20))
             except subprocess.TimeoutExpired:
                 fail("%s: %s did not terminate" % (stem, flag))
                 return
@@ -408,8 +439,12 @@ def main():
         return 1
     if "--prepare" in sys.argv:
         for stem in stems:
-            run([WASM_TOOLS, "parse", os.path.join(SRC, stem + ".wat"),
-                 "-o", os.path.join(WORK, stem + ".wasm")])
+            wasm = os.path.join(WORK, stem + ".wasm")
+            if run([WASM_TOOLS, "parse", os.path.join(SRC, stem + ".wat"),
+                    "-o", staged(wasm)])[0] == 0:
+                publish(wasm)
+            else:
+                unstage(wasm)
         build_wit_case()
         return 0
 

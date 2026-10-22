@@ -2481,8 +2481,9 @@ def main():
 
     warmc = args.warmc
     if not warmc:
-        warmc = os.path.join(out, "warmc-snapshot")
-        sh(["cp", os.path.join(build, "warmc"), warmc])
+        exe = ".exe" if os.name == "nt" else ""
+        warmc = os.path.join(out, "warmc-snapshot" + exe)
+        sh(["cp", os.path.join(build, "warmc" + exe), warmc])
     bad = rejected = refused = 0
 
     for n in range(args.count):

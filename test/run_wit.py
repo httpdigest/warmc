@@ -41,8 +41,9 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.chdir(ROOT)
 BUILD = os.environ.get("BUILD", "build")
 WARMC = os.path.join(BUILD, "warmc-asan" if os.environ.get("WIT_ASAN")
-                     else "warmc")
-WASM_TOOLS = os.path.join(BUILD, "tools", "bin", "wasm-tools")
+                     else "warmc") + (".exe" if os.name == "nt" else "")
+WASM_TOOLS = os.path.join(BUILD, "tools", "bin",
+                          "wasm-tools.exe" if os.name == "nt" else "wasm-tools")
 SRC = "test/wit"
 WORK = os.path.join(BUILD, "wit")
 GOLDEN = os.path.join(SRC, "expected")
@@ -68,8 +69,13 @@ def ok():
     with _lock:
         npass += 1
 
+# The limits below are generous for a workstation; a machine slow enough to
+# have been given a longer WARMC_TIMEOUT -- CI's runners -- gets that instead.
+def limit(seconds):
+    return max(seconds, float(os.environ.get("WARMC_TIMEOUT", "0")))
+
 def run(cmd, timeout=60):
-    p = subprocess.run(cmd, capture_output=True, timeout=timeout)
+    p = subprocess.run(cmd, capture_output=True, timeout=limit(timeout))
     return (p.returncode,
             p.stdout.decode("utf-8", "replace"),
             p.stderr.decode("utf-8", "replace"))

@@ -14500,7 +14500,6 @@ void opt_passtime_report(void) {
 static pthread_once_t g_pt_once = PTHREAD_ONCE_INIT;
 static void pt_init(void) {
   g_pt_on = warmc_getenv("WARMC_PASSTIME") != NULL;
-  ir_dom_check_on = warmc_getenv("WARMC_CHECK_DOM") != NULL;
 }
 
 /* The cleanup rounds every inline is followed by: folding, forwarding and

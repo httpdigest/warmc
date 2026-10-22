@@ -1,0 +1,772 @@
+name: Check
+
+# The build and the tests on the three supported hosts.  ci.yml calls it for
+# every push and pull request, to build warmc and run `make smoke`: a few
+# rows of `make check` that reach most of warmc in a minute or so.
+# nightly.yml calls it with `full`: the sanitizer builds and the whole of
+# `make check`, with every language toolchain installed, so that the
+# language test corpora run too.  A corpus whose toolchain is missing skips
+# itself, and the benchmark corpora are left to `make bench-compare`.
+#
+# Everything a job downloads or builds that does not change with warmc is
+# cached, and each cache is saved as soon as what it holds is complete, so a
+# failing test does not lose it:
+#   build/ci/llvm               the trimmed LLVM release (macOS, Linux)
+#   build/ci/{wasmtime,wabt,ccache}, build/ci/{kotlinc,asc}
+#                               the pinned release binaries
+#   ~/.rustup, ~/.cargo/bin     the pinned Rust toolchain
+#   build/tools                 what the Makefile fetches: wasm-tools (a
+#                               release binary here, never built), wasi-sdk,
+#                               the Kotlin stdlib
+#   build/ci-cache              ccache, the ThinLTO cache, Go's build cache:
+#                               saved anew by every run, the latest restored
+#   build/testrun/*.{wasm,ref}  the test modules and the interpreter's answers
+#                               for them, each with a stamp of what made it
+#   build/<corpus>/*.wasm       the language test corpora as their producers
+#                               built them, keyed on their sources and every pin
+#   ~/.ghc-wasm, the tool cache GHC's wasm backend, Go, TinyGo, Node
+#   (Zig)                       setup-zig caches its own
+
+on:
+  workflow_call:
+    inputs:
+      full:
+        description: Build the sanitizer builds too and run the whole of `make check` with every language toolchain, rather than `make smoke`
+        type: boolean
+        default: false
+
+permissions: {}
+
+jobs:
+  macos:
+    name: macOS arm64
+    runs-on: macos-26
+    timeout-minutes: ${{ inputs.full && 150 || 20 }}
+    permissions:
+      contents: read # to check out the repository
+    env:
+      CC: ccache clang
+      ASAN_CC: ccache clang
+      XCC: ccache clang
+      EXTRA_LDFLAGS: -Wl,-cache_path_lto,build/ci-cache/lto
+      CCACHE_DIR: ${{ github.workspace }}/build/ci-cache/ccache
+      CCACHE_BASEDIR: ${{ github.workspace }}
+      CCACHE_MAXSIZE: 500M
+      GOCACHE: ${{ github.workspace }}/build/ci-cache/go-build
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The caches are keyed on what they hold -- the pinned versions, and
+      # for LLVM which members of the release -- rather than on the text of
+      # the scripts, so that editing a script does not throw a cache away.
+      # The stamp in each tool's directory still decides whether it is
+      # installed again.
+      - &pins
+        name: Read the pins
+        id: pins
+        run: |
+          s=.github/scripts
+          sum() { cksum | cut -d' ' -f1; }
+          {
+            echo "makefile=$(grep -E '^(WASM_TOOLS_VERSION|WASI_SDK_VERSION) *:=' Makefile | sum)"
+            echo "rust=$(sed -n 's/^RUST_VERSION=//p' $s/install-rust.sh)"
+            echo "llvm=$(grep -E '^LLVM_VERSION=|lib/clang/' $s/install-llvm.sh | sum)"
+            echo "tools=$(grep -E '^[A-Z_]+_VERSION=' $s/install-tools.sh | sum)"
+            echo "languages=$(grep -E '^[A-Z_]+_(VERSION|COMMIT|FLAVOUR)=' $s/install-language-tools.sh | sum)"
+            echo "producers=$({ grep -hE '^[A-Z_]+_(VERSION|COMMIT|FLAVOUR)=' $s/*.sh
+                               grep -E '(go|tinygo|binaryen|node|java)-version:|^ +version: ' .github/workflows/check.yml; } | sum)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Restore LLVM
+        id: llvm
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: build/ci/llvm
+          key: llvm-macos-arm64-${{ steps.pins.outputs.llvm }}
+
+      - name: Install LLVM
+        run: .github/scripts/install-llvm.sh
+
+      - name: Save LLVM
+        if: steps.llvm.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: build/ci/llvm
+          key: ${{ steps.llvm.outputs.cache-primary-key }}
+
+      - name: Restore the tools
+        id: tools
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: &tools |
+            build/ci/wasmtime
+            build/ci/wabt
+            build/ci/ccache
+          key: tools-macos-arm64-${{ steps.pins.outputs.tools }}
+
+      - name: Restore what the Makefile fetches
+        id: make-tools
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: build/tools
+          key: make-tools-macos-arm64-${{ inputs.full && 'full' || 'smoke' }}-${{ steps.pins.outputs.makefile }}-${{ steps.pins.outputs.languages }}
+          restore-keys: |
+            make-tools-macos-arm64-${{ inputs.full && 'full' || 'smoke' }}-${{ steps.pins.outputs.makefile }}-
+            make-tools-macos-arm64-${{ inputs.full && 'full' || 'smoke' }}-
+
+      - name: Install wasmtime, wabt, ccache and wasm-tools
+        run: .github/scripts/install-tools.sh
+
+      - name: Save the tools
+        if: steps.tools.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: *tools
+          key: ${{ steps.tools.outputs.cache-primary-key }}
+
+      - name: Restore Rust
+        if: inputs.full
+        id: rust
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: &rust |
+            ~/.rustup/toolchains/${{ steps.pins.outputs.rust }}-*
+            ~/.cargo/bin
+          key: rust-macos-arm64-${{ steps.pins.outputs.rust }}
+
+      - name: Install Rust
+        if: inputs.full
+        run: .github/scripts/install-rust.sh
+
+      - name: Save Rust
+        if: inputs.full && steps.rust.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: *rust
+          key: ${{ steps.rust.outputs.cache-primary-key }}
+
+      - name: Restore the toolchains
+        if: inputs.full
+        id: toolcache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: &toolcache |
+            ${{ runner.tool_cache }}/go/1.27.3
+            ${{ runner.tool_cache }}/tinygo/0.43.0
+            ${{ runner.tool_cache }}/binaryen
+            ${{ runner.tool_cache }}/node/26.12.1
+          key: &toolcache-key toolcache-${{ runner.os }}-${{ runner.arch }}-go1.27.3-tinygo0.43.0-binaryen133-node26.12.1
+
+      - &setup-go
+        name: Install Go
+        if: inputs.full
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: 1.27.3
+          cache: false
+
+      - &setup-tinygo
+        name: Install TinyGo
+        if: inputs.full
+        uses: acifani/setup-tinygo@dd8a7075d951a7595b2ef2123ed0ab1af0c13e56 # v3.0.0
+        with:
+          tinygo-version: 0.43.0
+          binaryen-version: 133
+
+      - &setup-zig
+        name: Install Zig
+        if: inputs.full
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.17.0
+
+      - &setup-node
+        name: Install Node
+        if: inputs.full
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 26.12.1
+
+      - &save-toolcache
+        name: Save the toolchains
+        if: inputs.full && steps.toolcache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: *toolcache
+          key: *toolcache-key
+
+      # Temurin's newest release, for Kotlin.
+      - &setup-java
+        name: Install a JDK
+        if: inputs.full
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: 27
+
+      - name: Restore Kotlin, GHC and AssemblyScript
+        if: inputs.full
+        id: languages
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: &languages |
+            build/ci/kotlinc
+            build/ci/asc
+            ~/.ghc-wasm
+          key: languages-macos-arm64-${{ steps.pins.outputs.languages }}
+
+      - name: Install Kotlin, GHC and AssemblyScript
+        if: inputs.full
+        run: .github/scripts/install-language-tools.sh kotlin ghc asc
+
+      - name: Save Kotlin, GHC and AssemblyScript
+        if: inputs.full && steps.languages.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: *languages
+          key: ${{ steps.languages.outputs.cache-primary-key }}
+
+      - name: Restore the build caches
+        id: build-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: build/ci-cache
+          key: build-cache-macos-arm64-${{ inputs.full }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            build-cache-macos-arm64-${{ inputs.full }}-
+            build-cache-macos-arm64-
+
+      # GitHub's macOS runners are M1s, which lack the instructions the
+      # Makefile's default -mcpu=apple-m4 lets the compiler use.
+      - name: Build
+        run: make -j"$(sysctl -n hw.ncpu)" all HOST_TUNE=-mcpu=apple-m1
+
+      - name: Build with the sanitizers
+        if: inputs.full
+        run: make -j"$(sysctl -n hw.ncpu)" asan tsan HOST_TUNE=-mcpu=apple-m1
+
+      - name: Save the build caches
+        if: ${{ !cancelled() }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: build/ci-cache
+          key: ${{ steps.build-cache.outputs.cache-primary-key }}
+
+      - name: Fetch what `make check` needs
+        if: inputs.full
+        run: make check-tools
+
+      - name: Save what the Makefile fetched
+        if: steps.make-tools.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: build/tools
+          key: ${{ steps.make-tools.outputs.cache-primary-key }}
+
+      # A module found here newer than its source is not built again, so
+      # only an exact match on every source and pin is restored.
+      - name: Restore the built corpora
+        if: inputs.full
+        id: corpora
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: &corpora |
+            build/astests/*.wasm
+            build/astests/*.wasm.flags
+            build/ctests/*.wasm
+            build/ctests/*.wasm.flags
+            build/cpptests/*.wasm
+            build/cpptests/*.wasm.flags
+            build/gotests/*.wasm
+            build/gotests/*.wasm.flags
+            build/hstests/*.wasm
+            build/hstests/*.wasm.flags
+            build/kttests/*.wasm
+            build/kttests/*.wasm.flags
+            build/rstests/*.wasm
+            build/rstests/*.wasm.flags
+            build/stdgotests/*.wasm
+            build/stdgotests/*.wasm.flags
+            build/zigtests/*.wasm
+            build/zigtests/*.wasm.flags
+          key: corpora-macos-arm64-${{ inputs.full }}-${{ steps.pins.outputs.makefile }}-${{ steps.pins.outputs.producers }}-${{ hashFiles('test/*tests/**', 'test/gobench.py') }}
+
+      # The test modules assembled from the cases and the interpreter's answers
+      # for them, each beside a stamp of what it was made from, so that a
+      # restored one is used only while that still matches.  The
+      # interpreting is most of what a cold `make smoke` spends; the compiled
+      # tests are not kept, since every change to warmc makes them anew.
+      - name: Restore the test references
+        id: testrun
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: &testrun |
+            build/testrun/*.wasm
+            build/testrun/*.wasm.src
+            build/testrun/*.stamp
+            build/testrun/*.ref
+            build/testrun/*.ref.cases
+            build/testrun/pressure/want.*
+          key: testrun-macos-arm64-${{ inputs.full }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            testrun-macos-arm64-${{ inputs.full }}-
+            testrun-macos-arm64-
+
+      # `make check` starts every row at once, which a workstation takes in
+      # its stride; on a runner's three or four virtual cores a compile of a
+      # tenth of a second can wait half a minute for its turn.  The limits
+      # are there for a compile or a run that wedges, not for one that queues.
+      # The step has a limit of its own, short of the job's, so that a run
+      # that wedges anyway fails here and its logs are still kept below.
+      - name: Test
+        timeout-minutes: ${{ inputs.full && 120 || 10 }}
+        env: &test-env
+          SUITE: ${{ inputs.full && 'check' || 'smoke' }}
+          WARMC_TIMEOUT: 120
+          WARMC_RUN_TIMEOUT: 600
+          CHECK_BENCH: 0
+        run: make -j"$(sysctl -n hw.ncpu)" "$SUITE" HOST_TUNE=-mcpu=apple-m1
+
+      - name: Save the test references
+        if: ${{ !cancelled() }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: *testrun
+          key: ${{ steps.testrun.outputs.cache-primary-key }}
+
+      - name: Save the built corpora
+        if: ${{ inputs.full && !cancelled() && steps.corpora.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: *corpora
+          key: ${{ steps.corpora.outputs.cache-primary-key }}
+
+      - name: Keep the test logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: checklogs-macos
+          path: build/checklogs
+          retention-days: 14
+
+  linux:
+    name: Linux arm64
+    runs-on: ubuntu-26.04-arm
+    timeout-minutes: ${{ inputs.full && 150 || 20 }}
+    permissions:
+      contents: read # to check out the repository
+    env:
+      CC: ccache clang
+      ASAN_CC: ccache clang
+      XCC: ccache clang
+      EXTRA_LDFLAGS: -Wl,--thinlto-cache-dir=build/ci-cache/lto
+      CCACHE_DIR: ${{ github.workspace }}/build/ci-cache/ccache
+      CCACHE_BASEDIR: ${{ github.workspace }}
+      CCACHE_MAXSIZE: 500M
+      GOCACHE: ${{ github.workspace }}/build/ci-cache/go-build
+      # where TinyGo keeps its cache on Linux
+      XDG_CACHE_HOME: ${{ github.workspace }}/build/ci-cache/xdg
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - *pins
+
+      - name: Restore LLVM
+        id: llvm
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: build/ci/llvm
+          key: llvm-linux-arm64-${{ steps.pins.outputs.llvm }}
+
+      - name: Install LLVM
+        run: .github/scripts/install-llvm.sh
+
+      - name: Save LLVM
+        if: steps.llvm.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: build/ci/llvm
+          key: ${{ steps.llvm.outputs.cache-primary-key }}
+
+      - name: Restore the tools
+        id: tools
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: *tools
+          key: tools-linux-arm64-${{ steps.pins.outputs.tools }}
+
+      - name: Restore what the Makefile fetches
+        id: make-tools
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: build/tools
+          key: make-tools-linux-arm64-${{ inputs.full && 'full' || 'smoke' }}-${{ steps.pins.outputs.makefile }}-${{ steps.pins.outputs.languages }}
+          restore-keys: |
+            make-tools-linux-arm64-${{ inputs.full && 'full' || 'smoke' }}-${{ steps.pins.outputs.makefile }}-
+            make-tools-linux-arm64-${{ inputs.full && 'full' || 'smoke' }}-
+
+      - name: Install wasmtime, wabt, ccache and wasm-tools
+        run: .github/scripts/install-tools.sh
+
+      - name: Save the tools
+        if: steps.tools.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: *tools
+          key: ${{ steps.tools.outputs.cache-primary-key }}
+
+      - name: Restore Rust
+        if: inputs.full
+        id: rust
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: *rust
+          key: rust-linux-arm64-${{ steps.pins.outputs.rust }}
+
+      - name: Install Rust
+        if: inputs.full
+        run: .github/scripts/install-rust.sh
+
+      - name: Save Rust
+        if: inputs.full && steps.rust.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: *rust
+          key: ${{ steps.rust.outputs.cache-primary-key }}
+
+      - name: Restore the toolchains
+        if: inputs.full
+        id: toolcache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: *toolcache
+          key: *toolcache-key
+
+      - *setup-go
+      - *setup-tinygo
+      - *setup-zig
+      - *setup-node
+      - *save-toolcache
+      - *setup-java
+
+      - name: Restore Kotlin, GHC and AssemblyScript
+        if: inputs.full
+        id: languages
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: *languages
+          key: languages-linux-arm64-${{ steps.pins.outputs.languages }}
+
+      - name: Install Kotlin, GHC and AssemblyScript
+        if: inputs.full
+        run: .github/scripts/install-language-tools.sh kotlin ghc asc
+
+      - name: Save Kotlin, GHC and AssemblyScript
+        if: inputs.full && steps.languages.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: *languages
+          key: ${{ steps.languages.outputs.cache-primary-key }}
+
+      - name: Restore the build caches
+        id: build-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: build/ci-cache
+          key: build-cache-linux-arm64-${{ inputs.full }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            build-cache-linux-arm64-${{ inputs.full }}-
+            build-cache-linux-arm64-
+
+      - name: Build
+        run: make -j"$(nproc)" all
+
+      - name: Build with the sanitizers
+        if: inputs.full
+        run: make -j"$(nproc)" asan tsan
+
+      - name: Save the build caches
+        if: ${{ !cancelled() }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: build/ci-cache
+          key: ${{ steps.build-cache.outputs.cache-primary-key }}
+
+      - name: Fetch what `make check` needs
+        if: inputs.full
+        run: make check-tools
+
+      - name: Save what the Makefile fetched
+        if: steps.make-tools.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: build/tools
+          key: ${{ steps.make-tools.outputs.cache-primary-key }}
+
+      - name: Restore the built corpora
+        if: inputs.full
+        id: corpora
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: *corpora
+          key: corpora-linux-arm64-${{ inputs.full }}-${{ steps.pins.outputs.makefile }}-${{ steps.pins.outputs.producers }}-${{ hashFiles('test/*tests/**', 'test/gobench.py') }}
+
+      - name: Restore the test references
+        id: testrun
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: *testrun
+          key: testrun-linux-arm64-${{ inputs.full }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            testrun-linux-arm64-${{ inputs.full }}-
+            testrun-linux-arm64-
+
+      - name: Test
+        timeout-minutes: ${{ inputs.full && 120 || 10 }}
+        env: *test-env
+        run: make -j"$(nproc)" "$SUITE"
+
+      - name: Save the test references
+        if: ${{ !cancelled() }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: *testrun
+          key: ${{ steps.testrun.outputs.cache-primary-key }}
+
+      - name: Save the built corpora
+        if: ${{ inputs.full && !cancelled() && steps.corpora.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: *corpora
+          key: ${{ steps.corpora.outputs.cache-primary-key }}
+
+      - name: Keep the test logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: checklogs-linux
+          path: build/checklogs
+          retention-days: 14
+
+  windows:
+    name: Windows x64
+    runs-on: windows-2025
+    timeout-minutes: ${{ inputs.full && 180 || 20 }}
+    permissions:
+      contents: read # to check out the repository
+    defaults:
+      run:
+        shell: msys2 {0}
+    env:
+      CC: ccache clang
+      XCC: ccache clang
+      EXTRA_LDFLAGS: -Wl,--thinlto-cache-dir=build/ci-cache/lto
+      CCACHE_DIR: ${{ github.workspace }}/build/ci-cache/ccache
+      CCACHE_BASEDIR: ${{ github.workspace }}
+      CCACHE_MAXSIZE: 500M
+      GOCACHE: ${{ github.workspace }}/build/ci-cache/go-build
+    steps:
+      # The test scripts and their expected outputs must keep their LF line
+      # endings, which a Windows checkout would otherwise turn into CRLF.
+      - name: Keep line endings
+        shell: pwsh
+        run: git config --global core.autocrlf false
+
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # CLANG64 is one of the MSYS2 shells the Makefile and test/hostenv.sh
+      # know, and its LLVM is the one the job builds with.  The Windows PATH
+      # is inherited, so the toolchains the setup actions install are found
+      # from inside it.  setup-msys2 caches the packages it downloads, and
+      # installs on D:, which is faster than the image's own MSYS2 on C:.
+      # The installation is upgraded first, so that the packages are the
+      # newest MSYS2 has rather than its installer's; of LLVM only the tools
+      # (llvm-ar, llvm-mc, llvm-objcopy) are wanted, not the 440 MB of
+      # headers and libraries the llvm package is.  diffutils is for cmp,
+      # which a Git for Windows on the PATH would otherwise lend.  The
+      # Python is MSYS2's own, not CLANG64's native one: the test scripts run
+      # /bin/bash, call ld.lld by that name and write files for bash to read,
+      # and a native Python finds neither, nor writes them with bare newlines.
+      - name: Set up MSYS2
+        uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2.33.0
+        with:
+          msystem: CLANG64
+          update: true
+          path-type: inherit
+          install: >-
+            make
+            diffutils
+            unzip
+            perl
+            mingw-w64-clang-x86_64-clang
+            mingw-w64-clang-x86_64-lld
+            mingw-w64-clang-x86_64-llvm-tools
+            python
+
+      - *pins
+
+      - name: Restore the tools
+        id: tools
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: *tools
+          key: tools-windows-x64-${{ steps.pins.outputs.tools }}
+
+      - name: Restore what the Makefile fetches
+        id: make-tools
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: build/tools
+          key: make-tools-windows-x64-${{ inputs.full && 'full' || 'smoke' }}-${{ steps.pins.outputs.makefile }}
+          restore-keys: |
+            make-tools-windows-x64-${{ inputs.full && 'full' || 'smoke' }}-${{ steps.pins.outputs.makefile }}-
+            make-tools-windows-x64-${{ inputs.full && 'full' || 'smoke' }}-
+
+      - name: Install wasmtime, wabt, ccache and wasm-tools
+        run: .github/scripts/install-tools.sh
+
+      - name: Save the tools
+        if: steps.tools.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: *tools
+          key: ${{ steps.tools.outputs.cache-primary-key }}
+
+      - name: Restore Rust
+        if: inputs.full
+        id: rust
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: *rust
+          key: rust-windows-x64-${{ steps.pins.outputs.rust }}
+
+      - name: Install Rust
+        if: inputs.full
+        run: .github/scripts/install-rust.sh
+
+      - name: Save Rust
+        if: inputs.full && steps.rust.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: *rust
+          key: ${{ steps.rust.outputs.cache-primary-key }}
+
+      - name: Restore the toolchains
+        if: inputs.full
+        id: toolcache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: *toolcache
+          key: *toolcache-key
+
+      - *setup-go
+      - *setup-tinygo
+      - *setup-zig
+      - *setup-node
+      - *save-toolcache
+
+      # Kotlin/Wasm and GHC's wasm backend have no Windows builds here; their
+      # corpora skip themselves.
+      - name: Restore AssemblyScript
+        if: inputs.full
+        id: languages
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: build/ci/asc
+          key: languages-windows-x64-${{ steps.pins.outputs.languages }}
+
+      - name: Install AssemblyScript
+        if: inputs.full
+        run: .github/scripts/install-language-tools.sh asc
+
+      - name: Save AssemblyScript
+        if: inputs.full && steps.languages.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: build/ci/asc
+          key: ${{ steps.languages.outputs.cache-primary-key }}
+
+      - name: Restore the build caches
+        id: build-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: build/ci-cache
+          key: build-cache-windows-x64-${{ inputs.full }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            build-cache-windows-x64-${{ inputs.full }}-
+            build-cache-windows-x64-
+
+      - name: Build
+        run: make -j"$(nproc)" all
+
+      - name: Save the build caches
+        if: ${{ !cancelled() }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: build/ci-cache
+          key: ${{ steps.build-cache.outputs.cache-primary-key }}
+
+      - name: Fetch what `make check` needs
+        if: inputs.full
+        run: make check-tools
+
+      - name: Save what the Makefile fetched
+        if: steps.make-tools.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: build/tools
+          key: ${{ steps.make-tools.outputs.cache-primary-key }}
+
+      - name: Restore the built corpora
+        if: inputs.full
+        id: corpora
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: *corpora
+          key: corpora-windows-x64-${{ inputs.full }}-${{ steps.pins.outputs.makefile }}-${{ steps.pins.outputs.producers }}-${{ hashFiles('test/*tests/**', 'test/gobench.py') }}
+
+      - name: Restore the test references
+        id: testrun
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: *testrun
+          key: testrun-windows-x64-${{ inputs.full }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            testrun-windows-x64-${{ inputs.full }}-
+            testrun-windows-x64-
+
+      - name: Test
+        timeout-minutes: ${{ inputs.full && 120 || 10 }}
+        env: *test-env
+        run: make -j"$(nproc)" "$SUITE"
+
+      - name: Save the test references
+        if: ${{ !cancelled() }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: *testrun
+          key: ${{ steps.testrun.outputs.cache-primary-key }}
+
+      - name: Save the built corpora
+        if: ${{ inputs.full && !cancelled() && steps.corpora.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: *corpora
+          key: ${{ steps.corpora.outputs.cache-primary-key }}
+
+      - name: Keep the test logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: checklogs-windows
+          path: build/checklogs
+          retention-days: 14

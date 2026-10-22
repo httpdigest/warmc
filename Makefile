@@ -20,14 +20,28 @@ else
   HOST_OS     := linux
   EXE         :=
   HOST_TUNE   :=
-  HOST_LDLIBS := -lpthread
+  # glibc keeps POSIX and BSD declarations -- clock_gettime, MAP_ANONYMOUS --
+  # from a strict -std=c11 build unless it is asked for them.
+  HOST_DEFS   := -D_GNU_SOURCE
+  # -flto=thin objects are LLVM bitcode, which GNU ld, the usual default
+  # linker, cannot read.
+  HOST_LDLIBS := -lpthread -fuse-ld=lld
 endif
 
-CC      ?= clang
-CFLAGS  ?= -std=c11 -O3 $(HOST_TUNE) -flto=thin -fvisibility=hidden -fvisibility-inlines-hidden -fno-exceptions -fno-rtti -g -Wall -Wextra -Wno-unused-parameter
+# make predefines CC as cc, which `?=` leaves alone -- on Linux that is gcc,
+# which knows neither -flto=thin nor the cross targets -- so replace only
+# that built-in default, and keep a CC from the command line or environment.
+ifeq ($(origin CC),default)
+  CC := clang
+endif
+CFLAGS  ?= -std=c11 -O3 $(HOST_TUNE) $(HOST_DEFS) -flto=thin -fvisibility=hidden -fvisibility-inlines-hidden -fno-exceptions -fno-rtti -g -Wall -Wextra -Wno-unused-parameter
 BUILD   ?= build
 
 XCC     ?= clang
+
+# Appended to every link of a host program, for flags a build wants without
+# replacing HOST_LDLIBS -- CI's ThinLTO cache directory, for one.
+EXTRA_LDFLAGS ?=
 
 RT_TUNE ?=
 
@@ -93,7 +107,7 @@ $(BUILD)/obj/%.o: src/%.c
 
 $(BUILD)/warmc$(EXE): $(WARMC_OBJS)
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -o $@ $(WARMC_OBJS) $(HOST_LDLIBS)
+	$(CC) $(CFLAGS) -o $@ $(WARMC_OBJS) $(HOST_LDLIBS) $(EXTRA_LDFLAGS)
 
 # One pattern per runtime flavor; make picks the pattern with the shortest
 # stem, so the suffixed ones win for suffixed objects.  start*.o (assembly)
@@ -208,7 +222,7 @@ $(BUILD)/obj-asan/%.o: src/%.c
 
 $(BUILD)/warmc-asan$(EXE): $(ASAN_OBJS)
 	@mkdir -p $(BUILD)
-	$(ASAN_CC) $(CFLAGS) $(ASAN_FLAGS) -o $@ $(ASAN_OBJS) $(HOST_LDLIBS)
+	$(ASAN_CC) $(CFLAGS) $(ASAN_FLAGS) -o $@ $(ASAN_OBJS) $(HOST_LDLIBS) $(EXTRA_LDFLAGS)
 
 asan: $(BUILD)/warmc-asan$(EXE)
 
@@ -218,19 +232,19 @@ $(BUILD)/obj-tsan/%.o: src/%.c
 
 $(BUILD)/warmc-tsan$(EXE): $(TSAN_OBJS)
 	@mkdir -p $(BUILD)
-	$(ASAN_CC) $(CFLAGS) $(TSAN_FLAGS) -o $@ $(TSAN_OBJS) $(HOST_LDLIBS)
+	$(ASAN_CC) $(CFLAGS) $(TSAN_FLAGS) -o $@ $(TSAN_OBJS) $(HOST_LDLIBS) $(EXTRA_LDFLAGS)
 
 tsan: $(BUILD)/warmc-tsan$(EXE)
 
 $(BUILD)/a64_test$(EXE): test/a64_test.c $(WARMC_HDRS) \
                    $(BUILD)/obj/a64.o $(BUILD)/obj/util.o
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -o $@ test/a64_test.c $(BUILD)/obj/a64.o $(BUILD)/obj/util.o $(HOST_LDLIBS)
+	$(CC) $(CFLAGS) -o $@ test/a64_test.c $(BUILD)/obj/a64.o $(BUILD)/obj/util.o $(HOST_LDLIBS) $(EXTRA_LDFLAGS)
 
 $(BUILD)/x64_test$(EXE): test/x64_test.c $(WARMC_HDRS) \
                    $(BUILD)/obj/x64.o $(BUILD)/obj/util.o
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -o $@ test/x64_test.c $(BUILD)/obj/x64.o $(BUILD)/obj/util.o $(HOST_LDLIBS)
+	$(CC) $(CFLAGS) -o $@ test/x64_test.c $(BUILD)/obj/x64.o $(BUILD)/obj/util.o $(HOST_LDLIBS) $(EXTRA_LDFLAGS)
 
 check-encoder: $(BUILD)/a64_test$(EXE) $(BUILD)/x64_test$(EXE)
 	@./test/run_a64_test.sh $(BUILD)
@@ -363,6 +377,16 @@ check-win-fixture:
 check: all $(SAN_TARGETS) $(WIN_CHECKS) check-encoder $(CHECK_TOOLS)
 	@./test/run_all.sh
 
+# A few rows of `make check` that reach most of warmc in a minute of a small
+# machine (SMOKE_ROWS in test/run_all.sh), without the sanitizer builds or
+# the language corpora: what CI runs on every push.
+smoke: all $(WIN_CHECKS) check-encoder wasm-tools
+	@CHECK_SMOKE=1 ./test/run_all.sh
+
+# The pinned tools `make check` fetches, alone: CI fetches them before the
+# tests so that its cache of them is saved whatever the tests find.
+check-tools: $(CHECK_TOOLS)
+
 check-linux: all
 	@rc=0; ./test/run_gowasi_linux.sh || rc=1; ./test/run_gc_linux.sh || rc=1; exit $$rc
 
@@ -402,7 +426,7 @@ gc-jitter-full: all wasm-tools
 clean:
 	rm -rf $(BUILD)
 
-.PHONY: all asan tsan check check-linux check-encoder check-spec conformance testsuite wasm-tools \
+.PHONY: all asan tsan check smoke check-tools check-linux check-encoder check-spec conformance testsuite wasm-tools \
         kotlin-stdlib wasi-sdk fuzz clean bench-compare bench-record gc-jitter gc-jitter-full
 
 -include $(WARMC_DEPS)

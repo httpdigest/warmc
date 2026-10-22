@@ -58,7 +58,7 @@ import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILD = os.environ.get("BUILD", "build")
-WARMC = os.path.join(ROOT, BUILD, "warmc")
+WARMC = os.path.join(ROOT, BUILD, "warmc") + (".exe" if os.name == "nt" else "")
 os.environ.setdefault("WARMC_GC_HEAP_KB", str(16 << 20))
 
 BASE = ["--ensure-termination", "--disallow-traps", "true",

@@ -66,8 +66,14 @@ import hostbuild
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILD = os.environ.get("BUILD", "build")
-WARMC = os.path.join(ROOT, BUILD, "warmc")
-WASM_TOOLS = os.path.join(ROOT, BUILD, "tools", "bin", "wasm-tools")
+WARMC = os.path.join(ROOT, BUILD, "warmc") + (".exe" if os.name == "nt" else "")
+
+# The limits below are generous for a workstation; a machine slow enough to
+# have been given a longer WARMC_TIMEOUT -- CI's runners -- gets that instead.
+def limit(seconds):
+    return max(seconds, float(os.environ.get("WARMC_TIMEOUT", "0")))
+WASM_TOOLS = os.path.join(ROOT, BUILD, "tools", "bin",
+                          "wasm-tools.exe" if os.name == "nt" else "wasm-tools")
 
 CORPUS_CAP = int(os.environ.get("WAT_CORPUS_CAP", "1500"))
 
@@ -101,7 +107,7 @@ def jobs():
 def oracles():
     """The assemblers to compare against.  Each is (name, assemble, print)."""
     out = [("wasm-tools", [WASM_TOOLS, "parse"], [WASM_TOOLS, "print"])]
-    if sh(["wat2wasm", "--version"], timeout=20).returncode == 0:
+    if sh(["wat2wasm", "--version"], timeout=limit(20)).returncode == 0:
         out.append(("wabt", ["wat2wasm"] + WABT_FLAGS, ["wasm2wat"] + WABT_FLAGS))
     return out
 
@@ -350,7 +356,7 @@ def main():
                 f.write(src)
             p_ = subprocess.run([WARMC, "--emit-wasm", "-o",
                                  os.path.join(tmp, "o.wasm"), wat],
-                                capture_output=True, text=True, timeout=30)
+                                capture_output=True, text=True, timeout=limit(30))
             if p_.returncode != 0:
                 failures.append("inline-segment abbreviation refused: %s"
                                 % p_.stderr.strip())
@@ -373,7 +379,7 @@ def main():
                 f.write(src)
             p_ = subprocess.run([WARMC, "--emit-wasm", "-o",
                                  os.path.join(tmp, "o.wasm"), wat],
-                                capture_output=True, text=True, timeout=30)
+                                capture_output=True, text=True, timeout=limit(30))
             if p_.returncode == 0:
                 failures.append("an import after a definition was accepted")
             elif want not in p_.stderr:

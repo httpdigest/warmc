@@ -1397,7 +1397,8 @@ IrFunc *ir_build(Module *m, uint32_t fi, const OptOpts *opt) {
             set_term(b, b->cur, T_RETURN);
             blk->nret = c->nresults;
             blk->ret_args = xmalloc((c->nresults ? c->nresults : 1) * sizeof(Ref));
-            memcpy(blk->ret_args, &b->stack[base], c->nresults * sizeof(Ref));
+            if (c->nresults)
+              memcpy(blk->ret_args, &b->stack[base], c->nresults * sizeof(Ref));
           }
           b->nctl--;
           goto done;
@@ -1575,7 +1576,7 @@ IrFunc *ir_build(Module *m, uint32_t fi, const OptOpts *opt) {
         uint32_t base = b->sp - sig->nparams;
         uint32_t n = sig->nparams + (callee != REF_NONE ? 1u : 0u);
         Ref *args = xmalloc((n ? n : 1) * sizeof(Ref));
-        memcpy(args, &b->stack[base], sig->nparams * sizeof(Ref));
+        if (sig->nparams) memcpy(args, &b->stack[base], sig->nparams * sizeof(Ref));
         if (callee != REF_NONE) args[sig->nparams] = callee;
         ir_emit(f, b->cur, irop, VT_BOT, args, n, imm, imm2);
         xfree(args);

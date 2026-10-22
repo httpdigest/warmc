@@ -785,6 +785,39 @@ static u64 wasi_path_remove_directory(WarmInstance *vm, u64 fd_, u64 p_, u64 n_)
   WITH_LEAF(R_PATH_REMOVE_DIRECTORY, unlinkat(dir, name, H_AT_REMOVEDIR))
 }
 
+#if defined(WARMC_WINDOWS)
+/* Whether a link at `path` (under the preopen) to `target` would point out of
+   the preopen: an absolute target, or one whose `..`s climb above it from the
+   link's own directory.  Read lexically, as both are written. */
+static int link_leaves(const char *path, const char *target) {
+  if (target[0] == '/' || target[0] == '\\' || (target[0] && target[1] == ':'))
+    return 1;
+  int depth = 0, last = 0;
+  for (const char *p = path; *p;) {
+    const char *q = p;
+    while (*q && *q != '/' && *q != '\\') q++;
+    usz n = (usz)(q - p);
+    if (n == 2 && p[0] == '.' && p[1] == '.') depth--;
+    else if (n && !(n == 1 && p[0] == '.')) depth++;
+    last = n && !(n == 1 && p[0] == '.') && !(n == 2 && p[0] == '.' && p[1] == '.');
+    p = *q ? q + 1 : q;
+  }
+  if (last) depth--;
+  for (const char *p = target; *p;) {
+    const char *q = p;
+    while (*q && *q != '/' && *q != '\\') q++;
+    usz n = (usz)(q - p);
+    if (n == 2 && p[0] == '.' && p[1] == '.') {
+      if (--depth < 0) return 1;
+    } else if (n && !(n == 1 && p[0] == '.')) {
+      depth++;
+    }
+    p = *q ? q + 1 : q;
+  }
+  return 0;
+}
+#endif
+
 static u64 wasi_path_symlink(WarmInstance *vm, u64 old_, u64 oldn_, u64 fd_,
                              u64 p_, u64 n_) {
   Fd *d = fd_get((u32)fd_);
@@ -796,6 +829,13 @@ static u64 wasi_path_symlink(WarmInstance *vm, u64 old_, u64 oldn_, u64 fd_,
   if (rc) return rc;
   rc = copy_path(vm, p_, n_, path);
   if (rc) return rc;
+#if defined(WARMC_WINDOWS)
+  /* Win32 has to be told when a link is made whether its target is a
+     directory, and finding out for a target outside the preopen means
+     looking outside it.  So such a link is refused here, as wasmtime refuses
+     it on Windows; POSIX hosts make it and refuse to follow it instead. */
+  if (link_leaves(path, target)) return WASI_EPERM;
+#endif
   int dir;
   rc = walk(d->host, path, &dir, leaf);
   if (rc) return rc;

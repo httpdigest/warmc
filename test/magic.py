@@ -40,7 +40,12 @@ import os
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILD = os.environ.get("BUILD", "build")
-WARMC = os.path.join(ROOT, BUILD, "warmc")
+WARMC = os.path.join(ROOT, BUILD, "warmc") + (".exe" if os.name == "nt" else "")
+
+# The limits below are generous for a workstation; a machine slow enough to
+# have been given a longer WARMC_TIMEOUT -- CI's runners -- gets that instead.
+def limit(seconds):
+    return max(seconds, float(os.environ.get("WARMC_TIMEOUT", "0")))
 
 def magic(d, wide):
     """What warmc chooses for this divisor."""
@@ -117,7 +122,7 @@ def main():
     # crash on any host whose divide traps; the answer is what this asks for.
     for w in ("", ":64"):
         r = subprocess.run([WARMC, "--magic=0" + w],
-                           capture_output=True, text=True, timeout=30)
+                           capture_output=True, text=True, timeout=limit(30))
         if r.returncode != 0:
             print("FAIL[magic]: --magic=0%s exited %d: %s"
                   % (w, r.returncode, r.stderr.strip()[:120]))

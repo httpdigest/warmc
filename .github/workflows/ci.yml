@@ -1,0 +1,27 @@
+name: CI
+
+# The build and `make smoke` on macOS arm64, Linux arm64 and Windows x64 for
+# every push to main and every pull request, in a couple of minutes a job.
+# The whole of `make check`, with the sanitizer builds and the language
+# toolchains, is left to nightly.yml.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Check
+    uses: $/.github/workflows/check.yml
+    permissions:
+      contents: read # to check out the repository
+    with:
+      full: false
