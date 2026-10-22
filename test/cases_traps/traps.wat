@@ -165,6 +165,39 @@
       (br_if $l (i32.lt_u (local.tee $i (i32.add (local.get $i) (i32.const 1))) (i32.const 100))))
     (local.get $s))
 
+  ;; A loop guarded by a counter kept in a mutable global -- wasm-smith's fuel.
+  ;; The guard reads a global the loop decrements, so it is not invariant and
+  ;; must not be hoisted in front of the loop, where it holds once and the
+  ;; loop then never stops.  The decrement is in the loop, in a callee, and in
+  ;; a function that tail-calls itself, which becomes a loop.
+  (global $fuel (mut i32) (i32.const 0))
+  (func $burn (global.set $fuel (i32.sub (global.get $fuel) (i32.const 1))))
+  (func $fuel_loop (param $n i32) (result i32)
+    (local $i i32)
+    (global.set $fuel (i32.const 100))
+    (loop $l
+      (if (i32.eqz (global.get $fuel)) (then (unreachable)))
+      (global.set $fuel (i32.sub (global.get $fuel) (i32.const 1)))
+      (br_if $l (i32.lt_u (local.tee $i (i32.add (local.get $i) (i32.const 1))) (local.get $n))))
+    (local.get $i))
+  (func (export "fuel_loop") (result i32) (call $fuel_loop (i32.const 1000)))
+  (func (export "fuel_loop_ok") (result i32) (call $fuel_loop (i32.const 100)))
+  (func (export "fuel_loop_call") (result i32)
+    (local $i i32)
+    (global.set $fuel (i32.const 100))
+    (loop $l
+      (if (i32.eqz (global.get $fuel)) (then (unreachable)))
+      (call $burn)
+      (br_if $l (i32.lt_u (local.tee $i (i32.add (local.get $i) (i32.const 1))) (i32.const 1000))))
+    (local.get $i))
+  (func $spin (param $n i32) (result i32)
+    (if (i32.eqz (global.get $fuel)) (then (unreachable)))
+    (global.set $fuel (i32.sub (global.get $fuel) (i32.const 1)))
+    (return_call $spin (i32.add (local.get $n) (i32.const 1))))
+  (func (export "fuel_tail") (result i32)
+    (global.set $fuel (i32.const 100))
+    (call $spin (i32.const 0)))
+
   ;; A bound is only carried through a left shift while nothing leaves the
   ;; top.  popcount(0x7fffffff) is 31 and 31 << 27 is 0xf8000000, so the sum
   ;; wraps to zero -- but the *bound* on a popcount is 32, and 32 << 27 is
