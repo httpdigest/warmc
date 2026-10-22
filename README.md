@@ -486,9 +486,9 @@ command-line order, so put them **after** `-O`.
 | `inline` | call-site-scored inlining (on by default only at `-O2`) |
 | `reassoc` | rebalance associative integer chains for latency, and add the value a loop carries round last in its chain, so that an iteration waits on one op of it |
 | `rotate` | loop rotation |
-| `unroll` | 4× unrolling of constant-trip-count loops |
+| `unroll` | 4× unrolling of constant-trip-count loops; complete unrolling of short ones, and of a loop nest whose outer loop runs at most 8 times; a loop that runs once loses its back edge |
 | `vectorize` | auto-vectoriser: contiguous and interleaved accesses, if-converted bodies, integer and widening reductions, search loops; with runtime alias checks and a scalar fallback |
-| `addroff`, `memptr` | fold address arithmetic into displacements; compute a native pointer once per base |
+| `addroff`, `memptr` | fold address arithmetic into displacements; compute a native pointer once per base, and once per block for constant addresses too large for a displacement |
 | `ldcomb` | merge byte-assembling loads into one wide load |
 | `selftail` | turn self `return_call` into a loop |
 | `gloop`, `gssa` | keep globals in registers across loops; promote a global to SSA where that does fewer memory operations on it, such as Go's stack pointer or a shadow stack pointer moved in a loop (`-fgssa-all` promotes every one, which costs more than it saves) |
@@ -656,21 +656,23 @@ steady-state generated code, not start-up or compile time.
 | Corpus | Source language | Kernels | warmc / wasmtime | Range | Median peak RSS (warmc / wasmtime) |
 |---|---|---:|---:|---|---|
 | `gobench` | TinyGo | 26 | 0.59 | 0.07 – 1.00 | 1.9 / 8.9 MB |
-| `stdgo` | Go | 34 | 0.65 | 0.06 – 1.07 | 7.2 / 27.2 MB |
+| `stdgo` | Go | 34 | 0.65 | 0.06 – 1.00 | 7.2 / 27.3 MB |
 | `vecbench` | TinyGo (vectorisable loops) | 30 | 0.15 | 0.04 – 0.95 | 1.9 / 8.9 MB |
-| `asbench` | AssemblyScript | 25 | 0.63 | 0.17 – 1.00 | 1.9 / 8.7 MB |
+| `asbench` | AssemblyScript | 25 | 0.62 | 0.17 – 1.00 | 1.9 / 8.7 MB |
 | `rsbench` | Rust | 28 | 0.69 | 0.34 – 0.98 | 2.0 / 9.1 MB |
-| `zigbench` | Zig | 9 | 0.70 | 0.40 – 1.00 | 1.9 / 8.7 MB |
-| `ktbench` | Kotlin (Wasm GC) | 12 | 0.09 | 0.003 – 0.49 | 3.5 / 20.6 MB |
-| `cbench` | C | 14 | 0.83 | 0.32 – 1.05 | 2.0 / 9.0 MB |
+| `zigbench` | Zig | 9 | 0.71 | 0.42 – 1.00 | 1.9 / 8.7 MB |
+| `ktbench` | Kotlin (Wasm GC) | 12 | 0.09 | 0.004 – 0.49 | 3.5 / 20.6 MB |
+| `cbench` | C | 14 | 0.83 | 0.33 – 1.01 | 2.0 / 9.0 MB |
 | `cppbench` | C++ | 14 | 0.69 | 0.23 – 0.99 | 2.6 / 9.8 MB |
-| `hsbench` | Haskell | 15 | 0.65 | 0.40 – 0.88 | 10.2 / 32.2 MB |
+| `hsbench` | Haskell | 15 | 0.64 | 0.39 – 0.87 | 10.1 / 32.3 MB |
 
 Over all 207 kernels the geometric mean is **0.48**, and 0.45 without
-`stdgo`. Five kernels are slower than wasmtime, all within 8%, and three of
-them within 0.3%. Of the other two, `stdgo/memcpy` spends its time in the
-platform's memmove under both engines, and `cbench/nbody`'s pair loop
-compiles to nearly the same instructions in both.
+`stdgo`. Six kernels are slower than wasmtime, none by more than 1%:
+`asbench/div64`, `cbench/hashtab` and `cbench/sha256`, `gobench/mathfn`,
+`stdgo/bitops` and `zigbench/sortints`. Those are ties, and which of them
+lands just above 1.0 changes between recordings. `cbench/nbody`, which was
+5% slower, runs at 0.91× now that warmc unrolls its five-body loop nest
+completely and keeps the velocities in registers.
 
 `stdgo` is Go built by Go's own compiler, which is not LLVM. It compiles
 every function to a loop around a `br_table` over the function's resume
