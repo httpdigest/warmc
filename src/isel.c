@@ -83,7 +83,10 @@ static void slot_load(Isel *s, Buf *bf, int fp, int vec, int reg, uint32_t off) 
   sp_access(s, bf, false, 3, fp, vec, reg, off, -1);
 }
 
+/* A slot holds one value after another (share_slots), so whatever the
+   reload cache keeps of it is stale once anything is stored there. */
 static void slot_store(Isel *s, Buf *bf, int fp, int vec, int reg, uint32_t off) {
+  if (off >= s->slots_off) rc_kill_slot(s, (off - s->slots_off) / 8u);
   sp_access(s, bf, true, 3, fp, vec, reg, off, -1);
 }
 

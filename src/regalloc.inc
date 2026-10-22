@@ -868,6 +868,240 @@ static int piece_cmp(const void *a, const void *b) {
   return x->v < y->v ? -1 : x->v > y->v;
 }
 
+/* WARMC_VERIFY_RA: at every instruction, no two slots the scan handed out
+   that were merged into one hold values live across it -- by location, or as
+   a value's save around calls.  Liveness here is the exact one the safepoint
+   maps are made from, not the intervals the sharing went by.  A split
+   parameter aliased onto its source's slot is the same slot, and passes. */
+typedef struct {
+  uint32_t *stamp, *owner;
+  const uint32_t *oloc, *ocsa;
+  uint32_t site;
+} SlotCheck;
+
+static void slot_check_one(Isel *s, SlotCheck *c, uint32_t k, uint32_t old,
+                           bool vec) {
+  for (uint32_t u = 0; u < (vec ? 2u : 1u); u++) {
+    if (c->stamp[k + u] == c->site && c->owner[k + u] != old)
+      warmc_fatal("regalloc: slots %u and %u share slot %u while both are "
+                  "live in %s", c->owner[k + u], old, k + u,
+                  s->f->m->funcs[s->f->func_index].sym);
+    c->stamp[k + u] = c->site;
+    c->owner[k + u] = old;
+  }
+}
+
+static void slot_check_site(Isel *s, IrFunc *f, SlotCheck *c, const Ref *live,
+                            uint32_t nlive) {
+  c->site++;
+  for (uint32_t i = 0; i < nlive; i++) {
+    Ref v = live[i];
+    bool vec = (ValType)f->insts[v].type == VT_V128;
+    if (IS_SLOT(s->loc[v]))
+      slot_check_one(s, c, SLOT_OF(s->loc[v]), c->oloc[v], vec);
+    if (s->csa_slot && s->csa_slot[v] >= 0)
+      slot_check_one(s, c, (uint32_t)s->csa_slot[v], c->ocsa[v], vec);
+  }
+}
+
+/* for_each_live_site's walk, every instruction a site, without the sorted
+   copy of the live set it hands each callback: here the order does not
+   matter, and a sort per instruction made a function with thousands of
+   values live at once take seconds to check. */
+static void slot_check_walk(Isel *s, IrFunc *f, SlotCheck *c) {
+  uint32_t n = f->ninsts;
+  uint32_t eucap = eff_use_cap(f);
+  Ref *eu = xmalloc(eucap * sizeof(Ref));
+  LiveWalk w = { xcalloc(n ? n : 1, sizeof(uint32_t)),
+                 xmalloc((n ? n : 1) * sizeof(Ref)), NULL, 0 };
+  for (uint32_t oi = 0; oi < f->norder; oi++) {
+    uint32_t bi = f->order[oi];
+    Block *b = &f->blocks[bi];
+    w.nmem = 0;
+    for (uint32_t k = s->lv_out_off[bi]; k < s->lv_out_off[bi + 1]; k++)
+      lw_add(&w, s->lv_out[k]);
+    for (int32_t i = (int32_t)b->ninsts - 1; i >= 0; i--) {
+      Ref r2 = b->insts[i];
+      slot_check_site(s, f, c, w.mem, w.nmem);
+      lw_del(&w, r2);
+      uint32_t ne = eff_uses(s, f, r2, eu, eucap);
+      for (uint32_t j = 0; j < ne; j++) lw_add(&w, eu[j]);
+    }
+  }
+  xfree(w.idx); xfree(w.mem); xfree(eu);
+}
+
+/* Spill slots, renumbered so that values never live at the same time share
+   one.  The scan gives every spilled value a slot of its own: in a function
+   of a few thousand spills that is tens of kilobytes of frame, most of it
+   dead at any moment, past the 32 KB an arm64 load reaches from sp in one
+   instruction.  A slot is busy from the first position of anything placed
+   in it to the last -- the value whose slot it is, a web's other members and
+   a split parameter aliased onto it, which share its location, and a value
+   whose register is saved there around calls -- and slots of one size whose
+   spans do not meet become one, taken in order of start, each into the slot
+   that fell free first.  A value with no interval holds its slot throughout.
+   A block parameter's slot is written at the end of each predecessor, by
+   the edge's copy, where the parameter itself is not yet live: there the
+   slot is busy too, or a value living in it across the latch of a loop is
+   overwritten by the phi's next value.  A landing pad's are written earlier,
+   before the call that may throw (emit_eh_stores), while that call's own
+   operands are still to be read.  v128 slots are pairs, kept to even slots
+   of their own below the rest, as take_slot aligns them. */
+typedef struct {
+  int32_t lo, hi;
+  uint32_t old;
+  bool vec;
+} SlotSpan;
+
+static int span_cmp(const void *a, const void *b) {
+  const SlotSpan *x = a, *y = b;
+  if (x->lo != y->lo) return x->lo < y->lo ? -1 : 1;
+  return x->old < y->old ? -1 : x->old > y->old;
+}
+
+static void span_note(SlotSpan *sp, uint32_t k, const Interval *iv, Ref v,
+                      bool vec) {
+  int32_t lo = iv[v].end >= 0 ? iv[v].start : INT32_MIN;
+  int32_t hi = iv[v].end >= 0 ? iv[v].end : INT32_MAX;
+  if (lo < sp[k].lo) sp[k].lo = lo;
+  if (hi > sp[k].hi) sp[k].hi = hi;
+  sp[k].vec |= vec;
+}
+
+static uint32_t share_slots(Isel *s, const Interval *iv, uint32_t n,
+                            uint32_t nold, const int32_t *blk_end) {
+  if (nold < 2 || warmc_getenv("WARMC_NO_SLOT_SHARE")) return nold;
+  IrFunc *f = s->f;
+  SlotSpan *sp = xmalloc(nold * sizeof(SlotSpan));
+  for (uint32_t k = 0; k < nold; k++) {
+    sp[k].lo = INT32_MAX;
+    sp[k].hi = INT32_MIN;
+    sp[k].old = k;
+    sp[k].vec = false;
+  }
+  for (uint32_t v = 0; v < n; v++) {
+    bool vec = (ValType)f->insts[v].type == VT_V128;
+    if (IS_SLOT(s->loc[v])) span_note(sp, SLOT_OF(s->loc[v]), iv, v, vec);
+    if (s->csa_slot && s->csa_slot[v] >= 0)
+      span_note(sp, (uint32_t)s->csa_slot[v], iv, v, vec);
+  }
+  for (uint32_t bi = 0; bi < f->nblocks; bi++) {
+    Block *b = &f->blocks[bi];
+    if (!b->reachable) continue;
+    for (uint32_t e = 0; e < b->nsuccs; e++) {
+      Block *t = &f->blocks[b->succs[e].target];
+      int32_t at = b->succs[e].eh && b->ninsts ? blk_end[bi] - 1 : blk_end[bi];
+      for (uint32_t j = 0; j < t->nparams; j++) {
+        int l = s->loc[t->params[j]];
+        if (!IS_SLOT(l)) continue;
+        SlotSpan *x = &sp[SLOT_OF(l)];
+        if (at < x->lo) x->lo = at;
+        if (blk_end[bi] > x->hi) x->hi = blk_end[bi];
+      }
+    }
+  }
+  uint32_t nused = 0;
+  for (uint32_t k = 0; k < nold; k++)
+    if (sp[k].lo <= sp[k].hi) sp[nused++] = sp[k];
+  qsort(sp, nused, sizeof(SlotSpan), span_cmp);
+
+  uint32_t *map = xmalloc(nold * sizeof(uint32_t));
+  int32_t *hhi = xmalloc((nused ? nused : 1) * sizeof(int32_t));
+  uint32_t *hslot = xmalloc((nused ? nused : 1) * sizeof(uint32_t));
+  uint32_t count[2] = { 0, 0 };
+  for (int c = 0; c < 2; c++) {
+    /* a min-heap of the slots in use, by where they fall free */
+    uint32_t hn = 0;
+    for (uint32_t i = 0; i < nused; i++) {
+      if (sp[i].vec != (c == 1)) continue;
+      uint32_t slot;
+      if (hn && hhi[0] < sp[i].lo) {
+        slot = hslot[0];
+        hhi[0] = hhi[--hn];
+        hslot[0] = hslot[hn];
+        for (uint32_t p = 0;;) {
+          uint32_t l = 2 * p + 1, r = l + 1, m = p;
+          if (l < hn && hhi[l] < hhi[m]) m = l;
+          if (r < hn && hhi[r] < hhi[m]) m = r;
+          if (m == p) break;
+          int32_t th = hhi[m]; hhi[m] = hhi[p]; hhi[p] = th;
+          uint32_t ts = hslot[m]; hslot[m] = hslot[p]; hslot[p] = ts;
+          p = m;
+        }
+      } else {
+        slot = count[c]++;
+      }
+      map[sp[i].old] = slot;
+      uint32_t q = hn++;
+      hhi[q] = sp[i].hi;
+      hslot[q] = slot;
+      while (q) {
+        uint32_t p = (q - 1) / 2;
+        if (hhi[p] <= hhi[q]) break;
+        int32_t th = hhi[p]; hhi[p] = hhi[q]; hhi[q] = th;
+        uint32_t ts = hslot[p]; hslot[p] = hslot[q]; hslot[q] = ts;
+        q = p;
+      }
+    }
+  }
+  for (uint32_t i = 0; i < nused; i++)
+    map[sp[i].old] = sp[i].vec ? 2 * map[sp[i].old]
+                               : 2 * count[1] + map[sp[i].old];
+  bool verify = warmc_getenv("WARMC_VERIFY_RA") != NULL;
+  uint32_t *oloc = verify ? xmalloc((n ? n : 1) * sizeof(uint32_t)) : NULL;
+  uint32_t *ocsa = verify ? xmalloc((n ? n : 1) * sizeof(uint32_t)) : NULL;
+  for (uint32_t v = 0; v < n; v++) {
+    if (IS_SLOT(s->loc[v])) {
+      if (verify) oloc[v] = SLOT_OF(s->loc[v]);
+      s->loc[v] = SLOT(map[SLOT_OF(s->loc[v])]);
+    }
+    if (s->csa_slot && s->csa_slot[v] >= 0) {
+      if (verify) ocsa[v] = (uint32_t)s->csa_slot[v];
+      s->csa_slot[v] = (int32_t)map[s->csa_slot[v]];
+    }
+  }
+  uint32_t nnew = 2 * count[1] + count[0];
+  if (verify) {
+    SlotCheck c = { xcalloc(nnew + 2, sizeof(uint32_t)),
+                    xmalloc((nnew + 2) * sizeof(uint32_t)), oloc, ocsa, 0 };
+    slot_check_walk(s, f, &c);
+    /* and on every edge, where the copies into the target's parameters
+       land: nothing live into the target may hold one of their slots, nor,
+       on an unwind edge, anything the call that may throw still reads */
+    for (uint32_t bi = 0; bi < f->nblocks; bi++) {
+      Block *b = &f->blocks[bi];
+      if (!b->reachable) continue;
+      for (uint32_t e = 0; e < b->nsuccs; e++) {
+        uint32_t ti = b->succs[e].target;
+        Block *t = &f->blocks[ti];
+        c.site++;
+        for (uint32_t j = 0; j < t->nparams; j++) {
+          Ref p = t->params[j];
+          if (IS_SLOT(s->loc[p]))
+            slot_check_one(s, &c, SLOT_OF(s->loc[p]), oloc[p],
+                           (ValType)f->insts[p].type == VT_V128);
+        }
+        uint32_t nin = s->lv_in_off[ti + 1] - s->lv_in_off[ti];
+        uint32_t nops = b->succs[e].eh && b->ninsts
+                            ? f->insts[b->insts[b->ninsts - 1]].nargs : 0;
+        for (uint32_t k = 0; k < nin + nops; k++) {
+          Ref v = k < nin ? s->lv_in[s->lv_in_off[ti] + k]
+                          : ir_args(f, b->insts[b->ninsts - 1])[k - nin];
+          bool vec = (ValType)f->insts[v].type == VT_V128;
+          if (IS_SLOT(s->loc[v]))
+            slot_check_one(s, &c, SLOT_OF(s->loc[v]), oloc[v], vec);
+          if (s->csa_slot && s->csa_slot[v] >= 0)
+            slot_check_one(s, &c, (uint32_t)s->csa_slot[v], ocsa[v], vec);
+        }
+      }
+    }
+    xfree(c.stamp); xfree(c.owner); xfree(oloc); xfree(ocsa);
+  }
+  xfree(sp); xfree(map); xfree(hhi); xfree(hslot);
+  return nnew;
+}
+
 static void regalloc_linear(Isel *s) {
   IrFunc *f = s->f;
   uint32_t n = f->ninsts;
@@ -2661,7 +2895,7 @@ static void regalloc_linear(Isel *s) {
     }
   }
 
-  s->nslots = slot;
+  s->nslots = share_slots(s, iv, n, slot, blk_end);
 
   xfree(web); xfree(mem_head); xfree(mem_tail); xfree(mem_next);
   for (int i = 0; i < 32; i++) { xfree(gpr_occ[i].v); xfree(fpr_occ[i].v); }
