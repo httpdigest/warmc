@@ -2523,8 +2523,8 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
   fout->want_align = opt->align && has_loop;
   fout->code_len = (uint32_t)(pro.len + s->body.len);
   fout->code = xmalloc(fout->code_len ? fout->code_len : 1);
-  memcpy(fout->code, pro.data, pro.len);
-  memcpy(fout->code + pro.len, s->body.data, s->body.len);
+  if (pro.len) memcpy(fout->code, pro.data, pro.len);
+  if (s->body.len) memcpy(fout->code + pro.len, s->body.data, s->body.len);
   fout->nrelocs = s->nrelocs;
   fout->relocs = xmalloc((s->nrelocs ? s->nrelocs : 1) * sizeof(Reloc));
   for (uint32_t i = 0; i < s->nrelocs; i++) {

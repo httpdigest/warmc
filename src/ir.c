@@ -315,11 +315,15 @@ bool ir_dom_walk(const IrFunc *f, uint32_t a, uint32_t b) {
   }
 }
 
-bool ir_dom_check_on = false;
+/* Read before the first ordering computes a range, which every compile
+   thread does before it asks a dominance question. */
+static bool g_dom_check;
+static pthread_once_t g_dom_check_once = PTHREAD_ONCE_INIT;
+static void dom_check_init(void) { g_dom_check = warmc_getenv("WARMC_CHECK_DOM") != NULL; }
 
 bool ir_dominates_checked(const IrFunc *f, uint32_t a, uint32_t b) {
   bool r = ir_dom_range(f, a, b);
-  if (ir_dom_check_on && r != ir_dom_walk(f, a, b))
+  if (g_dom_check && r != ir_dom_walk(f, a, b))
     warmc_fatal("internal: dominator range test says %s for %u dom %u and the "
                 "idom walk says %s", r ? "yes" : "no", a, b, r ? "no" : "yes");
   return r;
@@ -701,6 +705,7 @@ void ir_path_share(const IrFunc *f, float *share) {
 void ir_order(IrFunc *f) { (void)ir_order_changed(f); }
 
 bool ir_order_changed(IrFunc *f) {
+  pthread_once(&g_dom_check_once, dom_check_init);
   size_t len = order_sig_len_of(f);
   if (len > f->order_sig_cap) {
     size_t osc_ = f->order_sig_cap;

@@ -2452,12 +2452,14 @@ static void emit_inst(Isel *s, Ref v) {
         trap_if_cc(s, XCC_AE, TRAP_ARRAY_OOB);
       }
       /* A store's value is read before the element's address goes into
-         TMP0: reading a float or vector constant may build it there. */
+         TMP0: reading a float or vector constant may build it there.  An
+         integer one goes to S0, which the array reference has left for
+         TMP1 -- not S2, which is RCX and may hold a live value. */
       int y = -1;
       ValType yt = VT_I32;
       if (in->op == I_ARRAY_SET) {
         yt = (ValType)f->insts[a[2]].type;
-        y = rd(s, a[2], yt == VT_V128 || vt_is_float(yt) ? F0 : S2);
+        y = rd(s, a[2], yt == VT_V128 || vt_is_float(yt) ? F0 : S0);
       }
       int32_t off = (int32_t)f->m->types[in->imm].hdr_size;
       if (size <= 3) {

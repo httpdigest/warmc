@@ -52,7 +52,7 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.chdir(ROOT)
 BUILD = os.environ.get("BUILD", "build")
-WARMC = os.path.join(BUILD, "warmc")
+WARMC = os.path.join(BUILD, "warmc") + (".exe" if os.name == "nt" else "")
 SRC = "test/components"
 WORK = os.path.join(BUILD, "components")
 GOLDEN = os.path.join(SRC, "expected")

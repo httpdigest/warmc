@@ -14,13 +14,9 @@
 static Buf ours;
 static FILE *asmf;
 static int ncases;
-static const char *cur_text;
-static size_t cur_start;
 
 #define CASE(text, ...)                                                        \
   do {                                                                         \
-    cur_text = (text);                                                         \
-    cur_start = ours.len;                                                      \
     __VA_ARGS__;                                                               \
     fprintf(asmf, "\t%s\n", text);                                             \
     ncases++;                                                                  \

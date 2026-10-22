@@ -1,0 +1,14 @@
+# Keeps the actions the workflows pin by commit up to date, a week after each
+# release at the earliest, all in one pull request.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      actions:
+        patterns:
+          - "*"

@@ -1143,7 +1143,7 @@ static bool inl_run(IrFunc *f, const OptOpts *o, uint32_t budget0, bool more) {
   InlVec sites = {0};
   InlEsc *ev = o->escape ? inl_caller_evidence(f) : NULL;
   inl_collect(f, o, memo, ev, &sites, more);
-  qsort(sites.v, sites.n, sizeof(InlSite), inl_site_cmp);
+  if (sites.n > 1) qsort(sites.v, sites.n, sizeof(InlSite), inl_site_cmp);
 
   uint32_t budget = budget0;
   uint32_t retsum = 0;

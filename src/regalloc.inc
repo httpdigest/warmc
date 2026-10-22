@@ -2266,7 +2266,7 @@ static void regalloc_linear(Isel *s) {
           pu[npu].v = u; pu[npu].i = i; npu++;
         }
       }
-      qsort(pu, npu, sizeof(PieceUse), piece_use_cmp);
+      if (npu > 1) qsort(pu, npu, sizeof(PieceUse), piece_use_cmp);
       double w = 1.0;
       for (uint32_t k = 0; k < b->loop_depth && k < 8; k++) w *= 10.0;
       if (b->cold) w = 0.01;
@@ -2289,7 +2289,7 @@ static void regalloc_linear(Isel *s) {
         c0 = c1 + 1;
       }
     }
-    qsort(pcd, npcd, sizeof(PieceCand), piece_cand_cmp);
+    if (npcd > 1) qsort(pcd, npcd, sizeof(PieceCand), piece_cand_cmp);
     struct Piece *pcs = xmalloc((npcd ? npcd : 1) * sizeof(struct Piece));
     uint32_t npcs = 0;
     for (uint32_t x = 0; x < npcd; x++) {
@@ -2616,7 +2616,7 @@ static void regalloc_linear(Isel *s) {
           cand[ncand++] = (SplitCand){ x, uw[x], 1, s->cls[x] };
         }
 
-        qsort(cand, ncand, sizeof(SplitCand), split_cand_cmp);
+        if (ncand > 1) qsort(cand, ncand, sizeof(SplitCand), split_cand_cmp);
         for (uint32_t i2 = 0; i2 < ncand; i2++) {
           SplitCand *c2 = &cand[i2];
           if (sp_max >= 0 && sp_done >= sp_max) break;

@@ -42,8 +42,9 @@ import urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILD = os.environ.get("BUILD", "build")
-WARMC = os.path.join(ROOT, BUILD, "warmc")
-WASM_TOOLS = os.path.join(ROOT, BUILD, "tools", "bin", "wasm-tools")
+WARMC = os.path.join(ROOT, BUILD, "warmc") + (".exe" if os.name == "nt" else "")
+WASM_TOOLS = os.path.join(ROOT, BUILD, "tools", "bin",
+                          "wasm-tools.exe" if os.name == "nt" else "wasm-tools")
 WORK = os.path.join(ROOT, BUILD, "canon")
 SPEC_DIR = os.path.join(ROOT, BUILD, "spec")
 SPEC = os.path.join(SPEC_DIR, "definitions.py")

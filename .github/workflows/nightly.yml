@@ -1,0 +1,27 @@
+name: Nightly
+
+# The whole test suite once a day and on demand: the sanitizer builds and
+# all of `make check`, where ci.yml runs `make smoke`, with every language
+# toolchain installed, so that the language test corpora (test/*tests) are
+# compiled and checked against wasmtime too.  The benchmark corpora are left
+# to `make bench-compare`.
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: nightly
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: Check
+    uses: $/.github/workflows/check.yml
+    permissions:
+      contents: read # to check out the repository
+    with:
+      full: true

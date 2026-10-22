@@ -56,18 +56,79 @@ done
 
 labels=()
 
+# Left to the end, run on its own: see pause_check in run_gc.sh.
+export GC_PAUSE_CHECK=0
+
+# `make smoke` (CHECK_SMOKE=1) runs only these: between them the hand-written
+# cases at every level, traps, the collector, relaxed SIMD, the C, SIMD,
+# control-flow and addressing workloads, WASI, linking, rejection, register
+# pressure, far branches, the canonical ABI and component linking -- most of
+# warmc, in under 30 CPU-seconds of a workstation and well under a minute of
+# a CI runner, against the fifteen minutes the whole of this takes there.  CI
+# runs it on every push.  adapter and wit are left out: their wasmtime runs
+# and subprocesses cost a minute and more of a macOS or Windows runner.
+SMOKE_ROWS="cases-O0 cases-O1 cases-O2 traps-O0 traps-O2 gc-O2 gcthread relaxed
+  workload-O2 vecwork-O2 simd-O2 control-O2 addr32-O2 addrmulti-O2 addr64-O2
+  wasi link reject pressure bincases canon clink"
+# Under MSYS2 every process costs a tenth of a second to start, and reject
+# starts warmc two hundred times to ask what no host can answer differently
+# -- whether the front end refuses a malformed module, and why -- so on
+# Windows it is left to the other two hosts' smoke runs and the full suite.
+case "$(uname -s)" in
+  MINGW*|CLANG*|MSYS*) SMOKE_ROWS=${SMOKE_ROWS/reject/} ;;
+esac
+SMOKE_ROWS=" $(echo $SMOKE_ROWS) "
+
+# The rows' output is held back and printed in order once they have all
+# finished, so a row says when it is done, at once -- with the seconds since
+# the run began, which a subshell's $SECONDS still counts -- and one that
+# failed shows the start of its log with it, in one write.
+row_done() {
+  if [ "$2" = 0 ]; then printf '[%4ds] %s: ok\n' "$SECONDS" "$1"
+  else printf '[%4ds] %s: exit %s\n%s\n' "$SECONDS" "$1" "$2" \
+         "$(head -n 12 "$LOGS/$1.log" | sed 's/^/    /')"
+  fi
+}
+
 start() {
   local label="$1"; shift
+  if [ -n "${CHECK_SMOKE:-}" ]; then
+    case "$SMOKE_ROWS" in *" $label "*) ;; *) return 0 ;; esac
+  fi
   labels[${#labels[@]}]="$label"
 
   if [ -n "${CHECK_TIMING:-}" ]; then
     ( t0=$(perl -MTime::HiRes=time -e 'print time')
-      "$@" >"$LOGS/$label.log" 2>&1; echo $? >"$LOGS/$label.rc"
+      "$@" >"$LOGS/$label.log" 2>&1; rc=$?; echo $rc >"$LOGS/$label.rc"
       perl -e "printf \"%.1f\", $(perl -MTime::HiRes=time -e 'print time')-$t0" \
-        >"$LOGS/$label.sec" ) &
+        >"$LOGS/$label.sec"
+      row_done "$label" $rc ) &
   else
-    ( "$@" >"$LOGS/$label.log" 2>&1; echo $? >"$LOGS/$label.rc" ) &
+    ( "$@" >"$LOGS/$label.log" 2>&1; rc=$?; echo $rc >"$LOGS/$label.rc"
+      row_done "$label" $rc ) &
   fi
+}
+
+# Every half minute, how far the run has got, and once few rows are left,
+# which: a row that wedges is then the one still named at the end.  It looks
+# every second, so that it is gone by the time the last row is.
+watch_rows() {
+  local tick=0 n l running
+  while :; do
+    sleep 1
+    n=0; running=""
+    for l in "${labels[@]}"; do
+      if [ -e "$LOGS/$l.rc" ]; then n=$((n + 1)); else running="$running $l"; fi
+    done
+    [ -n "$running" ] || return 0
+    tick=$((tick + 1))
+    [ $((tick % 30)) = 0 ] || continue
+    if [ $((${#labels[@]} - n)) -le 15 ]; then
+      printf '[%4ds] %d of %d rows done, waiting for:%s\n' "$SECONDS" "$n" "${#labels[@]}" "$running"
+    else
+      printf '[%4ds] %d of %d rows done\n' "$SECONDS" "$n" "${#labels[@]}"
+    fi
+  done
 }
 
 start cases-O0 env WARMC_FLAGS=-O0 ./test/run_tests.sh
@@ -92,8 +153,14 @@ for p in mem cse licm dce fold bce escape partial-escape reinline throw-jump loo
   start "gc-no-$p" env WARMC_FLAGS="-O2 -fno-$p" ./test/run_gc.sh
 done
 
-start nobar     ./test/run_nobar.sh
-start jobs      ./test/run_jobs.sh
+# The benchmark corpora -- the Makefile's BENCH_CORPORA -- are programs
+# sized to be timed, and building and running them is most of a run on a
+# small machine; CHECK_BENCH=0, which CI sets, leaves them to `make
+# bench-compare`, with the rows that compile nothing else.
+bench() { [ "${CHECK_BENCH:-1}" = 0 ] || start "$@"; }
+
+bench nobar     ./test/run_nobar.sh
+bench jobs      ./test/run_jobs.sh
 
 if [ -z "${GC_MODES_JOBS:-}" ]; then
   _cores=$( (sysctl -n hw.logicalcpu 2>/dev/null || nproc 2>/dev/null) || echo 4)
@@ -133,16 +200,16 @@ start pe       ./test/run_pe.sh
 
 start tinygo   ./test/run_tinygo.sh
 
-start gobench  python3 test/gobench.py --check
-start vecbench python3 test/gobench.py --corpus vecbench --check
-start asbench  python3 test/gobench.py --corpus asbench --check
-start rsbench  python3 test/gobench.py --corpus rsbench --check
-start stdgo    python3 test/gobench.py --corpus stdgo --check
-start ktbench  python3 test/gobench.py --corpus ktbench --check
-start zigbench python3 test/gobench.py --corpus zigbench --check
-start cbench   python3 test/gobench.py --corpus cbench --check
-start cppbench python3 test/gobench.py --corpus cppbench --check
-start hsbench  python3 test/gobench.py --corpus hsbench --check
+bench gobench  python3 test/gobench.py --check
+bench vecbench python3 test/gobench.py --corpus vecbench --check
+bench asbench  python3 test/gobench.py --corpus asbench --check
+bench rsbench  python3 test/gobench.py --corpus rsbench --check
+bench stdgo    python3 test/gobench.py --corpus stdgo --check
+bench ktbench  python3 test/gobench.py --corpus ktbench --check
+bench zigbench python3 test/gobench.py --corpus zigbench --check
+bench cbench   python3 test/gobench.py --corpus cbench --check
+bench cppbench python3 test/gobench.py --corpus cppbench --check
+bench hsbench  python3 test/gobench.py --corpus hsbench --check
 
 # The language test corpora: programs that print what they compute, line by
 # line, rather than a checksum, so a miscompile shows where it starts; each is
@@ -189,7 +256,7 @@ start gc-farbr    env WARMC_FAR_BRANCH=1 ./test/run_gc.sh
 # last call it made.
 start cases-gssa  env WARMC_FLAGS="-O2 -fgssa-all" ./test/run_tests.sh
 start gc-gssa     env WARMC_FLAGS="-O2 -fgssa-all" ./test/run_gc.sh
-start gobench-gssa python3 test/gobench.py --corpus gobench --check --variant '-O2 -fgssa-all'
+bench gobench-gssa python3 test/gobench.py --corpus gobench --check --variant '-O2 -fgssa-all'
 start traps-naive env WARMC_FLAGS="-O2 -fno-regalloc" ./test/run_traps.sh
 start gc-naive    env WARMC_FLAGS="-O2 -fno-regalloc" ./test/run_gc.sh
 start cases-noguard env WARMC_FLAGS="-O2 -fno-guard-pages" ./test/run_tests.sh
@@ -201,7 +268,16 @@ start reject   ./test/run_reject.sh
 start asan     ./test/run_asan.sh
 start tsan     ./test/run_tsan.sh
 
+printf '[%4ds] %d rows started\n' "$SECONDS" "${#labels[@]}"
+watch_rows &
 wait
+
+# Whether the collector keeps up while the program answers mark end, asked
+# of a machine no row is loading any more.
+if [ -z "${CHECK_SMOKE:-}" ]; then
+  start gc-pause env GC_PAUSE_CHECK=only WARMC_FLAGS=-O2 ./test/run_gc.sh
+  wait
+fi
 
 for label in "${labels[@]}"; do
   rc=$(cat "$LOGS/$label.rc" 2>/dev/null || echo 1)

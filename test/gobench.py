@@ -76,7 +76,7 @@ import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILD = os.environ.get("BUILD", "build")
-WARMC = os.path.join(ROOT, BUILD, "warmc")
+WARMC = os.path.join(ROOT, BUILD, "warmc") + (".exe" if os.name == "nt" else "")
 CORPUS = "gobench"
 WORK = os.path.join(ROOT, BUILD, "gobench")
 
@@ -230,15 +230,25 @@ def kotlin_klib_current():
     """
     if not os.path.exists(KOTLIN_KLIB):
         return False
+    v = kotlinc_version()
+    if v is None:
+        return True
+    return os.path.exists(os.path.join(os.path.dirname(KOTLIN_KLIB),
+                                       ".kotlin-stdlib-" + v))
+
+# The klib step below leaves a packed klib for the module step to include
+# only from 2.4.20 on, where that became the default; an older compiler
+# reports success and writes nothing there.
+KOTLIN_MIN = (2, 4, 20)
+
+def kotlinc_version():
+    """The compiler's version as `kotlinc -version` gives it, or None."""
     try:
         r = subprocess.run(["kotlinc", "-version"], capture_output=True, text=True)
     except OSError:
-        return True
+        return None
     m = re.search(r"kotlinc-jvm ([0-9.]+)", r.stdout + r.stderr)
-    if not m:
-        return True
-    return os.path.exists(os.path.join(os.path.dirname(KOTLIN_KLIB),
-                                       ".kotlin-stdlib-" + m.group(1)))
+    return m.group(1) if m else None
 
 GO_WASI_ENV = {"GOOS": "wasip1", "GOARCH": "wasm"}
 
@@ -877,6 +887,12 @@ def main():
         print("%s: %s not installed, skipping%s" % (CORPUS, tool,
               " (%s)" % hint if hint else ""), file=sys.stderr)
         return 0
+    if lang == "kt":
+        v = kotlinc_version()
+        if v and tuple(int(x) for x in v.split(".")[:3]) < KOTLIN_MIN:
+            print("%s: kotlinc %s predates %s, skipping" % (CORPUS, v,
+                  ".".join(map(str, KOTLIN_MIN))), file=sys.stderr)
+            return 0
     if lang == "rs" and not rust_target_installed():
         print("%s: rustc has no %s std, skipping "
               "(rustup target add %s)" % (CORPUS, RUST_TARGET, RUST_TARGET),

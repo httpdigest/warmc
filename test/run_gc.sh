@@ -52,6 +52,40 @@ build_one() {
   mv -f "$BIN.$$" "$BIN"
 }
 
+log_run() {
+  local case="$1" args="$2"; shift 2
+  ( unset WARMC_GC_STRESS WARMC_GC_GROWTH WARMC_GC_MIN_KB WARMC_GC_VERIFY \
+        WARMC_GC_RELOC WARMC_GC_RELOCATE_ALL WARMC_GC_LAB WARMC_GC_RELEASE \
+        WARMC_GC_HEAP_KB WARMC_GC_JITTER WARMC_GC_JITTER_SEED
+    wruntimeout env WARMC_GC_STATS=1 WARMC_GC_MIN_KB=64 \
+        "$@" sh -c 'exec "$0" "$1" $2' "$BIN" "$case" "$args" 2>&1 >/dev/null )
+}
+
+# While the collector waits for the program to answer mark end, it takes
+# what the program publishes, so the pause has little left to drain.  That
+# needs the collector to have a core to run on: with every core taken, the
+# program reaches its safepoint first and drains the mark itself, which is
+# correct and what this check reports as a failure.  Darwin's runtime asks
+# for user-interactive QoS and gets the core anyway; Linux gives its thread
+# nothing over the rest of a loaded machine.  So run_all.sh, which loads it
+# with every row at once, sets GC_PAUSE_CHECK=0 for the rows and runs this
+# alone at the end with GC_PAUSE_CHECK=only.
+pause_check() {
+  local out took
+  out=$(log_run walk_no_alloc "60 20000")
+  took=$(printf '%s' "$out" | sed -n 's/.*mark end, \([0-9]*\) taken waiting for it.*/\1/p')
+  case "$out" in
+    *"on a thread"*)
+      if [ -n "$took" ] && [ "$took" -gt 1000 ]; then
+        pass=$((pass+1))
+      else
+        echo "FAIL[gc] the mark end pause drained the mark: $out"
+        fail=$((fail+1))
+      fi
+      ;;
+  esac
+}
+
 expect() {
   local name="$1" want="$2"; shift 2
   local out rc t0 t1
@@ -74,6 +108,14 @@ expect() {
     pass=$((pass+1))
   fi
 }
+
+if [ "${GC_PAUSE_CHECK:-1}" = only ]; then
+  build_one gccollect
+  pause_check
+  echo "gc: $pass passed, $fail failed (the mark end pause alone)"
+  [ "$fail" -eq 0 ]
+  exit
+fi
 
 build_one gc
 expect mixed_roundtrip   "OK"
@@ -598,15 +640,6 @@ case "${WARMC_GC_STRESS:-0}${WARMC_GC_GROWTH:+g}" in
     ;;
 esac
 
-log_run() {
-  local case="$1" args="$2"; shift 2
-  ( unset WARMC_GC_STRESS WARMC_GC_GROWTH WARMC_GC_MIN_KB WARMC_GC_VERIFY \
-        WARMC_GC_RELOC WARMC_GC_RELOCATE_ALL WARMC_GC_LAB WARMC_GC_RELEASE \
-        WARMC_GC_HEAP_KB WARMC_GC_JITTER WARMC_GC_JITTER_SEED
-    wruntimeout env WARMC_GC_STATS=1 WARMC_GC_MIN_KB=64 \
-        "$@" sh -c 'exec "$0" "$1" $2' "$BIN" "$case" "$args" 2>&1 >/dev/null )
-}
-
 out=$(log_run satb_stall 8000)
 cycles=$(printf '%s' "$out" | sed -n 's/^gc: \([0-9]*\) cycles.*/\1/p')
 live=$(printf '%s' "$out" | sed -n 's/.*cycles, \([0-9]*\) bytes live.*/\1/p')
@@ -630,19 +663,8 @@ if [ "${WARMC_GC_STRESS:-0}" = 0 ]; then
   fi
 fi
 
-if [ "${WARMC_GC_STRESS:-0}" = 0 ]; then
-  out=$(log_run walk_no_alloc "60 20000")
-  wait=$(printf '%s' "$out" | sed -n 's/.*mark end, \([0-9]*\) taken waiting for it.*/\1/p')
-  case "$out" in
-    *"on a thread"*)
-      if [ -n "$wait" ] && [ "$wait" -gt 1000 ]; then
-        pass=$((pass+1))
-      else
-        echo "FAIL[gc] the mark end pause drained the mark: $out"
-        fail=$((fail+1))
-      fi
-      ;;
-  esac
+if [ "${WARMC_GC_STRESS:-0}" = 0 ] && [ "${GC_PAUSE_CHECK:-1}" = 1 ]; then
+  pause_check
 fi
 
 oom_err="$WORK/oom.$FTAG.$$"

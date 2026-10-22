@@ -75,27 +75,31 @@ case "$SRC" in
     python3 test/gen_bench.py || exit 1 ;;
 esac
 
-if [ "$(cat "$WASM.src" 2>/dev/null)" != "$SRC $SRCOPT" ]; then rm -f "$WASM"; fi
-if [ ! -s "$WASM" ] || [ "$SRC" -nt "$WASM" ]; then
+# The module is remade when its source or options change and the answers
+# when the module or the cases do, judged by content rather than by time: a
+# checkout makes every source newer than anything a cache kept of it, and
+# the answers are a wasm-interp run per case.
+SRCKEY="$SRC $SRCOPT $(cksum < "$SRC")"
+if [ ! -s "$WASM" ] || [ "$(cat "$WASM.src" 2>/dev/null)" != "$SRCKEY" ]; then
   case "$SRC" in
     *.wat) wat2wasm $WABT_FLAGS -o "$WASM" "$SRC" || exit 1 ;;
     *)     clang --target=wasm32 $SRCOPT -nostdlib -ffp-contract=off \
                  -Wl,--no-entry -Wl,--export-dynamic \
                  -o "$WASM" "$SRC" || exit 1 ;;
   esac
-  printf '%s %s\n' "$SRC" "$SRCOPT" > "$WASM.src"
+  printf '%s\n' "$SRCKEY" > "$WASM.src"
 fi
 
-CASES_NOW=$(printf '%s\n' "${CASES[@]}")
-if [ ! -s "$REF" ] || [ "$WASM" -nt "$REF" ] ||
-   [ "$CASES_NOW" != "$(cat "$REF.cases" 2>/dev/null)" ]; then
+CASES_NOW="$(printf '%s\n' "${CASES[@]}")
+$(cksum < "$WASM")"
+if [ ! -s "$REF" ] || [ "$CASES_NOW" != "$(cat "$REF.cases" 2>/dev/null)" ]; then
   : > "$REF"
   for c in "${CASES[@]}"; do
     set -- $c
     want=$(wasm-interp $WABT_FLAGS "$WASM" -r "$1" -a "i32:$2" 2>&1 | tail -1)
     echo "${want#*=> }" >> "$REF"
   done
-  printf '%s\n' "${CASES[@]}" > "$REF.cases"
+  printf '%s\n' "$CASES_NOW" > "$REF.cases"
 fi
 
 [ "$PREPARE" = --prepare ] && exit 0
