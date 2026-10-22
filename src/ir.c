@@ -443,6 +443,13 @@ static bool order_once(IrFunc *f, bool by_score, bool keep) {
 
   for (uint32_t i = 0; i < f->nblocks; i++) f->blocks[i].idom = REF_NONE;
   f->blocks[f->entry].idom = f->entry;
+  /* Every block a walk passes for one block's predecessors lies below the
+     dominator found so far, which only climbs, so a later walk that meets
+     one already has its answer.  Without the stamps a landing pad that
+     thousands of calls unwind to walked the dominator chain once for each
+     of them: Kotlin's main, nine tenths of its compile. */
+  uint32_t *stamp = xcalloc(f->nblocks ? f->nblocks : 1, sizeof(uint32_t));
+  uint32_t cur = 0;
   bool changed = true;
   while (changed) {
     changed = false;
@@ -450,20 +457,30 @@ static bool order_once(IrFunc *f, bool by_score, bool keep) {
       uint32_t bi = f->order[i];
       Block *b = &f->blocks[bi];
       uint32_t newidom = REF_NONE;
+      cur++;
       for (uint32_t p = 0; p < b->npreds; p++) {
         uint32_t pi = b->preds[p];
         if (f->blocks[pi].idom == REF_NONE) continue;
-        if (newidom == REF_NONE) { newidom = pi; continue; }
+        if (newidom == REF_NONE) { newidom = pi; stamp[pi] = cur; continue; }
         uint32_t x = pi, y = newidom;
         while (x != y) {
-          while (f->blocks[x].rpo > f->blocks[y].rpo) x = f->blocks[x].idom;
-          while (f->blocks[y].rpo > f->blocks[x].rpo) y = f->blocks[y].idom;
+          while (f->blocks[x].rpo > f->blocks[y].rpo) {
+            if (stamp[x] == cur) { x = y; break; }
+            stamp[x] = cur;
+            x = f->blocks[x].idom;
+          }
+          while (f->blocks[y].rpo > f->blocks[x].rpo) {
+            stamp[y] = cur;
+            y = f->blocks[y].idom;
+          }
         }
         newidom = x;
+        stamp[x] = cur;
       }
       if (newidom != REF_NONE && b->idom != newidom) { b->idom = newidom; changed = true; }
     }
   }
+  xfree(stamp);
   }
 
   for (uint32_t i = 0; i < f->nblocks; i++) {
