@@ -1926,6 +1926,9 @@ static void emit_inst(Isel *s, Ref v) {
       int size = (int)GCF_SIZE(in->imm2);
       uint32_t off = (uint32_t)in->imm;
       ValType t = (ValType)f->insts[a[1]].type;
+      /* The value is read before a far field's address goes into TMP0, as
+         in array.set. */
+      int y = rd(s, a[1], t == VT_V128 || vt_is_float(t) ? F0 : S1);
       bool scaled = (off >> size) <= 0xfff;
       int base = x;
       if (!scaled) {
@@ -1935,9 +1938,9 @@ static void emit_inst(Isel *s, Ref v) {
         off = 0;
       }
 
-      if (t == VT_V128) { int y = rd(s, a[1], F0); a64_str_q(B, y, base, off); }
-      else if (vt_is_float(t)) { int y = rd(s, a[1], F0); a64_fstr_imm(B, size, y, base, off); }
-      else { int y = rd(s, a[1], S1); a64_str_imm(B, size, y, base, off); }
+      if (t == VT_V128) a64_str_q(B, y, base, off);
+      else if (vt_is_float(t)) a64_fstr_imm(B, size, y, base, off);
+      else a64_str_imm(B, size, y, base, off);
       break;
     }
 
@@ -1993,6 +1996,14 @@ static void emit_inst(Isel *s, Ref v) {
         a64_cmp_reg(B, SF32, idx, TMP0);
         trap_if_cc(s, CC_HS, TRAP_ARRAY_OOB);
       }
+      /* A store's value is read before the element's address goes into
+         TMP0: reading a float or vector constant may build it there. */
+      int y = -1;
+      ValType yt = VT_I32;
+      if (in->op == I_ARRAY_SET) {
+        yt = (ValType)f->insts[a[2]].type;
+        y = rd(s, a[2], yt == VT_V128 || vt_is_float(yt) ? F0 : S2);
+      }
       uint32_t off = f->m->types[in->imm].hdr_size;
       a64_add_uxtw(B, TMP0, x, idx, size);
       if (in->op == I_ARRAY_GET) {
@@ -2009,10 +2020,9 @@ static void emit_inst(Isel *s, Ref v) {
           commit(s, v, d);
         }
       } else {
-        ValType t = (ValType)f->insts[a[2]].type;
-        if (t == VT_V128) { int y = rd(s, a[2], F0); a64_str_q(B, y, TMP0, off); }
-        else if (vt_is_float(t)) { int y = rd(s, a[2], F0); a64_fstr_imm(B, size, y, TMP0, off); }
-        else { int y = rd(s, a[2], S1); a64_str_imm(B, size, y, TMP0, off); }
+        if (yt == VT_V128) a64_str_q(B, y, TMP0, off);
+        else if (vt_is_float(yt)) a64_fstr_imm(B, size, y, TMP0, off);
+        else a64_str_imm(B, size, y, TMP0, off);
       }
       break;
     }

@@ -214,6 +214,8 @@ build_one gcgen
 expect wide_v128    "OK"
 expect wide_narrow  "OK"
 expect wide_distinct "OK"
+expect farpool_array "OK"
+expect farpool_field "OK"
 
 if [ "${WARMC_GC_STRESS:-0}" != 0 ]; then
   N=30; M=12; L=3

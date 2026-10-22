@@ -2451,6 +2451,14 @@ static void emit_inst(Isel *s, Ref v) {
         x64_cmp_rr(B, 0, idx, TMP0);
         trap_if_cc(s, XCC_AE, TRAP_ARRAY_OOB);
       }
+      /* A store's value is read before the element's address goes into
+         TMP0: reading a float or vector constant may build it there. */
+      int y = -1;
+      ValType yt = VT_I32;
+      if (in->op == I_ARRAY_SET) {
+        yt = (ValType)f->insts[a[2]].type;
+        y = rd(s, a[2], yt == VT_V128 || vt_is_float(yt) ? F0 : S2);
+      }
       int32_t off = (int32_t)f->m->types[in->imm].hdr_size;
       if (size <= 3) {
         x64_lea(B, 1, TMP0, TMP1, idx, size, 0);
@@ -2479,17 +2487,9 @@ static void emit_inst(Isel *s, Ref v) {
           commit(s, v, d);
         }
       } else {
-        ValType t = (ValType)f->insts[a[2]].type;
-        if (t == VT_V128) {
-          int y = rd(s, a[2], F0);
-          x64_vmovdqu_store(B, y, TMP0, X64_NOIDX, 0, off);
-        } else if (vt_is_float(t)) {
-          int y = rd(s, a[2], F0);
-          x64_vmovs_store(B, size == 3, y, TMP0, X64_NOIDX, 0, off);
-        } else {
-          int y = rd(s, a[2], S1);
-          gstore(B, size, y, TMP0, X64_NOIDX, 0, off);
-        }
+        if (yt == VT_V128) x64_vmovdqu_store(B, y, TMP0, X64_NOIDX, 0, off);
+        else if (vt_is_float(yt)) x64_vmovs_store(B, size == 3, y, TMP0, X64_NOIDX, 0, off);
+        else gstore(B, size, y, TMP0, X64_NOIDX, 0, off);
       }
       break;
     }
