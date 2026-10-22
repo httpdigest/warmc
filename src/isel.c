@@ -1545,8 +1545,12 @@ static void emit_prologue(Isel *s, Buf *b) {
       else    { if (ni <= 7) src = ni++; }
       if (src < 0) continue;
       int l = s->loc[e->params[i]];
-      if (l == LOC_NONE || IS_SLOT(l)) continue;
-      dst[nd] = l; src_of[nd] = src; nd++;
+      if (l == LOC_NONE) continue;
+      /* A param bound for a spill slot is stored from its register where
+         the loop below meets it, so it is a reader too: a move ahead of
+         it that writes that register is a clash, and the moves then wait
+         for the parallel copy, after every store. */
+      dst[nd] = IS_SLOT(l) ? -1 : l; src_of[nd] = src; nd++;
       (void)fp;
     }
 
