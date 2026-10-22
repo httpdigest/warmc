@@ -274,14 +274,17 @@ static bool callee_calls_are_cold(IrFunc *g) {
 /* Returning calls the caller will actually cross: reachable, warm, not on a
    panic path. The old gate's trap-block exemption widens to diverging
    blocks, the same cold-path discount CSA prices with. */
-static uint32_t warm_returning_calls(IrFunc *g) {
+static uint32_t warm_returning_calls(IrFunc *g, uint32_t *in_loop) {
   uint32_t n = 0;
+  *in_loop = 0;
   for (uint32_t bi = 0; bi < g->nblocks; bi++) {
     Block *b = &g->blocks[bi];
     if (!b->reachable || b->term == T_TRAP || b->diverges) continue;
     for (uint32_t i = 0; i < b->ninsts; i++) {
       uint16_t op = g->insts[b->insts[i]].op;
       if (op == I_CALL || op == I_CALL_INDIRECT || op == I_CALL_REF) n++;
+      if ((op == I_CALL_INDIRECT || op == I_CALL_REF) && b->loop_depth)
+        (*in_loop)++;
     }
   }
   return n;
@@ -583,6 +586,8 @@ typedef struct {
   uint8_t verdict;
   IrFunc *plain, *split;
   uint32_t ninsts, eparams, retcalls;
+  /* the indirect ones among them that sit in a loop of the callee */
+  uint32_t loopcalls;
   /* What the callee does with each reference parameter, bit p for p:
      keeps it to itself (no call, store, return or global sees it), lets it
      out by anything but a direct call or a return, returns it, or
@@ -641,7 +646,8 @@ static IrFunc *inl_callee(IrFunc *f, const OptOpts *o, InlMemo *memo,
     e->verdict = 2;
     IrFunc *g = ir_build(m, fidx, o);
     inl_summarize(e, g);
-    uint32_t r = warm_returning_calls(g);
+    uint32_t lc;
+    uint32_t r = warm_returning_calls(g, &lc);
     if (has_tail_call(g)) {
       g_stats.inl_rej_tailcall++;
       inl_dbg(f, fidx, bi, "tail call");
@@ -665,6 +671,7 @@ static IrFunc *inl_callee(IrFunc *f, const OptOpts *o, InlMemo *memo,
       e->ninsts = g->ninsts;
       e->eparams = g->blocks[g->entry].nparams;
       e->retcalls = r;
+      e->loopcalls = lc;
     }
   }
   if (e->verdict != 1) return NULL;
@@ -854,9 +861,20 @@ static bool inl_score_site(IrFunc *f, const OptOpts *o, InlMemo *memo,
      CSA's save/restore there, doubled in loops where those frame ops are
      loop-priced. In a loop, only take the crossing when something says
      this site is special -- a dying body, a folding argument, a callee
-     that touches nothing. */
+     that touches nothing.
+
+     A dying body says nothing about a callee whose own loop makes an
+     indirect call.  There every value the caller holds across the site
+     has to sit in a callee-saved register or in memory for the whole
+     loop, next to the loop's own call-crossing values, and the excess is
+     reloaded on every trip; out of line, the callee's prologue saves
+     them once a call.  What inlining saves is one call per run of the
+     loop, which the trips amortise to nothing -- a dispatch loop over a
+     table of method thunks ran 20% more instructions merged into its
+     caller's loop. */
   if (e->retcalls) {
-    if (b->loop_depth >= 1 && !once && nconst == 0 && !fonly && !escape) {
+    bool dies = once && !e->loopcalls;
+    if (b->loop_depth >= 1 && !dies && nconst == 0 && !fonly && !escape) {
       g_stats.inl_rej_retcalls++;
       inl_dbg(f, fidx, bi, "retcall in loop without evidence");
       return false;

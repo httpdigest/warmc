@@ -58,6 +58,7 @@ void a64_sub_reg_lsl(Buf *b, int sf, int rd, int rn, int rm, int shift);
 
 void a64_add_uxtw(Buf *b, int rd, int rn, int rm, int shift);
 
+void a64_addsub_extw(Buf *b, int sub, int rd, int rn, int rm, int sxtw, int shift);
 void a64_add_extx(Buf *b, int rd, int rn, int rm, int shift);
 void a64_cmp_uxtw(Buf *b, int rn, int rm, int shift);
 void a64_neg(Buf *b, int sf, int rd, int rm);
@@ -84,6 +85,7 @@ void a64_and_imm(Buf *b, int sf, int rd, int rn, uint32_t encoding);
 void a64_orr_imm(Buf *b, int sf, int rd, int rn, uint32_t encoding);
 void a64_eor_imm(Buf *b, int sf, int rd, int rn, uint32_t encoding);
 void a64_ror_imm(Buf *b, int sf, int rd, int rn, int shift);
+void a64_extr(Buf *b, int sf, int rd, int rn, int rm, int lsb);
 void a64_mvn(Buf *b, int sf, int rd, int rm);
 void a64_bic_reg(Buf *b, int sf, int rd, int rn, int rm);
 void a64_orn_reg(Buf *b, int sf, int rd, int rn, int rm);
@@ -234,6 +236,7 @@ void a64_vcmhs(Buf *b, int size, int rd, int rn, int rm);
 void a64_vbsl(Buf *b, int rd, int rn, int rm);
 void a64_vshl_imm(Buf *b, int size, int rd, int rn, int shift);
 void a64_vushr_imm(Buf *b, int size, int rd, int rn, int shift);
+void a64_vsli_imm(Buf *b, int size, int rd, int rn, int shift);
 void a64_vsshr_imm(Buf *b, int size, int rd, int rn, int shift);
 
 void a64_vushl_reg(Buf *b, int size, int rd, int rn, int rm);
@@ -281,6 +284,8 @@ void a64_vsmull(Buf *b, int q, int size, int rd, int rn, int rm);
 void a64_vumull(Buf *b, int q, int size, int rd, int rn, int rm);
 void a64_vumlal(Buf *b, int q, int size, int rd, int rn, int rm);
 void a64_vrev64(Buf *b, int size, int rd, int rn);
+void a64_vrev32(Buf *b, int size, int rd, int rn);
+void a64_vrev16(Buf *b, int rd, int rn);
 void a64_vxtn(Buf *b, int q, int size, int rd, int rn);
 
 void a64_vfadd(Buf *b, int sz, int rd, int rn, int rm);

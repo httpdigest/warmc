@@ -97,6 +97,12 @@ static int isel_cs_index(int r) {
    one before the parameter copy. */
 static int isel_break_reg(int bank) { return bank ? F2 : TMP1; }
 
+/* RSI and RDI hold the instance and memory base in every function. */
+static int isel_spare_gprs(Isel *s, int *out) {
+  (void)s; (void)out;
+  return 0;
+}
+
 static bool isel_fp_remat_ok(Isel *s, const Inst *in) {
   (void)in;
   return s->pool_ok;   /* one RIP-relative pool load */
@@ -105,6 +111,7 @@ static bool isel_fp_remat_ok(Isel *s, const Inst *in) {
 #define RA_HAVE_RETAREA_REUSE 0
 #define RA_RETAREA_REG 0
 #define RA_ALLOC_RES_REG X_RAX
+#define RA_HAVE_PIECES 0
 
 static const int ARG_GPR[4] = { X_RCX, X_RDX, X_R8, X_R9 };
 
@@ -824,8 +831,6 @@ static void analyse_immediates(Isel *s) {
     s->remat2_w = rw ? atof(rw) : 0.5;
     const char *rs = getenv("WARMC_REMAT2_SEG");
     s->remat2_seg = rs ? atof(rs) : 2.0;
-    const char *rc2 = getenv("WARMC_REMAT2_WCAP");
-    s->remat2_wcap = rc2 ? atof(rc2) : 10000.0;
     s->remat_glob = !getenv("WARMC_NO_REMAT_GLOBAL");
   }
   s->no_remat = xcalloc(n ? n : 1, 1);
@@ -1215,6 +1220,13 @@ static void emit_epilogue(Isel *s) {
 
 static void regalloc_naive(Isel *s);
 static void regalloc_linear(Isel *s);
+
+/* Instructions the prologue and epilogue spend on the callee-saved
+   registers used so far: a push and a pop each. */
+static int ra_cs_frame_ops(Isel *s) {
+  int list[NCS_GPR + 1];
+  return 2 * cs_gpr_list(s, list);
+}
 
 #include "regalloc.inc"
 

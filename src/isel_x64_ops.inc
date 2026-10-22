@@ -906,7 +906,7 @@ static void emit_inst(Isel *s, Ref v) {
       x64_setcc(B, cc, d);
       x64_movzx8(B, 0, d, d);
       commit(s, v, d);
-      s->cmp_ref = v; s->cmp_cc = cc; s->cmp_len = B->len;
+      s->cmp_ref = v; s->cmp_cc = cc; s->cmp_epoch = B->flags_epoch;
       break;
     }
 
@@ -1041,7 +1041,7 @@ static void emit_inst(Isel *s, Ref v) {
       int fp = is_fp_value(f, v);
       int cc = XCC_NE;
       bool folded_cond = s->folded && s->folded[a[2]];
-      bool flags_live = s->cmp_ref == a[2] && s->cmp_len == B->len;
+      bool flags_live = s->cmp_ref == a[2] && s->cmp_epoch == B->flags_epoch;
       if (folded_cond) {
         emit_compare(s, a[2]);
         uint16_t cop = f->insts[a[2]].op;
@@ -1052,10 +1052,11 @@ static void emit_inst(Isel *s, Ref v) {
         } else {
           cc = cond_of(s, a[2]);
         }
+      } else if (flags_live) {
+        cc = s->cmp_cc;
       } else {
         int c = rd(s, a[2], TMP1);
-        if (flags_live) cc = s->cmp_cc;
-        else x64_test_rr(B, 0, c, c);
+        x64_test_rr(B, 0, c, c);
       }
       if (fp) {
         int x = rd(s, a[0], F0), y = rd(s, a[1], F1);
@@ -2521,62 +2522,65 @@ static void emit_inst(Isel *s, Ref v) {
     }
 
     case I_REF_TEST: {
-      /* Same slot-id fast path as the a64 backend: equality answers yes
-         inline, anything else asks warmc_ref_test. */
+      /* Same slot fast path as the a64 backend: this module's objects
+         answer inline from their slot (rtest_slots), another module's ask
+         warmc_ref_test. */
       size_t to_end[3];
       int nend = 0;
+      int d = wr(s, v, S1);
+      uint32_t lo, hi, nslots;
+      bool exact;
       if ((RTEST_KIND(in->imm) & ~RTK_NULLABLE) == RTK_CONCRETE_ANY &&
-          !getenv("WARMC_NO_RTEST_FAST")) {
-        uint32_t slot_id = 0;
-        bool found = false;
-        uint32_t depth = RTEST_DEPTH(in->imm);
-        for (uint32_t i = 0; i < f->m->ntypes && !found; i++) {
-          const CompType *t = &f->m->types[i];
-          if (t->kind != CT_STRUCT && t->kind != CT_ARRAY) continue;
-          if (t->depth < depth || !t->display) continue;
-          if (t->display[depth] != in->imm2) continue;
-          slot_id = gctype_slot(f->m, i);
-          found = true;
-        }
-        if (found && slot_id < 0x1000) {
-          int x = rd(s, a[0], S0);
-          int d = wr(s, v, S1);
-          bool nullable = (RTEST_KIND(in->imm) & RTK_NULLABLE) != 0;
-          uint32_t tmask = (1u << (30 - GC_TYPE_SHIFT)) - 1u;
+          !getenv("WARMC_NO_RTEST_FAST") &&
+          rtest_slots(f->m, in->imm, in->imm2, &lo, &hi, &exact, &nslots)) {
+        int x = rd(s, a[0], S0);
+        bool nullable = (RTEST_KIND(in->imm) & RTK_NULLABLE) != 0;
+        uint32_t tmask = (1u << (30 - GC_TYPE_SHIFT)) - 1u;
+        size_t to_slow = 0;
 
-          x64_test_rr(B, 1, x, x);
-          x64_jcc_rel32(B, XCC_E);
-          size_t to_null = B->len;
-          x64_test_ri(B, 1, x, 3);
-          x64_jcc_rel32(B, XCC_NE);
-          size_t to_i31 = B->len;
-          emit_gc_canon(s, TMP0, x);
-          x64_load32(B, TMP0, TMP0, X64_NOIDX, 0, GC_HDR_WORD_OFF);
-          x64_load32(B, TMP1, REG_VMCTX, X64_NOIDX, 0, VMCTX_GC_HDR);
-          x64_shr_ri(B, 0, TMP0, GC_TYPE_SHIFT);
-          x64_and_ri(B, 0, TMP0, (int32_t)tmask);
-          x64_shr_ri(B, 0, TMP1, GC_TYPE_SHIFT);
-          x64_and_ri(B, 0, TMP1, (int32_t)tmask);
-          x64_add_ri(B, 0, TMP1, (int32_t)slot_id);
-          x64_cmp_rr(B, 0, TMP0, TMP1);
-          x64_jcc_rel32(B, XCC_NE);
-          size_t to_slow = B->len;
-          x64_mov_ri(B, 0, d, 1);
-          commit(s, v, d);
-          x64_jmp_rel32(B);
-          to_end[nend++] = B->len;
-          br_patch(s, to_null, B->len);
-          x64_mov_ri(B, 0, d, nullable ? 1 : 0);
-          commit(s, v, d);
-          x64_jmp_rel32(B);
-          to_end[nend++] = B->len;
-          br_patch(s, to_i31, B->len);
-          x64_mov_ri(B, 0, d, 0);
-          commit(s, v, d);
-          x64_jmp_rel32(B);
-          to_end[nend++] = B->len;
-          br_patch(s, to_slow, B->len);
+        x64_test_rr(B, 1, x, x);
+        x64_jcc_rel32(B, XCC_E);
+        size_t to_null = B->len;
+        x64_test_ri(B, 1, x, 3);
+        x64_jcc_rel32(B, XCC_NE);
+        size_t to_i31 = B->len;
+        emit_gc_canon(s, TMP0, x);
+        x64_load32(B, TMP0, TMP0, X64_NOIDX, 0, GC_HDR_WORD_OFF);
+        x64_load32(B, TMP1, REG_VMCTX, X64_NOIDX, 0, VMCTX_GC_HDR);
+        x64_shr_ri(B, 0, TMP0, GC_TYPE_SHIFT);
+        x64_and_ri(B, 0, TMP0, (int32_t)tmask);
+        x64_shr_ri(B, 0, TMP1, GC_TYPE_SHIFT);
+        x64_and_ri(B, 0, TMP1, (int32_t)tmask);
+        /* the slot, if the object is ours */
+        x64_sub_rr(B, 0, TMP0, TMP1);
+        if (exact) {
+          x64_cmp_ri(B, 0, TMP0, (int32_t)nslots);
+          x64_jcc_rel32(B, XCC_AE);
+          to_slow = B->len;
         }
+        if (lo <= hi) {
+          if (lo != hi && lo) x64_sub_ri(B, 0, TMP0, (int32_t)lo);
+          x64_cmp_ri(B, 0, TMP0, (int32_t)(lo == hi ? lo : hi - lo));
+          if (exact) {
+            x64_setcc(B, lo == hi ? XCC_E : XCC_BE, d);
+            x64_movzx8(B, 0, d, d);
+          } else {
+            x64_jcc_rel32(B, lo == hi ? XCC_NE : XCC_A);
+            to_slow = B->len;
+            x64_mov_ri(B, 0, d, 1);
+          }
+          x64_jmp_rel32(B);
+          to_end[nend++] = B->len;
+        }
+        br_patch(s, to_i31, B->len);
+        x64_mov_ri(B, 0, d, 0);
+        x64_jmp_rel32(B);
+        to_end[nend++] = B->len;
+        br_patch(s, to_null, B->len);
+        x64_mov_ri(B, 0, d, nullable ? 1 : 0);
+        x64_jmp_rel32(B);
+        to_end[nend++] = B->len;
+        if (to_slow) br_patch(s, to_slow, B->len);
       }
       csa_save(s, v);
       emit_call_args_core(s, a, 1, 0, 1, true, true);
@@ -2585,9 +2589,10 @@ static void emit_inst(Isel *s, Ref v) {
       helper_imm_at(s, 4, RTEST_DEPTH(in->imm));
       emit_call_sym(s, "warmc_ref_test");
       s->mem_valid = false;
-      commit(s, v, X_RAX);
+      if (d != X_RAX) x64_mov_rr(B, 0, d, X_RAX);
       csa_restore(s, v);
       for (int e = 0; e < nend; e++) br_patch(s, to_end[e], B->len);
+      commit(s, v, d);
       break;
     }
 
@@ -2675,7 +2680,6 @@ static void emit_block(Isel *s, uint32_t bi, uint32_t next_bi) {
     s->at_eh_site = eh && i + 1 == b->ninsts;
     if (s->at_eh_site) emit_eh_stores(s, bi);
     emit_inst(s, b->insts[i]);
-    if (s->cmp_ref != b->insts[i]) s->cmp_ref = REF_NONE;
   }
   s->at_eh_site = false;
 
@@ -2764,11 +2768,17 @@ static void emit_block(Isel *s, uint32_t bi, uint32_t next_bi) {
       bool tmoves = tn != 0, emoves = en != 0;
 
       bool invert = false;
-      if (!tmoves && !emoves && t->target == next_bi && e->target != next_bi) {
-        Edge *tmp = t; t = e; e = tmp;
+      if (!tmoves && !emoves && t->target == next_bi && e->target != next_bi)
         invert = true;
-      }
+      /* Neither side falls through: give the conditional jump, the only one
+         that costs a single branch, to the likelier side (see the arm64
+         emit_block). */
+      else if (!tmoves && !emoves && t->target != next_bi &&
+               e->target != next_bi &&
+               ir_succ_score(f, b, 1) > ir_succ_score(f, b, 0))
+        invert = true;
       if (invert) {
+        Edge *tmp = t; t = e; e = tmp;
         if (kind == 0) cc = xcc_invert(cc);
         else kind = (kind == 1) ? 2 : 1;
         Move *mtmp = tm; tm = em; em = mtmp;

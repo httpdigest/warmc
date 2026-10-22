@@ -35,7 +35,7 @@ static const int FPR_ALLOC[] = { 0, 1, 2, 3, 4, 5, 6, 7,
 #define NGPR_ALLOC ((int)(sizeof GPR_ALLOC / sizeof GPR_ALLOC[0]))
 #define NFPR_ALLOC ((int)(sizeof FPR_ALLOC / sizeof FPR_ALLOC[0]))
 
-static bool gpr_is_callee_saved(int r) { return r >= R21 && r <= R28; }
+static bool gpr_is_callee_saved(int r) { return r >= R19 && r <= R30; }
 static bool fpr_is_callee_saved(int r) { return r >= 8 && r <= 15; }
 
 #include "isel_core.inc"
@@ -65,6 +65,35 @@ static int isel_cs_index(int r) {
 
 static int isel_break_reg(int bank) { return bank ? F3 : TMP1; }
 
+/* x19 and x20 hold the instance and memory base, but a leaf moves those to
+   x9 and x10, where they need no save, and a function that touches neither
+   never loads them.  Whichever of the two is then idle is a callee-saved
+   register like x22-x28, which the allocator falls back on before it spills
+   a value read in a loop (regalloc_linear): one save and restore per call,
+   against a reload on every iteration.  BLAKE3's compressPre carries its
+   sixteen state words, a round counter and a base round a loop, and spilled
+   a temporary at almost every step of it.  The stack check of a function
+   with a call reads the instance from x19 whether or not the body does, so
+   x19 stays put there. */
+static int isel_spare_gprs(Isel *s, int *out) {
+  int n = 0;
+  if (s->vmctx_reg != R19 || (!s->needs_vmctx && !s->has_call)) out[n++] = R19;
+  if (s->membase_reg != R20 || !s->needs_mem) out[n++] = R20;
+  /* Without a call x29 and x30 are two more: x30 is read only by the ret,
+     after the epilogue has restored it, and the frame record x29 would
+     point to is one this code never builds -- a function with calls uses
+     the pair as its reload cache instead.  Saving them costs the same one
+     stp and ldp as any other pair. */
+  if (!s->has_call) { out[n++] = R29; out[n++] = R30; }
+  return n;
+}
+
+/* Whether the frame saves x29 and x30: for the calls, or because a leaf
+   allocated them. */
+static bool saves_lr(const Isel *s) {
+  return s->has_call || (s->used_gpr_cs & (1u << R29 | 1u << R30)) != 0;
+}
+
 static bool isel_fp_remat_ok(Isel *s, const Inst *in) {
   uint32_t imm8;
   return a64_fmov_imm(in->imm, vt_is_64((ValType)in->type) ? FT_D : FT_S,
@@ -75,6 +104,7 @@ static bool isel_fp_remat_ok(Isel *s, const Inst *in) {
 #define RA_HAVE_RETAREA_REUSE 1
 #define RA_RETAREA_REG R8
 #define RA_ALLOC_RES_REG R0
+#define RA_HAVE_PIECES 1
 
 #define A64_IDX_UXTW 2
 #define A64_IDX_LSL  3
@@ -93,7 +123,22 @@ static void pool_load(Isel *s, int ft, int fr, uint64_t bits);
 static int vmctx_at(Isel *s, uint32_t off, int size, uint32_t *disp,
                     int scratch);
 
+/* The register a use-cluster piece holds v in at the current instruction, or
+   -1.  Pieces are live only while the instruction loop of emit_block runs:
+   a terminator reads after the last piece has ended. */
+static int piece_reg(Isel *s, Ref v) {
+  if (!s->pc_live || !s->pc_head) return -1;
+  for (int32_t k = s->pc_head[v]; k >= 0; k = s->pc_next[k]) {
+    const struct Piece *p = &s->pc[k];
+    if (p->block == s->cur_block && p->lo <= s->cur_pos && s->cur_pos <= p->hi)
+      return p->reg;
+  }
+  return -1;
+}
+
 static int rd(Isel *s, Ref v, int scratch) {
+  int pr = piece_reg(s, v);
+  if (pr >= 0) return pr;
   int l = s->loc[v];
   if (l == LOC_NONE) {
     Inst *in = &s->f->insts[v];
@@ -128,12 +173,43 @@ static int rd(Isel *s, Ref v, int scratch) {
         a64_fmov_from_gpr(B, is64(s->f, v) ? SF64 : SF32, ft, scratch, TMP0);
       }
     } else {
-      a64_load_imm(B, is64(s->f, v) ? SF64 : SF32, scratch, in->imm);
+      /* A constant that takes a movz/movk chain is built once per stretch
+         the reload cache lives, into one of its registers, and read from
+         there after: the allocator keeps such constants out of slots, which
+         cost a chain and a store wherever LICM had put the def -- at the
+         entry of musl's printf_core, forty of them on every call. */
+      bool wide = is64(s->f, v);
+      if (s->rc_reg[0] && !s->rc_noconst && ir_const_cost(in->imm, wide) > 1) {
+        uint32_t key = RC_CONST | v;
+        for (int i = 0; i < 2; i++)
+          if (s->rc_slot[i] == key) { s->rc_used[i] = 1; return s->rc_reg[i]; }
+        int pick = -1;
+        for (int i = 0; i < 2 && pick < 0; i++)
+          if (!s->rc_slot[i] && !s->rc_used[i]) pick = i;
+        for (int k = 0; k < 2 && pick < 0; k++) {
+          int i = (s->rc_next + k) & 1;
+          if (!s->rc_used[i]) pick = i;
+        }
+        if (pick >= 0) {
+          a64_load_imm(B, wide ? SF64 : SF32, s->rc_reg[pick], in->imm);
+          s->rc_slot[pick] = key;
+          s->rc_used[pick] = 1;
+          s->rc_next = (uint8_t)((pick + 1) & 1);
+          return s->rc_reg[pick];
+        }
+      }
+      a64_load_imm(B, wide ? SF64 : SF32, scratch, in->imm);
     }
     return scratch;
   }
   if (!IS_SLOT(l)) return l;
   uint32_t sl = SLOT_OF(l);
+  /* Read by the very next instruction after its definition stored it: the
+     register it was stored from still has it.  A move is cheaper than the
+     reload, which waits on the store it reads back; nothing at all is
+     needed when that register is this scratch, as it often is.  Where the
+     reload cache takes the value, the move fills the cache instead. */
+  bool fwd = s->st_v == v && s->st_end == B->len;
   if (s->rc_reg[0] && !is_fp_value(s->f, v) && !is_vec_value(s->f, v)) {
     for (int i = 0; i < 2; i++)
       if (s->rc_reg[i] && s->rc_slot[i] == sl + 1) {
@@ -149,8 +225,12 @@ static int rd(Isel *s, Ref v, int scratch) {
       if (s->rc_reg[i] && !s->rc_used[i]) pick = i;
     }
     if (pick >= 0) {
-      slot_load(B, 0, 0, s->rc_reg[pick], slot_off(s, sl));
-      g_stats.reloads++;
+      if (fwd) {
+        emit_reg_move(B, s->rc_reg[pick], s->st_reg, 0, 1, 0);
+      } else {
+        slot_load(B, 0, 0, s->rc_reg[pick], slot_off(s, sl));
+        g_stats.reloads++;
+      }
       s->rc_slot[pick] = sl + 1;
       s->rc_used[pick] = 1;
       s->rc_next = (uint8_t)((pick + 1) & 1);
@@ -164,10 +244,46 @@ static int rd(Isel *s, Ref v, int scratch) {
         return s->frc_reg[i];
       }
   }
+  if (fwd) {
+    if (s->st_reg != scratch)
+      emit_reg_move(B, scratch, s->st_reg, is_fp_value(s->f, v), 1,
+                    is_vec_value(s->f, v));
+    return scratch;
+  }
   slot_load(B, is_fp_value(s->f, v), is_vec_value(s->f, v), scratch,
             slot_off(s, SLOT_OF(l)));
   g_stats.reloads++;
   return scratch;
+}
+
+/* Fill a piece's register before the first read of its cluster: from the
+   reload cache when it holds the slot (the value was just stored, and a load
+   would wait for that store), else from the slot, else by rematerialising. */
+static void piece_fill(Isel *s, const struct Piece *p) {
+  Ref v = p->v;
+  int l = s->loc[v];
+  bool fp = is_fp_value(s->f, v), vec = is_vec_value(s->f, v);
+  if (IS_SLOT(l)) {
+    uint32_t sl = SLOT_OF(l);
+    for (int i = 0; i < 2 && !fp; i++)
+      if (s->rc_reg[i] && s->rc_slot[i] == sl + 1) {
+        emit_reg_move(B, p->reg, s->rc_reg[i], 0, 1, 0);
+        return;
+      }
+    for (int i = 0; i < 2 && fp && !vec; i++)
+      if (s->frc_reg[i] && s->frc_slot[i] == sl + 1) {
+        emit_reg_move(B, p->reg, s->frc_reg[i], 1, 1, 0);
+        return;
+      }
+    slot_load(B, fp, vec, p->reg, slot_off(s, sl));
+    g_stats.reloads++;
+    return;
+  }
+  bool live = s->pc_live;
+  s->pc_live = false;
+  int r = rd(s, v, p->reg);
+  s->pc_live = live;
+  if (r != p->reg) emit_reg_move(B, p->reg, r, fp, is64(s->f, v), vec);
 }
 
 static void reload_size(Isel *s) {
@@ -201,13 +317,21 @@ static size_t br_cc(Isel *s, int kind, int cc, int zsf, int zreg) {
   return at;
 }
 
+/* A label bound right after a spill store is a join: the paths arriving
+   there stored the value from registers of their own. */
+static void label_at(Isel *s, size_t target) {
+  if (target == s->st_end) s->st_end = (size_t)-1;
+}
+
 static void patch_b26_checked(Isel *s, size_t site, size_t target) {
+  label_at(s, target);
   if (a64_patch_b26_ok(B, site, target)) return;
   warmc_fatal("function %u compiles to %zu bytes of code, past the range a "
               "branch can reach", s->f->func_index, B->len);
 }
 
 static void br_patch(Isel *s, size_t site, size_t target) {
+  label_at(s, target);
   if (s->far_br) { patch_b26_checked(s, site, target); return; }
   if (!a64_patch_b19_ok(B, site, target)) s->far_br_needed = true;
 }
@@ -246,6 +370,17 @@ static void trap_if_cc(Isel *s, int cond, int code) {
 static void trap_if_zero(Isel *s, int sf, int reg, int code) {
   size_t site = br_cc(s, 1, 0, sf, reg);
   trap_defer(s, site, !s->far_br, code);
+}
+
+/* cmp w<reg>, #imm for a ref.test's slot numbers, which a module with more
+   types than an imm12 holds can exceed */
+static void rtest_cmp_imm(Isel *s, int reg, uint32_t imm) {
+  if (imm <= 0xfffu) {
+    a64_cmp_imm(B, SF32, reg, imm);
+  } else {
+    a64_load_imm(B, SF32, TMP0, imm);
+    a64_cmp_reg(B, SF32, reg, TMP0);
+  }
 }
 
 static int emit_gc_load_barrier_pre(Isel *s, int dst, int base) {
@@ -356,8 +491,12 @@ static void emit_call_args_core(Isel *s, const Ref *args, uint32_t nargs,
   parallel_copy(s, mv, nmv);
 
   /* A rematerialised argument has no location to move from: it is made in
-     its own register, once every move has read the register it lands in. */
-  for (int k = 0; k < nlate; k++) rd(s, late[k], late_dst[k]);
+     its own register, once every move has read the register it lands in --
+     or copied there, when the reload cache already holds it. */
+  for (int k = 0; k < nlate; k++) {
+    int r = rd(s, late[k], late_dst[k]);
+    if (r != late_dst[k]) a64_mov_reg(B, SF64, late_dst[k], r);
+  }
 }
 
 static void emit_call_args_to(Isel *s, const Ref *args, uint32_t nargs,
@@ -925,6 +1064,40 @@ static bool small_loop(IrFunc *f, uint32_t h) {
   return ok && n <= SMALL_LOOP_INSTS;
 }
 
+/* The least padding after offset `at` that starts a loop of `span` bytes on
+   an `align` boundary (16 or 32) and keeps it inside one 64-byte fetch
+   block; just the alignment for a loop longer than a block. */
+static uint32_t fit_pad(uint32_t at, uint32_t span, uint32_t align) {
+  uint32_t p = (align - (at & (align - 1))) & (align - 1);
+  if (span <= 64)
+    while (((at + p) & 63) + span > 64) p += align;
+  return p;
+}
+
+/* The bytes the loop headed by h took, h at order index oi: its blocks laid
+   out in a row from h on, up to the end of the last of them. */
+static uint32_t loop_span(Isel *s, uint32_t h, uint32_t oi, const uint32_t *blk_end) {
+  IrFunc *f = s->f;
+  uint32_t nb = f->nblocks, sp = 0;
+  uint8_t *in = xcalloc(nb ? nb : 1, 1);
+  uint32_t *stk = xmalloc((nb ? nb : 1) * sizeof(uint32_t));
+  Block *hb = &f->blocks[h];
+  in[h] = 1;
+  for (uint32_t p = 0; p < hb->npreds; p++) {
+    uint32_t l = hb->preds[p];
+    if (f->blocks[l].rpo >= hb->rpo && !in[l]) { in[l] = 1; stk[sp++] = l; }
+  }
+  while (sp) {
+    Block *xb = &f->blocks[stk[--sp]];
+    for (uint32_t p = 0; p < xb->npreds; p++)
+      if (!in[xb->preds[p]]) { in[xb->preds[p]] = 1; stk[sp++] = xb->preds[p]; }
+  }
+  uint32_t last = h;
+  for (uint32_t j = oi; j < f->norder && in[f->order[j]]; j++) last = f->order[j];
+  xfree(in); xfree(stk);
+  return blk_end[last] - s->block_off[h];
+}
+
 static void emit_teardown(Isel *s);
 static void emit_epilogue(Isel *s);
 static void emit_block(Isel *s, uint32_t bi, uint32_t next_bi);
@@ -1036,6 +1209,22 @@ static int shift_fuse_amount(IrFunc *f, Ref v, ValType t) {
   return (int)(sh % (uint64_t)width);
 }
 
+/* A vector shift left (or logical right) by a constant: its source, lane
+   size and amount, the amount taken modulo the lane width as wasm does. */
+static bool vshift_const(IrFunc *f, Ref v, bool left, Ref *src, int *sz,
+                         int *k) {
+  Inst *in = &f->insts[v];
+  uint64_t amt;
+  if (in->op == (left ? I_VSHL : I_VSHRU)) amt = in->imm;
+  else if (in->op != (left ? I_VSHLV : I_VSHRUV) ||
+           !const_arg(f, ir_args(f, v)[1], &amt))
+    return false;
+  *sz = VLANE_SIZE(in->imm2);
+  *k = (int)(amt % (uint64_t)(8 << *sz));
+  *src = ir_args(f, v)[0];
+  return true;
+}
+
 static void analyse_immediates(Isel *s) {
   IrFunc *f = s->f;
   uint32_t n = f->ninsts;
@@ -1066,8 +1255,6 @@ static void analyse_immediates(Isel *s) {
     s->remat2_w = rw ? atof(rw) : 0.5;
     const char *rs = getenv("WARMC_REMAT2_SEG");
     s->remat2_seg = rs ? atof(rs) : 2.0;
-    const char *rc2 = getenv("WARMC_REMAT2_WCAP");
-    s->remat2_wcap = rc2 ? atof(rc2) : 10000.0;
     s->remat_glob = !getenv("WARMC_NO_REMAT_GLOBAL");
   }
   s->no_remat = xcalloc(n ? n : 1, 1);
@@ -1138,6 +1325,14 @@ static void analyse_immediates(Isel *s) {
       Ref *a = ir_args(f, u);
       for (uint32_t j = 0; j < in->nargs; j++)
         if (j != 0 || (in->op != I_LOAD && in->op != I_STORE)) addr_only[a[j]] = 0;
+      /* an offset each access of a shared address can scale */
+      if ((in->op == I_LOAD || in->op == I_STORE) && in->nargs &&
+          f->insts[a[0]].op == I_MEM_ADDR) {
+        uint64_t off = f->insts[a[0]].imm;
+        uint32_t size = (uint32_t)MEMF_SIZE(in->imm2);
+        if (off && ((off & ((1u << size) - 1)) != 0 || (off >> size) > 0xfff))
+          addr_only[a[0]] = 0;
+      }
     }
   }
   for (uint32_t oi = 0; oi < f->norder; oi++) {
@@ -1149,8 +1344,14 @@ static void analyse_immediates(Isel *s) {
       Ref ea = ir_args(f, u)[0];
       if (f->insts[ea].op != I_MEM_ADDR || f->insts[ea].nargs != 1) continue;
       if (blocked[ea]) continue;
+      /* Shared by accesses only, an address folds into each of them: with no
+         offset that is free, and with one it costs an add per access where a
+         register would cost one add for both -- the same for two accesses, a
+         load and the store back to the same place, so there it is folded
+         too, rather than held in a register from the one to the other. */
       if (uses[ea] != 1 &&
-          !(f->insts[ea].imm == 0 && addr_only[ea])) continue;
+          !(addr_only[ea] && (f->insts[ea].imm == 0 || uses[ea] <= 2)))
+        continue;
       uint64_t off = f->insts[ea].imm;
       uint32_t size = (uint32_t)MEMF_SIZE(in->imm2);
 
@@ -1254,6 +1455,45 @@ static void analyse_immediates(Isel *s) {
     }
   }
 
+  /* (x << k) | (y >> (width - k)) is the low half of x:y shifted right by
+     width - k, one extr.  The two shifts' bits never overlap, so xor is the
+     same.  Unrolled multi-word shifts are made of exactly this: each word of
+     a bitset or a big integer shifted by one bit takes its neighbour's top
+     bit. */
+  s->extr = xcalloc(n ? n : 1, 1);
+  for (uint32_t oi = 0; oi < f->norder; oi++) {
+    uint32_t bi = f->order[oi];
+    Block *b = &f->blocks[bi];
+    for (uint32_t i = 0; i < b->ninsts; i++) {
+      Ref u = b->insts[i];
+      Inst *in = &f->insts[u];
+      if ((in->op != I_OR && in->op != I_XOR) || in->nargs != 2) continue;
+      if (s->folded[u] || s->bfx[u].ok || s->no_imm) continue;
+      Ref *a = ir_args(f, u);
+      int width = vt_is_64((ValType)in->type) ? 64 : 32;
+      int shl = -1;
+      for (int slot = 0; slot < 2; slot++)
+        if (f->insts[a[slot]].op == I_SHL) shl = slot;
+      if (shl < 0) continue;
+      Ref l = a[shl], r = a[shl ^ 1];
+      if (f->insts[r].op != I_SHRU) continue;
+      bool ok = true;
+      Ref sh[2] = { l, r };
+      uint64_t amt[2];
+      for (int k = 0; k < 2 && ok; k++) {
+        Inst *ci = &f->insts[sh[k]];
+        ok = uses[sh[k]] == 1 && !blocked[sh[k]] && !s->folded[sh[k]] &&
+             !s->bfx[sh[k]].ok && ci->block == bi && ci->type == in->type &&
+             f->insts[ir_args(f, sh[k])[1]].op == I_CONST;
+        if (ok) amt[k] = f->insts[ir_args(f, sh[k])[1]].imm % (uint64_t)width;
+      }
+      if (!ok || amt[0] == 0 || amt[0] + amt[1] != (uint64_t)width) continue;
+      s->folded[l] = s->folded[r] = 1;
+      s->extr[u] = 1;
+      a[0] = l; a[1] = r;
+    }
+  }
+
   if (!getenv("WARMC_NO_OPFUSE"))
   for (uint32_t oi = 0; oi < f->norder; oi++) {
     uint32_t bi = f->order[oi];
@@ -1297,6 +1537,50 @@ static void analyse_immediates(Isel *s) {
           if (slot == 0) { Ref t = a[0]; a[0] = a[1]; a[1] = t; }
           break;
         }
+        /* A 64-bit add of a widened i32 widens it in the add: the extended-
+           register form reads the low half of its operand and zero- or
+           sign-extends it, so the extension costs neither an instruction
+           nor, on a chain like md5's rotate-then-add rounds, a cycle. */
+        if (arith && vt_is_64((ValType)in->type) &&
+            (ci->op == I_EXTENDU || ci->op == I_EXTENDS || ci->op == I_EXT32S)) {
+          s->folded[cand] = 1;
+          if (slot == 0) { Ref t = a[0]; a[0] = a[1]; a[1] = t; }
+          break;
+        }
+      }
+    }
+  }
+
+  /* A vector or of a left and a logical right shift of one value, by
+     amounts that add up to the lane width, is a rotate.  Wasm has no vector
+     rotate, so every one in BLAKE3's or ChaCha's lanes is spelled that way,
+     and so is each scalar rotl the vectoriser widens.  Three instructions
+     become a shift right and a shift-left-and-insert of the same source, and
+     a rotate by half the lane is a single byte or halfword swap; the shifts
+     fold into the or. */
+  s->vrot = xcalloc(n ? n : 1, 1);
+  for (uint32_t oi = 0; oi < f->norder; oi++) {
+    uint32_t bi = f->order[oi];
+    Block *b = &f->blocks[bi];
+    for (uint32_t i = 0; i < b->ninsts; i++) {
+      Ref u = b->insts[i];
+      if (f->insts[u].op != I_VOR || s->folded[u]) continue;
+      Ref *a = ir_args(f, u);
+      for (int slot = 0; slot < 2; slot++) {
+        Ref l = a[slot], r = a[slot ^ 1], xl, xr;
+        int szl, szr, kl, kr;
+        if (!vshift_const(f, l, true, &xl, &szl, &kl) ||
+            !vshift_const(f, r, false, &xr, &szr, &kr))
+          continue;
+        if (xl != xr || szl != szr || kl == 0 || kl + kr != 8 << szl) continue;
+        if (uses[l] != 1 || uses[r] != 1 || blocked[l] || blocked[r] ||
+            s->folded[l] || s->folded[r])
+          continue;
+        if (f->insts[l].block != bi || f->insts[r].block != bi) continue;
+        s->folded[l] = s->folded[r] = 1;
+        s->vrot[u] = (uint8_t)kl;
+        if (slot) { a[0] = l; a[1] = r; }
+        break;
       }
     }
   }
@@ -1470,9 +1754,9 @@ static int cs_gpr_list(Isel *s, int *list) {
 
     if (r == R19) needed = s->needs_vmctx && s->vmctx_reg == R19;
     else if (r == R20) needed = s->needs_mem && s->membase_reg == R20;
-    else if (r == R21) needed = s->needs_memsize ||
-                                (s->used_gpr_cs & (1u << R21)) != 0;
-    else needed = (s->used_gpr_cs & (1u << r)) != 0;
+    else if (r == R21) needed = s->needs_memsize;
+    else needed = false;
+    if (s->used_gpr_cs & (1u << r)) needed = true;
     if (needed) list[n++] = r;
   }
   if (n & 1) list[n++] = RZR;
@@ -1491,15 +1775,15 @@ static void emit_prologue(Isel *s, Buf *b) {
   int list[NCS_GPR + 1];
   int n = cs_gpr_list(s, list);
 
-  uint32_t nsave = (uint32_t)(s->has_call ? 16 : 0) + 16u * ((uint32_t)n / 2u);
+  uint32_t nsave = (uint32_t)(saves_lr(s) ? 16 : 0) + 16u * ((uint32_t)n / 2u);
 
-  bool record_only = s->has_call && n == 0;
+  bool record_only = saves_lr(s) && n == 0;
   if (record_only) {
     a64_stp(b, SF64, R29, R30, RSP, -16, LSP_PRE);
   } else if (nsave) {
     a64_sub_imm(b, SF64, RSP, RSP, nsave, 0);
     uint32_t at = nsave;
-    if (s->has_call) { at -= 16; a64_stp(b, SF64, R29, R30, RSP, (int)at, LSP_OFF); }
+    if (saves_lr(s)) { at -= 16; a64_stp(b, SF64, R29, R30, RSP, (int)at, LSP_OFF); }
     for (int i = 0; i < n; i += 2) {
       at -= 16;
       a64_stp(b, SF64, list[i], list[i + 1], RSP, (int)at, LSP_OFF);
@@ -1644,16 +1928,16 @@ static void emit_teardown(Isel *s) {
   int list[NCS_GPR + 1];
   int n = cs_gpr_list(s, list);
 
-  uint32_t nsave = (uint32_t)(s->has_call ? 16 : 0) + 16u * ((uint32_t)n / 2u);
+  uint32_t nsave = (uint32_t)(saves_lr(s) ? 16 : 0) + 16u * ((uint32_t)n / 2u);
 
-  if (s->has_call && n == 0) {
+  if (saves_lr(s) && n == 0) {
     a64_ldp(B, SF64, R29, R30, RSP, 16, LSP_POST);
   } else if (nsave) {
-    uint32_t top = nsave - (uint32_t)(s->has_call ? 16 : 0);
+    uint32_t top = nsave - (uint32_t)(saves_lr(s) ? 16 : 0);
     for (int i = n - 2; i >= 0; i -= 2)
       a64_ldp(B, SF64, list[i], list[i + 1], RSP,
               (int)(top - 16u - 16u * (uint32_t)(i / 2)), LSP_OFF);
-    if (s->has_call) a64_ldp(B, SF64, R29, R30, RSP, (int)(nsave - 16), LSP_OFF);
+    if (saves_lr(s)) a64_ldp(B, SF64, R29, R30, RSP, (int)(nsave - 16), LSP_OFF);
     a64_add_imm(B, SF64, RSP, RSP, nsave, 0);
   }
 }
@@ -1666,14 +1950,23 @@ static void emit_epilogue(Isel *s) {
 static void regalloc_naive(Isel *s);
 static void regalloc_linear(Isel *s);
 
+/* Instructions the prologue and epilogue spend on the callee-saved
+   registers used so far: one stp and one ldp a pair. */
+static int ra_cs_frame_ops(Isel *s) {
+  int list[NCS_GPR + 1];
+  return cs_gpr_list(s, list);
+}
+
 #include "regalloc.inc"
 
 /* 1 = emitted, 0 = a conditional branch needs the far layout, 2 = the
-   allocation filed a split plan; the caller applies it and retries. */
+   allocation filed a split plan; the caller applies it and retries, 4 = the
+   loops it aligned are measured; the caller runs it again to place them. */
 static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
                         uint32_t out_bytes, FuncOut *fout, bool far,
                         SplitCtl *sc, bool split_collect) {
   int split_ret = 0;
+  bool refit = false;
   Buf pro;
   memset(&pro, 0, sizeof pro);
   Isel st;
@@ -1712,6 +2005,7 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
   s->rc_reg[0] = s->rc_reg[1] = 0;
   s->rc_slot[0] = s->rc_slot[1] = 0;
   s->rc_next = 0;
+  s->st_end = (size_t)-1;
   {
 
     bool leaf = f->npads == 0, quasi = f->npads == 0;
@@ -1816,7 +2110,7 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
   {
     int list[NCS_GPR + 1];
     int ncs = cs_gpr_list(s, list);
-    s->saved_bytes = (uint32_t)(8 * ncs) + (s->has_call ? 16u : 0u);
+    s->saved_bytes = (uint32_t)(8 * ncs) + (saves_lr(s) ? 16u : 0u);
   }
   if (s->frame > 32000)
     warmc_fatal("function %s needs a %u byte frame, beyond the current addressing limit",
@@ -1851,7 +2145,22 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
      nops of padding become a branch over them, so a loop entered often pays
      one taken branch, not a row of nops. */
   bool small_align = lalign && opt->small_loop_align;
+  /* Aligning to 64 pads by up to 48 bytes where the loop may well have fit
+     where it was: vecbench/condsum's inner loop, 28 bytes, fit at a 32 mod
+     64 offset, and the branch over the 32 bytes of padding that put it at
+     the next block cost a taken branch on each of the many entries an outer
+     loop makes, 17% of the kernel.  Only the emitted size tells, so the
+     first emission measures each small loop it aligned (loop_bytes keeps
+     the sizes on the function) and asks to be run again when some loop
+     would be placed with less padding; the second places every one by
+     fit_pad, the least padding that keeps it inside a block, and asks no
+     more.  Off with far branches, whose sizes are not the first run's. */
+  bool fit = small_align && !s->far_br;
+  const uint16_t *span_of = fit ? f->loop_bytes : NULL;
+  uint32_t *blk_end = fit && !span_of ? xmalloc(f->nblocks * sizeof(uint32_t)) : NULL;
+  uint32_t *rec = NULL, nrec = 0;
 
+  s->prev_bi = UINT32_MAX;
   for (uint32_t oi = 0; oi < f->norder; oi++) {
     uint32_t bi = f->order[oi];
     if (lalign && opt->align && f->blocks[bi].loop_depth) {
@@ -1859,21 +2168,30 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
       bool header = false;
       for (uint32_t p = 0; p < lb->npreds && !header; p++)
         if (f->blocks[lb->preds[p]].rpo >= lb->rpo) header = true;
-      uint32_t want = lalign;
-      if (header && small_align && small_loop(f, bi)) want = 64;
+      bool small = header && small_align && small_loop(f, bi);
+      uint32_t want = small ? 64 : lalign;
       if (header) {
-        uint32_t pad = (want - ((pro.len + B->len) & (want - 1))) & (want - 1);
+        uint32_t at = (uint32_t)(pro.len + B->len);
+        uint32_t pad = (want - (at & (want - 1))) & (want - 1);
+        if (small && span_of && span_of[bi]) pad = fit_pad(at, span_of[bi], lalign);
+        if (small && blk_end) {
+          rec = xrealloc(rec, (nrec + 1) * 4 * sizeof(uint32_t));
+          rec[4 * nrec] = bi; rec[4 * nrec + 1] = oi;
+          rec[4 * nrec + 2] = at; rec[4 * nrec + 3] = pad;
+          nrec++;
+        }
         if (pad > 16) {
           size_t site = B->len;
           a64_b(B, 0);
-          while ((pro.len + B->len) & (want - 1)) a64_nop(B);
+          while (pro.len + B->len < at + pad) a64_nop(B);
           patch_b26_checked(s, site, B->len);
         } else {
-          while ((pro.len + B->len) & (want - 1)) a64_nop(B);
+          while (pro.len + B->len < at + pad) a64_nop(B);
         }
       }
     }
     s->block_off[bi] = (uint32_t)B->len;
+    s->st_end = (size_t)-1;
     s->mem_valid = s->mem_valid_in[bi] != 0;
     if (opt->profile) {
       a64_ldr_imm(B, 3, TMP0, REG_VMCTX, 56);
@@ -1884,6 +2202,8 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
       s->prof_skip = 0;
     }
     emit_block(s, bi, oi + 1 < f->norder ? f->order[oi + 1] : 0xffffffffu);
+    s->prev_bi = bi;
+    if (blk_end) blk_end[bi] = (uint32_t)B->len;
     if (opt->profile) {
       uint32_t w = (uint32_t)((B->len - s->prof_start[bi]) / 4);
       w = (w > s->prof_skip) ? w - s->prof_skip : 0;
@@ -1895,6 +2215,26 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
       memcpy(B->data + s->prof_site[bi], &word, 4);
     }
   }
+
+  /* Placed again with each size known, does any loop move?  Padding is the
+     only code that depends on where it lands, so the second run's offsets
+     are the first's shifted by the change in padding before them. */
+  if (blk_end && nrec) {
+    uint16_t *spans = ir_alloc(f, f->nblocks * sizeof(uint16_t));
+    memset(spans, 0, f->nblocks * sizeof(uint16_t));
+    int64_t shift = 0;
+    for (uint32_t k = 0; k < nrec; k++) {
+      uint32_t h = rec[4 * k], at = rec[4 * k + 2], pad = rec[4 * k + 3];
+      uint32_t span = loop_span(s, h, rec[4 * k + 1], blk_end);
+      if (!span || span > 0xffff) continue;
+      spans[h] = (uint16_t)span;
+      uint32_t np = fit_pad((uint32_t)((int64_t)at + shift), span, lalign);
+      if (np != pad) refit = true;
+      shift += (int64_t)np - (int64_t)pad;
+    }
+    if (refit) f->loop_bytes = spans;
+  }
+  xfree(blk_end); xfree(rec);
 
   emit_alloc_slow_arms(s);
   emit_gc_load_stubs(s);
@@ -1964,6 +2304,7 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
                 s->ncsa_vals, s->csa_consumed, f->m->funcs[f->func_index].sym);
 
   if (s->far_br_needed) goto give_up;
+  if (refit) { split_ret = 4; goto give_up; }
 
   memset(fout, 0, sizeof *fout);
   fout->want_align = opt->align && has_loop;
@@ -1996,7 +2337,7 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
     u.saved_bytes = s->saved_bytes;
     u.exn_slot = s->exn_slot;
     u.fpsave_off = s->fpsave_off;
-    u.saved = s->has_call ? UW_HAS_LR : 0u;
+    u.saved = saves_lr(s) ? UW_HAS_LR : 0u;
     int list[NCS_GPR + 1];
     int ncs = cs_gpr_list(s, list);
     for (int i = 0; i < ncs; i++)
@@ -2057,6 +2398,10 @@ give_up:
   xfree(s->imm_fold); xfree(s->fused); xfree(s->addr_fuse); xfree(s->ptr_fuse);
   xfree(s->zx_fuse); xfree(s->no_remat); xfree(s->paired); xfree(s->nl); xfree(s->pool);
   xfree(s->folded); xfree(s->uses); xfree(s->bfx); xfree(s->pinned); xfree(s->csinc);
+  xfree(s->vrot);
+  xfree(s->extr);
+  xfree(s->pc); xfree(s->pc_bfirst); xfree(s->pc_bn); xfree(s->pc_head);
+  xfree(s->pc_next);
   xfree(s->lowonly);
   xfree(s->sites); xfree(s->clauses);
   xfree(s->gcsites); xfree(s->gcroots);
@@ -2086,6 +2431,10 @@ static bool imm_ok_a64(IrFunc *f, Ref user, uint32_t idx, uint64_t cval, ValType
       if (masked <= 0xfff) return true;
       return (0 - (uint64_t)(sf ? (int64_t)masked : (int64_t)(int32_t)masked)) <= 0xfff;
     case I_SHL: case I_SHRS: case I_SHRU: case I_ROTR: case I_ROTL:
+      return idx == 1;
+    /* A constant lane shift is an immediate of ushr/shl/sshr; the register
+       a constant count would hold is never read. */
+    case I_VSHLV: case I_VSHRUV: case I_VSHRSV:
       return idx == 1;
     case I_AND: case I_OR: case I_XOR: {
       if (idx != 1) return false;

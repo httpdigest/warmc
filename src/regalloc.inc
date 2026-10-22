@@ -110,6 +110,10 @@ static void regalloc_naive(Isel *s) {
   s->nslots = slot;
 }
 
+/* A value read once in a loop weighs ten; see the spare registers in
+   regalloc_linear. */
+#define RA_SPARE_MIN_W 10.0
+
 static int op_tied_arg(uint16_t op) {
   switch (op) {
     case I_VSEL: return 0;
@@ -118,6 +122,10 @@ static int op_tied_arg(uint16_t op) {
        count of a clz or popcnt, the 32-bit result Go and TinyGo keep in an
        i64 -- and one in-place uxtw otherwise. */
     case I_WRAP: return 0;
+    /* A lane insert whose vector dies here inserts in place; in a register
+       of its own it first copies the whole vector, once per lane of a
+       gather built up an insert at a time. */
+    case I_VREPLACE: return 0;
     default: return -1;
   }
 }
@@ -150,6 +158,81 @@ static double iv_span(const Interval *iv, const Range *R) {
   double n = 0;
   for (uint32_t y = 0; y < iv->rcount; y++) n += R[iv->rfirst + y].hi - R[iv->rfirst + y].lo + 1;
   return n > 0 ? n : 1;
+}
+
+/* The same, each position weighted by its block's frequency: cumf is the
+   prefix sum of those weights over the scan's positions. */
+static double iv_wspan(const Interval *iv, const Range *R, const double *cumf) {
+  double n = 0;
+  if (!iv->rcount) n = cumf[iv->end + 1] - cumf[iv->start];
+  else
+    for (uint32_t y = 0; y < iv->rcount; y++)
+      n += cumf[R[iv->rfirst + y].hi + 1] - cumf[R[iv->rfirst + y].lo];
+  return n > 1e-9 ? n : 1e-9;
+}
+
+/* The same over contested positions only, where more values of the class
+   are live than it has registers (cumc, frequency weighted like cumf). */
+static double iv_cspan(const Interval *iv, const Range *R, const double *cumc) {
+  double n = 0;
+  if (!iv->rcount) n = cumc[iv->end + 1] - cumc[iv->start];
+  else
+    for (uint32_t y = 0; y < iv->rcount; y++)
+      n += cumc[R[iv->rfirst + y].hi + 1] - cumc[R[iv->rfirst + y].lo];
+  return n;
+}
+
+/* Does the interval live at frequency f0 at every position it holds? */
+static bool iv_uniform(const Interval *iv, const Range *R, const double *cumf,
+                       double f0) {
+  double sp = iv_span(iv, R), ws = iv_wspan(iv, R, cumf);
+  return ws <= f0 * sp * (1 + 1e-9) && ws >= f0 * sp * (1 - 1e-9);
+}
+
+/* Eviction rules, for the scan's passes (see "the scan, under several
+   eviction rules" in regalloc_linear).  ev_ratio says by how much cur
+   outranks a conflicting interval V under a rule; above 1, V may be evicted
+   for it, and the largest ratio picks the victim.
+     EV_WEIGHT     spill weights: references, frequency weighted.
+     EV_DENSITY    weight per position held, holes left out.
+     EV_WDENSITY   the same with the positions frequency weighted, so a value
+                   passing through a hot loop pays for the register there.
+     EV_UNIFORM    density where both live at cur's frequency throughout --
+                   one block, one loop body -- where a position costs the
+                   same everywhere and the static frequency guess cannot
+                   mislead it; weight elsewhere.
+     EV_CONTESTED  frequency-weighted density over only the positions where
+                   the class has more live values than registers: a value
+                   holds a register through a quiet stretch for free. */
+enum { EV_WEIGHT, EV_DENSITY, EV_WDENSITY, EV_UNIFORM, EV_CONTESTED };
+
+/* A rule other than weight must price below this share of the weight rule's
+   assignment to replace it. */
+#define RA_TRIAL_MARGIN 0.9
+
+static double ev_ratio(int rule, const Interval *cur, double cw,
+                       const Interval *V, double w, const Range *R,
+                       const double *cumf, const double *cumc) {
+  if (w <= 0) return 1e300;
+  double f0 = cumf[cur->start + 1] - cumf[cur->start];
+  switch (rule) {
+    case EV_DENSITY:
+      return (cw / iv_span(cur, R)) / (w / iv_span(V, R));
+    case EV_WDENSITY:
+      return (cw / iv_wspan(cur, R, cumf)) / (w / iv_wspan(V, R, cumf));
+    case EV_UNIFORM:
+      if (iv_uniform(cur, R, cumf, f0) && iv_uniform(V, R, cumf, f0))
+        return (cw / iv_span(cur, R)) / (w / iv_span(V, R));
+      return cw / w;
+    case EV_CONTESTED: {
+      double cc = iv_cspan(cur, R, cumc);
+      if (cc <= 0) return cw / w;
+      double vc = iv_cspan(V, R, cumc);
+      return (cw / cc) / (w / (vc > f0 ? vc : f0));
+    }
+    default:
+      return cw / w;
+  }
 }
 
 static void spill_debug(Isel *s, const char *kind, const Interval *cur,
@@ -283,9 +366,12 @@ static int occ_conflicts(OccHeap *h, const Interval *cur, const Range *R,
 static double csa_crossing_cost(const Interval *cur, const Range *R,
                                 int32_t def_pos, const int32_t *call_pos,
                                 const uint8_t *call_depth,
-                                const uint8_t *call_cold, uint32_t ncalls,
-                                double cold_div, uint64_t *work) {
+                                const uint8_t *call_cold,
+                                const float *call_share, uint32_t ncalls,
+                                double cold_div, uint64_t *work,
+                                uint8_t *deepest) {
   double c = 0;
+  if (deepest) *deepest = 0;
   Range span = { cur->start, cur->end };
   uint32_t nr = cur->rcount ? cur->rcount : 1;
   for (uint32_t i = 0; i < nr; i++) {
@@ -301,7 +387,8 @@ static double csa_crossing_cost(const Interval *cur, const Range *R,
     for (; a < ncalls && call_pos[a] <= hi; a++) {
       (*work)++;
       if (call_pos[a] == def_pos) continue;
-      double w = 1.0;
+      if (deepest && call_depth[a] > *deepest) *deepest = call_depth[a];
+      double w = call_share ? call_share[a] : 1.0;
       for (int k = 0; k < call_depth[a]; k++) w *= 10.0;
       if (call_cold[a]) w /= cold_div;
       c += 2.0 * w;
@@ -553,6 +640,66 @@ static int split_cand_cmp(const void *a, const void *b) {
   return x->v < y->v ? -1 : 1;
 }
 
+/* A register's full assignment as ranges sorted by start, for the passes
+   that place intervals after the scan: second chance and pieces. */
+typedef struct { Range *v; uint32_t n, cap; } RList;
+
+/* Append, or with sorted, insert in order. */
+static void rl_add(RList *L, int32_t lo, int32_t hi, bool sorted) {
+  if (L->n == L->cap) {
+    L->cap = L->cap ? L->cap * 2 : 16;
+    L->v = xrealloc(L->v, L->cap * sizeof(Range));
+  }
+  uint32_t z = L->n++;
+  while (sorted && z && L->v[z - 1].lo > lo) { L->v[z] = L->v[z - 1]; z--; }
+  L->v[z].lo = lo; L->v[z].hi = hi;
+}
+
+/* Is [lo, hi] clear of every range in L?  Ranges in one register are
+   disjoint but for a tied operand's shared end, so their ends are sorted
+   too and the first range ending at or after lo is the only candidate. */
+static bool rl_free(const RList *L, int32_t lo, int32_t hi) {
+  uint32_t a = 0, b = L->n;
+  while (a < b) {
+    uint32_t m = (a + b) / 2;
+    if (L->v[m].hi < lo) a = m + 1; else b = m;
+  }
+  return !(a < L->n && L->v[a].lo <= hi);
+}
+
+typedef struct { uint32_t idx; double w; } RefillCand;
+
+static int refill_cmp(const void *a, const void *b) {
+  const RefillCand *x = a, *y = b;
+  if (x->w != y->w) return x->w > y->w ? -1 : 1;
+  return x->idx < y->idx ? -1 : 1;
+}
+
+typedef struct { Ref v; uint32_t i; } PieceUse;
+
+static int piece_use_cmp(const void *a, const void *b) {
+  const PieceUse *x = a, *y = b;
+  if (x->v != y->v) return x->v < y->v ? -1 : 1;
+  return x->i < y->i ? -1 : x->i > y->i;
+}
+
+typedef struct { Ref v; uint32_t block, lo, hi; double gain; } PieceCand;
+
+static int piece_cand_cmp(const void *a, const void *b) {
+  const PieceCand *x = a, *y = b;
+  if (x->gain != y->gain) return x->gain > y->gain ? -1 : 1;
+  if (x->block != y->block) return x->block < y->block ? -1 : 1;
+  if (x->lo != y->lo) return x->lo < y->lo ? -1 : 1;
+  return x->v < y->v ? -1 : x->v > y->v;
+}
+
+static int piece_cmp(const void *a, const void *b) {
+  const struct Piece *x = a, *y = b;
+  if (x->block != y->block) return x->block < y->block ? -1 : 1;
+  if (x->lo != y->lo) return x->lo < y->lo ? -1 : 1;
+  return x->v < y->v ? -1 : x->v > y->v;
+}
+
 static void regalloc_linear(Isel *s) {
   IrFunc *f = s->f;
   uint32_t n = f->ninsts;
@@ -576,6 +723,9 @@ static void regalloc_linear(Isel *s) {
   int32_t *call_pos = xmalloc((n + 1) * sizeof(int32_t));
   uint8_t *call_depth = xmalloc(n + 1);
   uint8_t *call_cold = xmalloc(n + 1);
+  float *call_share = xmalloc((n + 1) * sizeof(float));
+  float *bshare = xmalloc((f->nblocks ? f->nblocks : 1) * sizeof(float));
+  ir_path_share(f, bshare);
   uint32_t ncalls = 0;
   int32_t pos = 0;
   for (uint32_t oi = 0; oi < f->norder; oi++) {
@@ -592,6 +742,7 @@ static void regalloc_linear(Isel *s) {
         int64_t fl;
         call_depth[ncalls] = (uint8_t)(b->loop_depth < 8 ? b->loop_depth : 8);
         call_cold[ncalls] = gc_fastnew_shape(f, r, &ft, &fl) ? 1 : 0;
+        call_share[ncalls] = bshare[bi];
         call_pos[ncalls++] = pos;
       }
       pos++;
@@ -935,8 +1086,30 @@ static void regalloc_linear(Isel *s) {
      which can only underprice spilling and so only withhold a grant. */
   double *weight = xcalloc(n ? n : 1, sizeof(double));
   double *wlat = xcalloc(n ? n : 1, sizeof(double));
+  /* wuse and wdef split weight into reads and the definition: what an
+     assignment that rematerialises a value pays is per read segment, wlat
+     less its definition. */
+  double *wuse = xcalloc(n ? n : 1, sizeof(double));
+  double *wdef = xcalloc(n ? n : 1, sizeof(double));
   uint32_t *lstamp = xcalloc(n ? n : 1, sizeof(uint32_t));
   uint32_t lseg = 0;
+  /* cumf[p] sums the frequency of the positions before p, the weight a
+     reference there would get, for the frequency-weighted spans of the
+     density rules (iv_wspan). */
+  double *cumf = xcalloc((size_t)maxpos + 2, sizeof(double));
+  {
+    double *pf = xcalloc((size_t)maxpos + 1, sizeof(double));
+    for (uint32_t oi = 0; oi < f->norder; oi++) {
+      uint32_t bi = f->order[oi];
+      uint32_t d = f->blocks[bi].loop_depth;
+      double w = 1.0;
+      for (uint32_t k = 0; k < d && k < 8; k++) w *= 10.0;
+      if (f->blocks[bi].cold) w = 0.01;
+      for (int32_t p = blk_start[bi]; p <= blk_end[bi] && p < maxpos; p++) pf[p] = w;
+    }
+    for (int32_t p = 0; p < maxpos; p++) cumf[p + 1] = cumf[p] + pf[p];
+    xfree(pf);
+  }
   for (uint32_t oi = 0; oi < f->norder; oi++) {
     uint32_t bi = f->order[oi];
     Block *b = &f->blocks[bi];
@@ -956,11 +1129,13 @@ static void regalloc_linear(Isel *s) {
       if (op_clobbers_caller_saved(in->op)) lseg++;
       weight[web[r2]] += w;
       wlat[web[r2]] += w;
+      wdef[web[r2]] += w;
       uint32_t ne = eff_uses(s, f, r2, eu, eucap);
       (void)a;
       for (uint32_t j = 0; j < ne; j++) {
         uint32_t rep = web[eu[j]];
         weight[rep] += w;
+        wuse[rep] += w;
         if (s->cls[eu[j]] == 0) {
           if (lstamp[rep] != lseg) { lstamp[rep] = lseg; wlat[rep] += w; }
         } else {
@@ -971,24 +1146,29 @@ static void regalloc_linear(Isel *s) {
     if (b->term == T_BRIF || b->term == T_BRTABLE) {
       weight[web[b->term_arg]] += w;
       wlat[web[b->term_arg]] += w;
+      wuse[web[b->term_arg]] += w;
     }
     for (uint32_t i = 0; i < b->nret; i++) {
       weight[web[b->ret_args[i]]] += w;
       wlat[web[b->ret_args[i]]] += w;
+      wuse[web[b->ret_args[i]]] += w;
     }
     for (uint32_t sidx = 0; sidx < b->nsuccs; sidx++)
       for (uint32_t j = 0; j < b->succs[sidx].nargs; j++) {
         weight[web[b->succs[sidx].args[j]]] += w;
         wlat[web[b->succs[sidx].args[j]]] += w;
+        wuse[web[b->succs[sidx].args[j]]] += w;
       }
   }
   xfree(lstamp);
 
-  /* A rematerialised constant pays its move sequence at every use; a spilled
-     one pays one cached reload per use segment.  A multi-instruction constant
-     whose uses cluster many-per-segment is cheaper in a slot, so it loses its
-     remat eligibility here -- weight counts uses, wlat counts segments, and
-     both are final at this point. */
+  /* A rematerialised global pays a load at every use; a spilled one pays one
+     cached reload per use segment.  A global whose uses cluster
+     many-per-segment is cheaper in a slot, so it loses its remat eligibility
+     here -- weight counts uses, wlat counts segments, and both are final at
+     this point.  A multi-instruction constant does not: rd() builds it into
+     the reload cache once per segment, which is what a slot would cost there,
+     without the slot's def -- a chain and a store wherever LICM put it. */
   for (uint32_t i = 0; i < n; i++) {
     if (web[i] != i || !remat_ok(s, i)) continue;
     Inst *ri = &f->insts[i];
@@ -1006,15 +1186,6 @@ static void regalloc_linear(Isel *s) {
       weight[i] *= remat_discount(s, i);
       continue;
     }
-    if (ri->op == I_CONST && !vt_is_float((ValType)ri->type) &&
-        (ValType)ri->type != VT_V128) {
-      int c = ir_const_cost(ri->imm, vt_is_64((ValType)ri->type));
-      if (c > 1 && ((double)c * weight[i] > s->remat2_seg * wlat[i] ||
-                    weight[i] > s->remat2_wcap)) {
-        s->no_remat[i] = 1;
-        continue;
-      }
-    }
     weight[i] *= remat_discount(s, i);
   }
 
@@ -1031,7 +1202,7 @@ static void regalloc_linear(Isel *s) {
     gpr_owner[i] = -1; fpr_owner[i] = -1;
   }
 
-  int gpool[NGPR_ALLOC + 2];
+  int gpool[NGPR_ALLOC + 8];
   int ngpool = 0;
   for (int i = 0; i < NGPR_ALLOC; i++) {
 
@@ -1044,6 +1215,53 @@ static void regalloc_linear(Isel *s) {
   if (!s->needs_memsize) gpool[ngpool++] = REG_MEMSIZE;
   if (RA_HAVE_RETAREA_REUSE && !s->needs_retarea && f->sig->nresults <= 1)
     gpool[ngpool++] = RA_RETAREA_REG;
+  /* The registers the back end lends besides (isel_spare_gprs) cost a save
+     and a restore on every call, on the entry path, whichever way the call
+     then goes, so they are a last resort: a value takes one only when no
+     other register is free and it would otherwise go to a slot, and only a
+     value read in a loop, where the slot would be paid round and round, and
+     not a constant, which is remade where it is used instead.  Offered
+     like the others, they went to values that fitted without them, a
+     string switch called millions of times paid two more pairs of saves on
+     every call, and the registers they freed went to constants. */
+  uint32_t spare = 0;
+  {
+    int nsp = isel_spare_gprs(s, gpool + ngpool);
+    for (int k = 0; k < nsp; k++) spare |= 1u << gpool[ngpool + k];
+    ngpool += nsp;
+  }
+
+  /* The same over the contested positions of each class -- where more of
+     its values are live than it has registers, so that a register held there
+     keeps some other value out of one -- for EV_CONTESTED (iv_cspan). */
+  double *cumc[2];
+  {
+    int32_t *dl[2];
+    for (int c = 0; c < 2; c++) {
+      dl[c] = xcalloc((size_t)maxpos + 2, sizeof(int32_t));
+      cumc[c] = xcalloc((size_t)maxpos + 2, sizeof(double));
+    }
+    for (uint32_t i = 0; i < ns; i++) {
+      const Interval *X = &sorted[i];
+      int c = X->cls ? 1 : 0;
+      if (!X->rcount) { dl[c][X->start]++; dl[c][X->end + 1]--; }
+      else
+        for (uint32_t y = 0; y < X->rcount; y++) {
+          dl[c][R[X->rfirst + y].lo]++;
+          dl[c][R[X->rfirst + y].hi + 1]--;
+        }
+    }
+    int K[2] = { ngpool, NFPR_ALLOC };
+    for (int c = 0; c < 2; c++) {
+      int32_t live = 0;
+      for (int32_t p = 0; p < maxpos; p++) {
+        live += dl[c][p];
+        double fp = cumf[p + 1] - cumf[p];
+        cumc[c][p + 1] = cumc[c][p] + (live > K[c] ? fp : 0);
+      }
+      xfree(dl[c]);
+    }
+  }
 
   uint32_t slot = 0;
   for (uint32_t i = 0; i < n; i++)
@@ -1098,191 +1316,642 @@ static void regalloc_linear(Isel *s) {
     }
   }
 
-  for (uint32_t i = 0; i < ns; i++) {
-    Interval *cur = &sorted[i];
-    int32_t *ends = cur->cls ? fpr_end : gpr_end;
-    int32_t *owner = cur->cls ? fpr_owner : gpr_owner;
-    OccHeap *heaps = cur->cls ? fpr_occ : gpr_occ;
-    const int *pool = cur->cls ? FPR_ALLOC : gpool;
-    int npool = cur->cls ? NFPR_ALLOC : ngpool;
-    int32_t vic;
+  /* ---- the scan, under several eviction rules ----
+     Which interval to give up when every register is taken is the one
+     decision a linear scan cannot take back, and no single rule takes it well
+     everywhere.  Comparing spill weights keeps the values a hot loop reads
+     most; but in one long block, where loaded values wait hundreds of
+     positions for their uses, it hands them every register and spills the
+     short temporaries between, each of which still needs a register at its
+     definition and its use.  Comparing weight per position held (density)
+     takes that right and gets loops wrong, where a long value's positions
+     are cheap to hold but its few uses are hot.  So the scan runs once per
+     rule, each assignment is priced by what its spills, rematerialisations
+     and caller saves would execute, and the cheapest is kept; the rules
+     differ only in how a victim is chosen.  The weight rule is the
+     incumbent: another must price below RA_TRIAL_MARGIN of it to be taken,
+     since the price rests on the same static frequency guess the weights
+     do.  An AOT compiler can afford the extra passes. */
+  static const uint8_t trial_rule[][2] = {
+    { EV_WEIGHT, EV_DENSITY }, { EV_UNIFORM, EV_DENSITY },
+    { EV_WDENSITY, EV_DENSITY }, { EV_CONTESTED, EV_DENSITY },
+    { EV_DENSITY, EV_DENSITY },
+  };
+  int ntrial = getenv("WARMC_NO_RA_TRIALS")
+                   ? 0 : (int)(sizeof trial_rule / sizeof trial_rule[0]);
+  bool trial_dbg = getenv("WARMC_RA_TRIAL_DEBUG") != NULL;
+  uint32_t slot0 = slot;
+  uint32_t used_gcs0 = s->used_gpr_cs, used_fcs0 = s->used_fpr_cs;
+  uint64_t st_cs0 = g_stats.caller_saves, st_sp0 = g_stats.spills,
+           st_spv0 = g_stats.spills_v128_xcall;
+  double best_cost = 1e300, base_cost = 1e300;
+  int best_rule = 0;
+  for (int trial = 0; trial <= ntrial; trial++) {
+    bool final = trial == ntrial;
+    int rule_i = final ? best_rule : trial;
+    if (trial > 0) {
+      for (int r = 0; r < 32; r++) {
+        gpr_end[r] = fpr_end[r] = -1;
+        gpr_owner[r] = fpr_owner[r] = -1;
+        gpr_occ[r].n = gpr_occ[r].dead = 0;
+        fpr_occ[r].n = fpr_occ[r].dead = 0;
+      }
+      memset(gone, 0, ns ? ns : 1);
+      for (uint32_t i = 0; i < ns; i++) {
+        s->loc[sorted[i].value] = LOC_NONE;
+        sorted[i].caller_saved_ok = 0;
+      }
+      if (s->csa_on) {
+        memset(s->csa_on, 0, n ? n : 1);
+        for (uint32_t z = 0; z < n; z++) s->csa_slot[z] = -1;
+      }
+      slot = slot0;
+      s->used_gpr_cs = used_gcs0; s->used_fpr_cs = used_fcs0;
+      g_stats.caller_saves = st_cs0; g_stats.spills = st_sp0;
+      g_stats.spills_v128_xcall = st_spv0;
+      csa_done = 0; csa_work = 0;
+    }
+    for (uint32_t i = 0; i < ns; i++) {
+      Interval *cur = &sorted[i];
+      int32_t *ends = cur->cls ? fpr_end : gpr_end;
+      int32_t *owner = cur->cls ? fpr_owner : gpr_owner;
+      OccHeap *heaps = cur->cls ? fpr_occ : gpr_occ;
+      const int *pool = cur->cls ? FPR_ALLOC : gpool;
+      int npool = cur->cls ? NFPR_ALLOC : ngpool;
+      int32_t vic;
 
-    /* Callees preserve only the low 64 bits of v8-v15, so for a V128 no
-       register is safe across a call: the preference for callee-saved
-       registers stands, but never satisfies a crossing. */
-    bool v128 = (ValType)f->insts[cur->value].type == VT_V128;
+      /* Callees preserve only the low 64 bits of v8-v15, so for a V128 no
+         register is safe across a call: the preference for callee-saved
+         registers stands, but never satisfies a crossing. */
+      bool v128 = (ValType)f->insts[cur->value].type == VT_V128;
 
-    if (hint[cur->value] < 0 && cur->value < n)
-      hint[cur->value] = web_hint[cur->value];
+      if (hint[cur->value] < 0 && cur->value < n)
+        hint[cur->value] = web_hint[cur->value];
 
-    int chosen = -1;
-    if (!no_tie) {
-      Ref ta = tied_operand_of(f, cur->value);
-      int tl = ta == REF_NONE ? LOC_NONE : s->loc[ta];
-      /* The operand's own interval has to end here; the register's end can
-         be later, when the operand sat in a hole of a value that lives on
-         past it -- the occupancy check below finds whether this one fits
-         in that hole too.  A popcount that a running sum lent its register
-         to is that: the wrap of the count found the sum's end there. */
-      if (ta != REF_NONE && tl != LOC_NONE && !IS_SLOT(tl) && tl >= 0 &&
-          owner[tl] >= 0 && sorted[owner[tl]].value == ta &&
-          sorted[owner[tl]].end == cur->start) {
-        bool cs = !v128 &&
-                  (cur->cls ? fpr_is_callee_saved(tl) : gpr_is_callee_saved(tl));
+      bool spare_ok = cur->cls == 0 && weight[cur->value] >= RA_SPARE_MIN_W &&
+                      !remat_ok(s, cur->value);
+      uint32_t barred = spare_ok || cur->cls ? 0 : spare;
+
+      int chosen = -1;
+      if (!no_tie) {
+        Ref ta = tied_operand_of(f, cur->value);
+        int tl = ta == REF_NONE ? LOC_NONE : s->loc[ta];
+        /* The operand's own interval has to end here; the register's end can
+           be later, when the operand sat in a hole of a value that lives on
+           past it -- the occupancy check below finds whether this one fits
+           in that hole too.  A popcount that a running sum lent its register
+           to is that: the wrap of the count found the sum's end there. */
+        if (ta != REF_NONE && tl != LOC_NONE && !IS_SLOT(tl) && tl >= 0 &&
+            owner[tl] >= 0 && sorted[owner[tl]].value == ta &&
+            sorted[owner[tl]].end == cur->start) {
+          bool cs = !v128 &&
+                    (cur->cls ? fpr_is_callee_saved(tl) : gpr_is_callee_saved(tl));
+          bool in_pool = false;
+          for (int k = 0; k < npool; k++) if (pool[k] == tl) { in_pool = true; break; }
+          int nc = occ_conflicts(&heaps[tl], cur, R, gone, ostack, &vic);
+          bool only_tied = nc == 0 || (nc == 1 && sorted[vic].value == ta);
+          if (in_pool && only_tied && (!cur->crosses_call || cs)) chosen = tl;
+        }
+      }
+      int want = no_hint ? -1 : hint[cur->value];
+      if (chosen < 0 && want >= 0 &&
+          occ_conflicts(&heaps[want], cur, R, gone, ostack, &vic) == 0) {
+        bool cs = !v128 && (cur->cls ? fpr_is_callee_saved(want)
+                                     : gpr_is_callee_saved(want));
         bool in_pool = false;
-        for (int k = 0; k < npool; k++) if (pool[k] == tl) { in_pool = true; break; }
-        int nc = occ_conflicts(&heaps[tl], cur, R, gone, ostack, &vic);
-        bool only_tied = nc == 0 || (nc == 1 && sorted[vic].value == ta);
-        if (in_pool && only_tied && (!cur->crosses_call || cs)) chosen = tl;
+        for (int k = 0; k < npool; k++) if (pool[k] == want) { in_pool = true; break; }
+        if (in_pool && !((barred >> want) & 1) && (!cur->crosses_call || cs))
+          chosen = want;
       }
-    }
-    int want = no_hint ? -1 : hint[cur->value];
-    if (chosen < 0 && want >= 0 &&
-        occ_conflicts(&heaps[want], cur, R, gone, ostack, &vic) == 0) {
-      bool cs = !v128 && (cur->cls ? fpr_is_callee_saved(want)
-                                   : gpr_is_callee_saved(want));
-      bool in_pool = false;
-      for (int k = 0; k < npool; k++) if (pool[k] == want) { in_pool = true; break; }
-      if (in_pool && (!cur->crosses_call || cs)) chosen = want;
-    }
-    for (int pass = 0; pass < 2 && chosen < 0; pass++) {
-      for (int k = 0; k < npool; k++) {
-        int rr = pool[k];
-        bool cs = cur->cls ? fpr_is_callee_saved(rr) : gpr_is_callee_saved(rr);
-        if (cur->crosses_call && (v128 || !cs)) continue;
-        bool want_cs = cur->crosses_call ? true : (pass == 1);
-        if (cs != want_cs) continue;
-        if (occ_conflicts(&heaps[rr], cur, R, gone, ostack, &vic) != 0) continue;
-        chosen = rr;
-        break;
+      for (int pass = 0; pass < 2 && chosen < 0; pass++) {
+        for (int k = 0; k < npool; k++) {
+          int rr = pool[k];
+          bool cs = cur->cls ? fpr_is_callee_saved(rr) : gpr_is_callee_saved(rr);
+          if (cur->crosses_call && (v128 || !cs)) continue;
+          if ((spare >> rr) & 1 && !cur->cls) continue;
+          bool want_cs = cur->crosses_call ? true : (pass == 1);
+          if (cs != want_cs) continue;
+          if (occ_conflicts(&heaps[rr], cur, R, gone, ostack, &vic) != 0) continue;
+          chosen = rr;
+          break;
+        }
       }
-    }
 
-    if (chosen < 0) {
+      if (chosen < 0) {
 
-      int victim_reg = -1;
-      int32_t victim_idx = -1;
-      /* Among float values the one to spill is the one whose register
-         buys least per position it holds: a long value read now and then
-         before the short temporaries of a block of arithmetic, each of
-         which, spilled, still needs a register at its definition and its
-         use.  Compared by weight alone, every temporary of an unrolled
-         n-body step spilled itself.  Integer values keep weight alone,
-         which measured better for them. */
-      bool dens = cur->cls != 0;
-      double victim_w = no_evict ? -1e300 : weight[cur->value];
-      double victim_d = no_evict ? -1e300 : (dens ? victim_w / iv_span(cur, R) : victim_w);
-      for (int k = 0; k < npool; k++) {
-        int rr = pool[k];
-        bool cs = cur->cls ? fpr_is_callee_saved(rr) : gpr_is_callee_saved(rr);
-        if (cur->crosses_call && (v128 || !cs)) continue;
-        int32_t cand;
-        if (occ_conflicts(&heaps[rr], cur, R, gone, ostack, &cand) != 1) continue;
-        double w = weight[sorted[cand].value];
-        double dd = dens ? w / iv_span(&sorted[cand], R) : w;
-        if (dd < victim_d) { victim_d = dd; victim_w = w; victim_reg = rr; victim_idx = cand; }
-      }
-      /* A call-crossing value the callee-saved registers cannot hold may
-         instead take a caller-saved register plus a private slot, paying two
-         frame operations per crossed site.  Priced against what it would
-         otherwise cost: the eviction victim's whole-life spill, or its own. */
-      int csa_reg = -1;
-      double csa_cost = 0;
-      if (csa_ok && cur->crosses_call &&
-          !inelig[cur->value] && csa_work <= CSA_BUDGET &&
-          !(csa_max >= 0 && csa_done >= csa_max)) {
-        double price = remat_ok(s, cur->value)
-                           ? weight[cur->value] * remat_discount(s, cur->value)
-                           : (csa_lat ? wlat[cur->value] : weight[cur->value]);
-        if (victim_reg >= 0 && victim_w < price) price = victim_w;
-        csa_cost = csa_crossing_cost(cur, R, num[cur->value], call_pos,
-                                     call_depth, call_cold, ncalls,
-                                     csa_cold_div, &csa_work);
-        if (csa_cost * csa_margin < price || getenv("WARMC_CSA_FORCE"))
-          for (int k = 0; k < npool; k++) {
-            int rr = pool[k];
-
-            /* Callee-saved was already tried (and is no protection for a
-               V128); the allocation fast path writes RA_ALLOC_RES_REG with
-               no call. */
-            if (cur->cls
-                    ? fpr_is_callee_saved(rr)
-                    : (gpr_is_callee_saved(rr) || rr == RA_ALLOC_RES_REG))
-              continue;
-            if (occ_conflicts(&heaps[rr], cur, R, gone, ostack, &vic) != 0)
-              continue;
-            csa_reg = rr;
-            break;
+        int victim_reg = -1;
+        int32_t victim_idx = -1;
+        /* The victim is the conflicting interval cur outranks by the widest
+           margin under this pass's rule (ev_ratio), if any does.  Among float
+           values the density rule is always the one: a long value read now
+           and then before the short temporaries of a block of arithmetic,
+           each of which, spilled, still needs a register at its definition and
+           its use -- compared by weight alone, every temporary of an unrolled
+           n-body step spilled itself. */
+        int rule = trial_rule[rule_i][cur->cls ? 1 : 0];
+        double cw = weight[cur->value];
+        double best_r = 1.0, victim_w = cw;
+        for (int k = 0; k < npool; k++) {
+          int rr = pool[k];
+          bool cs = cur->cls ? fpr_is_callee_saved(rr) : gpr_is_callee_saved(rr);
+          if (cur->crosses_call && (v128 || !cs)) continue;
+          if ((barred >> rr) & 1) continue;
+          int32_t cand;
+          if (occ_conflicts(&heaps[rr], cur, R, gone, ostack, &cand) != 1) continue;
+          const Interval *V = &sorted[cand];
+          double w = weight[V->value];
+          double r = no_evict ? 0
+                   : ev_ratio(rule, cur, cw, V, w, R, cumf, cumc[cur->cls ? 1 : 0]);
+          if (r > best_r) {
+            best_r = r; victim_w = w; victim_reg = rr; victim_idx = cand;
           }
+        }
+        /* A free spare register is better than a slot, for this value or for
+           the victim, but not better than remaking a constant victim where it
+           is used, which costs no frame at all. */
+        int spare_reg = -1;
+        if (spare_ok && !(victim_reg >= 0 && remat_ok(s, sorted[victim_idx].value)))
+          for (int k = 0; k < npool && spare_reg < 0; k++) {
+            int rr = pool[k];
+            if ((spare >> rr) & 1 &&
+                occ_conflicts(&heaps[rr], cur, R, gone, ostack, &vic) == 0)
+              spare_reg = rr;
+          }
+        /* A call-crossing value the callee-saved registers cannot hold may
+           instead take a caller-saved register plus a private slot, paying two
+           frame operations per crossed site.  Priced against what it would
+           otherwise cost: the eviction victim's whole-life spill, or its own. */
+        int csa_reg = -1;
+        double csa_cost = 0;
+        if (csa_ok && cur->crosses_call && spare_reg < 0 &&
+            !inelig[cur->value] && csa_work <= CSA_BUDGET &&
+            !(csa_max >= 0 && csa_done >= csa_max)) {
+          double price = remat_ok(s, cur->value)
+                             ? weight[cur->value] * remat_discount(s, cur->value)
+                             : (csa_lat ? wlat[cur->value] : weight[cur->value]);
+          if (victim_reg >= 0 && victim_w < price) price = victim_w;
+          csa_cost = csa_crossing_cost(cur, R, num[cur->value], call_pos,
+                                       call_depth, call_cold, NULL, ncalls,
+                                       csa_cold_div, &csa_work, NULL);
+          if (csa_cost * csa_margin < price || getenv("WARMC_CSA_FORCE"))
+            for (int k = 0; k < npool; k++) {
+              int rr = pool[k];
+
+              /* Callee-saved was already tried (and is no protection for a
+                 V128); the allocation fast path writes RA_ALLOC_RES_REG with
+                 no call. */
+              if (cur->cls
+                      ? fpr_is_callee_saved(rr)
+                      : (gpr_is_callee_saved(rr) || rr == RA_ALLOC_RES_REG))
+                continue;
+              if (occ_conflicts(&heaps[rr], cur, R, gone, ostack, &vic) != 0)
+                continue;
+              csa_reg = rr;
+              break;
+            }
+        }
+        if (spare_reg >= 0) {
+          chosen = spare_reg;
+        } else if (csa_reg >= 0) {
+          if (!s->csa_on) {
+            s->csa_on = xcalloc(n ? n : 1, 1);
+            s->csa_slot = xmalloc((n ? n : 1) * sizeof(int32_t));
+            for (uint32_t z = 0; z < n; z++) s->csa_slot[z] = -1;
+          }
+          cur->caller_saved_ok = 1;
+          s->csa_on[cur->value] = 1;
+          s->csa_slot[cur->value] = (int32_t)take_slot(s, cur->value, &slot);
+          g_stats.caller_saves++;
+          csa_done++;
+          if (csa_dbg)
+            fprintf(stderr, "csa[%u] v%u r%d cost=%.1f w=%.0f wl=%.0f\n",
+                    f->func_index, cur->value, csa_reg, csa_cost,
+                    weight[cur->value], wlat[cur->value]);
+          chosen = csa_reg;
+        } else if (victim_reg < 0) {
+
+          if (remat_ok(s, cur->value)) {
+            s->loc[cur->value] = LOC_NONE;
+            continue;
+          }
+          s->loc[cur->value] = SLOT(take_slot(s, cur->value, &slot));
+          g_stats.spills++;
+          if (cur->crosses_call && v128) g_stats.spills_v128_xcall++;
+          if (getenv("WARMC_SPILL_DEBUG"))
+            spill_debug(s, "self", cur, weight[cur->value]);
+          continue;
+        } else {
+          Interval *victim = &sorted[victim_idx];
+          gone[victim_idx] = 1;
+          if (s->csa_on && s->csa_on[victim->value]) {
+
+            /* Its saves are never emitted; the slot it holds becomes the spill
+               slot below or is abandoned. */
+            s->csa_on[victim->value] = 0;
+            victim->caller_saved_ok = 0;
+            g_stats.caller_saves--;
+          }
+          if (remat_ok(s, victim->value))
+            s->loc[victim->value] = LOC_NONE;
+          else {
+            int32_t reuse = s->csa_slot ? s->csa_slot[victim->value] : -1;
+            s->loc[victim->value] =
+                SLOT(reuse >= 0 ? (uint32_t)reuse
+                                : take_slot(s, victim->value, &slot));
+            g_stats.spills++;
+            if (getenv("WARMC_SPILL_DEBUG"))
+              spill_debug(s, "evict", victim, weight[victim->value]);
+          }
+          chosen = victim_reg;
+        }
       }
-      if (csa_reg >= 0) {
+
+      if (cur->end > ends[chosen]) ends[chosen] = cur->end;
+      owner[chosen] = (int32_t)i;
+      {
+        OccHeap *h = &heaps[chosen];
+        if (cur->rcount)
+          for (uint32_t y = 0; y < cur->rcount; y++)
+            occ_push(h, R[cur->rfirst + y].lo, R[cur->rfirst + y].hi, (int32_t)i);
+        else
+          occ_push(h, cur->start, cur->end, (int32_t)i);
+        if (h->dead > h->n / 2) occ_rebuild(h, gone, cur->start);
+      }
+      s->loc[cur->value] = chosen;
+      if (cur->cls) { if (fpr_is_callee_saved(chosen)) s->used_fpr_cs |= 1u << chosen; }
+      else { if (gpr_is_callee_saved(chosen)) s->used_gpr_cs |= 1u << chosen; }
+    }
+    /* Second chance: an interval that spilled itself because a register was
+       held then may find that register free after all, once the holder was
+       evicted later in the scan.  The scan's heaps forget ranges behind it, so
+       this pass rebuilds each register's full assignment as a range list and
+       places the self-spilled intervals, heaviest first, into any register
+       free over all of their ranges -- not an evicted one, whose ranges the
+       heaps still hold under the register it lost, and not a spare register,
+       which only a value read in a loop may take. */
+    {
+      bool no_refill = getenv("WARMC_NO_REFILL") != NULL;
+      RList rl[2][32];
+      memset(rl, 0, sizeof rl);
+      RefillCand *rc = xmalloc((ns ? ns : 1) * sizeof(RefillCand));
+      uint32_t nrc = 0;
+      for (uint32_t i = 0; i < ns; i++) {
+        const Interval *X = &sorted[i];
+        int l = s->loc[X->value];
+        if (l == LOC_NONE || IS_SLOT(l)) {
+          if (!gone[i]) { rc[nrc].idx = i; rc[nrc].w = weight[X->value]; nrc++; }
+          continue;
+        }
+        RList *L = &rl[X->cls ? 1 : 0][l];
+        if (X->rcount)
+          for (uint32_t y = 0; y < X->rcount; y++)
+            rl_add(L, R[X->rfirst + y].lo, R[X->rfirst + y].hi, false);
+        else
+          rl_add(L, X->start, X->end, false);
+      }
+      for (int c = 0; c < 2; c++)
+        for (int r = 0; r < 32; r++)
+          if (rl[c][r].n > 1)
+            qsort(rl[c][r].v, rl[c][r].n, sizeof(Range), split_range_cmp);
+      if (!no_refill) qsort(rc, nrc, sizeof(RefillCand), refill_cmp);
+      for (uint32_t a = 0; a < nrc && !no_refill; a++) {
+        Interval *X = &sorted[rc[a].idx];
+        bool v128 = (ValType)f->insts[X->value].type == VT_V128;
+        const int *pool = X->cls ? FPR_ALLOC : gpool;
+        int npool = X->cls ? NFPR_ALLOC : ngpool;
+        Range whole = { X->start, X->end };
+        const Range *xr = X->rcount ? &R[X->rfirst] : &whole;
+        uint32_t nx = X->rcount ? X->rcount : 1;
+        int got = -1;
+        for (int pass = 0; pass < 2 && got < 0; pass++)
+          for (int k = 0; k < npool && got < 0; k++) {
+            int rr = pool[k];
+            bool cs = X->cls ? fpr_is_callee_saved(rr) : gpr_is_callee_saved(rr);
+            if (X->crosses_call && (v128 || !cs)) continue;
+            if (!X->cls && ((spare >> rr) & 1)) continue;
+            bool want_cs = X->crosses_call ? true : (pass == 1);
+            if (cs != want_cs) continue;
+            bool clear = true;
+            for (uint32_t y = 0; y < nx && clear; y++)
+              clear = rl_free(&rl[X->cls ? 1 : 0][rr], xr[y].lo, xr[y].hi);
+            if (clear) got = rr;
+          }
+        if (got < 0) continue;
+        for (uint32_t y = 0; y < nx; y++) {
+          rl_add(&rl[X->cls ? 1 : 0][got], xr[y].lo, xr[y].hi, true);
+          occ_push(&(X->cls ? fpr_occ : gpr_occ)[got], xr[y].lo, xr[y].hi,
+                   (int32_t)rc[a].idx);
+        }
+        if (IS_SLOT(s->loc[X->value])) g_stats.spills--;
+        s->loc[X->value] = got;
+        if (X->cls) { if (fpr_is_callee_saved(got)) s->used_fpr_cs |= 1u << got; }
+        else { if (gpr_is_callee_saved(got)) s->used_gpr_cs |= 1u << got; }
+      }
+      for (int c = 0; c < 2; c++)
+        for (int r = 0; r < 32; r++) xfree(rl[c][r].v);
+      xfree(rc);
+    }
+    if (final) break;
+    /* The price of this pass's assignment: what its values without a
+       register of their own will execute -- a spill's store and one reload
+       per segment of reads (wlat), a rematerialisation's sequence per
+       segment, a caller save's two frame operations per call it spans --
+       plus a prologue save and epilogue restore per callee-saved register
+       the function did not need before. */
+    {
+      double cost = 0;
+      uint64_t cw2 = 0;
+      for (uint32_t i = 0; i < ns; i++) {
+        const Interval *X = &sorted[i];
+        Ref v = X->value;
+        int l = s->loc[v];
+        if (l == LOC_NONE) {
+          Inst *ri = &f->insts[v];
+          double per = 1.0;
+          if (ri->op == I_CONST && !vt_is_float((ValType)ri->type) &&
+              (ValType)ri->type != VT_V128)
+            per = ir_const_cost(ri->imm, vt_is_64((ValType)ri->type));
+          else if (ri->op == I_GLOBAL_GET) per = 2.0;
+          else if (vt_is_float((ValType)ri->type) || (ValType)ri->type == VT_V128)
+            per = 2.0;
+          /* one rebuild per segment of reads, the way wlat counts reloads:
+             the pieces hold a rebuilt value across a cluster */
+          double segs = wlat[v] - wdef[v];
+          cost += per * (segs < wuse[v] ? segs : wuse[v]);
+        } else if (IS_SLOT(l)) {
+          cost += wlat[v];
+        } else if (X->caller_saved_ok) {
+          cost += csa_crossing_cost(X, R, num[v], call_pos, call_depth, call_cold,
+                                    NULL, ncalls, csa_cold_div, &cw2, NULL);
+        }
+      }
+      cost += 2.0 * (double)(__builtin_popcount(s->used_gpr_cs & ~used_gcs0) +
+                             __builtin_popcount(s->used_fpr_cs & ~used_fcs0));
+      if (trial_dbg)
+        fprintf(stderr, "ratrial[%u] rule %d cost %.1f\n", f->func_index, trial, cost);
+      if (trial == 0) { best_cost = cost; best_rule = 0; base_cost = cost; }
+      else if (cost < best_cost * (1 - 1e-9) && cost < RA_TRIAL_MARGIN * base_cost) {
+        best_cost = cost; best_rule = trial;
+      }
+    }
+  }
+  if (trial_dbg && ntrial)
+    fprintf(stderr, "ratrial[%u] chose %d\n", f->func_index, best_rule);
+
+  /* ---- callee-saved registers the prologue need not save ----
+     A callee-saved register costs a save and a restore on every run of the
+     function; a caller-saved one saved around a call costs them only where
+     the call is.  When every value holding callee-saved registers crosses
+     calls only on paths few of the function's runs take -- the growth path
+     of a push inlined into a leaf that a loop calls -- the prologue pays
+     more than saving them around those calls would, and the registers are
+     given up: each one's values move to a caller-saved register free for
+     all of them, and are saved around the calls they cross.  The paths are
+     priced by ir_path_share, each crossing twice over for the reload it
+     puts after its call, and only a prologue that really shrinks counts --
+     a pair of registers saves as one instruction where the target pairs
+     them.  A value crossing a call in a loop stays where it is: a loop
+     behind a chain of early returns -- trial division by the small primes
+     before the loop over the rest -- is what the even split most
+     underprices, and a loop multiplies the error. */
+  if (csa_ok && ncalls) {
+    /* the GPR intervals holding each register, chained */
+    int32_t head[32];
+    int32_t *next = xmalloc((ns ? ns : 1) * sizeof(int32_t));
+    for (int r = 0; r < 32; r++) head[r] = -1;
+    for (uint32_t i = 0; i < ns; i++) {
+      int l = s->loc[sorted[i].value];
+      if (gone[i] || sorted[i].cls || l == LOC_NONE || IS_SLOT(l) || l >= 32)
+        continue;
+      next[i] = head[l];
+      head[l] = (int32_t)i;
+    }
+
+    struct { int reg, home; double cost; } vac[32];
+    int nvac = 0;
+    for (int k = 0; k < ngpool && nvac < 32; k++) {
+      int rr = gpool[k];
+      if (!gpr_is_callee_saved(rr) || !(s->used_gpr_cs & (1u << rr))) continue;
+      double c = 0;
+      bool ok = true;
+      for (int32_t i = head[rr]; i >= 0 && ok; i = next[i]) {
+        Interval *x = &sorted[i];
+        if (!x->crosses_call) continue;
+        uint8_t deepest;
+        c += 2.0 * csa_crossing_cost(x, R, num[x->value], call_pos,
+                                     call_depth, call_cold, call_share,
+                                     ncalls, csa_cold_div, &csa_work,
+                                     &deepest);
+        ok = !inelig[x->value] && !deepest;
+      }
+      if (!ok) continue;
+      int j = nvac++;
+      while (j && vac[j - 1].cost > c) { vac[j] = vac[j - 1]; j--; }
+      vac[j].reg = rr; vac[j].home = -1; vac[j].cost = c;
+    }
+
+    /* The cheapest prefix whose prologue saving outweighs its crossings,
+       cut short at the first register no caller-saved one can take in --
+       checked against every interval holding the candidate, range by
+       range, since the heaps have shed what the scan left behind. */
+    uint32_t keep = s->used_gpr_cs;
+    int before = ra_cs_frame_ops(s), take = 0;
+    double best = 0, cost = 0;
+    uint32_t homes = 0;
+    for (int t = 0; t < nvac; t++) {
+      for (int k = 0; k < ngpool && vac[t].home < 0; k++) {
+        int c = gpool[k];
+        if (gpr_is_callee_saved(c) || c == RA_ALLOC_RES_REG ||
+            (homes & (1u << c)))
+          continue;
+        bool fits = true;
+        for (int32_t i = head[vac[t].reg]; i >= 0 && fits; i = next[i])
+          for (int32_t j = head[c]; j >= 0 && fits; j = next[j])
+            fits = !iv_overlaps(&sorted[i], &sorted[j], R);
+        if (fits) vac[t].home = c;
+      }
+      if (vac[t].home < 0) break;
+      homes |= 1u << vac[t].home;
+      s->used_gpr_cs &= ~(1u << vac[t].reg);
+      cost += vac[t].cost;
+      double gain = (double)(before - ra_cs_frame_ops(s)) - cost;
+      if (gain > best) { best = gain; take = t + 1; }
+    }
+    s->used_gpr_cs = keep;
+    for (int t = 0; t < take; t++) {
+      int rr = vac[t].reg, c = vac[t].home;
+      for (int32_t i = head[rr]; i >= 0; i = next[i]) {
+        Interval *x = &sorted[i];
+        if (x->rcount)
+          for (uint32_t y = 0; y < x->rcount; y++)
+            occ_push(&gpr_occ[c], R[x->rfirst + y].lo, R[x->rfirst + y].hi, i);
+        else
+          occ_push(&gpr_occ[c], x->start, x->end, i);
+        s->loc[x->value] = c;
+        if (!x->crosses_call) continue;
         if (!s->csa_on) {
           s->csa_on = xcalloc(n ? n : 1, 1);
           s->csa_slot = xmalloc((n ? n : 1) * sizeof(int32_t));
           for (uint32_t z = 0; z < n; z++) s->csa_slot[z] = -1;
         }
-        cur->caller_saved_ok = 1;
-        s->csa_on[cur->value] = 1;
-        s->csa_slot[cur->value] = (int32_t)take_slot(s, cur->value, &slot);
+        x->caller_saved_ok = 1;
+        s->csa_on[x->value] = 1;
+        s->csa_slot[x->value] = (int32_t)take_slot(s, x->value, &slot);
         g_stats.caller_saves++;
-        csa_done++;
         if (csa_dbg)
-          fprintf(stderr, "csa[%u] v%u r%d cost=%.1f w=%.0f wl=%.0f\n",
-                  f->func_index, cur->value, csa_reg, csa_cost,
-                  weight[cur->value], wlat[cur->value]);
-        chosen = csa_reg;
-      } else if (victim_reg < 0) {
+          fprintf(stderr, "csa[%u] v%u r%d vacates r%d\n", f->func_index,
+                  x->value, c, rr);
+      }
+      gpr_occ[rr].n = 0;
+      s->used_gpr_cs &= ~(1u << rr);
+    }
+    xfree(next);
+  }
 
-        if (remat_ok(s, cur->value)) {
-          s->loc[cur->value] = LOC_NONE;
-          continue;
+  /* ---- use-cluster pieces ----
+     A value left without a register of its own reloads, or is rebuilt, at
+     every read the reload cache misses.  Where it is read several times in
+     one block with no call between, a register free across that stretch --
+     the range lists know every assignment -- can hold it instead, filled
+     once before the first read (isel's piece_fill).  Clusters are placed
+     heaviest first; a piece only ever takes a register nothing else holds
+     there, so it cannot cost a spill, and no callee-saved register the
+     function does not already save. */
+  bool pc_fn_ok = true;
+  {
+    const char *r = getenv("WARMC_PIECES_FUNCS");
+    unsigned lo = 0, hi = ~0u;
+    if (r && sscanf(r, "%u-%u", &lo, &hi) >= 1 &&
+        (f->func_index < lo || f->func_index > hi)) pc_fn_ok = false;
+  }
+  if (pc_fn_ok && RA_HAVE_PIECES && !getenv("WARMC_NO_PIECES")) {
+    /* every register's assignment, as the vacating pass left it */
+    RList rl[2][32];
+    memset(rl, 0, sizeof rl);
+    for (uint32_t i = 0; i < ns; i++) {
+      const Interval *X = &sorted[i];
+      int l = s->loc[X->value];
+      if (l == LOC_NONE || IS_SLOT(l) || l >= 32) continue;
+      RList *L = &rl[X->cls ? 1 : 0][l];
+      if (X->rcount)
+        for (uint32_t y = 0; y < X->rcount; y++)
+          rl_add(L, R[X->rfirst + y].lo, R[X->rfirst + y].hi, false);
+      else
+        rl_add(L, X->start, X->end, false);
+    }
+    for (int c = 0; c < 2; c++)
+      for (int r = 0; r < 32; r++)
+        if (rl[c][r].n > 1)
+          qsort(rl[c][r].v, rl[c][r].n, sizeof(Range), split_range_cmp);
+    PieceUse *pu = NULL; uint32_t npu = 0, cap_pu = 0;
+    PieceCand *pcd = NULL; uint32_t npcd = 0, cap_pcd = 0;
+    uint32_t *clob = NULL; uint32_t cap_clob = 0;
+    for (uint32_t oi = 0; oi < f->norder; oi++) {
+      uint32_t bi = f->order[oi];
+      Block *b = &f->blocks[bi];
+      if (!b->reachable || b->ninsts < 2) continue;
+      if (b->ninsts + 1 > cap_clob) {
+        cap_clob = b->ninsts + 1;
+        clob = xrealloc(clob, cap_clob * sizeof(uint32_t));
+      }
+      npu = 0;
+      clob[0] = 0;
+      for (uint32_t i = 0; i < b->ninsts; i++) {
+        Ref r = b->insts[i];
+        /* A call marshals its arguments into fixed registers, a piece's
+           among them, so its reads are no piece's and a piece never spans
+           one; a tail call likewise. */
+        uint16_t rop = f->insts[r].op;
+        bool barrier = op_clobbers_caller_saved(rop) || rop == I_RETURN_CALL ||
+                       rop == I_RETURN_CALL_INDIRECT || rop == I_RETURN_CALL_REF;
+        clob[i + 1] = clob[i] + (barrier ? 1 : 0);
+        if (barrier) continue;
+        uint32_t ne = eff_uses(s, f, r, eu, eucap);
+        for (uint32_t j = 0; j < ne; j++) {
+          Ref u = eu[j];
+          if (u >= n || num[u] < 0 || iv[web[u]].end < 0) continue;
+          if (!value_needs_location(f, u) || skip_location(s, u) || s->pinned[u])
+            continue;
+          int l = s->loc[web[u]];
+          if (l != LOC_NONE && !IS_SLOT(l)) continue;
+          if (npu == cap_pu) {
+            cap_pu = cap_pu ? cap_pu * 2 : 64;
+            pu = xrealloc(pu, cap_pu * sizeof(PieceUse));
+          }
+          pu[npu].v = u; pu[npu].i = i; npu++;
         }
-        s->loc[cur->value] = SLOT(take_slot(s, cur->value, &slot));
-        g_stats.spills++;
-        if (cur->crosses_call && v128) g_stats.spills_v128_xcall++;
-        if (getenv("WARMC_SPILL_DEBUG"))
-          spill_debug(s, "self", cur, weight[cur->value]);
-        continue;
-      } else {
-        Interval *victim = &sorted[victim_idx];
-        gone[victim_idx] = 1;
-        if (s->csa_on && s->csa_on[victim->value]) {
-
-          /* Its saves are never emitted; the slot it holds becomes the spill
-             slot below or is abandoned. */
-          s->csa_on[victim->value] = 0;
-          victim->caller_saved_ok = 0;
-          g_stats.caller_saves--;
+      }
+      qsort(pu, npu, sizeof(PieceUse), piece_use_cmp);
+      double w = 1.0;
+      for (uint32_t k = 0; k < b->loop_depth && k < 8; k++) w *= 10.0;
+      if (b->cold) w = 0.01;
+      /* each value's reads, split into runs with no barrier between */
+      for (uint32_t c0 = 0; c0 < npu;) {
+        uint32_t c1 = c0, npos = 1;
+        while (c1 + 1 < npu && pu[c1 + 1].v == pu[c0].v &&
+               clob[pu[c1 + 1].i] == clob[pu[c0].i]) {
+          if (pu[c1 + 1].i != pu[c1].i) npos++;
+          c1++;
         }
-        if (remat_ok(s, victim->value))
-          s->loc[victim->value] = LOC_NONE;
-        else {
-          int32_t reuse = s->csa_slot ? s->csa_slot[victim->value] : -1;
-          s->loc[victim->value] =
-              SLOT(reuse >= 0 ? (uint32_t)reuse
-                              : take_slot(s, victim->value, &slot));
-          g_stats.spills++;
-          if (getenv("WARMC_SPILL_DEBUG"))
-            spill_debug(s, "evict", victim, weight[victim->value]);
+        if (npos >= 2) {
+          if (npcd == cap_pcd) {
+            cap_pcd = cap_pcd ? cap_pcd * 2 : 64;
+            pcd = xrealloc(pcd, cap_pcd * sizeof(PieceCand));
+          }
+          pcd[npcd++] = (PieceCand){ pu[c0].v, bi, pu[c0].i, pu[c1].i,
+                                     w * (double)(npos - 1) };
         }
-        chosen = victim_reg;
+        c0 = c1 + 1;
       }
     }
-
-    if (cur->end > ends[chosen]) ends[chosen] = cur->end;
-    owner[chosen] = (int32_t)i;
-    {
-      OccHeap *h = &heaps[chosen];
-      if (cur->rcount)
-        for (uint32_t y = 0; y < cur->rcount; y++)
-          occ_push(h, R[cur->rfirst + y].lo, R[cur->rfirst + y].hi, (int32_t)i);
-      else
-        occ_push(h, cur->start, cur->end, (int32_t)i);
-      if (h->dead > h->n / 2) occ_rebuild(h, gone, cur->start);
+    qsort(pcd, npcd, sizeof(PieceCand), piece_cand_cmp);
+    struct Piece *pcs = xmalloc((npcd ? npcd : 1) * sizeof(struct Piece));
+    uint32_t npcs = 0;
+    for (uint32_t x = 0; x < npcd; x++) {
+      PieceCand *c = &pcd[x];
+      int cl = s->cls[c->v];
+      int32_t plo = blk_start[c->block] + 1 + (int32_t)c->lo;
+      int32_t phi = blk_start[c->block] + 1 + (int32_t)c->hi;
+      const int *pool = cl ? FPR_ALLOC : gpool;
+      int npool = cl ? NFPR_ALLOC : ngpool;
+      int got = -1;
+      /* no callee-saved register the function does not save already, and
+         not the register the allocation fast path writes */
+      for (int k = 0; k < npool && got < 0; k++) {
+        int rr = pool[k];
+        if (cl ? (fpr_is_callee_saved(rr) && !(s->used_fpr_cs & (1u << rr)))
+               : ((gpr_is_callee_saved(rr) && !(s->used_gpr_cs & (1u << rr))) ||
+                  rr == RA_ALLOC_RES_REG))
+          continue;
+        if (rl_free(&rl[cl ? 1 : 0][rr], plo, phi)) got = rr;
+      }
+      if (got < 0) continue;
+      rl_add(&rl[cl ? 1 : 0][got], plo, phi, true);
+      pcs[npcs++] = (struct Piece){ c->v, c->block, c->lo, c->hi, got };
     }
-    s->loc[cur->value] = chosen;
-    if (cur->cls) { if (fpr_is_callee_saved(chosen)) s->used_fpr_cs |= 1u << chosen; }
-    else { if (gpr_is_callee_saved(chosen)) s->used_gpr_cs |= 1u << chosen; }
+    if (npcs) {
+      qsort(pcs, npcs, sizeof(struct Piece), piece_cmp);
+      s->pc = pcs;
+      s->npc = npcs;
+      s->pc_bfirst = xcalloc(f->nblocks ? f->nblocks : 1, sizeof(uint32_t));
+      s->pc_bn = xcalloc(f->nblocks ? f->nblocks : 1, sizeof(uint32_t));
+      s->pc_head = xmalloc((n ? n : 1) * sizeof(int32_t));
+      s->pc_next = xmalloc(npcs * sizeof(int32_t));
+      for (uint32_t z = 0; z < n; z++) s->pc_head[z] = -1;
+      for (uint32_t x = npcs; x-- > 0;) {
+        struct Piece *pp = &pcs[x];
+        s->pc_next[x] = s->pc_head[pp->v];
+        s->pc_head[pp->v] = (int32_t)x;
+        s->pc_bfirst[pp->block] = x;
+        s->pc_bn[pp->block]++;
+      }
+      g_stats.pieces += npcs;
+    } else {
+      xfree(pcs);
+    }
+    xfree(pu); xfree(pcd); xfree(clob);
+  for (int c = 0; c < 2; c++)
+      for (int r = 0; r < 32; r++) xfree(rl[c][r].v);
   }
 
   /* ---- split planning, first allocation only ----
@@ -1292,9 +1961,21 @@ static void regalloc_linear(Isel *s) {
      and check a register is genuinely free there -- the occupancy heaps
      hold every assignment the scan just made.  Two shapes go in the plan:
      a header param of a spilled web is cut from its entry edges (veto),
+     and from the params outside the loop that what it carries flows into,
      and a slot-resident value defined outside the loop but used inside is
      threaded through a new header param.  The plan only ever asks; the
-     retry's allocation decides. */
+     retry's allocation decides.
+
+     By default only the first shape runs, and only for loops that make no
+     call.  A merged function -- five callees inlined into one loop -- is
+     where it pays: a callee's accumulator is coalesced with the param that
+     receives its result after the loop and carries it past every callee
+     inlined behind it, and when one of those is a register-hungry nest
+     the whole web is spilled, the hot loop's update included (rsbench
+     itadapt, a running sum loaded and stored seven times an iteration).
+     Out of line, the return is that cut.  In a loop that calls, the piece
+     can only win a callee-saved register by shuffling the neighbours that
+     held one, and that is what the opt-in plan measured losing. */
   if (s->split_collect && s->split_sc) {
     SplitCtl *sc = s->split_sc;
     const char *sp_only = getenv("WARMC_SPLIT_ONLY");
@@ -1303,8 +1984,8 @@ static void regalloc_linear(Isel *s) {
     const char *sp_rungs_s = getenv("WARMC_SPLIT_RUNGS");
     const char *sp_clob_s = getenv("WARMC_SPLIT_CLOB");
     int sp_max = sp_max_s ? atoi(sp_max_s) : -1, sp_done = 0;
-    int sp_rungs = sp_rungs_s ? atoi(sp_rungs_s) : 3;
-    int sp_clob = sp_clob_s ? atoi(sp_clob_s) : -1;
+    int sp_rungs = sp_rungs_s ? atoi(sp_rungs_s) : sc->full ? 3 : 1;
+    int sp_clob = sp_clob_s ? atoi(sp_clob_s) : sc->full ? -1 : 0;
     bool sp_mand = getenv("WARMC_SPLIT_MAND") != NULL;
     const char *sp_room_s = getenv("WARMC_SPLIT_HEADROOM");
     int sp_room = sp_room_s ? atoi(sp_room_s) : 0;
@@ -1324,6 +2005,8 @@ static void regalloc_linear(Isel *s) {
       uint8_t *planned = xcalloc(n ? n : 1, 1);
       SplitCand *cand = NULL;
       uint32_t cap_cand = 0;
+      Ref *xm = NULL;
+      uint32_t cap_xm = 0;
       uint32_t stamp_ctr = 0;
       uint64_t swork = 0;
 
@@ -1408,8 +2091,40 @@ static void regalloc_linear(Isel *s) {
 
         uint32_t ncand = 0;
 
-        /* the loop-carried shape: a header param of a spilled web whose
-           entry edges really joined it */
+        /* The exit merges, wanted once some header param's web is spilled:
+           each param outside the loop that a value defined in it reaches
+           along a forward edge and was coalesced with.  A backward one --
+           an exit straight to an enclosing header -- is not something the
+           veto cuts, and leaves its web joined. */
+        uint32_t nxm = 0;
+        bool want_xm = false;
+        for (uint32_t pi = 0; pi < hd->nparams && (sp_rungs & 1); pi++) {
+          Ref q = hd->params[pi];
+          want_xm |= iv[web[q]].end >= 0 && IS_SLOT(s->loc[web[q]]);
+        }
+        for (uint32_t oi2 = 0; want_xm && oi2 < f->norder; oi2++) {
+          Block *eb = &f->blocks[f->order[oi2]];
+          for (uint32_t si = 0; si < eb->nsuccs; si++) {
+            Edge *e2 = &eb->succs[si];
+            Block *tb = &f->blocks[e2->target];
+            if (member[e2->target] || e2->eh || eb->rpo >= tb->rpo) continue;
+            swork += e2->nargs;
+            for (uint32_t j2 = 0; j2 < e2->nargs && j2 < tb->nparams; j2++) {
+              Ref av = e2->args[j2], P = tb->params[j2];
+              if (!member[f->insts[av].block] || web[av] != web[P] ||
+                  s->pinned[P])
+                continue;
+              if (nxm == cap_xm) {
+                cap_xm = cap_xm ? cap_xm * 2 : 16;
+                xm = xrealloc(xm, cap_xm * sizeof(Ref));
+              }
+              xm[nxm++] = P;
+            }
+          }
+        }
+
+        /* the loop-carried shape: a header param of a spilled web that its
+           entry edges or its exit merges really joined */
         if (sp_rungs & 1)
           for (uint32_t pi = 0; pi < hd->nparams; pi++) {
             Ref q = hd->params[pi];
@@ -1419,6 +2134,8 @@ static void regalloc_linear(Isel *s) {
             if (iv[rep].end < 0 || !IS_SLOT(s->loc[rep])) continue;
             if ((ValType)f->insts[q].type == VT_V128 && lclob) continue;
             bool joined = false;
+            for (uint32_t k2 = 0; k2 < nxm && !joined; k2++)
+              joined = web[xm[k2]] == rep;
             for (uint32_t p = 0; p < hd->npreds && !joined; p++) {
               uint32_t pb = hd->preds[p];
               if (!f->blocks[pb].reachable || member[pb]) continue;
@@ -1535,6 +2252,21 @@ static void regalloc_linear(Isel *s) {
             }
             sc->cutp[sc->ncut++] = c2->v;
             g_stats.split_cuts++;
+            for (uint32_t k2 = 0; k2 < nxm; k2++) {
+              if (web[xm[k2]] != web[c2->v]) continue;
+              sc->veto[xm[k2]] = 1;
+              if (sc->nxcut == sc->cap_xcut) {
+                sc->cap_xcut = sc->cap_xcut ? sc->cap_xcut * 2 : 8;
+                sc->xcutp = xrealloc(sc->xcutp, sc->cap_xcut * sizeof(Ref));
+                sc->xcut_hdr =
+                    xrealloc(sc->xcut_hdr, sc->cap_xcut * sizeof(Ref));
+              }
+              sc->xcutp[sc->nxcut] = xm[k2];
+              sc->xcut_hdr[sc->nxcut++] = c2->v;
+              if (sp_dbg)
+                fprintf(stderr, "split[%u] exit v%u for v%u\n", f->func_index,
+                        xm[k2], c2->v);
+            }
           } else {
             if (sc->nadd == sc->cap_add) {
               sc->cap_add = sc->cap_add ? sc->cap_add * 2 : 8;
@@ -1558,12 +2290,16 @@ static void regalloc_linear(Isel *s) {
       }
       xfree(member); xfree(mstack); xfree(mblk); xfree(mrng);
       xfree(ustamp); xfree(uw); xfree(umand); xfree(uvals); xfree(planned);
-      xfree(cand);
+      xfree(cand); xfree(xm);
     }
   }
 
   xfree(weight);
   xfree(wlat);
+  xfree(wuse);
+  xfree(wdef);
+  xfree(cumf);
+  xfree(cumc[0]); xfree(cumc[1]);
 
 
   if (getenv("WARMC_VERIFY_RA")) {
@@ -1788,6 +2524,7 @@ static void regalloc_linear(Isel *s) {
   xfree(eu);
   xfree(num); xfree(iv); xfree(sorted); xfree(blk_start); xfree(blk_end);
   xfree(call_pos); xfree(call_depth); xfree(call_cold); xfree(inelig);
+  xfree(call_share); xfree(bshare);
   xfree(hint); xfree(web_hint);
 }
 

@@ -157,9 +157,15 @@ typedef enum {
 #define ARRO_SEG(x)    ((uint32_t)((x) >> 2))
 #define ARRO_MK(k, seg) ((uint64_t)(k) | ((uint64_t)(seg) << 2))
 
+/* A ref.test's imm: the runtime's kind and the target's subtyping depth,
+   which are what the runtime is asked, and the heap type tested for, which is
+   what the optimiser compares one test's proof with another's. */
 #define RTEST_KIND(x)  ((uint32_t)((x) & 0xffu))
-#define RTEST_DEPTH(x) ((uint32_t)((x) >> 8))
-#define RTEST_MK(kind, depth) ((uint64_t)(kind) | ((uint64_t)(depth) << 8))
+#define RTEST_DEPTH(x) ((uint32_t)(((x) >> 8) & 0xffffffu))
+#define RTEST_HEAP(x)  ((HeapType)(int32_t)(uint32_t)((x) >> 32))
+#define RTEST_MK(kind, depth, ht)                                    \
+  ((uint64_t)(kind) | ((uint64_t)(depth) << 8) |                     \
+   ((uint64_t)(uint32_t)(ht) << 32))
 
 #define VLANE_I8   0u
 #define VLANE_I16  1u
@@ -266,6 +272,11 @@ typedef struct {
 
   uint32_t *order; uint32_t norder, cap_order;
 
+  /* The bytes each small loop the arm64 back end aligned turned out to
+     take, by header block, from one emission for the next (see fit_pad in
+     isel.c); NULL when not measured. */
+  uint16_t *loop_bytes;
+
   struct IrChunk *chunks;
   char *bump;
   size_t bump_left;
@@ -308,6 +319,7 @@ typedef struct { uint32_t *off, *src, *si; } IrEdgeIdx;
 IrEdgeIdx ir_edge_index(IrFunc *f);
 void ir_edge_index_free(IrEdgeIdx *x);
 void ir_order(IrFunc *f);
+void ir_path_share(const IrFunc *f, float *share);
 
 int ir_succ_score(const IrFunc *f, const Block *b, uint32_t si);
 const char *ir_op_name(uint16_t op);
@@ -347,6 +359,7 @@ typedef struct {
   bool align;
   bool guard_pages;
   bool regalloc;
+  bool split;      /* cut a spilled loop web where the loop meets the rest */
   bool vectorize;
   bool selftail;
   bool ldcomb;
@@ -431,7 +444,7 @@ typedef struct {
 
   uint64_t bar_masks, bar_elided;
   uint64_t caller_saves, csa_restores, spills_v128_xcall, range_budget_trips;
-  uint64_t split_cuts, split_invs;
+  uint64_t split_cuts, split_invs, pieces;
   uint64_t devirt_ref, devirt_indirect, devirt_null_kept;
   uint64_t const_reads, throw_jumps, inl_more;
   uint64_t inl_flat, inl_spliced, inl_once_forced, inl_retcall_sites;

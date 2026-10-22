@@ -101,6 +101,27 @@ static bool describe_compare(Isel *s, Ref v, int *kind, Ref *ra, Ref *rb,
 
 static void emit_compare_raw(Isel *s, Ref v);
 
+/* Whether a compare's 0/1 is never read: every use of it is a select on it,
+   and those selects are the instructions right after it.  Each then reads the
+   flags the compare set -- a select and the operand reads before it emit
+   loads, moves and csel-family instructions, none of which write the flags --
+   so the cset would be dead, and it is what argmin's loop would spend an
+   issue slot on per element. */
+static bool flags_only(Isel *s, Ref v) {
+  IrFunc *f = s->f;
+  Block *b = &f->blocks[s->cur_block];
+  uint32_t n = s->uses[v], at = s->cur_pos;
+  if (n == 0 || at + n >= b->ninsts || b->insts[at] != v) return false;
+  for (uint32_t k = 1; k <= n; k++) {
+    Ref u = b->insts[at + k];
+    Ref *a = ir_args(f, u);
+    if (f->insts[u].op != I_SELECT || a[2] != v || a[0] == v || a[1] == v ||
+        s->paired[u])
+      return false;
+  }
+  return true;
+}
+
 static void emit_compare(Isel *s, Ref v) {
   int kind, sf;
   Ref ra, rb;
@@ -424,6 +445,9 @@ static void emit_inst(Isel *s, Ref v) {
           int sh = (int)(f->insts[ca[1]].imm % (uint64_t)(sf ? 64 : 32));
           if (in->op == I_ADD) a64_add_reg_lsl(B, sf, d, x, y, sh);
           else a64_sub_reg_lsl(B, sf, d, x, y, sh);
+        } else if (ci->op == I_EXTENDU || ci->op == I_EXTENDS || ci->op == I_EXT32S) {
+          int y = rd(s, ca[0], S1);
+          a64_addsub_extw(B, in->op == I_SUB, d, x, y, ci->op != I_EXTENDU, 0);
         } else {
           int y = rd(s, ca[0], S1), z = rd(s, ca[1], S3);
           if (in->op == I_ADD) a64_madd(B, sf, d, y, z, x);
@@ -458,6 +482,17 @@ static void emit_inst(Isel *s, Ref v) {
     case I_AND: case I_OR: case I_XOR: {
 
       if (emit_bfx(s, v)) break;
+
+      if (s->extr && s->extr[v]) {
+        Ref *la = ir_args(f, a[0]), *ra = ir_args(f, a[1]);
+        int hi = rd(s, la[0], S0);
+        int lo = rd(s, ra[0], S1);
+        int d = wr(s, v, S2);
+        a64_extr(B, sf, d, hi, lo,
+                 (int)(f->insts[ra[1]].imm % (uint64_t)(sf ? 64 : 32)));
+        commit(s, v, d);
+        break;
+      }
 
       if (s->folded && s->folded[a[1]] && f->insts[a[1]].op == I_SELECT) {
         Ref *sa = ir_args(f, a[1]);
@@ -592,9 +627,11 @@ static void emit_inst(Isel *s, Ref v) {
       emit_compare(s, v);
       int d = wr(s, v, S0);
       int cc = cond_of(s, v);
-      a64_cset(B, SF32, d, cc);
+      bool bare = flags_only(s, v);
+      if (!bare) a64_cset(B, SF32, d, cc);
       commit(s, v, d);
-      s->cmp_ref = v; s->cmp_cc = cc; s->cmp_len = B->len;
+      s->cmp_ref = v; s->cmp_cc = cc; s->cmp_epoch = B->flags_epoch;
+      s->cmp_bare = bare ? v : REF_NONE;
       break;
     }
 
@@ -700,15 +737,22 @@ static void emit_inst(Isel *s, Ref v) {
 
       int cc = CC_NE;
       bool folded_cond = s->folded && s->folded[a[2]];
-      bool flags_live = s->cmp_ref == a[2] && s->cmp_len == B->len;
+      /* Not only the instruction after the compare: csel, cset and the moves
+         and loads between leave the flags alone, so every select on a
+         compare in the epoch it set -- argmin's index and minimum both --
+         reads them, and the minimum's chain is cmp, csel rather than cmp,
+         cset, cmp, csel. */
+      bool flags_live = s->cmp_ref == a[2] && s->cmp_epoch == B->flags_epoch;
       if (folded_cond) {
         emit_compare(s, a[2]);
         cc = cond_of(s, a[2]);
+      } else if (flags_live) {
+        cc = s->cmp_cc;
       } else {
-
+        if (a[2] == s->cmp_bare)
+          warmc_fatal("internal: the flags of compare v%u were lost before its select", a[2]);
         int c = rd(s, a[2], S2);
-        if (flags_live) cc = s->cmp_cc;
-        else a64_cmp_imm(B, SF32, c, 0);
+        a64_cmp_imm(B, SF32, c, 0);
       }
       if (is_vec_value(f, v)) {
 
@@ -1044,6 +1088,26 @@ static void emit_inst(Isel *s, Ref v) {
         a64_vxtn(B, 0, 2, F3, ly);
         a64_vumlal(B, 0, 2, F2, FTMP, F3);
         commit(s, v, F2);
+        break;
+      }
+      if (in->op == I_VOR && s->vrot && s->vrot[v]) {
+        /* The shifts are folded (analyse_immediates): a[0] is the left one.
+           The source dies at the earliest here, so the result never shares
+           its register, which the two-instruction form needs. */
+        Inst *sh = &f->insts[a[0]];
+        int sz = VLANE_SIZE(sh->imm2), k = s->vrot[v], lane = 8 << sz;
+        int x = rd(s, ir_args(f, a[0])[0], F0);
+        int d = wr(s, v, F2);
+        if (2 * k == lane && sz > 0) {
+          if (sz == 1) a64_vrev16(B, d, x);
+          else if (sz == 2) a64_vrev32(B, 1, d, x);
+          else a64_vrev64(B, 2, d, x);
+        } else {
+          if (d == x) d = F2;
+          a64_vushr_imm(B, sz, d, x, lane - k);
+          a64_vsli_imm(B, sz, d, x, k);
+        }
+        commit(s, v, d);
         break;
       }
       int x = rd(s, a[0], F0), y = rd(s, a[1], F1);
@@ -1981,66 +2045,84 @@ static void emit_inst(Isel *s, Ref v) {
 
     case I_REF_TEST: {
 
-      /* The run-time id can answer yes but never no: gc_register_types hands
-         each module instance a disjoint id range, so a header id equal to
-         this instance's slot for a type that structurally matches the target
-         proves the test, while a structurally identical object allocated
-         next door carries a different id -- the false negative 1a4b7db
-         removed the old inline check for.  Equality answers inline; anything
-         else asks warmc_ref_test, which compares structurally.  Null and the
-         i31 tag are representation facts, not identities, and stay inline. */
+      /* The run-time id answers for this module's own objects: the header id
+         less the instance's base is the object's slot when it is below the
+         module's count, and rtest_slots says which slots pass, so a slot in
+         the passing run answers yes and -- when the run is every slot that
+         passes -- any other slot of the module's answers no.  An id outside
+         the range is another module's object: gc_register_types hands each
+         module a disjoint range, so a structurally identical object
+         allocated next door carries an id this module never compares with
+         -- the false negative 1a4b7db removed the old inline "no" for -- and
+         only such an object asks warmc_ref_test, which compares
+         structurally.  Null and the i31 tag are representation facts, not
+         identities, and stay inline.  Every path leaves its answer in d and
+         they meet at the end, for one commit. */
       size_t to_end[3];
       int nend = 0;
+      int d = wr(s, v, S1);
+      uint32_t lo, hi, nslots;
+      bool exact;
       if ((RTEST_KIND(in->imm) & ~RTK_NULLABLE) == RTK_CONCRETE_ANY &&
-          !getenv("WARMC_NO_RTEST_FAST")) {
-        uint32_t slot_id = 0;
-        bool found = false;
-        uint32_t depth = RTEST_DEPTH(in->imm);
-        for (uint32_t i = 0; i < f->m->ntypes && !found; i++) {
-          const CompType *t = &f->m->types[i];
-          if (t->kind != CT_STRUCT && t->kind != CT_ARRAY) continue;
-          if (t->depth < depth || !t->display) continue;
-          if (t->display[depth] != in->imm2) continue;
-          slot_id = gctype_slot(f->m, i);
-          found = true;
-        }
-        if (found && slot_id < 0x1000) {
-          int x = rd(s, a[0], S0);
-          int d = wr(s, v, S1);
-          bool nullable = (RTEST_KIND(in->imm) & RTK_NULLABLE) != 0;
+          !getenv("WARMC_NO_RTEST_FAST") &&
+          rtest_slots(f->m, in->imm, in->imm2, &lo, &hi, &exact, &nslots)) {
+        int x = rd(s, a[0], S0);
+        bool nullable = (RTEST_KIND(in->imm) & RTK_NULLABLE) != 0;
+        size_t to_i31, to_slow[2];
+        int nslow = 0;
 
-          size_t to_null = B->len;
-          a64_cbz(B, SF64, x, 0);
-          uint32_t tst3;
-          if (!a64_logical_imm(3, SF64, &tst3))
-            warmc_fatal("internal: 3 is not a logical immediate");
-          a64_tst_imm(B, SF64, x, tst3);
-          size_t to_i31 = B->len;
-          a64_bcond(B, CC_NE, 0);
-          a64_ldr_imm(B, 2, S2, x, GC_HDR_WORD_OFF);
-          a64_ldr_imm(B, 2, S3, REG_VMCTX, VMCTX_GC_HDR);
-          a64_ubfm(B, SF32, S2, S2, GC_TYPE_SHIFT, 29);
-          a64_ubfm(B, SF32, S3, S3, GC_TYPE_SHIFT, 29);
-          a64_add_imm(B, SF32, S3, S3, slot_id, 0);
-          a64_cmp_reg(B, SF32, S2, S3);
-          size_t to_slow = B->len;
-          a64_bcond(B, CC_NE, 0);
-          a64_load_imm(B, SF32, d, 1);
-          commit(s, v, d);
-          to_end[nend++] = B->len;
-          a64_b(B, 0);
-          a64_patch_b19(B, to_null, B->len);
-          a64_load_imm(B, SF32, d, nullable ? 1 : 0);
-          commit(s, v, d);
-          to_end[nend++] = B->len;
-          a64_b(B, 0);
-          a64_patch_b19(B, to_i31, B->len);
-          a64_load_imm(B, SF32, d, 0);
-          commit(s, v, d);
-          to_end[nend++] = B->len;
-          a64_b(B, 0);
-          a64_patch_b19(B, to_slow, B->len);
+        size_t to_null = B->len;
+        a64_cbz(B, SF64, x, 0);
+        uint32_t tst3;
+        if (!a64_logical_imm(3, SF64, &tst3))
+          warmc_fatal("internal: 3 is not a logical immediate");
+        a64_tst_imm(B, SF64, x, tst3);
+        to_i31 = B->len;
+        a64_bcond(B, CC_NE, 0);
+        a64_ldr_imm(B, 2, S2, x, GC_HDR_WORD_OFF);
+        a64_ldr_imm(B, 2, S3, REG_VMCTX, VMCTX_GC_HDR);
+        a64_ubfm(B, SF32, S2, S2, GC_TYPE_SHIFT, 29);
+        a64_ubfm(B, SF32, S3, S3, GC_TYPE_SHIFT, 29);
+        /* the slot, if the object is ours; another module's id below our
+           base wraps to far above any slot */
+        a64_sub_reg(B, SF32, S2, S2, S3);
+        if (exact) {
+          rtest_cmp_imm(s, S2, nslots);
+          to_slow[nslow++] = B->len;
+          a64_bcond(B, CC_HS, 0);
         }
+        if (lo <= hi) {
+          /* lo == hi: slot == lo; a longer run: slot - lo <= hi - lo */
+          int t = S2;
+          if (lo != hi && lo) {
+            t = S3;
+            if (lo <= 0xfffu) {
+              a64_sub_imm(B, SF32, t, S2, lo, 0);
+            } else {
+              a64_load_imm(B, SF32, TMP0, lo);
+              a64_sub_reg(B, SF32, t, S2, TMP0);
+            }
+          }
+          rtest_cmp_imm(s, t, lo == hi ? lo : hi - lo);
+          if (exact) {
+            a64_cset(B, SF32, d, lo == hi ? CC_EQ : CC_LS);
+          } else {
+            to_slow[nslow++] = B->len;
+            a64_bcond(B, lo == hi ? CC_NE : CC_HI, 0);
+            a64_load_imm(B, SF32, d, 1);
+          }
+          to_end[nend++] = B->len;
+          a64_b(B, 0);
+        }
+        a64_patch_b19(B, to_i31, B->len);
+        a64_load_imm(B, SF32, d, 0);
+        to_end[nend++] = B->len;
+        a64_b(B, 0);
+        a64_patch_b19(B, to_null, B->len);
+        a64_load_imm(B, SF32, d, nullable ? 1 : 0);
+        to_end[nend++] = B->len;
+        a64_b(B, 0);
+        for (int k = 0; k < nslow; k++) a64_patch_b19(B, to_slow[k], B->len);
       }
       csa_save(s, v);
       emit_call_args(s, a, 1);
@@ -2051,9 +2133,10 @@ static void emit_inst(Isel *s, Ref v) {
       isel_reloc(s, REL_CALL26, B->len, sym, 0);
       a64_bl(B, 0);
       s->mem_valid = false;
-      commit(s, v, R0);
+      if (d != R0) a64_mov_reg(B, SF32, d, R0);
       csa_restore(s, v);
       for (int e = 0; e < nend; e++) patch_b26_checked(s, to_end[e], B->len);
+      commit(s, v, d);
       break;
     }
 
@@ -2233,6 +2316,21 @@ static bool pair_is_fpr(IrFunc *f, Ref v) {
   return is_fp_value(f, v) || is_vec_value(f, v);
 }
 
+/* Does u read a value in reg -- directly, or through an operand folded into
+   it, which is emitted with u and reads its own operands there? */
+static bool pair_reads(Isel *s, Ref u, int reg, bool fp, int depth) {
+  IrFunc *f = s->f;
+  Inst *un = &f->insts[u];
+  Ref *ua = ir_args(f, u);
+  for (uint32_t t = 0; t < un->nargs; t++) {
+    Ref x = ua[t];
+    if (s->loc[x] == reg && pair_is_fpr(f, x) == fp) return true;
+    if (s->folded && s->folded[x] && depth < 8 && pair_reads(s, x, reg, fp, depth + 1))
+      return true;
+  }
+  return false;
+}
+
 static bool pair_load_ok(Isel *s, Block *b, uint32_t idx, uint32_t j) {
   IrFunc *f = s->f;
   Ref vj = b->insts[j];
@@ -2240,14 +2338,19 @@ static bool pair_load_ok(Isel *s, Block *b, uint32_t idx, uint32_t j) {
   int dj = s->loc[vj];
   bool fj = pair_is_fpr(f, vj);
   if (dj == s->loc[b->insts[idx]]) return false; /* ldp rt == rt2 */
+  /* a use-cluster piece holding dj anywhere from idx to j would see the
+     partner's result early */
+  for (uint32_t k = 0; s->pc_bn && k < s->pc_bn[s->cur_block]; k++) {
+    const struct Piece *p = &s->pc[s->pc_bfirst[s->cur_block] + k];
+    if (p->reg == dj && pair_is_fpr(f, p->v) == fj && p->lo < j && p->hi >= idx)
+      return false;
+  }
   for (uint32_t k = idx + 1; k < j; k++) {
     Ref u = b->insts[k];
     Inst *un = &f->insts[u];
     if (ir_has_result(un) && s->loc[u] == dj && pair_is_fpr(f, u) == fj)
       return false;
-    Ref *ua = ir_args(f, u);
-    for (uint32_t t = 0; t < un->nargs; t++)
-      if (s->loc[ua[t]] == dj && pair_is_fpr(f, ua[t]) == fj) return false;
+    if (pair_reads(s, u, dj, fj, 0)) return false;
   }
   return true;
 }
@@ -2413,18 +2516,23 @@ static void emit_block(Isel *s, uint32_t bi, uint32_t next_bi) {
 
   bool eh = ir_block_has_eh(f, bi);
   s->cmp_ref = REF_NONE;
-  s->fl_kind = 0;
+  s->cmp_bare = REF_NONE;
+  /* A block entered only from the one emitted just before it starts with the
+     flags that block's last compare left -- its branch, and the moves on the
+     edge, write none -- so a search loop's ltu on the key after its eq on the
+     key is no second cmp.  The epoch still says whether anything since has
+     written them. */
+  if (b->npreds != 1 || b->preds[0] != s->prev_bi || b->is_pad) s->fl_kind = 0;
+  uint32_t pck = s->pc_bn ? s->pc_bfirst[bi] : 0;
+  uint32_t pce = s->pc_bn ? pck + s->pc_bn[bi] : 0;
   for (uint32_t i = 0; i < b->ninsts; i++) {
+    s->cur_pos = i;
+    s->pc_live = true;
+    for (; pck < pce && s->pc[pck].lo == i; pck++) piece_fill(s, &s->pc[pck]);
     s->at_eh_site = eh && i + 1 == b->ninsts;
     if (s->at_eh_site) emit_eh_stores(s, bi);
-    if (s->paired[b->insts[i]]) {
-      if (s->cmp_ref != b->insts[i]) s->cmp_ref = REF_NONE;
-      continue;
-    }
-    if (!eh && !s->no_ldpair && maybe_pair(s, b, i)) {
-      if (s->cmp_ref != b->insts[i]) s->cmp_ref = REF_NONE;
-      continue;
-    }
+    if (s->paired[b->insts[i]]) continue;
+    if (!eh && !s->no_ldpair && maybe_pair(s, b, i)) continue;
     s->cur_pos = i;
     emit_inst(s, b->insts[i]);
 
@@ -2433,8 +2541,8 @@ static void emit_block(Isel *s, uint32_t bi, uint32_t next_bi) {
        just clobbered x30.  x29 survives a call; the x30 half must not. */
     if (op_clobbers_caller_saved(f->insts[b->insts[i]].op))
       rc_kill_reg(s, R30);
-    if (s->cmp_ref != b->insts[i]) s->cmp_ref = REF_NONE;
   }
+  s->pc_live = false;
   s->at_eh_site = false;
 
   if (s->tail_done) { s->tail_done = false; return; }
@@ -2520,11 +2628,19 @@ static void emit_block(Isel *s, uint32_t bi, uint32_t next_bi) {
       bool tmoves = tn != 0, emoves = en != 0;
 
       bool invert = false;
-      if (!tmoves && !emoves && t->target == next_bi && e->target != next_bi) {
-        Edge *tmp = t; t = e; e = tmp;
+      if (!tmoves && !emoves && t->target == next_bi && e->target != next_bi)
         invert = true;
-      }
+      /* Neither side falls through, so the block ends in a conditional
+         branch and an unconditional one, and only the side the conditional
+         names costs a single branch.  Give it the likelier side: a rotated
+         latch whose exit is laid out elsewhere would otherwise test for the
+         exit, fall into a jump back, and spend two branches on every trip. */
+      else if (!tmoves && !emoves && t->target != next_bi &&
+               e->target != next_bi &&
+               ir_succ_score(f, b, 1) > ir_succ_score(f, b, 0))
+        invert = true;
       if (invert) {
+        Edge *tmp = t; t = e; e = tmp;
         if (kind == 0) cc = cc_invert(cc);
         else kind = (kind == 1) ? 2 : 1;
         Move *mtmp = tm; tm = em; em = mtmp;

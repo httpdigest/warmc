@@ -83,6 +83,8 @@ static int drive(int argc, char **argv) {
   /* A's object cast in B, against B's own structurally identical type.
    * 100 for the ref.test plus the 11 the ref.cast reaches. */
   out("gclink_cast=");   put_i32((int)(u32)call(b, "cast_borrowed", 0)); out("\n");
+  /* B's object cast in A, against A's: the 5 B stored. */
+  out("gclink_lent=");   put_i32((int)(u32)call(b, "cast_lent", 0)); out("\n");
 
   /* Only when asked, because it costs two more collections. */
   if (argc >= 2 && argv[1][0] == 'r') {

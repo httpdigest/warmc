@@ -1023,7 +1023,7 @@ static Ref gc_ref_test(Bld *b, Ref x, HeapType ht, bool nul) {
   }
   if (nul) kind |= RTK_NULLABLE;
   return ir_emit(f, b->cur, I_REF_TEST, VT_I32, &x, 1,
-                 RTEST_MK(kind, depth), id);
+                 RTEST_MK(kind, depth, ht), id);
 }
 
 static void gc_build(Bld *b, uint32_t sub, const char *sym) {

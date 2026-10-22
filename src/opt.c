@@ -75,17 +75,24 @@ static bool rd_assoc_op(IrFunc *f, Ref v) {
   }
 }
 
+/* A chain of i32 links can continue below a wrap into i64 links of the same
+   op: Go's back end keeps every value in an i64 and adds in i64 until wasm
+   wants an i32, so md5's step  rotl(wrap((F + a) + x) + K)  is two i64 adds
+   and an i32 one, and its deepest term F first.  Each of these ops gives the
+   same low half whether done in 64 bits or 32, so the rebuilt chain is all
+   i32, its i64 terms wrapped where it starts. */
 static bool pass_reassoc(IrFunc *f) {
   uint32_t *uses = count_uses(f);
-  uint32_t *memo = xcalloc(f->ninsts ? f->ninsts : 1, sizeof(uint32_t));
-  uint8_t *seen = xcalloc(f->ninsts ? f->ninsts : 1, 1);
+  uint32_t cap = f->ninsts ? f->ninsts : 1;
+  uint32_t *memo = xcalloc(cap, sizeof(uint32_t));
+  uint8_t *seen = xcalloc(cap, 1);
 
-  uint8_t *inner = xcalloc(f->ninsts ? f->ninsts : 1, 1);
-  uint32_t *pos = xmalloc((f->ninsts ? f->ninsts : 1) * sizeof(uint32_t));
-  for (uint32_t i = 0; i < f->ninsts; i++) pos[i] = 0xffffffffu;
+  uint8_t *inner = xcalloc(cap, 1);
+  uint32_t *pos = xmalloc(cap * sizeof(uint32_t));
+  for (uint32_t i = 0; i < cap; i++) pos[i] = 0xffffffffu;
   bool changed = false;
   Ref chain[64], leaf[65];
-  uint8_t *link = xcalloc(f->ninsts ? f->ninsts : 1, 1);
+  uint8_t *link = xcalloc(cap, 1);
   uint32_t *tmp = NULL;
   uint32_t tmpcap = 0;
 
@@ -94,7 +101,7 @@ static bool pass_reassoc(IrFunc *f) {
     Block *b = &f->blocks[bi];
     memset(seen, 0, f->ninsts);
     for (uint32_t i = 0; i < b->ninsts; i++) pos[b->insts[i]] = i;
-    if (b->ninsts > tmpcap) { tmpcap = b->ninsts * 2 + 8;
+    if (b->ninsts + 65 > tmpcap) { tmpcap = b->ninsts * 2 + 72;
       tmp = xrealloc(tmp, tmpcap * sizeof(uint32_t)); }
     for (uint32_t i = 0; i < b->ninsts; i++) {
       Ref v = b->insts[i];
@@ -111,13 +118,24 @@ static bool pass_reassoc(IrFunc *f) {
       if (!rd_assoc_op(f, root) || inner[root]) continue;
       uint16_t op = f->insts[root].op;
       uint8_t ty = f->insts[root].type;
-      uint32_t n = 0;
+      uint32_t n = 0, wide = UINT32_MAX;
+      Ref wrap = REF_NONE;
       Ref cur = root;
       while (n < 64) {
         chain[n++] = cur;
         Ref l = ir_args(f, cur)[0];
         if (l >= f->ninsts || f->insts[l].block != bi) break;
-        if (f->insts[l].op != op || f->insts[l].type != ty) break;
+        if (wide == UINT32_MAX && ty == VT_I32 && f->insts[l].op == I_WRAP &&
+            uses[l] == 1) {
+          Ref l2 = ir_args(f, l)[0];
+          if (l2 >= f->ninsts || f->insts[l2].block != bi ||
+              f->insts[l2].op != op || f->insts[l2].type != VT_I64 || uses[l2] != 1)
+            break;
+          wrap = l; wide = n; cur = l2;
+          continue;
+        }
+        uint8_t lty = wide == UINT32_MAX ? ty : VT_I64;
+        if (f->insts[l].op != op || f->insts[l].type != lty) break;
         if (uses[l] != 1) break;
         cur = l;
       }
@@ -138,13 +156,60 @@ static bool pass_reassoc(IrFunc *f) {
       if (worst < last_d + 4) continue;
 
       if (n > 8) continue;
-      uint32_t rootpos = pos[chain[0]];
+
+      /* The i64 terms of a chain that went through a wrap, wrapped: made
+         at the end of the block, moved below to where the chain goes. */
+      Ref made[65];
+      uint32_t nmade = 0;
+      if (wide != UINT32_MAX) {
+        for (uint32_t k = 0; k < nl; k++) {
+          if (f->insts[leaf[k]].type != VT_I64) continue;
+          uint16_t lop = f->insts[leaf[k]].op;
+          if ((lop == I_EXTENDU || lop == I_EXTENDS) && f->insts[leaf[k]].nargs == 1) {
+            leaf[k] = ir_args(f, leaf[k])[0];
+            continue;
+          }
+          Ref w = lop == I_CONST
+                ? ir_emit(f, bi, I_CONST, VT_I32, NULL, 0,
+                          f->insts[leaf[k]].imm & 0xffffffffu, 0)
+                : ir_emit(f, bi, I_WRAP, VT_I32, &leaf[k], 1, 0, 0);
+          made[nmade++] = w;
+          leaf[k] = w;
+        }
+        b = &f->blocks[bi];
+        b->ninsts -= nmade;
+        for (uint32_t k = wide; k < n; k++) f->insts[chain[k]].type = VT_I32;
+        ir_args(f, chain[wide - 1])[0] = chain[wide];
+        f->insts[wrap].op = I_NOP;
+        f->insts[wrap].nargs = 0;
+        if (f->ninsts > cap) {
+          uint32_t nc = f->ninsts * 2;
+          memo = xrealloc(memo, nc * sizeof(uint32_t));
+          seen = xrealloc(seen, nc);
+          inner = xrealloc(inner, nc);
+          link = xrealloc(link, nc);
+          pos = xrealloc(pos, nc * sizeof(uint32_t));
+          uses = xrealloc(uses, nc * sizeof(uint32_t));
+          memset(memo + cap, 0, (nc - cap) * sizeof(uint32_t));
+          memset(seen + cap, 0, nc - cap);
+          memset(inner + cap, 0, nc - cap);
+          memset(link + cap, 0, nc - cap);
+          memset(uses + cap, 0, (nc - cap) * sizeof(uint32_t));
+          cap = nc;
+        }
+        for (uint32_t k = 0; k < nmade; k++) uses[made[k]] = 1;
+      }
+
+      if (b->ninsts + nmade > tmpcap) {
+        tmpcap = (b->ninsts + nmade) * 2;
+        tmp = xrealloc(tmp, tmpcap * sizeof(uint32_t));
+      }
       for (uint32_t k = 0; k < n; k++) link[chain[k]] = 1;
       uint32_t m = 0;
       for (uint32_t k = 0; k < b->ninsts; k++) {
         Ref u = b->insts[k];
         if (u == chain[0]) {
-
+          for (uint32_t j = 0; j < nmade; j++) tmp[m++] = made[j];
           for (uint32_t j = n; j-- > 0;) tmp[m++] = chain[j];
           continue;
         }
@@ -153,6 +218,7 @@ static bool pass_reassoc(IrFunc *f) {
       }
       for (uint32_t k = 0; k < n; k++) link[chain[k]] = 0;
       memcpy(b->insts, tmp, m * sizeof(uint32_t));
+      b->ninsts = m;
 
       Ref a = leaf[wi];
       for (uint32_t k = wi; k + 1 < nl; k++) leaf[k] = leaf[k + 1];
@@ -161,11 +227,12 @@ static bool pass_reassoc(IrFunc *f) {
       ir_args(f, chain[n - 1])[1] = leaf[1];
       for (uint32_t k = n - 1, li = 2; k-- > 0; li++)
         ir_args(f, chain[k])[1] = leaf[li];
+      for (uint32_t k = 1; k < n; k++) inner[chain[k]] = 1;
       changed = true;
       g_stats.reassoc++;
       for (uint32_t k = 0; k < b->ninsts; k++) pos[b->insts[k]] = k;
       memset(seen, 0, f->ninsts);
-      (void)rootpos;
+      i = pos[chain[0]];
     }
   }
   xfree(uses); xfree(memo); xfree(seen); xfree(inner); xfree(pos);
@@ -763,6 +830,37 @@ static void strength_divs_pow2(IrFunc *f, uint32_t bi, uint32_t *idx, Ref v, int
   in->op = I_SHRS;
 }
 
+/* y ^ (y >> k), where y is x ^ (x >> k) and 2k is at least the width, is x:
+   the second shift sees only bits of x that the first xor left alone, so the
+   two xors cancel.  Logical shifts either way (an arithmetic one fills with
+   the sign, which does not cancel).  murmur's fmix64 begins and ends with
+   x ^= x >> 33, so iterating it -- a hash of a hash, as gobench/mix does --
+   applies that step twice in a row, two cycles of a latency chain each time. */
+static Ref xorshift_undone(IrFunc *f, Ref v) {
+  Inst *in = &f->insts[v];
+  Ref *a = ir_args(f, v);
+  uint64_t w = vt_is_64((ValType)in->type) ? 64 : 32;
+  for (int s = 0; s < 2; s++) {
+    Ref y = a[s], sh = a[s ^ 1];
+    Inst *si = &f->insts[sh];
+    uint64_t k, k2;
+    if ((si->op != I_SHRU && si->op != I_SHL) || ir_args(f, sh)[0] != y ||
+        !is_const(f, ir_args(f, sh)[1], &k) || 2 * (k % w) < w)
+      continue;
+    Inst *yi = &f->insts[y];
+    if (yi->op != I_XOR || yi->type != in->type) continue;
+    Ref *ya = ir_args(f, y);
+    for (int t = 0; t < 2; t++) {
+      Ref x = ya[t], sh2 = ya[t ^ 1];
+      Inst *s2 = &f->insts[sh2];
+      if (s2->op == si->op && ir_args(f, sh2)[0] == x &&
+          is_const(f, ir_args(f, sh2)[1], &k2) && k2 % w == k % w)
+        return x;
+    }
+  }
+  return REF_NONE;
+}
+
 static bool is_commutative(uint16_t op) {
   return op == I_ADD || op == I_MUL || op == I_AND || op == I_OR ||
          op == I_XOR || op == I_EQ || op == I_NE;
@@ -1032,6 +1130,18 @@ static bool fold_block(IrFunc *f, uint32_t bi, const OptOpts *o, const uint32_t 
         continue;
       }
     }
+    /* A reinterpreted constant is a constant of the other type with the same
+       bits.  GHC writes every double it uses as an i64.const and an
+       f64.reinterpret_i64, which left alone lives in an integer register and
+       crosses to the FP file with an fmov each time: spectral's 1.0 did that
+       on every iteration of its inner loop. */
+    if (in->op == I_REINTERPRET && in->nargs == 1 && (ValType)in->type != VT_V128 &&
+        is_const(f, a[0], &x)) {
+      replace_with_const(f, v, x);
+      g_stats.folded++;
+      changed = true;
+      continue;
+    }
     if (in->nargs == 1 && !vt_is_float((ValType)f->insts[a[0]].type) && is_const(f, a[0], &x)) {
       ValType ot = (ValType)f->insts[a[0]].type;
       if (fold_int_unop(in->op, ot, x, &r)) {
@@ -1136,6 +1246,12 @@ static bool fold_block(IrFunc *f, uint32_t bi, const OptOpts *o, const uint32_t 
           g_stats.folded++;
         }
         else if ((in->op == I_SUB || in->op == I_ADD) && in->nargs == 2 && fold_add_neg(f, v)) {
+          changed = true;
+          g_stats.folded++;
+        }
+        else if (in->op == I_XOR && xorshift_undone(f, v) != REF_NONE) {
+          ir_replace(f, v, xorshift_undone(f, v));
+          in->op = I_NOP;
           changed = true;
           g_stats.folded++;
         }
@@ -3300,8 +3416,10 @@ static bool pass_branch(IrFunc *f) {
    one loop the dispatch heads, which is all the layout and the loop passes
    get to see.
 
-   A block that does nothing but switch on one of its parameters, reached by
-   an edge that hands that parameter a constant, is bypassed: the edge goes
+   A block that does nothing but switch on one of its parameters -- or
+   branch on its compare with a constant, as a merge of `c ? x : 1` into an
+   `if` does, in AssemblyScript's String.__eq among many -- reached by an
+   edge that hands that parameter a constant, is bypassed: the edge goes
    to a fresh block that takes the dispatch's parameters and jumps straight
    to the case the constant picks.  The dispatch's parameters can be read
    beyond its own edges -- Go's stack pointer is one -- and every such read
@@ -3466,15 +3584,47 @@ static bool td_numeric(ValType t) {
   return t == VT_I32 || t == VT_I64 || t == VT_F32 || t == VT_F64 || t == VT_V128;
 }
 
-static bool thread_dispatch(IrFunc *f, uint32_t B) {
+/* The test of a block that branches on nothing but a compare of one of its
+   parameters with a constant -- binaryen's `c ? x : 1` merged into the block
+   whose `if` tests it -- as the opcode and constant, or false.  The compare
+   is the block's one instruction and its branch the one reader (uses[], as
+   counted before the pass), so an edge that bypasses the block leaves
+   nothing undefined. */
+static bool thread_test(IrFunc *f, uint32_t B, const uint32_t *uses,
+                        uint32_t nuses, uint16_t *op, uint64_t *k) {
   Block *b = &f->blocks[B];
-  if (!b->reachable || b->is_pad || b->ninsts || B == f->entry) return false;
+  Ref c = b->term_arg;
+  if (b->term != T_BRIF || b->ninsts != 1 || b->insts[0] != c) return false;
+  if (c >= nuses || uses[c] != 1) return false;
+  Inst *ci = &f->insts[c];
+  Ref *ca = ir_args(f, c);
+  if (ci->op == I_EQZ) *k = 0;
+  else if ((ci->op == I_EQ || ci->op == I_NE) && is_const(f, ca[1], k)) {}
+  else return false;
+  if (f->insts[ca[0]].op != I_PARAM || f->insts[ca[0]].block != B) return false;
+  *op = ci->op;
+  return true;
+}
+
+static bool thread_dispatch(IrFunc *f, uint32_t B, const uint32_t *nread,
+                            uint32_t nnread) {
+  Block *b = &f->blocks[B];
+  if (!b->reachable || b->is_pad || B == f->entry) return false;
   if (b->term != T_BRTABLE && b->term != T_BRIF) return false;
   if (ir_block_has_eh(f, B)) return false;
+  /* The switch is on a parameter, or on its compare with a constant. */
+  uint16_t top = I_NOP;
+  uint64_t tk = 0;
+  Ref sw = b->term_arg;
+  if (b->ninsts) {
+    if (!thread_test(f, B, nread, nnread, &top, &tk)) return false;
+    sw = ir_args(f, b->term_arg)[0];
+  }
   uint32_t k = UINT32_MAX;
   for (uint32_t q = 0; q < b->nparams; q++)
-    if (b->params[q] == b->term_arg) k = q;
+    if (b->params[q] == sw) k = q;
   if (k == UINT32_MAX) return false;
+  uint64_t tmask = f->insts[sw].type == VT_I64 ? ~0ull : 0xffffffffu;
   /* The repair needs a zero of each parameter's type; see td_repair. */
   for (uint32_t q = 0; q < b->nparams; q++)
     if (!td_numeric((ValType)f->insts[b->params[q]].type)) return false;
@@ -3489,6 +3639,9 @@ static bool thread_dispatch(IrFunc *f, uint32_t B) {
       uint64_t c;
       if (e->target != B || e->eh || e->nargs != bb->nparams) continue;
       if (!is_const(f, e->args[k], &c)) continue;
+      c &= tmask;
+      if (top == I_EQZ || top == I_EQ) c = c == (tk & tmask);
+      else if (top == I_NE) c = c != (tk & tmask);
       uint32_t pick;
       if (bb->term == T_BRIF) pick = c ? 0 : 1;
       else pick = c < bb->nsuccs - 1 ? (uint32_t)c : bb->nsuccs - 1;
@@ -3576,11 +3729,13 @@ static bool thread_dispatch(IrFunc *f, uint32_t B) {
 static bool pass_thread(IrFunc *f) {
   if (f->npads) return false;
   bool changed = false;
+  uint32_t *nread = count_uses(f), nnread = f->ninsts;
   for (uint32_t bi = 0, n = f->nblocks; bi < n; bi++)
-    if (thread_dispatch(f, bi)) {
+    if (thread_dispatch(f, bi, nread, nnread)) {
       changed = true;
       if (getenv("WARMC_THREAD_DEBUG")) { ir_print(f, "thread"); ir_verify(f, "thread"); }
     }
+  xfree(nread);
   if (changed) {
     prune_params(f);
     ir_order(f);
@@ -6187,23 +6342,313 @@ static bool gc_counted_cond(IrFunc *f, uint32_t hb, Ref cond, bool taken,
   return false;
 }
 
+/* What a dominating test or cast proved of an object: that it is null or an
+   ht. */
+typedef struct { Ref obj; HeapType ht; } GcTy;
+
+/* A ref.test of heap type t, asked of an object of heap type h, null aside:
+   1 when every such object passes, 0 when none does, -1 when the object's
+   own type decides.  The any hierarchy is a tree -- eq over i31, struct and
+   array, each concrete type under its one supertype, the chain the runtime's
+   displays compare -- so of two heap types in it neither of which is below
+   the other, no value is both. */
+static int gc_test_given(const Module *m, HeapType h, HeapType t) {
+  if (heap_subtype(m, h, t)) return 1;
+  if (heap_subtype(m, t, h)) return -1;
+  if (heap_subtype(m, h, HT_ANY) && heap_subtype(m, t, HT_ANY)) return 0;
+  return -1;
+}
+
+/* The answer the facts give a ref.test, or -1.  nonnull says its object is
+   not null; each fact on the object's root, and the static type of every
+   value between the operand and the root, says it is null or of that type --
+   a ref.convert's type is its cast's, which a later test of the same or a
+   wider type repeats.  A subtype tested and a supertype asked answers only
+   for the supertype; a nullable proof answers a non-nullable test only once
+   the object is known not to be null. */
+static int gc_test_known(IrFunc *f, Ref v, bool nonnull, const GcTy *ty,
+                         uint32_t nty) {
+  const Module *m = f->m;
+  const Inst *in = &f->insts[v];
+  HeapType t = RTEST_HEAP(in->imm);
+  bool nullable = (RTEST_KIND(in->imm) & RTK_NULLABLE) != 0;
+  bool pass = false, fail = false;
+  Ref r = ir_resolve(f, ir_args(f, v)[0]);
+  for (int hop = 0; ; hop++) {
+    ValType vt = (ValType)f->insts[r].type;
+    if (vt_is_ref(vt)) {
+      if (!vt_nullable(vt)) nonnull = true;
+      int g = gc_test_given(m, vt_heap(vt), t);
+      pass |= g == 1;
+      fail |= g == 0;
+    }
+    /* the walk gc_ref_root makes, so r ends on the root the facts name */
+    if (hop == 8 || f->insts[r].op != I_REF_CONVERT || f->insts[r].nargs != 1)
+      break;
+    r = ir_resolve(f, ir_args(f, r)[0]);
+  }
+  for (uint32_t k = 0; k < nty; k++) {
+    if (ty[k].obj != r) continue;
+    int g = gc_test_given(m, ty[k].ht, t);
+    pass |= g == 1;
+    fail |= g == 0;
+  }
+  /* both: no type fits, so the object is null */
+  if (pass && fail) return nullable ? 1 : 0;
+  if (pass && (nonnull || nullable)) return 1;
+  if (fail && (nonnull || !nullable)) return 0;
+  return -1;
+}
+
+static void gc_root_add(Ref *set, uint32_t *n, uint32_t cap, Ref obj) {
+  for (uint32_t k = 0; k < *n; k++)
+    if (set[k] == obj) return;
+  if (*n < cap) set[(*n)++] = obj;
+}
+
+/* What a ref.test that passed -- the true arm of its branch, or past its
+   cast's trap -- proves of its object: the type, and with a non-nullable
+   test that it is not null. */
+static void gc_test_passed(IrFunc *f, Ref test, Ref *set, uint32_t *n,
+                           GcTy *ty, uint32_t *nty, uint32_t cap) {
+  const Inst *in = &f->insts[test];
+  Ref obj = gc_ref_root(f, ir_args(f, test)[0]);
+  if (!(RTEST_KIND(in->imm) & RTK_NULLABLE)) gc_root_add(set, n, cap, obj);
+  if (*nty < cap) {
+    ty[*nty].obj = obj;
+    ty[*nty].ht = RTEST_HEAP(in->imm);
+    (*nty)++;
+  }
+}
+
+/* The facts pass_gc_nullchk holds at the end of each block it has done:
+   objects not null, and the types of objects. */
+typedef struct {
+  Ref **sets; uint32_t *counts;
+  GcTy **tsets; uint32_t *tcounts;
+} GcFacts;
+
+/* What one way to a point proves of an object: that it is null, that it is
+   not, and that it is null or an ht. */
+typedef struct { bool null, nonnull, typed; HeapType ht; } GcWay;
+
+static void gc_way_type(const Module *m, GcWay *w, HeapType ht) {
+  if (!w->typed || heap_subtype(m, ht, w->ht)) {
+    w->typed = true;
+    w->ht = ht;
+  }
+}
+
+/* The ref.is_null or ref.test cond is, under any eqz, or REF_NONE. */
+static Ref gc_cond_test(IrFunc *f, Ref cond, bool *taken) {
+  cond = ir_resolve(f, cond);
+  while (f->insts[cond].op == I_EQZ && f->insts[cond].nargs == 1) {
+    cond = ir_resolve(f, ir_args(f, cond)[0]);
+    *taken = !*taken;
+  }
+  const Inst *c = &f->insts[cond];
+  if (c->nargs != 1 || (c->op != I_REF_IS_NULL && c->op != I_REF_TEST))
+    return REF_NONE;
+  return cond;
+}
+
+/* What cond says of y once it is known nonzero (taken) or zero. */
+static void gc_way_cond(IrFunc *f, Ref cond, bool taken, Ref y, GcWay *w) {
+  cond = gc_cond_test(f, cond, &taken);
+  if (cond == REF_NONE || gc_ref_root(f, ir_args(f, cond)[0]) != y) return;
+  const Inst *c = &f->insts[cond];
+  if (c->op == I_REF_IS_NULL) {
+    if (taken) w->null = true;
+    else w->nonnull = true;
+    return;
+  }
+  bool nullable = (RTEST_KIND(c->imm) & RTK_NULLABLE) != 0;
+  if (taken) {
+    gc_way_type(f->m, w, RTEST_HEAP(c->imm));
+    if (!nullable) w->nonnull = true;
+  } else if (nullable) {
+    w->nonnull = true;
+  }
+}
+
+/* What the way from qb to `to` proves of y: the branch it leaves qb by, the
+   branches into the run of single-pred blocks it ends -- the facts keep no
+   word of null, which is what the arm of a `x == null` sends -- and qb's
+   facts once qb is done.  The run stops at y's definition: a branch above
+   it, round a loop, spoke of the y before. */
+static void gc_way_edge(IrFunc *f, const GcFacts *fx, uint32_t qb, uint32_t to,
+                        Ref y, GcWay *w) {
+  Block *q = &f->blocks[qb];
+  if (q->term == T_BRIF && q->nsuccs >= 2 &&
+      q->succs[0].target != q->succs[1].target)
+    gc_way_cond(f, q->term_arg, q->succs[0].target == to, y, w);
+  uint32_t yb = f->insts[y].block;
+  for (uint32_t c = qb, k = 0; k < 4 && c != yb; k++) {
+    Block *cb = &f->blocks[c];
+    if (cb->npreds != 1) break;
+    uint32_t r = cb->preds[0];
+    Block *rb = &f->blocks[r];
+    if (rb->term == T_BRIF && rb->nsuccs >= 2 &&
+        rb->succs[0].target != rb->succs[1].target)
+      gc_way_cond(f, rb->term_arg, rb->succs[0].target == c, y, w);
+    else if (rb->term != T_JUMP)
+      break;
+    c = r;
+  }
+  if (!fx->sets[qb]) return;
+  for (uint32_t j = 0; j < fx->counts[qb]; j++)
+    if (fx->sets[qb][j] == y) w->nonnull = true;
+  for (uint32_t j = 0; j < fx->tcounts[qb]; j++)
+    if (fx->tsets[qb][j].obj == y) gc_way_type(f->m, w, fx->tsets[qb][j].ht);
+}
+
+/* Adds one way to what all the ways into a point prove: an object of the
+   widest of their types, or null where one of them allows it.  False when
+   the ways have nothing in common to say. */
+static bool gc_way_join(const Module *m, GcWay *all, const GcWay *w) {
+  if (w->null && w->nonnull) return true;   /* a way nothing takes */
+  if (w->null) {
+    all->nonnull = false;
+    all->null = true;
+    return true;
+  }
+  if (!w->typed) return false;
+  if (!w->nonnull) all->nonnull = false;
+  if (!all->typed || heap_subtype(m, all->ht, w->ht)) {
+    all->typed = true;
+    all->ht = w->ht;
+    return true;
+  }
+  return heap_subtype(m, w->ht, all->ht);
+}
+
+/* Ways that join speak of the y every one of them reaches only when y is
+   defined above the point they meet at. */
+static bool gc_way_above(IrFunc *f, Ref y, uint32_t at) {
+  uint32_t yb = f->insts[y].block;
+  return yb != at && dominates(f, yb, at);
+}
+
+/* A branch on a merge's param, as `x != null && x is T` leaves it when the
+   null arm hands the merge a constant and the other the test's answer.  An
+   arm of the branch is reached by the ways into the merge whose value can
+   take it, so it knows of the object what all of those ways do; each way's
+   knowledge is its value and what gc_way_edge reads off it. */
+static bool gc_merge_cond(IrFunc *f, const GcFacts *fx, uint32_t pb, Ref cond,
+                          bool taken, Ref *yp, GcWay *out) {
+  const Inst *ci = &f->insts[cond];
+  Block *p = &f->blocks[pb];
+  if (ci->op != I_PARAM || ci->block != pb) return false;
+  uint32_t pi = UINT32_MAX;
+  for (uint32_t j = 0; j < p->nparams && pi == UINT32_MAX; j++)
+    if (p->params[j] == cond) pi = j;
+  if (pi == UINT32_MAX) return false;
+  Ref y = REF_NONE;
+  for (uint32_t k = 0; k < p->npreds; k++) {
+    Edge *e = iv_edge(f, p->preds[k], pb);
+    if (!e || e->eh || pi >= e->nargs) return false;
+    bool t = taken;
+    Ref c = gc_cond_test(f, e->args[pi], &t);
+    if (y == REF_NONE && c != REF_NONE) y = gc_ref_root(f, ir_args(f, c)[0]);
+  }
+  if (y == REF_NONE || !gc_way_above(f, y, pb)) return false;
+  GcWay all = { false, true, false, 0 };
+  for (uint32_t k = 0; k < p->npreds; k++) {
+    uint32_t qb = p->preds[k];
+    Ref a = ir_resolve(f, iv_edge(f, qb, pb)->args[pi]);
+    GcWay w = { false, false, false, 0 };
+    if (f->insts[a].op == I_CONST) {
+      if ((f->insts[a].imm != 0) != taken) continue;
+    } else {
+      gc_way_cond(f, a, taken, y, &w);
+    }
+    gc_way_edge(f, fx, qb, pb, y, &w);
+    if (!gc_way_join(f->m, &all, &w)) return false;
+  }
+  if (!all.typed) return false;
+  *yp = y;
+  *out = all;
+  return true;
+}
+
+/* The same at a block that ways meet at -- what jump threading makes of
+   that merge, or a `when` arm that two tests share: the objects their
+   branches test, and what all the ways prove of each.  Returns how many of
+   ys it found. */
+#define GC_JOIN_MAX 4
+static uint32_t gc_join_ways(IrFunc *f, const GcFacts *fx, uint32_t bi,
+                             Ref *ys, GcWay *outs) {
+  Block *b = &f->blocks[bi];
+  Ref cand[GC_JOIN_MAX];
+  uint32_t nc = 0, n = 0;
+  for (uint32_t k = 0; k < b->npreds; k++) {
+    Edge *e = iv_edge(f, b->preds[k], bi);
+    if (!e || e->eh) return 0;
+    Block *q = &f->blocks[b->preds[k]];
+    if (q->term != T_BRIF) continue;
+    bool t = true;
+    Ref c = gc_cond_test(f, q->term_arg, &t);
+    if (c == REF_NONE) continue;
+    Ref y = gc_ref_root(f, ir_args(f, c)[0]);
+    bool have = false;
+    for (uint32_t j = 0; j < nc; j++) have |= cand[j] == y;
+    if (!have && nc < GC_JOIN_MAX) cand[nc++] = y;
+  }
+  for (uint32_t j = 0; j < nc; j++) {
+    if (!gc_way_above(f, cand[j], bi)) continue;
+    GcWay all = { false, true, false, 0 };
+    bool ok = true;
+    for (uint32_t k = 0; k < b->npreds && ok; k++) {
+      GcWay w = { false, false, false, 0 };
+      gc_way_edge(f, fx, b->preds[k], bi, cand[j], &w);
+      ok = gc_way_join(f->m, &all, &w);
+    }
+    if (!ok || !all.typed) continue;
+    ys[n] = cand[j];
+    outs[n++] = all;
+  }
+  return n;
+}
+
+static void gc_way_add(const GcWay *w, Ref y, Ref *set, uint32_t *n,
+                       GcTy *ty, uint32_t *nty, uint32_t cap) {
+  if (w->nonnull) gc_root_add(set, n, cap, y);
+  if (w->typed && *nty < cap) {
+    ty[*nty].obj = y;
+    ty[*nty].ht = w->ht;
+    (*nty)++;
+  }
+}
+
 /* Clears redundant GC checks a dominating proof already answered.  Null
    checks: an earlier flagged access on the same object (it trapped or it
-   passed), the ref.as_non_null trap, the allocation that defined it, or
-   the non-null arm of a br_on_null -- the build sets GCF_NULLCHK from
-   static nullability alone, so all flow-sensitive redundancy survives to
-   here.  Bounds checks: a dominating branch on idx <u array.len(o) --
-   lengths are fixed at allocation, so the proof survives anything in
-   between, including calls.  Same dominator-inheritance shape as
-   pass_bce: sets copy from the idom in RPO, so membership means a
-   strictly dominating (or earlier same-block) proof; branch facts ride
-   single-pred edges. */
+   passed), the ref.as_non_null trap, the allocation that defined it, the
+   non-null arm of a br_on_null, or a passed non-nullable ref.test -- the
+   build sets GCF_NULLCHK from static nullability alone, so all
+   flow-sensitive redundancy survives to here.  Tests and casts: the true
+   arm of a ref.test's branch and the code past a cast's trap know their
+   object's type, and the false arm of a nullable test that it is not null;
+   a later ref.test those facts decide becomes its answer (gc_test_known),
+   so the cast Kotlin repeats after each `is` -- the same test again, made
+   nullable -- folds to 1 and its trap goes.  Where ways meet -- a block
+   more than one reaches, or the arms of a branch on a merge's param, which
+   is what `x != null && x is T` makes -- an object is what every way that
+   gets there proves (gc_join_ways, gc_merge_cond).  Bounds checks: a
+   dominating branch on idx <u array.len(o) -- lengths are fixed at
+   allocation, so the proof survives anything in between, including calls,
+   as an object's type does.  Same dominator-inheritance shape as pass_bce:
+   sets copy from the idom in RPO, so membership means a strictly
+   dominating (or earlier same-block) proof; branch facts ride single-pred
+   edges. */
 static bool pass_gc_nullchk(IrFunc *f) {
   bool changed = false;
   Ref **sets = xcalloc(f->nblocks, sizeof(Ref *));
   uint32_t *counts = xcalloc(f->nblocks, sizeof(uint32_t));
   GcBnd **bsets = xcalloc(f->nblocks, sizeof(GcBnd *));
   uint32_t *bcounts = xcalloc(f->nblocks, sizeof(uint32_t));
+  GcTy **tsets = xcalloc(f->nblocks, sizeof(GcTy *));
+  uint32_t *tcounts = xcalloc(f->nblocks, sizeof(uint32_t));
+  GcFacts fx = { sets, counts, tsets, tcounts };
   const uint32_t CAP = 64;
   for (uint32_t oi = 0; oi < f->norder; oi++) {
     uint32_t bi = f->order[oi];
@@ -6212,15 +6657,29 @@ static bool pass_gc_nullchk(IrFunc *f) {
     counts[bi] = 0;
     bsets[bi] = xmalloc(CAP * sizeof(GcBnd));
     bcounts[bi] = 0;
+    tsets[bi] = xmalloc(CAP * sizeof(GcTy));
+    tcounts[bi] = 0;
     uint32_t d = b->idom;
     if (bi != f->entry && d != REF_NONE && sets[d]) {
       counts[bi] = counts[d];
       memcpy(sets[bi], sets[d], counts[d] * sizeof(Ref));
       bcounts[bi] = bcounts[d];
       memcpy(bsets[bi], bsets[d], bcounts[d] * sizeof(GcBnd));
+      tcounts[bi] = tcounts[d];
+      memcpy(tsets[bi], tsets[d], tcounts[d] * sizeof(GcTy));
     }
-    /* branch facts: the non-null arm of a br_on_null, and the in-bounds
-       arm of an index-below-length test */
+    /* where ways meet, what every one of them proves of an object */
+    if (b->npreds >= 2) {
+      Ref ys[GC_JOIN_MAX];
+      GcWay ws[GC_JOIN_MAX];
+      uint32_t n = gc_join_ways(f, &fx, bi, ys, ws);
+      for (uint32_t k = 0; k < n; k++)
+        gc_way_add(&ws[k], ys[k], sets[bi], &counts[bi], tsets[bi],
+                   &tcounts[bi], CAP);
+    }
+    /* branch facts: the non-null arm of a br_on_null, both arms of a
+       ref.test, a branch on a merge of them (gc_merge_cond), and the
+       in-bounds arm of an index-below-length test */
     if (b->npreds == 1) {
       Block *p = &f->blocks[b->preds[0]];
       if (p->term == T_BRIF && p->nsuccs >= 2 &&
@@ -6233,8 +6692,23 @@ static bool pass_gc_nullchk(IrFunc *f) {
           taken = !taken;
         }
         if (f->insts[cond].op == I_REF_IS_NULL && f->insts[cond].nargs == 1 &&
-            !taken && counts[bi] < CAP)
-          sets[bi][counts[bi]++] = gc_ref_root(f, ir_args(f, cond)[0]);
+            !taken)
+          gc_root_add(sets[bi], &counts[bi], CAP,
+                      gc_ref_root(f, ir_args(f, cond)[0]));
+        if (f->insts[cond].op == I_REF_TEST && f->insts[cond].nargs == 1) {
+          if (taken)
+            gc_test_passed(f, cond, sets[bi], &counts[bi], tsets[bi],
+                           &tcounts[bi], CAP);
+          /* null passes a nullable test, so failing it says not null */
+          else if (RTEST_KIND(f->insts[cond].imm) & RTK_NULLABLE)
+            gc_root_add(sets[bi], &counts[bi], CAP,
+                        gc_ref_root(f, ir_args(f, cond)[0]));
+        }
+        Ref my;
+        GcWay mw;
+        if (gc_merge_cond(f, &fx, b->preds[0], cond, taken, &my, &mw))
+          gc_way_add(&mw, my, sets[bi], &counts[bi], tsets[bi], &tcounts[bi],
+                     CAP);
         Ref bidx, blen;
         if (bcounts[bi] < CAP &&
             (gc_inbounds_cond(f, cond, taken, &bidx, &blen) ||
@@ -6283,30 +6757,51 @@ static bool pass_gc_nullchk(IrFunc *f) {
             }
           }
           break;
-        case I_TRAP_IF:
-          if (in->imm == TRAP_NULL_REF && in->nargs == 1)
+        case I_TRAP_IF: {
+          if (in->nargs != 1) break;
+          if (in->imm == TRAP_NULL_REF) {
             obj = gc_ref_root(f, ir_args(f, v)[0]);
+            break;
+          }
+          /* it traps on zero: past a cast's trap, its test passed */
+          Ref t = ir_resolve(f, ir_args(f, v)[0]);
+          if (f->insts[t].op == I_REF_TEST && f->insts[t].nargs == 1)
+            gc_test_passed(f, t, sets[bi], &counts[bi], tsets[bi],
+                           &tcounts[bi], CAP);
           break;
+        }
+        case I_REF_TEST: {
+          if (in->nargs != 1) break;
+          Ref root = gc_ref_root(f, ir_args(f, v)[0]);
+          bool nonnull = false;
+          for (uint32_t k = 0; k < counts[bi] && !nonnull; k++)
+            nonnull = sets[bi][k] == root;
+          int r = gc_test_known(f, v, nonnull, tsets[bi], tcounts[bi]);
+          if (r < 0) break;
+          replace_with_const(f, v, (uint64_t)r);
+          changed = true;
+          g_stats.checks_removed++;
+          break;
+        }
         case I_STRUCT_NEW: case I_ARRAY_NEW: case I_ARRAY_NEW_SEG:
           obj = v;
           break;
         default: break;
       }
-      if (obj == REF_NONE || counts[bi] >= CAP) continue;
-      bool have = false;
-      for (uint32_t k = 0; k < counts[bi] && !have; k++)
-        have = sets[bi][k] == obj;
-      if (!have) sets[bi][counts[bi]++] = obj;
+      if (obj != REF_NONE) gc_root_add(sets[bi], &counts[bi], CAP, obj);
     }
   }
   for (uint32_t bi = 0; bi < f->nblocks; bi++) {
     xfree(sets[bi]);
     xfree(bsets[bi]);
+    xfree(tsets[bi]);
   }
   xfree(sets);
   xfree(counts);
   xfree(bsets);
   xfree(bcounts);
+  xfree(tsets);
+  xfree(tcounts);
   return changed;
 }
 
@@ -7038,9 +7533,16 @@ static bool gs_promote_one(IrFunc *f, const OptOpts *o, uint32_t gidx,
   for (uint32_t oi = 0; oi < f->norder; oi++) {
     uint32_t bi = f->order[oi];
     Block *b = &f->blocks[bi];
+    /* A merge no write reaches gets what any way in carries, the value read
+       on entry -- from a way in already walked: the first predecessor can be
+       the latch of a loop this block heads, which a jump-threaded loop
+       entered at its body has first, and has nothing yet. */
+    uint32_t in = b->npreds ? b->preds[0] : bi;
+    for (uint32_t p = 0; p < b->npreds; p++)
+      if (done[b->preds[p]]) { in = b->preds[p]; break; }
     Ref cur = bi == f->entry ? seed
             : param[bi] != REF_NONE ? param[bi]
-            : outv[b->preds[0]];
+            : outv[in];
     /* What memory holds, which is the entry value only until the first
        write before a call: the value left for the return and the next call
        is compared with that, not with the entry value, or a function that
@@ -7191,6 +7693,41 @@ static bool gs_pays(IrFunc *f, const OptOpts *o, uint32_t gidx) {
   gs_promote_one(f, o, gidx, (ValType)f->m->globals[gidx].type, &costs);
   bool pays = saves > costs;
   uint32_t best = 0;
+
+  /* A loop nested in the cycle's that makes such a call is no way round
+     without it: the counts take a loop to run, and one whose body calls
+     pays the store and reload every time round it.  An inlined callee's
+     dispatch loop is the shape -- its shadow-stack push and pop sit on a
+     path that only skips the calls by running the loop zero times. */
+  uint8_t *lcall = xcalloc(nb ? nb : 1, 1);
+  for (uint32_t oi = 0; oi < f->norder && !pays; oi++) {
+    uint32_t t = f->order[oi];
+    Block *tb = &f->blocks[t];
+    bool header = false;
+    for (uint32_t p = 0; p < tb->npreds && !header; p++)
+      header = dominates(f, t, tb->preds[p]);
+    if (!header) continue;
+    uint32_t sp = 0;
+    memset(bwd, 0, nb);
+    bwd[t] = 1;
+    lcall[t] = callb[t];
+    for (uint32_t p = 0; p < tb->npreds; p++) {
+      uint32_t l = tb->preds[p];
+      if (!bwd[l] && dominates(f, t, l)) { bwd[l] = 1; stk[sp++] = l; }
+    }
+    while (sp && !lcall[t]) {
+      uint32_t x = stk[--sp];
+      Block *xb = &f->blocks[x];
+      if (callb[x]) lcall[t] = 1;
+      for (uint32_t p = 0; p < xb->npreds; p++) {
+        uint32_t q = xb->preds[p];
+        if (bwd[q]) continue;
+        bwd[q] = 1;
+        stk[sp++] = q;
+      }
+    }
+  }
+
   for (uint32_t oi = 0; oi < f->norder && !pays; oi++) {
     uint32_t h = f->order[oi];
     Block *hb = &f->blocks[h];
@@ -7210,7 +7747,7 @@ static bool gs_pays(IrFunc *f, const OptOpts *o, uint32_t gidx) {
       Block *xb = &f->blocks[stk[--sp]];
       for (uint32_t s = 0; s < xb->nsuccs; s++) {
         uint32_t t = xb->succs[s].target;
-        if (fwd[t] || callb[t] || !dominates(f, h, t)) continue;
+        if (fwd[t] || callb[t] || lcall[t] || !dominates(f, h, t)) continue;
         fwd[t] = 1;
         stk[sp++] = t;
       }
@@ -7239,7 +7776,7 @@ static bool gs_pays(IrFunc *f, const OptOpts *o, uint32_t gidx) {
             f->m->funcs[f->func_index].sym ? f->m->funcs[f->func_index].sym : "?",
             gidx, (unsigned long long)saves, (unsigned long long)costs, best,
             pays ? "promote" : "leave");
-  xfree(callb); xfree(touch); xfree(fwd); xfree(bwd); xfree(stk);
+  xfree(callb); xfree(touch); xfree(fwd); xfree(bwd); xfree(stk); xfree(lcall);
   return pays;
 }
 
@@ -7295,6 +7832,179 @@ static bool pass_global_ssa(IrFunc *f, const OptOpts *o) {
     ir_order(f);
     ir_verify(f, "post-global-ssa");
   }
+  return changed;
+}
+
+/* An unsigned 32-bit division or remainder by a value its loop does not
+   change: the hardware divider takes 7 to 9 cycles a time, one division in
+   flight, where the reciprocal M = ceil(2^64 / d), made once before the loop,
+   turns each one into a multiply-high (Lemire, Kaser and Kurz, "Faster
+   remainder by direct computation"):
+
+     n / d  =  mulhu64(M, n)          n % d  =  mulhu64(M * n mod 2^64, d)
+
+   exactly, for every 32-bit n and every d from 2 up.  M is UINT64_MAX / d + 1,
+   which is 0 for d = 1: the remainder comes out 0 regardless, and the quotient
+   selects n.  A division by 0 still traps where it did -- the check stays in
+   the loop, a compare the branch predictor never misses -- and the reciprocal
+   is made from 1 instead, so making it cannot trap first.  gobench/divmod
+   hashes a slice by d and by d + 1 that way, a divider-bound loop in both
+   engines.  A 64-bit division whose operands both fit in 32 bits is the same
+   division -- Go's compiler widens a uint32 before it divides, so stdgo's copy
+   of that loop divides i64s -- and takes the 64-bit reciprocal as it is.  The
+   reciprocal goes before the outermost loop the divisor is invariant in: outer
+   loops are met first in rpo. */
+/* A remainder of a division the block has already made is n - q*d, a
+   multiply-subtract: asbench/div64 takes n / d and n % d of every pair, and
+   two divisions back to back are what both engines spend that loop on.  The
+   division comes first, so a divisor of 0, or a signed overflow, has trapped
+   there before the remainder could be asked for. */
+static bool pass_divrem(IrFunc *f) {
+  bool changed = false;
+  for (uint32_t oi = 0; oi < f->norder; oi++) {
+    uint32_t bi = f->order[oi];
+    Ref div[8];
+    uint32_t nd = 0;
+    for (uint32_t i = 0; i < f->blocks[bi].ninsts; i++) {
+      Ref v = f->blocks[bi].insts[i];
+      Inst *in = &f->insts[v];
+      if (in->op == I_DIVS || in->op == I_DIVU) {
+        if (nd < 8) div[nd++] = v;
+        continue;
+      }
+      if (in->op != I_REMS && in->op != I_REMU) continue;
+      uint16_t want = in->op == I_REMS ? I_DIVS : I_DIVU;
+      Ref *a = ir_args(f, v);
+      Ref q = REF_NONE;
+      for (uint32_t j = 0; j < nd && q == REF_NONE; j++) {
+        Ref *da = ir_args(f, div[j]);
+        if (f->insts[div[j]].op == want && f->insts[div[j]].type == in->type &&
+            da[0] == a[0] && da[1] == a[1])
+          q = div[j];
+      }
+      if (q == REF_NONE) continue;
+      Ref ma[2] = { q, a[1] };
+      uint32_t at = i;
+      Ref m = emit_before(f, bi, &at, I_MUL, (ValType)in->type, ma, 2, 0);
+      in = &f->insts[v];
+      a = ir_args(f, v);
+      a[1] = m;
+      in->op = I_SUB;
+      i = at;
+      changed = true;
+      g_stats.strength_reduced++;
+    }
+  }
+  return changed;
+}
+
+#define ID_MAX 8
+static bool pass_invdiv(IrFunc *f) {
+  bool changed = false;
+  uint8_t *inloop = xcalloc(f->nblocks, 1);
+  uint32_t *stack = xmalloc(f->nblocks * sizeof(uint32_t));
+  uint32_t *lblk = xmalloc(f->nblocks * sizeof(uint32_t));
+  for (uint32_t oi = 0; oi < f->norder; oi++) {
+    uint32_t hb = f->order[oi];
+    Block *h = &f->blocks[hb];
+    bool is_header = false;
+    uint32_t pre = REF_NONE, nfwd = 0;
+    for (uint32_t p = 0; p < h->npreds; p++) {
+      uint32_t pb = h->preds[p];
+      if (f->blocks[pb].rpo >= h->rpo) is_header = true;
+      else { nfwd++; pre = pb; }
+    }
+    if (!is_header || nfwd != 1 || pre == REF_NONE) continue;
+    if (ir_block_has_eh(f, pre)) continue;
+
+    uint32_t nl = 0, sp = 0;
+    inloop[hb] = 1;
+    lblk[nl++] = hb;
+    for (uint32_t p = 0; p < h->npreds; p++) {
+      uint32_t pb = h->preds[p];
+      if (f->blocks[pb].rpo >= h->rpo && !inloop[pb]) {
+        inloop[pb] = 1; lblk[nl++] = pb; stack[sp++] = pb;
+      }
+    }
+    while (sp) {
+      Block *c = &f->blocks[stack[--sp]];
+      for (uint32_t p = 0; p < c->npreds; p++)
+        if (!inloop[c->preds[p]]) {
+          inloop[c->preds[p]] = 1; lblk[nl++] = c->preds[p]; stack[sp++] = c->preds[p];
+        }
+    }
+    if (inloop[pre] || inloop[f->entry]) {
+      for (uint32_t i = 0; i < nl; i++) inloop[lblk[i]] = 0;
+      continue;
+    }
+
+    Ref dv[ID_MAX], dm[ID_MAX], d64[ID_MAX], one32[ID_MAX];
+    ValType dt[ID_MAX];
+    uint32_t nd = 0;
+    for (uint32_t li = 0; li < nl; li++) {
+      uint32_t bi = lblk[li];
+      for (uint32_t i = 0; i < f->blocks[bi].ninsts; i++) {
+        Ref v = f->blocks[bi].insts[i];
+        Inst *in = &f->insts[v];
+        if (in->op != I_DIVU && in->op != I_REMU) continue;
+        Ref n = ir_args(f, v)[0], d = ir_args(f, v)[1];
+        if (inloop[f->insts[d].block] || f->insts[d].op == I_CONST) continue;
+        ValType t = (ValType)in->type;
+        if (t == VT_I64 && (ir_value_max(f, n, 6) > 0xffffffffu ||
+                            ir_value_max(f, d, 6) > 0xffffffffu))
+          continue;
+        if (t != VT_I32 && t != VT_I64) continue;
+        uint32_t k = 0;
+        while (k < nd && !(dv[k] == d && dt[k] == t)) k++;
+        if (k == nd) {
+          if (nd == ID_MAX) continue;
+          /* d' = d ? d : 1, then M = UINT64_MAX / d' + 1, before the loop */
+          Ref c1 = ir_emit(f, pre, I_CONST, t, NULL, 0, 1, 0);
+          Ref sa[3] = { d, c1, d };
+          Ref dd = ir_emit(f, pre, I_SELECT, t, sa, 3, 0, 0);
+          Ref wide = t == VT_I64 ? dd : ir_emit(f, pre, I_EXTENDU, VT_I64, &dd, 1, 0, 0);
+          Ref all = ir_emit(f, pre, I_CONST, VT_I64, NULL, 0, ~(uint64_t)0, 0);
+          Ref qa[2] = { all, wide };
+          Ref q0 = ir_emit(f, pre, I_DIVU, VT_I64, qa, 2, 0, 0);
+          Ref c64 = ir_emit(f, pre, I_CONST, VT_I64, NULL, 0, 1, 0);
+          Ref ma[2] = { q0, c64 };
+          dv[k] = d;
+          dm[k] = ir_emit(f, pre, I_ADD, VT_I64, ma, 2, 0, 0);
+          d64[k] = wide;
+          Ref ea[2] = { d, c1 };
+          one32[k] = ir_emit(f, pre, I_EQ, VT_I32, ea, 2, 0, 0);
+          dt[k] = t;
+          nd++;
+        }
+        uint32_t at = i;
+        emit_before(f, bi, &at, I_TRAP_IF, VT_BOT, &d, 1, TRAP_DIV_ZERO);
+        Ref n64 = t == VT_I64 ? n : emit_before(f, bi, &at, I_EXTENDU, VT_I64, &n, 1, 0);
+        Ref r;
+        if (in->op == I_DIVU) {
+          Ref ha[2] = { dm[k], n64 };
+          Ref q = emit_before(f, bi, &at, I_MULHU, VT_I64, ha, 2, 0);
+          if (t == VT_I32) q = emit_before(f, bi, &at, I_WRAP, VT_I32, &q, 1, 0);
+          Ref sa[3] = { n, q, one32[k] };
+          r = emit_before(f, bi, &at, I_SELECT, t, sa, 3, 0);
+        } else {
+          Ref la[2] = { dm[k], n64 };
+          Ref lo = emit_before(f, bi, &at, I_MUL, VT_I64, la, 2, 0);
+          Ref ha[2] = { lo, d64[k] };
+          r = emit_before(f, bi, &at, I_MULHU, VT_I64, ha, 2, 0);
+          if (t == VT_I32) r = emit_before(f, bi, &at, I_WRAP, VT_I32, &r, 1, 0);
+        }
+        in = &f->insts[v];
+        ir_replace(f, v, r);
+        in->op = I_NOP;
+        i = at;
+        changed = true;
+        g_stats.strength_reduced++;
+      }
+    }
+    for (uint32_t i = 0; i < nl; i++) inloop[lblk[i]] = 0;
+  }
+  xfree(inloop); xfree(stack); xfree(lblk);
+  if (changed) ir_apply_subst(f);
   return changed;
 }
 
@@ -8178,6 +8888,30 @@ static bool lh_kill_redundant(IrFunc *f, uint32_t hb, uint32_t pre,
 #define LH_MAX_STORES 8
 #define LH_MAX_CHAIN 32
 
+/* Whether the trap block a header's invariant guard leaves for can be
+   reached from before the loop instead.  It reads what it reads where the
+   guard first held, and an invariant guard that holds at all holds on the
+   first iteration: so the header's parameters stand for what the preheader
+   passes in -- Rust's bounds-check panic reports the index -- and nothing
+   else from inside the loop may be read there.  The header must be its
+   only way in, or another path would see the substitution too. */
+static bool lh_trap_reads_ok(IrFunc *f, uint32_t tb, uint32_t hb,
+                             const uint8_t *inloop) {
+  Block *t = &f->blocks[tb];
+  if (t->npreds != 1 || t->preds[0] != hb) return false;
+  for (uint32_t i = 0; i < t->ninsts; i++) {
+    Ref v = t->insts[i];
+    Ref *a = ir_args(f, v);
+    for (uint32_t j = 0; j < f->insts[v].nargs; j++) {
+      uint32_t db = f->insts[a[j]].block;
+      if (db == tb || !inloop[db]) continue;
+      if (f->insts[a[j]].op == I_PARAM && db == hb) continue;
+      return false;
+    }
+  }
+  return true;
+}
+
 static bool lh_merge_down(IrFunc *f, uint32_t hb) {
   Block *b = &f->blocks[hb];
   if (b->term != T_JUMP || b->nsuccs != 1 || ir_block_has_eh(f, hb)) return false;
@@ -8376,7 +9110,8 @@ static bool pass_loop_hoist(IrFunc *f) {
                    LH_MAX_CHAIN, 0)) {
       for (uint32_t i = 0; i < 2; i++) {
         uint32_t t = h->succs[i].target;
-        if (!inloop[t] && f->blocks[t].term == T_TRAP && !h->succs[i].eh)
+        if (!inloop[t] && f->blocks[t].term == T_TRAP && !h->succs[i].eh &&
+            lh_trap_reads_ok(f, t, hb, inloop))
           trap_s = i;
         else if (inloop[t]) keep_s = i;
       }
@@ -8467,6 +9202,17 @@ static bool pass_loop_hoist(IrFunc *f) {
         memcpy(kargs, h->succs[keep_s].args, knargs * sizeof(Ref));
       }
 
+      /* the header's parameters, as the preheader passes them in */
+      {
+        Block *tbb = &f->blocks[tb];
+        Edge *pe = &f->blocks[ph].succs[0];
+        for (uint32_t i = 0; i < tbb->ninsts; i++) {
+          Ref *a = ir_args(f, tbb->insts[i]);
+          for (uint32_t j = 0; j < f->insts[tbb->insts[i]].nargs; j++)
+            for (uint32_t q = 0; q < h->nparams && q < pe->nargs; q++)
+              if (a[j] == h->params[q]) { a[j] = pe->args[q]; break; }
+        }
+      }
       f->blocks[ph].term = T_BRIF;
       f->blocks[ph].term_arg = cond;
       if (trap_s == 0) {
@@ -8610,6 +9356,21 @@ static bool rotate_one(IrFunc *f, uint32_t hb) {
   if (body_calls && !rot_all) RJ("body makes a call");
 
   if (!body_mem && !rot_all) RJ("body touches no memory");
+
+  /* What rotation saves is the jump back to the header: the latch ends in
+     the header's test instead, one conditional branch where there were two.
+     A latch that already ends in a conditional branch -- its other side
+     leaves the loop, as LLVM's loops with a break do -- has no jump to
+     save.  The copied test lands after the latch's own branch, a trip
+     still takes two, and the latch's way out, which fell through into the
+     code after the loop, becomes a taken branch over the copy.
+     vecbench/condsum's skip loop, left by every flag it keeps, ran 45%
+     slower rotated.  So at least one latch must end in a jump. */
+  bool jump_latch = false;
+  for (uint32_t p = 0; p < h->npreds; p++)
+    if (f->blocks[h->preds[p]].rpo >= h->rpo &&
+        f->blocks[h->preds[p]].term == T_JUMP) jump_latch = true;
+  if (!jump_latch) RJ("no latch ends in a jump");
 
   /* Which of the header's successors dominates each block.  Climbing the
      dominator tree from every block separately is the same walk over and
@@ -8931,6 +9692,62 @@ static Edge *iv_edge(IrFunc *f, uint32_t from, uint32_t to) {
     found = &b->succs[s];
   }
   return found;
+}
+
+/* A counter that runs down as `while (n--)` is tested before the decrement
+   that it carries to the next trip: the block computes n - 1 and branches on
+   n, so the old count and the new one are both live at the branch, cannot
+   share a register, and the back edge carries a move -- in a rotated latch
+   the move needs a block of its own, and a trip pays a second taken branch
+   for it (AssemblyScript's String.__eq compares its u16 tail like that).
+   Testing the new count instead -- n != 0 is n - 1 != -1 -- ends the old
+   one at the subtraction.  Only when the old count has no other use, and
+   the new one leaves along an edge, the shape of a carried counter. */
+static bool pass_postdec_test(IrFunc *f) {
+  uint32_t *uses = count_uses(f);
+  bool changed = false;
+  for (uint32_t oi = 0; oi < f->norder; oi++) {
+    uint32_t bi = f->order[oi];
+    Block *b = &f->blocks[bi];
+    if (b->term != T_BRIF || b->nsuccs != 2) continue;
+    /* The test is the count itself, its eqz, or its compare with zero. */
+    Ref c = b->term_arg;
+    bool zero_test = false;
+    uint64_t z;
+    if (f->insts[c].block == bi && uses[c] == 1) {
+      uint16_t op = f->insts[c].op;
+      Ref *ta = ir_args(f, c);
+      if (op == I_EQZ) { c = ta[0]; zero_test = true; }
+      else if ((op == I_EQ || op == I_NE) && is_const(f, ta[1], &z) && z == 0) {
+        zero_test = op == I_EQ;
+        c = ta[0];
+      }
+    }
+    ValType t = (ValType)f->insts[c].type;
+    if ((t != VT_I32 && t != VT_I64) || uses[c] != 2) continue;
+    uint64_t ones = t == VT_I64 ? ~0ull : 0xffffffffu;
+    Ref d = REF_NONE;
+    for (uint32_t i = 0; i < b->ninsts && d == REF_NONE; i++) {
+      Ref r = b->insts[i];
+      Inst *in = &f->insts[r];
+      if (in->type != t || in->nargs != 2) continue;
+      Ref *a = ir_args(f, r);
+      if (a[0] != c || f->insts[a[1]].op != I_CONST) continue;
+      uint64_t k = f->insts[a[1]].imm & ones;
+      if ((in->op == I_SUB && k == 1) || (in->op == I_ADD && k == ones)) d = r;
+    }
+    if (d == REF_NONE) continue;
+    bool carried = false;
+    for (uint32_t s = 0; s < b->nsuccs; s++)
+      for (uint32_t j = 0; j < b->succs[s].nargs; j++)
+        if (b->succs[s].args[j] == d) carried = true;
+    if (!carried) continue;
+    Ref args[2] = { d, ir_const(f, bi, t, ones) };
+    b->term_arg = ir_emit(f, bi, zero_test ? I_EQ : I_NE, VT_I32, args, 2, 0, 0);
+    changed = true;
+  }
+  xfree(uses);
+  return changed;
 }
 
 typedef struct { Ref addr; Ref iv; Ref entry; uint64_t step; uint16_t sop; } IvCand;
@@ -9331,6 +10148,12 @@ static bool pass_mem_ptr(IrFunc *f) {
   for (uint32_t base = 0; base < n; base++) {
     if (count[base] < 2) continue;
 
+    /* The pointer is made where the base is, so it costs an add every time
+       that block runs, and on the path from the base to its loads: in a
+       pointer chase that is a cycle per step.  Only accesses that run as often
+       as it pays for it -- not the ones in the block a search leaves its loop
+       for, which run once per search. */
+    uint32_t depth = f->blocks[f->insts[base].block].loop_depth;
     bool ok = true;
     uint32_t cost = 0;
     uint32_t mem = 0;
@@ -9343,10 +10166,12 @@ static bool pass_mem_ptr(IrFunc *f) {
         uint32_t nu = 0;
         ok = addr_users_are_accesses(f, &ui, v, in->imm, &nu, &mem, &seen);
 
-        if (ok) {
-          if (in->imm == 0) cost += 0;
-          else if (nu == 1) cost += 1;
-          else cost += 2;
+        if (ok && in->imm != 0) {
+          uint32_t hot = 0;
+          for (uint32_t k2 = ui.first[v]; k2 != UINT32_MAX; k2 = ui.next[k2])
+            if (f->blocks[f->insts[ui.user[k2]].block].loop_depth >= depth) hot++;
+          if (hot == 1) cost += 1;
+          else if (hot > 1) cost += 2;
         }
       }
     }
@@ -9401,6 +10226,7 @@ static bool pass_mem_ptr(IrFunc *f) {
 #define VEC_MAX_SEL  32
 #define VEC_MAX_GRP  8
 #define VEC_MAX_RED  4
+#define VEC_MAX_PAY  4
 
 #define VEC_MAX_WIDEN 3
 #define VEC_MAX_MEMO 128
@@ -9696,6 +10522,24 @@ static Ref v_scalar_minmax(IrFunc *f, uint32_t blk, IrOp vop, ValType t,
   return ir_emit(f, blk, I_SELECT, t, sa, 3, 0, 0);
 }
 
+/* v as the counter iv plus a constant, through adds and subtracts of
+   constants (32-bit, wrapping): the index an argmin keeps is the counter, or
+   the counter and an offset. */
+static bool v_iv_offset(IrFunc *f, Ref v, Ref iv, uint32_t *off) {
+  uint32_t acc = 0;
+  for (int d = 0; d < VEC_DEPTH && v != iv; d++) {
+    Inst *in = &f->insts[v];
+    uint64_t c;
+    if ((in->op != I_ADD && in->op != I_SUB) || in->nargs != 2 ||
+        (ValType)in->type != VT_I32 || !is_const(f, ir_args(f, v)[1], &c))
+      return false;
+    acc += in->op == I_ADD ? (uint32_t)c : (uint32_t)0 - (uint32_t)c;
+    v = ir_args(f, v)[0];
+  }
+  *off = acc;
+  return v == iv;
+}
+
 static bool v_cmp_form(uint16_t op, uint64_t *vop, bool *swap_ops, bool *swap_arms) {
   *swap_ops = false;
   *swap_arms = false;
@@ -9976,6 +10820,10 @@ static Ref v_build(VecCtx *c, const Ref *tuple, uint32_t k, uint32_t st, int dep
     case I_FNEG: if (flt) vop = I_VFNEG; break;
     case I_FABS: if (flt) vop = I_VFABS; break;
     case I_FSQRT: if (flt) vop = I_VFSQRT; break;
+    /* f32x4.min and max are f32.min and max lane by lane: a NaN wins and
+       -0 is below +0 in both */
+    case I_FMIN: if (flt) vop = I_VFMIN; break;
+    case I_FMAX: if (flt) vop = I_VFMAX; break;
     case I_SHL: case I_SHRU: case I_SHRS:
     case I_ROTL: case I_ROTR: if (!flt) vop = (IrOp)op0; break;
     default: break;
@@ -10418,7 +11266,7 @@ static bool vectorize_one(IrFunc *f, uint32_t hb, uint8_t *reach, uint8_t *inloo
       case I_AND: case I_OR: case I_XOR:
       case I_SHL: case I_SHRU: case I_SHRS: case I_ROTL: case I_ROTR:
       case I_FADD: case I_FSUB: case I_FMUL: case I_FDIV:
-      case I_FNEG: case I_FABS: case I_FSQRT:
+      case I_FNEG: case I_FABS: case I_FSQRT: case I_FMIN: case I_FMAX:
       case I_LOAD: case I_STORE: case I_MEM_ADDR: case I_MEM_PTR:
 
       case I_MEM_BASE:
@@ -10662,19 +11510,36 @@ static bool vectorize_one(IrFunc *f, uint32_t hb, uint8_t *reach, uint8_t *inloo
   bool redsigned[VEC_MAX_RED];
 
   bool redmul[VEC_MAX_RED];
+  /* a min/max reduction's compares and which arm of its selects the element
+     is on, by lane, for an index carried beside it */
+  Ref redcmp[VEC_MAX_RED][VEC_MAX_MEMB];
+  bool redtt[VEC_MAX_RED][VEC_MAX_MEMB];
+  uint32_t pdef[16], npdef = 0;
   uint32_t nred = 0;
   for (uint32_t p = 0; p < np; p++) {
     if (isiv[p]) continue;
     Ref par = hparam[p], nx = back_args[p];
     if (nx == par) VREJ("carried value with no update");
     ValType pt = (ValType)f->insts[par].type;
-    if (vt_is_float(pt)) VREJ("carried value is not a lane");
     Inst *n = &f->insts[nx];
+    /* A float sum is not reassociable, but min and max are, exactly: wasm's
+       f32.min returns a NaN if either side is one, whatever the order, and
+       -0 below +0, so a lane-wise min of the elements and then of the lanes
+       is the min of them all.  Only the NaN's payload may differ, and wasm
+       leaves that open. */
+    bool is_fmm = vt_is_float(pt) && (n->op == I_FMIN || n->op == I_FMAX);
+    if (vt_is_float(pt) && !is_fmm) VREJ("carried value is not a lane");
     IrOp mmop = (IrOp)0;
-    bool is_mm = inloop[n->block] && v_minmax_form(f, nx, &mmop);
+    bool is_mm = !is_fmm && inloop[n->block] && v_minmax_form(f, nx, &mmop);
+    if (!is_mm && !is_fmm && inloop[n->block] && n->op == I_SELECT && pt == VT_I32) {
+      /* perhaps an index kept beside a min or max: settled after them */
+      if (npdef == 16) VREJ("too many index reductions");
+      pdef[npdef++] = p;
+      continue;
+    }
     if (!inloop[n->block] ||
-        (!is_mm && n->op != I_ADD && n->op != I_AND && n->op != I_OR &&
-         n->op != I_XOR))
+        (!is_mm && !is_fmm && n->op != I_ADD && n->op != I_AND &&
+         n->op != I_OR && n->op != I_XOR))
       VREJ("carried value is not a reduction");
 
     if (is_mm && v_lane_of(pt) == VLANE_I64) VREJ("64-bit min/max reduction");
@@ -10704,6 +11569,7 @@ static bool vectorize_one(IrFunc *f, uint32_t hb, uint8_t *reach, uint8_t *inloo
     Ref cur = nx;
 
     Ref mmcmp[VEC_MAX_MEMB];
+    bool tsd[VEC_MAX_MEMB];
     uint32_t nmmcmp = 0;
     while (cur != par) {
       Inst *ci = &f->insts[cur];
@@ -10723,6 +11589,7 @@ static bool vectorize_one(IrFunc *f, uint32_t hb, uint8_t *reach, uint8_t *inloo
       else if (reach[y]) { next = y; term = x; }
       else VREJ("reduction chain end");
       if (nterm == k) VREJ("reduction chain too long");
+      tsd[nterm] = term == x;
       redterm[nred][nterm++] = term;
       cur = next;
     }
@@ -10736,6 +11603,7 @@ static bool vectorize_one(IrFunc *f, uint32_t hb, uint8_t *reach, uint8_t *inloo
         int l = v_lane_of_term(&ctx, redterm[nred][t], VEC_DEPTH);
         if (l < 0 || (uint32_t)l >= k || got[l]) VREJ("reduction terms do not line up");
         ord[l] = redterm[nred][t];
+        if (is_mm) { redcmp[nred][l] = mmcmp[t]; redtt[nred][l] = tsd[t]; }
         got[l] = 1;
       }
       memcpy(redterm[nred], ord, k * sizeof(Ref));
@@ -10835,6 +11703,128 @@ static bool vectorize_one(IrFunc *f, uint32_t hb, uint8_t *reach, uint8_t *inloo
     nred++;
   }
 
+  /* argmin and argmax: an index carried beside a min or max reduction and
+     taken where that reduction's select takes the element --
+     select(i, at, v < best) beside select(v, best, v < best).  Each lane
+     keeps the position of its own best element: the first of equal ones
+     where the compare is strict, the last where it is not.  The exit takes,
+     among the lanes that hold the overall best, the earliest position (or
+     the latest), and makes the index that element had: the counter's entry
+     value, the index's offset from the counter, and the position times the
+     index's step.  A position is the element's place in the vector loop,
+     memory order in a forward loop, and the loop's count is capped so that
+     positions never wrap, however the index itself does.  The scalar entry
+     value stands for the elements before the loop, which win ties when the
+     first is wanted and lose them when the last is. */
+  Ref payparam[VEC_MAX_PAY];
+  uint32_t payred[VEC_MAX_PAY], payiv[VEC_MAX_PAY];
+  uint32_t payc0[VEC_MAX_PAY], payd[VEC_MAX_PAY];
+  bool payfirst[VEC_MAX_PAY], payside[VEC_MAX_PAY], payltm[VEC_MAX_PAY];
+  uint16_t paycop[VEC_MAX_PAY];
+  int paymap[16];
+  for (uint32_t p = 0; p < 16; p++) paymap[p] = -1;
+  uint32_t npay = 0;
+  for (uint32_t di = 0; di < npdef; di++) {
+    uint32_t p = pdef[di];
+    Ref par = hparam[p], nx = back_args[p];
+    if (backward || lane != VLANE_I32 || width != 4) VREJ("index reduction shape");
+    if (npay == VEC_MAX_PAY) VREJ("too many index reductions");
+    memset(reach, 0, f->ninsts);
+    reach[par] = 1;
+    for (uint32_t i = 0; i < nbody; i++) {
+      Ref r = body[i];
+      Inst *ri = &f->insts[r];
+      Ref *ra = ir_args(f, r);
+      for (uint32_t j = 0; j < ri->nargs; j++)
+        if (reach[ra[j]]) { reach[r] = 1; break; }
+    }
+    Ref term[VEC_MAX_MEMB], cnd[VEC_MAX_MEMB], link[VEC_MAX_MEMB];
+    bool side[VEC_MAX_MEMB];
+    uint32_t nt = 0;
+    for (Ref cur = nx; cur != par;) {
+      Inst *ci = &f->insts[cur];
+      if (ci->op != I_SELECT || ci->nargs != 3 || !inloop[ci->block])
+        VREJ("carried value is not a reduction");
+      Ref *ca = ir_args(f, cur);
+      if (reach[ca[0]] == reach[ca[1]] || reach[ca[2]]) VREJ("index reduction chain");
+      if (nt == k) VREJ("index reduction chain too long");
+      side[nt] = !reach[ca[0]];
+      term[nt] = side[nt] ? ca[0] : ca[1];
+      cnd[nt] = ca[2];
+      link[nt] = cur;
+      cur = side[nt] ? ca[1] : ca[0];
+      nt++;
+    }
+    if (nt != k) VREJ("index reduction chain length");
+
+    /* the min/max reduction the compares belong to, lane by lane */
+    uint32_t r = 0xffffffffu, lof[VEC_MAX_MEMB];
+    uint8_t got[VEC_MAX_MEMB];
+    memset(got, 0, sizeof got);
+    for (uint32_t t = 0; t < nt; t++) {
+      uint32_t hr = 0xffffffffu, hl = 0;
+      for (uint32_t rr = 0; rr < nred && hr == 0xffffffffu; rr++) {
+        if (!v_is_minmax_op(redop[rr]) || redwiden[rr]) continue;
+        for (uint32_t l = 0; l < k; l++)
+          if (redcmp[rr][l] == cnd[t]) { hr = rr; hl = l; break; }
+      }
+      if (hr == 0xffffffffu || (r != 0xffffffffu && hr != r))
+        VREJ("index reduction compare");
+      if (got[hl] || side[t] != redtt[hr][hl] || side[t] != side[0])
+        VREJ("index reduction arms");
+      r = hr; got[hl] = 1; lof[t] = hl;
+    }
+    uint16_t cop = f->insts[cnd[0]].op;
+    bool ltm = ir_args(f, cnd[0])[0] == redterm[r][lof[0]];
+    for (uint32_t t = 0; t < nt; t++)
+      if (f->insts[cnd[t]].op != cop ||
+          (ir_args(f, cnd[t])[0] == redterm[r][lof[t]]) != ltm)
+        VREJ("index reduction compares differ");
+    bool strict = cop == I_LTS || cop == I_LTU || cop == I_GTS || cop == I_GTU;
+    if (!strict && cop != I_LES && cop != I_LEU && cop != I_GES && cop != I_GEU)
+      VREJ("index reduction compare");
+
+    /* the index is the counter plus an offset that grows by one step per
+       element */
+    uint32_t q = 0xffffffffu, off[VEC_MAX_MEMB];
+    for (uint32_t qq = 0; qq < np && q == 0xffffffffu; qq++) {
+      if (!isiv[qq] || (ValType)f->insts[hparam[qq]].type != VT_I32) continue;
+      bool all = true;
+      for (uint32_t t = 0; t < nt && all; t++)
+        all = v_iv_offset(f, term[t], hparam[qq], &off[lof[t]]);
+      if (all) q = qq;
+    }
+    if (q == 0xffffffffu) VREJ("index is not the counter");
+    uint32_t step = ivadd[q] ? (uint32_t)ivstep[q] : (uint32_t)0 - (uint32_t)ivstep[q];
+    uint32_t d = k == 1 ? step : off[1] - off[0];
+    for (uint32_t l = 0; l < k; l++)
+      if (off[l] != off[0] + l * d) VREJ("index does not step with the elements");
+    if (d * k != step) VREJ("index does not step with the elements");
+
+    /* nothing else reads the index or its links */
+    if (lb->term_arg == par) VREJ("accumulator read elsewhere");
+    for (uint32_t qq = 0; qq < np; qq++)
+      if (qq != p && back_args[qq] == par) VREJ("accumulator carried twice");
+    for (uint32_t t = 0; t <= nt; t++) {
+      Ref want = t < nt ? link[t] : par;
+      uint32_t uses = 0;
+      for (uint32_t i = 0; i < nbody; i++) {
+        Inst *in = &f->insts[body[i]];
+        Ref *a = ir_args(f, body[i]);
+        for (uint32_t j = 0; j < in->nargs; j++) if (a[j] == want) uses++;
+      }
+      if (uses != (t == 0 ? 0u : 1u) || lb->term_arg == want)
+        VREJ("accumulator read elsewhere");
+    }
+
+    payparam[npay] = par; payred[npay] = r; payiv[npay] = q;
+    payc0[npay] = off[0]; payd[npay] = d;
+    payfirst[npay] = side[0] ? strict : !strict;
+    payside[npay] = side[0]; payltm[npay] = ltm; paycop[npay] = cop;
+    paymap[p] = (int)npay;
+    npay++;
+  }
+
   Ref ivside, bound;
   IrOp rel;
   {
@@ -10919,6 +11909,12 @@ static bool vectorize_one(IrFunc *f, uint32_t hb, uint8_t *reach, uint8_t *inloo
   Ref ok;
   Ref cnt = guard_trip_count(f, vguard, ct, rel, K, down, q0, bound,
                              clone_bound, U, &ok);
+  if (npay) {
+    /* at most 2^24 vector iterations, so a position stays below 2^28 */
+    Ref cap = ir_emit(f, vguard, I_CONST, ct, NULL, 0, 0x00ffffffu, 0);
+    ok = vemit(f, vguard, I_AND, VT_I32, ok,
+               vemit(f, vguard, I_LEU, VT_I32, cnt, cap, 0, 0), 0, 0);
+  }
 
   Ref cnt32 = ct == VT_I64 ? vemit(f, vguard, I_WRAP, VT_I32, cnt, REF_NONE, 0, 0) : cnt;
   Ref cnt64 = ct == VT_I64 ? cnt
@@ -11022,6 +12018,9 @@ static bool vectorize_one(IrFunc *f, uint32_t hb, uint8_t *reach, uint8_t *inloo
 
   for (uint32_t r = 0; r < nred; r++)
     pacc[r] = ir_add_param(f, vbody, VT_V128);
+  Ref ppay[VEC_MAX_PAY], ppos = REF_NONE;
+  for (uint32_t i = 0; i < npay; i++) ppay[i] = ir_add_param(f, vbody, VT_V128);
+  if (npay) ppos = ir_add_param(f, vbody, VT_V128);
 
   for (uint32_t g = 0; g < ctx.ngrp; g++) {
     VGroup *G = &ctx.grp[g];
@@ -11114,14 +12113,18 @@ static bool vectorize_one(IrFunc *f, uint32_t hb, uint8_t *reach, uint8_t *inloo
   }
 
   Ref nextacc[VEC_MAX_RED];
+  Ref accbefore[VEC_MAX_RED][VEC_MAX_VEC];
   for (uint32_t r = 0; r < nred; r++) {
     IrOp vop = v_is_minmax_op(redop[r]) ? redop[r]
+             : redop[r] == I_FMIN ? I_VFMIN
+             : redop[r] == I_FMAX ? I_VFMAX
              : redop[r] == I_ADD ? I_VADD
              : redop[r] == I_AND ? I_VAND
              : redop[r] == I_OR  ? I_VOR : I_VXOR;
     uint32_t sg = redsigned[r] ? 1u : 0u;
     nextacc[r] = pacc[r];
     for (uint32_t v = 0; v < nvec; v++) {
+      accbefore[r][v] = nextacc[r];
       if (!redwiden[r]) {
         Ref cm = vop == I_VADD ? v_counted_mask(f, accval[r][v]) : REF_NONE;
         if (cm != REF_NONE)
@@ -11156,6 +12159,41 @@ static bool vectorize_one(IrFunc *f, uint32_t hb, uint8_t *reach, uint8_t *inloo
     }
   }
 
+  /* An index takes the position of an element where its reduction's
+     compare, against the accumulator as it was before that vector, takes
+     the element. */
+  Ref nextpay[VEC_MAX_PAY], nextpos = REF_NONE;
+  if (npay) {
+    uint32_t lv = VEC_BYTES / width;
+    for (uint32_t i = 0; i < npay; i++) {
+      uint32_t r = payred[i];
+      uint64_t vop;
+      bool swap_ops, swap_arms;
+      v_cmp_form(paycop[i], &vop, &swap_ops, &swap_arms);
+      nextpay[i] = ppay[i];
+      for (uint32_t v = 0; v < nvec; v++) {
+        Ref pos = ppos;
+        if (v) {
+          Ref c = ir_emit(f, vguard, I_CONST, VT_I32, NULL, 0, v * lv, 0);
+          pos = vemit(f, vbody, I_VADD, VT_V128, ppos,
+                      vemit(f, vguard, I_VSPLAT, VT_V128, c, REF_NONE, 0, lane),
+                      0, lane);
+        }
+        Ref x = payltm[i] ? accval[r][v] : accbefore[r][v];
+        Ref y = payltm[i] ? accbefore[r][v] : accval[r][v];
+        if (swap_ops) { Ref t = x; x = y; y = t; }
+        Ref mask = vemit(f, vbody, I_VCMP, VT_V128, x, y, vop, lane);
+        bool take_on_mask = payside[i] != swap_arms;
+        nextpay[i] = vemit3(f, vbody, I_VSEL, VT_V128, mask,
+                            take_on_mask ? pos : nextpay[i],
+                            take_on_mask ? nextpay[i] : pos, 0, lane);
+      }
+    }
+    Ref c = ir_emit(f, vguard, I_CONST, VT_I32, NULL, 0, nvec * lv, 0);
+    nextpos = vemit(f, vbody, I_VADD, VT_V128, ppos,
+                    vemit(f, vguard, I_VSPLAT, VT_V128, c, REF_NONE, 0, lane), 0, lane);
+  }
+
   Ref step1 = ir_emit(f, vbody, I_CONST, VT_I64, NULL, 0, W, 0);
   Ref stepm = REF_NONE;
   Ref nptr[VEC_MAX_GRP];
@@ -11174,9 +12212,11 @@ static bool vectorize_one(IrFunc *f, uint32_t hb, uint8_t *reach, uint8_t *inloo
   Ref ncnt = vemit(f, vbody, I_SUB, ct, pcnt, vone, 0, 0);
   Ref more = vemit(f, vbody, I_NE, VT_I32, ncnt, vzero, 0, 0);
 
-  Ref eacc[VEC_MAX_RED];
+  Ref eacc[VEC_MAX_RED], epay[VEC_MAX_PAY];
   for (uint32_t r = 0; r < nred; r++)
     eacc[r] = ir_add_param(f, vexit, VT_V128);
+  for (uint32_t i = 0; i < npay; i++)
+    epay[i] = ir_add_param(f, vexit, VT_V128);
 
   for (uint32_t s = 0; s < f->blocks[pre].nsuccs; s++)
     if (f->blocks[pre].succs[s].target == hb) {
@@ -11184,16 +12224,20 @@ static bool vectorize_one(IrFunc *f, uint32_t hb, uint8_t *reach, uint8_t *inloo
       f->blocks[pre].succs[s].nargs = 0;
     }
 
-  Ref vb_args[VEC_MAX_GRP + 1 + VEC_MAX_RED];
+  Ref vb_args[VEC_MAX_GRP + 1 + VEC_MAX_RED + VEC_MAX_PAY + 1];
   uint32_t nvb = 0;
   for (uint32_t g = 0; g < ctx.ngrp; g++) vb_args[nvb++] = ctx.grp[g].ptr;
   vb_args[nvb++] = cnt;
   for (uint32_t r = 0; r < nred; r++) {
 
     ValType st = (ValType)f->insts[redparam[r]].type;
-    bool w32 = st == VT_I32;
+    bool w32 = st == VT_I32 || st == VT_F32;
 
-    uint64_t ident = redop[r] == I_AND ? (w32 ? 0xffffffffu : ~0ull)
+    /* +inf and -inf are the identities of a float min and max: no NaN, and
+       min(+inf, -0) is -0 */
+    uint64_t ident = redop[r] == I_FMIN ? (w32 ? 0x7f800000u : 0x7ff0000000000000ull)
+                   : redop[r] == I_FMAX ? (w32 ? 0xff800000u : 0xfff0000000000000ull)
+                   : redop[r] == I_AND ? (w32 ? 0xffffffffu : ~0ull)
                    : redop[r] == I_VSMIN ? (w32 ? 0x7fffffffu : 0x7fffffffffffffffull)
                    : redop[r] == I_VSMAX ? (w32 ? 0x80000000u : 0x8000000000000000ull)
                    : redop[r] == I_VUMIN ? (w32 ? 0xffffffffu : ~0ull)
@@ -11201,6 +12245,15 @@ static bool vectorize_one(IrFunc *f, uint32_t hb, uint8_t *reach, uint8_t *inloo
     Ref sc = ir_emit(f, vguard, I_CONST, st, NULL, 0, ident, 0);
     vb_args[nvb++] = vemit(f, vguard, I_VSPLAT, VT_V128, sc, REF_NONE, 0,
                            lane + redwiden[r]);
+  }
+  if (npay) {
+    /* a lane whose best is still the identity never took a position, and the
+       exit never picks it */
+    Ref z = ir_emit(f, vguard, I_CONST, VT_I32, NULL, 0, 0, 0);
+    Ref zs = vemit(f, vguard, I_VSPLAT, VT_V128, z, REF_NONE, 0, lane);
+    for (uint32_t i = 0; i < npay; i++) vb_args[nvb++] = zs;
+    vb_args[nvb++] = ir_emit(f, vguard, I_CONST, VT_V128, NULL, 0,
+                             0x0000000100000000ull, 0x0000000300000002ull);
   }
   f->blocks[vguard].term = T_BRIF;
   f->blocks[vguard].term_arg = ok;
@@ -11211,11 +12264,16 @@ static bool vectorize_one(IrFunc *f, uint32_t hb, uint8_t *reach, uint8_t *inloo
   for (uint32_t g = 0; g < ctx.ngrp; g++) vb_args[nvb++] = nptr[g];
   vb_args[nvb++] = ncnt;
   for (uint32_t r = 0; r < nred; r++) vb_args[nvb++] = nextacc[r];
+  for (uint32_t i = 0; i < npay; i++) vb_args[nvb++] = nextpay[i];
+  if (npay) vb_args[nvb++] = nextpos;
   f->blocks[vbody].term = T_BRIF;
   f->blocks[vbody].term_arg = more;
   ir_add_edge(f, vbody, vbody, vb_args, nvb);
 
-  ir_add_edge(f, vbody, vexit, nextacc, nred);
+  Ref ex_args[VEC_MAX_RED + VEC_MAX_PAY];
+  for (uint32_t r = 0; r < nred; r++) ex_args[r] = nextacc[r];
+  for (uint32_t i = 0; i < npay; i++) ex_args[nred + i] = nextpay[i];
+  ir_add_edge(f, vbody, vexit, ex_args, nred + npay);
 
   Ref exit_args[16];
   Ref done_iters = us
@@ -11241,6 +12299,49 @@ static bool vectorize_one(IrFunc *f, uint32_t hb, uint8_t *reach, uint8_t *inloo
       }
       exit_args[p] = vemit(f, vexit, ivadd[p] ? I_ADD : I_SUB, pt,
                            entry_args[p], delta, 0, 0);
+    } else if (paymap[p] >= 0) {
+      uint32_t i = (uint32_t)paymap[p], r = payred[i];
+      uint32_t rp = 0;
+      while (hparam[rp] != redparam[r]) rp++;
+      ValType rt = (ValType)f->insts[redparam[r]].type;
+      Ref m = vemit(f, vexit, I_VREDUCE, rt, eacc[r], REF_NONE, redop[r], lane);
+      uint64_t eqop;
+      bool so, sa;
+      v_cmp_form(I_EQ, &eqop, &so, &sa);
+      Ref best = vemit(f, vexit, I_VCMP, VT_V128, eacc[r],
+                       vemit(f, vexit, I_VSPLAT, VT_V128, m, REF_NONE, 0, lane),
+                       eqop, lane);
+      Ref none = ir_emit(f, vexit, I_CONST, VT_I32, NULL, 0,
+                         payfirst[i] ? 0xffffffffu : 0, 0);
+      Ref cand = vemit3(f, vexit, I_VSEL, VT_V128, best, epay[i],
+                        vemit(f, vexit, I_VSPLAT, VT_V128, none, REF_NONE, 0, lane),
+                        0, lane);
+      Ref pos = vemit(f, vexit, I_VREDUCE, VT_I32, cand, REF_NONE,
+                      payfirst[i] ? I_VUMIN : I_VUMAX, lane);
+      Ref base = vemit(f, vexit, I_ADD, VT_I32, entry_args[payiv[i]],
+                       ir_emit(f, vexit, I_CONST, VT_I32, NULL, 0, payc0[i], 0), 0, 0);
+      Ref idx = vemit(f, vexit, I_ADD, VT_I32, base,
+                      vemit(f, vexit, I_MUL, VT_I32, pos,
+                            ir_emit(f, vexit, I_CONST, VT_I32, NULL, 0, payd[i], 0),
+                            0, 0), 0, 0);
+      bool mn = redop[r] == I_VSMIN || redop[r] == I_VUMIN;
+      bool sg = redop[r] == I_VSMIN || redop[r] == I_VSMAX;
+      IrOp bop = mn ? (payfirst[i] ? (sg ? I_LTS : I_LTU) : (sg ? I_LES : I_LEU))
+                    : (payfirst[i] ? (sg ? I_GTS : I_GTU) : (sg ? I_GES : I_GEU));
+      Ref better = vemit(f, vexit, bop, VT_I32, m, entry_args[rp], 0, 0);
+      Ref sa3[3] = { idx, entry_args[p], better };
+      exit_args[p] = ir_emit(f, vexit, I_SELECT, VT_I32, sa3, 3, 0, 0);
+    } else if (redop[ri] == I_FMIN || redop[ri] == I_FMAX) {
+      /* The lanes one by one, onto the value the loop came in with: the
+         loop leaves once, and both back ends extract a float lane already. */
+      Ref acc = entry_args[p];
+      uint32_t nl = VEC_BYTES >> VLANE_SIZE(lane);
+      for (uint32_t l = 0; l < nl; l++) {
+        Ref e = vemit(f, vexit, I_VEXTRACTU, pt, eacc[ri], REF_NONE, l, lane);
+        acc = vemit(f, vexit, redop[ri], pt, acc, e, 0, 0);
+      }
+      exit_args[p] = acc;
+      ri++;
     } else {
 
       Ref red = vemit(f, vexit, I_VREDUCE, pt, eacc[ri], REF_NONE,
@@ -13267,6 +14368,11 @@ void ir_optimize(IrFunc *f, const OptOpts *o) {
       ir_order(f);
     }
   }
+  if (o->strength && TP("invdiv", pass_invdiv(f))) {
+    if (o->dce) pass_dce(f);
+    ir_order(f);
+  }
+  if (o->strength) TP("divrem", pass_divrem(f));
 
   if (o->strength && pass_iv_strength(f)) {
     prune_params(f);
@@ -13317,12 +14423,17 @@ void ir_optimize(IrFunc *f, const OptOpts *o) {
     ir_verify(f, "post-once-loops");
   }
 
+  if (o->strength && TP("postdec_test", pass_postdec_test(f)) && o->dce)
+    pass_dce(f);
   if (prune_params(f)) ir_order(f);
   if (o->labcache) pass_lab_cache(f);
 
   if (o->loopclose && TP("loop_close", pass_loop_close(f))) ir_order(f);
-  if (o->reassoc) TP("reassoc", pass_reassoc(f));
-  if (o->reassoc && TP("reassoc_carried", pass_reassoc_carried(f)) && o->dce) pass_dce(f);
+  /* A chain rebuilt through a wrap leaves the wrap, and an extend under it,
+     unread. */
+  bool reassoced = o->reassoc && TP("reassoc", pass_reassoc(f));
+  if (o->reassoc && TP("reassoc_carried", pass_reassoc_carried(f))) reassoced = true;
+  if (reassoced && o->dce) pass_dce(f);
 
   if (o->barelide) TP("bar_elide", pass_bar_elide(f));
   if (o->print_ir) ir_print(f, "optimised");
