@@ -13707,11 +13707,13 @@ static bool uac_regroup(IrFunc *f, Block *b) {
        gap here (the trailer's dce runs after this pass), so the window is
        wider than the emitter's */
     uint32_t lim = i + 24 < b->ninsts ? i + 24 : b->ninsts;
-    for (uint32_t j = i + 2; j < lim; j++) {
+    /* from i + 1: the op right after u0 is in the gap too, and a load
+       moved up past a store there read memory before the store wrote it */
+    for (uint32_t j = i + 1; j < lim; j++) {
       Ref u1 = b->insts[j];
       Inst *l1 = &f->insts[u1];
       if (!uac_pure(l1->op)) break;
-      if (l1->op != I_LOAD) continue;
+      if (l1->op != I_LOAD || j == i + 1) continue;
       Ref m1 = ir_args(f, u1)[0];
       if (f->insts[m1].op != I_MEM_ADDR || f->insts[m1].nargs != 1) continue;
       if (ir_args(f, m1)[0] != root) continue;
