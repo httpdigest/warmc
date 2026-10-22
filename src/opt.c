@@ -8313,19 +8313,24 @@ static bool pass_licm(IrFunc *f, const OptOpts *o) {
       for (uint32_t i = 0; i < b->ninsts; i++) {
         Ref v = b->insts[i];
         Inst *in = &f->insts[v];
-        bool stop_any = stops_block(in), stop_other = stops_with_other_code(in);
+        /* Only an op that stays ends the always-reached stretch: one hoisted
+           runs in the preheader, in the same order before the rest, so what
+           follows it in the header is still reached first on entry --
+           Kotlin's interface calls, a checked receiver load, then the
+           checked load of its itable. */
         bool m = reach_mem, any = reach_any;
-        if (stop_any) reach_any = false;
-        if (stop_other) reach_mem = false;
-        if (guarded_pre && in->op != I_CONST) { b->insts[k++] = v; continue; }
-        if (!inst_hoistable(f, v, m, any, &lf, inloop, lblk, nlbl, acc,
-                            const_reg_use, preheader, o->gcpure)) {
-          b->insts[k++] = v; continue; }
+        bool hoist = !(guarded_pre && in->op != I_CONST) &&
+                     inst_hoistable(f, v, m, any, &lf, inloop, lblk, nlbl,
+                                    acc, const_reg_use, preheader, o->gcpure);
         Ref *a = ir_args(f, v);
-        bool invariant = true;
-        for (uint32_t j = 0; j < in->nargs; j++)
-          if (inloop[f->insts[a[j]].block]) { invariant = false; break; }
-        if (!invariant) { b->insts[k++] = v; continue; }
+        for (uint32_t j = 0; hoist && j < in->nargs; j++)
+          if (inloop[f->insts[a[j]].block]) hoist = false;
+        if (!hoist) {
+          if (stops_block(in)) reach_any = false;
+          if (stops_with_other_code(in)) reach_mem = false;
+          b->insts[k++] = v;
+          continue;
+        }
 
         if (pre->ninsts == pre->cap_insts) {
           uint32_t oc_ = pre->cap_insts;
