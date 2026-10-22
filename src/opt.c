@@ -7358,8 +7358,11 @@ static bool inst_hoistable(IrFunc *f, Ref v, bool reach_mem, bool reach_any,
   if (ir_is_pure(in)) return true;
   if (!reach_any) return false;
   if (in->op == I_BOUNDS_CHECK) return !lf->may_grow;
+  /* A trap_if on an invariant condition fires on the first trip or never,
+     as a divide by an invariant zero does: Kotlin's cast of an invariant
+     receiver to its itable type, rechecked on every call. */
   return in->op == I_DIVS || in->op == I_DIVU ||
-         in->op == I_REMS || in->op == I_REMU;
+         in->op == I_REMS || in->op == I_REMU || in->op == I_TRAP_IF;
 }
 
 bool ir_op_is_gc_safepoint(uint16_t op) {
