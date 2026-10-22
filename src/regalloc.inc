@@ -143,6 +143,15 @@ typedef struct {
   int32_t reg;
 } Interval;
 
+/* How many positions an interval holds a register for: its ranges, holes
+   left out. */
+static double iv_span(const Interval *iv, const Range *R) {
+  if (!iv->rcount) return (double)(iv->end - iv->start + 1);
+  double n = 0;
+  for (uint32_t y = 0; y < iv->rcount; y++) n += R[iv->rfirst + y].hi - R[iv->rfirst + y].lo + 1;
+  return n > 0 ? n : 1;
+}
+
 static void spill_debug(Isel *s, const char *kind, const Interval *cur,
                         double w) {
   Inst *in = &s->f->insts[cur->value];
@@ -1153,7 +1162,16 @@ static void regalloc_linear(Isel *s) {
 
       int victim_reg = -1;
       int32_t victim_idx = -1;
+      /* Among float values the one to spill is the one whose register
+         buys least per position it holds: a long value read now and then
+         before the short temporaries of a block of arithmetic, each of
+         which, spilled, still needs a register at its definition and its
+         use.  Compared by weight alone, every temporary of an unrolled
+         n-body step spilled itself.  Integer values keep weight alone,
+         which measured better for them. */
+      bool dens = cur->cls != 0;
       double victim_w = no_evict ? -1e300 : weight[cur->value];
+      double victim_d = no_evict ? -1e300 : (dens ? victim_w / iv_span(cur, R) : victim_w);
       for (int k = 0; k < npool; k++) {
         int rr = pool[k];
         bool cs = cur->cls ? fpr_is_callee_saved(rr) : gpr_is_callee_saved(rr);
@@ -1161,7 +1179,8 @@ static void regalloc_linear(Isel *s) {
         int32_t cand;
         if (occ_conflicts(&heaps[rr], cur, R, gone, ostack, &cand) != 1) continue;
         double w = weight[sorted[cand].value];
-        if (w < victim_w) { victim_w = w; victim_reg = rr; victim_idx = cand; }
+        double dd = dens ? w / iv_span(&sorted[cand], R) : w;
+        if (dd < victim_d) { victim_d = dd; victim_w = w; victim_reg = rr; victim_idx = cand; }
       }
       /* A call-crossing value the callee-saved registers cannot hold may
          instead take a caller-saved register plus a private slot, paying two

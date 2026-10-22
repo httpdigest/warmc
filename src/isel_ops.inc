@@ -371,7 +371,13 @@ static void emit_inst(Isel *s, Ref v) {
   int ft = wide ? FT_D : FT_S;
 
   s->rc_used[0] = s->rc_used[1] = 0;
+  s->frc_used[0] = s->frc_used[1] = 0;
   if (op_clobbers_caller_saved(in->op)) rc_clear(s);
+  if (s->frc_reg[0]) {
+    bool vec = in->type == VT_V128;
+    for (uint32_t j = 0; j < in->nargs && !vec; j++) vec = f->insts[a[j]].type == VT_V128;
+    if (vec) s->frc_slot[0] = s->frc_slot[1] = 0;
+  }
 
   if (s->loc[v] == LOC_NONE &&
       (is_imm(s, v) || in->op == I_CONST || in->op == I_MEM_BASE ||

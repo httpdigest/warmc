@@ -182,6 +182,11 @@ typedef struct {
   uint32_t rc_slot[2];
   uint8_t rc_used[2];
   uint8_t rc_next;
+  /* the same for scalar floats, in two FP registers nothing allocates */
+  int frc_reg[2];
+  uint32_t frc_slot[2];
+  uint8_t frc_used[2];
+  uint8_t frc_next;
 
   int tid_reg;
   uint64_t tid_val;
@@ -272,15 +277,23 @@ static bool is_imm_at(Isel *s, Ref user, uint32_t idx, Ref v) {
   return ir_imm_ok(s->f, user, idx, in->imm, (ValType)in->type);
 }
 
-static void rc_clear(Isel *s) { s->rc_slot[0] = 0; s->rc_slot[1] = 0; }
+static void rc_clear(Isel *s) {
+  s->rc_slot[0] = 0; s->rc_slot[1] = 0;
+  s->frc_slot[0] = 0; s->frc_slot[1] = 0;
+}
 
 __attribute__((unused))
 static void rc_kill_reg(Isel *s, int reg) {
   for (int i = 0; i < 2; i++) if (s->rc_reg[i] == reg) s->rc_slot[i] = 0;
 }
 
+static void frc_kill_reg(Isel *s, int reg) {
+  for (int i = 0; i < 2; i++) if (s->frc_reg[i] == reg) s->frc_slot[i] = 0;
+}
+
 static void rc_kill_slot(Isel *s, uint32_t slot) {
   for (int i = 0; i < 2; i++) if (s->rc_slot[i] == slot + 1) s->rc_slot[i] = 0;
+  for (int i = 0; i < 2; i++) if (s->frc_slot[i] == slot + 1) s->frc_slot[i] = 0;
 }
 
 /* Is v read again in this block within a few instructions, with no call
@@ -317,6 +330,20 @@ static void rc_put(Isel *s, uint32_t slot, int reg) {
   s->rc_next = (uint8_t)((pick + 1) & 1);
 }
 
+static void frc_put(Isel *s, uint32_t slot, int reg, bool wide) {
+  int pick = -1;
+  for (int i = 0; i < 2 && pick < 0; i++)
+    if (!s->frc_slot[i] && !s->frc_used[i]) pick = i;
+  for (int k = 0; k < 2 && pick < 0; k++) {
+    int i = (s->frc_next + k) & 1;
+    if (!s->frc_used[i]) pick = i;
+  }
+  if (pick < 0) return;
+  emit_reg_move(B, s->frc_reg[pick], reg, 1, wide, 0);
+  s->frc_slot[pick] = slot + 1;
+  s->frc_next = (uint8_t)((pick + 1) & 1);
+}
+
 static int wr(Isel *s, Ref v, int scratch) {
   int l = s->loc[v];
   return IS_SLOT(l) ? scratch : l;
@@ -338,6 +365,9 @@ static void commit(Isel *s, Ref v, int reg) {
   if (s->rc_reg[0] && !s->no_rc_def && !is_fp_value(s->f, v) &&
       !is_vec_value(s->f, v) && used_soon(s, v))
     rc_put(s, SLOT_OF(l), reg);
+  if (s->frc_reg[0] && !s->no_rc_def && is_fp_value(s->f, v) &&
+      !is_vec_value(s->f, v) && used_soon(s, v))
+    frc_put(s, SLOT_OF(l), reg, is64(s->f, v));
 }
 
 /* A value the allocator marked caller-saved-around-call keeps its register
@@ -456,6 +486,7 @@ static void parallel_copy_to(Isel *s, Buf *out, Move *mv, int n) {
       if (done[i]) continue;
       int tmp = isel_break_reg(move_bank(&mv[i]));
       if (mv[i].src == tmp) continue;
+      if (move_bank(&mv[i])) frc_kill_reg(s, tmp);
       emit_move_to(s, out, tmp, mv[i].src, mv[i].fp, mv[i].wide, mv[i].vec);
 
       for (int j = 0; j < n; j++)
