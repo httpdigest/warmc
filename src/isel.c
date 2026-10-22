@@ -1405,6 +1405,9 @@ static void analyse_immediates(Isel *s) {
     for (uint32_t i = 0; i < b->ninsts; i++) {
       Ref u = b->insts[i];
       Inst *in = &f->insts[u];
+      /* a folded-away op keeps its operands but reads none of them; only
+         dce takes it out of the block, and -fno-dce leaves it there */
+      if (in->op == I_NOP) continue;
       Ref *a = ir_args(f, u);
       for (uint32_t j = 0; j < in->nargs; j++) {
         if (!s->ptr_fuse[a[j]]) continue;

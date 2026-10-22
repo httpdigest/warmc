@@ -84,7 +84,7 @@ start gc-noinl    env WARMC_FLAGS="-O2 -fno-inline" ./test/run_gc.sh
 start workload-noinl \
   env WARMC_FLAGS="-O2 -fno-inline" WORKLOAD_CLANG_OPT=-O0 ./test/run_workload.sh
 
-for p in mem strength cse loopclose; do
+for p in mem strength cse loopclose dce; do
   start "cases-no-$p" env WARMC_FLAGS="-O2 -fno-$p" ./test/run_tests.sh
 done
 
