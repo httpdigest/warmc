@@ -33,6 +33,38 @@ typedef struct {
   const uint32_t *take;
 } Worker;
 
+/* Under WARMC_TIME, each function's time from build to emitted code, so the
+   report can name the ones a compile waits for. */
+static double *g_ftime;
+
+static void ftime_begin(bool tm, uint32_t n) {
+  g_ftime = tm ? xcalloc(n ? n : 1, sizeof(double)) : NULL;
+}
+
+static void ftime_report(const Module *m, uint32_t first, uint32_t n) {
+  if (!g_ftime) return;
+  uint32_t top[6], nt = 0;
+  for (uint32_t i = 0; i < n; i++) {
+    uint32_t k = nt < 6 ? nt++ : 6;
+    while (k > 0 && g_ftime[top[k - 1]] < g_ftime[i]) {
+      if (k < 6) top[k] = top[k - 1];
+      k--;
+    }
+    if (k < 6) top[k] = i;
+  }
+  fprintf(stderr, "slowest:");
+  for (uint32_t k = 0; k < nt; k++) {
+    const Func *fn = &m->funcs[first + top[k]];
+    fprintf(stderr, " f%u", first + top[k]);
+    if (fn->sym) fprintf(stderr, " (%s)", fn->sym);
+    fprintf(stderr, " %.1fms %ub%s", g_ftime[top[k]],
+            (uint32_t)(fn->body_end - fn->body), k + 1 < nt ? "," : "");
+  }
+  fprintf(stderr, "\n");
+  xfree(g_ftime);
+  g_ftime = NULL;
+}
+
 static void *compile_worker(void *arg) {
   Worker *w = arg;
   uint32_t me = atomic_fetch_add(w->slot_next, 1);
@@ -41,11 +73,13 @@ static void *compile_worker(void *arg) {
     if (k >= w->n) break;
     uint32_t i = w->take ? w->take[k] : k;
     if (w->m->reached && !w->m->reached[w->first + i]) continue;
+    double t0 = g_ftime ? now_ms() : 0;
     IrFunc *f = ir_build(w->m, w->first + i, w->opts);
     ir_verify(f, "post-build");
     ir_optimize(f, w->opts);
     ir_produce_function(f, w->o, w->opts, w->out_bytes, &w->outs[i]);
     ir_free(f);
+    if (g_ftime) g_ftime[i] = now_ms() - t0;
   }
 
   w->slots[me] = g_stats;
@@ -524,7 +558,9 @@ static bool compile_parallel(Module *m, ObjBuilder *o, const OptOpts *opts,
   cursor = 0;
   o->frozen = true;
   opt_effects_workers_running = true;
+  ftime_begin(tm, n);
   run_pool(compile_worker, &w, nthreads);
+  ftime_report(m, first, n);
   opt_effects_workers_running = false;
   o->frozen = false;
   for (uint32_t i = 0; i <= nthreads; i++) opt_stats_add(&g_stats, &slots[i]);
@@ -577,9 +613,11 @@ void compile_module(Module *m, ObjBuilder *o, const OptOpts *opts) {
   uint32_t first = m->nimported_funcs;
   uint32_t nout = m->nfuncs > first ? m->nfuncs - first : 0;
   FuncOut *outs = xcalloc(nout ? nout : 1, sizeof(FuncOut));
+  ftime_begin(tm, nout);
   for (uint32_t i = first; i < m->nfuncs; i++) {
     if (m->reached && !m->reached[i]) continue;
-    t0 = tm ? now_ms() : 0;
+    double tf = tm ? now_ms() : 0;
+    t0 = tf;
     IrFunc *f = ir_build(m, i, opts);
     if (tm) { t_build += now_ms() - t0; t0 = now_ms(); }
     if (opts->print_ir) ir_print(f, "built");
@@ -590,8 +628,9 @@ void compile_module(Module *m, ObjBuilder *o, const OptOpts *opts) {
     ir_produce_function(f, o, opts, out_bytes, &outs[i - first]);
     if (tm) { t_emit += now_ms() - t0; t0 = now_ms(); }
     ir_free(f);
-    if (tm) t_free += now_ms() - t0;
+    if (tm) { t_free += now_ms() - t0; g_ftime[i - first] = now_ms() - tf; }
   }
+  ftime_report(m, first, nout);
   place_functions(m, o, opts, outs, first, nout);
   xfree(outs);
 
