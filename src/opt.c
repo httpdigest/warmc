@@ -8721,16 +8721,27 @@ static uint32_t lh_preheader(IrFunc *f, uint32_t hb, uint32_t pre) {
   return ph;
 }
 
+/* The chain of pure instructions in the loop that v is computed by, all of
+   which can run before the loop instead.  Pure is not invariant for what
+   reads state: a mutable global's value is the loop's own when the loop sets
+   it, or calls anything that may (gset is null then, or marks the globals the
+   loop sets) -- wasm-smith's fuel counter is read, tested and decremented on
+   every way round, and hoisting its test made the loop run forever -- and a
+   vector load reads memory the loop may store. */
 static bool lh_collect(IrFunc *f, Ref v, const uint8_t *inloop, uint8_t *moved,
-                       uint32_t *out, uint32_t *nout, uint32_t cap, int depth) {
+                       uint32_t *out, uint32_t *nout, uint32_t cap, int depth,
+                       const uint8_t *gset) {
   if (!inloop[f->insts[v].block]) return true;
   if (depth > 16) return false;
   Inst *in = &f->insts[v];
-  if (in->op == I_PARAM || !ir_is_pure(in)) return false;
+  if (in->op == I_PARAM || !ir_is_pure(in) || in->op == I_VLOAD) return false;
+  if (in->op == I_GLOBAL_GET && in->imm < f->m->nglobals &&
+      f->m->globals[in->imm].mutable_ && (!gset || gset[in->imm]))
+    return false;
   if (moved[v]) return true;
   Ref *a = ir_args(f, v);
   for (uint32_t i = 0; i < in->nargs; i++)
-    if (!lh_collect(f, a[i], inloop, moved, out, nout, cap, depth + 1))
+    if (!lh_collect(f, a[i], inloop, moved, out, nout, cap, depth + 1, gset))
       return false;
   if (*nout == cap) return false;
   moved[v] = 1;
@@ -8957,6 +8968,7 @@ static bool pass_loop_hoist(IrFunc *f) {
   uint32_t *lblk = xmalloc(cap * sizeof(uint32_t));
   uint32_t mcap = f->ninsts ? f->ninsts : 1;
   uint8_t *moved = xcalloc(mcap, 1);
+  uint8_t *gsetbuf = xcalloc(f->m->nglobals + 1, 1);
   uint32_t nb = f->nblocks;
   for (uint32_t hb = 0; hb < nb; hb++) {
     if (f->nblocks >= cap) {
@@ -9021,6 +9033,19 @@ static bool pass_loop_hoist(IrFunc *f) {
         if (gl_opaque(op) || lh_writes_mem(op)) { has_call = true; break; }
       }
     }
+    /* the globals the loop sets, when no call could set any other */
+    const uint8_t *gset = NULL;
+    if (!has_call) {
+      memset(gsetbuf, 0, f->m->nglobals + 1);
+      for (uint32_t li = 0; li < nlbl; li++) {
+        Block *b = &f->blocks[lblk[li]];
+        for (uint32_t i = 0; i < b->ninsts; i++) {
+          Inst *gi = &f->insts[b->insts[i]];
+          if (gi->op == I_GLOBAL_SET && gi->imm < f->m->nglobals) gsetbuf[gi->imm] = 1;
+        }
+      }
+      gset = gsetbuf;
+    }
 
     if (lh_kill_redundant(f, hb, pre, lblk, nlbl)) changed = true;
 
@@ -9034,8 +9059,8 @@ static bool pass_loop_hoist(IrFunc *f) {
         if (in->op != I_STORE) continue;
         Ref *a = ir_args(f, r);
         uint32_t save = nchain;
-        if (!lh_collect(f, a[0], inloop, moved, chain, &nchain, LH_MAX_CHAIN, 0) ||
-            !lh_collect(f, a[1], inloop, moved, chain, &nchain, LH_MAX_CHAIN, 0)) {
+        if (!lh_collect(f, a[0], inloop, moved, chain, &nchain, LH_MAX_CHAIN, 0, gset) ||
+            !lh_collect(f, a[1], inloop, moved, chain, &nchain, LH_MAX_CHAIN, 0, gset)) {
           for (uint32_t k = save; k < nchain; k++) moved[chain[k]] = 0;
           nchain = save;
           continue;
@@ -9107,7 +9132,7 @@ static bool pass_loop_hoist(IrFunc *f) {
     }
     if (guard_clear && h->term == T_BRIF && h->nsuccs == 2 &&
         lh_collect(f, h->term_arg, inloop, moved, chain, &nchain,
-                   LH_MAX_CHAIN, 0)) {
+                   LH_MAX_CHAIN, 0, gset)) {
       for (uint32_t i = 0; i < 2; i++) {
         uint32_t t = h->succs[i].target;
         if (!inloop[t] && f->blocks[t].term == T_TRAP && !h->succs[i].eh &&
@@ -9256,7 +9281,7 @@ static bool pass_loop_hoist(IrFunc *f) {
     for (uint32_t k = 0; k < nchain; k++) moved[chain[k]] = 0;
     for (uint32_t i = 0; i < nlbl; i++) inloop[lblk[i]] = 0;
   }
-  xfree(inloop); xfree(stack); xfree(lblk); xfree(moved);
+  xfree(inloop); xfree(stack); xfree(lblk); xfree(moved); xfree(gsetbuf);
   if (changed) { ir_recompute_preds(f); ir_order(f); }
   return changed;
 }
