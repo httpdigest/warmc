@@ -144,6 +144,15 @@ start cbench   python3 test/gobench.py --corpus cbench --check
 start cppbench python3 test/gobench.py --corpus cppbench --check
 start hsbench  python3 test/gobench.py --corpus hsbench --check
 
+# The language test corpora: programs that print what they compute, line by
+# line, rather than a checksum, so a miscompile shows where it starts; each is
+# compared with wasmtime at every optimisation level.  Not benchmarks, so not
+# in the Makefile's BENCH_CORPORA.
+for c in ctests cpptests rstests gotests stdgotests astests kttests zigtests hstests; do
+  start "$c" python3 test/gobench.py --corpus "$c" --check \
+    --variant -O0 --variant -O1 --variant -O2
+done
+
 start wasi     ./test/run_wasi.sh
 
 start wasi-noexp env WARMC_FLAGS="--no-export-names" ./test/run_wasi.sh

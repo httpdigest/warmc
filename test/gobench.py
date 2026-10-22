@@ -84,7 +84,7 @@ LANGS = {"main.go": "go", "main.ts": "as", "main.rs": "rs",
          "main.kt": "kt", "main.zig": "zig", "main.c": "c", "main.cpp": "cpp",
          "Main.hs": "hs"}
 
-CORPUS_LANG = {"stdgo": "gostd"}
+CORPUS_LANG = {"stdgo": "gostd", "stdgotests": "gostd"}
 KDIR = os.path.join(ROOT, "test", "gobench")
 
 ASC_FLAGS = ["-O3", "--exportStart", "_start", "--use", "abort=",
@@ -507,21 +507,23 @@ def check(names, wasm, exes, variants):
     is reported as one rather than being quietly compared.
     """
     bad = 0
+    # Compared as bytes: a program may print anything, and output that is not
+    # UTF-8 has to be a difference or an agreement, not a decoding error.
+    txt = lambda b: b.decode("utf-8", "replace")
     for k in names:
-        ref = subprocess.run(["wasmtime", wasm[k]], capture_output=True, text=True)
+        ref = subprocess.run(["wasmtime", wasm[k]], capture_output=True)
         if ref.returncode != 0 or not ref.stdout.strip():
             print("FAIL[%s/%s]: reference does not run: rc=%d out=%r err=%r"
-                  % (CORPUS, k, ref.returncode, ref.stdout.strip()[:80],
-                     ref.stderr.strip()[:160]))
+                  % (CORPUS, k, ref.returncode, txt(ref.stdout.strip()[:80]),
+                     txt(ref.stderr.strip()[:160])))
             bad += 1
             continue
         for v in variants:
-            got = subprocess.run([exes[(k, v)]], capture_output=True, text=True,
-                             env=RUNENV)
+            got = subprocess.run([exes[(k, v)]], capture_output=True, env=RUNENV)
             if got.stdout != ref.stdout or got.returncode != ref.returncode:
                 print("FAIL[%s/%s %s]: warmc %r rc=%d, wasmtime %r rc=%d"
-                      % (CORPUS, k, v, got.stdout.strip()[:120],
-                         got.returncode, ref.stdout.strip()[:120],
+                      % (CORPUS, k, v, txt(got.stdout.strip()[:120]),
+                         got.returncode, txt(ref.stdout.strip()[:120]),
                          ref.returncode))
                 bad += 1
     if not bad:
