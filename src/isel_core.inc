@@ -99,7 +99,9 @@ typedef struct {
   bool at_eh_site;
   uint8_t *pinned;
 
-  uint64_t *lv_in, *lv_out;
+  /* Live-in and live-out sets per block, built on first use (regalloc.inc). */
+  uint32_t *lv_in_off, *lv_out_off;
+  Ref *lv_in, *lv_out;
 
   bool no_imm;
   uint8_t *imm_fold;

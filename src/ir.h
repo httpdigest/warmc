@@ -276,6 +276,18 @@ typedef struct {
      take, by header block, from one emission for the next (see fit_pad in
      isel.c); NULL when not measured. */
   uint16_t *loop_bytes;
+  /* The register allocation a first emission made, kept for the second when
+     only the loops' padding differs between them (isel.c); ra_keep_drop
+     frees it if the second does not take it. */
+  void *ra_keep;
+  void (*ra_keep_drop)(void *);
+  /* What ir_compact found before renumbering, for the few code-generation
+     decisions that read the whole instruction array rather than the code:
+     how many instructions there were, the most arguments any had, and
+     whether a dropped one was a safepoint or of reference type.  0 and
+     false when the function was not compacted. */
+  uint32_t made_insts, made_maxargs;
+  bool ghost_safepoint, ghost_ref;
 
   struct IrChunk *chunks;
   char *bump;
@@ -319,6 +331,9 @@ typedef struct { uint32_t *off, *src, *si; } IrEdgeIdx;
 IrEdgeIdx ir_edge_index(IrFunc *f);
 void ir_edge_index_free(IrEdgeIdx *x);
 void ir_order(IrFunc *f);
+/* ir_order, saying whether the graph had changed since the last. */
+bool ir_order_changed(IrFunc *f);
+void ir_compact(IrFunc *f);
 void ir_path_share(const IrFunc *f, float *share);
 
 int ir_succ_score(const IrFunc *f, const Block *b, uint32_t si);
@@ -425,6 +440,8 @@ void codegen_prewarm_symbols(Module *m, ObjBuilder *o);
 void compile_module(Module *m, ObjBuilder *o, const OptOpts *opts);
 void compile_set_jobs(long n);
 bool pass_inline(IrFunc *f, const OptOpts *o);
+/* Frees the calling thread's inliner memo (inline.c). */
+void inl_memos_release(void);
 bool pass_inline_round2(IrFunc *f, const OptOpts *o);
 bool pass_inline_more(IrFunc *f, const OptOpts *o);
 bool opt_const_object(IrFunc *f, Ref r);

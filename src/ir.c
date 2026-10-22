@@ -32,14 +32,23 @@ void opt_stats_add(OptStats *dst, const OptStats *src) {
    about and did. */
 struct IrChunk { struct IrChunk *next; size_t cap; };
 
-#define IR_CHUNK_MIN (64u * 1024u)
+/* Chunks start small and double, each filling its allocator size class: a
+   fixed 64 KB was a 128 KB allocation once the allocator's header was added,
+   for every function built -- and the inliner keeps the IR of every callee
+   it considers while it compiles a caller, most of them a few instructions
+   long. */
+#define IR_CHUNK_FIRST (16u * 1024u)
+#define IR_CHUNK_MAX ((size_t)1 << 20)
 #define IR_ALIGN(n) (((n) + 15u) & ~(size_t)15u)
 
 void *ir_alloc(IrFunc *f, size_t n) {
   n = IR_ALIGN(n);
   if (n > f->bump_left) {
+    size_t want = IR_CHUNK_FIRST;
+    if (f->chunks) want = f->chunks->cap * 2 > IR_CHUNK_MAX ? IR_CHUNK_MAX : f->chunks->cap * 2;
     size_t cap = n + sizeof(struct IrChunk);
-    if (cap < IR_CHUNK_MIN) cap = IR_CHUNK_MIN;
+    if (cap < want) cap = want;
+    cap = xmalloc_fit(cap);
     struct IrChunk *c = xmalloc(cap);
     c->next = f->chunks;
     c->cap = cap;
@@ -403,7 +412,13 @@ static void dfs_post(IrFunc *f, uint32_t entry, uint8_t *seen, uint32_t *post,
   xfree(stk);
 }
 
-static void order_once(IrFunc *f, bool by_score) {
+/* Returns whether every retreating edge was natural, which makes the graph
+   reducible: then the dominators, the predecessor lists and the loop depths
+   are the graph's own and not the search order's, and a second ordering
+   given keep = true takes them as they are and renumbers only what follows
+   the order -- rpo, and the dominator tree's interval numbering. */
+static bool order_once(IrFunc *f, bool by_score, bool keep) {
+  bool reducible = true;
   uint8_t *seen = xcalloc(f->nblocks, 1);
   uint32_t *post = xmalloc(f->nblocks * sizeof(uint32_t));
   uint32_t n = 0;
@@ -419,10 +434,11 @@ static void order_once(IrFunc *f, bool by_score) {
   for (uint32_t i = 0; i < f->nblocks; i++) {
     f->blocks[i].reachable = seen[i] != 0;
     f->blocks[i].rpo = 0xffffffffu;
-    f->blocks[i].loop_depth = 0;
+    if (!keep) f->blocks[i].loop_depth = 0;
   }
   for (uint32_t i = 0; i < n; i++) f->blocks[f->order[i]].rpo = i;
 
+  if (!keep) {
   ir_recompute_preds(f);
 
   for (uint32_t i = 0; i < f->nblocks; i++) f->blocks[i].idom = REF_NONE;
@@ -447,6 +463,7 @@ static void order_once(IrFunc *f, bool by_score) {
       }
       if (newidom != REF_NONE && b->idom != newidom) { b->idom = newidom; changed = true; }
     }
+  }
   }
 
   for (uint32_t i = 0; i < f->nblocks; i++) {
@@ -489,9 +506,19 @@ static void order_once(IrFunc *f, bool by_score) {
     xfree(kids_at); xfree(kids); xfree(fill); xfree(stack); xfree(taken);
   }
 
-  uint8_t *inloop = xmalloc(f->nblocks);
-  uint8_t *fwd = xmalloc(f->nblocks);
-  uint32_t *stack = xmalloc(f->nblocks * sizeof(uint32_t));
+  /* Each back edge's loop body, walked up from the latch.  The walk lists
+     the blocks it marks, so a loop costs its own size: clearing and scanning
+     every block per back edge made this blocks times loops, which in a
+     function of 78,000 blocks and 300 loops was most of the compile. */
+  if (keep) {
+    xfree(seen);
+    xfree(post);
+    return true;
+  }
+  uint8_t *inloop = xcalloc(f->nblocks ? f->nblocks : 1, 1);
+  uint8_t *fwd = xmalloc(f->nblocks ? f->nblocks : 1);
+  uint32_t *stack = xmalloc((f->nblocks ? f->nblocks : 1) * sizeof(uint32_t));
+  uint32_t *body = xmalloc((f->nblocks ? f->nblocks : 1) * sizeof(uint32_t));
   for (uint32_t i = 0; i < n; i++) {
     uint32_t bi = f->order[i];
     Block *b = &f->blocks[bi];
@@ -499,16 +526,21 @@ static void order_once(IrFunc *f, bool by_score) {
       uint32_t t = b->succs[s].target;
       if (f->blocks[t].rpo > b->rpo) continue;
       bool natural = block_dominates(f, t, bi);
-      uint32_t sp = 0;
-      memset(inloop, 0, f->nblocks);
+      if (!natural) reducible = false;
+      uint32_t sp = 0, nbody = 0;
       inloop[t] = 1;
+      body[nbody++] = t;
 
-      if (bi != t) { inloop[bi] = 1; stack[sp++] = bi; }
+      if (bi != t) { inloop[bi] = 1; body[nbody++] = bi; stack[sp++] = bi; }
       while (sp) {
         uint32_t cur = stack[--sp];
         Block *c = &f->blocks[cur];
         for (uint32_t p = 0; p < c->npreds; p++)
-          if (!inloop[c->preds[p]]) { inloop[c->preds[p]] = 1; stack[sp++] = c->preds[p]; }
+          if (!inloop[c->preds[p]]) {
+            inloop[c->preds[p]] = 1;
+            body[nbody++] = c->preds[p];
+            stack[sp++] = c->preds[p];
+          }
       }
       if (!natural) {
 
@@ -520,28 +552,25 @@ static void order_once(IrFunc *f, bool by_score) {
           for (uint32_t e = 0; e < c->nsuccs; e++)
             if (!fwd[c->succs[e].target]) { fwd[c->succs[e].target] = 1; stack[sp++] = c->succs[e].target; }
         }
-        for (uint32_t k = 0; k < f->nblocks; k++) if (!fwd[k]) inloop[k] = 0;
+        for (uint32_t j = 0; j < nbody; j++)
+          if (!fwd[body[j]]) inloop[body[j]] = 0;
       }
-      for (uint32_t k = 0; k < f->nblocks; k++) {
+      for (uint32_t j = 0; j < nbody; j++) {
+        uint32_t k = body[j];
         if (!inloop[k]) continue;
-
-        if (natural) {
-          uint32_t d = k;
-          while (d != t && d != f->entry && f->blocks[d].idom != REF_NONE &&
-                 f->blocks[d].idom != d)
-            d = f->blocks[d].idom;
-          if (d != t)
-            warmc_fatal("internal: block %u is in the loop headed by %u but "
-                        "is not dominated by it", k, t);
-        }
+        inloop[k] = 0;
+        if (natural && !ir_dom_range(f, t, k))
+          warmc_fatal("internal: block %u is in the loop headed by %u but "
+                      "is not dominated by it", k, t);
         f->blocks[k].loop_depth++;
       }
     }
   }
-  xfree(inloop); xfree(fwd); xfree(stack);
+  xfree(inloop); xfree(fwd); xfree(stack); xfree(body);
 
   xfree(seen);
   xfree(post);
+  return reducible;
 }
 
 static bool diverge_step(IrFunc *f, uint32_t i) {
@@ -652,7 +681,9 @@ void ir_path_share(const IrFunc *f, float *share) {
   xfree(top); xfree(nexit);
 }
 
-void ir_order(IrFunc *f) {
+void ir_order(IrFunc *f) { (void)ir_order_changed(f); }
+
+bool ir_order_changed(IrFunc *f) {
   size_t len = order_sig_len_of(f);
   if (len > f->order_sig_cap) {
     size_t osc_ = f->order_sig_cap;
@@ -665,16 +696,107 @@ void ir_order(IrFunc *f) {
   order_sig_fill(f, f->order_sig_new);
   if (f->order_sig_valid && f->order_sig_len == len &&
       memcmp(f->order_sig, f->order_sig_new, len * sizeof(uint32_t)) == 0)
-    return;
+    return false;
 
-  order_once(f, false);
+  bool reducible = order_once(f, false, false);
 
   mark_diverging(f);
-  order_once(f, true);
+  order_once(f, true, reducible);
 
   f->order_sig_len = order_sig_len_of(f);
   order_sig_fill(f, f->order_sig);
   f->order_sig_valid = true;
+  return true;
+}
+
+/* Before code generation: number the instructions densely, in their old
+   order, dropping those nothing holds -- by then twice as many have been
+   made as are left, and every array instruction selection and the
+   allocator keep per value (some fifty) is sized by the count.  Kept: every
+   instruction a block lists, live or not (collect_refs reads unreachable
+   blocks too), every param, and whatever those, a branch, a return or an
+   edge reads.  The order is kept, so every comparison of values decides as
+   it did; the few decisions that read the whole array rather than the code
+   get what it held from made_insts, made_maxargs and the ghost flags.
+   Pending substitutions are left alone, uncompacted. */
+void ir_compact(IrFunc *f) {
+  uint32_t n = f->ninsts;
+  for (uint32_t v = 0; v < n; v++)
+    if (f->subst[v] != v) return;
+  uint8_t *keep = xcalloc(n ? n : 1, 1);
+  Ref *stack = xmalloc((n ? n : 1) * sizeof(Ref));
+  uint32_t sp = 0;
+#define KEEP(r) do { Ref r_ = (r); if (r_ < n && !keep[r_]) { keep[r_] = 1; stack[sp++] = r_; } } while (0)
+  for (uint32_t bi = 0; bi < f->nblocks; bi++) {
+    Block *b = &f->blocks[bi];
+    for (uint32_t p = 0; p < b->nparams; p++) KEEP(b->params[p]);
+    for (uint32_t i = 0; i < b->ninsts; i++) KEEP(b->insts[i]);
+    KEEP(b->term_arg);
+    for (uint32_t i = 0; i < b->nret; i++) KEEP(b->ret_args[i]);
+    for (uint32_t s = 0; s < b->nsuccs; s++)
+      for (uint32_t j = 0; j < b->succs[s].nargs; j++) KEEP(b->succs[s].args[j]);
+  }
+  while (sp) {
+    Ref v = stack[--sp];
+    const Ref *a = &f->argpool[f->insts[v].args_off];
+    for (uint32_t j = 0; j < f->insts[v].nargs; j++) KEEP(a[j]);
+  }
+#undef KEEP
+  xfree(stack);
+
+  uint32_t newn = 0, maxargs = 0, nargs = 0;
+  bool gsp = false, gref = false;
+  for (uint32_t v = 0; v < n; v++) {
+    const Inst *in = &f->insts[v];
+    if (in->nargs > maxargs) maxargs = in->nargs;
+    if (keep[v]) { newn++; nargs += in->nargs; continue; }
+    if (ir_op_is_gc_safepoint(in->op)) gsp = true;
+    if (vt_is_ref((ValType)in->type)) gref = true;
+  }
+  if (newn == n) { xfree(keep); return; }
+
+  Ref *map = xmalloc((n ? n : 1) * sizeof(Ref));
+  Inst *ni = ir_alloc(f, (size_t)(newn ? newn : 1) * sizeof(Inst));
+  Ref *na = ir_alloc(f, (size_t)(nargs ? nargs : 1) * sizeof(Ref));
+  Ref *ns = ir_alloc(f, (size_t)(newn ? newn : 1) * sizeof(Ref));
+  uint32_t k = 0;
+  for (uint32_t v = 0; v < n; v++) map[v] = keep[v] ? k++ : REF_NONE;
+  uint32_t off = 0;
+  for (uint32_t v = 0; v < n; v++) {
+    if (!keep[v]) continue;
+    Inst in = f->insts[v];
+    const Ref *a = &f->argpool[in.args_off];
+    for (uint32_t j = 0; j < in.nargs; j++) na[off + j] = map[a[j]];
+    in.args_off = off;
+    off += in.nargs;
+    ni[map[v]] = in;
+    ns[map[v]] = map[v];
+  }
+#define MAP(r) ((r) < n ? map[(r)] : (r))
+  for (uint32_t bi = 0; bi < f->nblocks; bi++) {
+    Block *b = &f->blocks[bi];
+    for (uint32_t p = 0; p < b->nparams; p++) b->params[p] = MAP(b->params[p]);
+    for (uint32_t i = 0; i < b->ninsts; i++) b->insts[i] = MAP(b->insts[i]);
+    b->term_arg = MAP(b->term_arg);
+    for (uint32_t i = 0; i < b->nret; i++) b->ret_args[i] = MAP(b->ret_args[i]);
+    for (uint32_t s = 0; s < b->nsuccs; s++)
+      for (uint32_t j = 0; j < b->succs[s].nargs; j++)
+        b->succs[s].args[j] = MAP(b->succs[s].args[j]);
+  }
+#undef MAP
+  f->insts = ni;
+  f->ninsts = f->cap_insts = newn;
+  f->argpool = na;
+  f->nargpool = f->cap_argpool = nargs;
+  f->subst = ns;
+  xfree(f->kb_epoch); xfree(f->kb_bits);
+  f->kb_epoch = NULL; f->kb_bits = NULL; f->kb_cap = 0; f->kb_gen = 0;
+  f->made_insts = n;
+  f->made_maxargs = maxargs;
+  f->ghost_safepoint = gsp;
+  f->ghost_ref = gref;
+  xfree(map);
+  xfree(keep);
 }
 
 int ir_const_cost(uint64_t bits, bool wide) {
@@ -1335,7 +1457,7 @@ static void ir_verify_ssa(IrFunc *f, const char *stage) {
 
 static bool g_verify_ssa;
 static pthread_once_t g_verify_ssa_once = PTHREAD_ONCE_INIT;
-static void verify_ssa_init(void) { g_verify_ssa = getenv("WARMC_VERIFY_SSA") != NULL; }
+static void verify_ssa_init(void) { g_verify_ssa = warmc_getenv("WARMC_VERIFY_SSA") != NULL; }
 
 void ir_verify(IrFunc *f, const char *stage) {
   pthread_once(&g_verify_ssa_once, verify_ssa_init);

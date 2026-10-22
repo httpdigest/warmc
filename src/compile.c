@@ -83,6 +83,7 @@ static void *compile_worker(void *arg) {
   }
 
   w->slots[me] = g_stats;
+  inl_memos_release();
   xcache_release();
   return NULL;
 }
@@ -141,7 +142,7 @@ void compile_set_jobs(long n) { g_jobs = n; }
 static uint32_t want_threads(Module *m, uint32_t nfuncs) {
   long n = g_jobs;
   if (n <= 0) {
-    const char *e = getenv("WARMC_JOBS");
+    const char *e = warmc_getenv("WARMC_JOBS");
     n = e ? atol(e) : 0;
   }
   long cores = host_ncpus();
@@ -413,7 +414,7 @@ static bool *module_reach(Module *m, bool closed) {
     return NULL;
   }
 
-  if (getenv("WARMC_REACH_STATS")) {
+  if (warmc_getenv("WARMC_REACH_STATS")) {
     uint32_t nf = 0, nt = 0, ne = 0, ng = 0, nd = 0;
     for (uint32_t i = 0; i < m->nfuncs; i++) nf += R.fn[i];
     for (uint32_t i = 0; i < m->ntypes; i++) { nt += R.ty[i]; ne += R.tyent[i]; }
@@ -552,8 +553,8 @@ static bool compile_parallel(Module *m, ObjBuilder *o, const OptOpts *opts,
   opt_effects_end(m, opts);
   xfree((void *)warm.take);
   double t_warm = tm ? now_ms() : 0;
-  if (tm) fprintf(stderr, "warm: scan %.1f resolve %.1f\n",
-                  t_scan - t0, t_warm - t_scan);
+  if (tm) fprintf(stderr, "warm: scan %.1f resolve %.1f (peak %.0f MB)\n",
+                  t_scan - t0, t_warm - t_scan, peak_rss_mb());
 
   cursor = 0;
   o->frozen = true;
@@ -573,8 +574,9 @@ static bool compile_parallel(Module *m, ObjBuilder *o, const OptOpts *opts,
   double t2 = tm ? now_ms() : 0;
   codegen_emit_module_data(m, o);
   if (tm)
-    fprintf(stderr, "time: %u threads, warm %.0f produce %.0f place %.0f moddata %.0f\n",
-            nthreads, t_warm - t0, t1 - t_warm, t2 - t1, now_ms() - t2);
+    fprintf(stderr, "time: %u threads, warm %.0f produce %.0f place %.0f moddata %.0f "
+                    "(peak %.0f MB)\n",
+            nthreads, t_warm - t0, t1 - t_warm, t2 - t1, now_ms() - t2, peak_rss_mb());
   return true;
 }
 
@@ -598,7 +600,7 @@ void compile_module(Module *m, ObjBuilder *o, const OptOpts *opts) {
   }
   uint32_t out_bytes = codegen_out_bytes(m);
 
-  bool tm = getenv("WARMC_TIME") != NULL;
+  bool tm = warmc_getenv("WARMC_TIME") != NULL;
 
   codegen_prewarm_symbols(m, o);
   if (compile_parallel(m, o, opts, out_bytes, tm)) return;
@@ -631,6 +633,7 @@ void compile_module(Module *m, ObjBuilder *o, const OptOpts *opts) {
     if (tm) { t_free += now_ms() - t0; g_ftime[i - first] = now_ms() - tf; }
   }
   ftime_report(m, first, nout);
+  inl_memos_release();
   place_functions(m, o, opts, outs, first, nout);
   xfree(outs);
 
@@ -638,6 +641,7 @@ void compile_module(Module *m, ObjBuilder *o, const OptOpts *opts) {
   codegen_emit_module_data(m, o);
   opt_passtime_report();
   if (tm)
-    fprintf(stderr, "time: warm %.0f build %.0f verify %.0f opt %.0f emit %.0f free %.0f moddata %.0f\n",
-            t_warm, t_build, t_verify, t_opt, t_emit, t_free, now_ms() - t0);
+    fprintf(stderr, "time: warm %.0f build %.0f verify %.0f opt %.0f emit %.0f free %.0f moddata %.0f "
+                    "(peak %.0f MB)\n",
+            t_warm, t_build, t_verify, t_opt, t_emit, t_free, now_ms() - t0, peak_rss_mb());
 }

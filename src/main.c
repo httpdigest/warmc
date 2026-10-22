@@ -162,7 +162,7 @@ static bool ends_with(const char *s, const char *suffix) {
 }
 
 static const char *macos_libdir(void) {
-  const char *env = getenv("WARMC_MACOS_LIBDIR");
+  const char *env = warmc_getenv("WARMC_MACOS_LIBDIR");
   if (env && *env) return env;
 
 #ifdef __APPLE__
@@ -208,14 +208,14 @@ int main(int argc, char **argv) {
   _setmode(_fileno(stderr), _O_BINARY);
 #endif
   const char *input = NULL, *output = NULL, *target = "linux";
-  const char *rt = getenv("WARMC_RT");
-  const char *ld = getenv("WARMC_LD");
-  const char *wasi = getenv("WARMC_WASI");
+  const char *rt = warmc_getenv("WARMC_RT");
+  const char *ld = warmc_getenv("WARMC_LD");
+  const char *wasi = warmc_getenv("WARMC_WASI");
   bool want_wasi = false;
   bool obj_only = false, keep_obj = false, verbose = false, validate_only = false;
   bool dead_strip = true;
 
-  bool system_ld = getenv("WARMC_SYSTEM_LD") != NULL;
+  bool system_ld = warmc_getenv("WARMC_SYSTEM_LD") != NULL;
   bool dump_component = false, dump_wit = false, emit_wasm = false;
   bool dump_canon = false;
   bool dump_adapter = false, dump_cwit = false, dump_link = false;
@@ -495,7 +495,7 @@ int main(int argc, char **argv) {
     return 0;
   }
 
-  bool wtm = getenv("WARMC_TIME") != NULL;
+  bool wtm = warmc_getenv("WARMC_TIME") != NULL;
   struct timespec _ts; double _t0 = 0, _t1 = 0, _t2 = 0, _t3 = 0;
 #define STAMP(v) do { if (wtm) { clock_gettime(CLOCK_MONOTONIC, &_ts); \
     (v) = _ts.tv_sec * 1e3 + _ts.tv_nsec / 1e6; } } while (0)
@@ -504,7 +504,8 @@ int main(int argc, char **argv) {
   STAMP(_t1);
   wasm_validate(m);
   STAMP(_t2);
-  if (wtm) fprintf(stderr, "front: parse %.1f validate %.1f\n", _t1 - _t0, _t2 - _t1);
+  if (wtm) fprintf(stderr, "front: parse %.1f validate %.1f (peak %.0f MB)\n",
+                   _t1 - _t0, _t2 - _t1, peak_rss_mb());
   if (validate_only) { module_free(m); xfree(bin); return 0; }
 
   if (!obj_only && !want_wasi)
@@ -522,7 +523,8 @@ int main(int argc, char **argv) {
   memset(&o, 0, sizeof o);
   compile_module(m, &o, &opt);
   STAMP(_t3);
-  if (wtm) fprintf(stderr, "front: compile_module total %.1f\n", _t3 - _t2);
+  if (wtm) fprintf(stderr, "front: compile_module total %.1f (peak %.0f MB)\n",
+                   _t3 - _t2, peak_rss_mb());
   if (opt.stats) {
     fprintf(stderr,
             "warmc stats: folded=%llu dce=%llu cse=%llu licm=%llu branch=%llu\n"

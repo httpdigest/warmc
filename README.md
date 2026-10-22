@@ -458,7 +458,7 @@ are parsed but not enforced.
 | `--print-ir` | dump each function's IR, before and after optimisation, to stderr |
 | `--stats` | print optimisation counters: folds, inlined calls, spills, `ldp`/`stp` pairs, vectorised loops, and so on |
 | `--profile` | instrument the code to count executed instructions; prints `icount: N` at exit |
-| `WARMC_TIME=1` | print per-phase compile and link timings, and the slowest functions to compile |
+| `WARMC_TIME=1` | print per-phase compile and link timings with the peak memory reached by each, and the slowest functions to compile |
 
 ---
 
@@ -552,7 +552,7 @@ as `call stack exhausted` rather than crashing.
 | `WARMC_SYSTEM_LD` | compiler | same as `--system-ld` |
 | `WARMC_MACOS_LIBDIR` | compiler | directory holding `libSystem.tbd` for `--system-ld` on macOS (otherwise found with `xcrun`) |
 | `WARMC_JOBS` | compiler | same as `-j` |
-| `WARMC_TIME` | compiler | print phase timings and the slowest functions |
+| `WARMC_TIME` | compiler | print phase timings, peak memory and the slowest functions |
 | `WARMC_GC_HEAP_KB` | program | GC heap reservation (default 1 GiB) |
 | `WARMC_GC_MIN_KB`, `WARMC_GC_GROWTH` | program | collection trigger: minimum size, and growth as a percentage of live data |
 | `WARMC_GC_CONC` | program | `0` disables the background collector thread |

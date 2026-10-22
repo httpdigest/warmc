@@ -820,18 +820,18 @@ static void analyse_immediates(Isel *s) {
   s->imm_fold = xcalloc(n ? n : 1, 1);
   s->fused = xcalloc(n ? n : 1, 1);
   s->pool_ok = s->opt->cpool != 0;
-  s->remat_fp = !getenv("WARMC_NO_REMAT_FP");
+  s->remat_fp = !warmc_getenv("WARMC_NO_REMAT_FP");
   s->remat_v128 = false;
   {
-    const char *rc = getenv("WARMC_REMAT_COST");
+    const char *rc = warmc_getenv("WARMC_REMAT_COST");
     s->remat_cost = rc ? atoi(rc) : 2;
     if (s->remat_cost < 1) s->remat_cost = 1;
     if (s->remat_cost > 4) s->remat_cost = 4;
-    const char *rw = getenv("WARMC_REMAT2_W");
+    const char *rw = warmc_getenv("WARMC_REMAT2_W");
     s->remat2_w = rw ? atof(rw) : 0.5;
-    const char *rs = getenv("WARMC_REMAT2_SEG");
+    const char *rs = warmc_getenv("WARMC_REMAT2_SEG");
     s->remat2_seg = rs ? atof(rs) : 2.0;
-    s->remat_glob = !getenv("WARMC_NO_REMAT_GLOBAL");
+    s->remat_glob = !warmc_getenv("WARMC_NO_REMAT_GLOBAL");
   }
   s->no_remat = xcalloc(n ? n : 1, 1);
   s->paired = xcalloc(n ? n : 1, 1);
@@ -841,13 +841,13 @@ static void analyse_immediates(Isel *s) {
   s->uses = uses;
   uint8_t *blocked = xcalloc(n ? n : 1, 1);
 
-  s->no_imm = getenv("WARMC_NO_IMM") != NULL;
+  s->no_imm = warmc_getenv("WARMC_NO_IMM") != NULL;
   if (!s->no_imm)
   for (uint32_t i = 0; i < n; i++)
     if (f->insts[i].op == I_CONST && fits_gpr(f, i))
       s->imm_fold[i] = 1;
 
-  bool no_edge_remat = getenv("WARMC_NO_EDGE_REMAT") != NULL;
+  bool no_edge_remat = warmc_getenv("WARMC_NO_EDGE_REMAT") != NULL;
   for (uint32_t oi = 0; oi < f->norder; oi++) {
     uint32_t bi = f->order[oi];
     Block *b = &f->blocks[bi];
@@ -917,7 +917,7 @@ static void analyse_immediates(Isel *s) {
         if (uses[ea] != 1 &&
             !(f->insts[ea].imm == 0 && addr_only[ea])) continue;
         if (f->insts[ea].imm > 0x7fffffffull) continue;
-        if (!getenv("WARMC_NO_ADDRFUSE")) { s->addr_fuse[ea] = 1; s->folded[ea] = 1; }
+        if (!warmc_getenv("WARMC_NO_ADDRFUSE")) { s->addr_fuse[ea] = 1; s->folded[ea] = 1; }
       }
     }
     xfree(addr_only);
@@ -976,7 +976,7 @@ static void analyse_immediates(Isel *s) {
   }
 
   /* A single-use compare feeding a SELECT folds into its cmov. */
-  if (!getenv("WARMC_NO_FUSE"))
+  if (!warmc_getenv("WARMC_NO_FUSE"))
   for (uint32_t oi = 0; oi < f->norder; oi++) {
     uint32_t bi = f->order[oi];
     Block *b = &f->blocks[bi];
@@ -1001,11 +1001,11 @@ static void analyse_immediates(Isel *s) {
     if (f->insts[c].block != bi) continue;
     uint16_t op = f->insts[c].op;
     bool cmpish = (op >= I_EQ && op <= I_EQZ) || (op >= I_FEQ && op <= I_FGE);
-    if (cmpish && !getenv("WARMC_NO_FUSE")) s->fused[c] = 1;
+    if (cmpish && !warmc_getenv("WARMC_NO_FUSE")) s->fused[c] = 1;
   }
 
   /* AND feeding only a zero-test becomes TEST. */
-  if (!getenv("WARMC_NO_TSTFUSE"))
+  if (!warmc_getenv("WARMC_NO_TSTFUSE"))
   for (uint32_t oi = 0; oi < f->norder; oi++) {
     uint32_t bi = f->order[oi];
     Block *b = &f->blocks[bi];
@@ -1376,7 +1376,7 @@ static int produce_body_x64(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
 
   emit_prologue(s, &pro);
 
-  const char *lal_s = getenv("WARMC_LOOP_ALIGN");
+  const char *lal_s = warmc_getenv("WARMC_LOOP_ALIGN");
   uint32_t lalign = lal_s ? (uint32_t)strtoul(lal_s, NULL, 0) : 16;
   if (lalign != 16 && lalign != 32) lalign = 0;
 
@@ -1489,7 +1489,7 @@ static int produce_body_x64(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
   for (uint32_t i = 0; i < f->nblocks && !has_loop; i++)
     if (f->blocks[i].reachable && f->blocks[i].loop_depth > 0) has_loop = true;
 
-  if (getenv("WARMC_VERIFY_RA") && s->csa_consumed != s->ncsa_vals)
+  if (warmc_getenv("WARMC_VERIFY_RA") && s->csa_consumed != s->ncsa_vals)
     warmc_fatal("internal: %u caller-save entries built but %u emitted in %s",
                 s->ncsa_vals, s->csa_consumed, f->m->funcs[f->func_index].sym);
 
@@ -1589,7 +1589,7 @@ give_up:
   xfree(s->sp_first); xfree(s->sp_n); xfree(s->sp_vals);
   xfree(s->csa_slot); xfree(s->csa_on);
   xfree(s->csa_first); xfree(s->csa_n); xfree(s->csa_vals);
-  xfree(s->lv_in); xfree(s->lv_out);
+  xfree(s->lv_in); xfree(s->lv_out); xfree(s->lv_in_off); xfree(s->lv_out_off);
   if (split_ret) return split_ret;
   return 1;
 }

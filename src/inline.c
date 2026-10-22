@@ -56,35 +56,35 @@ static struct {
 static void inl_init(void) {
   const char *e;
   g_inl.max_callee =
-      (e = getenv("WARMC_INLINE_MAX_CALLEE")) ? (uint32_t)atol(e)
+      (e = warmc_getenv("WARMC_INLINE_MAX_CALLEE")) ? (uint32_t)atol(e)
                                               : INLINE_MAX_CALLEE;
   g_inl.growth =
-      (e = getenv("WARMC_INLINE_GROWTH")) ? (uint32_t)atol(e)
+      (e = warmc_getenv("WARMC_INLINE_GROWTH")) ? (uint32_t)atol(e)
                                           : INLINE_MAX_GROWTH;
   g_inl.tiny =
-      (e = getenv("WARMC_INLINE_TINY")) ? (uint32_t)atol(e) : INLINE_TINY;
-  g_inl.retcalls = (e = getenv("WARMC_INLINE_RETCALLS")) ? (uint32_t)atol(e)
+      (e = warmc_getenv("WARMC_INLINE_TINY")) ? (uint32_t)atol(e) : INLINE_TINY;
+  g_inl.retcalls = (e = warmc_getenv("WARMC_INLINE_RETCALLS")) ? (uint32_t)atol(e)
                                                          : INLINE_RETCALLS;
-  g_inl.retcall_cost = (e = getenv("WARMC_INLINE_RETCALL_COST"))
+  g_inl.retcall_cost = (e = warmc_getenv("WARMC_INLINE_RETCALL_COST"))
                            ? (uint32_t)atol(e)
                            : INLINE_RETCALL_COST;
-  g_inl.retcall_total = (e = getenv("WARMC_INLINE_RETCALL_TOTAL"))
+  g_inl.retcall_total = (e = warmc_getenv("WARMC_INLINE_RETCALL_TOTAL"))
                             ? (uint32_t)atol(e)
                             : INLINE_RETCALL_TOTAL;
   g_inl.depth =
-      (e = getenv("WARMC_INLINE_DEPTH")) ? (uint32_t)atol(e) : INLINE_DEPTH;
+      (e = warmc_getenv("WARMC_INLINE_DEPTH")) ? (uint32_t)atol(e) : INLINE_DEPTH;
   if (g_inl.depth > INLINE_MAX_DEPTH) g_inl.depth = INLINE_MAX_DEPTH;
-  g_inl.only = (e = getenv("WARMC_INLINE_ONLY")) ? atol(e) : -1;
-  g_inl.upto = (e = getenv("WARMC_INLINE_UPTO")) ? atol(e) : -1;
-  g_inl.max = (e = getenv("WARMC_INLINE_MAX")) ? atol(e) : -1;
-  g_inl.round2_growth = (e = getenv("WARMC_INLINE_ROUND2_GROWTH"))
+  g_inl.only = (e = warmc_getenv("WARMC_INLINE_ONLY")) ? atol(e) : -1;
+  g_inl.upto = (e = warmc_getenv("WARMC_INLINE_UPTO")) ? atol(e) : -1;
+  g_inl.max = (e = warmc_getenv("WARMC_INLINE_MAX")) ? atol(e) : -1;
+  g_inl.round2_growth = (e = warmc_getenv("WARMC_INLINE_ROUND2_GROWTH"))
                             ? (uint32_t)atol(e)
                             : INLINE_ROUND2_GROWTH;
-  g_inl.dbg = getenv("WARMC_INLINE_DEBUG") != NULL;
-  g_inl.noscore = getenv("WARMC_INLINE_NOSCORE") != NULL;
-  g_inl.leafonly = getenv("WARMC_INLINE_LEAFONLY") != NULL;
-  g_inl.notrans = getenv("WARMC_NO_INLINE_TRANS") != NULL;
-  g_inl.round2 = getenv("WARMC_INLINE_ROUND2") != NULL;
+  g_inl.dbg = warmc_getenv("WARMC_INLINE_DEBUG") != NULL;
+  g_inl.noscore = warmc_getenv("WARMC_INLINE_NOSCORE") != NULL;
+  g_inl.leafonly = warmc_getenv("WARMC_INLINE_LEAFONLY") != NULL;
+  g_inl.notrans = warmc_getenv("WARMC_NO_INLINE_TRANS") != NULL;
+  g_inl.round2 = warmc_getenv("WARMC_INLINE_ROUND2") != NULL;
 }
 
 static void inl_dbg(IrFunc *f, uint32_t fidx, uint32_t bi, const char *what) {
@@ -599,6 +599,53 @@ typedef struct {
   uint32_t npass;
 } InlMemo;
 
+/* The memo every inline run on a thread uses: an entry per function of the
+   module, cleared when a run first touches it and released through the list
+   of the ones it touched.  A fresh array per run, zeroed and then walked to
+   free, was the module's size again for every function compiled: 3.4 GB
+   zeroed compiling a Go program of 3,700 functions. */
+typedef struct {
+  InlMemo *e;
+  uint32_t *gen, *touched;
+  uint32_t n, ntouched, cur;
+} InlMemos;
+
+static _Thread_local InlMemos g_memos;
+
+static InlMemos *inl_memos_begin(const Module *m) {
+  InlMemos *ms = &g_memos;
+  uint32_t n = m->nfuncs ? m->nfuncs : 1;
+  if (ms->n < n) {
+    xfree(ms->e); xfree(ms->gen); xfree(ms->touched);
+    ms->e = xmalloc(n * sizeof(InlMemo));
+    ms->gen = xcalloc(n, sizeof(uint32_t));
+    ms->touched = xmalloc(n * sizeof(uint32_t));
+    ms->n = n;
+    ms->cur = 0;
+  }
+  if (++ms->cur == 0) {
+    memset(ms->gen, 0, ms->n * sizeof(uint32_t));
+    ms->cur = 1;
+  }
+  ms->ntouched = 0;
+  return ms;
+}
+
+static InlMemo *memo_at(InlMemos *ms, uint32_t fidx) {
+  if (ms->gen[fidx] != ms->cur) {
+    ms->gen[fidx] = ms->cur;
+    memset(&ms->e[fidx], 0, sizeof(InlMemo));
+    ms->touched[ms->ntouched++] = fidx;
+  }
+  return &ms->e[fidx];
+}
+
+void inl_memos_release(void) {
+  InlMemos *ms = &g_memos;
+  xfree(ms->e); xfree(ms->gen); xfree(ms->touched);
+  memset(ms, 0, sizeof *ms);
+}
+
 static void inl_summarize(InlMemo *e, IrFunc *g) {
   e->summed = true;
   for (uint32_t p = 0; p < INL_DISP_PARAMS; p++) e->disp_off[p] = INL_NO_DISP;
@@ -638,10 +685,10 @@ static void inl_summarize(InlMemo *e, IrFunc *g) {
   }
 }
 
-static IrFunc *inl_callee(IrFunc *f, const OptOpts *o, InlMemo *memo,
+static IrFunc *inl_callee(IrFunc *f, const OptOpts *o, InlMemos *memo,
                           uint32_t fidx, uint32_t bi, bool want_split) {
   Module *m = f->m;
-  InlMemo *e = &memo[fidx];
+  InlMemo *e = memo_at(memo, fidx);
   if (e->verdict == 0) {
     e->verdict = 2;
     IrFunc *g = ir_build(m, fidx, o);
@@ -687,14 +734,14 @@ static IrFunc *inl_callee(IrFunc *f, const OptOpts *o, InlMemo *memo,
    calls it hands p to included: each must keep it too, and must not hand
    it back by returning it into a result that is read.  At the top, a
    dispatch on p is allowed when `disp` says the dispatch will resolve. */
-static bool inl_keeps(IrFunc *f, const OptOpts *o, InlMemo *memo,
+static bool inl_keeps(IrFunc *f, const OptOpts *o, InlMemos *memo,
                       uint32_t fidx, uint32_t p, uint32_t bi, bool disp,
                       int depth) {
   Module *m = f->m;
   if (p >= 64 || depth > INL_KEEP_DEPTH || fidx >= m->nfuncs ||
       fidx == f->func_index || m->funcs[fidx].imported || !m->funcs[fidx].body)
     return false;
-  InlMemo *e = &memo[fidx];
+  InlMemo *e = memo_at(memo, fidx);
   if (!e->summed) inl_callee(f, o, memo, fidx, bi, false);
   if (!e->summed) return false;
   uint64_t bit = 1ull << p;
@@ -704,7 +751,7 @@ static bool inl_keeps(IrFunc *f, const OptOpts *o, InlMemo *memo,
     if (q.param != p) continue;
     if (!inl_keeps(f, o, memo, q.callee, q.arg, bi, false, depth + 1))
       return false;
-    if (q.used && (memo[q.callee].ret_params >> q.arg & 1)) return false;
+    if (q.used && (memo_at(memo, q.callee)->ret_params >> q.arg & 1)) return false;
   }
   return true;
 }
@@ -772,7 +819,7 @@ static int inl_site_cmp(const void *pa, const void *pb) {
    the rounds right after, so both are discounted, floored so nothing is
    ever free. A transitive site carries the chain of callees it was copied
    out of; a candidate already on its own chain is a cycle. */
-static bool inl_score_site(IrFunc *f, const OptOpts *o, InlMemo *memo,
+static bool inl_score_site(IrFunc *f, const OptOpts *o, InlMemos *memo,
                            const InlEsc *ev, Ref call, uint32_t ord1,
                            uint32_t ord2, const InlSite *parent,
                            InlSite *out) {
@@ -813,7 +860,7 @@ static bool inl_score_site(IrFunc *f, const OptOpts *o, InlMemo *memo,
     return false;
   }
   if (!inl_callee(f, o, memo, fidx, bi, false)) return false;
-  InlMemo *e = &memo[fidx];
+  InlMemo *e = memo_at(memo, fidx);
   if (e->ninsts > lim) {
     g_stats.inl_rej_size++;
     inl_dbg(f, fidx, bi, "too big");
@@ -919,7 +966,7 @@ static bool inl_score_site(IrFunc *f, const OptOpts *o, InlMemo *memo,
 
 /* A later round takes only the calls pass_devirt has made since, and the
    calls an allocation leaves by. */
-static void inl_collect(IrFunc *f, const OptOpts *o, InlMemo *memo,
+static void inl_collect(IrFunc *f, const OptOpts *o, InlMemos *memo,
                         const InlEsc *ev, InlVec *sites, bool more) {
   for (uint32_t oi = 0; oi < f->norder; oi++) {
     Block *b = &f->blocks[f->order[oi]];
@@ -937,9 +984,19 @@ static void inl_collect(IrFunc *f, const OptOpts *o, InlMemo *memo,
   }
 }
 
-static bool inl_apply(IrFunc *f, const OptOpts *o, InlMemo *memo,
+/* Sets *stale when it leaves the caller's substitutions to apply and its
+   block order to recompute.  Both are functions of the graph alone, so the
+   inliner does them once at the end, and before it scores calls a splice
+   copied in.  What it reads of them in between is local: the call's
+   arguments, resolved here; the call block's instruction list, brought up
+   to date here as applying would; and that block's reachability, which a
+   splice changes only when the callee never returns or takes over the
+   call's exception edges, and then both are done at once.  Doing them
+   after every inline was most of a compile that inlined two thousand calls
+   into 78,000 blocks. */
+static bool inl_apply(IrFunc *f, const OptOpts *o, InlMemos *memo,
                       const InlSite *site, uint32_t *budget,
-                      uint32_t *retsum) {
+                      uint32_t *retsum, bool *stale) {
   Module *m = f->m;
   Ref call = site->call;
   Inst *cin = &f->insts[call];
@@ -948,6 +1005,12 @@ static bool inl_apply(IrFunc *f, const OptOpts *o, InlMemo *memo,
   uint32_t bi = cin->block;
   Block *b = &f->blocks[bi];
   if (!b->reachable) return false;
+  if (*stale) {
+    uint32_t w = 0;
+    for (uint32_t i = 0; i < b->ninsts; i++)
+      if (ir_resolve(f, b->insts[i]) == b->insts[i]) b->insts[w++] = b->insts[i];
+    b->ninsts = w;
+  }
   uint32_t k = 0;
   while (k < b->ninsts && b->insts[k] != call) k++;
   if (k == b->ninsts) return false;
@@ -968,8 +1031,8 @@ static bool inl_apply(IrFunc *f, const OptOpts *o, InlMemo *memo,
   }
 
   /* the frame-cap pressure valve: surviving calls a caller absorbs */
-  if (memo[fidx].retcalls &&
-      *retsum + memo[fidx].retcalls >
+  if (memo_at(memo, fidx)->retcalls &&
+      *retsum + memo_at(memo, fidx)->retcalls >
           g_inl.retcall_total + (site->escape ? INL_ESC_SLACK : 0)) {
     g_stats.inl_rej_retcalls++;
     inl_dbg(f, fidx, bi, "caller absorbed enough calls");
@@ -980,12 +1043,13 @@ static bool inl_apply(IrFunc *f, const OptOpts *o, InlMemo *memo,
   uint32_t nargs = cin->nargs;
   Ref *callargs = xmalloc((nargs ? nargs : 1) * sizeof(Ref));
   memcpy(callargs, ir_args(f, call), nargs * sizeof(Ref));
+  for (uint32_t i = 0; i < nargs; i++) callargs[i] = ir_resolve(f, callargs[i]);
 
-  if (site->once && memo[fidx].ninsts > g_inl.max_callee)
+  if (site->once && memo_at(memo, fidx)->ninsts > g_inl.max_callee)
     g_stats.inl_once_forced++;
-  if (memo[fidx].retcalls) g_stats.inl_retcall_sites++;
+  if (memo_at(memo, fidx)->retcalls) g_stats.inl_retcall_sites++;
   if (site->escape) g_stats.inl_escape++;
-  *retsum += memo[fidx].retcalls;
+  *retsum += memo_at(memo, fidx)->retcalls;
 
   if (!nehe && !any_eh && g->norder == 1 && g->order[0] == g->entry &&
       g->blocks[g->entry].term == T_RETURN &&
@@ -995,8 +1059,7 @@ static bool inl_apply(IrFunc *f, const OptOpts *o, InlMemo *memo,
     g_stats.inl_flat++;
     inl_dbg(f, fidx, bi, "inlined flat");
     xfree(callargs);
-    ir_apply_subst(f);
-    ir_order(f);
+    *stale = true;
     return true;
   }
 
@@ -1051,6 +1114,10 @@ static bool inl_apply(IrFunc *f, const OptOpts *o, InlMemo *memo,
     }
   }
 
+  bool returns = false;
+  for (uint32_t oi = 0; oi < g->norder && !returns; oi++)
+    returns = g->blocks[g->order[oi]].term == T_RETURN;
+
   splice(f, g, bi, cont, callargs, nargs, ehe, nehe);
 
   xfree(ehe);
@@ -1059,14 +1126,20 @@ static bool inl_apply(IrFunc *f, const OptOpts *o, InlMemo *memo,
   g_stats.inl_spliced++;
   inl_dbg(f, fidx, bi, "inlined spliced");
   xfree(callargs); xfree(contp);
-  ir_apply_subst(f);
-  ir_order(f);
+  if (nehe || !returns) {
+    ir_apply_subst(f);
+    ir_order(f);
+    *stale = false;
+  } else {
+    f->blocks[cont].reachable = true;
+    *stale = true;
+  }
   return true;
 }
 
 static bool inl_run(IrFunc *f, const OptOpts *o, uint32_t budget0, bool more) {
   Module *m = f->m;
-  InlMemo *memo = xcalloc(m->nfuncs ? m->nfuncs : 1, sizeof(InlMemo));
+  InlMemos *memo = inl_memos_begin(m);
   InlVec sites = {0};
   InlEsc *ev = o->escape ? inl_caller_evidence(f) : NULL;
   inl_collect(f, o, memo, ev, &sites, more);
@@ -1075,12 +1148,12 @@ static bool inl_run(IrFunc *f, const OptOpts *o, uint32_t budget0, bool more) {
   uint32_t budget = budget0;
   uint32_t retsum = 0;
   long events = 0;
-  bool any = false;
+  bool any = false, stale = false;
   for (uint32_t i = 0; i < sites.n && budget > 0; i++) {
     if (g_inl.max >= 0 && events >= g_inl.max) break;
     InlSite site = sites.v[i];
     uint32_t before = f->ninsts;
-    if (!inl_apply(f, o, memo, &site, &budget, &retsum)) continue;
+    if (!inl_apply(f, o, memo, &site, &budget, &retsum, &stale)) continue;
     any = true;
     events++;
     if (more) g_stats.inl_more++;
@@ -1091,6 +1164,7 @@ static bool inl_run(IrFunc *f, const OptOpts *o, uint32_t budget0, bool more) {
     uint32_t had = sites.n;
     for (Ref v = (Ref)before; v < (Ref)f->ninsts; v++) {
       if (f->insts[v].op != I_CALL) continue;
+      if (stale) { ir_apply_subst(f); ir_order(f); stale = false; }
       InlSite ns;
       if (inl_score_site(f, o, memo, NULL, v, f->insts[v].block, v, &site, &ns))
         inl_push(&sites, &ns);
@@ -1100,14 +1174,16 @@ static bool inl_run(IrFunc *f, const OptOpts *o, uint32_t budget0, bool more) {
             inl_site_cmp);
   }
 
+  if (stale) { ir_apply_subst(f); ir_order(f); }
   xfree(sites.v);
   xfree(ev);
-  for (uint32_t fi = 0; fi < m->nfuncs; fi++) {
-    if (memo[fi].plain) ir_free(memo[fi].plain);
-    if (memo[fi].split) ir_free(memo[fi].split);
-    xfree(memo[fi].pass);
+  for (uint32_t k = 0; k < memo->ntouched; k++) {
+    InlMemo *e = &memo->e[memo->touched[k]];
+    if (e->plain) ir_free(e->plain);
+    if (e->split) ir_free(e->split);
+    xfree(e->pass);
   }
-  xfree(memo);
+  memo->ntouched = 0;
   return any;
 }
 

@@ -884,7 +884,7 @@ static bool ar_take_one(Linker *L, Archive *a, void (*rd)(InObj *)) {
       continue;
     }
     a->taken[me] = true;
-    if (getenv("WARMC_LINK_DEBUG"))
+    if (warmc_getenv("WARMC_LINK_DEBUG"))
       for (uint32_t q = 0; q < probe.nsecs; q++)
         if (probe.secs[q].kind == K_DROP && probe.secs[q].size)
           fprintf(stderr, "link:   drop %s %s (%llu bytes)\n", probe.name,
@@ -975,7 +975,7 @@ static void ds_why(Linker *L, Walk *w, const char *why) {
 }
 
 static void dead_strip(Linker *L, const char *entry) {
-  const char *why = getenv("WARMC_LINK_WHY");
+  const char *why = warmc_getenv("WARMC_LINK_WHY");
   Walk w;
   memset(&w, 0, sizeof w);
   bool **live = xcalloc(L->nobjs ? L->nobjs : 1, sizeof(bool *));
@@ -1046,11 +1046,11 @@ static void dead_strip(Linker *L, const char *entry) {
       gone[is->kind] += is->size;
       ndrop++;
       is->kind = K_DROP;
-      if (getenv("WARMC_LINK_STRIP"))
+      if (warmc_getenv("WARMC_LINK_STRIP"))
         fprintf(stderr, "strip: %-8llu %-52s %s\n", (unsigned long long)is->size,
                 is->name, L->objs[i].name);
     }
-  if (getenv("WARMC_LINK_DEBUG"))
+  if (warmc_getenv("WARMC_LINK_DEBUG"))
     fprintf(stderr, "link: dead-stripped %u sections: text %llu of %llu, "
                     "rodata %llu of %llu, data %llu of %llu, bss %llu of %llu\n",
             ndrop,
@@ -1643,7 +1643,7 @@ void warmc_link_exec(TargetFmt fmt, const char *out, const char *objpath,
   memset(&L, 0, sizeof L);
   L.fmt = fmt;
 
-  bool tm = getenv("WARMC_TIME") != NULL;
+  bool tm = warmc_getenv("WARMC_TIME") != NULL;
   double t0 = tm ? lk_ms() : 0, t_read, t_pull, t_lay, t_rel;
   load_main(&L, objpath);
 
@@ -1698,7 +1698,7 @@ void warmc_link_exec(TargetFmt fmt, const char *out, const char *objpath,
 
   if (strip) dead_strip(&L, entry);
   reserve_indirection(&L);
-  if (getenv("WARMC_LINK_DEBUG")) {
+  if (warmc_getenv("WARMC_LINK_DEBUG")) {
     uint32_t nimp = 0;
     for (uint32_t i = 0; i < L.ngsyms; i++) if (L.gsyms[i].imported) nimp++;
     fprintf(stderr, "link: %u objects, %u globals, %u imported, %u got, %u stubs\n",
@@ -1716,13 +1716,13 @@ void warmc_link_exec(TargetFmt fmt, const char *out, const char *objpath,
   resolve_addrs(&L);
   if (tm) { t_lay = lk_ms() - t0; t0 = lk_ms(); }
 
-  if (getenv("WARMC_LINK_MAP")) {
+  if (warmc_getenv("WARMC_LINK_MAP")) {
     for (uint32_t i = 0; i < L.ngsyms; i++)
       if (L.gsyms[i].defined)
         fprintf(stderr, "map %016llx %s\n",
                 (unsigned long long)L.gsyms[i].addr, L.gsyms[i].name);
   }
-  if (getenv("WARMC_LINK_DEBUG"))
+  if (warmc_getenv("WARMC_LINK_DEBUG"))
     fprintf(stderr, "link: text %llx+%llx rodata %llx+%llx got %llx+%x "
             "data %llx+%llx bss %llx+%llx\n",
             (unsigned long long)L.text_addr, (unsigned long long)L.text_size,
@@ -1731,7 +1731,7 @@ void warmc_link_exec(TargetFmt fmt, const char *out, const char *objpath,
             (unsigned long long)L.data_addr, (unsigned long long)L.data_size,
             (unsigned long long)L.bss_addr, (unsigned long long)L.bss_size);
 
-  if (getenv("WARMC_LINK_SECS"))
+  if (warmc_getenv("WARMC_LINK_SECS"))
     for (uint32_t i = 0; i < L.nobjs; i++)
       for (uint32_t s = 0; s < L.objs[i].nsecs; s++) {
         InSec *is = &L.objs[i].secs[s];
@@ -1741,7 +1741,7 @@ void warmc_link_exec(TargetFmt fmt, const char *out, const char *objpath,
                 (unsigned long long)is->align, (int)is->kind, is->name,
                 L.objs[i].name);
       }
-  if (getenv("WARMC_LINK_DEBUG"))
+  if (warmc_getenv("WARMC_LINK_DEBUG"))
     for (uint32_t i = 0; i < L.ngot; i++)
       fprintf(stderr, "link:   got[%u] +0x%02x %016llx %s%s\n", i, i * 8,
               (unsigned long long)L.gsyms[L.got[i]].addr, L.gsyms[L.got[i]].name,
@@ -1749,11 +1749,11 @@ void warmc_link_exec(TargetFmt fmt, const char *out, const char *objpath,
   int32_t e = gs_find(&L, entry);
   if (e < 0 || !L.gsyms[e].defined) warmc_fatal("link: no entry point %s", entry);
   apply_relocs(&L);
-  if (getenv("WARMC_LINK_DEBUG")) {
+  if (warmc_getenv("WARMC_LINK_DEBUG")) {
     uint32_t own = 0;
     for (uint32_t i = 0; i < L.ngot; i++) if (!L.gsyms[L.got[i]].imported) own++;
     fprintf(stderr, "link: %u rebases from data + %u from the got\n", L.nrebase, own);
-    if (getenv("WARMC_LINK_REBASE"))
+    if (warmc_getenv("WARMC_LINK_REBASE"))
       for (uint32_t i = 0; i < L.nrebase; i++)
         fprintf(stderr, "reb %016llx\n", (unsigned long long)L.rebase[i]);
   }

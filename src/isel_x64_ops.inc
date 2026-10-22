@@ -2531,7 +2531,7 @@ static void emit_inst(Isel *s, Ref v) {
       uint32_t lo, hi, nslots;
       bool exact;
       if ((RTEST_KIND(in->imm) & ~RTK_NULLABLE) == RTK_CONCRETE_ANY &&
-          !getenv("WARMC_NO_RTEST_FAST") &&
+          !warmc_getenv("WARMC_NO_RTEST_FAST") &&
           rtest_slots(f->m, in->imm, in->imm2, &lo, &hi, &exact, &nslots)) {
         int x = rd(s, a[0], S0);
         bool nullable = (RTEST_KIND(in->imm) & RTK_NULLABLE) != 0;
