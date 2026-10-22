@@ -2131,6 +2131,11 @@ static void parse_elem(P *p, uint32_t index) {
     e->table = take_ref(p, "table");
     e->explicit_table = true;
     expect_rpar(p);
+  } else if (at_index(p) && tk_at(p, p->i + 1)->kind == TK_LPAR) {
+    /* the MVP's bare table index, (elem 0 (i32.const 0) $f ...), told from
+       a function list by the offset that follows it */
+    e->table = take_ref(p, "table");
+    e->explicit_table = true;
   }
 
   bool have_offset = false;
@@ -2206,7 +2211,13 @@ static void parse_elem(P *p, uint32_t index) {
 
 static void parse_data(P *p, uint32_t index) {
   WData *d = &p->da.v[index];
-  if (at_group(p, "memory")) {
+  /* The MVP's form names the memory bare, (data 0 (i32.const 0) "..."), and
+     wabt and the older test suites still write it; the segment's own $id
+     has been taken already, so an index here is the memory's. */
+  if (at_index(p)) {
+    d->mem = take_ref(p, "memory");
+    d->active = true;
+  } else if (at_group(p, "memory")) {
     p->i += 2;
     d->mem = take_ref(p, "memory");
     expect_rpar(p);
