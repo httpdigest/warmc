@@ -9,13 +9,15 @@
 ;; instruction counts or in `user`.  A wait with no file descriptor in it is now
 ;; a nanosleep, which says what it means.
 ;;
-;; The test times 300 naps of 100us against 300 of 1ms.  Where the short nap is
-;; honoured the first loop is far quicker than the second; where it is rounded
-;; up to a millisecond the two are the same, so `t1 * 2 < t2` separates them.
-;; A ratio rather than a deadline, because the suite runs this on a machine
-;; doing ninety other things: per-iteration overhead lands on both loops and
-;; cancels, and the test still tolerates 0.8ms of it before it would misjudge.
-;; Both engines print `ok`; before this, warmc printed `slow`.
+;; The test takes the shortest of 300 naps of 100us and of 300 of 1ms.  Where
+;; the short nap is honoured it is far shorter than the long one; where it is
+;; rounded up to a millisecond the two are the same, so `t1 * 2 < t2` separates
+;; them.  The shortest, not the total, because the suite runs this on a machine
+;; doing ninety other things: the totals carried every wakeup the scheduler was
+;; late for, and past 0.8ms of that a nap misjudged either engine, wasmtime as
+;; often as warmc.  Some of 300 naps wake on time however busy the machine is,
+;; and no rounded-up nap is ever shorter than a millisecond.  Both engines print
+;; `ok`; before this, warmc printed `slow`.
 
 (module
   (import "wasi_snapshot_preview1" "poll_oneoff"
@@ -51,15 +53,20 @@
     (drop (call $poll (i32.const 0x100) (i32.const 0x140) (i32.const 1)
                       (i32.const 0x1c0))))
 
+  ;; The shortest of n naps, in nanoseconds.
   (func $naps (param $n i32) (param $ns i64) (result i64)
-    (local $t0 i64) (local $i i32)
-    (local.set $t0 (call $now))
+    (local $t0 i64) (local $d i64) (local $best i64) (local $i i32)
+    (local.set $best (i64.const -1))
     (block $done (loop $l
       (br_if $done (i32.ge_u (local.get $i) (local.get $n)))
+      (local.set $t0 (call $now))
       (call $nap (local.get $ns))
+      (local.set $d (i64.sub (call $now) (local.get $t0)))
+      (if (i64.lt_u (local.get $d) (local.get $best))
+        (then (local.set $best (local.get $d))))
       (local.set $i (i32.add (local.get $i) (i32.const 1)))
       (br $l)))
-    (i64.sub (call $now) (local.get $t0)))
+    (local.get $best))
 
   (func (export "_start")
     (local $t1 i64) (local $t2 i64)
