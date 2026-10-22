@@ -3996,6 +3996,15 @@ static void access_base(IrFunc *f, Ref addr, Ref *base, uint64_t *off) {
   else if (in->op == I_MEM_PTR) { *base = ir_args(f, addr)[0]; *off = 0; }
   else if (in->op == I_CONST) { *base = REF_NONE; *off = in->imm; }
   else { *base = addr; *off = 0; }
+  /* A constant index is a constant address, however it is spelled: the
+     pointer mem_ptr made for a run of globals before a loop was unrolled,
+     and the constants the unrolled copies compute, name the same slots. */
+  if (*base != REF_NONE && f->insts[*base].op == I_CONST &&
+      (ValType)f->insts[*base].type != VT_V128) {
+    uint64_t c = f->insts[*base].imm;
+    *off += vt_is_64((ValType)f->insts[*base].type) ? c : (uint64_t)(uint32_t)c;
+    *base = REF_NONE;
+  }
 }
 
 #define ADDR_WALK_DEPTH 8
@@ -9232,6 +9241,78 @@ static bool addr_users_are_accesses(IrFunc *f, const UseIdx *ui, Ref ea,
   return any;
 }
 
+/* An access at a constant address too far from the memory base for a
+   displacement makes the back end build the address every time -- a mov and
+   a movk on arm64 -- and C's globals are such addresses: nbody reads and
+   writes its bodies at 0x10970 and on, fifteen of them a step.  Accesses
+   near one another share one native pointer instead, made once at entry,
+   and reach their slots by displacement from it.  The address each one
+   makes is the one it made before, so it traps where it did. */
+typedef struct { Ref inst; uint64_t addr; uint32_t size, mem, block; } ConstAcc;
+
+static int const_acc_cmp(const void *x, const void *y) {
+  const ConstAcc *a = x, *b = y;
+  if (a->block != b->block) return a->block < b->block ? -1 : 1;
+  if (a->mem != b->mem) return a->mem < b->mem ? -1 : 1;
+  return a->addr < b->addr ? -1 : a->addr > b->addr;
+}
+
+static bool mem_ptr_consts(IrFunc *f) {
+  uint32_t cap = 0, na = 0;
+  ConstAcc *acc = NULL;
+  for (uint32_t oi = 0; oi < f->norder; oi++) {
+    Block *b = &f->blocks[f->order[oi]];
+    for (uint32_t i = 0; i < b->ninsts; i++) {
+      Ref v = b->insts[i];
+      Inst *in = &f->insts[v];
+      if (in->op != I_LOAD && in->op != I_STORE) continue;
+      Ref a0 = ir_args(f, v)[0];
+      if (f->insts[a0].op != I_CONST || f->insts[a0].type != VT_I64) continue;
+      uint64_t addr = f->insts[a0].imm + in->imm;
+      uint32_t size = (uint32_t)MEMF_SIZE(in->imm2);
+      if (addr >> 32 || ir_mem_disp_ok(addr, size)) continue;
+      if (na == cap) { cap = cap ? cap * 2 : 32; acc = xrealloc(acc, cap * sizeof *acc); }
+      acc[na++] = (ConstAcc){ v, addr, size, MEMF_MEM(in->imm2), f->order[oi] };
+    }
+  }
+  bool changed = false;
+  if (na >= 2) {
+    qsort(acc, na, sizeof *acc, const_acc_cmp);
+    uint32_t entry;
+    for (uint32_t s = 0; s < na;) {
+      uint64_t base = acc[s].addr & ~(uint64_t)7;
+      uint32_t e = s;
+      while (e < na && acc[e].block == acc[s].block && acc[e].mem == acc[s].mem &&
+             ir_mem_disp_ok(acc[e].addr - base, acc[e].size))
+        e++;
+      if (e - s >= 2) {
+        /* one pointer per block: a pointer shared by the code before a loop
+           and the code after it holds a register right through the loop,
+           which measured worse than the moves it saves */
+        entry = acc[s].block;
+        Ref k = ir_emit(f, entry, I_CONST, VT_I32, NULL, 0, base, 0);
+        Ref p = ir_emit(f, entry, I_MEM_PTR, VT_I64, &k, 1, 0, acc[s].mem);
+        Block *eb = &f->blocks[entry];
+        uint32_t at = 0;
+        while (at < eb->ninsts - 2 && f->insts[eb->insts[at]].op == I_PARAM) at++;
+        for (uint32_t j = eb->ninsts - 1; j >= at + 2; j--) eb->insts[j] = eb->insts[j - 2];
+        eb->insts[at] = k;
+        eb->insts[at + 1] = p;
+        for (uint32_t q = s; q < e; q++) {
+          Inst *in = &f->insts[acc[q].inst];
+          in->imm = acc[q].addr - base;
+          ir_args(f, acc[q].inst)[0] = p;
+        }
+        changed = true;
+      }
+      if (e == s) e++;
+      s = e;
+    }
+  }
+  xfree(acc);
+  return changed;
+}
+
 static bool pass_mem_ptr(IrFunc *f) {
   bool changed = false;
   uint32_t n = f->ninsts;
@@ -9306,6 +9387,7 @@ static bool pass_mem_ptr(IrFunc *f) {
   }
   use_index_free(&ui);
   xfree(count);
+  if (mem_ptr_consts(f)) changed = true;
   return changed;
 }
 
@@ -11525,6 +11607,7 @@ static bool pass_vectorize(IrFunc *f) {
    run to run. */
 #define UNROLL_K          4
 #define UNROLL_MAX_BODY   40
+#define UNROLL_MAX_BODY_FULL 160
 #define UNROLL_MAX_PARAMS 8
 
 static pthread_once_t g_unr_once = PTHREAD_ONCE_INIT;
@@ -11711,7 +11794,12 @@ static bool unroll_one(IrFunc *f, uint32_t hb, Ref *fixmap, uint32_t *cycleid,
 
   uint32_t nbody = 0;
   for (uint32_t i = 0; i < ncyc; i++) nbody += f->blocks[cyc[i]].ninsts;
-  if (nbody > g_unr.max_body) UREJ("body too large", unr_rej_body);
+  /* A body past the limit is still taken when the trip is a constant the
+     unroll factor equals: the copies are then the whole loop, run once,
+     and the test folds away -- the inner walks nbody's bodies make once
+     their outer walk is laid out. */
+  bool big = nbody > g_unr.max_body;
+  if (nbody > UNROLL_MAX_BODY_FULL) UREJ("body too large", unr_rej_body);
   for (uint32_t i = 0; i < ncyc; i++) {
     Block *b = &f->blocks[cyc[i]];
     for (uint32_t j = 0; j < b->ninsts; j++) {
@@ -11829,6 +11917,7 @@ static bool unroll_one(IrFunc *f, uint32_t hb, Ref *fixmap, uint32_t *cycleid,
   if (cst && unr_trip_count(rel, top, down, cbits, K, c_init, c_bound, &trip))
     for (uint32_t k = g_unr.k; k >= 2; k--)
       if (trip >= k && trip % k == 0) { uk = k; break; }
+  if (big && !(uk && trip == uk)) UREJ("body too large", unr_rej_body);
   if (!uk) {
     /* Guarded form: version the loop behind a runtime trip count (the
        vectorizer's arithmetic with U := the unroll factor) and keep the
@@ -12323,6 +12412,230 @@ static bool pass_unroll_addr(IrFunc *f) {
   xfree(adds.add);
   for (uint32_t oi = 0; oi < f->norder; oi++)
     if (uac_regroup(f, &f->blocks[f->order[oi]])) changed = true;
+  return changed;
+}
+
+/* The number of times a bottom-tested loop runs, when that is a constant:
+   a param stepped by a constant from a constant, which the latch's test
+   compares with a constant.  0 when it is not. */
+static uint64_t loop_trip_bottom(IrFunc *f, uint32_t hb, uint32_t latch, uint32_t pre) {
+  uint64_t trip = 0;
+  Block *h = &f->blocks[hb], *lb = &f->blocks[latch];
+  uint32_t np = h->nparams;
+  uint32_t ci = lb->succs[0].target == hb ? 0 : 1;
+  Edge *back = &lb->succs[ci];
+  Edge *pe = iv_edge(f, pre, hb);
+  if (lb->term != T_BRIF || lb->nsuccs != 2 || !pe || pe->nargs != np || back->nargs != np)
+    return 0;
+  {
+    Ref cond = lb->term_arg;
+    bool cont = ci == 0;
+    if (f->insts[cond].op == I_EQZ && f->insts[cond].nargs == 1) {
+      cond = ir_args(f, cond)[0];
+      cont = !cont;
+    }
+    for (uint32_t p = 0; p < np && !trip; p++) {
+      Ref nx = back->args[p];
+      Inst *n = &f->insts[nx];
+      uint64_t stp, c_init, c_bound = 0;
+      if ((n->op != I_ADD && n->op != I_SUB) || n->nargs != 2 ||
+          ir_args(f, nx)[0] != h->params[p] || !is_const(f, ir_args(f, nx)[1], &stp) ||
+          !stp || !is_const(f, pe->args[p], &c_init))
+        continue;
+      ValType ct = (ValType)n->type;
+      if (ct != VT_I32 && ct != VT_I64) continue;
+      uint32_t cbits = ct == VT_I64 ? 64 : 32;
+      uint64_t cmask = cbits == 64 ? ~0ull : (1ull << cbits) - 1;
+      Ref ivside, bound;
+      IrOp rel;
+      if (cond == nx) { rel = cont ? I_NE : I_EQ; ivside = nx; bound = REF_NONE; }
+      else rel = v_continue_rel(f, cond, cont, &ivside, &bound);
+      if (rel != I_NOP && ivside != nx && bound == nx) {
+        rel = v_mirror(rel);
+        Ref tt = ivside; ivside = bound; bound = tt;
+      }
+      if (rel == I_NOP || ivside != nx) continue;
+      if (bound != REF_NONE && !is_const(f, bound, &c_bound)) continue;
+      uint64_t K = stp & cmask;
+      bool down = n->op == I_SUB;
+      if (K & (1ull << (cbits - 1))) { down = !down; K = (0 - K) & cmask; }
+      bool gform = rel == I_GTU || rel == I_GTS || rel == I_GEU || rel == I_GES;
+      if (down && !gform && rel != I_NE) continue;
+      if (!down && gform) continue;
+      if (rel == I_EQ) continue;
+      uint64_t tc;
+      if (unr_trip_count(rel, false, down, cbits, K, c_init & cmask, c_bound & cmask, &tc))
+        trip = tc;
+    }
+  }
+  return trip;
+}
+
+/* A loop that runs a few times, a constant number of them, with a loop
+   inside it -- nbody's walk over its five bodies, whose inner walk over the
+   bodies after each one then runs 4, 3, 2 and 1 times -- is laid out that
+   many times over.  Each copy's counter is a constant, so the inner loops
+   get constant trip counts the unroller then takes, and every address the
+   copies make is a constant memory forwarding can follow: the velocities
+   the pairs add into stay in registers for the whole step.  Only a loop
+   that is itself inside a loop, entered once, bottom-tested and left only
+   by its test, and small. */
+#define UNEST_TRIP 8
+#define UNEST_INSTS 1200
+
+static bool unroll_nest_one(IrFunc *f, uint32_t hb) {
+  Block *h = &f->blocks[hb];
+  if (!h->reachable || !h->nparams || h->is_pad || h->loop_depth < 2) return false;
+  uint32_t pre = UINT32_MAX, latch = UINT32_MAX, nfwd = 0, nback = 0;
+  for (uint32_t p = 0; p < h->npreds; p++) {
+    uint32_t pb = h->preds[p];
+    if (f->blocks[pb].rpo >= h->rpo) { nback++; latch = pb; }
+    else { nfwd++; pre = pb; }
+  }
+  if (nback != 1 || nfwd != 1 || latch == hb) return false;
+
+  uint32_t nb0 = f->nblocks, ni0 = f->ninsts;
+  uint8_t *in = xcalloc(nb0, 1);
+  uint32_t *stack = xmalloc(nb0 * sizeof(uint32_t)), sp = 0;
+  bool ok = true, inner = false;
+  uint32_t ninst = 0;
+  in[hb] = 1;
+  in[latch] = 1;
+  stack[sp++] = latch;
+  while (sp && ok) {
+    uint32_t x = stack[--sp];
+    for (uint32_t p = 0; p < f->blocks[x].npreds; p++) {
+      uint32_t pb = f->blocks[x].preds[p];
+      if (pb == pre || pb == f->order[0]) { ok = false; break; }
+      if (!in[pb]) { in[pb] = 1; stack[sp++] = pb; }
+    }
+  }
+  for (uint32_t x = 0; x < nb0 && ok; x++) {
+    if (!in[x]) continue;
+    Block *b = &f->blocks[x];
+    if (b->is_pad) ok = false;
+    ninst += b->ninsts;
+    /* as the unroller: a call site or a throw is not copied */
+    for (uint32_t j = 0; j < b->ninsts && ok; j++) {
+      uint16_t op = f->insts[b->insts[j]].op;
+      if (is_call_op(op) || op == I_RETURN_CALL || op == I_RETURN_CALL_INDIRECT ||
+          op == I_RETURN_CALL_REF || op == I_RESULT || op == I_THROW || op == I_THROW_REF)
+        ok = false;
+    }
+    for (uint32_t p = 0; p < b->npreds && ok; p++) {
+      uint32_t pb = b->preds[p];
+      if (x != hb && !in[pb]) ok = false;
+      if (x != hb && in[pb] && f->blocks[pb].rpo >= b->rpo) inner = true;
+    }
+    for (uint32_t s = 0; s < b->nsuccs && ok; s++) {
+      if (b->succs[s].eh) ok = false;
+      if (!in[b->succs[s].target] && x != latch) ok = false;
+    }
+  }
+  Block *lb = &f->blocks[latch];
+  if (!ok || !inner || lb->term != T_BRIF || lb->nsuccs != 2 ||
+      (lb->succs[0].target == hb) == (lb->succs[1].target == hb) ||
+      in[lb->succs[0].target] == in[lb->succs[1].target]) {
+    xfree(in); xfree(stack);
+    return false;
+  }
+  uint32_t ci = lb->succs[0].target == hb ? 0 : 1;
+  Edge *back = &lb->succs[ci];
+  Edge *pe = iv_edge(f, pre, hb);
+  uint32_t np = h->nparams;
+  if (!pe || pe->nargs != np || back->nargs != np) { xfree(in); xfree(stack); return false; }
+
+  uint64_t trip = loop_trip_bottom(f, hb, latch, pre);
+  if (trip < 2 || trip > UNEST_TRIP || (uint64_t)ninst * trip > UNEST_INSTS) {
+    xfree(in); xfree(stack);
+    return false;
+  }
+
+  if (getenv("WARMC_UNROLL_DEBUG"))
+    fprintf(stderr, "unroll %s b%u: nest trip=%llu body=%u\n",
+            f->m->funcs[f->func_index].sym, hb, (unsigned long long)trip, ninst);
+  uint32_t *bc = xmalloc((size_t)trip * nb0 * sizeof(uint32_t));
+  Ref *mp = xmalloc((size_t)trip * ni0 * sizeof(Ref));
+  for (uint32_t x = 0; x < nb0; x++) bc[x] = in[x] ? x : UINT32_MAX;
+  for (uint32_t v = 0; v < ni0; v++) mp[v] = v;
+  for (uint64_t k = 1; k < trip; k++)
+    clone_blocks(f, in, nb0, ni0, &bc[k * nb0], &mp[k * ni0]);
+
+  /* each copy's test goes on to the next copy, the last one's out */
+  for (uint64_t k = 0; k < trip; k++) {
+    uint32_t L = bc[k * nb0 + latch];
+    Block *b = &f->blocks[L];
+    uint32_t hk = bc[k * nb0 + hb];
+    uint32_t c = b->succs[0].target == hk ? 0 : 1;
+    Edge keep = b->succs[k + 1 < trip ? c : 1 - c];
+    if (k + 1 < trip) keep.target = bc[(k + 1) * nb0 + hb];
+    b->succs[0] = keep;
+    b->nsuccs = 1;
+    b->term = T_JUMP;
+    b->term_arg = REF_NONE;
+  }
+
+  /* what the loop made and the code after it reads is the last copy's */
+  const Ref *last = &mp[(trip - 1) * ni0];
+#define UN_MAP(r) do { Ref r_ = (r); if (r_ != REF_NONE && r_ < ni0 &&            \
+      f->insts[r_].block < nb0 && in[f->insts[r_].block] && last[r_] != REF_NONE) \
+      (r) = last[r_]; } while (0)
+  for (uint32_t x = 0; x < nb0; x++) {
+    Block *b = &f->blocks[x];
+    if (in[x] || !b->reachable) continue;
+    for (uint32_t i = 0; i < b->ninsts; i++) {
+      Ref *a = ir_args(f, b->insts[i]);
+      for (uint32_t q = 0; q < f->insts[b->insts[i]].nargs; q++) UN_MAP(a[q]);
+    }
+    if (b->term == T_BRIF || b->term == T_BRTABLE) UN_MAP(b->term_arg);
+    for (uint32_t q = 0; q < b->nret; q++) UN_MAP(b->ret_args[q]);
+    for (uint32_t s = 0; s < b->nsuccs; s++)
+      for (uint32_t q = 0; q < b->succs[s].nargs; q++) UN_MAP(b->succs[s].args[q]);
+  }
+#undef UN_MAP
+  xfree(bc); xfree(mp); xfree(in); xfree(stack);
+  ir_recompute_preds(f);
+  return true;
+}
+
+static bool pass_unroll_nest(IrFunc *f) {
+  if (f->npads || getenv("WARMC_NO_UNROLL_NEST")) return false;
+  bool changed = false;
+  /* one loop per round: the rest of the orders, depths and preds are stale */
+  for (uint32_t oi = 0; oi < f->norder; oi++)
+    if (unroll_nest_one(f, f->order[oi])) { changed = true; break; }
+  return changed;
+}
+
+/* A bottom-tested loop that runs exactly once -- the unroller's copies of
+   a loop whose trip was the unroll factor, or a walk over one element --
+   never takes its back edge: its test becomes the jump out. */
+static bool pass_once_loops(IrFunc *f) {
+  bool changed = false;
+  for (uint32_t oi = 0; oi < f->norder; oi++) {
+    uint32_t hb = f->order[oi];
+    Block *h = &f->blocks[hb];
+    if (!h->reachable || !h->nparams || h->is_pad) continue;
+    uint32_t pre = UINT32_MAX, latch = UINT32_MAX, nfwd = 0, nback = 0;
+    for (uint32_t p = 0; p < h->npreds; p++) {
+      uint32_t pb = h->preds[p];
+      if (f->blocks[pb].rpo >= h->rpo) { nback++; latch = pb; }
+      else { nfwd++; pre = pb; }
+    }
+    if (nback != 1 || nfwd != 1) continue;
+    Block *lb = &f->blocks[latch];
+    if (lb->term != T_BRIF || lb->nsuccs != 2) continue;
+    uint32_t ci = lb->succs[0].target == hb ? 0 : 1;
+    if (lb->succs[ci].target != hb || lb->succs[1 - ci].target == hb) continue;
+    if (loop_trip_bottom(f, hb, latch, pre) != 1) continue;
+    lb = &f->blocks[latch];
+    lb->succs[0] = lb->succs[1 - ci];
+    lb->nsuccs = 1;
+    lb->term = T_JUMP;
+    lb->term_arg = REF_NONE;
+    changed = true;
+  }
+  if (changed) ir_recompute_preds(f);
   return changed;
 }
 
@@ -12925,6 +13238,12 @@ void ir_optimize(IrFunc *f, const OptOpts *o) {
     if (!moved) break;
   }
 
+  for (int r = 0; o->unroll && r < 4 && TP("unroll_nest", pass_unroll_nest(f)); r++) {
+    ir_order(f);
+    opt_cleanup(f, o);
+    ir_verify(f, "post-unroll-nest");
+  }
+
   if (o->strength && TP("iv_strength", pass_iv_strength(f))) {
     prune_params(f);
     ir_order(f);
@@ -12986,6 +13305,16 @@ void ir_optimize(IrFunc *f, const OptOpts *o) {
     prune_params(f);
     ir_order(f);
     ir_verify(f, "post-unroll");
+  }
+  /* once the copies' counter steps are folded into one, a loop unrolled
+     by its whole trip shows that it runs once */
+  if (o->unroll && TP("once_loops", pass_once_loops(f))) {
+    /* the params of a header left with one way in become what flows in --
+       constant counters and addresses -- and fold and memory forwarding
+       need a round after that */
+    ir_order(f);
+    opt_cleanup(f, o);
+    ir_verify(f, "post-once-loops");
   }
 
   if (prune_params(f)) ir_order(f);

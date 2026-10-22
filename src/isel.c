@@ -157,6 +157,13 @@ static int rd(Isel *s, Ref v, int scratch) {
       return s->rc_reg[pick];
     }
   }
+  if (s->frc_reg[0] && is_fp_value(s->f, v) && !is_vec_value(s->f, v)) {
+    for (int i = 0; i < 2; i++)
+      if (s->frc_slot[i] == sl + 1) {
+        s->frc_used[i] = 1;
+        return s->frc_reg[i];
+      }
+  }
   slot_load(B, is_fp_value(s->f, v), is_vec_value(s->f, v), scratch,
             slot_off(s, SLOT_OF(l)));
   g_stats.reloads++;
@@ -1784,6 +1791,9 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
   }
 
   if (s->has_call && !s->naive) { s->rc_reg[0] = R29; s->rc_reg[1] = R30; }
+  /* F3 and F4 are scratch for a few vector sequences only, which drop what
+     they hold (emit_inst), and F3 breaks move cycles, which drops it too. */
+  if (!s->naive) { s->frc_reg[0] = F3; s->frc_reg[1] = F4; }
   compute_safepoints(s);
 
   s->slots_off = out_bytes;
