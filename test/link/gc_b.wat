@@ -59,4 +59,15 @@
     (i32.add
       (i32.mul (ref.test (ref $box) (local.get $borrowed)) (i32.const 100))
       (struct.get $box $val (ref.cast (ref $box) (local.get $borrowed)))))
+
+  ;; And the other way: B's object cast in A, against A's $box.  B was
+  ;; instantiated second, so its ids lie above A's range where the borrowed
+  ;; one's lie below B's -- the inline answer has to leave both to the
+  ;; runtime, and this is the side a range check with no upper bound gets
+  ;; wrong.
+  (func (export "cast_lent") (result i32)
+    (local $lent (ref null $box))
+    (local.set $lent (struct.new $box (i32.const 5)))
+    (call $escape (local.get $lent))
+    (call $val (local.get $lent)))
 )

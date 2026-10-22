@@ -592,6 +592,66 @@ static void order_sig_fill(const IrFunc *f, uint32_t *o) {
   }
 }
 
+/* How many of the function's runs reach each block, as a share of its
+   entry, by the one estimate that needs no profile: every branch splits
+   evenly between the successors that can return, and a path that cannot
+   gets nothing.  Only the top level is split.  A loop is taken whole -- it
+   runs when its header is reached, its blocks share the header's share,
+   and its exits divide that share between them -- so inside a loop this is
+   what reaches the loop, and how often the loop goes round stays the loop
+   depth's business, as everywhere else.  It is a guess, and its users
+   take it only where being wrong costs little: it tells the growth path
+   of a push from the push.  Needs ir_order's dominators, depths and RPO. */
+void ir_path_share(const IrFunc *f, float *share) {
+  uint32_t nb = f->nblocks;
+  uint32_t *top = xmalloc((nb ? nb : 1) * sizeof(uint32_t));
+  uint32_t *nexit = xcalloc(nb ? nb : 1, sizeof(uint32_t));
+  for (uint32_t i = 0; i < nb; i++) share[i] = 0;
+  for (uint32_t oi = 0; oi < f->norder; oi++) {
+    uint32_t bi = f->order[oi], t = bi;
+    while (f->blocks[t].loop_depth && t != f->entry &&
+           f->blocks[t].idom != REF_NONE && f->blocks[t].idom != t &&
+           f->blocks[f->blocks[t].idom].loop_depth)
+      t = f->blocks[t].idom;
+    top[bi] = f->blocks[bi].loop_depth ? t : bi;
+  }
+  for (uint32_t oi = 0; oi < f->norder; oi++) {
+    const Block *b = &f->blocks[f->order[oi]];
+    if (!b->loop_depth) continue;
+    for (uint32_t s = 0; s < b->nsuccs; s++) {
+      const Block *t = &f->blocks[b->succs[s].target];
+      if (!t->loop_depth && t->rpo > b->rpo && !t->diverges &&
+          !b->succs[s].eh)
+        nexit[top[f->order[oi]]]++;
+    }
+  }
+  share[f->entry] = 1;
+  for (uint32_t oi = 0; oi < f->norder; oi++) {
+    uint32_t bi = f->order[oi];
+    const Block *b = &f->blocks[bi];
+    if (b->loop_depth && top[bi] != bi) share[bi] = share[top[bi]];
+    uint32_t n = 0;
+    for (uint32_t s = 0; s < b->nsuccs; s++) {
+      const Block *t = &f->blocks[b->succs[s].target];
+      if (t->rpo <= b->rpo || t->diverges || b->succs[s].eh) continue;
+      if (b->loop_depth && t->loop_depth) continue;
+      n++;
+    }
+    if (!n) continue;
+    float out = b->loop_depth ? share[top[bi]] / (float)nexit[top[bi]]
+                              : share[bi] / (float)n;
+    for (uint32_t s = 0; s < b->nsuccs; s++) {
+      uint32_t ti = b->succs[s].target;
+      const Block *t = &f->blocks[ti];
+      if (t->rpo <= b->rpo || t->diverges || b->succs[s].eh) continue;
+      if (b->loop_depth && t->loop_depth) continue;
+      share[ti] += out;
+    }
+  }
+  for (uint32_t i = 0; i < nb; i++) if (share[i] > 1) share[i] = 1;
+  xfree(top); xfree(nexit);
+}
+
 void ir_order(IrFunc *f) {
   size_t len = order_sig_len_of(f);
   if (len > f->order_sig_cap) {
@@ -671,6 +731,30 @@ static uint64_t branch_bound(IrFunc *f, Block *pb, uint32_t si, Ref v,
   return om == 0 ? 0 : om - 1;
 }
 
+/* The bound the branches above block pbi put on v, for blocks entered from
+   one predecessor only: that predecessor's branch holds wherever the block
+   runs, and so do the branches above it.  Jump threading leaves an edge from
+   a block below the test that bounded its value -- the clamp
+   `n > 1024 ? 1024 : n` and then `n == 0` -- and a parameter's bound must not
+   end at the first block up. */
+static uint64_t chain_bound(IrFunc *f, uint32_t pbi, Ref v, int depth) {
+  uint64_t best = ~0ull;
+  for (int up = 0; up < 3; up++) {
+    Block *pb = &f->blocks[pbi];
+    if (pb->npreds != 1) break;
+    uint32_t qi = pb->preds[0];
+    Block *qb = &f->blocks[qi];
+    uint32_t sidx = 0, n = 0;
+    for (uint32_t s = 0; s < qb->nsuccs; s++)
+      if (qb->succs[s].target == pbi) { sidx = s; n++; }
+    if (n != 1) break;
+    uint64_t bb = branch_bound(f, qb, sidx, v, depth);
+    if (bb < best) best = bb;
+    pbi = qi;
+  }
+  return best;
+}
+
 uint64_t ir_value_max(IrFunc *f, Ref v, int depth) {
   Inst *in = &f->insts[v];
   int width = vt_is_64((ValType)in->type) ? 64 : 32;
@@ -699,6 +783,8 @@ uint64_t ir_value_max(IrFunc *f, Ref v, int depth) {
           Ref inv = pb->succs[si].args[k];
           uint64_t m = ir_value_max(f, inv, depth - 1);
           uint64_t bb = branch_bound(f, pb, si, inv, depth - 1);
+          if (bb < m) m = bb;
+          bb = chain_bound(f, b->preds[pi], inv, depth - 1);
           if (bb < m) m = bb;
           if (m > r) r = m;
           seen = true;

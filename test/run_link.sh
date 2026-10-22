@@ -121,7 +121,8 @@ link_prog gcprog test/link/gcdriver.c "$WORK/gca.o" "$WORK/gcb.o" || exit 1
 
 gcwant='gclink_small=4330
 gclink_large=4330
-gclink_cast=111'
+gclink_cast=111
+gclink_lent=5'
 
 gc_run() {
   local label="$1"; shift

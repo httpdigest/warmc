@@ -137,6 +137,33 @@
     (i32.div_u (i32.const 1) (i32.add (i32.load (i32.const 4)) (i32.const 1))))
   (func (export "rem0_masked") (result i64)       ;; 64 & 63 is 0
     (i64.rem_u (i64.const 1) (i64.and (i64.load (i32.const 16)) (i64.const 63))))
+  ;; The same zero divisor, in a loop that does not change it: the division
+  ;; becomes a multiply by a reciprocal made before the loop, which must not
+  ;; trap there (its divisor is replaced by 1) and must still trap here.
+  (func (export "div0_loop_u") (result i32)
+    (local $i i32) (local $s i32) (local $d i32)
+    (local.set $d (i32.load (i32.const 8)))
+    (loop $l
+      (i32.store (i32.const 12) (local.get $i))
+      (local.set $s (i32.add (local.get $s) (i32.div_u (local.get $i) (local.get $d))))
+      (br_if $l (i32.lt_u (local.tee $i (i32.add (local.get $i) (i32.const 1))) (i32.const 100))))
+    (local.get $s))
+  ;; A division and then the remainder of the same pair, which becomes a
+  ;; multiply-subtract of the quotient: the division still traps first.
+  (func (export "divrem_ovf") (result i32)
+    (local $n i32) (local $d i32)
+    (local.set $n (i32.load (i32.const 32)))
+    (local.set $n (i32.add (local.get $n) (i32.const 1)))
+    (local.set $d (i32.load (i32.const 4)))
+    (i32.add (i32.div_s (local.get $n) (local.get $d))
+             (i32.rem_s (local.get $n) (local.get $d))))
+  (func (export "rem0_loop_u") (result i32)
+    (local $i i32) (local $s i32) (local $d i32)
+    (local.set $d (i32.load (i32.const 8)))
+    (loop $l
+      (local.set $s (i32.add (local.get $s) (i32.rem_u (i32.mul (local.get $i) (i32.const 7)) (local.get $d))))
+      (br_if $l (i32.lt_u (local.tee $i (i32.add (local.get $i) (i32.const 1))) (i32.const 100))))
+    (local.get $s))
 
   ;; A bound is only carried through a left shift while nothing leaves the
   ;; top.  popcount(0x7fffffff) is 31 and 31 << 27 is 0xf8000000, so the sum

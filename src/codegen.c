@@ -179,6 +179,27 @@ static void split_prune_plan(IrFunc *f, SplitCtl *sc) {
     sc->cutp[w++] = p;
   }
   sc->ncut = w;
+
+  /* An exit merge goes with its cut.  One param can serve two cuts --
+     the exit of one loop the header of the next -- so the survivors set
+     their veto bits again after the dropped ones cleared theirs. */
+  w = 0;
+  for (uint32_t k = 0; k < sc->nxcut; k++) {
+    bool keep = false;
+    for (uint32_t c = 0; c < sc->ncut && !keep; c++)
+      keep = sc->cutp[c] == sc->xcut_hdr[k];
+    if (!keep) {
+      if (sc->xcutp[k] < sc->veto_n) sc->veto[sc->xcutp[k]] = 0;
+      continue;
+    }
+    sc->xcutp[w] = sc->xcutp[k];
+    sc->xcut_hdr[w++] = sc->xcut_hdr[k];
+  }
+  sc->nxcut = w;
+  for (uint32_t c = 0; c < sc->ncut; c++)
+    if (sc->cutp[c] < sc->veto_n) sc->veto[sc->cutp[c]] = 1;
+  for (uint32_t k = 0; k < sc->nxcut; k++)
+    if (sc->xcutp[k] < sc->veto_n) sc->veto[sc->xcutp[k]] = 1;
   if (sc->veto && sc->veto_n > f->ninsts)
     memset(sc->veto + f->ninsts, 0, sc->veto_n - f->ninsts);
   if (sc->inv_fail) memset(sc->inv_fail, 0, sc->cap_add);
@@ -186,24 +207,47 @@ static void split_prune_plan(IrFunc *f, SplitCtl *sc) {
   sc->nfailed_new = 0;
 }
 
+/* One produce_body, run a second time when the first has measured the loops
+   it aligns and wants to place them again knowing their sizes (4).  The
+   sizes are for that code only, so they go once the second run has used
+   them. */
+static int produce_once(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
+                        uint32_t out_bytes, FuncOut *fout, bool far,
+                        SplitCtl *sc, bool collect) {
+  int r = g_target->produce_body(f, obj, opt, out_bytes, fout, far, sc, collect);
+  if (r == 4)
+    r = g_target->produce_body(f, obj, opt, out_bytes, fout, far, sc, collect);
+  f->loop_bytes = NULL;
+  return r;
+}
+
 void ir_produce_function(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
                          uint32_t out_bytes, FuncOut *fout) {
   SplitCtl sc;
   memset(&sc, 0, sizeof sc);
 
-  /* Loop-boundary live-range splitting, opt-in.  The prune loop below
-     rolls every failed grant out of the IR, so enabling this never loses
-     a race any more (the old chunks +4.9% and the ktbench drift are
-     gone); what remains is one reproduced winner (asbench mapint -3%)
-     for +8-9% compile time on granted modules -- 71% of grants fail the
-     retry and cost their extra regalloc rounds anyway.  Not a trade to
-     make by default.  The measured record lives with the
-     warmc-split-series memory note. */
-  bool collect = opt->regalloc && getenv("WARMC_SPLIT") != NULL;
-  int r = g_target->produce_body(f, obj, opt, out_bytes, fout, false, &sc, collect);
+  /* Loop-boundary live-range splitting.  The whole plan is opt-in
+     (WARMC_SPLIT): the prune loop below rolls every failed grant out of
+     the IR, so enabling it never loses a race any more (the old chunks
+     +4.9% and the ktbench drift are gone); what remains is one reproduced
+     winner (asbench mapint -3%) for +8-9% compile time on granted modules
+     -- 71% of grants fail the retry and cost their extra regalloc rounds
+     anyway.  Not a trade to make by default.  The measured record lives
+     with the warmc-split-series memory note.
+
+     Its cut shape, with the exit merges that make a cut stick, runs by
+     default (-fsplit) in loops that make no call: that is the spilled
+     accumulator of a callee inlined ahead of a register-hungry one, 20%
+     of rsbench/itadapt, for 2% more compile time on the largest modules.
+     The one row it costs, cppbench/algorithms at 2%, runs fewer
+     instructions: an insertion sort's previous index left a stack slot
+     for a register and its loads now issue early. */
+  sc.full = getenv("WARMC_SPLIT") != NULL;
+  bool collect = opt->regalloc && (opt->split || sc.full);
+  int r = produce_once(f, obj, opt, out_bytes, fout, false, &sc, collect);
   if (r == 2) {
     split_apply_adds(f, &sc);
-    r = g_target->produce_body(f, obj, opt, out_bytes, fout, false, &sc, false);
+    r = produce_once(f, obj, opt, out_bytes, fout, false, &sc, false);
   }
   /* Each round the retry reports the grants it could not keep in
      registers; they are rolled out of the IR and the survivors re-run, so
@@ -215,14 +259,15 @@ void ir_produce_function(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
     split_prune_plan(f, &sc);
     split_apply_adds(f, &sc);
     if (rounds >= 8) sc.accept = true;
-    r = g_target->produce_body(f, obj, opt, out_bytes, fout, false, &sc, false);
+    r = produce_once(f, obj, opt, out_bytes, fout, false, &sc, false);
   }
   if (r == 0) {
     sc.accept = true;
-    r = g_target->produce_body(f, obj, opt, out_bytes, fout, true, &sc, false);
+    r = produce_once(f, obj, opt, out_bytes, fout, true, &sc, false);
   }
   xfree(sc.veto); xfree(sc.addv); xfree(sc.addhdr); xfree(sc.addp);
   xfree(sc.cutp); xfree(sc.inv_fail); xfree(sc.cut_fail);
+  xfree(sc.xcutp); xfree(sc.xcut_hdr);
   if (r == 1) return;
   warmc_fatal("function %u cannot be laid out: a conditional branch is still "
               "out of range after relaxation", f->func_index);

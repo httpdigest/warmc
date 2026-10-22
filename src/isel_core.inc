@@ -110,6 +110,18 @@ typedef struct {
   /* select(c, k + 1, k), either way round: 1 + the arm that is the add,
      which is folded, and the select is a csinc of k */
   uint8_t *csinc;
+  /* an or or xor of x << k and y >> (width - k), both folded: one extr */
+  uint8_t *extr;
+  /* Use-cluster pieces: a value with no register of its own (a slot or a
+     rematerialisation) held in a register that is free across a run of its
+     uses in one block, filled once before the first of them.  pc is sorted
+     by (block, first instruction); pc_bfirst/pc_bn index it per block, and
+     pc_head/pc_next chain each value's pieces. */
+  struct Piece { Ref v; uint32_t block, lo, hi; int reg; } *pc;
+  uint32_t npc;
+  uint32_t *pc_bfirst, *pc_bn;
+  int32_t *pc_head, *pc_next;
+  bool pc_live;
   /* a wrap all of whose readers read only the low half of a register */
   uint8_t *lowonly;
   uint8_t *no_remat;
@@ -134,6 +146,9 @@ typedef struct {
   bool t1_ok, t1_was;
   uint8_t *folded;
   struct Bfx *bfx;
+  /* A vector or that is a rotate: its left shift amount, the shifts folded
+     into it (arm64 only). */
+  uint8_t *vrot;
   uint32_t *uses;
 
   uint32_t prof_skip;
@@ -153,7 +168,7 @@ typedef struct {
   bool pool_ok;
   bool remat_fp, remat_v128, remat_glob;
   int remat_cost;
-  double remat2_w, remat2_seg, remat2_wcap;
+  double remat2_w, remat2_seg;
   bool far_br, far_br_needed;
 
   struct EdgeStub {
@@ -173,13 +188,19 @@ typedef struct {
   uint64_t fl_imm;
   int fl_sf;
   uint32_t fl_epoch;
+  uint32_t prev_bi;   /* the block emitted last, for its flags */
 
+  /* The compare whose result the flags still hold, as cc, while the buffer's
+     flags epoch is still cmp_epoch: a select on it reads the flags instead of
+     testing the 0/1 it was also materialised to. */
   Ref cmp_ref;
   int cmp_cc;
-  size_t cmp_len;
+  uint32_t cmp_epoch;
+  Ref cmp_bare;   /* a compare left in the flags only, never made a 0/1 */
 
   int rc_reg[2];
-  uint32_t rc_slot[2];
+  uint32_t rc_slot[2];   /* slot + 1, or RC_CONST | the constant */
+  bool rc_noconst;       /* making an edge's moves: no constant cache */
   uint8_t rc_used[2];
   uint8_t rc_next;
   /* the same for scalar floats, in two FP registers nothing allocates */
@@ -187,6 +208,12 @@ typedef struct {
   uint32_t frc_slot[2];
   uint8_t frc_used[2];
   uint8_t frc_next;
+  /* The value commit last stored to its slot, the register it stored from,
+     and where the code ended after the store: while nothing has been
+     emitted since, that register still holds the value (arm64's rd). */
+  Ref st_v;
+  int st_reg;
+  size_t st_end;
 
   int tid_reg;
   uint64_t tid_val;
@@ -216,7 +243,8 @@ typedef struct {
 
 /* Hooks each backend defines after including this file: spill-slot access,
    register-register moves, the parallel-copy cycle breaker, the
-   callee-saved-register -> unwind-index map, and FP-constant remat.
+   callee-saved-register -> unwind-index map, FP-constant remat, and the
+   reserved registers this function leaves idle for the allocator.
    regalloc.inc additionally wants the GPR_ALLOC / FPR_ALLOC tables, the
    gpr/fpr_is_callee_saved predicates, REG_MEMSIZE, and the
    RA_HAVE_RETAREA_REUSE / RA_RETAREA_REG / RA_ALLOC_RES_REG macros. */
@@ -228,6 +256,7 @@ static int isel_break_reg(int bank);
 static int rd(Isel *s, Ref v, int scratch);
 static int isel_cs_index(int reg);
 static bool isel_fp_remat_ok(Isel *s, const Inst *in);
+static int isel_spare_gprs(Isel *s, int *out);
 static bool skip_location(Isel *s, Ref v);
 static bool op_clobbers_caller_saved(uint16_t op);
 
@@ -276,6 +305,8 @@ static bool is_imm_at(Isel *s, Ref user, uint32_t idx, Ref v) {
   if (in->op != I_CONST || !fits_gpr(s->f, v)) return false;
   return ir_imm_ok(s->f, user, idx, in->imm, (ValType)in->type);
 }
+
+#define RC_CONST 0x80000000u
 
 static void rc_clear(Isel *s) {
   s->rc_slot[0] = 0; s->rc_slot[1] = 0;
@@ -362,6 +393,9 @@ static void commit(Isel *s, Ref v, int reg) {
   }
   slot_store(B, is_fp_value(s->f, v), is_vec_value(s->f, v), reg,
              slot_off(s, SLOT_OF(l)));
+  s->st_v = v;
+  s->st_reg = reg;
+  s->st_end = B->len;
   if (s->rc_reg[0] && !s->no_rc_def && !is_fp_value(s->f, v) &&
       !is_vec_value(s->f, v) && used_soon(s, v))
     rc_put(s, SLOT_OF(l), reg);
@@ -413,6 +447,44 @@ static Ref load_barrier_mask(const IrFunc *f, Ref v) {
   return ir_args((IrFunc *)f, v)[in->nargs - 1];
 }
 
+/* A ref.test of a concrete type in the any hierarchy, as an object this
+   module allocated answers it.  Such an object's header holds the instance's
+   type base plus its type's slot; the slots are the types module_data gives a
+   descriptor, numbered in type order, and every module has its own range of
+   ids (gc_register_types), so an object of another module's -- even of a
+   structurally identical type -- never lands inside it.  For this module's
+   objects the slot alone decides the test, as warmc_ref_test would decide it
+   from the display the slot's type was emitted with.  *lo..*hi is the first
+   run of slots that pass (lo > hi when none does); *exact says no slot
+   outside the run passes, so a slot of this module outside it fails without
+   asking the runtime, which is left only another module's objects, whose
+   slot is not below *nslots.  False when the slots are not numbered as
+   module_data numbers them, which leaves the runtime every answer. */
+static bool rtest_slots(const Module *m, uint64_t imm, uint64_t id,
+                        uint32_t *lo, uint32_t *hi, bool *exact,
+                        uint32_t *nslots) {
+  uint32_t depth = RTEST_DEPTH(imm);
+  uint32_t n = 0;
+  *lo = 1;
+  *hi = 0;
+  *exact = true;
+  for (uint32_t i = 0; i < m->ntypes; i++) {
+    if (m->type_entry && !m->type_entry[i]) continue;
+    if (gctype_slot(m, i) != n) return false;
+    const CompType *t = &m->types[i];
+    /* a type reach found unused is emitted with an empty display */
+    bool live = !m->type_live || m->type_live[i];
+    if (live && t->display && t->depth >= depth && t->display[depth] == id) {
+      if (*lo > *hi) *lo = *hi = n;
+      else if (*hi + 1 == n) *hi = n;
+      else *exact = false;
+    }
+    n++;
+  }
+  *nslots = n;
+  return true;
+}
+
 static void emit_move_to(Isel *s, Buf *out, int dst, int src, int fp, int wide,
                          int vec) {
   if (dst == src) return;
@@ -445,10 +517,18 @@ static void emit_remat_move(Isel *s, Buf *out, const Move *m) {
     warmc_fatal("internal: a rematerialised move outside the function body");
   if (IS_SLOT(m->dst)) {
     rc_kill_slot(s, SLOT_OF(m->dst));
+    s->rc_noconst = true;
     int r = rd(s, m->rv, (m->fp || m->vec) ? FTMP : TMP0);
+    s->rc_noconst = false;
     slot_store(out, m->fp, m->vec, r, slot_off(s, SLOT_OF(m->dst)));
   } else {
+    /* An edge's moves are made after the branch that picks the edge, and the
+       other edge's after them in the buffer: a constant the first left in the
+       reload cache is not there on the second's path, so these neither take
+       one from the cache nor leave one in it. */
+    s->rc_noconst = true;
     int r = rd(s, m->rv, m->dst);
+    s->rc_noconst = false;
     if (r != m->dst) emit_reg_move(out, m->dst, r, m->fp, m->wide, m->vec);
   }
 }

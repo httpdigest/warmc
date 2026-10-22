@@ -105,6 +105,14 @@ void a64_add_uxtw(Buf *b, int rd, int rn, int rm, int shift) {
     (2u << 13) | ((uint32_t)(shift & 7) << 10) | (M5(rn) << 5) | M5(rd));
 }
 
+/* 64-bit ADD/SUB (extended register) of a W register: rd = rn +/- (uxtw or
+   sxtw of wm) << shift.  Register 31 is sp, not xzr, in rd and rn here. */
+void a64_addsub_extw(Buf *b, int sub, int rd, int rn, int rm, int sxtw, int shift) {
+  W((1u << 31) | ((uint32_t)(sub != 0) << 30) | (0x0Bu << 24) | (1u << 21) |
+    (M5(rm) << 16) | ((sxtw ? 6u : 2u) << 13) | ((uint32_t)(shift & 7) << 10) |
+    (M5(rn) << 5) | M5(rd));
+}
+
 void a64_add_extx(Buf *b, int rd, int rn, int rm, int shift) {
   W((1u << 31) | (0x0Bu << 24) | (1u << 21) | (M5(rm) << 16) |
     (3u << 13) | ((uint32_t)(shift & 7) << 10) | (M5(rn) << 5) | M5(rd));
@@ -237,6 +245,13 @@ void a64_orr_imm(Buf *b, int sf, int rd, int rn, uint32_t e) { log_imm(b, sf, 1,
 void a64_eor_imm(Buf *b, int sf, int rd, int rn, uint32_t e) { log_imm(b, sf, 2, rd, rn, e); }
 void a64_ands_imm(Buf *b, int sf, int rd, int rn, uint32_t e) { log_imm(b, sf, 3, rd, rn, e); }
 void a64_tst_imm(Buf *b, int sf, int rn, uint32_t e) { a64_ands_imm(b, sf, RZR, rn, e); }
+
+/* EXTR: rd = the low half of the double-width rn:rm shifted right by lsb,
+   (rm >> lsb) | (rn << (width - lsb)).  ROR by an immediate is rn == rm. */
+void a64_extr(Buf *b, int sf, int rd, int rn, int rm, int lsb) {
+  W(((uint32_t)sf << 31) | (0x27u << 23) | ((uint32_t)sf << 22) |
+    (M5(rm) << 16) | ((uint32_t)(lsb & 0x3f) << 10) | (M5(rn) << 5) | M5(rd));
+}
 
 void a64_ror_imm(Buf *b, int sf, int rd, int rn, int shift) {
 
@@ -628,6 +643,10 @@ void a64_vushr_imm(Buf *b, int size, int rd, int rn, int shift) {
   uint32_t imm = (uint32_t)(16 << size) - (uint32_t)shift;
   W(0x6F000400u | ((imm >> 3) << 19) | ((imm & 7u) << 16) | (M5(rn) << 5) | M5(rd));
 }
+void a64_vsli_imm(Buf *b, int size, int rd, int rn, int shift) {
+  uint32_t imm = (uint32_t)(8 << size) + (uint32_t)shift;
+  W(0x6F005400u | ((imm >> 3) << 19) | ((imm & 7u) << 16) | (M5(rn) << 5) | M5(rd));
+}
 void a64_vsshr_imm(Buf *b, int size, int rd, int rn, int shift) {
   uint32_t imm = (uint32_t)(16 << size) - (uint32_t)shift;
   W(0x4F000400u | ((imm >> 3) << 19) | ((imm & 7u) << 16) | (M5(rn) << 5) | M5(rd));
@@ -745,6 +764,8 @@ void a64_vumlal(Buf *b, int q, int size, int rd, int rn, int rm) {
 }
 
 void a64_vrev64(Buf *b, int size, int rd, int rn) { V2(0x4E200800u | VSZ(size), rd, rn); }
+void a64_vrev32(Buf *b, int size, int rd, int rn) { V2(0x6E200800u | VSZ(size), rd, rn); }
+void a64_vrev16(Buf *b, int rd, int rn) { V2(0x4E201800u, rd, rn); }
 void a64_vxtn(Buf *b, int q, int size, int rd, int rn) {
   W(0x0E212800u | ((uint32_t)(q & 1) << 30) | VSZ(size) | (M5(rn) << 5) | M5(rd));
 }

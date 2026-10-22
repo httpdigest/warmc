@@ -1202,7 +1202,9 @@ static void parse_type(P *p, bool in_rec) {
       supers[nsupers++] = take_ref(p, "type");
     }
   }
-  if (sub) {
+  /* (sub final ...) with no supertypes is what a bare composite type means,
+     and is written as one, as wasm-tools writes it */
+  if (sub && !(final_ && nsupers == 0)) {
     wb_byte(s, final_ ? 0x4f : 0x50);
     wb_u32(s, nsupers);
     for (uint32_t i = 0; i < nsupers; i++)

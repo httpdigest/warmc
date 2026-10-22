@@ -4,8 +4,9 @@
 #include "ir.h"
 
 /* The live-range split plan: written by the first allocation, consumed by
-   the retry.  veto flags params whose ENTRY-edge coalescing the retry
-   skips, cutting a spilled web at its loop boundary so the in-loop piece
+   the retry.  veto flags params whose coalescing across forward edges --
+   a header's entry edges, a merge's incoming ones -- the retry skips,
+   cutting a spilled web at its loop boundary so the in-loop piece
    competes for a register on its own; addv/addhdr name values to thread
    through a NEW header param first (the loop-invariant shape).  The plan
    only ever asks -- the retry's allocation stays the sole authority. */
@@ -31,6 +32,18 @@ typedef struct SplitCtl {
   uint8_t *cut_fail;
   uint32_t nfailed_new;
   bool accept;
+
+  /* The other side of a cut: params outside the loop that what the loop
+     defines flows into along a forward edge, vetoed with it and dropped
+     with it -- xcut_hdr[k] is the header param whose cut xcutp[k] serves.
+     Without them the in-loop piece stays joined to everything it flows
+     into after the loop, and is spilled with that. */
+  Ref *xcutp, *xcut_hdr;
+  uint32_t nxcut, cap_xcut;
+
+  /* Every rung in every loop (WARMC_SPLIT), rather than the default: only
+     cuts, and only in loops that make no call. */
+  bool full;
 } SplitCtl;
 
 // One backend, selected once at startup from --target before any worker
@@ -51,7 +64,8 @@ typedef struct Target {
 
   // Register allocation + emission of one function body; the return-code
   // protocol is the split/far-branch retry contract ir_produce_function
-  // drives (1 done, 0 needs far branches, 2/3 split rounds).
+  // drives (1 done, 0 needs far branches, 2/3 split rounds, 4 run again to
+  // place the loops it measured).
   int (*produce_body)(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
                       uint32_t out_bytes, FuncOut *fout, bool far,
                       SplitCtl *sc, bool split_collect);

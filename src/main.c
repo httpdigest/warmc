@@ -51,7 +51,7 @@ static const char *usage_text =
   "                rotate, addroff, memptr, align, regalloc, guard-pages,\n"
   "                vectorize, unroll, selftail, ldcomb, escape, partial-escape,\n"
   "                gloop, gssa, loopclose, cpool, reach, prune, merge, devirt,\n"
-  "                reinline, throw-jump, closed-world, gcpure, labcache,\n"
+  "                reinline, throw-jump, closed-world, gcpure, split, labcache,\n"
   "                barelide, small-loop-align\n"
   "                The last two are the passes built on a loop containing\n"
   "                no safepoint, which is the only assumption the compiler\n"
@@ -236,6 +236,7 @@ int main(int argc, char **argv) {
   opt.align = true;
   opt.guard_pages = true;
   opt.regalloc = true;
+  opt.split = true;
   opt.vectorize = true;
   opt.selftail = true;
   opt.ldcomb = true;
@@ -300,6 +301,7 @@ int main(int argc, char **argv) {
       opt.level = 0;
       opt.guard_pages = false;
       opt.align = false;
+      opt.split = false;
       opt.inl = false;
       opt.devirt = false;
       opt.unroll = false;
@@ -361,6 +363,7 @@ int main(int argc, char **argv) {
       else if (!strcmp(name, "align")) opt.align = on;
       else if (!strcmp(name, "guard-pages")) opt.guard_pages = on;
       else if (!strcmp(name, "regalloc")) opt.regalloc = on;
+      else if (!strcmp(name, "split")) opt.split = on;
       else if (!strcmp(name, "vectorize")) opt.vectorize = on;
       else if (!strcmp(name, "selftail")) opt.selftail = on;
       else if (!strcmp(name, "ldcomb")) opt.ldcomb = on;
@@ -528,7 +531,7 @@ int main(int argc, char **argv) {
             "             self_tail=%llu ldcomb=%llu spills=%llu insts=%llu\n"
             "             ldpairs=%llu stpairs=%llu\n"
             "             reloads=%llu caller_saves=%llu csa_restores=%llu"
-            " v128_spills=%llu rb_trips=%llu split_cuts=%llu split_invs=%llu\n"
+            " v128_spills=%llu rb_trips=%llu split_cuts=%llu split_invs=%llu pieces=%llu\n"
             "             escape_removed=%llu escape_forwarded=%llu escape_made=%llu gloop=%llu\n"
             "             loop_closed=%llu reassoc=%llu cmp_reused=%llu gssa=%llu\n"
             "             bar_masks=%llu bar_elided=%llu\n"
@@ -566,6 +569,7 @@ int main(int argc, char **argv) {
             (unsigned long long)g_stats.range_budget_trips,
             (unsigned long long)g_stats.split_cuts,
             (unsigned long long)g_stats.split_invs,
+            (unsigned long long)g_stats.pieces,
             (unsigned long long)g_stats.escape_removed,
             (unsigned long long)g_stats.escape_forwarded,
             (unsigned long long)g_stats.escape_made,

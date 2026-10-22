@@ -28,6 +28,8 @@ assemble test/cases_gc/constroot.wat constroot
 assemble test/cases_gc/exnpayload.wat exnpayload
 assemble test/cases_gc/devirt_vt.wat devirt_vt
 assemble test/cases_gc/escape.wat escape
+assemble test/cases_gc/castfacts.wat castfacts
+assemble test/cases_gc/castfacts.wat castfacts_nt
 assemble "$WORK/gcgen.wat" gcgen
 
 [ "${1:-}" = --prepare ] && exit 0
@@ -244,6 +246,67 @@ expect vt_nullslot_ok     "OK"
 expect vt_nulltrap        "null reference"
 expect vt_mut             "OK"
 expect vt_dup             "OK"
+
+# The objects by index: 0 null, 1 i31, 2 $base, 3 $d1, 4 $d2, 5 $leaf,
+# 6 $other, 7 $twin1, 8 $twin2, 9 $arr, 10 $d3, 11 $pad.
+build_one castfacts
+for ke in 0:-7 1:1005 2:10 3:21 4:32 5:33 6:-7 7:1 8:3 9:7 10:14 11:-7; do
+  expect when_chain       "OK" ${ke%:*} ${ke#*:}
+done
+expect false_cast         "OK" 3
+expect false_cast         "OK" 5
+for k in 0 1 2 4 8 10; do expect false_cast "cast failure" $k; done
+for ke in 0:1 1:0 2:0 3:100 5:100; do expect false_test "OK" ${ke%:*} ${ke#*:}; done
+for ke in 0:1 1:-1 2:-1 3:11 5:11; do expect null_true "OK" ${ke%:*} ${ke#*:}; done
+expect null_true_get      "null reference" 0
+expect null_true_get      "OK" 3
+expect null_true_get      "OK" 2
+expect null_true_cast     "cast failure" 0
+expect null_true_cast     "OK" 3
+expect null_true_cast     "OK" 4
+for ke in 0:-1 1:50 2:10 3:-1 4:12 5:-1 6:50 9:50 10:14; do
+  expect null_false       "OK" ${ke%:*} ${ke#*:}
+done
+for ke in 0:0 2:0 3:0 5:36; do expect sub_super "OK" ${ke%:*} ${ke#*:}; done
+for k in 0 1 3 5; do expect super_sub "OK" $k; done
+for k in 2 4 10; do expect super_sub "cast failure" $k; done
+for ke in 0:-1 1:-1 2:0 3:1 4:2 5:5 6:-1 10:8; do
+  expect super_tests      "OK" ${ke%:*} ${ke#*:}
+done
+for ke in 0:0 1:102 2:0 3:48 5:48 6:0; do expect disjoint "OK" ${ke%:*} ${ke#*:}; done
+for ke in 0:-1 1:-1 2:5 3:5 4:5 5:5 6:4 7:6 8:6 9:-1 10:5 11:4; do
+  expect abstract         "OK" ${ke%:*} ${ke#*:}
+done
+for ke in 3:1 5:3; do expect after_cast "OK" ${ke%:*} ${ke#*:}; done
+for k in 0 2 4; do expect after_cast "cast failure" $k 0; done
+for ke in 0:6 3:3 5:3; do expect after_null_cast "OK" ${ke%:*} ${ke#*:}; done
+expect after_null_cast    "cast failure" 2 0
+# The merges of a test with a null check, and of two tests.
+merge_cases() {
+  for ke in 0:-2 1:-1 2:-1 3:21 5:123; do expect merge_and "OK" ${ke%:*} ${ke#*:}; done
+  for ke in 0:101 1:50 2:50 3:111 5:111; do expect merge_or "OK" ${ke%:*} ${ke#*:}; done
+  expect merge_or_get       "null reference" 0
+  for k in 1 2 3 5; do expect merge_or_get "OK" $k; done
+  expect merge_or_cast      "cast failure" 0
+  for k in 1 2 3 5; do expect merge_or_cast "OK" $k; done
+  for ke in 0:-1 2:-1 3:1 4:-1 5:11; do expect merge_tests "OK" ${ke%:*} ${ke#*:}; done
+  for ke in 0:-1 2:-1 3:-1 4:110 5:101; do expect merge_unrelated "OK" ${ke%:*} ${ke#*:}; done
+  expect merge_loop_and     "OK" 0 11 44
+  expect merge_loop_and     "OK" 0 2 0
+  expect merge_loop_and     "OK" 4 11 23
+  expect merge_loop_or      "OK" 1 11 46
+  expect merge_loop_or      "OK" 4 4 0
+  expect merge_loop_or      "null reference" 0 3 0
+}
+merge_cases
+for ke in 0:2 2:-1 3:3 5:7; do expect static_type "OK" ${ke%:*} ${ke#*:}; done
+for ke in 0:-1 2:-1 3:1 5:3; do expect br_cast "OK" ${ke%:*} ${ke#*:}; done
+for ke in 1:77 2:77 3:21 5:23; do expect br_cast_fail "OK" ${ke%:*} ${ke#*:}; done
+expect br_cast_fail       "null reference" 0 0
+# Jump threading makes most of those merges into blocks two ways meet at;
+# built without it they stay merges, branched on by their param.
+WARMC_FLAGS="${WARMC_FLAGS:-} -fno-thread" build_one castfacts_nt
+merge_cases
 
 build_one escape
 expect sr_box_loop        "OK" 10 45
