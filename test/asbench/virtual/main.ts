@@ -1,7 +1,9 @@
-// Virtual dispatch over a heterogeneous array: the call target is decided by
-// the receiver's runtime type, so every one is an indirect call through the
-// function table and none of them can be devirtualised.  gobench/iface is the
-// same shape through a Go interface.
+// Virtual dispatch over a heterogeneous array: which `area` runs is decided by
+// the receiver's runtime class, so none of the calls can be devirtualised.
+// AssemblyScript does not dispatch through the function table: it reads the
+// class id from the object's header and switches on it with a `br_table`, and
+// binaryen inlines that switch and all three method bodies into the loop.
+// gobench/iface is the same program through a Go interface.
 import { print } from "../wasi";
 
 abstract class Shape { abstract area(): i32; }
