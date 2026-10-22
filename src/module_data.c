@@ -8,25 +8,58 @@
 #include <stdlib.h>
 #include <string.h>
 
-static uint32_t module_max_outgoing(Module *m) {
-  uint32_t worst = 0;
+/* The stack arguments of a call of type t, in bytes.  Mirrors the backends'
+   stack-argument walk: one arg_slot per scalar, an aligned 16 for a v128.
+   With a64's 16-byte slot that is just nstack * 16, the shape this had
+   before x64 needed a narrower one. */
+static uint32_t sig_stack_bytes(const CompType *t) {
   int int_cap = g_target->narg_int - 1;   /* one int slot carries vmctx */
   int fp_cap = g_target->narg_fp;
-  /* Mirrors the backends' stack-argument walk: one arg_slot per scalar, an
-     aligned 16 for a v128.  With a64's 16-byte slot that is just
-     nstack * 16, the shape this had before x64 needed a narrower one. */
+  int ints = 0, flts = 0;
+  uint32_t bytes = 0;
+  for (uint32_t j = 0; j < t->nparams; j++) {
+    bool vec = t->params[j] == VT_V128;
+    if (vt_is_vec_reg(t->params[j])) { if (flts < fp_cap) { flts++; continue; } }
+    else { if (ints < int_cap) { ints++; continue; } }
+    if (vec) bytes = ((bytes + 15) & ~15u) + 16;
+    else bytes += g_target->arg_slot;
+  }
+  return bytes;
+}
+
+static uint32_t module_max_outgoing(Module *m) {
+  uint32_t worst = 0;
   for (uint32_t i = 0; i < m->ntypes; i++) {
-    CompType *t = &m->types[i];
-    int ints = 0, flts = 0;
-    uint32_t bytes = 0;
-    for (uint32_t j = 0; j < t->nparams; j++) {
-      bool vec = t->params[j] == VT_V128;
-      if (vt_is_vec_reg(t->params[j])) { if (flts < fp_cap) { flts++; continue; } }
-      else { if (ints < int_cap) { ints++; continue; } }
-      if (vec) bytes = ((bytes + 15) & ~15u) + 16;
-      else bytes += g_target->arg_slot;
-    }
+    uint32_t bytes = sig_stack_bytes(&m->types[i]);
     if (bytes > worst) worst = bytes;
+  }
+  return (worst + 15) & ~15u;
+}
+
+/* The stack arguments any tail call in the module passes.  A tail call
+   writes them where its own arrived, in its caller's outgoing area, so every
+   function that calls a wasm function makes room for them as well as for
+   the stack arguments of its own calls. */
+static uint32_t module_tail_outgoing(Module *m) {
+  uint32_t worst = 0;
+  for (uint32_t i = m->nimported_funcs; i < m->nfuncs; i++) {
+    const Func *fn = &m->funcs[i];
+    if (!fn->body) continue;
+    Rd r = rd_make(fn->body, fn->body_end, m->bin);
+    while (!rd_eof(&r)) {
+      uint32_t op = wasm_read_op(&r);
+      if (op == 0x12 || op == 0x13 || op == 0x15) {
+        Rd at = r;
+        uint32_t k = rd_u32(&at);
+        uint32_t ti = op == 0x12 ? (k < m->nfuncs ? m->funcs[k].type_index
+                                                   : UINT32_MAX)
+                                 : k;
+        uint32_t bytes = ti < m->ntypes ? sig_stack_bytes(&m->types[ti])
+                                        : module_max_outgoing(m);
+        if (bytes > worst) worst = bytes;
+      }
+      if (!wasm_skip_imm(&r, op)) break;
+    }
   }
   return (worst + 15) & ~15u;
 }
@@ -147,7 +180,7 @@ void codegen_prewarm_symbols(Module *m, ObjBuilder *o) {
       obj_intern_sym(o, m->funcs[i].sym, SYM_LOCAL_FUNC, -1, 0);
 }
 
-uint32_t codegen_out_bytes(Module *m) { return module_max_outgoing(m); }
+uint32_t codegen_tail_out_bytes(Module *m) { return module_tail_outgoing(m); }
 
 static char g_module_sym[128] = "warmc_module";
 
