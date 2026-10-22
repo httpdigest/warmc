@@ -2008,6 +2008,11 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
   s->st_end = (size_t)-1;
   {
 
+    /* A call that only a trap follows -- a panic helper's -- leaves nothing
+       after it to need the instance or memory registers, so they may stay in
+       caller-saved registers.  "Diverges" alone is not enough: a block that
+       ends in a tail call diverges too, and the code before that call reads
+       the instance. */
     bool leaf = f->npads == 0, quasi = f->npads == 0;
     for (uint32_t bi = 0; bi < f->nblocks && quasi; bi++) {
       Block *bb = &f->blocks[bi];
@@ -2016,7 +2021,13 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
       for (uint32_t i = 0; i < bb->ninsts; i++)
         if (op_clobbers_caller_saved(f->insts[bb->insts[i]].op)) {
           leaf = false;
-          if (!bb->diverges || i + 1 != bb->ninsts) { quasi = false; break; }
+          bool traps = i + 1 == bb->ninsts &&
+                       (bb->term == T_TRAP || bb->term == T_JUMP);
+          for (uint32_t k = 0; k < bb->nsuccs && traps; k++) {
+            Block *t = &f->blocks[bb->succs[k].target];
+            if (t->term != T_TRAP || t->ninsts) traps = false;
+          }
+          if (!traps) { quasi = false; break; }
         }
     }
 
