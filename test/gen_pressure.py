@@ -134,6 +134,61 @@ def bigtailcall(name, k):
     L.append(f' (export "{name}" (func ${name}))')
     return "\n".join(L)
 
+def farframe(name, ni, nf, nv, tail=False, params=False):
+    """More slots than an arm64 ldr/str reaches from sp with its scaled
+    offset -- 32 KB of them -- of every kind: i32, f64 and v128 values all
+    live across a call that returns two results, so the slots are laid out
+    past the rest of the frame and each far one is reached through a
+    borrowed register.  The values mix n non-linearly and are folded in
+    order, so that no pass can sum them away.  With tail, the result leaves
+    through a tail call to $wide; with params, the function takes $wide's
+    parameters, some of which arrive on the stack above the far frame."""
+    sig = (f"(param {wide_params})" if params else "(param $n i32)")
+    L = [f' (func ${name} {sig} (result i32)']
+    if params:
+        L.append("  (local $n i32)")
+    for i in range(ni):
+        L.append(f"  (local $v{i} i32)")
+    for i in range(nf):
+        L.append(f"  (local $f{i} f64)")
+    for i in range(nv):
+        L.append(f"  (local $w{i} v128)")
+    L.append("  (local $acc i32) (local $accf f64) (local $accv v128)")
+    if params:
+        L.append("  (local.set $n (i32.add (local.get 9) "
+                 "(i32.trunc_f64_s (local.get 20))))")
+    for i in range(ni):
+        L.append(f"  (local.set $v{i} (i32.xor (i32.mul (local.get $n) "
+                 f"(i32.const {(i * 2654435761 + 1) & 0x7fffffff})) "
+                 f"(i32.add (local.get $n) (i32.const {i}))))")
+    for i in range(nf):
+        L.append(f"  (local.set $f{i} (f64.mul (f64.convert_i32_s (i32.add "
+                 f"(local.get $n) (i32.const {i}))) (f64.const 1.5)))")
+    for i in range(nv):
+        L.append(f"  (local.set $w{i} (v128.xor (i32x4.splat (local.get $n)) "
+                 f"(v128.const i32x4 {i} {2 * i} {3 * i} {4 * i})))")
+    L.append("  (local.set $acc (i32.add (call_indirect (type $two) (i32.const 0))))")
+    for i in range(ni):
+        L.append(f"  (local.set $acc (i32.add (i32.mul (local.get $acc) "
+                 f"(i32.const 31)) (local.get $v{i})))")
+    for i in range(nf):
+        L.append(f"  (local.set $accf (f64.add (local.get $accf) (local.get $f{i})))")
+    for i in range(nv):
+        L.append(f"  (local.set $accv (i32x4.add (local.get $accv) (local.get $w{i})))")
+    L.append("  (local.set $acc (i32.add (local.get $acc) (i32.add "
+             "(i32.trunc_sat_f64_s (f64.div (local.get $accf) (f64.const 1000))) "
+             "(i32.xor (i32x4.extract_lane 0 (local.get $accv)) "
+             "(i32x4.extract_lane 3 (local.get $accv))))))")
+    if tail:
+        ints = " ".join(f"(local.get $v{i})" for i in range(10)) + " (local.get $acc)"
+        flts = " ".join(f"(local.get $f{i})" for i in range(10))
+        L.append(f"  (return_call $wide {ints} {flts}))")
+    else:
+        L.append("  (local.get $acc))")
+    if not params:
+        L.append(f' (export "{name}" (func ${name}))')
+    return "\n".join(L)
+
 wide_params = " ".join(["i32"] * 11 + ["f64"] * 10)
 wide_body = ("(i32.add (local.get 0) (i32.add (local.get 7) (i32.add (local.get 8) "
              "(i32.add (local.get 9) (i32.add (local.get 10) "
@@ -162,6 +217,18 @@ parts.append(bigframe("bigframe", 400))
 made.append("bigframe")
 parts.append(bigtailcall("bigtailcall", 400))
 made.append("bigtailcall")
+parts.append(farframe("farframe", 2500, 1000, 400))
+made.append("farframe")
+parts.append(farframe("fartailcall", 2500, 1000, 400, tail=True))
+made.append("fartailcall")
+parts.append(farframe("farparams", 2500, 1000, 400, params=True))
+parts.append(' (func $farcall (param $n i32) (result i32)\n'
+             '  (call $farparams ' + " ".join(
+                 ["(i32.add (local.get $n) (i32.const %d))" % i for i in range(11)] +
+                 ["(f64.convert_i32_s (i32.add (local.get $n) (i32.const %d)))" % i
+                  for i in range(10)]) + '))\n'
+             ' (export "farcall" (func $farcall))')
+made.append("farcall")
 parts.append(")")
 
 with open(os.path.join(OUT, "pressure.wat"), "w") as f:

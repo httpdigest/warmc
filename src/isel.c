@@ -40,16 +40,51 @@ static bool fpr_is_callee_saved(int r) { return r >= 8 && r <= 15; }
 
 #include "isel_core.inc"
 
-static void slot_load(Buf *bf, int fp, int vec, int reg, uint32_t off) {
-  if (vec) a64_ldr_q(bf, reg, RSP, off);
-  else if (fp) a64_fldr_imm(bf, 3, reg, RSP, off);
-  else a64_ldr_imm(bf, 3, reg, RSP, off);
+/* A load or store of 1 << size bytes at sp + off, or of a q register when
+   vec.  An offset past the scaled immediate's reach -- a slot in a frame
+   over 32 KB, or a stack parameter above one -- goes through a register
+   holding sp plus the offset's 4 KB pages: a load into a GPR builds that in
+   its own destination, anything else in tmp when the caller has a register
+   free, and otherwise borrows TMP0 (TMP1 when TMP0 is the value), parked in
+   the frame's near save slot and put back after, so that every scratch
+   register comes through as the caller left it. */
+static void sp_access(Isel *s, Buf *bf, bool st, int size, int fp, int vec,
+                      int reg, uint32_t off, int tmp) {
+  int base = RSP, t = -1;
+  bool park = false;
+  if ((off >> (vec ? 4 : size)) > 0xfff) {
+    if (!st && !fp && !vec) t = reg;
+    else if (tmp >= 0) t = tmp;
+    else {
+      if (!s->far_frame)
+        warmc_fatal("internal: a stack access past reach in a near frame");
+      t = (!fp && !vec && reg == TMP0) ? TMP1 : TMP0;
+      a64_str_imm(bf, 3, t, RSP, s->far_save);
+      park = true;
+    }
+    a64_add_imm(bf, SF64, t, RSP, off >> 12, 1);
+    base = t;
+    off &= 0xfff;
+  }
+  if (vec) {
+    if (st) a64_str_q(bf, reg, base, off);
+    else a64_ldr_q(bf, reg, base, off);
+  } else if (fp) {
+    if (st) a64_fstr_imm(bf, size, reg, base, off);
+    else a64_fldr_imm(bf, size, reg, base, off);
+  } else {
+    if (st) a64_str_imm(bf, size, reg, base, off);
+    else a64_ldr_imm(bf, size, reg, base, off);
+  }
+  if (park) a64_ldr_imm(bf, 3, t, RSP, s->far_save);
 }
 
-static void slot_store(Buf *bf, int fp, int vec, int reg, uint32_t off) {
-  if (vec) a64_str_q(bf, reg, RSP, off);
-  else if (fp) a64_fstr_imm(bf, 3, reg, RSP, off);
-  else a64_str_imm(bf, 3, reg, RSP, off);
+static void slot_load(Isel *s, Buf *bf, int fp, int vec, int reg, uint32_t off) {
+  sp_access(s, bf, false, 3, fp, vec, reg, off, -1);
+}
+
+static void slot_store(Isel *s, Buf *bf, int fp, int vec, int reg, uint32_t off) {
+  sp_access(s, bf, true, 3, fp, vec, reg, off, -1);
 }
 
 static void emit_reg_move(Buf *out, int dst, int src, int fp, int wide,
@@ -228,7 +263,7 @@ static int rd(Isel *s, Ref v, int scratch) {
       if (fwd) {
         emit_reg_move(B, s->rc_reg[pick], s->st_reg, 0, 1, 0);
       } else {
-        slot_load(B, 0, 0, s->rc_reg[pick], slot_off(s, sl));
+        slot_load(s, B, 0, 0, s->rc_reg[pick], slot_off(s, sl));
         g_stats.reloads++;
       }
       s->rc_slot[pick] = sl + 1;
@@ -250,7 +285,7 @@ static int rd(Isel *s, Ref v, int scratch) {
                     is_vec_value(s->f, v));
     return scratch;
   }
-  slot_load(B, is_fp_value(s->f, v), is_vec_value(s->f, v), scratch,
+  slot_load(s, B, is_fp_value(s->f, v), is_vec_value(s->f, v), scratch,
             slot_off(s, SLOT_OF(l)));
   g_stats.reloads++;
   return scratch;
@@ -275,7 +310,7 @@ static void piece_fill(Isel *s, const struct Piece *p) {
         emit_reg_move(B, p->reg, s->frc_reg[i], 1, 1, 0);
         return;
       }
-    slot_load(B, fp, vec, p->reg, slot_off(s, sl));
+    slot_load(s, B, fp, vec, p->reg, slot_off(s, sl));
     g_stats.reloads++;
     return;
   }
@@ -461,15 +496,15 @@ static void emit_call_args_core(Isel *s, const Ref *args, uint32_t nargs,
     uint32_t at = (uint32_t)stack_slot++ * ARG_STACK_SLOT;
     if (vec) {
       int r = l == LOC_NONE ? rd(s, v, FTMP)
-              : IS_SLOT(l) ? (slot_load(B, 1, 1, FTMP, slot_off(s, SLOT_OF(l))), FTMP) : l;
+              : IS_SLOT(l) ? (slot_load(s, B, 1, 1, FTMP, slot_off(s, SLOT_OF(l))), FTMP) : l;
       a64_str_q(B, r, stack_base, at);
     } else if (fp) {
       int r = l == LOC_NONE ? rd(s, v, FTMP)
-              : IS_SLOT(l) ? (slot_load(B, 1, 0, FTMP, slot_off(s, SLOT_OF(l))), FTMP) : l;
+              : IS_SLOT(l) ? (slot_load(s, B, 1, 0, FTMP, slot_off(s, SLOT_OF(l))), FTMP) : l;
       a64_fstr_imm(B, wide ? 3 : 2, r, stack_base, at);
     } else {
       int r = l == LOC_NONE ? rd(s, v, TMP0)
-              : IS_SLOT(l) ? (slot_load(B, 0, 0, TMP0, slot_off(s, SLOT_OF(l))), TMP0) : l;
+              : IS_SLOT(l) ? (slot_load(s, B, 0, 0, TMP0, slot_off(s, SLOT_OF(l))), TMP0) : l;
       a64_str_imm(B, wide ? 3 : 2, r, stack_base, at);
     }
   }
@@ -1879,12 +1914,10 @@ static void emit_prologue(Isel *s, Buf *b) {
     if (l == LOC_NONE) continue;
     if (from_stack) {
       if (!IS_SLOT(l)) continue;   /* register home: pass 2 */
-      if (vec) a64_ldr_q(b, FTMP, RSP, at);
-      else if (fp) a64_fldr_imm(b, wide ? 3 : 2, FTMP, RSP, at);
-      else a64_ldr_imm(b, wide ? 3 : 2, TMP0, RSP, at);
-      slot_store(b, fp, vec, src, slot_off(s, SLOT_OF(l)));
+      sp_access(s, b, false, wide ? 3 : 2, fp, vec, src, at, TMP1);
+      slot_store(s, b, fp, vec, src, slot_off(s, SLOT_OF(l)));
     } else if (IS_SLOT(l)) {
-      slot_store(b, fp, vec, src, slot_off(s, SLOT_OF(l)));
+      slot_store(s, b, fp, vec, src, slot_off(s, SLOT_OF(l)));
     } else if (l != src) {
       if (clash) {
         if (npmv == (int)(sizeof pmv / sizeof pmv[0]))
@@ -1910,9 +1943,7 @@ static void emit_prologue(Isel *s, Buf *b) {
     uint32_t at = s->frame + s->saved_bytes + ARG_STACK_SLOT * (uint32_t)stack_slot++;
     int l = s->loc[p];
     if (l == LOC_NONE || IS_SLOT(l)) continue;
-    if (vec) a64_ldr_q(b, l, RSP, at);
-    else if (fp) a64_fldr_imm(b, wide ? 3 : 2, l, RSP, at);
-    else a64_ldr_imm(b, wide ? 3 : 2, l, RSP, at);
+    sp_access(s, b, false, wide ? 3 : 2, fp, vec, l, at, TMP1);
   }
 
   if (s->needs_mem) {
@@ -2222,12 +2253,28 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
   s->throw_area_off = (s->exn_slot + (s->has_pads ? 8u : 0u) + 15u) & ~15u;
   s->frame = s->throw_area_off + s->throw_area_bytes;
   s->frame = (s->frame + 15) & ~15u;
+  /* Past a scaled offset's reach the slots go last, behind everything else
+     the frame holds and a save slot for sp_access, so only they and the
+     stack parameters above the frame are far.  1 MB stays inside the 2 MB
+     the runtime leaves below its stack limit, which a leaf, never checking,
+     may run into. */
+  s->far_frame = s->frame > 32000;
+  if (s->far_frame) {
+    s->far_save = out_bytes;
+    s->retarea_off = (out_bytes + 8u + 15u) & ~15u;
+    s->retptr_slot = s->retarea_off + RESULT_SLOT_SIZE * maxres;
+    s->fpsave_off = s->retptr_slot + (f->sig->nresults > 1 ? 8u : 0u);
+    s->exn_slot = s->fpsave_off + 8u * nfp;
+    s->throw_area_off = (s->exn_slot + (s->has_pads ? 8u : 0u) + 15u) & ~15u;
+    s->slots_off = (s->throw_area_off + s->throw_area_bytes + 15u) & ~15u;
+    s->frame = (s->slots_off + 8u * s->nslots + 15u) & ~15u;
+  }
   {
     int list[NCS_GPR + 1];
     int ncs = cs_gpr_list(s, list);
     s->saved_bytes = (uint32_t)(8 * ncs) + (saves_lr(s) ? 16u : 0u);
   }
-  if (s->frame > 32000)
+  if (s->frame > (1u << 20))
     warmc_fatal("function %s needs a %u byte frame, beyond the current addressing limit",
                 f->m->funcs[f->func_index].sym, s->frame);
   if (s->frame > g_stats.max_frame_bytes) g_stats.max_frame_bytes = s->frame;

@@ -63,13 +63,15 @@ static bool fpr_is_callee_saved(int r) { return r >= 8 && r <= 15; }
 
 #include "isel_core.inc"
 
-static void slot_load(Buf *bf, int fp, int vec, int reg, uint32_t off) {
+static void slot_load(Isel *s, Buf *bf, int fp, int vec, int reg, uint32_t off) {
+  (void)s;
   if (vec) x64_vmovdqu_load(bf, reg, X_RSP, X64_NOIDX, 0, (int32_t)off);
   else if (fp) x64_vmovs_load(bf, 1, reg, X_RSP, X64_NOIDX, 0, (int32_t)off);
   else x64_load64(bf, reg, X_RSP, X64_NOIDX, 0, (int32_t)off);
 }
 
-static void slot_store(Buf *bf, int fp, int vec, int reg, uint32_t off) {
+static void slot_store(Isel *s, Buf *bf, int fp, int vec, int reg, uint32_t off) {
+  (void)s;
   if (vec) x64_vmovdqu_store(bf, reg, X_RSP, X64_NOIDX, 0, (int32_t)off);
   else if (fp) x64_vmovs_store(bf, 1, reg, X_RSP, X64_NOIDX, 0, (int32_t)off);
   else x64_store64(bf, reg, X_RSP, X64_NOIDX, 0, (int32_t)off);
@@ -291,7 +293,7 @@ static int rd(Isel *s, Ref v, int scratch) {
     return scratch;
   }
   if (!IS_SLOT(l)) return l;
-  slot_load(B, is_fp_value(s->f, v), is_vec_value(s->f, v), scratch,
+  slot_load(s, B, is_fp_value(s->f, v), is_vec_value(s->f, v), scratch,
             slot_off(s, SLOT_OF(l)));
   g_stats.reloads++;
   return scratch;
@@ -424,11 +426,11 @@ static void emit_call_args_core(Isel *s, const Ref *args, uint32_t nargs,
       int32_t at = base_disp + 32 + 8 * (pos - 4);
       if (fp) {
         int r = IS_SLOT(l)
-            ? (slot_load(B, 1, 0, FTMP, slot_off(s, SLOT_OF(l))), FTMP) : l;
+            ? (slot_load(s, B, 1, 0, FTMP, slot_off(s, SLOT_OF(l))), FTMP) : l;
         x64_vmovs_store(B, wide, r, X_RSP, X64_NOIDX, 0, at);
       } else {
         int r = IS_SLOT(l)
-            ? (slot_load(B, 0, 0, TMP0, slot_off(s, SLOT_OF(l))), TMP0) : l;
+            ? (slot_load(s, B, 0, 0, TMP0, slot_off(s, SLOT_OF(l))), TMP0) : l;
         x64_store64(B, r, X_RSP, X64_NOIDX, 0, at);
       }
     }
@@ -446,15 +448,15 @@ static void emit_call_args_core(Isel *s, const Ref *args, uint32_t nargs,
       int32_t at = base_disp + 32 + arg_stack_at(&cursor, vec);
       if (vec) {
         int r = IS_SLOT(l)
-            ? (slot_load(B, 1, 1, FTMP, slot_off(s, SLOT_OF(l))), FTMP) : l;
+            ? (slot_load(s, B, 1, 1, FTMP, slot_off(s, SLOT_OF(l))), FTMP) : l;
         x64_vmovdqu_store(B, r, X_RSP, X64_NOIDX, 0, at);
       } else if (fp) {
         int r = IS_SLOT(l)
-            ? (slot_load(B, 1, 0, FTMP, slot_off(s, SLOT_OF(l))), FTMP) : l;
+            ? (slot_load(s, B, 1, 0, FTMP, slot_off(s, SLOT_OF(l))), FTMP) : l;
         x64_vmovs_store(B, wide, r, X_RSP, X64_NOIDX, 0, at);
       } else {
         int r = IS_SLOT(l)
-            ? (slot_load(B, 0, 0, TMP0, slot_off(s, SLOT_OF(l))), TMP0) : l;
+            ? (slot_load(s, B, 0, 0, TMP0, slot_off(s, SLOT_OF(l))), TMP0) : l;
         if (wide) x64_store64(B, r, X_RSP, X64_NOIDX, 0, at);
         else x64_store32(B, r, X_RSP, X64_NOIDX, 0, at);
       }
@@ -1159,9 +1161,9 @@ static void emit_prologue(Isel *s, Buf *b) {
       else if (fp) x64_vmovs_load(b, wide, FTMP, X_RSP, X64_NOIDX, 0, at);
       else if (wide) x64_load64(b, TMP0, X_RSP, X64_NOIDX, 0, at);
       else x64_load32(b, TMP0, X_RSP, X64_NOIDX, 0, at);
-      slot_store(b, fp, vec, src, slot_off(s, SLOT_OF(l)));
+      slot_store(s, b, fp, vec, src, slot_off(s, SLOT_OF(l)));
     } else if (IS_SLOT(l)) {
-      slot_store(b, fp, vec, src, slot_off(s, SLOT_OF(l)));
+      slot_store(s, b, fp, vec, src, slot_off(s, SLOT_OF(l)));
     } else if (l != src) {
       if (clash) {
         if (npmv == (int)(sizeof pmv / sizeof pmv[0]))

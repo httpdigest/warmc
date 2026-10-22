@@ -1852,19 +1852,11 @@ static void emit_inst(Isel *s, Ref v) {
 
     case I_RESULT: {
       uint32_t off = s->retarea_off + RESULT_SLOT_SIZE * (uint32_t)in->imm;
-      if ((ValType)in->type == VT_V128) {
-        int d = wr(s, v, F0);
-        a64_ldr_q(B, d, RSP, off);
-        commit(s, v, d);
-      } else if (vt_is_float((ValType)in->type)) {
-        int d = wr(s, v, F0);
-        a64_fldr_imm(B, wide ? 3 : 2, d, RSP, off);
-        commit(s, v, d);
-      } else {
-        int d = wr(s, v, S0);
-        a64_ldr_imm(B, wide ? 3 : 2, d, RSP, off);
-        commit(s, v, d);
-      }
+      ValType rt = (ValType)in->type;
+      bool vec = rt == VT_V128, fp = vt_is_float(rt);
+      int d = wr(s, v, vec || fp ? F0 : S0);
+      sp_access(s, B, false, wide ? 3 : 2, fp, vec, d, off, TMP0);
+      commit(s, v, d);
       break;
     }
 

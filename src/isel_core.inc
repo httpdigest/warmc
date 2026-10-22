@@ -54,6 +54,11 @@ typedef struct {
   uint32_t exn_slot;
   uint32_t throw_area_off, throw_area_bytes;
   uint32_t frame;
+  /* arm64, a frame past a scaled offset's reach: its slots are laid out
+     last, and far_save is the near slot a far access parks the register it
+     borrows in (sp_access) */
+  bool far_frame;
+  uint32_t far_save;
 
   uint32_t *block_off;
   BrFix *fixups;
@@ -250,8 +255,8 @@ typedef struct {
    regalloc.inc additionally wants the GPR_ALLOC / FPR_ALLOC tables, the
    gpr/fpr_is_callee_saved predicates, REG_MEMSIZE, and the
    RA_HAVE_RETAREA_REUSE / RA_RETAREA_REG / RA_ALLOC_RES_REG macros. */
-static void slot_load(Buf *bf, int fp, int vec, int reg, uint32_t off);
-static void slot_store(Buf *bf, int fp, int vec, int reg, uint32_t off);
+static void slot_load(Isel *s, Buf *bf, int fp, int vec, int reg, uint32_t off);
+static void slot_store(Isel *s, Buf *bf, int fp, int vec, int reg, uint32_t off);
 static void emit_reg_move(Buf *out, int dst, int src, int fp, int wide,
                           int vec);
 static int isel_break_reg(int bank);
@@ -393,7 +398,7 @@ static void commit(Isel *s, Ref v, int reg) {
                     is_vec_value(s->f, v));
     return;
   }
-  slot_store(B, is_fp_value(s->f, v), is_vec_value(s->f, v), reg,
+  slot_store(s, B, is_fp_value(s->f, v), is_vec_value(s->f, v), reg,
              slot_off(s, SLOT_OF(l)));
   s->st_v = v;
   s->st_reg = reg;
@@ -415,7 +420,7 @@ static void csa_save(Isel *s, Ref site) {
   if (!s->csa_n || !s->csa_n[site]) return;
   for (uint32_t k = 0; k < s->csa_n[site]; k++) {
     Ref v = s->csa_vals[s->csa_first[site] + k];
-    slot_store(B, is_fp_value(s->f, v), is_vec_value(s->f, v), s->loc[v],
+    slot_store(s, B, is_fp_value(s->f, v), is_vec_value(s->f, v), s->loc[v],
                slot_off(s, (uint32_t)s->csa_slot[v]));
   }
   s->csa_consumed += s->csa_n[site];
@@ -425,7 +430,7 @@ static void csa_restore(Isel *s, Ref site) {
   if (!s->csa_n || !s->csa_n[site]) return;
   for (uint32_t k = 0; k < s->csa_n[site]; k++) {
     Ref v = s->csa_vals[s->csa_first[site] + k];
-    slot_load(B, is_fp_value(s->f, v), is_vec_value(s->f, v), s->loc[v],
+    slot_load(s, B, is_fp_value(s->f, v), is_vec_value(s->f, v), s->loc[v],
               slot_off(s, (uint32_t)s->csa_slot[v]));
     g_stats.csa_restores++;
   }
@@ -496,12 +501,12 @@ static void emit_move_to(Isel *s, Buf *out, int dst, int src, int fp, int wide,
   if (IS_SLOT(dst)) rc_kill_slot(s, SLOT_OF(dst));
   if (IS_SLOT(dst) && IS_SLOT(src)) {
     int t = (fp || vec) ? FTMP : TMP0;
-    slot_load(out, fp, vec, t, slot_off(s, SLOT_OF(src)));
-    slot_store(out, fp, vec, t, slot_off(s, SLOT_OF(dst)));
+    slot_load(s, out, fp, vec, t, slot_off(s, SLOT_OF(src)));
+    slot_store(s, out, fp, vec, t, slot_off(s, SLOT_OF(dst)));
   } else if (IS_SLOT(dst)) {
-    slot_store(out, fp, vec, src, slot_off(s, SLOT_OF(dst)));
+    slot_store(s, out, fp, vec, src, slot_off(s, SLOT_OF(dst)));
   } else if (IS_SLOT(src)) {
-    slot_load(out, fp, vec, dst, slot_off(s, SLOT_OF(src)));
+    slot_load(s, out, fp, vec, dst, slot_off(s, SLOT_OF(src)));
   } else {
     emit_reg_move(out, dst, src, fp, wide, vec);
   }
@@ -522,7 +527,7 @@ static void emit_remat_move(Isel *s, Buf *out, const Move *m) {
     s->rc_noconst = true;
     int r = rd(s, m->rv, (m->fp || m->vec) ? FTMP : TMP0);
     s->rc_noconst = false;
-    slot_store(out, m->fp, m->vec, r, slot_off(s, SLOT_OF(m->dst)));
+    slot_store(s, out, m->fp, m->vec, r, slot_off(s, SLOT_OF(m->dst)));
   } else {
     /* An edge's moves are made after the branch that picks the edge, and the
        other edge's after them in the buffer: a constant the first left in the
