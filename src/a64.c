@@ -99,6 +99,12 @@ void a64_add_reg_lsl(Buf *b, int sf, int rd, int rn, int rm, int sh) {
 void a64_sub_reg_lsl(Buf *b, int sf, int rd, int rn, int rm, int sh) {
   addsub_reg(b, sf, 1, 0, rd, rn, rm, 0, sh);
 }
+void a64_add_reg_sh(Buf *b, int sf, int rd, int rn, int rm, int kind, int sh) {
+  addsub_reg(b, sf, 0, 0, rd, rn, rm, kind, sh);
+}
+void a64_sub_reg_sh(Buf *b, int sf, int rd, int rn, int rm, int kind, int sh) {
+  addsub_reg(b, sf, 1, 0, rd, rn, rm, kind, sh);
+}
 void a64_add_uxtw(Buf *b, int rd, int rn, int rm, int shift) {
 
   W((1u << 31) | (0x0Bu << 24) | (1u << 21) | (M5(rm) << 16) |

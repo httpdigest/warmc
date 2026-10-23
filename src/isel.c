@@ -1572,12 +1572,12 @@ static void analyse_immediates(Isel *s) {
         if (f->insts[cand].block != bi) continue;
         if (shift_fuse_kind(f, cand, (ValType)in->type, s->no_imm) >= 0) {
 
-          if (arith) {
-            if (ci->op != I_SHL) continue;
-            Ref *ca = ir_args(f, cand);
-            uint64_t sh = f->insts[ca[1]].imm % (vt_is_64((ValType)in->type) ? 64 : 32);
-            if (sh > 4) continue;
-          }
+          /* Any lsl, lsr or asr folds into an add or sub (a rotate has no
+             such form).  On Apple's cores the shifted operand takes two
+             cycles, as the separate shift and add do, the other operand one,
+             and the fused form issues at 1.6 times the rate of the pair: an
+             M4 Max measures the same for lsl #2 as for lsl #12 or lsr #31. */
+          if (arith && ci->op != I_SHL && ci->op != I_SHRU && ci->op != I_SHRS) continue;
           s->folded[cand] = 1;
           if (slot == 0) { Ref t = a[0]; a[0] = a[1]; a[1] = t; }
           break;
@@ -1598,6 +1598,27 @@ static void analyse_immediates(Isel *s) {
           break;
         }
       }
+    }
+  }
+
+  /* An i32 high multiply shifted right again, as an unsigned divide by a
+     constant is: umull leaves the product in 64 bits, and one lsr by 32 + k
+     takes the quotient from it, zero above as an i32 must be.  (The signed
+     one's asr would leave the sign above, so it keeps its two shifts.) */
+  for (uint32_t oi = 0; oi < f->norder; oi++) {
+    uint32_t bi = f->order[oi];
+    Block *b = &f->blocks[bi];
+    for (uint32_t i = 0; i < b->ninsts; i++) {
+      Ref u = b->insts[i];
+      Inst *in = &f->insts[u];
+      if (in->op != I_SHRU || in->type != VT_I32 || s->folded[u] || s->bfx[u].ok) continue;
+      Ref *a = ir_args(f, u);
+      Inst *mi = &f->insts[a[0]];
+      if (mi->op != I_MULHU || mi->type != VT_I32 || mi->block != bi ||
+          uses[a[0]] != 1 || blocked[a[0]] || s->folded[a[0]] ||
+          f->insts[a[1]].op != I_CONST || (f->insts[a[1]].imm & 31) == 0)
+        continue;
+      s->folded[a[0]] = 1;
     }
   }
 
