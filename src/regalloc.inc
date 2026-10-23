@@ -91,6 +91,24 @@ static double remat_discount(Isel *s, Ref v) {
   return 0.5;
 }
 
+/* A constant zero is never worth a callee-saved register: that costs a
+   save and a restore on every run of the function, where each use -- an
+   argument, a result, a stored value -- reads the zero register or makes
+   the zero in one move, no more than the copy from a register was.  Go
+   passes PC_B = 0 to every call and returns 0 from nearly every function:
+   12115 of stdgo/recurse's 16809 calls read that zero from x22, which half
+   of its functions saved and restored for it.  So a zero across a call is
+   rematerialised, and any other takes a caller-saved register or none --
+   on a64, where uses read the zero register; x64 has none to read. */
+static bool ra_zero_const(Isel *s, Ref v, int cls) {
+  const Inst *in = &s->f->insts[v];
+  if (!RA_ZERO_REG || cls || in->op != I_CONST ||
+      ((ValType)in->type != VT_I32 && (ValType)in->type != VT_I64))
+    return false;
+  uint64_t m = (ValType)in->type == VT_I64 ? in->imm : (in->imm & 0xffffffffu);
+  return m == 0 && remat_ok(s, v);
+}
+
 static uint32_t take_slot(Isel *s, Ref v, uint32_t *slot) {
   if ((ValType)s->f->insts[v].type == VT_V128) {
     if (*slot & 1) (*slot)++;
@@ -1773,6 +1791,11 @@ static void regalloc_linear(Isel *s) {
       if (hint[cur->value] < 0 && cur->value < n)
         hint[cur->value] = web_hint[cur->value];
 
+      bool zero = ra_zero_const(s, cur->value, cur->cls);
+      if (zero && cur->crosses_call) {
+        s->loc[cur->value] = LOC_NONE;
+        continue;
+      }
       bool spare_ok = cur->cls == 0 && weight[cur->value] >= RA_SPARE_MIN_W &&
                       !remat_ok(s, cur->value);
       uint32_t barred = spare_ok || cur->cls ? 0 : spare;
@@ -1805,10 +1828,11 @@ static void regalloc_linear(Isel *s) {
                                      : gpr_is_callee_saved(want));
         bool in_pool = false;
         for (int k = 0; k < npool; k++) if (pool[k] == want) { in_pool = true; break; }
-        if (in_pool && !((barred >> want) & 1) && (!cur->crosses_call || cs))
+        if (in_pool && !((barred >> want) & 1) && (!cur->crosses_call || cs) &&
+            !(zero && cs))
           chosen = want;
       }
-      for (int pass = 0; pass < 2 && chosen < 0; pass++) {
+      for (int pass = 0; pass < (zero ? 1 : 2) && chosen < 0; pass++) {
         for (int k = 0; k < npool; k++) {
           int rr = pool[k];
           bool cs = cur->cls ? fpr_is_callee_saved(rr) : gpr_is_callee_saved(rr);
@@ -1822,6 +1846,10 @@ static void regalloc_linear(Isel *s) {
         }
       }
 
+      if (chosen < 0 && zero) {
+        s->loc[cur->value] = LOC_NONE;
+        continue;
+      }
       if (chosen < 0) {
 
         int victim_reg = -1;
@@ -2008,10 +2036,12 @@ static void regalloc_linear(Isel *s) {
         const Range *xr = X->rcount ? &R[X->rfirst] : &whole;
         uint32_t nx = X->rcount ? X->rcount : 1;
         int got = -1;
+        bool zero = ra_zero_const(s, X->value, X->cls);
         for (int pass = 0; pass < 2 && got < 0; pass++)
           for (int k = 0; k < npool && got < 0; k++) {
             int rr = pool[k];
             bool cs = X->cls ? fpr_is_callee_saved(rr) : gpr_is_callee_saved(rr);
+            if (zero && cs) continue;
             if (X->crosses_call && (v128 || !cs)) continue;
             if (!X->cls && ((spare >> rr) & 1)) continue;
             bool want_cs = X->crosses_call ? true : (pass == 1);

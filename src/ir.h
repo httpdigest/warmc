@@ -484,6 +484,7 @@ typedef struct {
   uint64_t unr_rej_trip, unr_rej_escape, unr_addr_folded;
   uint64_t gc_nullchk_removed;
   uint64_t ldpairs, stpairs;
+  uint64_t cold_frames, early_rets;
 
   uint64_t max_frame_bytes;
 } OptStats;

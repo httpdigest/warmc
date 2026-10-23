@@ -55,6 +55,8 @@
   (type $raise_t (func (param i32)))
   (global $raise_boxed (mut (ref null $raise_t)) (ref.func $raise))
   (global $raise_plain (mut (ref null $raise_t)) (ref.func $raise_i32))
+  (type $cold_t (func (param i32 i32) (result i32)))
+  (global $cold_churn (mut (ref null $cold_t)) (ref.func $cold_churn))
 
   (global $keep (mut (ref null $node)) (ref.null $node))
   (global $keep2 (mut (ref null eq)) (ref.null eq))
@@ -1024,6 +1026,37 @@
     (drop)
     (call $churn (local.get $n))
     (call $eq32 (struct.get $node $val (local.get $o)) (i32.const 8888)))
+
+  ;; A quasi-leaf -- its one call a panic's, `call; unreachable` -- makes that
+  ;; call in a frame of its own (cold_calls_only in src/isel.c), and the
+  ;; collections the call makes walk through that frame to the caller's
+  ;; reference.  A frame the walk could not read through would end it there,
+  ;; and the object would be swept.  $churn_raise recurses so as not to be
+  ;; inlined into the panic path, and the caller reaches $cold_churn through
+  ;; a mutable global so as not to inline it.
+  (func $churn_raise (param $n i32) (result i32)
+    (if (i32.gt_u (local.get $n) (i32.const 0x7fffff00))
+      (then (return (call $churn_raise (i32.shr_u (local.get $n) (i32.const 1))))))
+    (call $churn (local.get $n))
+    (throw $plain (i32.const 7)))
+  (func $cold_churn (type $cold_t) (param $x i32) (param $n i32) (result i32)
+    (if (i32.ge_u (local.get $x) (i32.const 10))
+      (then (drop (call $churn_raise (local.get $n))) (unreachable)))
+    (i32.mul (local.get $x) (i32.const 3)))
+  (func (export "keep_across_cold") (param $n i32)
+    (local $o (ref $node))
+    (local.set $o (struct.new $node (ref.null $node) (i32.const 6161)))
+    (call $escape (local.get $o))
+    (call $eq32
+      (call_ref $cold_t (i32.const 4) (local.get $n) (global.get $cold_churn))
+      (i32.const 12))
+    (block $h (result i32)
+      (try_table (catch $plain $h)
+        (drop (call_ref $cold_t (i32.const 20) (local.get $n) (global.get $cold_churn))))
+      (unreachable))
+    (call $eq32 (i32.const 7))
+    (call $churn (local.get $n))
+    (call $eq32 (struct.get $node $val (local.get $o)) (i32.const 6161)))
 
   ;; ---- control flow -----------------------------------------------------
 

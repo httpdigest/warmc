@@ -376,6 +376,21 @@ static bool emit_bfx(Isel *s, Ref v) {
   return true;
 }
 
+/* After a cold call (emit_cold_frame) the function's own frame is gone:
+   the trap that follows reads nothing from it, and nothing may have been
+   recorded there for the collector -- the analysis left no value live
+   across the call.  The result, which nothing reads, is not committed:
+   its location could be a slot of the frame torn down. */
+static void cold_call_done(Isel *s, Ref v) {
+  if (s->ngcsites && s->gcsites[s->ngcsites - 1].pc == (uint32_t)s->body.len)
+    warmc_fatal("internal: a root recorded at a cold call in %s",
+                s->f->m->funcs[s->f->func_index].sym);
+  if (s->csa_n && s->csa_n[v])
+    warmc_fatal("internal: a value saved around a cold call in %s",
+                s->f->m->funcs[s->f->func_index].sym);
+  s->mem_valid = false;
+}
+
 static CompType *call_sig(Isel *s, Inst *in) {
   Module *m = s->f->m;
   if (in->op == I_CALL) return &m->types[m->funcs[in->imm].type_index];
@@ -1009,7 +1024,7 @@ static void emit_inst(Isel *s, Ref v) {
     case I_STORE: {
       int size = (int)MEMF_SIZE(in->imm2);
       int fp = is_fp_value(f, a[1]);
-      int val = fp ? rd(s, a[1], F0) : rd(s, a[1], S1);
+      int val = fp ? rd(s, a[1], F0) : rd_zr(s, a[1], S1);
 
       if (s->ptr_fuse && s->ptr_fuse[a[0]]) {
         Ref *ea = ir_args(f, a[0]);
@@ -1597,7 +1612,7 @@ static void emit_inst(Isel *s, Ref v) {
       }
       if (t == VT_V128) { int x = rd(s, a[0], F0); a64_str_q(B, x, base, off); }
       else if (vt_is_float(t)) { int x = rd(s, a[0], F0); a64_fstr_imm(B, size, x, base, off); }
-      else { int x = rd(s, a[0], S0); a64_str_imm(B, size, x, base, off); }
+      else { int x = rd_zr(s, a[0], S0); a64_str_imm(B, size, x, base, off); }
       break;
     }
 
@@ -1730,14 +1745,17 @@ static void emit_inst(Isel *s, Ref v) {
         int base = vmctx_at(s, off, 3, &disp, TMP1);
         a64_ldr_imm(B, 3, TMP0, base, disp);
         a64_ldr_imm(B, 3, R0, base, disp + 8);
+        if (s->cold_frame) emit_cold_frame(s);
         a64_blr(B, TMP0);
       } else {
+        if (s->cold_frame) emit_cold_frame(s);
         uint32_t sym = obj_intern_sym(s->o, fn->sym, SYM_LOCAL_FUNC, -1, 0);
         isel_reloc(s, REL_CALL26, B->len, sym, 0);
         a64_bl(B, 0);
       }
       note_site(s);
       note_safepoint(s, v);
+      if (s->cold_frame) { cold_call_done(s, v); break; }
       emit_call_ret(s, v, sig);
       csa_restore(s, v);
       break;
@@ -1758,9 +1776,11 @@ static void emit_inst(Isel *s, Ref v) {
         emit_call_args_novmctx(s, a, in->nargs - 1);
         a64_ldr_imm(B, 3, R0, S1, FUNCREF_INSTANCE);
       }
+      if (s->cold_frame) emit_cold_frame(s);
       a64_blr(B, S2);
       note_site(s);
       note_safepoint(s, v);
+      if (s->cold_frame) { cold_call_done(s, v); break; }
       emit_call_ret(s, v, sig);
       csa_restore(s, v);
       break;
@@ -2228,7 +2248,8 @@ static void emit_return(Isel *s, Block *b) {
       int x = rd(s, r, F0);
       if (x != 0) a64_fmov_reg(B, is64(f, r) ? FT_D : FT_S, 0, x);
     } else {
-      int x = rd(s, r, S0);
+      /* made, or reloaded, where it is returned: nothing is read after */
+      int x = rd(s, r, R0);
       if (x != R0) a64_mov_reg(B, SF64, R0, x);
     }
   } else if (sig->nresults > 1) {
@@ -2433,8 +2454,8 @@ static void pair_emit(Isel *s, Ref vi, Ref vj, const PairShape *si,
     p = TMP1;
   }
   if (st) {
-    int rlo = rd(s, ir_args(f, vlo)[1], S1);
-    int rhi = rd(s, ir_args(f, vhi)[1], S0);
+    int rlo = si->fp ? rd(s, ir_args(f, vlo)[1], S1) : rd_zr(s, ir_args(f, vlo)[1], S1);
+    int rhi = si->fp ? rd(s, ir_args(f, vhi)[1], S0) : rd_zr(s, ir_args(f, vhi)[1], S0);
     if (si->fp) a64_fstp(B, si->size == 3 ? FT_D : FT_S, rlo, rhi, p, (int)lo, LSP_OFF);
     else a64_stp(B, si->size == 3, rlo, rhi, p, (int)lo, LSP_OFF);
     g_stats.stpairs++;
@@ -2655,6 +2676,14 @@ static void emit_block(Isel *s, uint32_t bi, uint32_t next_bi) {
       break;
     }
     case T_BRIF: {
+      /* The test ahead of the prologue has taken the early return; what
+         gets here goes the other way. */
+      if (bi == f->entry && s->early_main) {
+        Edge *m = &b->succs[s->early_main - 1];
+        emit_edge(s, m);
+        if (m->target != next_bi) { add_fix(s, B->len, 0, m->target); a64_b(B, 0); }
+        break;
+      }
       Edge *t = &b->succs[0], *e = &b->succs[1];
       Ref c = b->term_arg;
 

@@ -617,7 +617,7 @@ int main(int argc, char **argv) {
             "             loads_fwd=%llu dead_stores=%llu checks_removed=%llu params=%llu\n"
             "             strength=%llu inlined=%llu rotated=%llu vectorised=%llu\n"
             "             self_tail=%llu ldcomb=%llu spills=%llu insts=%llu\n"
-            "             ldpairs=%llu stpairs=%llu\n"
+            "             ldpairs=%llu stpairs=%llu cold_frames=%llu early_rets=%llu\n"
             "             reloads=%llu caller_saves=%llu csa_restores=%llu"
             " v128_spills=%llu rb_trips=%llu split_cuts=%llu split_invs=%llu pieces=%llu\n"
             "             escape_removed=%llu escape_forwarded=%llu escape_made=%llu gloop=%llu\n"
@@ -650,6 +650,8 @@ int main(int argc, char **argv) {
             (unsigned long long)g_stats.insts_emitted,
             (unsigned long long)g_stats.ldpairs,
             (unsigned long long)g_stats.stpairs,
+            (unsigned long long)g_stats.cold_frames,
+            (unsigned long long)g_stats.early_rets,
             (unsigned long long)g_stats.reloads,
             (unsigned long long)g_stats.caller_saves,
             (unsigned long long)g_stats.csa_restores,

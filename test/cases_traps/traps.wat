@@ -310,6 +310,30 @@
   (func (export "ind_param_null") (result i32) (call $ind_param (i32.const 1)))
   (func (export "ind_param_oob") (result i32) (call $ind_param (i32.const 2)))
 
+  ;; A quasi-leaf's panic call that comes back after all: the trap after it
+  ;; still fires, from the frame the call is made in (cold_calls_only in
+  ;; src/isel.c).  And a load ahead of an early return's test still traps
+  ;; where it is: an entry that loads keeps its test after the prologue
+  ;; (early_ret_shape).  test/cases/callframe.wat has the ones that return.
+  (global $cold_seen (mut i32) (i32.const 0))
+  (func $cold_back (param $x i32) (result i32)
+    (if (i32.gt_u (local.get $x) (i32.const 0x7fffff00))
+      (then (return (call $cold_back (i32.shr_u (local.get $x) (i32.const 1))))))
+    (global.set $cold_seen (local.get $x))
+    (local.get $x))
+  (func $cold_q (param $p i32) (result i32)
+    (if (i32.ge_u (local.get $p) (i32.const 100))
+      (then (drop (call $cold_back (local.get $p))) (unreachable)))
+    (i32.add (local.get $p) (i32.const 1)))
+  (func (export "cold_call_returns") (result i32) (call $cold_q (i32.const 500)))
+  (func $early_ld (param $p i32) (param $n i32) (result i32)
+    (local $v i32)
+    (local.set $v (i32.load (local.get $p)))
+    (if (i32.eqz (local.get $n)) (then (return (i32.const 5))))
+    (i32.add (local.get $v)
+             (call $early_ld (local.get $p) (i32.sub (local.get $n) (i32.const 1)))))
+  (func (export "early_load_oob") (result i32) (call $early_ld (i32.const 70000) (i32.const 0)))
+
   (func $recurse (param i32) (result i32)
     (i32.add (i32.const 1) (call $recurse (local.get 0))))
   (func (export "stack_overflow") (result i32) (call $recurse (i32.const 1)))

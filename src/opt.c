@@ -6447,6 +6447,61 @@ static uint32_t memopt_compact(MemEnt *ent, uint32_t nent) {
   return kept;
 }
 
+/* What may lie between two writes of a global for the first to be dead:
+   arithmetic, which neither reads the global nor can trap -- a trap would
+   leave the first value for whoever looks at the instance after it. */
+static bool gdse_transparent(uint16_t op) {
+  switch (op) {
+    case I_CONST: case I_NOP:
+    case I_ADD: case I_SUB: case I_MUL: case I_MULHU:
+    case I_AND: case I_OR: case I_XOR:
+    case I_SHL: case I_SHRS: case I_SHRU: case I_ROTL: case I_ROTR:
+    case I_CLZ: case I_CTZ: case I_POPCNT: case I_BSWAP:
+    case I_EQ: case I_NE: case I_LTS: case I_LTU: case I_GTS: case I_GTU:
+    case I_LES: case I_LEU: case I_GES: case I_GEU: case I_EQZ:
+    case I_WRAP: case I_EXTENDS: case I_EXTENDU:
+    case I_EXT8S: case I_EXT16S: case I_EXT32S:
+    case I_SELECT: case I_MEM_ADDR: case I_MEM_PTR: case I_MEM_BASE:
+      return true;
+    default:
+      return false;
+  }
+}
+
+/* A global.set that another of the same global follows in its block, with
+   nothing between that reads the global, calls or can trap, writes a value
+   nobody sees.  Go's return path pops its frame and then the return
+   address, two stores of __stack_pointer one after the other with an add
+   between (stdgo: some 360 sites a binary), wherever global_ssa leaves
+   that global in memory because promoting it does not pay. */
+static bool global_dse(IrFunc *f) {
+  bool changed = false;
+  Ref last[MAX_TRACKED_GLOBALS];
+  for (uint32_t oi = 0; oi < f->norder; oi++) {
+    Block *b = &f->blocks[f->order[oi]];
+    uint64_t live = 0;   /* bit g: last[g] is a write nothing has seen yet */
+    for (uint32_t i = 0; i < b->ninsts; i++) {
+      Ref v = b->insts[i];
+      Inst *in = &f->insts[v];
+      uint32_t g = (uint32_t)in->imm;
+      if (in->op == I_GLOBAL_SET && g < MAX_TRACKED_GLOBALS) {
+        if ((live >> g) & 1) {
+          f->insts[last[g]].op = I_NOP;
+          g_stats.stores_removed++;
+          changed = true;
+        }
+        last[g] = v;
+        live |= (uint64_t)1 << g;
+      } else if (in->op == I_GLOBAL_GET) {
+        if (g < MAX_TRACKED_GLOBALS) live &= ~((uint64_t)1 << g);
+      } else if (!gdse_transparent(in->op)) {
+        live = 0;
+      }
+    }
+  }
+  return changed;
+}
+
 static bool pass_memopt(IrFunc *f, const OptOpts *o) {
   bool changed = false;
   MemEnt ent[MEMOPT_ENTS];
@@ -16031,6 +16086,10 @@ void ir_optimize(IrFunc *f, const OptOpts *o) {
     ir_order(f);
     ir_verify(f, "post-global-ssa-clean");
   }
+  /* Only once global_ssa has weighed a global's writes: dropping one first
+     tipped stdgo/recurse's fib into leaving its stack pointer in memory,
+     25% slower. */
+  if (o->memopt && TP("global_dse", global_dse(f)) && o->dce) pass_dce(f);
 
   for (int shape = 0; shape < 6; shape++) {
     bool moved = false;

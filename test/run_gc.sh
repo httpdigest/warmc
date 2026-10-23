@@ -521,6 +521,7 @@ expect exn_payload        "OK" $N
 expect exnref_kept        "OK" $M
 expect many_throws        "OK" $M
 expect keep_across_try    "OK" $M
+expect keep_across_cold   "OK" $M
 expect block_params       "OK" $N
 expect cast_paths         "OK" $N
 expect subtype_fields     "OK" $N

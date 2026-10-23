@@ -138,6 +138,8 @@ expect ind_type          "indirect call type mismatch"
 expect ind_param_type    "indirect call type mismatch"
 expect ind_param_null    "uninitialized element"
 expect ind_param_oob     "undefined element"
+expect cold_call_returns "unreachable executed"
+expect early_load_oob    "out of bounds memory access"
 expect hoist_past_call   "unreachable executed"
 expect hoist_past_div    "integer divide by zero"
 
