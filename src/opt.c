@@ -1953,6 +1953,326 @@ static Ref sub_cancels(IrFunc *f, uint16_t op, const Ref *a) {
   return REF_NONE;
 }
 
+/* ---- 64x64 multiplies written in 32-bit halves ----------------------------
+
+   wasm has no high multiply, so a 128-bit product -- Rust's u128 and i128,
+   C's and Zig's through __multi3, Go's bits.Mul64 -- arrives written in
+   32-bit halves.  With xl, xh, yl, yh the halves of x and y, ll = xl*yl,
+   hh = xh*yh and the cross products xh*yl and xl*yh are each exact in 64
+   bits, and two shapes put them together.  Rust's compiler_builtins adds
+   the cross products and catches the carries with compares, c being either
+   of them:
+
+     mid = xh*yl + xl*yh                       (mod 2^64)
+     lo  = ll + (mid << 32)
+     hi  = hh + ((zext(mid <u c) << 32) | (mid >> 32)) + zext(lo <u ll)
+
+   compiler-rt's __mulddi3, Zig's and Go's add them one at a time, where
+   nothing can carry ({c1, c2} the two cross products):
+
+     t  = (ll >> 32) + c1
+     u  = (t & 0xffffffff) + c2
+     lo = (u << 32) | (ll & 0xffffffff)
+     hi = hh + (t >> 32) + (u >> 32)
+
+   Either way lo is x * y and hi is mulhu(x, y): a sum holding hi's terms
+   becomes mulhu plus the rest of it, lo becomes a mul, and the halves die --
+   fifteen instructions for umulh's one in Rust's u128 division and its i128
+   dot product, which on wasm ran 7x native's.  A signed product is the
+   unsigned one of sign-extended operands, so x*(y >>s 63) + y*(x >>s 63)
+   beside mulhu(x, y) makes it mulhs(x, y): i64::saturating_mul. */
+#define MW_TERMS 24
+
+/* v is the i64 x & 0xffffffff, or the zero extension of x wrapped */
+static bool mw_low(IrFunc *f, Ref v, Ref *x) {
+  const Inst *in = &f->insts[v];
+  if (in->type != VT_I64) return false;
+  if (in->op == I_AND && in->nargs == 2) {
+    const Ref *a = ir_args(f, v);
+    uint64_t c;
+    for (int k = 0; k < 2; k++)
+      if (is_const(f, ir_resolve(f, a[k]), &c) && c == 0xffffffffu) {
+        *x = ir_resolve(f, a[1 - k]);
+        return true;
+      }
+    return false;
+  }
+  if (in->op == I_EXTENDU && in->nargs == 1) {
+    Ref w = ir_resolve(f, ir_args(f, v)[0]);
+    if (f->insts[w].op != I_WRAP || f->insts[w].nargs != 1) return false;
+    *x = ir_resolve(f, ir_args(f, w)[0]);
+    return f->insts[*x].type == VT_I64;
+  }
+  return false;
+}
+
+/* v is the i64 x >> k, k the constant given */
+static bool mw_shr(IrFunc *f, Ref v, uint32_t k, IrOp op, Ref *x) {
+  const Inst *in = &f->insts[v];
+  uint64_t c;
+  if (in->op != op || in->nargs != 2 || in->type != VT_I64) return false;
+  const Ref *a = ir_args(f, v);
+  if (!is_const(f, ir_resolve(f, a[1]), &c) || (c & 63) != k) return false;
+  *x = ir_resolve(f, a[0]);
+  return true;
+}
+
+/* v is the i64 x << 32 */
+static bool mw_shl32(IrFunc *f, Ref v, Ref *x) {
+  return mw_shr(f, v, 32, I_SHL, x);
+}
+
+/* the operands of the i64 binary op v, resolved */
+static bool mw_bin(IrFunc *f, Ref v, IrOp op, Ref *l, Ref *r) {
+  const Inst *in = &f->insts[v];
+  if (in->op != op || in->nargs != 2 || in->type != VT_I64) return false;
+  const Ref *a = ir_args(f, v);
+  *l = ir_resolve(f, a[0]);
+  *r = ir_resolve(f, a[1]);
+  return true;
+}
+
+/* v = half of p times half of q, as 2 * (p's high half) + (q's high half),
+   or -1.  For p = q the two cross products are one kind, 1. */
+static int mw_prod(IrFunc *f, Ref v, Ref p, Ref q) {
+  Ref m[2], x[2];
+  int h[2];
+  if (!mw_bin(f, v, I_MUL, &m[0], &m[1])) return -1;
+  for (int k = 0; k < 2; k++) {
+    if (mw_low(f, m[k], &x[k])) h[k] = 0;
+    else if (mw_shr(f, m[k], 32, I_SHRU, &x[k])) h[k] = 1;
+    else return -1;
+  }
+  int kind;
+  if (x[0] == p && x[1] == q) kind = 2 * h[0] + h[1];
+  else if (x[0] == q && x[1] == p) kind = 2 * h[1] + h[0];
+  else return -1;
+  return p == q && kind == 2 ? 1 : kind;
+}
+
+/* the two cross products of p and q, one of each kind (both kind 1 for a
+   square) */
+static bool mw_crosses(IrFunc *f, Ref a, Ref b, Ref p, Ref q) {
+  int ka = mw_prod(f, a, p, q), kb = mw_prod(f, b, p, q);
+  if (p == q) return ka == 1 && kb == 1;
+  return (ka == 1 && kb == 2) || (ka == 2 && kb == 1);
+}
+
+/* v = ll of some x and y: xl * yl */
+static bool mw_ll(IrFunc *f, Ref v, Ref *x, Ref *y) {
+  Ref m0, m1;
+  return mw_bin(f, v, I_MUL, &m0, &m1) && mw_low(f, m0, x) && mw_low(f, m1, y);
+}
+
+/* v = mid, the sum of p's and q's cross products */
+static bool mw_mid(IrFunc *f, Ref v, Ref p, Ref q) {
+  Ref c1, c2;
+  return mw_bin(f, v, I_ADD, &c1, &c2) && mw_crosses(f, c1, c2, p, q);
+}
+
+/* v = zext(a <u b) */
+static bool mw_carry(IrFunc *f, Ref v, Ref *a, Ref *b) {
+  const Inst *in = &f->insts[v];
+  if (in->op != I_EXTENDU || in->nargs != 1 || in->type != VT_I64) return false;
+  Ref c = ir_resolve(f, ir_args(f, v)[0]);
+  const Inst *ci = &f->insts[c];
+  if (ci->nargs != 2 || (ci->op != I_LTU && ci->op != I_GTU)) return false;
+  const Ref *ca = ir_args(f, c);
+  Ref l = ir_resolve(f, ca[0]), r = ir_resolve(f, ca[1]);
+  if (f->insts[l].type != VT_I64) return false;
+  *a = ci->op == I_LTU ? l : r;
+  *b = ci->op == I_LTU ? r : l;
+  return true;
+}
+
+/* Rust's (zext(mid <u c) << 32) | (mid >> 32) */
+static bool mw_rs_carry(IrFunc *f, Ref v, Ref p, Ref q) {
+  Ref o[2];
+  if (!mw_bin(f, v, I_OR, &o[0], &o[1])) return false;
+  for (int k = 0; k < 2; k++) {
+    Ref mid, e, a, b, c1, c2;
+    if (!mw_shr(f, o[1 - k], 32, I_SHRU, &mid) || !mw_shl32(f, o[k], &e) ||
+        !mw_carry(f, e, &a, &b) || a != mid ||
+        !mw_bin(f, mid, I_ADD, &c1, &c2) || (b != c1 && b != c2) ||
+        !mw_crosses(f, c1, c2, p, q))
+      continue;
+    return true;
+  }
+  return false;
+}
+
+/* x * y: a mul of p and q, or Rust's ll + (mid << 32) */
+static bool mw_rs_lo(IrFunc *f, Ref v, Ref p, Ref q) {
+  Ref l, r, x, y, mid;
+  if (mw_bin(f, v, I_MUL, &l, &r)) return (l == p && r == q) || (l == q && r == p);
+  if (!mw_bin(f, v, I_ADD, &l, &r)) return false;
+  for (int k = 0; k < 2; k++) {
+    Ref ll = k ? r : l, sh = k ? l : r;
+    if (mw_ll(f, ll, &x, &y) && ((x == p && y == q) || (x == q && y == p)) &&
+        mw_shl32(f, sh, &mid) && mw_mid(f, mid, p, q))
+      return true;
+  }
+  return false;
+}
+
+/* Rust's zext(lo <u ll) */
+static bool mw_rs_locarry(IrFunc *f, Ref v, Ref p, Ref q) {
+  Ref lo, ll, x, y;
+  return mw_carry(f, v, &lo, &ll) && mw_ll(f, ll, &x, &y) &&
+         ((x == p && y == q) || (x == q && y == p)) && mw_rs_lo(f, lo, p, q);
+}
+
+/* the other shape's t = (ll >> 32) + c1, its cross product's kind in *kind */
+static bool mw_hd_t(IrFunc *f, Ref t, Ref p, Ref q, int *kind) {
+  Ref o[2], ll, x, y;
+  if (!mw_bin(f, t, I_ADD, &o[0], &o[1])) return false;
+  for (int k = 0; k < 2; k++) {
+    if (!mw_shr(f, o[k], 32, I_SHRU, &ll) || !mw_ll(f, ll, &x, &y) ||
+        !((x == p && y == q) || (x == q && y == p)))
+      continue;
+    int c = mw_prod(f, o[1 - k], p, q);
+    if (c != 1 && c != 2) continue;
+    *kind = c;
+    return true;
+  }
+  return false;
+}
+
+/* u = (t & 0xffffffff) + c2, with t as above and c2 the other cross product */
+static bool mw_hd_u(IrFunc *f, Ref u, Ref p, Ref q, Ref *t) {
+  Ref o[2];
+  if (!mw_bin(f, u, I_ADD, &o[0], &o[1])) return false;
+  for (int k = 0; k < 2; k++) {
+    int k1, k2 = mw_prod(f, o[1 - k], p, q);
+    if (!mw_low(f, o[k], t) || !mw_hd_t(f, *t, p, q, &k1)) continue;
+    if (p == q ? k1 == 1 && k2 == 1 : k1 + k2 == 3) return true;
+  }
+  return false;
+}
+
+/* the leaves of the i64 add tree at v, or false past MW_TERMS */
+static bool mw_terms(IrFunc *f, Ref v, Ref *term, uint32_t *n) {
+  Ref stk[MW_TERMS];
+  uint32_t sp = 0;
+  *n = 0;
+  stk[sp++] = v;
+  while (sp) {
+    Ref x = stk[--sp], l, r;
+    if (mw_bin(f, x, I_ADD, &l, &r)) {
+      if (sp + 2 > MW_TERMS) return false;
+      stk[sp++] = r;
+      stk[sp++] = l;
+      continue;
+    }
+    if (*n == MW_TERMS) return false;
+    term[(*n)++] = x;
+  }
+  return true;
+}
+
+/* v, an i64 add or or, rewritten as a high or low multiply where it is one
+   (the shapes above); the new instructions go before position *idx */
+static bool fold_mulwide(IrFunc *f, uint32_t bi, uint32_t *idx, Ref v) {
+  Ref term[MW_TERMS], l, r, x, y, t;
+  uint32_t n;
+  /* lo: Rust's ll + (mid << 32), the other's (u << 32) | (ll & 0xffffffff) */
+  if ((f->insts[v].op == I_ADD || f->insts[v].op == I_OR) &&
+      mw_bin(f, v, (IrOp)f->insts[v].op, &l, &r)) {
+    for (int k = 0; k < 2; k++) {
+      Ref a = k ? r : l, b = k ? l : r, u, ll, mid;
+      bool hit = false;
+      if (f->insts[v].op == I_ADD && mw_ll(f, a, &x, &y) && mw_shl32(f, b, &mid) &&
+          mw_mid(f, mid, x, y))
+        hit = true;
+      else if (mw_shl32(f, a, &u) && mw_low(f, b, &ll) && mw_ll(f, ll, &x, &y) &&
+               mw_hd_u(f, u, x, y, &t)) {
+        Ref t0, t1, sl, x2, y2;
+        /* the t inside u starts from this ll */
+        mw_bin(f, t, I_ADD, &t0, &t1);
+        hit = (mw_shr(f, t0, 32, I_SHRU, &sl) || mw_shr(f, t1, 32, I_SHRU, &sl)) &&
+              sl == ll && mw_ll(f, sl, &x2, &y2);
+      }
+      if (!hit) continue;
+      Ref ma[2] = { x, y };
+      Ref m = emit_before(f, bi, idx, I_MUL, VT_I64, ma, 2, 0);
+      ir_replace(f, v, m);
+      f->insts[v].op = I_NOP;
+      return true;
+    }
+  }
+  if (f->insts[v].op != I_ADD || !mw_terms(f, v, term, &n)) return false;
+  bool used[MW_TERMS] = { false };
+  IrOp op = I_NOP;
+  bool hi = false;   /* hi's terms found, not a mulhu already there */
+  Ref p = REF_NONE, q = REF_NONE;
+  for (uint32_t h = 0; h < n && op == I_NOP; h++) {
+    if (!mw_bin(f, term[h], I_MUL, &l, &r) || !mw_shr(f, l, 32, I_SHRU, &p) ||
+        !mw_shr(f, r, 32, I_SHRU, &q))
+      continue;
+    /* Rust's shape: hh, the mid carry, the lo carry */
+    int ic = -1, il = -1;
+    for (uint32_t k = 0; k < n; k++) {
+      if (k == h) continue;
+      if (ic < 0 && mw_rs_carry(f, term[k], p, q)) ic = (int)k;
+      else if (il < 0 && mw_rs_locarry(f, term[k], p, q)) il = (int)k;
+    }
+    if (ic >= 0 && il >= 0) {
+      used[h] = used[ic] = used[il] = true;
+      op = I_MULHU;
+      hi = true;
+      break;
+    }
+    /* the other: hh, t >> 32, u >> 32, the t inside u */
+    for (uint32_t iu = 0; iu < n && op == I_NOP; iu++) {
+      Ref u;
+      if (iu == h || !mw_shr(f, term[iu], 32, I_SHRU, &u) || !mw_hd_u(f, u, p, q, &t))
+        continue;
+      for (uint32_t it = 0; it < n; it++) {
+        Ref t2;
+        if (it == h || it == iu || !mw_shr(f, term[it], 32, I_SHRU, &t2) || t2 != t)
+          continue;
+        used[h] = used[iu] = used[it] = true;
+        op = I_MULHU;
+        hi = true;
+        break;
+      }
+    }
+  }
+  /* beside mulhu(p, q), p * (q >>s 63) + q * (p >>s 63) makes it mulhs */
+  for (uint32_t k = 0; k < n && op == I_NOP; k++)
+    if (mw_bin(f, term[k], I_MULHU, &p, &q)) {
+      used[k] = true;
+      op = I_MULHU;
+    }
+  int ix = -1, iy = -1;
+  for (uint32_t k = 0; k < n && op != I_NOP; k++) {
+    if (used[k] || !mw_bin(f, term[k], I_MUL, &l, &r)) continue;
+    for (int s = 0; s < 2; s++) {
+      Ref a = s ? r : l, sh = s ? l : r, src;
+      if (!mw_shr(f, sh, 63, I_SHRS, &src)) continue;
+      if (ix < 0 && a == p && src == q) { ix = (int)k; break; }
+      if (iy < 0 && a == q && src == p && (int)k != ix) { iy = (int)k; break; }
+    }
+  }
+  bool sign = ix >= 0 && iy >= 0 && ix != iy;
+  /* a mulhu already there and no sign terms: the same sum again */
+  if (op == I_NOP || (!hi && !sign)) return false;
+  if (sign) {
+    used[ix] = used[iy] = true;
+    op = I_MULHS;
+  }
+  Ref ma[2] = { p, q };
+  Ref s = emit_before(f, bi, idx, op, VT_I64, ma, 2, 0);
+  for (uint32_t k = 0; k < n; k++) {
+    if (used[k]) continue;
+    Ref aa[2] = { s, term[k] };
+    s = emit_before(f, bi, idx, I_ADD, VT_I64, aa, 2, 0);
+  }
+  ir_replace(f, v, s);
+  f->insts[v].op = I_NOP;
+  return true;
+}
+
 static bool fold_block(IrFunc *f, uint32_t bi, const OptOpts *o, const uint32_t *uses) {
   Block *b = &f->blocks[bi];
   bool changed = false;
@@ -1987,6 +2307,12 @@ static bool fold_block(IrFunc *f, uint32_t bi, const OptOpts *o, const uint32_t 
         changed = true;
         continue;
       }
+    }
+    if (o->mulwide && t == VT_I64 && (in->op == I_ADD || in->op == I_OR) &&
+        fold_mulwide(f, bi, &i, v)) {
+      g_stats.mul_wide++;
+      changed = true;
+      continue;
     }
     /* A reinterpreted constant is a constant of the other type with the same
        bits.  GHC writes every double it uses as an i64.const and an

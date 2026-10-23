@@ -412,6 +412,8 @@ typedef struct {
 
   bool ifconv;
 
+  bool mulwide;   /* a multiply written in 32-bit halves becomes one */
+
   bool gcpure;
 
   bool closed_world;
@@ -479,6 +481,7 @@ typedef struct {
   uint64_t reassoc;
   uint64_t cmp_reused;
   uint64_t csel_fused;
+  uint64_t mul_wide;     /* 64x64 multiplies in halves made mul, mulhu or mulhs */
 
   uint64_t bar_masks, bar_elided;
   uint64_t caller_saves, csa_restores, spills_v128_xcall, range_budget_trips;

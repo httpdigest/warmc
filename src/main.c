@@ -54,7 +54,7 @@ static const char *usage_text =
   "                vectorize, edge-tests, unroll, selftail, ldcomb, escape,\n"
   "                partial-escape, gloop, gssa, loopclose, cpool, ictab, reach,\n"
   "                prune, merge, devirt, reinline, throw-jump, closed-world,\n"
-  "                gcpure, split, labcache, ifconv, barelide,\n"
+  "                gcpure, split, labcache, ifconv, mulwide, barelide,\n"
   "                small-loop-align\n"
   "                The last two are the passes built on a loop containing\n"
   "                no safepoint, which is the only assumption the compiler\n"
@@ -304,6 +304,7 @@ int main(int argc, char **argv) {
   opt.throwjump = true;
   opt.unroll = true;
   opt.ifconv = true;
+  opt.mulwide = true;
   opt.gcpure = true;
   opt.closed_world = true;
 
@@ -445,6 +446,7 @@ int main(int argc, char **argv) {
       else if (!strcmp(name, "throw-jump")) opt.throwjump = on;
       else if (!strcmp(name, "unroll")) opt.unroll = on;
       else if (!strcmp(name, "ifconv")) opt.ifconv = on;
+      else if (!strcmp(name, "mulwide")) opt.mulwide = on;
       else if (!strcmp(name, "gcpure")) opt.gcpure = on;
       else if (!strcmp(name, "closed-world")) opt.closed_world = on;
       else warmc_fatal("unknown pass %s", name);
@@ -624,7 +626,7 @@ int main(int argc, char **argv) {
             "             reloads=%llu caller_saves=%llu csa_restores=%llu"
             " v128_spills=%llu rb_trips=%llu split_cuts=%llu split_invs=%llu pieces=%llu\n"
             "             escape_removed=%llu escape_forwarded=%llu escape_made=%llu gloop=%llu\n"
-            "             loop_closed=%llu reassoc=%llu cmp_reused=%llu csel_fused=%llu gssa=%llu\n"
+            "             loop_closed=%llu reassoc=%llu cmp_reused=%llu csel_fused=%llu mul_wide=%llu gssa=%llu\n"
             "             bar_masks=%llu bar_elided=%llu\n"
             "             devirt_ref=%llu devirt_indirect=%llu"
             " devirt_null_kept=%llu const_reads=%llu throw_jumps=%llu"
@@ -671,6 +673,7 @@ int main(int argc, char **argv) {
             (unsigned long long)g_stats.reassoc,
             (unsigned long long)g_stats.cmp_reused,
             (unsigned long long)g_stats.csel_fused,
+            (unsigned long long)g_stats.mul_wide,
             (unsigned long long)g_stats.globals_ssa,
             (unsigned long long)g_stats.bar_masks,
             (unsigned long long)g_stats.bar_elided,
