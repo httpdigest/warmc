@@ -22,11 +22,13 @@ static const char *usage_text =
   "\n"
   "usage: warmc [options] input.wasm|input.wat\n"
   "\n"
-  "  a module may be given in either the binary or the text format; which one\n"
-  "  it is decided by whether it begins with the binary magic, not by its name\n"
+  "  a module may be given in either the binary or the text format: a name\n"
+  "  ending in .wat is read as text and one ending in .wasm as binary; any\n"
+  "  other is binary when it begins with the binary magic\n"
   "\n"
   "  a *component* is compiled too, when nothing it exports needs conversion\n"
-  "  code -- see --dump-link for what was resolved and why one is refused\n"
+  "  code -- compiling one that is not says why, and --dump-link shows what\n"
+  "  was resolved\n"
   "\n"
   "  -o FILE       output path (default a.out, a.exe for windows, or out.o\n"
   "                with -c)\n"
@@ -105,7 +107,7 @@ static const char *usage_text =
   "                warmc_find_export in an embedder.  Refused for a\n"
   "                component, where a name is how one instance is bound to\n"
   "                another\n"
-  "  --print-ir    dump the IR after optimisation\n"
+  "  --print-ir    dump each function's IR before and after optimisation\n"
   "  --stats       print optimisation counters\n"
   "  --profile     count executed instructions at run time\n"
   "  --profile=P   compile for a wasm profile: full (default) or\n"
@@ -113,9 +115,9 @@ static const char *usage_text =
   "                which is warmc's own instruction counter\n"
   "  -c            emit a relocatable object and stop\n"
   "  --target T    linux (ELF, default), macos (Mach-O) or windows (PE,\n"
-  "                x64; default output a.exe).  The macOS link needs\n"
-  "                libSystem, found through `xcrun --show-sdk-path`;\n"
-  "                $WARMC_MACOS_LIBDIR overrides that\n"
+  "                x64; default output a.exe).  With --system-ld the macOS\n"
+  "                link needs libSystem, found through\n"
+  "                `xcrun --show-sdk-path`; $WARMC_MACOS_LIBDIR overrides that\n"
   "  --rt PATH     runtime archive or object to link (default $WARMC_RT)\n"
   "  --system-ld   link with an external linker instead of doing it here:\n"
   "                ld.lld for linux; for macos ld on a macOS host and\n"
@@ -316,7 +318,12 @@ int main(int argc, char **argv) {
       opt.unroll = false;
       opt.gcpure = false;
     }
-    else if (!strcmp(a, "-O2")) opt.level = 2;
+    else if (!strcmp(a, "-O2")) {
+      /* back to the defaults an earlier -O0 or -O1 turned off */
+      opt.level = 2;
+      opt.guard_pages = opt.align = opt.split = true;
+      opt.inl = opt.devirt = opt.unroll = opt.gcpure = true;
+    }
     else if (!strcmp(a, "--validate-only")) validate_only = true;
     else if (!strcmp(a, "--dump-component")) dump_component = true;
     else if (!strcmp(a, "--dump-canon")) dump_canon = true;

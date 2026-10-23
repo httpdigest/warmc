@@ -591,8 +591,8 @@ void warmc_invoke(void *fn, WarmInstance *vm, const u64 *iargs,
 /* x64 carries only 3 ints and 4 floats in argument registers; a callee
    with more reads the rest from its incoming stack slots, which
    warmc_invoke cannot populate.  These variants also copy a caller-built
-   image of those slots: 16 bytes per parameter past its class's register
-   ceiling, in parameter order. */
+   image of those slots: 8 bytes per scalar parameter past its class's
+   register ceiling and 16 per v128, in parameter order. */
 void warmc_invoke_s(void *fn, WarmInstance *vm, const u64 *iargs,
                     const u64 *fargs, u64 *retbuf,
                     const u64 *stk, u64 stk_bytes);
