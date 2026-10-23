@@ -537,7 +537,7 @@ static bool order_once(IrFunc *f, bool by_score, bool keep) {
     return true;
   }
   uint8_t *inloop = xcalloc(f->nblocks ? f->nblocks : 1, 1);
-  uint8_t *fwd = xmalloc(f->nblocks ? f->nblocks : 1);
+  uint8_t *fwd = xcalloc(f->nblocks ? f->nblocks : 1, 1);
   uint32_t *stack = xmalloc((f->nblocks ? f->nblocks : 1) * sizeof(uint32_t));
   uint32_t *body = xmalloc((f->nblocks ? f->nblocks : 1) * sizeof(uint32_t));
   for (uint32_t i = 0; i < n; i++) {
@@ -564,17 +564,24 @@ static bool order_once(IrFunc *f, bool by_score, bool keep) {
           }
       }
       if (!natural) {
-
-        memset(fwd, 0, f->nblocks);
+        /* Only the blocks t reaches stay.  The walk from t need not leave
+           the body: a block on a path from t to one in the body reaches bi
+           through that one, without passing t, so it is in the body too.
+           Walking the whole function from t, once for each such edge, was
+           a tenth of compiling Go, whose threaded dispatch leaves hundreds
+           of them. */
         fwd[t] = 1; sp = 0; stack[sp++] = t;
         while (sp) {
           uint32_t cur = stack[--sp];
           Block *c = &f->blocks[cur];
-          for (uint32_t e = 0; e < c->nsuccs; e++)
-            if (!fwd[c->succs[e].target]) { fwd[c->succs[e].target] = 1; stack[sp++] = c->succs[e].target; }
+          for (uint32_t e = 0; e < c->nsuccs; e++) {
+            uint32_t g = c->succs[e].target;
+            if (inloop[g] && !fwd[g]) { fwd[g] = 1; stack[sp++] = g; }
+          }
         }
         for (uint32_t j = 0; j < nbody; j++)
           if (!fwd[body[j]]) inloop[body[j]] = 0;
+        for (uint32_t j = 0; j < nbody; j++) fwd[body[j]] = 0;
       }
       for (uint32_t j = 0; j < nbody; j++) {
         uint32_t k = body[j];
