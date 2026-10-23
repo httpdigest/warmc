@@ -65,7 +65,8 @@ Hello world!
     on some paths is allocated only on those, and one merged with null
     becomes its fields and a flag
   - store-to-load forwarding
-  - magic-number division
+  - magic-number division, and 128-bit multiplies written in 32-bit halves
+    turned back into `mul` and `umulh`/`smulh`
   - a linear-scan register allocator that runs under several spill rules and
     keeps the cheapest, with rematerialisation, a second-chance pass and
     live-range splitting at loop boundaries
@@ -691,6 +692,7 @@ command-line order, so put them **after** `-O`.
 | `licm` | loop-invariant code motion, including hoisting invariant stores and trap guards |
 | `branch` | constant-branch folding and block merging |
 | `edge-tests` | in loops, fold a test or branch that a dominating branch on the same value has already decided, such as an inlined bounds check behind a loop's own exit test |
+| `mulwide` | a 64-by-64 multiply that wasm spells in 32-bit halves -- `__multi3` from Rust, C and Zig, Go's `bits.Mul64` -- becomes one `mul` for the low half and `umulh`, or `smulh` for sign-extended operands, for the high |
 | `ifconv` | if-conversion: a diamond or triangle whose arms are cheap and cannot trap becomes selects (`csel`), and so does a small `br_table` of cheap arms, its default dropped where the index is provably in range |
 | `thread` | jump threading through a block that only switches on a parameter, such as the dispatch Go's compiler puts around every function, or only compares one with a constant, when an edge passes that parameter a constant |
 | `nodesplit` | copy the part of a loop that a switch outside it enters in the middle, so that the loop has one way in again and the loop passes can take it |
