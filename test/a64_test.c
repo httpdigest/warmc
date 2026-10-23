@@ -654,6 +654,11 @@ int main(int argc, char **argv) {
   CASE("saddlp v2.4s, v3.8h", a64_vsaddlp(b, 1, 2, 3));
   CASE("uaddlp v4.8h, v5.16b", a64_vuaddlp(b, 0, 4, 5));
   CASE("uaddlp v6.4s, v7.8h", a64_vuaddlp(b, 1, 6, 7));
+  CASE("uaddlp v8.2d, v9.4s", a64_vuaddlp(b, 2, 8, 9));
+  CASE("sadalp v0.8h, v1.16b", a64_vsadalp(b, 0, 0, 1));
+  CASE("sadalp v2.2d, v3.4s", a64_vsadalp(b, 2, 2, 3));
+  CASE("uadalp v4.4s, v5.8h", a64_vuadalp(b, 1, 4, 5));
+  CASE("uadalp v30.2d, v31.4s", a64_vuadalp(b, 2, 30, 31));
 
   CASE("smull v0.8h, v1.8b, v2.8b", a64_vsmull(b, 0, 0, 0, 1, 2));
   CASE("smull2 v3.8h, v4.16b, v5.16b", a64_vsmull(b, 1, 0, 3, 4, 5));

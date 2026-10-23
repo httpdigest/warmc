@@ -11020,6 +11020,9 @@ static bool pass_mem_ptr(IrFunc *f) {
 
 #define VEC_MAX_CHECK 8
 #define VEC_DEPTH    12
+/* The most copies of the vector body one iteration of the vector loop
+   holds; see vectorize_one. */
+#define VEC_MAX_COPY 4
 
 typedef struct {
   Ref inst;
@@ -11055,7 +11058,7 @@ typedef struct {
   Ref member[VEC_MAX_MEMB];
   uint32_t pos[VEC_MAX_MEMB];
   Ref ptr;
-  Ref loaded[VEC_MAX_VEC];
+  Ref loaded[VEC_MAX_COPY][VEC_MAX_VEC];
   Ref lo, hi;
   bool spec;
   bool pol;
@@ -11090,6 +11093,9 @@ typedef struct {
   uint32_t mpv;
   uint32_t gran;
   uint32_t nvec;
+  /* the copy of the body v_build is building: which of each group's loads
+     a load of the scalar body stands for */
+  uint32_t copy;
   VGroup grp[VEC_MAX_GRP];
   uint32_t ngrp;
   VMemo memo[VEC_MAX_MEMO];
@@ -11230,6 +11236,28 @@ static Ref v_abs_operand(IrFunc *f, Ref r, uint32_t bits) {
   if (!((xa[0] == x && xa[1] == sgn) || (xa[0] == sgn && xa[1] == x)))
     return REF_NONE;
   return x;
+}
+
+/* x + (x << k) or (x << k) + x, which is how strength reduction leaves
+   x * (2^k + 1), or (x << k) - x for x * (2^k - 1): x, and the multiplier
+   in *mul.  bits is the lane's width. */
+static Ref v_mul_form(IrFunc *f, Ref r, uint32_t bits, uint64_t *mul) {
+  Inst *in = &f->insts[r];
+  if ((in->op != I_ADD && in->op != I_SUB) || in->nargs != 2) return REF_NONE;
+  Ref *a = ir_args(f, r);
+  for (int side = 0; side < 2; side++) {
+    if (in->op == I_SUB && side) break;
+    Ref sh = a[side], x = a[side ^ 1];
+    Inst *si = &f->insts[sh];
+    uint64_t k;
+    if (si->op != I_SHL || si->nargs != 2 || ir_args(f, sh)[0] != x ||
+        !is_const(f, ir_args(f, sh)[1], &k) || k == 0 || k >= bits)
+      continue;
+    uint64_t lm = bits >= 64 ? ~0ull : (1ull << bits) - 1;
+    *mul = ((1ull << k) + (in->op == I_ADD ? 1u : (uint64_t)-1)) & lm;
+    return x;
+  }
+  return REF_NONE;
 }
 
 static Ref v_counted_mask(IrFunc *f, Ref term) {
@@ -11750,11 +11778,12 @@ static Ref v_build(VecCtx *c, const Ref *tuple, uint32_t k, uint32_t st, int dep
           for (uint32_t j = 0; j < k && same; j++)
             same = G->member[v_slot(G, c->mpv, v, off + j * st)] == tuple[j];
           if (!same) continue;
-          if (st == 1) { out = G->loaded[v]; goto done; }
+          Ref ld = G->loaded[c->copy][v];
+          if (st == 1) { out = ld; goto done; }
 
           if (st != 2) return REF_NONE;
           out = vemit(f, c->vbody, off ? I_VUZP2 : I_VUZP1, VT_V128,
-                      G->loaded[v], G->loaded[v], c->gran, c->lane);
+                      ld, ld, c->gran, c->lane);
           goto done;
         }
     }
@@ -11950,6 +11979,18 @@ shift_var:
     for (uint32_t j = 0; j < k; j++) sub[j] = ir_args(f, tuple[j])[0];
     Ref x = v_build(c, sub, k, st, depth - 1);
     if (x == REF_NONE) return REF_NONE;
+    /* A left shift by an amount the loop does not change is a multiply by
+       2^amount, splatted once before the loop: the shift by a register
+       masks and splats its amount at every use, three instructions a
+       vector and twelve an iteration of four copies (vecbench/varshift went
+       from 1.29x native to 0.94x). */
+    if (op0 == I_SHL && ir_vec_mul_one(c->lane)) {
+      Ref one = ir_emit(f, c->vguard, I_CONST, t, NULL, 0, 1, 0);
+      Ref pw = vemit(f, c->vguard, I_SHL, t, one, amt, 0, 0);
+      Ref ps = vemit(f, c->vguard, I_VSPLAT, VT_V128, pw, REF_NONE, 0, c->lane);
+      out = vemit(f, c->vbody, I_VMUL, VT_V128, x, ps, 0, c->lane);
+      goto done;
+    }
     IrOp o = op0 == I_SHL ? I_VSHLV : (op0 == I_SHRU ? I_VSHRUV : I_VSHRSV);
     out = vemit(f, c->vbody, o, VT_V128, x, amt, 0, c->lane);
     goto done;
@@ -11968,6 +12009,32 @@ shift_var:
       Ref x = v_build(c, sub, k, st, depth - 1);
       if (x != REF_NONE) {
         out = vemit(f, c->vbody, I_VABS, VT_V128, x, REF_NONE, 0, c->lane);
+        goto done;
+      }
+    }
+  }
+
+  /* One multiply for the shift and add strength reduction made of a
+     multiply by a constant: a loop of copies runs out of vector
+     instructions first (vecbench/scale, c[i] = a[i]*3 + 7, went from 1.19x
+     native to 0.86x). */
+  if ((op0 == I_ADD || op0 == I_SUB) && ir_vec_mul_one(c->lane)) {
+    uint32_t bits = (uint32_t)c->width * 8u;
+    Ref sub[VEC_MAX_MEMB];
+    uint64_t m0 = 0;
+    bool all = true;
+    for (uint32_t j = 0; j < k && all; j++) {
+      uint64_t mj;
+      sub[j] = v_mul_form(f, tuple[j], bits, &mj);
+      all = sub[j] != REF_NONE && (j == 0 || mj == m0);
+      m0 = mj;
+    }
+    if (all) {
+      Ref x = v_build(c, sub, k, st, depth - 1);
+      if (x != REF_NONE) {
+        Ref mc = ir_emit(f, c->vguard, I_CONST, t, NULL, 0, m0, 0);
+        Ref ms = vemit(f, c->vguard, I_VSPLAT, VT_V128, mc, REF_NONE, 0, c->lane);
+        out = vemit(f, c->vbody, I_VMUL, VT_V128, x, ms, 0, c->lane);
         goto done;
       }
     }
@@ -12018,6 +12085,17 @@ done:
     m->val = out;
   }
   return out;
+}
+
+/* Forgets what v_build made for one copy of the body before it builds the
+   next, or another body: a load, and anything computed from one, stands for
+   different elements there.  What it made in the guard -- a constant or a
+   loop-invariant value splatted -- is the same for every copy and stays. */
+static void v_memo_next_copy(VecCtx *c) {
+  uint32_t n = 0;
+  for (uint32_t i = 0; i < c->nmemo; i++)
+    if (c->f->insts[c->memo[i].val].block == c->vguard) c->memo[n++] = c->memo[i];
+  c->nmemo = n;
 }
 
 static int v_lane_of_term(VecCtx *c, Ref v, int depth) {
@@ -12086,10 +12164,13 @@ static uint32_t v_log2(uint64_t x) {
    iterations when it is true.  Shared by the vectorizer (U = lanes) and
    the unroller's guarded form (U = unroll factor); rel is the normalized
    continue-relation, down the normalized direction, and bound REF_NONE
-   means an implicit zero. */
+   means an implicit zero.  With whole the count is of every full group,
+   T >> log2(U), for a caller that can leave past the loop when no
+   iteration is left over; *T_out, if asked for, is then T itself. */
 static Ref guard_trip_count(IrFunc *f, uint32_t gb, ValType ct, IrOp rel,
                             uint64_t K, bool down, Ref q0, Ref bound,
-                            bool clone_bound, uint32_t U, Ref *ok_out) {
+                            bool clone_bound, uint32_t U, bool whole,
+                            Ref *T_out, Ref *ok_out) {
   uint32_t cbits = ct == VT_I64 ? 64 : 32;
   uint32_t ks = v_log2(K), us = v_log2(U);
   Ref zero = ir_emit(f, gb, I_CONST, ct, NULL, 0, 0, 0);
@@ -12147,7 +12228,7 @@ static Ref guard_trip_count(IrFunc *f, uint32_t gb, ValType ct, IrOp rel,
     }
   }
 
-  Ref M = vemit(f, gb, I_SUB, ct, T, one, 0, 0);
+  Ref M = whole ? T : vemit(f, gb, I_SUB, ct, T, one, 0, 0);
   Ref ush = ir_emit(f, gb, I_CONST, ct, NULL, 0, us, 0);
   Ref cnt = us ? vemit(f, gb, I_SHRU, ct, M, ush, 0, 0) : M;
   Ref cntnz = vemit(f, gb, I_NE, VT_I32, cnt, zero, 0, 0);
@@ -12159,8 +12240,99 @@ static Ref guard_trip_count(IrFunc *f, uint32_t gb, ValType ct, IrOp rel,
                vemit(f, gb, I_LEU, VT_I32, cnt, cap, 0, 0), 0, 0);
   }
   *ok_out = ok;
+  if (T_out) *T_out = T;
   return cnt;
 }
+
+/* How many copies of the body an iteration of the vector loop holds where
+   nothing keeps it to fewer: the target's say, or WARMC_VEC_COPIES (1, 2
+   or 4), for measuring.  Four on arm64: two was the most an elementwise
+   loop needed to keep up with native (vecbench/addi32 1.00x), but a
+   reduction's accumulators wait on adds of two cycles or more, and with
+   four, vecbench/dotint ran 0.54x native where two left it 0.72x. */
+static uint32_t v_copies_wanted(void) {
+  const char *e = warmc_getenv("WARMC_VEC_COPIES");
+  uint32_t n = e ? (uint32_t)atoi(e) : ir_vec_copies();
+  return n >= 4 ? 4u : n >= 2 ? 2u : 1u;
+}
+
+/* One vector loop: its block, the copies of the body it holds, its
+   parameters and what it passes itself for the next iteration. */
+typedef struct {
+  uint32_t blk, R;
+  Ref pptr[VEC_MAX_GRP], pcnt, pacc[VEC_MAX_RED][VEC_MAX_COPY];
+  Ref ppay[VEC_MAX_PAY], ppos;
+  Ref nptr[VEC_MAX_GRP], ncnt, more;
+  Ref nextacc[VEC_MAX_RED][VEC_MAX_COPY], nextpay[VEC_MAX_PAY], nextpos;
+} VBody;
+
+/* What a value read past a loop is to the vector loop's exit: np for one
+   from outside the loop, or a constant, which is anywhere's; p for the
+   value the loop carries into its next iteration as back[p]; -1 for any
+   other value of the loop. */
+static int v_live_slot(IrFunc *f, const uint8_t *inloop, Ref v, const Ref *back,
+                       uint32_t np) {
+  const Inst *in = &f->insts[v];
+  if (!inloop[in->block] || in->op == I_CONST) return (int)np;
+  for (uint32_t p = 0; p < np; p++)
+    if (back[p] == v) return (int)p;
+  return -1;
+}
+
+#define V_EACH_USE(b, X) do {                                              \
+    for (uint32_t i_ = 0; i_ < (b)->ninsts; i_++) {                        \
+      Ref *a_ = ir_args(f, (b)->insts[i_]);                                \
+      for (uint32_t j_ = 0; j_ < f->insts[(b)->insts[i_]].nargs; j_++)     \
+        X(a_[j_]);                                                         \
+    }                                                                      \
+    if ((b)->term == T_BRIF || (b)->term == T_BRTABLE) X((b)->term_arg);   \
+    for (uint32_t j_ = 0; j_ < (b)->nret; j_++) X((b)->ret_args[j_]);      \
+    for (uint32_t s_ = 0; s_ < (b)->nsuccs; s_++)                          \
+      for (uint32_t j_ = 0; j_ < (b)->succs[s_].nargs; j_++)               \
+        X((b)->succs[s_].args[j_]);                                        \
+  } while (0)
+
+/* Can the vector loop's exit go past the scalar loop, to the block the
+   scalar loop leaves for?  Only if every value of the loop read past it --
+   on the exit edge or in any block outside the loop -- is one the loop
+   carries into its next iteration, which the vector exit computes as well.
+   need[p] says whether back[p] is read outside the loop other than on the
+   exit edge, and so has to become a parameter of the exit block; which
+   only a block the latch alone enters can have read so (then everything
+   past the loop is past that block), and only such a block can take. */
+static bool v_exit_live(IrFunc *f, const uint8_t *inloop, uint32_t latch,
+                        uint32_t xsucc, const Ref *back, uint32_t np,
+                        uint8_t *need) {
+  const Edge *ex = &f->blocks[latch].succs[xsucc];
+  const Block *xb = &f->blocks[ex->target];
+  if (ex->eh || xb->is_pad || inloop[ex->target]) return false;
+  memset(need, 0, np);
+  for (uint32_t j = 0; j < ex->nargs; j++)
+    if (v_live_slot(f, inloop, ex->args[j], back, np) < 0) return false;
+  bool ok = true;
+#define V_LIVE(x) do { int p_ = v_live_slot(f, inloop, (x), back, np);      \
+    if (p_ < 0) ok = false; else if (p_ < (int)np) need[p_] = 1; } while (0)
+  for (uint32_t oi = 0; oi < f->norder && ok; oi++)
+    if (!inloop[f->order[oi]]) V_EACH_USE(&f->blocks[f->order[oi]], V_LIVE);
+#undef V_LIVE
+  for (uint32_t p = 0; p < np && ok; p++)
+    if (need[p] && xb->npreds != 1) ok = false;
+  return ok;
+}
+
+/* Every read of back[p] outside the loop now reads the exit block's
+   parameter par[p]: in the blocks v_exit_live looked at, the ones reached
+   before the vector loop was made (f->order is not yet redone). */
+static void v_exit_rewrite(IrFunc *f, const uint8_t *inloop, const Ref *back,
+                           uint32_t np, const Ref *par) {
+#define V_SWAP(x) do { for (uint32_t p_ = 0; p_ < np; p_++)                 \
+    if (par[p_] != REF_NONE && (x) == back[p_]) { (x) = par[p_]; break; } \
+  } while (0)
+  for (uint32_t oi = 0; oi < f->norder; oi++)
+    if (!inloop[f->order[oi]]) V_EACH_USE(&f->blocks[f->order[oi]], V_SWAP);
+#undef V_SWAP
+}
+#undef V_EACH_USE
 
 static bool vectorize_one(IrFunc *f, uint32_t hb, uint8_t *reach, uint8_t *inloop) {
 #define VREJ(w) do { if (warmc_getenv("WARMC_VEC_DEBUG")) \
@@ -12551,6 +12723,9 @@ static bool vectorize_one(IrFunc *f, uint32_t hb, uint8_t *reach, uint8_t *inloo
 
   uint32_t chk[VEC_MAX_CHECK][2];
   uint32_t nchk = 0;
+  /* the most vector iterations' worth of elements a store and another
+     access through the same pointer are apart */
+  uint64_t rcap = ~0ull;
   for (uint32_t g = 0; g < ctx.ngrp; g++) {
     for (uint32_t g2 = g + 1; g2 < ctx.ngrp; g2++) {
       VGroup *A = &ctx.grp[g], *Bg = &ctx.grp[g2];
@@ -12577,6 +12752,8 @@ static bool vectorize_one(IrFunc *f, uint32_t hb, uint8_t *reach, uint8_t *inloo
         if ((a_first ? A : Bg)->store) VREJ("store read back in the same iteration");
       } else if (dist < W * A->m) {
         VREJ("overlapping groups");
+      } else if (dist / ((uint64_t)W * A->m) < rcap) {
+        rcap = dist / ((uint64_t)W * A->m);
       }
     }
   }
@@ -12985,6 +13162,7 @@ static bool vectorize_one(IrFunc *f, uint32_t hb, uint8_t *reach, uint8_t *inloo
   if (K == 0 || (K & (K - 1))) VREJ("counter step is not a power of two");
   if (K >= (1ull << (cbits - 2))) VREJ("counter step");
 
+  uint64_t tmax = ~0ull;
   {
     uint64_t dmax = ~0ull, zc;
     if (prestep) {
@@ -12998,7 +13176,42 @@ static bool vectorize_one(IrFunc *f, uint32_t hb, uint8_t *reach, uint8_t *inloo
     }
     if (dmax != ~0ull && dmax / K + 1 <= (uint64_t)U)
       VREJ("trip count cannot fill a vector");
+    if (dmax != ~0ull) tmax = dmax / K + 1;
   }
+
+  /* Copies.  A loop of one vector an iteration bumps every group's pointer
+     once per sixteen bytes, and Apple's cores retire such a loop at one
+     iteration a cycle however little it computes: vecbench/addi32 took
+     1.06 cycles a vector where native, two vectors off each pointer and one
+     bump, takes 0.80.  A reduction's one accumulator is worse, a chain of
+     two-cycle adds (vecbench/dotint 1.9 cycles a vector, 1.0 with two).  So
+     where the scalar body's U iterations fill one vector, an iteration of
+     the vector loop holds R copies of them, 16 bytes apart off the same
+     pointers, and each reduction keeps an accumulator per copy, the copies
+     combined after the loop.  The guard still counts single vectors, and a
+     second loop of one copy takes the last count % R of them, so a loop too
+     short for R vectors runs as many vectors as it did.  Fewer copies where
+     the count is known to fill no more than R vectors; none where an index
+     is kept beside a min or max (its positions are one vector's), nor where
+     a store and another access through the same pointer are less than R
+     vectors apart -- the copies' loads all come before their stores. */
+  uint32_t R = 1;
+  if (nvec == 1 && !npay) {
+    R = v_copies_wanted();
+    while (R > 1 && (rcap < R || tmax <= (uint64_t)U * R)) R >>= 1;
+  }
+
+  /* Past the scalar loop.  The guard leaves the scalar loop 1..U
+     iterations, because the vector loop's exit can only go on into it; for
+     a loop of 4096 bytes that is sixteen scalar iterations after 255
+     vectors, 7% of vecbench/addi8.  Where the loop hands on nothing but
+     values it carries, which the vector exit computes too (v_exit_live),
+     the vector loop takes every whole vector and its exit goes straight to
+     the scalar loop's exit block when nothing is left. */
+  uint32_t xsucc = taken_continues ? 1u : 0u;
+  uint32_t xb = lb->succs[xsucc].target;
+  uint8_t xneed[16];
+  bool skip = v_exit_live(f, inloop, latch, xsucc, back_args, np, xneed);
 
   uint32_t vguard = ir_new_block(f);
   uint32_t vbody = ir_new_block(f);
@@ -13010,9 +13223,9 @@ static bool vectorize_one(IrFunc *f, uint32_t hb, uint8_t *reach, uint8_t *inloo
   if (prestep) bound = ir_emit(f, vguard, I_CONST, ct, NULL, 0, pre_bound, 0);
   uint32_t us = v_log2(U);
   Ref q0 = iventry[tp];
-  Ref ok;
+  Ref ok, T;
   Ref cnt = guard_trip_count(f, vguard, ct, rel, K, down, q0, bound,
-                             clone_bound, U, &ok);
+                             clone_bound, U, skip, &T, &ok);
   if (npay) {
     /* at most 2^24 vector iterations, so a position stays below 2^28 */
     Ref cap = ir_emit(f, vguard, I_CONST, ct, NULL, 0, 0x00ffffffu, 0);
@@ -13073,24 +13286,35 @@ static bool vectorize_one(IrFunc *f, uint32_t hb, uint8_t *reach, uint8_t *inloo
       a0 = a0 == REF_NONE ? gb : vemit(f, vguard, I_ADD, at, a0, gb, 0, 0);
     }
 
-    if (backward) cst = (cst + Sa - W) & amask;
+    /* An interleaved group moves m times the stride an iteration, and
+       spans m times the bytes: backward, its first vectors start m times
+       as far below the first iteration's elements, and either way it
+       reaches m times as far as the others.  With one vector's extent the
+       guard took an output just past it for one apart from it
+       (test/cases/veccopies.wat pairs_alias), and backward the vectors
+       were off by the difference (pairsrev). */
+    if (backward) cst = (cst + (uint64_t)G->m * (Sa - W)) & amask;
     if (cst || a0 == REF_NONE) {
       Ref dc = ir_emit(f, vguard, I_CONST, at, NULL, 0, cst, 0);
       a0 = a0 == REF_NONE ? dc : vemit(f, vguard, I_ADD, at, a0, dc, 0, 0);
     }
     Ref a64 = idx64 ? a0
             : vemit(f, vguard, I_EXTENDU, VT_I64, a0, REF_NONE, 0, 0);
+    Ref gbytes = G->m == 1 ? bytes
+               : vemit(f, vguard, I_MUL, VT_I64, bytes,
+                       ir_emit(f, vguard, I_CONST, VT_I64, NULL, 0, G->m, 0), 0, 0);
     Ref lo, hi;
     if (backward) {
 
       hi = vemit(f, vguard, I_ADD, VT_I64, a64,
-                 ir_emit(f, vguard, I_CONST, VT_I64, NULL, 0, W, 0), 0, 0);
-      lo = vemit(f, vguard, I_SUB, VT_I64, hi, bytes, 0, 0);
+                 ir_emit(f, vguard, I_CONST, VT_I64, NULL, 0, (uint64_t)W * G->m, 0),
+                 0, 0);
+      lo = vemit(f, vguard, I_SUB, VT_I64, hi, gbytes, 0, 0);
       ok = vemit(f, vguard, I_AND, VT_I32, ok,
                  vemit(f, vguard, I_LEU, VT_I32, lo, hi, 0, 0), 0, 0);
     } else {
       lo = a64;
-      hi = vemit(f, vguard, I_ADD, VT_I64, a64, bytes, 0, 0);
+      hi = vemit(f, vguard, I_ADD, VT_I64, a64, gbytes, 0, 0);
 
       if (idx64)
         ok = vemit(f, vguard, I_AND, VT_I32, ok,
@@ -13116,205 +13340,253 @@ static bool vectorize_one(IrFunc *f, uint32_t hb, uint8_t *reach, uint8_t *inloo
     ok = vemit(f, vguard, I_AND, VT_I32, ok, apart, 0, 0);
   }
 
-  Ref pptr[VEC_MAX_GRP], pacc[VEC_MAX_RED];
-  for (uint32_t g = 0; g < ctx.ngrp; g++) pptr[g] = ir_add_param(f, vbody, VT_I64);
-  Ref pcnt = ir_add_param(f, vbody, ct);
-
+  IrOp redvop[VEC_MAX_RED];
   for (uint32_t r = 0; r < nred; r++)
-    pacc[r] = ir_add_param(f, vbody, VT_V128);
-  Ref ppay[VEC_MAX_PAY], ppos = REF_NONE;
-  for (uint32_t i = 0; i < npay; i++) ppay[i] = ir_add_param(f, vbody, VT_V128);
-  if (npay) ppos = ir_add_param(f, vbody, VT_V128);
+    redvop[r] = v_is_minmax_op(redop[r]) ? redop[r]
+              : redop[r] == I_FMIN ? I_VFMIN
+              : redop[r] == I_FMAX ? I_VFMAX
+              : redop[r] == I_ADD ? I_VADD
+              : redop[r] == I_AND ? I_VAND
+              : redop[r] == I_OR  ? I_VOR : I_VXOR;
 
+  /* A group at the very addresses of an earlier one -- the store back of
+     an in-place update -- goes through that group's pointer, one bump
+     fewer an iteration (vecbench/inplace). */
+  uint32_t gown[VEC_MAX_GRP];
   for (uint32_t g = 0; g < ctx.ngrp; g++) {
-    VGroup *G = &ctx.grp[g];
-    if (G->store) continue;
-    Ref raw[VEC_MAX_VEC];
-    for (uint32_t v = 0; v < G->nv; v++)
-      raw[v] = vemit(f, vbody, I_VLOAD, VT_V128, pptr[g], REF_NONE,
-                     v * VEC_BYTES, lane);
-    if (G->m == 1) {
-      for (uint32_t v = 0; v < G->nv; v++) G->loaded[v] = raw[v];
-    } else {
-
-      G->loaded[0] = vemit(f, vbody, I_VUZP1, VT_V128, raw[0], raw[1], gran, lane);
-      G->loaded[1] = vemit(f, vbody, I_VUZP2, VT_V128, raw[0], raw[1], gran, lane);
+    const VGroup *G = &ctx.grp[g];
+    gown[g] = g;
+    for (uint32_t q = 0; q < g && gown[g] == g; q++) {
+      const VGroup *Q = &ctx.grp[q];
+      if (Q->base == G->base && Q->ivx == G->ivx && Q->coeff == G->coeff &&
+          Q->disp == G->disp && Q->m == G->m && Q->mem == G->mem)
+        gown[g] = q;
     }
   }
 
-  bool bad = false;
-  Ref stored[VEC_MAX_GRP][VEC_MAX_VEC];
-  for (uint32_t g = 0; g < ctx.ngrp && !bad; g++) {
-    VGroup *G = &ctx.grp[g];
-    if (!G->store) continue;
-    for (uint32_t v = 0; v < G->nv && !bad; v++) {
-      Ref tuple[VEC_MAX_MEMB];
-      for (uint32_t t = 0; t < mpv; t++)
-        tuple[t] = ir_args(f, G->member[v_slot(G, mpv, v, t)])[1];
-      stored[g][v] = v_build(&ctx, tuple, mpv, 1, VEC_DEPTH);
-      if (stored[g][v] == REF_NONE) bad = true;
-    }
-  }
-  Ref accval[VEC_MAX_RED][VEC_MAX_VEC];
-
-  Ref mulx[VEC_MAX_RED][VEC_MAX_VEC], muly[VEC_MAX_RED][VEC_MAX_VEC];
-  for (uint32_t r = 0; r < nred && !bad; r++)
-    for (uint32_t v = 0; v < nvec && !bad; v++) {
-      if (redmul[r]) {
-        Ref xs[VEC_MAX_MEMB], ys[VEC_MAX_MEMB];
-        for (uint32_t t = 0; t < mpv; t++) {
-          Ref *ma = ir_args(f, redterm[r][v * mpv + t]);
-          xs[t] = ma[0]; ys[t] = ma[1];
-        }
-        mulx[r][v] = v_build(&ctx, xs, mpv, 1, VEC_DEPTH);
-        muly[r][v] = v_build(&ctx, ys, mpv, 1, VEC_DEPTH);
-        accval[r][v] = REF_NONE;
-        if (mulx[r][v] == REF_NONE || muly[r][v] == REF_NONE) bad = true;
-        continue;
-      }
-      accval[r][v] = v_build(&ctx, redterm[r] + v * mpv, mpv, 1, VEC_DEPTH);
-      if (accval[r][v] == REF_NONE) bad = true;
-    }
-  if (bad) {
-
-    VREJ_OP2("body is not vectorisable", ctx.fail ? ctx.fail : "no reason recorded");
-  }
-
-  for (uint32_t g = 0; g < ctx.ngrp && !bad; g++) {
-    VGroup *G = &ctx.grp[g];
-    if (!G->store || !G->spec) continue;
-    for (uint32_t v = 0; v < G->nv && !bad; v++) {
-      Ref ct[VEC_MAX_MEMB];
-      for (uint32_t t = 0; t < mpv; t++)
-        ct[t] = G->mcond[v_slot(G, mpv, v, t)];
-      bool swap_arms = false;
-      Ref mask = v_mask(&ctx, ct, mpv, 1, VEC_DEPTH, &swap_arms);
-      if (mask == REF_NONE) { bad = true; break; }
-      Ref old = vemit(f, vbody, I_VLOAD, VT_V128, pptr[g], REF_NONE,
-                      v * VEC_BYTES, lane);
-
-      bool keep_new = G->pol != swap_arms;
-      stored[g][v] = vemit3(f, vbody, I_VSEL, VT_V128, mask,
-                            keep_new ? stored[g][v] : old,
-                            keep_new ? old : stored[g][v], 0, lane);
-    }
-  }
-  if (bad) VREJ("conditional store");
-
-  for (uint32_t g = 0; g < ctx.ngrp; g++) {
-    VGroup *G = &ctx.grp[g];
-    if (!G->store) continue;
-    if (G->m == 1) {
-      for (uint32_t v = 0; v < G->nv; v++)
-        vemit(f, vbody, I_VSTORE, (ValType)0, pptr[g], stored[g][v],
-              v * VEC_BYTES, lane);
-    } else {
-      Ref z0 = vemit(f, vbody, I_VZIP1, VT_V128, stored[g][0], stored[g][1], gran, lane);
-      Ref z1 = vemit(f, vbody, I_VZIP2, VT_V128, stored[g][0], stored[g][1], gran, lane);
-      vemit(f, vbody, I_VSTORE, (ValType)0, pptr[g], z0, 0, lane);
-      vemit(f, vbody, I_VSTORE, (ValType)0, pptr[g], z1, VEC_BYTES, lane);
-    }
-  }
-
-  Ref nextacc[VEC_MAX_RED];
+  /* The bodies: the loop of R copies, and with more than one the loop of
+     one copy after it. */
+  uint32_t vbody1 = R > 1 ? ir_new_block(f) : REF_NONE;
+  VBody bod[2];
+  Ref accval[VEC_MAX_RED][VEC_MAX_COPY][VEC_MAX_VEC];
   Ref accbefore[VEC_MAX_RED][VEC_MAX_VEC];
-  for (uint32_t r = 0; r < nred; r++) {
-    IrOp vop = v_is_minmax_op(redop[r]) ? redop[r]
-             : redop[r] == I_FMIN ? I_VFMIN
-             : redop[r] == I_FMAX ? I_VFMAX
-             : redop[r] == I_ADD ? I_VADD
-             : redop[r] == I_AND ? I_VAND
-             : redop[r] == I_OR  ? I_VOR : I_VXOR;
-    uint32_t sg = redsigned[r] ? 1u : 0u;
-    nextacc[r] = pacc[r];
-    for (uint32_t v = 0; v < nvec; v++) {
-      accbefore[r][v] = nextacc[r];
-      if (!redwiden[r]) {
-        Ref cm = vop == I_VADD ? v_counted_mask(f, accval[r][v]) : REF_NONE;
-        if (cm != REF_NONE)
-          nextacc[r] = vemit(f, vbody, I_VSUB, VT_V128, nextacc[r], cm, 0, lane);
-        else
-          nextacc[r] = vemit(f, vbody, vop, VT_V128, nextacc[r],
-                             accval[r][v], 0, lane);
-        continue;
-      }
+  for (uint32_t bi = 0; bi < (R > 1 ? 2u : 1u); bi++) {
+    VBody *B = &bod[bi];
+    uint32_t vb = bi ? vbody1 : vbody, RC = bi ? 1u : R;
+    B->blk = vb;
+    B->R = RC;
+    ctx.vbody = vb;
+    ctx.copy = 0;
+    if (bi) v_memo_next_copy(&ctx);
 
-      Ref cur;
-      if (redmul[r]) {
+    for (uint32_t g = 0; g < ctx.ngrp; g++)
+      B->pptr[g] = gown[g] == g ? ir_add_param(f, vb, VT_I64) : B->pptr[gown[g]];
+    B->pcnt = ir_add_param(f, vb, ct);
 
-        Ref lo = vemit(f, vbody, I_VEXTMUL, VT_V128, mulx[r][v], muly[r][v],
-                       sg, lane + 1);
-        Ref hi = vemit(f, vbody, I_VEXTMUL, VT_V128, mulx[r][v], muly[r][v],
-                       sg | 2u, lane + 1);
-        cur = vemit(f, vbody, I_VADD, VT_V128, lo, hi, 0, lane + 1);
-      } else {
-        cur = accval[r][v];
-        for (uint32_t st = 0; st < redwiden[r]; st++) {
-          uint32_t dst_lane = lane + st + 1;
-          Ref lo = vemit(f, vbody, I_VEXTEND, VT_V128, cur, REF_NONE,
-                         sg, dst_lane);
-          Ref hi = vemit(f, vbody, I_VEXTEND, VT_V128, cur, REF_NONE,
-                         sg | 2u, dst_lane);
-          cur = vemit(f, vbody, I_VADD, VT_V128, lo, hi, 0, dst_lane);
+    for (uint32_t r = 0; r < nred; r++)
+      for (uint32_t c = 0; c < RC; c++) B->pacc[r][c] = ir_add_param(f, vb, VT_V128);
+    B->ppos = REF_NONE;
+    for (uint32_t i = 0; i < npay; i++) B->ppay[i] = ir_add_param(f, vb, VT_V128);
+    if (npay) B->ppos = ir_add_param(f, vb, VT_V128);
+
+    /* every copy's loads first, a group's side by side, which the back end
+       pairs */
+    for (uint32_t g = 0; g < ctx.ngrp; g++) {
+      VGroup *G = &ctx.grp[g];
+      if (G->store) continue;
+      Ref raw[VEC_MAX_COPY][VEC_MAX_VEC];
+      for (uint32_t c = 0; c < RC; c++)
+        for (uint32_t v = 0; v < G->nv; v++)
+          raw[c][v] = vemit(f, vb, I_VLOAD, VT_V128, B->pptr[g], REF_NONE,
+                            (c * G->nv + v) * VEC_BYTES, lane);
+      for (uint32_t c = 0; c < RC; c++) {
+        if (G->m == 1) {
+          for (uint32_t v = 0; v < G->nv; v++) G->loaded[c][v] = raw[c][v];
+        } else {
+
+          G->loaded[c][0] = vemit(f, vb, I_VUZP1, VT_V128, raw[c][0], raw[c][1], gran, lane);
+          G->loaded[c][1] = vemit(f, vb, I_VUZP2, VT_V128, raw[c][0], raw[c][1], gran, lane);
         }
       }
-      nextacc[r] = vemit(f, vbody, I_VADD, VT_V128, nextacc[r], cur,
-                         0, lane + redwiden[r]);
     }
-  }
 
-  /* An index takes the position of an element where its reduction's
-     compare, against the accumulator as it was before that vector, takes
-     the element. */
-  Ref nextpay[VEC_MAX_PAY], nextpos = REF_NONE;
-  if (npay) {
-    uint32_t lv = VEC_BYTES / width;
-    for (uint32_t i = 0; i < npay; i++) {
-      uint32_t r = payred[i];
-      uint64_t vop;
-      bool swap_ops, swap_arms;
-      v_cmp_form(paycop[i], &vop, &swap_ops, &swap_arms);
-      nextpay[i] = ppay[i];
-      for (uint32_t v = 0; v < nvec; v++) {
-        Ref pos = ppos;
-        if (v) {
-          Ref c = ir_emit(f, vguard, I_CONST, VT_I32, NULL, 0, v * lv, 0);
-          pos = vemit(f, vbody, I_VADD, VT_V128, ppos,
-                      vemit(f, vguard, I_VSPLAT, VT_V128, c, REF_NONE, 0, lane),
-                      0, lane);
+    Ref stored[VEC_MAX_GRP][VEC_MAX_COPY][VEC_MAX_VEC];
+    Ref mulx[VEC_MAX_RED][VEC_MAX_COPY][VEC_MAX_VEC];
+    Ref muly[VEC_MAX_RED][VEC_MAX_COPY][VEC_MAX_VEC];
+    for (uint32_t c = 0; c < RC; c++) {
+      ctx.copy = c;
+      if (c) v_memo_next_copy(&ctx);
+      bool bad = false;
+      for (uint32_t g = 0; g < ctx.ngrp && !bad; g++) {
+        VGroup *G = &ctx.grp[g];
+        if (!G->store) continue;
+        for (uint32_t v = 0; v < G->nv && !bad; v++) {
+          Ref tuple[VEC_MAX_MEMB];
+          for (uint32_t t = 0; t < mpv; t++)
+            tuple[t] = ir_args(f, G->member[v_slot(G, mpv, v, t)])[1];
+          stored[g][c][v] = v_build(&ctx, tuple, mpv, 1, VEC_DEPTH);
+          if (stored[g][c][v] == REF_NONE) bad = true;
         }
-        Ref x = payltm[i] ? accval[r][v] : accbefore[r][v];
-        Ref y = payltm[i] ? accbefore[r][v] : accval[r][v];
-        if (swap_ops) { Ref t = x; x = y; y = t; }
-        Ref mask = vemit(f, vbody, I_VCMP, VT_V128, x, y, vop, lane);
-        bool take_on_mask = payside[i] != swap_arms;
-        nextpay[i] = vemit3(f, vbody, I_VSEL, VT_V128, mask,
-                            take_on_mask ? pos : nextpay[i],
-                            take_on_mask ? nextpay[i] : pos, 0, lane);
+      }
+
+      for (uint32_t r = 0; r < nred && !bad; r++)
+        for (uint32_t v = 0; v < nvec && !bad; v++) {
+          if (redmul[r]) {
+            Ref xs[VEC_MAX_MEMB], ys[VEC_MAX_MEMB];
+            for (uint32_t t = 0; t < mpv; t++) {
+              Ref *ma = ir_args(f, redterm[r][v * mpv + t]);
+              xs[t] = ma[0]; ys[t] = ma[1];
+            }
+            mulx[r][c][v] = v_build(&ctx, xs, mpv, 1, VEC_DEPTH);
+            muly[r][c][v] = v_build(&ctx, ys, mpv, 1, VEC_DEPTH);
+            accval[r][c][v] = REF_NONE;
+            if (mulx[r][c][v] == REF_NONE || muly[r][c][v] == REF_NONE) bad = true;
+            continue;
+          }
+          accval[r][c][v] = v_build(&ctx, redterm[r] + v * mpv, mpv, 1, VEC_DEPTH);
+          if (accval[r][c][v] == REF_NONE) bad = true;
+        }
+      if (bad) {
+
+        VREJ_OP2("body is not vectorisable", ctx.fail ? ctx.fail : "no reason recorded");
+      }
+
+      for (uint32_t g = 0; g < ctx.ngrp && !bad; g++) {
+        VGroup *G = &ctx.grp[g];
+        if (!G->store || !G->spec) continue;
+        for (uint32_t v = 0; v < G->nv && !bad; v++) {
+          Ref ct[VEC_MAX_MEMB];
+          for (uint32_t t = 0; t < mpv; t++)
+            ct[t] = G->mcond[v_slot(G, mpv, v, t)];
+          bool swap_arms = false;
+          Ref mask = v_mask(&ctx, ct, mpv, 1, VEC_DEPTH, &swap_arms);
+          if (mask == REF_NONE) { bad = true; break; }
+          Ref old = vemit(f, vb, I_VLOAD, VT_V128, B->pptr[g], REF_NONE,
+                          (c * G->nv + v) * VEC_BYTES, lane);
+
+          bool keep_new = G->pol != swap_arms;
+          stored[g][c][v] = vemit3(f, vb, I_VSEL, VT_V128, mask,
+                                   keep_new ? stored[g][c][v] : old,
+                                   keep_new ? old : stored[g][c][v], 0, lane);
+        }
+      }
+      if (bad) VREJ("conditional store");
+    }
+
+    for (uint32_t g = 0; g < ctx.ngrp; g++) {
+      VGroup *G = &ctx.grp[g];
+      if (!G->store) continue;
+      for (uint32_t c = 0; c < RC; c++) {
+        uint64_t co = (uint64_t)c * G->nv * VEC_BYTES;
+        if (G->m == 1) {
+          for (uint32_t v = 0; v < G->nv; v++)
+            vemit(f, vb, I_VSTORE, (ValType)0, B->pptr[g], stored[g][c][v],
+                  co + v * VEC_BYTES, lane);
+        } else {
+          Ref z0 = vemit(f, vb, I_VZIP1, VT_V128, stored[g][c][0], stored[g][c][1],
+                         gran, lane);
+          Ref z1 = vemit(f, vb, I_VZIP2, VT_V128, stored[g][c][0], stored[g][c][1],
+                         gran, lane);
+          vemit(f, vb, I_VSTORE, (ValType)0, B->pptr[g], z0, co, lane);
+          vemit(f, vb, I_VSTORE, (ValType)0, B->pptr[g], z1, co + VEC_BYTES, lane);
+        }
       }
     }
-    Ref c = ir_emit(f, vguard, I_CONST, VT_I32, NULL, 0, nvec * lv, 0);
-    nextpos = vemit(f, vbody, I_VADD, VT_V128, ppos,
-                    vemit(f, vguard, I_VSPLAT, VT_V128, c, REF_NONE, 0, lane), 0, lane);
-  }
 
-  Ref step1 = ir_emit(f, vbody, I_CONST, VT_I64, NULL, 0, W, 0);
-  Ref stepm = REF_NONE;
-  Ref nptr[VEC_MAX_GRP];
-  for (uint32_t g = 0; g < ctx.ngrp; g++) {
-    Ref st = step1;
-    if (ctx.grp[g].m > 1) {
-      if (stepm == REF_NONE)
-        stepm = ir_emit(f, vbody, I_CONST, VT_I64, NULL, 0,
-                        (uint64_t)W * ctx.grp[g].m, 0);
-      st = stepm;
+    for (uint32_t r = 0; r < nred; r++) {
+      IrOp vop = redvop[r];
+      uint32_t sg = redsigned[r] ? 1u : 0u;
+      for (uint32_t c = 0; c < RC; c++) {
+        Ref acc = B->pacc[r][c];
+        for (uint32_t v = 0; v < nvec; v++) {
+          if (!c) accbefore[r][v] = acc;
+          if (!redwiden[r]) {
+            Ref cm = vop == I_VADD ? v_counted_mask(f, accval[r][c][v]) : REF_NONE;
+            if (cm != REF_NONE)
+              acc = vemit(f, vb, I_VSUB, VT_V128, acc, cm, 0, lane);
+            else
+              acc = vemit(f, vb, vop, VT_V128, acc, accval[r][c][v], 0, lane);
+            continue;
+          }
+
+          Ref cur;
+          if (redmul[r]) {
+
+            Ref lo = vemit(f, vb, I_VEXTMUL, VT_V128, mulx[r][c][v], muly[r][c][v],
+                           sg, lane + 1);
+            Ref hi = vemit(f, vb, I_VEXTMUL, VT_V128, mulx[r][c][v], muly[r][c][v],
+                           sg | 2u, lane + 1);
+            cur = vemit(f, vb, I_VADD, VT_V128, lo, hi, 0, lane + 1);
+          } else {
+            /* A sum does not care which elements meet first: each step
+               adds neighbouring lanes into one twice as wide, one
+               instruction where widening the halves and adding them took
+               three (vecbench/widen8 was bound by them). */
+            cur = accval[r][c][v];
+            for (uint32_t st = 0; st < redwiden[r]; st++)
+              cur = vemit(f, vb, I_VEXTADD, VT_V128, cur, REF_NONE, sg,
+                          lane + st + 1);
+          }
+          acc = vemit(f, vb, I_VADD, VT_V128, acc, cur, 0, lane + redwiden[r]);
+        }
+        B->nextacc[r][c] = acc;
+      }
     }
-    nptr[g] = vemit(f, vbody, backward ? I_SUB : I_ADD, VT_I64, pptr[g], st, 0, 0);
+
+    /* An index takes the position of an element where its reduction's
+       compare, against the accumulator as it was before that vector, takes
+       the element. */
+    B->nextpos = REF_NONE;
+    if (npay) {
+      uint32_t lv = VEC_BYTES / width;
+      for (uint32_t i = 0; i < npay; i++) {
+        uint32_t r = payred[i];
+        uint64_t vop;
+        bool swap_ops, swap_arms;
+        v_cmp_form(paycop[i], &vop, &swap_ops, &swap_arms);
+        B->nextpay[i] = B->ppay[i];
+        for (uint32_t v = 0; v < nvec; v++) {
+          Ref pos = B->ppos;
+          if (v) {
+            Ref c = ir_emit(f, vguard, I_CONST, VT_I32, NULL, 0, v * lv, 0);
+            pos = vemit(f, vb, I_VADD, VT_V128, B->ppos,
+                        vemit(f, vguard, I_VSPLAT, VT_V128, c, REF_NONE, 0, lane),
+                        0, lane);
+          }
+          Ref x = payltm[i] ? accval[r][0][v] : accbefore[r][v];
+          Ref y = payltm[i] ? accbefore[r][v] : accval[r][0][v];
+          if (swap_ops) { Ref t = x; x = y; y = t; }
+          Ref mask = vemit(f, vb, I_VCMP, VT_V128, x, y, vop, lane);
+          bool take_on_mask = payside[i] != swap_arms;
+          B->nextpay[i] = vemit3(f, vb, I_VSEL, VT_V128, mask,
+                                 take_on_mask ? pos : B->nextpay[i],
+                                 take_on_mask ? B->nextpay[i] : pos, 0, lane);
+        }
+      }
+      Ref c = ir_emit(f, vguard, I_CONST, VT_I32, NULL, 0, nvec * lv, 0);
+      B->nextpos = vemit(f, vb, I_VADD, VT_V128, B->ppos,
+                         vemit(f, vguard, I_VSPLAT, VT_V128, c, REF_NONE, 0, lane),
+                         0, lane);
+    }
+
+    Ref step1 = ir_emit(f, vb, I_CONST, VT_I64, NULL, 0, (uint64_t)W * RC, 0);
+    Ref stepm = REF_NONE;
+    for (uint32_t g = 0; g < ctx.ngrp; g++) {
+      if (gown[g] != g) { B->nptr[g] = B->nptr[gown[g]]; continue; }
+      Ref st = step1;
+      if (ctx.grp[g].m > 1) {
+        if (stepm == REF_NONE)
+          stepm = ir_emit(f, vb, I_CONST, VT_I64, NULL, 0,
+                          (uint64_t)W * ctx.grp[g].m * RC, 0);
+        st = stepm;
+      }
+      B->nptr[g] = vemit(f, vb, backward ? I_SUB : I_ADD, VT_I64, B->pptr[g], st, 0, 0);
+    }
+    Ref vone = ir_emit(f, vb, I_CONST, ct, NULL, 0, 1, 0);
+    Ref vzero = ir_emit(f, vb, I_CONST, ct, NULL, 0, 0, 0);
+    B->ncnt = vemit(f, vb, I_SUB, ct, B->pcnt, vone, 0, 0);
+    B->more = vemit(f, vb, I_NE, VT_I32, B->ncnt, vzero, 0, 0);
   }
-  Ref vone = ir_emit(f, vbody, I_CONST, ct, NULL, 0, 1, 0);
-  Ref vzero = ir_emit(f, vbody, I_CONST, ct, NULL, 0, 0, 0);
-  Ref ncnt = vemit(f, vbody, I_SUB, ct, pcnt, vone, 0, 0);
-  Ref more = vemit(f, vbody, I_NE, VT_I32, ncnt, vzero, 0, 0);
 
   Ref eacc[VEC_MAX_RED], epay[VEC_MAX_PAY];
   for (uint32_t r = 0; r < nred; r++)
@@ -13328,9 +13600,11 @@ static bool vectorize_one(IrFunc *f, uint32_t hb, uint8_t *reach, uint8_t *inloo
       f->blocks[pre].succs[s].nargs = 0;
     }
 
-  Ref vb_args[VEC_MAX_GRP + 1 + VEC_MAX_RED + VEC_MAX_PAY + 1];
+  Ref vb_args[VEC_MAX_GRP + 1 + VEC_MAX_RED * VEC_MAX_COPY + VEC_MAX_PAY + 1];
+  Ref ident[VEC_MAX_RED];
   uint32_t nvb = 0;
-  for (uint32_t g = 0; g < ctx.ngrp; g++) vb_args[nvb++] = ctx.grp[g].ptr;
+  for (uint32_t g = 0; g < ctx.ngrp; g++)
+    if (gown[g] == g) vb_args[nvb++] = ctx.grp[g].ptr;
   vb_args[nvb++] = cnt;
   for (uint32_t r = 0; r < nred; r++) {
 
@@ -13339,16 +13613,17 @@ static bool vectorize_one(IrFunc *f, uint32_t hb, uint8_t *reach, uint8_t *inloo
 
     /* +inf and -inf are the identities of a float min and max: no NaN, and
        min(+inf, -0) is -0 */
-    uint64_t ident = redop[r] == I_FMIN ? (w32 ? 0x7f800000u : 0x7ff0000000000000ull)
-                   : redop[r] == I_FMAX ? (w32 ? 0xff800000u : 0xfff0000000000000ull)
-                   : redop[r] == I_AND ? (w32 ? 0xffffffffu : ~0ull)
-                   : redop[r] == I_VSMIN ? (w32 ? 0x7fffffffu : 0x7fffffffffffffffull)
-                   : redop[r] == I_VSMAX ? (w32 ? 0x80000000u : 0x8000000000000000ull)
-                   : redop[r] == I_VUMIN ? (w32 ? 0xffffffffu : ~0ull)
-                   : 0;
-    Ref sc = ir_emit(f, vguard, I_CONST, st, NULL, 0, ident, 0);
-    vb_args[nvb++] = vemit(f, vguard, I_VSPLAT, VT_V128, sc, REF_NONE, 0,
-                           lane + redwiden[r]);
+    uint64_t idv = redop[r] == I_FMIN ? (w32 ? 0x7f800000u : 0x7ff0000000000000ull)
+                 : redop[r] == I_FMAX ? (w32 ? 0xff800000u : 0xfff0000000000000ull)
+                 : redop[r] == I_AND ? (w32 ? 0xffffffffu : ~0ull)
+                 : redop[r] == I_VSMIN ? (w32 ? 0x7fffffffu : 0x7fffffffffffffffull)
+                 : redop[r] == I_VSMAX ? (w32 ? 0x80000000u : 0x8000000000000000ull)
+                 : redop[r] == I_VUMIN ? (w32 ? 0xffffffffu : ~0ull)
+                 : 0;
+    Ref sc = ir_emit(f, vguard, I_CONST, st, NULL, 0, idv, 0);
+    ident[r] = vemit(f, vguard, I_VSPLAT, VT_V128, sc, REF_NONE, 0,
+                     lane + redwiden[r]);
+    vb_args[nvb++] = ident[r];
   }
   if (npay) {
     /* a lane whose best is still the identity never took a position, and the
@@ -13361,23 +13636,99 @@ static bool vectorize_one(IrFunc *f, uint32_t hb, uint8_t *reach, uint8_t *inloo
   }
   f->blocks[vguard].term = T_BRIF;
   f->blocks[vguard].term_arg = ok;
-  ir_add_edge(f, vguard, vbody, vb_args, nvb);
-  ir_add_edge(f, vguard, hb, entry_args, np);
+  if (R == 1) {
+    ir_add_edge(f, vguard, vbody, vb_args, nvb);
+    ir_add_edge(f, vguard, hb, entry_args, np);
+  } else {
+    /* count / R iterations of R copies if there are any, the rest one copy
+       at a time */
+    uint32_t vsel = ir_new_block(f);
+    ir_add_edge(f, vguard, vsel, NULL, 0);
+    ir_add_edge(f, vguard, hb, entry_args, np);
+    Ref cntR = vemit(f, vsel, I_SHRU, ct, cnt,
+                     ir_emit(f, vsel, I_CONST, ct, NULL, 0, v_log2(R), 0), 0, 0);
+    Ref zero = ir_emit(f, vsel, I_CONST, ct, NULL, 0, 0, 0);
+    f->blocks[vsel].term = T_BRIF;
+    f->blocks[vsel].term_arg = vemit(f, vsel, I_NE, VT_I32, cntR, zero, 0, 0);
+    /* backward, the copies' pointer is the lowest of their R vectors */
+    nvb = 0;
+    for (uint32_t g = 0; g < ctx.ngrp; g++)
+      if (gown[g] == g)
+        vb_args[nvb++] = !backward ? ctx.grp[g].ptr
+          : vemit(f, vsel, I_SUB, VT_I64, ctx.grp[g].ptr,
+                  ir_emit(f, vsel, I_CONST, VT_I64, NULL, 0,
+                          (uint64_t)(R - 1) * W * ctx.grp[g].m, 0), 0, 0);
+    vb_args[nvb++] = cntR;
+    for (uint32_t r = 0; r < nred; r++)
+      for (uint32_t c = 0; c < R; c++) vb_args[nvb++] = ident[r];
+    ir_add_edge(f, vsel, vbody, vb_args, nvb);
+    nvb = 0;
+    for (uint32_t g = 0; g < ctx.ngrp; g++)
+      if (gown[g] == g) vb_args[nvb++] = ctx.grp[g].ptr;
+    vb_args[nvb++] = cnt;
+    for (uint32_t r = 0; r < nred; r++) vb_args[nvb++] = ident[r];
+    ir_add_edge(f, vsel, vbody1, vb_args, nvb);
+  }
 
-  nvb = 0;
-  for (uint32_t g = 0; g < ctx.ngrp; g++) vb_args[nvb++] = nptr[g];
-  vb_args[nvb++] = ncnt;
-  for (uint32_t r = 0; r < nred; r++) vb_args[nvb++] = nextacc[r];
-  for (uint32_t i = 0; i < npay; i++) vb_args[nvb++] = nextpay[i];
-  if (npay) vb_args[nvb++] = nextpos;
-  f->blocks[vbody].term = T_BRIF;
-  f->blocks[vbody].term_arg = more;
-  ir_add_edge(f, vbody, vbody, vb_args, nvb);
+  for (uint32_t bi = 0; bi < (R > 1 ? 2u : 1u); bi++) {
+    VBody *B = &bod[bi];
+    nvb = 0;
+    for (uint32_t g = 0; g < ctx.ngrp; g++)
+      if (gown[g] == g) vb_args[nvb++] = B->nptr[g];
+    vb_args[nvb++] = B->ncnt;
+    for (uint32_t r = 0; r < nred; r++)
+      for (uint32_t c = 0; c < B->R; c++) vb_args[nvb++] = B->nextacc[r][c];
+    for (uint32_t i = 0; i < npay; i++) vb_args[nvb++] = B->nextpay[i];
+    if (npay) vb_args[nvb++] = B->nextpos;
+    f->blocks[B->blk].term = T_BRIF;
+    f->blocks[B->blk].term_arg = B->more;
+    ir_add_edge(f, B->blk, B->blk, vb_args, nvb);
+    if (B->R > 1) continue;
 
-  Ref ex_args[VEC_MAX_RED + VEC_MAX_PAY];
-  for (uint32_t r = 0; r < nred; r++) ex_args[r] = nextacc[r];
-  for (uint32_t i = 0; i < npay; i++) ex_args[nred + i] = nextpay[i];
-  ir_add_edge(f, vbody, vexit, ex_args, nred + npay);
+    Ref ex_args[VEC_MAX_RED + VEC_MAX_PAY];
+    for (uint32_t r = 0; r < nred; r++) ex_args[r] = B->nextacc[r][0];
+    for (uint32_t i = 0; i < npay; i++) ex_args[nred + i] = B->nextpay[i];
+    ir_add_edge(f, B->blk, vexit, ex_args, nred + npay);
+  }
+  if (R > 1) {
+    /* the copies' accumulators, combined pairwise; then the vectors the
+       copies left, if any */
+    uint32_t vmid = ir_new_block(f);
+    Ref mptr[VEC_MAX_GRP], macc[VEC_MAX_RED][VEC_MAX_COPY];
+    for (uint32_t g = 0; g < ctx.ngrp; g++)
+      mptr[g] = gown[g] == g ? ir_add_param(f, vmid, VT_I64) : mptr[gown[g]];
+    for (uint32_t r = 0; r < nred; r++)
+      for (uint32_t c = 0; c < R; c++) macc[r][c] = ir_add_param(f, vmid, VT_V128);
+    nvb = 0;
+    for (uint32_t g = 0; g < ctx.ngrp; g++)
+      if (gown[g] == g) vb_args[nvb++] = bod[0].nptr[g];
+    for (uint32_t r = 0; r < nred; r++)
+      for (uint32_t c = 0; c < R; c++) vb_args[nvb++] = bod[0].nextacc[r][c];
+    ir_add_edge(f, vbody, vmid, vb_args, nvb);
+
+    for (uint32_t r = 0; r < nred; r++)
+      for (uint32_t sp = 1; sp < R; sp <<= 1)
+        for (uint32_t c = 0; c + sp < R; c += 2 * sp)
+          macc[r][c] = vemit(f, vmid, redvop[r], VT_V128, macc[r][c], macc[r][c + sp],
+                             0, lane + redwiden[r]);
+    Ref rem = vemit(f, vmid, I_AND, ct, cnt,
+                    ir_emit(f, vmid, I_CONST, ct, NULL, 0, R - 1, 0), 0, 0);
+    Ref zero = ir_emit(f, vmid, I_CONST, ct, NULL, 0, 0, 0);
+    f->blocks[vmid].term = T_BRIF;
+    f->blocks[vmid].term_arg = vemit(f, vmid, I_NE, VT_I32, rem, zero, 0, 0);
+    nvb = 0;
+    for (uint32_t g = 0; g < ctx.ngrp; g++)
+      if (gown[g] == g)
+        vb_args[nvb++] = !backward ? mptr[g]
+          : vemit(f, vmid, I_ADD, VT_I64, mptr[g],
+                  ir_emit(f, vmid, I_CONST, VT_I64, NULL, 0,
+                          (uint64_t)(R - 1) * W * ctx.grp[g].m, 0), 0, 0);
+    vb_args[nvb++] = rem;
+    for (uint32_t r = 0; r < nred; r++) vb_args[nvb++] = macc[r][0];
+    ir_add_edge(f, vmid, vbody1, vb_args, nvb);
+    for (uint32_t r = 0; r < nred; r++) vb_args[r] = macc[r][0];
+    ir_add_edge(f, vmid, vexit, vb_args, nred);
+  }
 
   Ref exit_args[16];
   Ref done_iters = us
@@ -13457,12 +13808,49 @@ static bool vectorize_one(IrFunc *f, uint32_t hb, uint8_t *reach, uint8_t *inloo
       ri++;
     }
   }
-  f->blocks[vexit].term = T_JUMP;
-  ir_add_edge(f, vexit, hb, exit_args, np);
+  if (!skip) {
+    f->blocks[vexit].term = T_JUMP;
+    ir_add_edge(f, vexit, hb, exit_args, np);
+  } else {
+    /* The exit block takes, after what it took, each carried value read
+       past the loop: from the latch the value itself, from the vector exit
+       what the exit made of it. */
+    Edge *ex = &f->blocks[latch].succs[xsucc];
+    uint32_t nx = ex->nargs;
+    Ref *xargs = xmalloc((nx + np + 1) * sizeof(Ref));
+    for (uint32_t j = 0; j < nx; j++) {
+      int p = v_live_slot(f, inloop, ex->args[j], back_args, np);
+      xargs[j] = p < (int)np ? exit_args[p] : ex->args[j];
+    }
+    Ref xpar[16];
+    for (uint32_t p = 0; p < np; p++) {
+      xpar[p] = REF_NONE;
+      if (!xneed[p]) continue;
+      xpar[p] = ir_add_param(f, xb, (ValType)f->insts[back_args[p]].type);
+      edge_push_arg_at(f, latch, xsucc, back_args[p]);
+      xargs[nx++] = exit_args[p];
+    }
+    v_exit_rewrite(f, inloop, back_args, np, xpar);
+    if (U == 1) {
+      f->blocks[vexit].term = T_JUMP;
+      ir_add_edge(f, vexit, xb, xargs, nx);
+    } else {
+      Ref left = vemit(f, vexit, I_AND, ct, T,
+                       ir_emit(f, vexit, I_CONST, ct, NULL, 0, U - 1, 0), 0, 0);
+      Ref zero = ir_emit(f, vexit, I_CONST, ct, NULL, 0, 0, 0);
+      f->blocks[vexit].term = T_BRIF;
+      f->blocks[vexit].term_arg = vemit(f, vexit, I_NE, VT_I32, left, zero, 0, 0);
+      ir_add_edge(f, vexit, hb, exit_args, np);
+      ir_add_edge(f, vexit, xb, xargs, nx);
+    }
+    xfree(xargs);
+  }
 
   if (warmc_getenv("WARMC_VEC_DEBUG"))
-    fprintf(stderr, "vec: fn=%s b%u lane=%u width=%u k=%u U=%u groups=%u red=%u\n",
-            f->m->funcs[f->func_index].sym, hb, lane, width, k, U, ctx.ngrp, nred);
+    fprintf(stderr, "vec: fn=%s b%u lane=%u width=%u k=%u U=%u groups=%u red=%u"
+            " copies=%u past=%d\n",
+            f->m->funcs[f->func_index].sym, hb, lane, width, k, U, ctx.ngrp, nred,
+            R, (int)skip);
   g_stats.vectorized++;
   return true;
 #undef VREJ
@@ -13956,19 +14344,24 @@ static bool pass_vectorize(IrFunc *f) {
   bool changed = false;
   uint32_t norig = f->nblocks;
   uint8_t *reach = NULL, *inloop = NULL;
+  /* A loop vectorised once is not again: the scalar loop the vector loop
+     leaves past is entered from the guard alone, and looks like a loop
+     there is still a way into. */
+  uint8_t *done = xcalloc(norig ? norig : 1, 1);
   uint32_t rcap = 0, lcap = 0;
   for (uint32_t oi = 0; oi < f->norder; oi++) {
     uint32_t hb = f->order[oi];
-    if (hb >= norig) continue;
+    if (hb >= norig || done[hb]) continue;
     if (f->ninsts > rcap) { rcap = f->ninsts; reach = xrealloc(reach, rcap); }
     if (f->nblocks > lcap) { lcap = f->nblocks; inloop = xrealloc(inloop, lcap); }
     if (vectorize_one(f, hb, reach, inloop)) {
+      done[hb] = 1;
       changed = true;
       ir_order(f);
       oi = 0;
     }
   }
-  xfree(reach); xfree(inloop);
+  xfree(reach); xfree(inloop); xfree(done);
   return changed;
 }
 
@@ -14349,7 +14742,7 @@ static bool unroll_one(IrFunc *f, uint32_t hb, Ref *fixmap, uint32_t *cycleid,
                                bound,
                                bound != REF_NONE &&
                                    unr_in_cycle(f, cyc, ncyc, bound),
-                               uk, &ok);
+                               uk, false, NULL, &ok);
 
     Ref bpar[17];
     for (uint32_t p = 0; p < np; p++)

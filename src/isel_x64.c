@@ -1722,4 +1722,6 @@ const Target warmc_target_x64 = {
   .narg_fp = 4,
   .arg_slot = X64_ARG_SLOT,
   .max_frame = 1u << 27,   /* disp32 addressing: no practical frame cap */
+  .vec_copies = 2,         /* sixteen xmm registers, four of them scratch */
+  .vec_mul_lanes = 0x2,    /* vpmullw; vpmulld is two uops, bytes eight */
 };

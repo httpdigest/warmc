@@ -829,6 +829,14 @@ int ir_vconst_cost(uint64_t lo, uint64_t hi) {
   return g_target->vconst_cost(lo, hi);
 }
 
+uint32_t ir_vec_copies(void) {
+  return g_target->vec_copies;
+}
+
+bool ir_vec_mul_one(uint32_t lane) {
+  return !VLANE_IS_FLOAT(lane) && ((g_target->vec_mul_lanes >> VLANE_SIZE(lane)) & 1);
+}
+
 bool ir_has_result(const Inst *in) {
   return in->type != 0;
 }

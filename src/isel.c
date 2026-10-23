@@ -1656,6 +1656,36 @@ static void analyse_immediates(Isel *s) {
     }
   }
 
+  /* A widening sum the vectoriser makes adds each vector's neighbouring
+     lanes into lanes twice as wide, perhaps again, and those into the
+     accumulator: the last two are one uadalp, which adds the pairs into the
+     accumulator itself.  Only after a first widening: uadalp is slower than
+     the add it replaces, and where the add is all the loop's accumulators
+     wait on, the uaddlp beside it is free -- u32 into u64 (gobench/sum) ran
+     20% slower fused, bytes into u32 (vecbench/widen8, three instructions
+     a vector unfused) 18% faster. */
+  s->vadal = xcalloc(n ? n : 1, 1);
+  for (uint32_t oi = 0; oi < f->norder; oi++) {
+    uint32_t bi = f->order[oi];
+    Block *b = &f->blocks[bi];
+    for (uint32_t i = 0; i < b->ninsts; i++) {
+      Ref u = b->insts[i];
+      Inst *in = &f->insts[u];
+      if (in->op != I_VADD || in->nargs != 2 || s->folded[u]) continue;
+      Ref *a = ir_args(f, u);
+      for (int slot = 0; slot < 2; slot++) {
+        Ref e = a[slot];
+        Inst *ei = &f->insts[e];
+        if (ei->op != I_VEXTADD || ei->imm2 != in->imm2 || ei->block != bi) continue;
+        if (f->insts[ir_args(f, e)[0]].op != I_VEXTADD) continue;
+        if (uses[e] != 1 || blocked[e] || s->folded[e]) continue;
+        s->folded[e] = 1;
+        s->vadal[u] = (uint8_t)(slot + 1);
+        break;
+      }
+    }
+  }
+
   if (!warmc_getenv("WARMC_NO_FUSE"))
   for (uint32_t oi = 0; oi < f->norder; oi++) {
     uint32_t bi = f->order[oi];
@@ -2632,7 +2662,7 @@ give_up:
   xfree(s->imm_fold); xfree(s->fused); xfree(s->addr_fuse); xfree(s->ptr_fuse);
   xfree(s->zx_fuse); xfree(s->no_remat); xfree(s->paired); xfree(s->nl); xfree(s->pool);
   xfree(s->folded); xfree(s->uses); xfree(s->bfx); xfree(s->pinned); xfree(s->csinc);
-  xfree(s->vrot);
+  xfree(s->vrot); xfree(s->vadal);
   xfree(s->extr);
   xfree(s->pc); xfree(s->pc_bfirst); xfree(s->pc_bn); xfree(s->pc_head);
   xfree(s->pc_next);
@@ -2750,4 +2780,6 @@ const Target warmc_target_a64 = {
   .narg_fp = 8,
   .arg_slot = ARG_STACK_SLOT,
   .max_frame = 32000,
+  .vec_copies = 4,
+  .vec_mul_lanes = 0x7,    /* mul of 8, 16 and 32-bit lanes */
 };
