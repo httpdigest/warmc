@@ -401,7 +401,7 @@ bench-compare: all
 
 bench-record: all
 	@for c in $(BENCH_CORPORA); do \
-	  python3 test/gobench.py --corpus $$c --rounds 5 --record | tail -1; \
+	  python3 test/gobench.py --corpus $$c --rounds 5 --record --native | tail -1; \
 	done
 
 FUZZ_SEED  ?= 1
