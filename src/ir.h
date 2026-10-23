@@ -12,7 +12,7 @@ typedef enum {
 
   I_ADD, I_SUB, I_MUL, I_DIVS, I_DIVU, I_REMS, I_REMU,
 
-  I_MULHU,
+  I_MULHU, I_MULHS,
   I_AND, I_OR, I_XOR, I_SHL, I_SHRS, I_SHRU, I_ROTL, I_ROTR,
   I_CLZ, I_CTZ, I_POPCNT,
 

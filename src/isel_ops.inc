@@ -561,13 +561,14 @@ static void emit_inst(Isel *s, Ref v) {
       commit(s, v, d);
       break;
     }
-    case I_MULHU: {
+    case I_MULHU: case I_MULHS: {
       int x = rd(s, a[0], S0), y = rd(s, a[1], S1);
       int d = wr(s, v, S2);
-      if (sf) a64_umulh(B, d, x, y);
+      bool hs = in->op == I_MULHS;
+      if (sf) { if (hs) a64_smulh(B, d, x, y); else a64_umulh(B, d, x, y); }
       else {
 
-        a64_umull(B, d, x, y);
+        if (hs) a64_smull(B, d, x, y); else a64_umull(B, d, x, y);
         a64_lsr_imm(B, SF64, d, d, 32);
       }
       commit(s, v, d);
@@ -2233,7 +2234,7 @@ static bool pair_reg(Isel *s, Ref r) {
 
 static bool pair_pure_op(uint16_t op) {
   switch (op) {
-    case I_CONST: case I_ADD: case I_SUB: case I_MUL: case I_MULHU:
+    case I_CONST: case I_ADD: case I_SUB: case I_MUL: case I_MULHU: case I_MULHS:
     case I_AND: case I_OR: case I_XOR: case I_SHL: case I_SHRS: case I_SHRU:
     case I_ROTL: case I_ROTR: case I_CLZ: case I_CTZ: case I_POPCNT:
     case I_BSWAP:

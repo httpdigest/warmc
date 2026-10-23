@@ -1141,7 +1141,7 @@ const Target *g_target = &warmc_target_a64;
 bool ir_is_pure(const Inst *in) {
   switch (in->op) {
     case I_PARAM: case I_CONST:
-    case I_ADD: case I_SUB: case I_MUL: case I_MULHU:
+    case I_ADD: case I_SUB: case I_MUL: case I_MULHU: case I_MULHS:
     case I_AND: case I_OR: case I_XOR:
     case I_SHL: case I_SHRS: case I_SHRU: case I_ROTL: case I_ROTR:
     case I_CLZ: case I_CTZ: case I_POPCNT: case I_BSWAP:
@@ -1237,7 +1237,7 @@ const char *ir_op_name(uint16_t op) {
 #define N(op, str) [op] = str
   static const char *names[I_OP_COUNT] = {
     N(I_PARAM, "param"), N(I_CONST, "const"),
-    N(I_ADD, "add"), N(I_SUB, "sub"), N(I_MUL, "mul"), N(I_MULHU, "mulhu"),
+    N(I_ADD, "add"), N(I_SUB, "sub"), N(I_MUL, "mul"), N(I_MULHU, "mulhu"), N(I_MULHS, "mulhs"),
     N(I_DIVS, "divs"), N(I_DIVU, "divu"), N(I_REMS, "rems"), N(I_REMU, "remu"),
     N(I_AND, "and"), N(I_OR, "or"), N(I_XOR, "xor"),
     N(I_SHL, "shl"), N(I_SHRS, "shrs"), N(I_SHRU, "shru"),
