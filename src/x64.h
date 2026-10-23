@@ -251,6 +251,9 @@ void x64_vcvtdq2pd(Buf *b, int dst, int src);
 void x64_vcvttpd2dq(Buf *b, int dst, int src);
 void x64_vfmadd231p(Buf *b, int d, int dst, int a, int c);
 void x64_vfnmadd231p(Buf *b, int d, int dst, int a, int c);
+void x64_vfmadd231s(Buf *b, int d, int dst, int a, int c);
+void x64_vfnmadd231s(Buf *b, int d, int dst, int a, int c);
+void x64_vfmsub231s(Buf *b, int d, int dst, int a, int c);
 
 /* VEX compare predicates (the ordered/unordered pairs we lower to). */
 enum {

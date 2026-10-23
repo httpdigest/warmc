@@ -146,6 +146,12 @@ static int op_tied_arg(uint16_t op) {
        of its own it first copies the whole vector, once per lane of a
        gather built up an insert at a time. */
     case I_VREPLACE: return 0;
+    /* A multiply-add accumulates into its destination (fmla; x64's 231
+       forms, scalar too), so an addend that dies here is the destination
+       and needs no copy first; a64's scalar fmadd has a register of its
+       own for it. */
+    case I_VFMADD: return 2;
+    case I_FMA: return RA_FMA_TIED ? 2 : -1;
     default: return -1;
   }
 }

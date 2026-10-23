@@ -22,6 +22,9 @@ typedef enum {
 
   I_FADD, I_FSUB, I_FMUL, I_FDIV, I_FMIN, I_FMAX, I_FCOPYSIGN,
   I_FABS, I_FNEG, I_FSQRT, I_FCEIL, I_FFLOOR, I_FTRUNC, I_FNEAREST,
+  /* a * b + c rounded once, which only -ffma makes (pass_fma); imm 1 is
+     c - a * b and imm 2 a * b - c */
+  I_FMA,
   I_FEQ, I_FNE, I_FLT, I_FGT, I_FLE, I_FGE,
 
   I_WRAP, I_EXTENDS, I_EXTENDU,
@@ -414,6 +417,8 @@ typedef struct {
 
   bool mulwide;   /* a multiply written in 32-bit halves becomes one */
 
+  bool fma;       /* -ffma: fuse a float multiply into its add; off by default */
+
   bool gcpure;
 
   bool closed_world;
@@ -482,6 +487,7 @@ typedef struct {
   uint64_t cmp_reused;
   uint64_t csel_fused;
   uint64_t mul_wide;     /* 64x64 multiplies in halves made mul, mulhu or mulhs */
+  uint64_t fma_fused;    /* -ffma: multiplies fused into the add reading them */
 
   uint64_t bar_masks, bar_elided;
   uint64_t caller_saves, csa_restores, spills_v128_xcall, range_budget_trips;

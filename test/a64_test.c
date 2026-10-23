@@ -354,6 +354,12 @@ int main(int argc, char **argv) {
   CASE("fadd d3, d4, d5", a64_fadd(b, FT_D, 3, 4, 5));
   CASE("fsub s6, s7, s8", a64_fsub(b, FT_S, 6, 7, 8));
   CASE("fmul d9, d10, d11", a64_fmul(b, FT_D, 9, 10, 11));
+  CASE("fmadd d1, d2, d3, d4", a64_fmadd(b, FT_D, 0, 1, 2, 3, 4));
+  CASE("fmadd s28, s29, s30, s31", a64_fmadd(b, FT_S, 0, 28, 29, 30, 31));
+  CASE("fmsub s5, s6, s7, s8", a64_fmadd(b, FT_S, 1, 5, 6, 7, 8));
+  CASE("fmsub d16, d0, d31, d17", a64_fmadd(b, FT_D, 1, 16, 0, 31, 17));
+  CASE("fnmsub d9, d10, d11, d12", a64_fmadd(b, FT_D, 2, 9, 10, 11, 12));
+  CASE("fnmsub s20, s21, s22, s23", a64_fmadd(b, FT_S, 2, 20, 21, 22, 23));
   CASE("fdiv s12, s13, s14", a64_fdiv(b, FT_S, 12, 13, 14));
   CASE("fmax d15, d16, d17", a64_fmax(b, FT_D, 15, 16, 17));
   CASE("fmin s18, s19, s20", a64_fmin(b, FT_S, 18, 19, 20));

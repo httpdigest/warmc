@@ -55,7 +55,10 @@ static const char *usage_text =
   "                partial-escape, gloop, gssa, loopclose, cpool, ictab, reach,\n"
   "                prune, merge, devirt, reinline, throw-jump, closed-world,\n"
   "                gcpure, split, labcache, ifconv, mulwide, barelide,\n"
-  "                small-loop-align\n"
+  "                small-loop-align, fma\n"
+  "                fma is off unless asked for: it fuses a float multiply\n"
+  "                into the add that reads it, rounded once, which is not\n"
+  "                wasm's arithmetic and can change a result's last bit\n"
   "                The last two are the passes built on a loop containing\n"
   "                no safepoint, which is the only assumption the compiler\n"
   "                makes about the collector: turning them off says whether\n"
@@ -447,6 +450,7 @@ int main(int argc, char **argv) {
       else if (!strcmp(name, "unroll")) opt.unroll = on;
       else if (!strcmp(name, "ifconv")) opt.ifconv = on;
       else if (!strcmp(name, "mulwide")) opt.mulwide = on;
+      else if (!strcmp(name, "fma")) opt.fma = on;
       else if (!strcmp(name, "gcpure")) opt.gcpure = on;
       else if (!strcmp(name, "closed-world")) opt.closed_world = on;
       else warmc_fatal("unknown pass %s", name);
@@ -626,7 +630,7 @@ int main(int argc, char **argv) {
             "             reloads=%llu caller_saves=%llu csa_restores=%llu"
             " v128_spills=%llu rb_trips=%llu split_cuts=%llu split_invs=%llu pieces=%llu\n"
             "             escape_removed=%llu escape_forwarded=%llu escape_made=%llu gloop=%llu\n"
-            "             loop_closed=%llu reassoc=%llu cmp_reused=%llu csel_fused=%llu mul_wide=%llu gssa=%llu\n"
+            "             loop_closed=%llu reassoc=%llu cmp_reused=%llu csel_fused=%llu mul_wide=%llu fma=%llu gssa=%llu\n"
             "             bar_masks=%llu bar_elided=%llu\n"
             "             devirt_ref=%llu devirt_indirect=%llu"
             " devirt_null_kept=%llu const_reads=%llu throw_jumps=%llu"
@@ -674,6 +678,7 @@ int main(int argc, char **argv) {
             (unsigned long long)g_stats.cmp_reused,
             (unsigned long long)g_stats.csel_fused,
             (unsigned long long)g_stats.mul_wide,
+            (unsigned long long)g_stats.fma_fused,
             (unsigned long long)g_stats.globals_ssa,
             (unsigned long long)g_stats.bar_masks,
             (unsigned long long)g_stats.bar_elided,
