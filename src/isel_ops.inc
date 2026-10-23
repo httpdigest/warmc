@@ -810,11 +810,25 @@ static void emit_inst(Isel *s, Ref v) {
         if (yv == 1) a64_cset(B, sf, d, cc_invert(cc));
         else a64_csetm(B, sf, d, cc_invert(cc));
       } else if (s->csinc && s->csinc[v]) {
-        /* c ? k + 1 : k is k, or k + 1 where c holds: csinc increments
-           where its condition fails. */
-        int slot = s->csinc[v] - 1;
-        int k = rd(s, a[slot ^ 1], S0);
-        a64_csinc(B, sf, d, k, k, slot == 0 ? cc_invert(cc) : cc);
+        /* c ? x + 1 : y is y, or x + 1 where c holds: csinc increments
+           where its condition fails, csneg negates and csinv inverts. */
+        int slot = (s->csinc[v] & 3) - 1;
+        Ref src = ir_args(f, a[slot])[(s->csinc[v] & CS_NEG) ? 1 : 0];
+        int y = rd(s, a[slot ^ 1], S0), x = rd(s, src, S1);
+        int c2 = slot == 0 ? cc_invert(cc) : cc;
+        if (s->csinc[v] & CS_NEG) a64_csneg(B, sf, d, y, x, c2);
+        else if (s->csinc[v] & CS_INV) a64_csinv(B, sf, d, y, x, c2);
+        else a64_csinc(B, sf, d, y, x, c2);
+      } else if (xc && !yc && (xv == 1 || xv == m)) {
+        /* c ? 1 : y and c ? -1 : y: y, or the zero register plus one or
+           inverted where c holds */
+        int y = rd(s, a[1], S1);
+        if (xv == 1) a64_csinc(B, sf, d, y, RZR, cc_invert(cc));
+        else a64_csinv(B, sf, d, y, RZR, cc_invert(cc));
+      } else if (yc && !xc && (yv == 1 || yv == m)) {
+        int x = rd(s, a[0], S0);
+        if (yv == 1) a64_csinc(B, sf, d, x, RZR, cc);
+        else a64_csinv(B, sf, d, x, RZR, cc);
       } else if (xc && yc && (xv == ((yv + 1) & m) || yv == ((xv + 1) & m))) {
         /* two constants a step apart: one of them and a csinc */
         bool up = xv == ((yv + 1) & m);

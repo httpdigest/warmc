@@ -758,7 +758,14 @@ static bool pass_reassoc_carried(IrFunc *f) {
    compare tree on the index; Zig's 6-way tagged-union dispatch ran 1.23x
    native through the table and 1.05x through native's tree, and LLVM
    builds such switches as trees on AArch64.  Past BRT_TREE_MAX ranges the
-   table's one branch is worth its loads. */
+   table's one branch is worth its loads.
+
+   An index that cannot reach the default -- cbench/fnptr's x >> 29 picks one
+   of eight cases -- leaves the default no range: the last case's range runs
+   on past it instead, which is the same for every index the code can see.
+   fnptr's eight cases are then a tree of eight ranges, where the default's
+   ninth was one past BRT_TREE_MAX and kept the table, and the tree's leaves
+   are the arms pass_ifconvert collapses into selects, level by level. */
 #define BRT_TREE_MAX 8
 typedef struct { uint64_t lo; uint32_t edge; } BrtSeg;
 
@@ -791,7 +798,7 @@ static void brt_node(IrFunc *f, uint32_t nb, Ref idx, const BrtSeg *seg,
   }
 }
 
-static bool pass_brtable_tree(IrFunc *f) {
+static bool pass_brtable_tree(IrFunc *f, bool *jumped) {
   bool changed = false;
   uint32_t nb = f->nblocks;
   for (uint32_t bi = 0; bi < nb; bi++) {
@@ -801,11 +808,21 @@ static bool pass_brtable_tree(IrFunc *f) {
     BrtSeg seg[BRT_TREE_MAX + 1];
     uint32_t nseg = 0;
     bool ok = true;
-    for (uint32_t i = 0; i <= n && ok; i++) {
+    uint32_t last = n;
+    if (n && ir_value_max(f, b->term_arg, 6) < n) last = n - 1;
+    for (uint32_t i = 0; i <= last && ok; i++) {
       if (b->succs[i].eh) ok = false;
       else if (nseg && brt_edge_eq(&b->succs[seg[nseg - 1].edge], &b->succs[i])) continue;
       else if (nseg == BRT_TREE_MAX) ok = false;
       else seg[nseg++] = (BrtSeg){ i, i };
+    }
+    if (ok && nseg == 1 && last < n) {
+      /* every case the index can pick is the same edge */
+      b->succs[0] = b->succs[seg[0].edge];
+      b->nsuccs = 1;
+      b->term = T_JUMP;
+      changed = *jumped = true;
+      continue;
     }
     if (!ok || nseg < 2) continue;
     /* the edges are copied out: the block's own list is rebuilt */
@@ -819,6 +836,543 @@ static bool pass_brtable_tree(IrFunc *f) {
   }
   if (changed) ir_recompute_preds(f);
   return changed;
+}
+
+/* ---- if-conversion ---------------------------------------------------------
+
+   A two-way branch whose arms are a few pure instructions that meet again
+   becomes straight-line code: both arms run, and the join's parameters are
+   selects on the branch's condition.  A branch the data decides costs a
+   pipeline refill each time it is guessed wrong, about fourteen cycles on the
+   M-series cores, where csel costs one.  LLVM folds the smallest such joins
+   to selects before the wasm is written, and its AArch64 back end runs early
+   if-conversion over what is left; warmc saw only the branches.
+   cbench/fnptr is the case: clang turned table[x >> 29](s, x) into an
+   eight-way br_table of one- to three-op bodies, native computes all eight
+   and picks with seven csels, and warmc jumped through the table on a
+   random index, 3.0x native.
+
+   The shapes, B ending in br_if:
+     diamond   B -> X0 -> J and B -> X1 -> J
+     triangle  B -> X -> J and B -> J
+     a branch both of whose edges go to J, with different arguments.
+   An arm X has B as its only predecessor and no parameters, ends in a jump,
+   is not on a path the compiler made rare, and holds only instructions safe
+   to run when the branch would not have run them: pure and unable to trap
+   -- no load (a guard page or a check before it is what made it safe where
+   it was), store, call, global.set, division that can trap, trapping
+   truncation, GC access or allocation -- and of no reference type, so
+   nothing moves past what the collector's maps describe.  The arms'
+   instructions are appended to B, and B jumps to J with a select on the
+   condition for each parameter the two edges pass differently, the first
+   operand the value the taken edge passed, as wasm's select takes it.  A
+   compare that only the branch read is moved down to just before the
+   selects, so that each csel reads the flags it set (flags_only in isel).
+
+   Blocks are visited in post-order, so an inner diamond is collapsed before
+   the branch around it: its head is then a block that jumps to the join,
+   which is an arm of its own head in turn, and a compare tree that
+   pass_brtable_tree made goes level by level into a tree of selects, as
+   native's does for fnptr.  A join left with B as its one predecessor is
+   merged into B, which makes B an arm of the next branch out when the join
+   went on to the outer join -- an `if` with a result nested in another.
+
+   What it costs, in the spirit of LLVM's SimplifyCFG and early
+   if-conversion, without a profile to say which branches are unpredictable:
+     * each arm's issue slots (ifc_cost: a constant is free, a multiply two)
+       are at most IFC_ARM_COST for every arm of the source the arm was made
+       of, and the selects count too, against a triangle's one arm or a
+       diamond's two together; so a tree of cheap leaves collapses whole
+       however deep it is, while an arm doing real work -- what a branch
+       should guard -- stays one.  The selects count because compiler-rt's
+       128-bit divide normalises with a six-op arm and three selects behind
+       a branch that almost always goes one way (zigbench/wide128, +2.7%
+       instructions when they did not); a triangle's empty side earns
+       nothing because a chain of early exits, LLVM's unrolled remainder
+       loop with each step leaving for the join, would otherwise collapse a
+       step at a time into one block running every step (rsbench/itadapt,
+       +6.6%);
+     * each select's operands must be ready within IFC_CRIT cycles of the
+       earlier of them, counting the condition: the cycles a correctly
+       guessed branch would not have waited (LLVM's limit is half the
+       misprediction penalty);
+     * in a loop, a condition that waits on a load in the loop the values do
+       not wait on keeps its branch: a guessed branch runs ahead of the load
+       where the select would wait for it, and a load decides the step of a
+       decoding loop -- with gobench/utf8scan's rune width a select, it ran
+       1.20x, since the index the next load reads came from it.  Applied
+       outside loops as well it changed 35 kernels, nearly all GHC's tag
+       tests, for nothing (1.003);
+     * so does a condition computed from the value the select would hand
+       round the loop, when it is ready later than the values: the select
+       then adds the condition's latency to every iteration's recurrence
+       (ifc_recurrence; hsbench/fusion's Collatz step, 1.017x);
+     * a join that branches again on a value the two edges pass keeps both
+       branches (see the test in ifc_try);
+     * at most IFC_MAX_SEL selects per join. */
+#define IFC_ARM_COST 6
+#define IFC_ARM_MAX  32
+#define IFC_CRIT     8
+#define IFC_MAX_SEL  6
+#define IFC_LOAD_SLACK 2
+#define IFC_DEPTH_LIM 48
+
+/* WARMC_NO_IFCONV turns the pass off as -fno-ifconv does; WARMC_IFC_DEBUG=1
+   prints each conversion and =2 each branch turned down too, with why;
+   WARMC_IFC_ARM, _CRIT and _SEL set the three limits. */
+static pthread_once_t g_ifc_once = PTHREAD_ONCE_INIT;
+static struct { bool off; int dbg, arm, crit, sel; long only; } g_ifc;
+
+static void ifc_init(void) {
+  g_ifc.off = warmc_getenv("WARMC_NO_IFCONV") != NULL;
+  const char *d = warmc_getenv("WARMC_IFC_DEBUG");
+  g_ifc.dbg = d ? (d[0] == '2' ? 2 : 1) : 0;
+  const char *e = warmc_getenv("WARMC_IFC_ARM");
+  g_ifc.arm = e ? atoi(e) : IFC_ARM_COST;
+  e = warmc_getenv("WARMC_IFC_CRIT");
+  g_ifc.crit = e ? atoi(e) : IFC_CRIT;
+  e = warmc_getenv("WARMC_IFC_SEL");
+  g_ifc.sel = e ? atoi(e) : IFC_MAX_SEL;
+  if (g_ifc.sel > 16) g_ifc.sel = 16;
+  /* one function's conversions only, by index, for bisecting */
+  e = warmc_getenv("WARMC_IFC_ONLY");
+  g_ifc.only = e ? atol(e) : -1;
+}
+
+static bool lh_can_trap(IrFunc *f, Ref v);
+
+/* The issue slots speculating v takes and the cycles its result takes
+   (*lat), or -1 when v cannot run where its branch did not. */
+static int ifc_cost(IrFunc *f, Ref v, uint32_t *lat) {
+  Inst *in = &f->insts[v];
+  ValType t = (ValType)in->type;
+  if (vt_is_ref(t)) return -1;
+  *lat = 1;
+  switch (in->op) {
+    case I_CONST: case I_NOP:
+      *lat = 0;
+      return 0;
+    case I_ADD: case I_SUB: case I_AND: case I_OR: case I_XOR:
+    case I_SHL: case I_SHRS: case I_SHRU: case I_ROTL: case I_ROTR:
+    case I_CLZ: case I_BSWAP:
+    case I_EQ: case I_NE: case I_LTS: case I_LTU: case I_GTS: case I_GTU:
+    case I_LES: case I_LEU: case I_GES: case I_GEU: case I_EQZ:
+    case I_WRAP: case I_EXTENDS: case I_EXTENDU:
+    case I_EXT8S: case I_EXT16S: case I_EXT32S:
+      return 1;
+    case I_SELECT:
+      return t == VT_V128 ? 3 : 1;
+    case I_CTZ:
+      *lat = 2;
+      return 2;
+    case I_MUL: case I_MULHU:
+      *lat = 3;
+      return 2;
+    case I_POPCNT:
+      *lat = 8;
+      return 4;
+    case I_FABS: case I_FNEG: case I_REINTERPRET:
+      *lat = 2;
+      return 1;
+    /* The float pipes are fewer than the integer ones, and a diamond of
+       float arithmetic is mostly the same polynomial on two inputs:
+       asbench/mathf's sin and cos, run twice for a sign that holds for a
+       stretch of the sweep at a time, +1.9% instructions at one each. */
+    case I_FADD: case I_FSUB: case I_FMUL: case I_FMIN: case I_FMAX:
+    case I_FCOPYSIGN:
+    case I_FCEIL: case I_FFLOOR: case I_FTRUNC: case I_FNEAREST:
+    case I_CONVERTS: case I_CONVERTU: case I_DEMOTE: case I_PROMOTE:
+    case I_TRUNC_SATS: case I_TRUNC_SATU:
+      *lat = 3;
+      return 2;
+    case I_FEQ: case I_FNE: case I_FLT: case I_FGT: case I_FLE: case I_FGE:
+      *lat = 2;
+      return 1;
+    case I_GLOBAL_GET:
+      *lat = 4;
+      return 1;
+    case I_DIVS: case I_DIVU: case I_REMS: case I_REMU:
+      /* by a constant that is neither 0 nor, signed, -1 */
+      if (lh_can_trap(f, v)) return -1;
+      *lat = 10;
+      return 4;
+    default:
+      if (in->op >= I_VADD && in->op <= I_VDOTI7ADD && ir_is_pure(in)) {
+        *lat = 3;
+        return 1;
+      }
+      return -1;
+  }
+}
+
+typedef struct {
+  uint32_t *uses; uint32_t ucap;   /* reads of each value */
+  uint32_t *dep; uint32_t dcap;    /* ifc_depth's, IFC_UNSEEN before */
+  uint32_t *leaves;                /* arms of the source each block is made of */
+} IfcCtx;
+
+#define IFC_UNSEEN 0xffffffffu
+#define IFC_LOADED 0x80000000u
+
+static void ifc_grow(IfcCtx *cx, uint32_t n) {
+  if (n <= cx->ucap) return;
+  uint32_t c = cx->ucap * 2 > n ? cx->ucap * 2 : n;
+  cx->uses = xrealloc(cx->uses, c * sizeof(uint32_t));
+  memset(cx->uses + cx->ucap, 0, (c - cx->ucap) * sizeof(uint32_t));
+  cx->ucap = c;
+}
+
+/* The cycles v is ready after the block parameters it is computed from --
+   a loop's header parameters start each of its iterations -- with
+   IFC_LOADED set when a load in a loop is on the way.  The instructions
+   speculated keep theirs wherever they move. */
+static uint32_t ifc_depth(IrFunc *f, IfcCtx *cx, Ref v, int lim) {
+  v = ir_resolve(f, v);
+  if (v >= cx->dcap) {
+    uint32_t c = f->ninsts + f->ninsts / 2 + 64;
+    cx->dep = xrealloc(cx->dep, c * sizeof(uint32_t));
+    memset(cx->dep + cx->dcap, 0xff, (c - cx->dcap) * sizeof(uint32_t));
+    cx->dcap = c;
+  }
+  if (cx->dep[v] != IFC_UNSEEN) return cx->dep[v];
+  Inst *in = &f->insts[v];
+  if (in->op == I_PARAM || in->op == I_CONST || lim == 0) return 0;
+  uint32_t d = 0, ld = 0;
+  for (uint32_t j = 0; j < in->nargs; j++) {
+    uint32_t x = ifc_depth(f, cx, ir_args(f, v)[j], lim - 1);
+    ld |= x & IFC_LOADED;
+    if ((x & ~IFC_LOADED) > d) d = x & ~IFC_LOADED;
+  }
+  uint32_t lat;
+  if (ifc_cost(f, v, &lat) < 0) lat = rd_latency(in->op);
+  switch (in->op) {
+    case I_LOAD: case I_VLOAD: case I_FIELD_GET: case I_ARRAY_GET:
+    case I_ARRAY_LEN: case I_TABLE_GET:
+      lat = 4;
+      if (f->blocks[in->block].loop_depth) ld = IFC_LOADED;
+      break;
+    default:
+      break;
+  }
+  if (d + lat < IFC_LOADED) d += lat;
+  cx->dep[v] = d | ld;
+  return cx->dep[v];
+}
+
+/* Whether x is an arm of the branch ending b, and the block it joins. */
+static bool ifc_arm(IrFunc *f, uint32_t b, uint32_t x, uint32_t *join) {
+  Block *xb = &f->blocks[x];
+  if (x == b || x == f->entry || xb->is_pad || xb->cold) return false;
+  if (xb->npreds != 1 || xb->preds[0] != b || xb->nparams) return false;
+  if (xb->term != T_JUMP || xb->nsuccs != 1 || xb->succs[0].eh) return false;
+  *join = xb->succs[0].target;
+  return true;
+}
+
+static void ifc_drop_pred(Block *t, uint32_t p) {
+  for (uint32_t i = 0; i < t->npreds; i++)
+    if (t->preds[i] == p) {
+      t->preds[i] = t->preds[--t->npreds];
+      return;
+    }
+}
+
+static void ifc_kill(Block *x) {
+  x->reachable = false;
+  x->ninsts = 0;
+  x->nsuccs = 0;
+  x->npreds = 0;
+  x->nparams = 0;
+  x->nret = 0;
+  x->term = T_NONE;
+}
+
+static void ifc_append(IrFunc *f, uint32_t bi, Ref v) {
+  Block *b = &f->blocks[bi];
+  if (b->ninsts == b->cap_insts) {
+    uint32_t oc_ = b->cap_insts;
+    b->cap_insts = b->cap_insts ? b->cap_insts * 2 : 8;
+    b->insts = ir_grow(f, b->insts, (size_t)oc_ * sizeof(uint32_t),
+                       (size_t)b->cap_insts * sizeof(uint32_t));
+  }
+  b->insts[b->ninsts++] = v;
+  f->insts[v].block = bi;
+}
+
+static bool ifc_is_compare(uint16_t op) {
+  return (op >= I_EQ && op <= I_EQZ) || (op >= I_FEQ && op <= I_FGE);
+}
+
+/* A join that only bi enters any more is bi's own code: its parameters are
+   what bi passes, its instructions and its way out bi's. */
+static bool ifc_merge_join(IrFunc *f, uint32_t bi, IfcCtx *cx, bool *subst) {
+  Block *b = &f->blocks[bi];
+  if (b->term != T_JUMP || b->nsuccs != 1) return false;
+  uint32_t ji = b->succs[0].target;
+  Block *jb = &f->blocks[ji];
+  if (ji == bi || ji == f->entry || jb->is_pad || jb->npreds != 1 ||
+      jb->preds[0] != bi || ir_block_has_eh(f, ji) ||
+      b->succs[0].nargs != jb->nparams)
+    return false;
+  for (uint32_t p = 0; p < jb->nparams; p++) {
+    Ref par = jb->params[p], to = ir_resolve(f, b->succs[0].args[p]);
+    ifc_grow(cx, f->ninsts);
+    cx->uses[to] += cx->uses[par];
+    ir_replace(f, par, to);
+    *subst = true;
+  }
+  for (uint32_t i = 0; i < jb->ninsts; i++) ifc_append(f, bi, jb->insts[i]);
+  b->nsuccs = 0;
+  b->term = jb->term;
+  b->term_arg = jb->term_arg;
+  b->term_imm = jb->term_imm;
+  b->ret_args = jb->ret_args;
+  b->nret = jb->nret;
+  b->cap_ret = jb->cap_ret;
+  jb->ret_args = NULL;
+  jb->cap_ret = 0;
+  for (uint32_t s = 0; s < jb->nsuccs; s++) {
+    Edge *e = &jb->succs[s];
+    ir_add_edge(f, bi, e->target, e->args, e->nargs);
+    ifc_drop_pred(&f->blocks[e->target], ji);
+  }
+  ifc_kill(jb);
+  cx->leaves[bi] += cx->leaves[ji];
+  return true;
+}
+
+static bool ifc_reaches(IrFunc *f, Ref v, const Ref *hp, uint32_t n, int lim) {
+  v = ir_resolve(f, v);
+  for (uint32_t i = 0; i < n; i++)
+    if (v == hp[i]) return true;
+  Inst *in = &f->insts[v];
+  if (lim == 0 || in->op == I_PARAM || in->op == I_CONST) return false;
+  for (uint32_t j = 0; j < in->nargs; j++)
+    if (ifc_reaches(f, ir_args(f, v)[j], hp, n, lim - 1)) return true;
+  return false;
+}
+
+/* Whether what join ji's parameter p receives goes round a loop into a
+   header parameter that cond is computed from: either ji is the header, or
+   it passes p, or a value it makes of p, along a back edge.  A select there
+   is on the loop's own recurrence, and its condition's latency is paid
+   every time round, where a guessed branch would not wait for it. */
+static bool ifc_recurrence(IrFunc *f, uint32_t ji, uint32_t p, Ref cond) {
+  Block *jb = &f->blocks[ji];
+  Ref hp[8], der[16];
+  uint32_t n = 0, nd = 0;
+  for (uint32_t i = 0; i < jb->npreds; i++)
+    if (f->blocks[jb->preds[i]].rpo >= jb->rpo) { hp[n++] = jb->params[p]; break; }
+  der[nd++] = jb->params[p];
+  for (uint32_t i = 0; i < jb->ninsts && nd < 16; i++) {
+    Ref v = jb->insts[i];
+    Inst *in = &f->insts[v];
+    for (uint32_t j = 0; j < in->nargs; j++) {
+      Ref a = ir_resolve(f, ir_args(f, v)[j]);
+      uint32_t k = 0;
+      while (k < nd && der[k] != a) k++;
+      if (k < nd) { der[nd++] = v; break; }
+    }
+  }
+  for (uint32_t s = 0; s < jb->nsuccs; s++) {
+    Block *tb = &f->blocks[jb->succs[s].target];
+    if (tb->rpo > jb->rpo) continue;
+    for (uint32_t a = 0; a < jb->succs[s].nargs && a < tb->nparams && n < 8; a++) {
+      Ref v = ir_resolve(f, jb->succs[s].args[a]);
+      for (uint32_t k = 0; k < nd; k++)
+        if (der[k] == v) { hp[n++] = tb->params[a]; break; }
+    }
+  }
+  return n && ifc_reaches(f, cond, hp, n, 8);
+}
+
+#define IFC_REJ(why) do { if (g_ifc.dbg > 1) \
+    fprintf(stderr, "ifc %s b%u reject: %s (depth %u)\n", \
+            f->m->funcs[f->func_index].sym, bi, why, b->loop_depth); \
+    return false; } while (0)
+
+static bool ifc_try(IrFunc *f, uint32_t bi, IfcCtx *cx) {
+  Block *b = &f->blocks[bi];
+  if (!b->reachable || b->term != T_BRIF || b->nsuccs != 2) return false;
+  if (b->succs[0].eh || b->succs[1].eh) return false;
+  uint32_t s0 = b->succs[0].target, s1 = b->succs[1].target, j0 = 0, j1 = 0;
+  uint32_t x[2] = { REF_NONE, REF_NONE }, ji;
+  bool a0 = b->succs[0].nargs == 0 && ifc_arm(f, bi, s0, &j0);
+  bool a1 = b->succs[1].nargs == 0 && ifc_arm(f, bi, s1, &j1);
+  if (a0 && a1 && j0 == j1) { x[0] = s0; x[1] = s1; ji = j0; }
+  else if (a0 && j0 == s1) { x[0] = s0; ji = s1; }
+  else if (a1 && j1 == s0) { x[1] = s1; ji = s0; }
+  else if (s0 == s1) ji = s0;
+  else return false;
+  Block *jb = &f->blocks[ji];
+  if (ji == bi || jb->is_pad) IFC_REJ("join");
+  /* the edges into the join: through the arm, or straight from b */
+  Edge *e[2];
+  for (int k = 0; k < 2; k++)
+    e[k] = x[k] != REF_NONE ? &f->blocks[x[k]].succs[0] : &b->succs[k];
+  uint32_t np = jb->nparams;
+  if (e[0]->nargs != np || e[1]->nargs != np) IFC_REJ("arity");
+
+  Ref cond = ir_resolve(f, b->term_arg);
+  int cost[2] = { 0, 0 };
+  uint32_t leaves[2] = { 1, 1 };
+  for (int k = 0; k < 2; k++) {
+    if (x[k] == REF_NONE) continue;
+    Block *xb = &f->blocks[x[k]];
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < xb->ninsts; i++) {
+      Ref v = xb->insts[i];
+      uint32_t lat;
+      int c = ifc_cost(f, v, &lat);
+      if (c < 0) {
+        if (g_ifc.dbg > 1)
+          fprintf(stderr, "ifc %s b%u reject: arm op %s (depth %u)\n",
+                  f->m->funcs[f->func_index].sym, bi,
+                  ir_op_name(f->insts[v].op), b->loop_depth);
+        return false;
+      }
+      cost[k] += c;
+      if (c && ++n > IFC_ARM_MAX) IFC_REJ("arm too long");
+    }
+    leaves[k] = cx->leaves[x[k]];
+    if (cost[k] > g_ifc.arm * (int)leaves[k]) IFC_REJ("arm cost");
+  }
+
+  /* one select for each pair of values the two edges pass, made below */
+  Ref pt[16], pf[16];
+  ValType pty[16];
+  uint32_t nsel = 0, dcl = ifc_depth(f, cx, cond, IFC_DEPTH_LIM);
+  uint32_t dc = dcl & ~IFC_LOADED;
+  for (uint32_t p = 0; p < np; p++) {
+    Ref tv = ir_resolve(f, e[0]->args[p]), fv = ir_resolve(f, e[1]->args[p]);
+    if (tv == fv) continue;
+    ValType t = (ValType)f->insts[jb->params[p]].type;
+    if (t != VT_I32 && t != VT_I64 && t != VT_F32 && t != VT_F64 && t != VT_V128)
+      IFC_REJ("reference join");
+    /* A join that branches again on what the two edges passed is a branch
+       on a branch, which jump threading takes apart where it can; a select
+       there makes the second branch wait on the first's condition where
+       both were guessed.  Go's compiler materialises every && and || so,
+       three quarters of stdgo's conversions before this test, and
+       ktbench/arrobj's `i >= 0 && ...` ran 1.05x with the select. */
+    if (jb->term == T_BRIF && ir_resolve(f, jb->term_arg) == jb->params[p])
+      IFC_REJ("join branches on it");
+    uint32_t q = 0;
+    while (q < nsel && !(pt[q] == tv && pf[q] == fv)) q++;
+    if (q < nsel) continue;
+    if ((int)nsel >= g_ifc.sel) IFC_REJ("selects");
+    uint32_t dt = ifc_depth(f, cx, tv, IFC_DEPTH_LIM) & ~IFC_LOADED;
+    uint32_t df = ifc_depth(f, cx, fv, IFC_DEPTH_LIM) & ~IFC_LOADED;
+    uint32_t lo = dt < df ? dt : df, hi = dt < df ? df : dt;
+    /* a condition a load in the loop decides, picking between values
+       that do not wait for it */
+    if (b->loop_depth && (dcl & IFC_LOADED) && dc > hi + IFC_LOAD_SLACK)
+      IFC_REJ("condition waits on a load");
+    /* a condition computed from what the select hands round the loop, and
+       later than the values: hsbench/fusion's Collatz step, n even ? n / 2
+       : 3n + 1, whose parity test is four of the cycles each step */
+    if (b->loop_depth && dc > hi && ifc_recurrence(f, ji, p, cond))
+      IFC_REJ("condition is the loop's own");
+    if (dc > hi) hi = dc;
+    if (hi + 1 - lo > (uint32_t)g_ifc.crit) IFC_REJ("latency");
+    pt[nsel] = tv; pf[nsel] = fv; pty[nsel] = t; nsel++;
+  }
+
+  /* the selects are work both ways run: a triangle's arm pays for them out
+     of its own budget, a diamond's two out of the two together */
+  if (cost[0] + cost[1] + (int)nsel >
+      g_ifc.arm * (int)((x[0] != REF_NONE ? leaves[0] : 0) + (x[1] != REF_NONE ? leaves[1] : 0) +
+                        (x[0] == REF_NONE && x[1] == REF_NONE ? 1 : 0)))
+    IFC_REJ("cost with selects");
+
+  if (g_ifc.dbg)
+    fprintf(stderr, "ifc %s b%u: %s arms %d/%d leaves %u/%u sels %u depth %u\n",
+            f->m->funcs[f->func_index].sym, bi,
+            x[0] != REF_NONE && x[1] != REF_NONE ? "diamond" :
+            x[0] != REF_NONE || x[1] != REF_NONE ? "triangle" : "edges",
+            cost[0], cost[1], leaves[0], leaves[1], nsel, b->loop_depth);
+
+  /* the compare only the branch read goes down to the selects */
+  ifc_grow(cx, f->ninsts);
+  bool mv = cx->uses[cond] == 1 && f->insts[cond].block == bi &&
+            ifc_is_compare(f->insts[cond].op) && nsel;
+  if (mv) {
+    uint32_t k = 0;
+    for (uint32_t i = 0; i < b->ninsts; i++)
+      if (b->insts[i] != cond) b->insts[k++] = b->insts[i];
+    b->ninsts = k;
+  }
+  for (int k = 0; k < 2; k++) {
+    if (x[k] == REF_NONE) continue;
+    Block *xb = &f->blocks[x[k]];
+    for (uint32_t i = 0; i < xb->ninsts; i++) ifc_append(f, bi, xb->insts[i]);
+  }
+  if (mv) ifc_append(f, bi, cond);
+  Ref *na = xmalloc((np ? np : 1) * sizeof(Ref)), sel[16];
+  for (uint32_t q = 0; q < nsel; q++) {
+    Ref sa[3] = { pt[q], pf[q], cond };
+    sel[q] = ir_emit(f, bi, I_SELECT, pty[q], sa, 3, 0, 0);
+    ifc_grow(cx, f->ninsts);
+    cx->uses[pt[q]]++; cx->uses[pf[q]]++; cx->uses[cond]++;
+  }
+  for (uint32_t p = 0; p < np; p++) {
+    Ref tv = ir_resolve(f, e[0]->args[p]), fv = ir_resolve(f, e[1]->args[p]);
+    na[p] = tv;
+    for (uint32_t q = 0; q < nsel && tv != fv; q++)
+      if (pt[q] == tv && pf[q] == fv) na[p] = sel[q];
+  }
+  cx->uses[cond]--;
+  for (int k = 0; k < 2; k++) {
+    ifc_drop_pred(jb, x[k] != REF_NONE ? x[k] : bi);
+    if (x[k] != REF_NONE) ifc_kill(&f->blocks[x[k]]);
+  }
+  b->nsuccs = 0;
+  b->term = T_JUMP;
+  ir_add_edge(f, bi, ji, na, np);
+  xfree(na);
+  /* the arms of the source now in bi: a triangle's empty side is none,
+     so a chain of early exits -- LLVM's unrolled remainder loop, each step
+     leaving for the join -- does not earn a budget a step at a time */
+  cx->leaves[bi] = (x[0] != REF_NONE ? leaves[0] : 0) + (x[1] != REF_NONE ? leaves[1] : 0);
+  if (!cx->leaves[bi]) cx->leaves[bi] = 1;
+  g_stats.branch_simplified++;
+  return true;
+}
+
+#undef IFC_REJ
+
+static bool pass_ifconvert(IrFunc *f) {
+  pthread_once(&g_ifc_once, ifc_init);
+  if (g_ifc.off || (g_ifc.only >= 0 && f->func_index != (uint32_t)g_ifc.only))
+    return false;
+  IfcCtx cx = { 0 };
+  bool changed = false, subst = false;
+  for (uint32_t oi = f->norder; oi-- > 0;) {
+    uint32_t bi = f->order[oi];
+    Block *b = &f->blocks[bi];
+    if (!b->reachable || b->term != T_BRIF || ir_block_has_eh(f, bi)) continue;
+    if (!cx.uses) {
+      cx.uses = count_uses(f);
+      cx.ucap = f->ninsts ? f->ninsts : 1;
+      cx.dcap = f->ninsts + 64;
+      cx.dep = xmalloc(cx.dcap * sizeof(uint32_t));
+      memset(cx.dep, 0xff, cx.dcap * sizeof(uint32_t));
+      cx.leaves = xmalloc((f->nblocks ? f->nblocks : 1) * sizeof(uint32_t));
+      for (uint32_t i = 0; i < f->nblocks; i++) cx.leaves[i] = 1;
+    }
+    for (int r = 0; r < 8 && ifc_try(f, bi, &cx); r++) {
+      changed = true;
+      if (!ifc_merge_join(f, bi, &cx, &subst)) break;
+    }
+  }
+  if (cx.uses) {
+    xfree(cx.uses); xfree(cx.dep); xfree(cx.leaves);
+  }
+  if (!changed) return false;
+  if (subst) ir_apply_subst(f);
+  ir_recompute_preds(f);
+  ir_order(f);
+  return true;
 }
 
 static Magic magic_u32(uint32_t d) {
@@ -16226,8 +16780,24 @@ void ir_optimize(IrFunc *f, const OptOpts *o) {
   if (reassoced && o->dce) pass_dce(f);
 
   if (o->barelide) TP("bar_elide", pass_bar_elide(f));
-  if (!warmc_getenv("WARMC_NO_BRT_TREE") && TP("brtable_tree", pass_brtable_tree(f)))
+  bool brt_jumped = false;
+  if (!warmc_getenv("WARMC_NO_BRT_TREE") &&
+      TP("brtable_tree", pass_brtable_tree(f, &brt_jumped))) {
     ir_order(f);
+    /* a table made a jump leaves its index unread */
+    if (brt_jumped && o->dce) pass_dce(f);
+  }
+  /* Last, after the loop passes, and after the compare trees that
+     pass_brtable_tree has just made.  Run before the loop passes instead --
+     after the inline rounds, so that the vectoriser would see selects in
+     loop bodies -- it vectorised nothing more anywhere in the ten corpora
+     (vectorize_one takes a diamond's arms as guarded already, and the
+     producers that leave selects to warmc leave loads in those arms), and
+     timed the same: 0.999 geomean over the 183 kernels it changed. */
+  if (o->ifconv && TP("ifconvert", pass_ifconvert(f)) && o->dce) {
+    pass_dce(f);
+    ir_order(f);
+  }
   if (o->print_ir) ir_print(f, "optimised");
   ir_verify(f, "post-opt");
 }
