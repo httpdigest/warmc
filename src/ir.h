@@ -472,6 +472,7 @@ typedef struct {
   uint64_t globals_promoted, loops_closed, globals_ssa;
   uint64_t reassoc;
   uint64_t cmp_reused;
+  uint64_t csel_fused;
 
   uint64_t bar_masks, bar_elided;
   uint64_t caller_saves, csa_restores, spills_v128_xcall, range_budget_trips;

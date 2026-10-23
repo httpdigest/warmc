@@ -120,6 +120,7 @@ typedef struct {
   Ref *lv_in, *lv_out;
 
   bool no_imm;
+  bool no_csel_fuse;   /* WARMC_NO_CSEL_FUSE: no cmp, csel pairs (sel_fuses) */
   uint8_t *imm_fold;
   uint8_t *fused;
   uint8_t *addr_fuse;

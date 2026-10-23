@@ -1405,6 +1405,7 @@ static void analyse_immediates(Isel *s) {
   uint8_t *blocked = xcalloc(n ? n : 1, 1);
 
   s->no_imm = warmc_getenv("WARMC_NO_IMM") != NULL;
+  s->no_csel_fuse = warmc_getenv("WARMC_NO_CSEL_FUSE") != NULL;
   if (!s->no_imm)
   for (uint32_t i = 0; i < n; i++)
     if (f->insts[i].op == I_CONST && fits_gpr(f, i))
