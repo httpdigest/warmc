@@ -120,7 +120,10 @@ RUST_TARGET = "wasm32-wasip1"
 # kotlinc-wasm compiles to wasm by itself; -Xwasm is deprecated since 2.4.0.
 KOTLIN_FLAGS = ["-Xwasm-target=wasm-wasi", "-nowarn"]
 
-FLAGS_FOR = {"go": ["-target=wasip1", "-scheduler=none"],
+# TinyGo optimises for size (-opt=z) unless told otherwise; -opt=2 is its
+# setting for speed, and the one a benchmark of generated code should start
+# from.
+FLAGS_FOR = {"go": ["-target=wasip1", "-scheduler=none", "-opt=2"],
              "as": ASC_FLAGS, "rs": RUSTC_FLAGS,
              "gostd": ["GOOS=wasip1", "GOARCH=wasm"],
              "kt": KOTLIN_FLAGS, "zig": ZIG_FLAGS,
@@ -360,8 +363,7 @@ def build_wasm(name, lang):
     os.makedirs(part, exist_ok=True)
     out = os.path.join(part, name + ".wasm")
     if lang == "go":
-        cmd = ["tinygo", "build", "-o", out, "-target=wasip1",
-               "-scheduler=none", src]
+        cmd = ["tinygo", "build", "-o", out] + FLAGS_FOR["go"] + [src]
     elif lang == "gostd":
         cmd = ["go", "build", "-o", out, src]
         env = dict(os.environ, **GO_WASI_ENV)
@@ -443,15 +445,80 @@ def build_kotlin(name, src, wasm, stampf, stamp):
         f.write(stamp)
     return wasm
 
-def build_native(name, src):
-    """The same kernel in C, as the ceiling.  Absent for kernels with no
-    straightforward C equivalent, and then the column is left blank."""
-    c = os.path.join(WORK, name + ".c")
+# The same kernels compiled for the host by the language's own native
+# compiler, at -O2 or the nearest it has: what the detour through wasm costs
+# against the producer's native back end.  Zig has no -O2 (ReleaseFast is its
+# optimised build) and Go no levels at all.  AssemblyScript and Kotlin/Wasm
+# have no native compiler to compare with.
+NATIVE_FLAGS = {"c": ["-O2"], "cpp": ["-O2", "-std=c++20"],
+                "rs": ["-C", "opt-level=2", "-C", "panic=abort", "-C", "lto=fat",
+                       "-C", "codegen-units=1"],
+                "zig": ["-O", "ReleaseFast", "-lc"],
+                "go": ["-opt=2", "-scheduler=none"], "gostd": [], "hs": ["-O2"]}
+NATIVE_TOOL = {"c": "clang", "cpp": "clang++", "rs": "rustc", "zig": "zig",
+               "go": "tinygo", "gostd": "go", "hs": "ghc"}
+NATIVE_VERSION = {"c": ["clang", "--version"], "cpp": ["clang++", "--version"],
+                  "rs": ["rustc", "--version"], "zig": ["zig", "version"],
+                  "go": ["tinygo", "version"], "gostd": ["go", "version"],
+                  "hs": ["ghc", "--version"]}
+
+def build_native(name, lang):
+    """One kernel built natively, or None when its language has no native
+    compiler here or the build fails.
+
+    The kernels are portable as written, with two exceptions the build papers
+    over: Zig's print helper writes through WASI's fd_write, so the native
+    build links test/zigbench/native.zig in its place, and std.heap's
+    wasm_allocator exists only on wasm, so a native kernel gets libc's."""
+    if lang not in NATIVE_FLAGS or not have(NATIVE_VERSION[lang]):
+        return None
+    os.makedirs(WORK, exist_ok=True)
     exe = os.path.join(WORK, name + ".native")
-    if not os.path.exists(c):
+    hwork = os.path.join(WORK, name + ".nativebuild")
+    if name == "empty":
+        src = os.path.join(WORK, EMPTY[lang][0])
+        build_wasm(name, lang)          # writes the empty program's source
+    else:
+        entry = "main.go" if lang == "gostd" else \
+            [e for e, l in LANGS.items() if l == lang][0]
+        src = os.path.join(KDIR, name, entry)
+    deps = [os.path.join(KDIR, "native.zig")] if lang == "zig" else []
+    newest = max(os.path.getmtime(p) for p in [src] + deps if os.path.exists(p))
+    stampf = exe + ".flags"
+    stamp = " ".join(NATIVE_FLAGS[lang])
+    old = open(stampf).read() if os.path.exists(stampf) else None
+    if os.path.exists(exe) and os.path.getmtime(exe) > newest and old == stamp:
+        return exe
+    if lang == "zig" and "wasm_allocator" in open(src).read():
+        patched = os.path.join(WORK, name + ".native.zig")
+        with open(patched, "w") as f:
+            f.write(open(src).read().replace("std.heap.wasm_allocator",
+                                             "std.heap.c_allocator"))
+        src = patched
+    env = {k: v for k, v in os.environ.items() if k not in GO_WASI_ENV}
+    flags = NATIVE_FLAGS[lang]
+    if lang in ("c", "cpp", "rs"):
+        cmd = [NATIVE_TOOL[lang], src, "-o", exe] + flags
+    elif lang == "zig":
+        cmd = ["zig", "build-exe"] + flags + ["-femit-bin=" + exe]
+        if name == "empty":
+            cmd += ["-Mroot=" + src]
+        else:
+            cmd += ["--dep", "wasi", "-Mroot=" + src, "-Mwasi=" + deps[0]]
+    elif lang == "go":
+        cmd = ["tinygo", "build", "-o", exe] + flags + [src]
+    elif lang == "gostd":
+        cmd = ["go", "build", "-o", exe, src]
+    else:
+        shutil.rmtree(hwork, ignore_errors=True)
+        cmd = ["ghc", src, "-o", exe, "-outputdir", hwork] + flags
+    r = subprocess.run(cmd, capture_output=True, text=True, env=env)
+    if r.returncode != 0:
+        print("%s native build %s failed:\n%s" % (cmd[0], name, r.stderr[:400]),
+              file=sys.stderr)
         return None
-    if sh(["clang", "-O2", "-o", exe, c]).returncode != 0:
-        return None
+    with open(stampf, "w") as f:
+        f.write(stamp)
     return exe
 
 def link(wasm, flags, tag, target_flags):
@@ -610,7 +677,8 @@ def baseline_load():
     with open(BASELINE) as f:
         return json.load(f)
 
-def baseline_rows(names, variants, best, second, have_wasmtime, rss=None):
+def baseline_rows(names, variants, best, second, have_wasmtime, rss=None,
+                  differs=()):
     """The figures worth keeping from a timing run.
 
     The *ratio* to wasmtime is the number recorded and compared, not the times.
@@ -633,10 +701,22 @@ def baseline_rows(names, variants, best, second, have_wasmtime, rss=None):
             row["wasmtime"] = round(r, 5)
             row["ratio"] = round(w / max(r, 1e-9), 4)
 
+        # A native time under 5 ms is lost in the spread of a process
+        # start -- GHC's runtime takes 16 ms to start and varies by 3 -- so
+        # it is kept, but no ratio is taken from it.
+        if k in best.get("native", {}):
+            n = best["native"][k] - best["native"]["empty"]
+            row["native"] = round(max(n, 0.0), 5)
+            if n >= 0.005:
+                row["native_ratio"] = round(w / n, 4)
+            if k in differs:
+                row["native_differs"] = True
         if rss is not None:
             row["rss_kb"] = int(rss[base][k] / 1024)
             if have_wasmtime:
                 row["rss_kb_wasmtime"] = int(rss["wasmtime"][k] / 1024)
+            if k in best.get("native", {}):
+                row["rss_kb_native"] = int(rss["native"][k] / 1024)
         out[k] = row
     return out
 
@@ -649,7 +729,7 @@ def first_line(cmd):
     out = (r.stdout.strip() or r.stderr.strip()).splitlines()
     return out[0] if out else None
 
-def baseline_record(corpus, rows, host, variant, lang):
+def baseline_record(corpus, rows, host, variant, lang, with_native=False):
     """Write this run's figures in as the corpus's baseline.
 
     The ratios are against one wasmtime and one producer, so both versions go
@@ -662,6 +742,9 @@ def baseline_record(corpus, rows, host, variant, lang):
     data[corpus] = {"host": host, "variant": variant, "kernels": rows,
                     "wasmtime": first_line(["wasmtime", "--version"]),
                     "producer": first_line(producer)}
+    if with_native:
+        data[corpus]["native"] = "%s %s" % (first_line(NATIVE_VERSION[lang]),
+                                            " ".join(NATIVE_FLAGS[lang]))
     with open(BASELINE, "w") as f:
         json.dump(data, f, indent=2, sort_keys=True)
         f.write("\n")
@@ -779,6 +862,14 @@ usage: python3 test/gobench.py [options]
                      interleaved run, which is the only way to resolve a few
                      percent:
                        --variant -O2 --variant '-O2 -fno-inline'
+  --native           also time each kernel built natively, at -O2 or the
+                     toolchain's nearest (see NATIVE_FLAGS), interleaved with
+                     the rest; with --record its time goes into the baseline
+                     too.  A native build that prints something else than
+                     warmc's is still timed and is reported: Go's int, Rust's
+                     usize and Haskell's Int are 32 bits on wasm32 and 64
+                     natively, which changes the sums a kernel prints but not
+                     the work it does.
   --check            compile and run every kernel at every variant and check its
                      output against wasmtime's.  Reports nothing about time, so
                      it needs no quiet machine.
@@ -835,6 +926,9 @@ def main():
     want_rss = "--rss" in args
     if want_rss:
         args.remove("--rss")
+    want_native = "--native" in args
+    if want_native:
+        args.remove("--native")
     want_rss = want_rss or record or compare
     threshold = BASE_THRESHOLD
     if "--threshold" in args:
@@ -917,6 +1011,33 @@ def main():
     if spills_only:
         return spill_traffic(names, wasm, target_flags)
 
+    native, differs = {}, set()
+    if want_native and not check_only:
+        floor = build_native("empty", lang)
+        if floor is None:
+            print("%s: no native build for %s, so no native column"
+                  % (CORPUS, lang), file=sys.stderr)
+        else:
+            native["empty"] = floor
+            for k in names:
+                e = build_native(k, lang)
+                if e is None:
+                    continue
+                a = subprocess.run([exes[(k, variants[0])]], capture_output=True,
+                                   text=True, env=RUNENV)
+                b = subprocess.run([e], capture_output=True, text=True)
+                if a.returncode != b.returncode:
+                    print("%s: %s native exits %d, warmc %d; left out"
+                          % (CORPUS, k, b.returncode, a.returncode),
+                          file=sys.stderr)
+                    continue
+                if a.stdout != b.stdout:
+                    differs.add(k)
+                native[k] = e
+            if differs:
+                print("%s: native prints differently (int width, fused "
+                      "multiply-add): %s" % (CORPUS, " ".join(sorted(differs))))
+
     if check_only:
         if not have_wasmtime:
             print("%s: wasmtime not installed, cannot check" % CORPUS,
@@ -924,7 +1045,8 @@ def main():
             return 0
         return 1 if check(names, wasm, exes, variants) else 0
 
-    cols = list(variants) + (["wasmtime"] if have_wasmtime else [])
+    cols = list(variants) + (["wasmtime"] if have_wasmtime else []) + \
+        (["native"] if native else [])
     print("host: %s   rounds: %d   floor subtracted per engine" % (
         subprocess.run(". test/hostenv.sh; echo $WARMC_HOST", shell=True,
                        capture_output=True, text=True, cwd=ROOT,
@@ -935,7 +1057,10 @@ def main():
     for _ in range(rounds):
         for k in ["empty"] + names:
             for c in cols:
+                if c == "native" and k not in native:
+                    continue
                 cmd = ([exes[(k, c)]] if c in variants
+                       else [native[k]] if c == "native"
                        else ["wasmtime", wasm[k]])
                 t, m = run_once(cmd)
                 samples[c][k].append(t)
@@ -945,6 +1070,8 @@ def main():
     for c in cols:
         for k in ["empty"] + names:
             ts = sorted(samples[c][k])
+            if not ts:
+                continue
             best[c][k] = ts[0]
             second[c][k] = ts[1] if len(ts) > 1 else ts[0]
 
@@ -957,7 +1084,8 @@ def main():
     for k in names:
         row = "%-8s" % k
         for c in cols:
-            row += "%13.4fs" % (best[c][k] - best[c]["empty"])
+            row += ("%13.4fs" % (best[c][k] - best[c]["empty"])
+                    if k in best[c] else "%14s" % "-")
         spread = second[base][k] - best[base][k]
         row += "%9.1f%%" % (100.0 * spread / max(best[base][k] - best[base]["empty"], 1e-9))
         print(row)
@@ -968,7 +1096,7 @@ def main():
             print("%s vs %s:" % (base, c), "  ".join(
                 "%s %.2fx" % (k, (best[base][k] - best[base]["empty"]) /
                               max(best[c][k] - best[c]["empty"], 1e-9))
-                for k in names))
+                for k in names if k in best[c]))
 
     if want_rss:
         print()
@@ -978,10 +1106,12 @@ def main():
         host = subprocess.run(". test/hostenv.sh; echo $WARMC_HOST", shell=True,
                               capture_output=True, text=True, cwd=ROOT,
                               executable="/bin/bash").stdout.strip() or "?"
-        rows = baseline_rows(names, variants, best, second, have_wasmtime, rss)
+        rows = baseline_rows(names, variants, best, second, have_wasmtime, rss,
+                             differs)
         print()
         if record:
-            return baseline_record(CORPUS, rows, host, base, lang)
+            return baseline_record(CORPUS, rows, host, base, lang,
+                                   bool(native))
         return baseline_compare(CORPUS, rows, host, base, threshold)
     return 0
 
