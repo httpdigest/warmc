@@ -1,7 +1,8 @@
 # warmc
 
 **warmc** is an ahead-of-time compiler that turns WebAssembly into standalone
-native executables. It needs no JIT, interpreter or VM process at run time.
+native executables, or into shared libraries that other languages call. It
+needs no JIT, interpreter or VM process at run time.
 
 You give it a `.wasm` or `.wat` file and it produces a Linux, macOS or Windows
 binary. That binary is linked against a small freestanding runtime, which
@@ -34,11 +35,14 @@ Hello world!
 
   Cross-compiling works out of the box: any host can produce any of the
   three, using the runtime archives that `make` builds for every target.
+  With `--shared`, each target gets a shared library instead: a `.so`, a
+  `.dylib` or a `.dll`.
 
-- **Self-contained toolchain.** warmc links executables itself. It reads
-  `.a` archives and ELF, Mach-O and COFF objects, dead-strips unused
-  sections, and resolves Windows DLL imports from a built-in table. It needs no
-  `ld`, SDK import libraries or `lld` for normal use.
+- **Self-contained toolchain.** warmc links executables and shared libraries
+  itself. It reads `.a` archives and ELF, Mach-O and COFF objects,
+  dead-strips unused sections, and resolves Windows DLL imports from a
+  built-in table. It needs no `ld`, SDK import libraries or `lld` for normal
+  use.
 - **WebAssembly 3.0.** This covers the 1.0 and 2.0 core plus multi-value,
   bulk memory, reference types, typed function references, **GC** (structs,
   arrays, i31, casts), **SIMD** and **relaxed SIMD**, **tail calls**,
@@ -90,6 +94,9 @@ Hello world!
 - **Embeddable.** Compile with `-c` to get a relocatable object that exposes
   one module descriptor. A small C API instantiates modules, wires them
   together, binds host functions and calls exports.
+- **Shared libraries.** With `--shared`, each export becomes a C function,
+  declared in a generated header. C, C++, Python's `ctypes`, Java's foreign
+  function API or any other C FFI can call it.
 
 ---
 
@@ -138,7 +145,7 @@ versions of the compiler, `build/warmc-asan` and `build/warmc-tsan`.
 ```sh
 make -j
 
-# warmc always needs a runtime archive: pass --rt, or set WARMC_RT once.
+# Linking needs a runtime archive: pass --rt, or set WARMC_RT once.
 export WARMC_RT=$PWD/build/warmrt-macos.a      # on macOS
 # export WARMC_RT=$PWD/build/warmrt.a          # on Linux
 
@@ -171,9 +178,9 @@ build/warmc --target macos --wasi -o kt-hello example/kotlin/out/hello.wasm
 warmc [options] input.wasm|input.wat
 ```
 
-warmc decides whether the input is binary or text from its contents (the
-`\0asm` magic number), not from its file name. A file named `*.wasm` is always
-read as binary.
+A file named `*.wat` is read as text and one named `*.wasm` as binary. For
+any other name, warmc decides from the contents: binary if they begin with
+the `\0asm` magic number, text otherwise.
 
 ### Choosing a target
 
@@ -184,7 +191,9 @@ read as binary.
 | Windows / x86-64 | `--target windows --rt build/warmrt-windows.a` | `a.exe` |
 
 `-o FILE` names the output. `-c` stops after writing a relocatable object
-(`out.o` unless you pass `-o`).
+(`out.o` unless you pass `-o`). `--shared` builds a shared library, by default
+`libNAME.so`, `libNAME.dylib` or `NAME.dll` for an input named `NAME.wasm` or
+`NAME.wat` (see [Shared libraries](#shared-libraries)).
 
 When you pass `--wasi`, warmc finds the matching host archive next to the
 runtime by name: `warmrt-macos.a` becomes `warmwasi-macos.a` for a core module
@@ -238,16 +247,21 @@ PROG [--catch] [--bench N] EXPORT ARGS... [-- EXPORT ARGS...]...
   share one line.
 - You can chain several calls with `--`. `--catch` reports a trap and carries
   on with the next call.
-- `--bench N` calls the export N times and prints min, median, max and mean
-  nanoseconds to stderr.
+- `--bench N` times the export. It warms up first (at least 3 calls and
+  100 ms), then takes up to N samples, at most 512, each a batch of calls
+  lasting about 3 ms. It stops early once it has 5 samples and has spent
+  40 ms. It prints `bench: NAME n=… min_ns=… med_ns=… max_ns=… mean_ns=…`,
+  per call, to stderr. The result still goes to stdout.
 - **Exit codes:**
   - `0` success
   - `1` trap, printed to stderr as `trap: <spec message>`
-  - `2` unknown export or wrong argument count
+  - `2` unknown export, too few arguments (extra ones are ignored), a `v128`
+    parameter, or more than 7 integer or 8 float parameters
   - `4` unresolved import (the harness provides no imports)
 
-`--no-export-names` removes the export-name table from the binary, which also
-disables this harness.
+`--no-export-names` removes the export-name table from the binary, except for
+`_start` and `main`. The harness still runs those with no arguments, but it
+can no longer call an export by name or list the exports.
 
 ### WASI preview 1 programs
 
@@ -261,8 +275,8 @@ warmc compiles directly:
 | Rust | `rustc --target wasm32-wasip1 -C opt-level=3 -o app.wasm main.rs`, or `cargo build --target wasm32-wasip1` |
 | Zig | `zig build-exe -target wasm32-wasi -O ReleaseFast main.zig` |
 | AssemblyScript | `asc main.ts -O3 --exportStart _start --use abort= -o app.wasm` (with a WASI shim; see `test/asbench/wasi.ts`) |
-| Kotlin/Wasm | `kotlinc-wasm -Xwasm -Xwasm-target=wasm-wasi …` (two steps, klib then module; see `build_kotlin` in `test/gobench.py`) |
-| C | `clang -O3 main.c -o app.wasm` with [wasi-sdk](https://github.com/WebAssembly/wasi-sdk)'s clang (`make wasi-sdk` fetches the pinned release); add `-mllvm -wasm-enable-sjlj -lsetjmp` for `setjmp`/`longjmp` |
+| Kotlin/Wasm | `kotlinc-wasm -Xwasm-target=wasm-wasi …` (two steps, klib then module; see `build_kotlin` in `test/gobench.py`) |
+| C | `clang -O3 main.c -o app.wasm` with [wasi-sdk](https://github.com/WebAssembly/wasi-sdk)'s clang (`make wasi-sdk` fetches the pinned release); add `-mllvm -wasm-enable-sjlj -mllvm -wasm-use-legacy-eh=false -lsetjmp` for `setjmp`/`longjmp` |
 | C++ | `clang++ -O3 -fwasm-exceptions -mllvm -wasm-use-legacy-eh=false main.cpp -lunwind -o app.wasm` (wasi-sdk), or without the exception flags for code that never throws |
 | Haskell | `wasm32-wasi-ghc -O2 Main.hs -o app.wasm`, with GHC's wasm backend from [ghc-wasm-meta](https://gitlab.haskell.org/haskell-wasm/ghc-wasm-meta) |
 
@@ -273,7 +287,7 @@ build/warmc --target macos --rt build/warmrt-macos.a --wasi -o app app.wasm
 ```
 
 The resulting program reads its own sandbox flags anywhere before a `--`. Every
-other argument becomes the guest's `argv`:
+other argument, an unknown flag included, becomes the guest's `argv`:
 
 | Flag | Effect |
 |---|---|
@@ -297,10 +311,11 @@ of its own:
 
 | Code | Meaning |
 |---|---|
+| 70 | the host's own import stub failed to instantiate |
 | 71 | link failure |
 | 72 | no `_start` |
 | 73 | trap, printed to stderr |
-| 74 | bad host flag |
+| 74 | a `--dir` that cannot be opened, a `--tcplisten` that cannot listen, or no memory for the flags |
 
 On Linux a WASI program is a static executable with no libc, like every
 other Linux output: `rt/linuxposix.c` answers the WASI hosts' POSIX calls
@@ -324,17 +339,23 @@ and streams) and `wasi:random`. It accepts any `@0.2.x` interface version.
 
 The exit status is `0` or `1`, from `run`'s result, unless the component
 calls `wasi:cli/exit`'s `exit-with-code` with another (Rust's
-`std::process::exit` does). If the component calls a
+`std::process::exit` does). As for preview 1, the host exits with 72 when
+there is no `run` export, 73 on a trap, and 74 for a `--dir` that cannot be
+opened or no memory for the flags. If the component calls a
 `wasi:*` function this host does not implement, the program traps when the
 call happens and names the function. It is not refused at link time.
 
 ### Embedding compiled modules in C
 
-`-c` produces an object that exports a single symbol, the module descriptor
-`warmc_module`. With `--symbol-prefix=P`, the descriptor is named `P_module`,
-so several modules can live in one program. The runtime owns the process entry
-point. To take control, replace the CLI harness by defining
-`warmc_driver_hook`.
+For a core module, `-c` produces an object that exports a single symbol, the
+module descriptor `warmc_module`. With `--symbol-prefix=P`, the descriptor is
+named `P_module`, so several modules can live in one program. A component's
+object instead exports a descriptor for each of its core modules plus
+`warmc_component`, `warmc_modules`, `warmc_module_names` and
+`warmc_nmodules`; `--symbol-prefix` does not apply to it.
+
+The runtime owns the process entry point. To take control, replace the CLI
+harness by defining `warmc_driver_hook`.
 
 ```c
 /* host.c */
@@ -343,7 +364,8 @@ point. To take control, replace the CLI harness by defining
 extern const ModuleDesc guest_module;    /* warmc -c --symbol-prefix=guest */
 const ModuleDesc warmc_module = { 0 };   /* the default harness still refers to this */
 
-/* A host import: it receives the bound instance, then the wasm arguments as u64. */
+/* A host import: it receives its binding's inst (NULL below; warmc_bind_import
+   can pass the guest instead), then the wasm arguments as u64. */
 static u64 print_i64(WarmInstance *self, u64 v) { /* ... */ return 0; }
 
 static int drive(int argc, char **argv) {
@@ -383,18 +405,202 @@ The rest of the API, in [`rt/warm_rt.h`](rt/warm_rt.h):
 
 | Call | Purpose |
 |---|---|
-| `warmc_instantiate(md)`, `warmc_instantiate_catching(md, &err)` | instantiate a module and run its start function; the `_catching` form returns a trap code instead of exiting |
+| `warmc_instantiate(md)`, `warmc_instantiate_catching(md, &err)` | instantiate a module and run its start function; instead of exiting, the `_catching` form returns NULL and stores the trap code in `err` |
 | `warmc_register(name, inst)` | make an instance's exports importable under module `name`, so modules can import one another. Shared memories, tables, globals and tags all work. |
-| `warmc_bind_import(inst, module, name, fn, self)` | rebind an already-linked function import to a host function |
-| `warmc_invoke(...)`, `warmc_invoke_catching(...)` | call an export. Integer and reference args go in `iargs[0..6]`. Floats go in `fargs[2*i]`. Results come back in `ret[WARMC_RET_X0]` (integer), `ret[WARMC_RET_V0]` (float) or `ret[WARMC_RET_MULTI(i)]` (multi-value). |
-| `warmc_invoke_s`, `warmc_invoke_catching_s` | x64 only: needed for functions with more than 3 integer or 4 float parameters |
+| `warmc_bind_import(inst, module, name, fn, self)` | rebind an already-linked function import to a host function, which then receives `self` first (`test/tinygo/driver.c` passes the guest, to reach its memory) |
+| `warmc_invoke(...)`, `warmc_invoke_catching(...)` | call an export. Integer and reference args go in `iargs`: up to 7 on arm64 and 3 on x64. Floats go in `fargs[2*i]`: up to 8 on arm64 and 4 on x64. Results come back in `ret[WARMC_RET_X0]` (integer), `ret[WARMC_RET_V0]` (float) or `ret[WARMC_RET_MULTI(i)]` (multi-value). |
+| `warmc_invoke_s`, `warmc_invoke_catching_s` | x64 only: for functions with more than 3 integer or 4 float parameters, which take the rest from an image of their stack slots, 8 bytes per scalar and 16 per `v128`. On arm64 a function with more than 7 integer or 8 float parameters cannot be called from C. |
 | `warmc_global_cell(inst, idx)`, `inst->mem_base` / `mem_size` | access globals and linear memory 0 |
 | `warmc_gc_collect()`, `warmc_gc_hold()` / `warmc_gc_release()` | drive the collector; register C-side roots |
 
 Limits: at most 4096 instances per process, and instances are never freed.
+At `-O2` each module's first memory, and each further one it defines, takes
+one of 1024 guarded address-space reservations, so at most 1024 such modules
+can be instantiated.
 
 `test/link/driver.c` (multi-module linking) and `test/tinygo/driver.c`
 (hand-written WASI imports) are complete examples.
+
+### Shared libraries
+
+`--shared` builds a library that programs in other languages load and call
+through their C foreign function interface: a `.dylib` for macOS, a `.so` for
+Linux and a `.dll` for Windows. Each exported function whose parameters and
+results are `i32`, `i64`, `f32` or `f64` becomes a C function of the export's
+name, and warmc writes a header that declares them.
+
+```wat
+;; calc.wat
+(module
+  (import "env" "scale" (func $scale (param i64) (result i64)))
+  (memory (export "memory") 1)
+  (func (export "add") (param i32 i32) (result i32)
+    (i32.add (local.get 0) (local.get 1)))
+  (func (export "divmod") (param i32 i32) (result i32 i32)
+    (i32.div_s (local.get 0) (local.get 1))
+    (i32.rem_s (local.get 0) (local.get 1)))
+  (func (export "scaled") (param i64) (result i64)
+    (call $scale (local.get 0))))
+```
+
+```console
+$ build/warmc --target macos --rt build/warmrt-macos.a --shared -o libcalc.dylib calc.wat
+$ ls
+calc.h  calc.wat  libcalc.dylib
+```
+
+`calc.h` declares the exports, a type for each import, and four functions of
+the library's own, named after it:
+
+```c
+int32_t add(int32_t p0, int32_t p1);
+void divmod(int32_t p0, int32_t p1, int32_t *r0, int32_t *r1);
+int64_t scaled(int64_t p0);
+
+typedef int64_t (*calc_import_env_scale)(void *ctx, int64_t p0);
+
+uint32_t calc_last_trap(void);
+const char *calc_trap_name(uint32_t trap);
+uint8_t *calc_memory(size_t *size);
+int calc_bind_import(const char *module, const char *name, void *fn, void *ctx);
+```
+
+```c
+/* main.c */
+#include <stdio.h>
+#include "calc.h"
+
+static int64_t scale(void *ctx, int64_t v) { return v * *(int *)ctx; }
+
+int main(void) {
+  static int factor = 10;
+  calc_bind_import("env", "scale", (void *)scale, &factor);  /* before the first call */
+
+  int32_t q, r;
+  divmod(17, 5, &q, &r);
+  printf("%d %d %d %lld\n", add(2, 3), q, r, (long long)scaled(4));
+
+  divmod(1, 0, &q, &r);                     /* traps, and returns */
+  printf("%s\n", calc_trap_name(calc_last_trap()));
+}
+```
+
+```console
+$ cc -o main main.c -L. -lcalc -Wl,-rpath,@executable_path
+$ ./main
+5 3 2 40
+integer divide by zero
+```
+
+How a library behaves:
+- **The instance** is made by the first call, with the imports bound by then.
+  Bind every import before that call with
+  `calc_bind_import(module, name, fn, ctx)`; the host function receives `ctx`
+  first, then the wasm arguments. If an import is still unbound, the first
+  call names it on stderr, and every call then fails with trap 100 (`link
+  failure`). `calc_bind_import` returns 0, 1 for an import the module does not
+  have, or 2 once the first call has been made.
+- **Threads.** Any thread may call; the calls take turns on the one instance.
+  An import may call back into the library.
+- **Traps** do not unwind into the caller. The call returns 0, results
+  returned through pointers are left as they were, and `calc_last_trap()`
+  gives the calling thread's trap code (0 after a call that returned).
+  `calc_trap_name` names it. A wasm exception that leaves the export is trap
+  13, `uncaught exception`. The instance stays usable.
+- **Several results** come back through pointers after the parameters.
+- **Memory.** `calc_memory(&size)` returns linear memory 0 and its size. A call
+  that grows the memory may move it.
+- **Stack.** Recursion is limited by the calling thread's own stack. Running
+  out traps as `call stack exhausted`.
+- **Faults.** The first call installs the runtime's fault handlers (SIGSEGV
+  and SIGBUS, or a vectored exception handler on Windows). Faults outside
+  wasm code go on to the handler that was there before, so a JVM's handler, or
+  the program's own, keeps working.
+- **Options.** The first call reads the runtime's `WARMC_GC_*` variables from
+  the environment, as a program does when it starts.
+
+Names:
+- `--symbol-prefix=P` sets the prefix of the library's own functions.
+  Without it, the prefix is the output's name without a leading `lib` and
+  without its extension. `--header PATH` writes the header somewhere other
+  than `PREFIX.h` beside the library.
+- An export whose name is not a C identifier gets one, with `_` for each
+  other character: `add-one` becomes `add_one`.
+- A name that C or the runtime already uses (a C keyword, `main`, `_start`,
+  or one starting `warmc_`) gets the prefix: `int` becomes `calc_int`. The
+  header gives the original name of every renamed export.
+- An export that C cannot call gets no symbol, and warmc warns about it. That
+  covers `v128` and reference types, more than 16 results, and, on arm64,
+  more than 7 integer or 8 float parameters.
+
+warmc refuses to build a library that imports a memory, table, global or tag,
+or a function returning more than one result. On Windows, for now, an
+imported function may take at most three parameters. `--shared` cannot be
+combined with `--wasi`, `--no-export-names`, `--system-ld` or a component.
+
+| Target | Default output | Linking a program against it |
+|---|---|---|
+| macOS | `libNAME.dylib`, install name `@rpath/libNAME.dylib` | `-L DIR -lNAME -Wl,-rpath,DIR` |
+| Linux | `libNAME.so`, with no dependencies: the runtime needs no libc | `-L DIR -lNAME -Wl,-rpath,DIR` |
+| Windows | `NAME.dll`, plus `NAME.def` beside it | an import library made from the `.def`: `llvm-dlltool -m i386:x86-64 -d NAME.def -l libNAME.dll.a`, or MSVC's `lib /def:NAME.def /machine:x64` |
+
+`NAME` is the input's name without its extension. A Windows DLL needs an
+x86-64-v3 CPU, like a Windows program. On an older CPU its first call says so,
+and every call fails with trap 100.
+
+Other languages load the same library through their own FFI. Python's
+`ctypes`:
+
+```python
+import ctypes
+
+calc = ctypes.CDLL("./libcalc.dylib")
+scale = ctypes.CFUNCTYPE(ctypes.c_int64, ctypes.c_void_p, ctypes.c_int64)(
+    lambda ctx, v: 10 * v)                      # keep it alive while calc may call it
+calc.calc_bind_import(b"env", b"scale", scale, None)
+
+calc.add.argtypes = [ctypes.c_int32, ctypes.c_int32]
+calc.add.restype = ctypes.c_int32
+calc.scaled.argtypes = [ctypes.c_int64]
+calc.scaled.restype = ctypes.c_int64
+print(calc.add(2, 3), calc.scaled(4))           # 5 40
+```
+
+Java's foreign function and memory API (Java 22 or newer), run with
+`java --enable-native-access=ALL-UNNAMED Calc.java`:
+
+```java
+import java.lang.foreign.*;
+import java.lang.invoke.*;
+import java.nio.file.Path;
+import static java.lang.foreign.ValueLayout.*;
+
+public class Calc {
+  static long scale(MemorySegment ctx, long v) { return 10 * v; }
+
+  public static void main(String[] args) throws Throwable {
+    Linker linker = Linker.nativeLinker();
+    Arena arena = Arena.global();
+    SymbolLookup calc = SymbolLookup.libraryLookup(Path.of("./libcalc.dylib"), arena);
+
+    MethodHandle bind = linker.downcallHandle(calc.find("calc_bind_import").orElseThrow(),
+        FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS, ADDRESS));
+    MemorySegment scale = linker.upcallStub(
+        MethodHandles.lookup().findStatic(Calc.class, "scale",
+            MethodType.methodType(long.class, MemorySegment.class, long.class)),
+        FunctionDescriptor.of(JAVA_LONG, ADDRESS, JAVA_LONG), arena);
+    int rc = (int) bind.invokeExact(arena.allocateFrom("env"), arena.allocateFrom("scale"),
+                                    scale, MemorySegment.NULL);
+
+    MethodHandle add = linker.downcallHandle(calc.find("add").orElseThrow(),
+        FunctionDescriptor.of(JAVA_INT, JAVA_INT, JAVA_INT));
+    System.out.println((int) add.invokeExact(2, 3));                    // 5
+  }
+}
+```
+
+`test/shared/` has a fuller C program, C++ use of the header, and Python and
+Java tests; `test/run_shared.sh` runs them all.
 
 ### Components and WIT
 
@@ -415,8 +621,10 @@ Inside such a component, warmc handles:
   adapter* modules that copy UTF-8 strings, lists, records, tuples, variants,
   enums, flags, options and results between memories.
 
-Anything else is refused with a reason. `--dump-link` shows that reason in its
-`blocked:` lines.
+Anything else is refused with a reason when you compile it. `--dump-link`
+shows the resolved instance graph, and its `blocked:` lines name the bindings
+that could not be resolved; the other reasons, such as an export that needs
+conversion code, are given only when you compile.
 
 Components are binary only: warmc's WAT assembler accepts core modules only.
 Assemble component text with
@@ -426,7 +634,7 @@ Assemble component text with
 | Flag | Prints |
 |---|---|
 | `--dump-component` | one line per definition, with nested components indented |
-| `--dump-canon` | canonical-ABI size, alignment and flattening for every type, plus each canon definition |
+| `--dump-canon` | canonical-ABI size, alignment and flattening for each type of the outermost component, plus its canon definitions (nested components are not shown) |
 | `--dump-adapter` | the canonical-ABI conversion code, as wasm text |
 | `--dump-link` | the resolved instance graph: modules, instances, import bindings, lifts and lowers, exports, and why it is blocked, if it is |
 | `--dump-component-wit` | the component's interfaces rendered back as WIT |
@@ -459,7 +667,7 @@ are parsed but not enforced.
 | `--print-ir` | dump each function's IR, before and after optimisation, to stderr |
 | `--stats` | print optimisation counters: folds, inlined calls, spills, `ldp`/`stp` pairs, vectorised loops, and so on |
 | `--profile` | instrument the code to count executed instructions; prints `icount: N` at exit |
-| `WARMC_TIME=1` | print per-phase compile and link timings with the peak memory reached by each, and the slowest functions to compile |
+| `WARMC_TIME=1` | print per-phase compile and link timings, the peak memory reached by each compile phase, and the slowest functions to compile |
 
 ---
 
@@ -505,7 +713,13 @@ command-line order, so put them **after** `-O`.
 | `labcache`, `barelide` | keep the GC allocation buffer open, and hoist the load-barrier mask, in safepoint-free loops |
 | `reach`, `prune`, `merge` | module-wide reachability; skip unreachable bodies; share byte-identical functions |
 | `split` | live-range splitting at loop boundaries in loops that make no call, so a value the loop carries keeps a register inside it although it is spilled outside |
-| `align`, `cpool`, `regalloc`, `guard-pages` | code alignment; constant pools; the real register allocator (off: every value lives in a stack slot); guard-page bounds checking |
+| `align`, `small-loop-align` | code alignment; a loop small enough for one 64-byte fetch block is placed inside one |
+| `cpool`, `regalloc`, `guard-pages` | constant pools; the real register allocator (off: every value lives in a stack slot); guard-page bounds checking |
+
+`-fno-loadbar` stops emitting GC load barriers. That is unsound for a module
+with GC references, because relocation heals them through the barrier; it
+exists so that `test/run_nobar.sh` can show that a module without GC
+references compiles to the same bytes either way.
 
 `-j N` (or `WARMC_JOBS`) caps the number of compile threads. By default warmc
 picks a count from the module size and the number of cores. Functions are
@@ -528,28 +742,36 @@ as `call stack exhausted` rather than crashing.
 
 | Option | Meaning |
 |---|---|
-| `-o FILE` | output path (default `a.out`, `a.exe` on Windows, `out.o` with `-c`) |
+| `-o FILE` | output path (default `a.out`, `a.exe` on Windows, `out.o` with `-c`, `libNAME.so`/`libNAME.dylib`/`NAME.dll` with `--shared`) |
 | `-c` | write a relocatable object and stop |
-| `--target linux\|macos\|windows` | output format and ISA (default `linux`) |
+| `--shared` | build a shared library (see [Shared libraries](#shared-libraries)) |
+| `--header PATH` | where `--shared` writes the header (default `PREFIX.h` beside the library) |
+| `--target linux\|macos\|windows` | output format and ISA (default `linux`; `darwin` means `macos`) |
 | `--rt PATH` | runtime archive to link (default `$WARMC_RT`) |
 | `--wasi[=PATH]` | link a WASI host and run `_start` (core module) or `wasi:cli/run` (component) |
 | `-O0` `-O1` `-O2` | optimisation level (default `-O2`) |
 | `-fPASS`, `-fno-PASS` | toggle one pass (see [Optimisation](#optimisation)) |
-| `-j N` | maximum number of compile threads |
+| `-j N`, `-jN` | maximum number of compile threads |
 | `--profile=full\|deterministic` | the WebAssembly profile. `deterministic` makes relaxed-SIMD and NaN results platform-independent. |
-| `--symbol-prefix=P` | name the module descriptor `P_module` |
+| `--symbol-prefix=P` | name the module descriptor `P_module`; with `--shared`, the prefix of the library's own functions instead; ignored for a component |
 | `--no-export-names` | drop the export-name table, keeping only `_start` and `main` |
 | `--no-dead-strip` | keep unreferenced sections in the link |
-| `--system-ld`, `--ld PATH` | link with an external linker instead (Linux and macOS only) |
+| `--system-ld`, `--ld PATH` | link with an external linker instead (Linux and macOS only, not with `--shared`) |
 | `--keep-obj` | keep the intermediate object |
 | `-v` | print the external link command |
-| `--validate-only`, `--emit-wasm`, `--dump-*`, `--print-ir`, `--stats`, `--profile` | see above |
+| `--validate-only`, `--emit-wasm`, `--dump-*`, `--print-ir`, `--stats`, `--profile`, `-fno-loadbar` | see above |
+| `--magic=D[:64]` | print the multiply, add and shift that divide by `D` (unsigned; 32-bit, or 64-bit with `:64`) and stop |
+| `-h`, `--help` | print the option summary |
+
+`--target`, `--rt`, `--ld` and `--header` also take their value after an `=`,
+as in `--target=macos`.
 
 ### Environment variables
 
 | Variable | Read by | Effect |
 |---|---|---|
-| `WARMC_RT`, `WARMC_WASI`, `WARMC_LD` | compiler | defaults for `--rt`, `--wasi=` and `--ld` |
+| `WARMC_RT`, `WARMC_WASI` | compiler | defaults for `--rt` and `--wasi=` |
+| `WARMC_LD` | compiler | the external linker `--system-ld` runs (unlike `--ld`, it does not turn `--system-ld` on) |
 | `WARMC_SYSTEM_LD` | compiler | same as `--system-ld` |
 | `WARMC_MACOS_LIBDIR` | compiler | directory holding `libSystem.tbd` for `--system-ld` on macOS (otherwise found with `xcrun`) |
 | `WARMC_JOBS` | compiler | same as `-j` |
@@ -562,7 +784,9 @@ as `call stack exhausted` rather than crashing.
 | `WARMC_RANDOM_SEED` | program | make WASI preview 1 `random_get` deterministic |
 
 Many more `WARMC_*` variables exist for debugging individual passes, the
-register allocator and the linker. Search for `getenv` in `src/`.
+register allocator, the linker and the collector. Search for `getenv` in
+`src/` and for `rt_getenv` in `rt/`. A shared library reads the runtime's
+variables, `WARMC_GC_*` among them, at its first call.
 
 ---
 
@@ -577,11 +801,11 @@ register allocator and the linker. Search for `getenv` in `src/`.
 | GC: struct, array, i31, recursive types and subtyping, casts | ✅ |
 | Exception handling: `try_table`, `throw`, `throw_ref`, `exnref` | ✅ |
 | Exception handling: legacy `try` / `catch` / `delegate` | ❌ |
-| memory64 and table64 | ✅ (memory capped at 65536 pages) |
+| memory64 and table64 | ✅ (memory capped at 65536 pages; a 32-bit memory at 65535) |
 | Multi-memory | ✅ |
 | Extended constant expressions | ✅ |
 | Deterministic profile | ✅ `--profile=deterministic` |
-| Threads, shared memory, atomics | ❌ rejected at parse time |
+| Threads, shared memory, atomics | ❌ a shared memory is rejected when parsing, atomic instructions when validating |
 | Stack switching, stringref, wide arithmetic, custom page sizes, custom descriptors | ❌ |
 | Component Model | partial, see [Components and WIT](#components-and-wit) |
 
@@ -623,6 +847,11 @@ cheaper. Functions compile in parallel and are laid out deterministically.
   in-process.
 - Windows: a PE32+ whose DLL imports come from a curated table, so no SDK is
   needed.
+- With `--shared`: an ELF shared object with its own dynamic symbol table,
+  hash table and relative relocations; a Mach-O dylib with an export trie; or
+  a DLL with an export directory and base relocations. `src/shlib.c` adds a
+  stub per export that enters the runtime through `rt/lib.c`, which reads the
+  platform's C calling convention and makes the instance on the first call.
 - On Linux and macOS the executable keeps its function names, local ones
   included: each compiled wasm function is `wasm_func_N` (its index in the
   module), next to the runtime's own functions, so `perf`, Instruments,
@@ -657,18 +886,18 @@ geometric mean of warmc time ÷ wasmtime time, so lower is better. Each
 engine's empty-program time is subtracted first, so the ratios compare
 steady-state generated code, not start-up or compile time.
 
-| Corpus | Source language | Kernels | warmc / wasmtime | Range | Median peak RSS (warmc / wasmtime) |
+| Corpus | Source language | Kernels | warmc / wasmtime | Range | Median peak RSS, MiB (warmc / wasmtime) |
 |---|---|---:|---:|---|---|
-| `gobench` | TinyGo | 39 | 0.61 | 0.07 – 0.99 | 1.9 / 8.9 MB |
-| `stdgo` | Go | 49 | 0.65 | 0.06 – 1.01 | 7.4 / 27.4 MB |
-| `vecbench` | TinyGo (vectorisable loops) | 43 | 0.20 | 0.04 – 1.04 | 1.9 / 8.9 MB |
-| `asbench` | AssemblyScript | 37 | 0.61 | 0.17 – 0.97 | 1.9 / 8.7 MB |
-| `rsbench` | Rust | 39 | 0.74 | 0.34 – 1.04 | 2.0 / 9.1 MB |
-| `zigbench` | Zig | 22 | 0.82 | 0.41 – 1.15 | 2.0 / 8.9 MB |
-| `ktbench` | Kotlin (Wasm GC) | 25 | 0.11 | 0.003 – 0.74 | 3.5 / 20.8 MB |
-| `cbench` | C | 27 | 0.84 | 0.32 – 0.99 | 2.0 / 9.0 MB |
-| `cppbench` | C++ | 26 | 0.71 | 0.23 – 1.01 | 2.4 / 9.6 MB |
-| `hsbench` | Haskell | 28 | 0.66 | 0.38 – 0.95 | 10.2 / 32.6 MB |
+| `gobench` | TinyGo | 39 | 0.61 | 0.07 – 0.99 | 1.9 / 8.9 |
+| `stdgo` | Go | 49 | 0.65 | 0.06 – 1.01 | 7.4 / 27.4 |
+| `vecbench` | TinyGo (vectorisable loops) | 43 | 0.20 | 0.04 – 1.04 | 1.9 / 8.9 |
+| `asbench` | AssemblyScript | 37 | 0.61 | 0.17 – 0.97 | 1.9 / 8.7 |
+| `rsbench` | Rust | 39 | 0.74 | 0.34 – 1.04 | 2.0 / 9.1 |
+| `zigbench` | Zig | 22 | 0.82 | 0.41 – 1.15 | 2.0 / 8.9 |
+| `ktbench` | Kotlin (Wasm GC) | 25 | 0.11 | 0.003 – 0.74 | 3.5 / 20.8 |
+| `cbench` | C | 27 | 0.84 | 0.32 – 0.99 | 2.0 / 9.0 |
+| `cppbench` | C++ | 26 | 0.71 | 0.23 – 1.01 | 2.4 / 9.6 |
+| `hsbench` | Haskell | 28 | 0.66 | 0.38 – 0.95 | 9.8 / 32.4 |
 
 Over all 335 kernels the geometric mean is **0.51**, and 0.49 without
 `stdgo`. Seven kernels are slower than wasmtime. Four of them are within 2.5%:
@@ -708,17 +937,19 @@ make bench-compare                                      # all corpora vs the rec
 ```sh
 make check          # the full differential test suite (rows run in parallel; logs in build/checklogs)
 make smoke          # a few of its rows that reach most of warmc in seconds; what CI runs on every push
-make check-encoder  # AArch64 and x64 encoders against llvm-mc
+make check-encoder  # the AArch64 encoder against GNU as, llvm-mc or clang; the x64 one against llvm-mc
 make check-spec     # the official WebAssembly testsuite, at three optimisation settings
 make conformance    # write CONFORMANCE.md: spec results grouped by proposal
 make fuzz           # random modules vs wasm-interp (FUZZ_SEED, FUZZ_COUNT)
 make gc-jitter      # GC schedule sweep with randomised collector delays
-make check-linux    # run the TinyGo WASI corpus and GC tests as real Linux binaries (podman/docker arm64)
+make check-linux    # run the GC tests, and on a macOS host with tinygo the TinyGo WASI corpus, as real Linux binaries (podman/docker arm64)
 ```
 
 Most of the suite is **differential**. warmc's output is compared with:
-- wabt's `wasm-interp`, for the hand-written cases in `test/cases*` (at every
-  `-O` level and with individual passes turned off)
+- wabt's `wasm-interp`, for the hand-written cases in `test/cases` (at every
+  `-O` level and with individual passes turned off). `test/cases_gc`,
+  `cases_traps` and `cases_relaxed` are checked against the results written
+  in their scripts.
 - wasmtime, for WASI preview 1 and 0.2 programs (stdout, stderr, exit code and
   the resulting directory tree)
 - wasmtime, for the benchmark corpora in Go, Rust, Zig, AssemblyScript,
@@ -733,6 +964,10 @@ Most of the suite is **differential**. warmc's output is compared with:
   exactly; for example, it prints no arithmetic NaN bits.
 - `wasm-tools`, for component, WIT and WAT handling
 - the Component Model's reference `definitions.py`, for canonical-ABI layout
+
+`test/run_shared.sh` builds a shared library and calls it from C, C++,
+Python's `ctypes` and Java's foreign function API. The Java part needs Java 22
+or newer, and skips itself otherwise.
 
 Requirements:
 - `make check` needs `python3`, `perl` and wabt (`wat2wasm`, `wasm-interp`).
@@ -759,6 +994,7 @@ Requirements:
 ```
 src/            the compiler
   main.c          command line
+  util.c          allocation, diagnostics, byte buffers and object symbol tables
   parse.c validate.c wat.c opcodes.c      front end
   component.c canon.c clink.c wit.c witgen.c   Component Model and WIT
   ir.c ir_build.c opt.c inline.c          SSA IR and optimiser
@@ -766,10 +1002,15 @@ src/            the compiler
   a64.c x64.c                             machine-code encoders
   codegen.c compile.c module_data.c       per-function emission, parallel driver, module descriptor
   elf.c macho.c coff.c pe.c link.c        object writers and linker
-rt/             the runtime linked into every program
+  shlib.c                                 --shared: the C entry points, header and .def
+rt/             the runtime linked into every program and shared library
   rt.c            instantiation, traps, GC, exceptions, CLI harness
   start.S start_x64.S                     entry, invoke, throw and GC trampolines
-  wasi.c wasifs.c wasi.wat                WASI preview 1 host
+  lib.c                                   a shared library's face: the C calls, its lock and its traps
+  hook.c gcthook.c gcthtest.c             defaults a driver or the GC thread tests replace
+  modules.c component.c                   the descriptor tables of a program that is not a component
+  wasi.c wasi.wat                         WASI preview 1 host
+  wasifs.c                                the filesystem of both WASI hosts
   wasip2.c                                WASI 0.2 host
   linuxposix.c                            the WASI hosts' POSIX calls over Linux syscalls
   win.inc winposix.c                      Windows platform layer
@@ -794,3 +1035,6 @@ example/        TinyGo and Kotlin sample programs (source, .wasm and a macOS bui
 - **Exceptions** do not propagate through host (C) frames.
 - **The collector** does not run while wasm is re-entered from a host call.
 - **Instances** are never freed, and a process holds at most 4096 of them.
+- **A shared library** holds one instance. Calls from several threads take
+  turns on it, and its imports cannot be rebound once it has been made. On
+  Windows an imported function takes at most three parameters.
