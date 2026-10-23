@@ -734,7 +734,27 @@ def first_line(cmd):
     out = (r.stdout.strip() or r.stderr.strip()).splitlines()
     return out[0] if out else None
 
-def baseline_record(corpus, rows, host, variant, lang, with_native=False):
+def baseline_reuse(corpus, rows):
+    """Each row's wasmtime and native figures as last recorded, and its
+    ratios over them: --reuse-baseline timed warmc alone."""
+    old = baseline_load().get(corpus, {}).get("kernels", {})
+    for k, row in rows.items():
+        was = old.get(k)
+        if not was:
+            continue
+        for key in ("wasmtime", "native", "rss_kb_wasmtime", "rss_kb_native",
+                    "native_differs"):
+            if key in was:
+                row[key] = was[key]
+        w = row["warmc"]
+        if "wasmtime" in was:
+            row["ratio"] = round(w / max(was["wasmtime"], 1e-9), 4)
+        if "native_ratio" in was:
+            row["native_ratio"] = round(w / max(was["native"], 1e-9), 4)
+    return rows
+
+def baseline_record(corpus, rows, host, variant, lang, with_native=False,
+                    reuse=False):
     """Write this run's figures in as the corpus's baseline.
 
     The ratios are against one wasmtime and one producer, so both versions go
@@ -744,9 +764,17 @@ def baseline_record(corpus, rows, host, variant, lang, with_native=False):
     data = baseline_load()
     producer = (["kotlinc", "-version"] if lang == "kt"
                 else [TOOLCHAIN[lang][0]] + TOOLCHAIN[lang][1])
+    was = data.get(corpus, {})
     data[corpus] = {"host": host, "variant": variant, "kernels": rows,
                     "wasmtime": first_line(["wasmtime", "--version"]),
                     "producer": first_line(producer)}
+    if reuse:
+        # the figures beside warmc's are the old run's, so are their tools
+        for key in ("wasmtime", "native"):
+            if key in was:
+                data[corpus][key] = was[key]
+            else:
+                data[corpus].pop(key, None)
     if with_native:
         data[corpus]["native"] = "%s %s" % (first_line(NATIVE_VERSION[lang]),
                                             " ".join(NATIVE_FLAGS[lang]))
@@ -887,6 +915,12 @@ usage: python3 test/gobench.py [options]
                      --record and --compare.
   --record           write this run's ratio against wasmtime, per kernel, into
                      test/baseline.json.
+  --reuse-baseline   time warmc alone and take each kernel's wasmtime and native
+                     times from test/baseline.json, with its memory figures and
+                     whether native prints differently: neither of those moves
+                     when warmc does, and re-running them is most of a record.
+                     With --record, the ratios are the new warmc time over the
+                     recorded ones.
   --compare          time as usual and report every kernel whose ratio has moved
                      more than --threshold, exiting non-zero if any got worse.
   --threshold P      the move --compare reports, in percent (default %.0f).
@@ -934,6 +968,10 @@ def main():
     want_native = "--native" in args
     if want_native:
         args.remove("--native")
+    reuse = "--reuse-baseline" in args
+    if reuse:
+        args.remove("--reuse-baseline")
+        want_native = False
     want_rss = want_rss or record or compare
     threshold = BASE_THRESHOLD
     if "--threshold" in args:
@@ -965,7 +1003,7 @@ def main():
     if not os.path.exists(WARMC):
         print("%s: %s not built" % (CORPUS, WARMC), file=sys.stderr)
         return 1
-    have_wasmtime = have(["wasmtime", "--version"])
+    have_wasmtime = have(["wasmtime", "--version"]) and not reuse
     target_flags = host_flags()
 
     names, lang = kernels()
@@ -1113,10 +1151,12 @@ def main():
                               executable="/bin/bash").stdout.strip() or "?"
         rows = baseline_rows(names, variants, best, second, have_wasmtime, rss,
                              differs)
+        if reuse:
+            rows = baseline_reuse(CORPUS, rows)
         print()
         if record:
             return baseline_record(CORPUS, rows, host, base, lang,
-                                   bool(native))
+                                   bool(native), reuse)
         return baseline_compare(CORPUS, rows, host, base, threshold)
     return 0
 
