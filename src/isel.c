@@ -2699,8 +2699,12 @@ static int vconst_cost_a64(uint64_t lo, uint64_t hi) {
   return const_cost_a64(lo, true) + const_cost_a64(hi, true) + 2;
 }
 
+/* A displacement that is not a multiple of the access size still fits one
+   instruction, the unscaled ldur/stur, below 256: TinyGo zeroes its shadow
+   frame's slot pairs with an i64.store at offset 20, and one such store
+   kept pass_mem_ptr from giving the whole frame a native pointer. */
 static bool mem_disp_ok_a64(uint64_t off, uint32_t size_log2) {
-  if (off & ((1u << size_log2) - 1)) return false;
+  if (off & ((1u << size_log2) - 1)) return off < 256;
   return (off >> size_log2) <= 0xfff;
 }
 
