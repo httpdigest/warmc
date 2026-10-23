@@ -785,6 +785,18 @@ void a64_vumlal(Buf *b, int q, int size, int rd, int rn, int rm) {
   W(0x2E208000u | ((uint32_t)(q & 1) << 30) | VSZ(size) |
     (M5(rm) << 16) | (M5(rn) << 5) | M5(rd));
 }
+void a64_vsmlal(Buf *b, int q, int size, int rd, int rn, int rm) {
+  W(0x0E208000u | ((uint32_t)(q & 1) << 30) | VSZ(size) |
+    (M5(rm) << 16) | (M5(rn) << 5) | M5(rd));
+}
+void a64_vaddhn(Buf *b, int q, int size, int rd, int rn, int rm) {
+  W(0x0E204000u | ((uint32_t)(q & 1) << 30) | VSZ(size) |
+    (M5(rm) << 16) | (M5(rn) << 5) | M5(rd));
+}
+void a64_vldn(Buf *b, int n, int size, int rt, int rn) {
+  uint32_t opc = n == 2 ? 0x8u : n == 3 ? 0x4u : 0x0u;
+  W(0x4C400000u | (opc << 12) | ((uint32_t)(size & 3) << 10) | (M5(rn) << 5) | M5(rt));
+}
 
 void a64_vrev64(Buf *b, int size, int rd, int rn) { V2(0x4E200800u | VSZ(size), rd, rn); }
 void a64_vrev32(Buf *b, int size, int rd, int rn) { V2(0x6E200800u | VSZ(size), rd, rn); }

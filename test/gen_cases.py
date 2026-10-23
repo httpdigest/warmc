@@ -3986,6 +3986,208 @@ def gen_vecloops(tn):
     return ("  (memory 1)\n  (data (i32.const %d) \"%s\")\n" % (VL_TAB, seg) +
             "".join(init) + "".join(exports))
 
+# ---- interleaved loads ----------------------------------------------------
+#
+# Loops that read m interleaved streams -- RGB pixels, xyz points, stereo
+# samples -- m = 2, 3, 4 elements a step of one input, and write one element
+# a step of the output: weighted sums with and without a rounding constant
+# shifted down by the narrow type's width (fixed-point code, which in bytes
+# and halfwords needs lanes twice as wide), shifted by something else, plain
+# lane arithmetic, products of the streams.  The counters as producers leave
+# them, one for each array or one scaled by m, the trip counts as in
+# vecloops, an output overlapping the input; each export hashes its output,
+# a few elements past the end too.
+
+IL_TYPES = {
+    #       value  load             store          size
+    "u8":  ("i32", "i32.load8_u",  "i32.store8",  1),
+    "s8":  ("i32", "i32.load8_s",  "i32.store8",  1),
+    "u16": ("i32", "i32.load16_u", "i32.store16", 2),
+    "s16": ("i32", "i32.load16_s", "i32.store16", 2),
+    "i32": ("i32", "i32.load",     "i32.store",   4),
+    "i64": ("i64", "i64.load",     "i64.store",   8),
+    "f32": ("f32", "f32.load",     "f32.store",   4),
+    "f64": ("f64", "f64.load",     "f64.store",   8),
+}
+IL_W = {
+    "u8": ([77, 150, 29, 200], 128),
+    "s8": ([-3, 5, 7, -9], 64),
+    "u16": ([19595, 38470, 7471, 1000], 32768),
+    "s16": ([-300, 500, 700, -900], 16384),
+    "i32": ([3, -5, 7, 11], 1000),
+    "i64": ([3, -5, 7, 11], 1000),
+}
+
+def gen_ilvloops(tn):
+    vt, ld, st, S = IL_TYPES[tn]
+    isint = vt in ("i32", "i64")
+    A, C = VL_A, VL_C
+    tab = []
+
+    def dyn(v):
+        tab.append(v)
+        return "(i32.load (i32.const %d))" % (VL_TAB + 4 * (len(tab) - 1))
+
+    def k(c):
+        return "(%s.const %s)" % (vt, c)
+
+    def shapes(m):
+        """name -> function of the m loaded values giving the stored value"""
+        sh = {}
+        if isint:
+            w, rnd = IL_W[tn]
+            def dot(x, r):
+                t = None
+                for i in range(m):
+                    p = "(%s.mul %s %s)" % (vt, x[i], k(w[i]))
+                    t = p if t is None else "(%s.add %s %s)" % (vt, t, p)
+                return t if r is None else "(%s.add %s %s)" % (vt, t, k(r))
+            hb = 8 * S if S < 4 else 3
+            sh["dot"] = lambda x: "(%s.shr_u %s %s)" % (vt, dot(x, rnd), k(hb))
+            sh["dotnr"] = lambda x: "(%s.shr_u %s %s)" % (vt, dot(x, None), k(hb))
+            # the constant first, as a producer may put it
+            sh["dotcf"] = lambda x: "(%s.shr_u (%s.add %s %s) %s)" % (
+                vt, vt, k(rnd), dot(x, None), k(hb))
+            sh["dot7"] = lambda x: "(%s.shr_u %s %s)" % (vt, dot(x, rnd), k(hb - 1))
+            sh["low"] = lambda x: dot(x, rnd)
+            def mix(x):
+                t = "(%s.xor (%s.add %s (%s.shl %s %s)) %s)" % (
+                    vt, vt, x[0], vt, x[1], k(1), x[m - 1])
+                return t
+            sh["mix"] = mix
+            def prod(x):
+                t = "(%s.mul %s %s)" % (vt, x[0], x[1])
+                if m > 2:
+                    t = "(%s.add %s (%s.mul %s %s))" % (vt, t, vt, x[2], x[m - 1])
+                return "(%s.shr_u (%s.add %s %s) %s)" % (vt, vt, t, k(rnd), k(hb))
+            sh["prod"] = prod
+        else:
+            def fdot(x):
+                cs = ["0.5", "0.25", "-1.5", "2"]
+                t = None
+                for i in range(m):
+                    p = "(%s.mul %s %s)" % (vt, x[i], k(cs[i]))
+                    t = p if t is None else "(%s.add %s %s)" % (vt, t, p)
+                return t
+            sh["dot"] = fdot
+            sh["mix"] = lambda x: "(%s.sub (%s.max %s %s) %s)" % (vt, vt, x[0], x[1], x[m - 1])
+        return sh
+
+    def fill():
+        kk = "(local.get $k)"
+        if vt == "i64":
+            v = "(i64.add (i64.mul (i64.extend_i32_u %s) (i64.const 0x9E3779B97F4A7C15)) (i64.const 977))" % kk
+        elif vt == "i32":
+            v = "(i32.add (i32.mul %s (i32.const 2654435761)) (i32.shr_u %s (i32.const 3)))" % (kk, kk)
+        else:
+            v = "(%s.mul (%s.convert_i32_s (i32.sub (i32.rem_u (i32.mul %s (i32.const 37)) (i32.const 1001)) (i32.const 500))) (%s.const 0.25))" % (vt, vt, kk, vt)
+        out = ["  (func $init (local $k i32)\n    (loop $l\n"]
+        for base in (A, C):
+            out.append("      (%s (i32.add (i32.const %d) (i32.mul (local.get $k) (i32.const %d))) %s)\n" % (
+                st, base, S, v if base == A else "(%s.const 0)" % vt))
+        out.append("      (br_if $l (i32.lt_u (local.tee $k (i32.add (local.get $k) (i32.const 1))) (i32.const %d)))))\n" % VL_N)
+        return "".join(out)
+
+    def hash_region(base, n):
+        if tn in ("f32",):
+            val = "(i64.extend_i32_u (i32.reinterpret_f32 (f32.load %s)))"
+        elif tn == "f64":
+            val = "(i64.reinterpret_f64 (f64.load %s))"
+        elif vt == "i64":
+            val = "(i64.load %s)"
+        else:
+            val = "(i64.extend_i32_u (" + ld + " %s))"
+        el = "(i32.add %s (i32.mul (local.get $k) (i32.const %d)))" % (base, S)
+        return ("    (local.set $k (i32.const 0))\n"
+                "    (block $hd (loop $hl\n"
+                "      (br_if $hd (i32.ge_u (local.get $k) (i32.const %d)))\n"
+                "      (local.set $h (i64.add (i64.mul (local.get $h) (i64.const 0x100000001b3)) %s))\n"
+                "      (local.set $k (i32.add (local.get $k) (i32.const 1)))\n"
+                "      (br $hl)))\n" % (n, val % el))
+
+    exports = []
+    def export(name, body):
+        exports.append('  (func (export "%s") (result i64)\n'
+                       '    (local $i i32) (local $j i32) (local $e i32) (local $pa i32) (local $pc i32) (local $k i32) (local $h i64)\n'
+                       '    (call $init)\n%s    (local.get $h))\n' % (name, body))
+
+    def loop(m, expr, P, rel, T, dynend, dynbase, scaled, outb=C):
+        b = []
+        if dynbase:
+            b.append("    (local.set $pa %s)\n    (local.set $pc %s)\n" % (dyn(A), dyn(outb)))
+        else:
+            b.append("    (local.set $pa (i32.const %d))\n    (local.set $pc (i32.const %d))\n" % (A, outb))
+        step = P * S
+        endv = dyn(T * S) if dynend else "(i32.const %d)" % (T * S)
+        b.append("    (local.set $e %s)\n" % endv)
+        if rel == "down":
+            b.append("    (local.set $i (local.get $e))\n"
+                     "    (local.set $j (i32.mul (local.get $e) (i32.const %d)))\n" % m)
+        else:
+            b.append("    (local.set $i (i32.const 0))\n    (local.set $j (i32.const 0))\n")
+        b.append("    (loop $l\n")
+        if rel == "down":
+            b.append("      (local.set $i (i32.sub (local.get $i) (i32.const %d)))\n" % step)
+            if not scaled:
+                b.append("      (local.set $j (i32.sub (local.get $j) (i32.const %d)))\n" % (m * step))
+        if scaled:
+            pa = "(i32.add (local.get $pa) (i32.mul (local.get $i) (i32.const %d)))" % m
+        else:
+            pa = "(i32.add (local.get $pa) (local.get $j))"
+        pc = "(i32.add (local.get $pc) (local.get $i))"
+        for c in range(P):
+            xs = ["(%s offset=%d %s)" % (ld, (c * m + t) * S, pa) for t in range(m)]
+            b.append("      (%s offset=%d %s %s)\n" % (st, c * S, pc, expr(xs)))
+        if rel == "down":
+            b.append("      (br_if $l (i32.ne (local.get $i) (i32.const 0))))\n")
+        else:
+            if not scaled:
+                b.append("      (local.set $j (i32.add (local.get $j) (i32.const %d)))\n" % (m * step))
+            cmpop = "i32.ne" if rel == "ne" else "i32.lt_u"
+            b.append("      (br_if $l (%s (local.tee $i (i32.add (local.get $i) (i32.const %d))) (local.get $e))))\n" % (cmpop, step))
+        ran = -(-T // P) * P if rel == "lt" else T
+        return "".join(b), ran
+
+    VARIANTS = [("ne", 16, False), ("ne", 17, False), ("lt", None, False), ("ne", 31, True),
+                ("down", 9, False), ("lt", None, True), ("ne", 1, False), ("ne", 64, False),
+                ("down", 33, True), ("ne", 50, False)]
+    LT_T = [61, 5, 99, 2, 40, 7]
+    vi = 0
+    for m in (2, 3, 4):
+        for name, expr in sorted(shapes(m).items()):
+            for P in (1, 2):
+                for j in range(2):
+                    rel, mult, dynend = VARIANTS[vi % len(VARIANTS)]
+                    T = LT_T[vi % len(LT_T)] if rel == "lt" else mult * P
+                    T = min(T, (VL_N // m) // P * P)
+                    dynbase = vi % 4 == 3
+                    scaled = vi % 3 == 1
+                    vi += 1
+                    body, ran = loop(m, expr, P, rel, T, dynend, dynbase, scaled)
+                    body += hash_region("(i32.const %d)" % C, ran + 4)
+                    export("%s_m%d_%s_p%d_%s%d%s%s%s" % (
+                        tn, m, name, P, rel, T, "_dyn" if dynend else "",
+                        "_dynbase" if dynbase else "", "_scaled" if scaled else ""), body)
+    # the output over the input: c at a + d, read m elements a step and
+    # written one, so the two meet
+    for m in (2, 3, 4):
+        expr = sorted(shapes(m).items())[0][1]
+        for d in (-3, -1, 1, 2, 5, 16, 40):
+            for dynbase in (False, True):
+                outb = A + d * S
+                T = 24
+                body, ran = loop(m, expr, 1, "ne", T, False, dynbase, False, outb=outb)
+                body += hash_region("(i32.const %d)" % min(A, outb), m * ran + abs(d) + 4)
+                export("%s_overlap_m%d_d%s%d%s" % (tn, m, "m" if d < 0 else "", abs(d),
+                                                 "_dynbase" if dynbase else ""), body)
+
+    seg = "".join("\\%02x" % ((v >> (8 * i)) & 0xff) for v in tab for i in range(4))
+    return ("  (memory 1)\n  (data (i32.const %d) \"%s\")\n" % (VL_TAB, seg) +
+            fill() + "".join(exports))
+
+for _t in IL_TYPES:
+    write("ilvloops_" + _t, gen_ilvloops(_t))
+
 write("vecloops_i8", gen_vecloops("i8"))
 write("vecloops_i16", gen_vecloops("i16"))
 write("vecloops_i32", gen_vecloops("i32"))

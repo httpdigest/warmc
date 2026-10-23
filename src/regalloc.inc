@@ -151,6 +151,8 @@ static int op_tied_arg(uint16_t op) {
        and needs no copy first; a64's scalar fmadd has a register of its
        own for it. */
     case I_VFMADD: return 2;
+    /* umlal likewise */
+    case I_VEXTMLA: return 0;
     case I_FMA: return RA_FMA_TIED ? 2 : -1;
     default: return -1;
   }

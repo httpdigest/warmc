@@ -290,6 +290,13 @@ void a64_vuadalp(Buf *b, int size, int rd, int rn);
 void a64_vsmull(Buf *b, int q, int size, int rd, int rn, int rm);
 void a64_vumull(Buf *b, int q, int size, int rd, int rn, int rm);
 void a64_vumlal(Buf *b, int q, int size, int rd, int rn, int rm);
+void a64_vsmlal(Buf *b, int q, int size, int rd, int rn, int rm);
+/* add returning high narrow: rd's lanes of size (its high half for q) are
+   the high halves of rn + rm's, twice as wide */
+void a64_vaddhn(Buf *b, int q, int size, int rd, int rn, int rm);
+/* ld2, ld3 or ld4 (n) of 16-byte registers rt, rt + 1 ... from [rn],
+   deinterleaving lanes of size */
+void a64_vldn(Buf *b, int n, int size, int rt, int rn);
 void a64_vrev64(Buf *b, int size, int rd, int rn);
 void a64_vrev32(Buf *b, int size, int rd, int rn);
 void a64_vrev16(Buf *b, int rd, int rn);

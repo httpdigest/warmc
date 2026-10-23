@@ -4,11 +4,11 @@
 // constants, the adds, an i32.shr_u by 8 and an i32.store8 -- a fixed-point
 // dot product computed in i32 on byte inputs.
 //
-// NEON has LD3, which loads 48 bytes and deinterleaves them into three
-// vectors in one instruction, and widening multiply-accumulates to do the
-// arithmetic in 16-bit lanes.  `stride2` shows warmc deinterleaving a stride
-// of two with UZP1 and UZP2; a stride of three it rejects ("interleave
-// factor"), so this runs as a scalar loop.  Here to show the gap.
+// NEON's LD3 loads 48 bytes and deinterleaves them into three vectors in one
+// instruction, which is how warmc loads the pixels, and the sum needs 16
+// bits, so warmc computes it in 16-bit lanes: UMULL and UMLAL from the bytes,
+// and the rounding shift as an ADDHN that narrows to the bytes stored -- the
+// instructions LLVM's native build picks.  Here to keep that working.
 package main
 
 //go:noinline
