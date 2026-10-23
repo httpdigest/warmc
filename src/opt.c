@@ -7064,9 +7064,21 @@ static bool pass_memopt(IrFunc *f, const OptOpts *o) {
   Ref gval[MAX_TRACKED_GLOBALS];
   uint64_t gok;   /* bit g: gval[g] is what global g holds */
   MemState *st = xcalloc(f->nblocks ? f->nblocks : 1, sizeof(MemState));
-  uint8_t *reach = xmalloc(f->nblocks ? f->nblocks : 1);
-  uint32_t *rstack = xmalloc((f->nblocks ? f->nblocks : 1) * sizeof(uint32_t));
-  bool apply = false;
+  /* Sweeps go on until no block's end state moves, then one more applies
+     what they found.  Without a back edge each block's predecessors all
+     come before it in the order, so the first sweep already sees their
+     final states: the sweep that would only confirm them and the one that
+     would then apply them are the first one.  Most functions have no loop,
+     and memopt was a ninth of all compile time. */
+  bool apply = true;
+  for (uint32_t oi = 0; oi < f->norder && apply; oi++) {
+    const Block *b = &f->blocks[f->order[oi]];
+    for (uint32_t p = 0; p < b->npreds; p++)
+      if (f->blocks[b->preds[p]].reachable && f->blocks[b->preds[p]].rpo >= b->rpo) {
+        apply = false;
+        break;
+      }
+  }
   for (int sweep = 0; ; sweep++) {
     bool moved = false;
   for (uint32_t oi = 0; oi < f->norder; oi++) {
@@ -7389,7 +7401,7 @@ static bool pass_memopt(IrFunc *f, const OptOpts *o) {
     if (!moved || sweep + 1 >= MEMOPT_SWEEPS) apply = true;
   }
   for (uint32_t i = 0; i < f->nblocks; i++) memstate_free(&st[i]);
-  xfree(st); xfree(reach); xfree(rstack);
+  xfree(st);
   if (changed) ir_apply_subst(f);
   return changed;
 }
