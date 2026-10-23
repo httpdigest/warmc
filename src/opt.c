@@ -8,6 +8,7 @@
 #include "reader.h"
 
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -5805,6 +5806,16 @@ static bool scan_table_ops(const uint8_t *p, const uint8_t *end,
   return false;
 }
 
+typedef struct { Module *m; uint32_t **sites; _Atomic bool writes; } T0Scan;
+
+static void t0_scan_one(void *ctx, uint32_t k, uint32_t w) {
+  T0Scan *sc = ctx;
+  if (atomic_load(&sc->writes)) return;
+  const Func *fn = &sc->m->funcs[sc->m->nimported_funcs + k];
+  if (fn->body && scan_table_ops(fn->body, fn->body_end, sc->sites[w], sc->m->ntypes))
+    atomic_store(&sc->writes, true);
+}
+
 /* Table 0 is frozen when nothing can change it after instantiation: it is
    the module's only table, module-private, never a table-write target, and
    filled only by single-instruction ref.func/ref.null elem items.  A table
@@ -5824,10 +5835,22 @@ const Table0Facts *module_table0_facts(Module *m) {
   for (uint32_t i = 0; i < m->nexports; i++)
     if (m->exports[i].kind == EK_TABLE) return t0;
   t0->sites = xcalloc(m->ntypes ? m->ntypes : 1, sizeof(uint32_t));
-  for (uint32_t i = m->nimported_funcs; i < m->nfuncs; i++)
-    if (m->funcs[i].body &&
-        scan_table_ops(m->funcs[i].body, m->funcs[i].body_end, t0->sites, m->ntypes))
-      return t0;
+  /* Every body is walked, on the compiler's threads (15 ms of a serial
+     front end for stdgo otherwise), each counting its call_indirects into
+     its own array.  The counts are read only of a frozen table, for which
+     no walk stopped early, so their sum is what one walk in order counts. */
+  uint32_t nb = m->nfuncs - m->nimported_funcs;
+  uint32_t nt = compile_want_threads(m, nb);
+  T0Scan sc = { m, xcalloc(nt, sizeof(uint32_t *)), false };
+  for (uint32_t w = 0; w < nt; w++)
+    sc.sites[w] = xcalloc(m->ntypes ? m->ntypes : 1, sizeof(uint32_t));
+  warmc_par_for(nb, nt, t0_scan_one, &sc);
+  for (uint32_t w = 0; w < nt; w++) {
+    for (uint32_t ti = 0; ti < m->ntypes; ti++) t0->sites[ti] += sc.sites[w][ti];
+    xfree(sc.sites[w]);
+  }
+  xfree(sc.sites);
+  if (atomic_load(&sc.writes)) return t0;
 
   Table *t = &m->tables[0];
   if (t->has_init) {
