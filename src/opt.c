@@ -17345,6 +17345,122 @@ static void opt_cleanup(IrFunc *f, const OptOpts *o) {
 #undef RUN
 }
 
+/* -ffma: a float multiply whose one reader is an add or a subtract becomes
+   one fused multiply-add, rounded once.  That is not wasm's arithmetic --
+   f32.mul and f32.add round each -- so a result can differ in its last bit,
+   or come out finite where the separate ones overflowed: off unless asked
+   for, for code that can take it, as C can by default (clang contracts
+   a * b + c natively, the fmla.2d cbench/matmul's native build has and the
+   wasm cannot ask for).  Scalars, and the vectoriser's lanes, last of all;
+   a vector a * b - c has no one instruction and stays.
+
+   Not where the addend is what a loop carries round and the multiply is
+   off every such chain, acc = acc + a[i] * b[i]: there the add is the chain
+   each iteration waits on, and a fused one waits four cycles where the add
+   alone took three -- a dot product ran a third slower fused.  Where the
+   product is on a chain too, x = x + dt * v with v this iteration's, it is
+   the later operand, and fusing shortens the chain: cbench/nbody, 16%.  A
+   value is on a chain when a loop's parameter reaches it and it reaches
+   what the back edge hands that parameter (fma_cycles). */
+static void fma_cycles(IrFunc *f, uint8_t *oncyc) {
+  uint32_t n = f->ninsts;
+  UseIdx ui = use_index(f);
+  uint8_t *back = xcalloc(n ? n : 1, 1);
+  Ref *stk = xmalloc((n ? n : 1) * sizeof(Ref)), *seen = xmalloc((n ? n : 1) * sizeof(Ref));
+  for (uint32_t oi = 0; oi < f->norder; oi++) {
+    uint32_t hb = f->order[oi];
+    Block *h = &f->blocks[hb];
+    for (uint32_t q = 0; q < h->npreds; q++) {
+      uint32_t lb = h->preds[q];
+      if (f->blocks[lb].rpo < h->rpo) continue;
+      Edge *e = iv_edge(f, lb, hb);
+      if (!e || e->nargs != h->nparams) continue;
+      for (uint32_t k = 0; k < h->nparams; k++) {
+        /* what reaches the back edge's argument, inside the loop */
+        uint32_t sp = 0, ns = 0;
+        Ref a0 = ir_resolve(f, e->args[k]);
+        if (a0 < n) { stk[sp++] = a0; back[a0] = 1; seen[ns++] = a0; }
+        while (sp && ns < 4096) {
+          Ref x = stk[--sp];
+          const Inst *xi = &f->insts[x];
+          if (xi->op == I_PARAM || !ir_dom_range(f, hb, xi->block)) continue;
+          const Ref *xa = ir_args(f, x);
+          for (uint32_t j = 0; j < xi->nargs; j++) {
+            Ref y = ir_resolve(f, xa[j]);
+            if (y < n && !back[y] && ir_dom_range(f, hb, f->insts[y].block)) {
+              back[y] = 1; seen[ns++] = y; stk[sp++] = y;
+            }
+          }
+        }
+        /* of those, the ones the parameter reaches */
+        Ref P = h->params[k];
+        if (P < n && back[P]) {
+          oncyc[P] = 1;
+          sp = 0;
+          stk[sp++] = P;
+          while (sp) {
+            Ref x = stk[--sp];
+            for (uint32_t u = ui.first[x]; u != UINT32_MAX; u = ui.next[u]) {
+              Ref y = ui.user[u];
+              if (y < n && back[y] && !oncyc[y]) { oncyc[y] = 1; stk[sp++] = y; }
+            }
+          }
+        }
+        for (uint32_t j = 0; j < ns; j++) back[seen[j]] = 0;
+      }
+    }
+  }
+  xfree(back); xfree(stk); xfree(seen);
+  use_index_free(&ui);
+}
+
+static bool pass_fma(IrFunc *f) {
+  uint32_t nuses = f->ninsts;
+  uint32_t *uses = count_uses(f);
+  uint8_t *oncyc = xcalloc(nuses ? nuses : 1, 1);
+  fma_cycles(f, oncyc);
+  bool changed = false;
+  for (uint32_t oi = 0; oi < f->norder; oi++) {
+    uint32_t bi = f->order[oi];
+    for (uint32_t i = 0; i < f->blocks[bi].ninsts; i++) {
+      Ref v = f->blocks[bi].insts[i];
+      const Inst *in = &f->insts[v];
+      bool vec = in->op == I_VFADD || in->op == I_VFSUB;
+      if ((!vec && in->op != I_FADD && in->op != I_FSUB) || in->nargs != 2) continue;
+      bool sub = in->op == I_FSUB || in->op == I_VFSUB;
+      for (int k = 0; k < 2; k++) {
+        Ref m = ir_args(f, v)[k], c = ir_args(f, v)[1 - k];
+        const Inst *mi = &f->insts[m];
+        if (mi->op != (vec ? I_VFMUL : I_FMUL) || mi->nargs != 2 ||
+            m >= nuses || uses[m] != 1 || mi->type != in->type ||
+            (vec && mi->imm2 != in->imm2))
+          continue;
+        Ref cr = ir_resolve(f, c);
+        Ref x0 = ir_resolve(f, ir_args(f, m)[0]), x1 = ir_resolve(f, ir_args(f, m)[1]);
+        bool mcyc = (x0 < nuses && oncyc[x0]) || (x1 < nuses && oncyc[x1]);
+        if (cr < nuses && oncyc[cr] && v < nuses && oncyc[v] && !mcyc) continue;
+        /* c - a*b where the multiply is what is taken away, a*b - c else */
+        uint64_t form = !sub ? 0 : k == 1 ? 1 : 2;
+        if (vec && form == 2) continue;
+        Ref ma[3] = { ir_args(f, m)[0], ir_args(f, m)[1], c };
+        uint64_t lane = in->imm2;
+        Ref r = emit_before(f, bi, &i, vec ? I_VFMADD : I_FMA,
+                            (ValType)in->type, ma, 3, form);
+        f->insts[r].imm2 = vec ? lane : 0;
+        ir_replace(f, v, r);
+        f->insts[v].op = I_NOP;
+        g_stats.fma_fused++;
+        changed = true;
+        break;
+      }
+    }
+  }
+  xfree(uses);
+  xfree(oncyc);
+  if (changed) ir_apply_subst(f);
+  return changed;
+}
+
 /* Inlining, devirtualization and escape analysis feed one another: an
    inlined callee shows a dispatch the class of its receiver, the direct
    call that dispatch becomes is inlined in turn, and an allocation handed
@@ -17574,6 +17690,7 @@ void ir_optimize(IrFunc *f, const OptOpts *o) {
     pass_dce(f);
     ir_order(f);
   }
+  if (o->fma && TP("fma", pass_fma(f)) && o->dce) pass_dce(f);
   if (o->print_ir) ir_print(f, "optimised");
   ir_verify(f, "post-opt");
 }

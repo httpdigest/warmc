@@ -746,6 +746,13 @@ static void emit_inst(Isel *s, Ref v) {
     FBIN(I_FMIN, a64_fmin)
     FBIN(I_FMAX, a64_fmax)
 #undef FBIN
+    case I_FMA: {
+      int x = rd(s, a[0], F0), y = rd(s, a[1], F1), c = rd(s, a[2], F2);
+      int d = wr(s, v, F2);
+      a64_fmadd(B, ft, (int)in->imm, d, x, y, c);
+      commit(s, v, d);
+      break;
+    }
     case I_FCOPYSIGN: emit_copysign(s, v); break;
 
 #define FUN(op, fn)                                                            \
@@ -1464,10 +1471,14 @@ static void emit_inst(Isel *s, Ref v) {
     case I_VFMADD: {
       int x = rd(s, a[0], F0), y = rd(s, a[1], F1), c = rd(s, a[2], F2);
       int fsz = (in->imm2 == VLANE_F64);
-      a64_vmov(B, FTMP, c);
-      if (in->imm & 1) a64_vfmls(B, fsz, FTMP, x, y);
-      else             a64_vfmla(B, fsz, FTMP, x, y);
-      commit(s, v, FTMP);
+      /* fmla adds into its destination: the result's own register, the
+         addend's where the allocator tied them, unless it is a factor */
+      int d = wr(s, v, FTMP);
+      if (d == x || d == y) d = FTMP;
+      if (d != c) a64_vmov(B, d, c);
+      if (in->imm & 1) a64_vfmls(B, fsz, d, x, y);
+      else             a64_vfmla(B, fsz, d, x, y);
+      commit(s, v, d);
       break;
     }
 

@@ -692,6 +692,7 @@ command-line order, so put them **after** `-O`.
 | `licm` | loop-invariant code motion, including hoisting invariant stores and trap guards |
 | `branch` | constant-branch folding and block merging |
 | `edge-tests` | in loops, fold a test or branch that a dominating branch on the same value has already decided, such as an inlined bounds check behind a loop's own exit test |
+| `fma` | off unless asked for: a float multiply whose one reader is an add or a subtract becomes one fused multiply-add (`fmadd`, `fmla`), rounded once. wasm rounds the multiply and the add each, so a result can differ in its last bit; `-ffma` is for code that does not depend on that, as native C compilers assume by default |
 | `mulwide` | a 64-by-64 multiply that wasm spells in 32-bit halves -- `__multi3` from Rust, C and Zig, Go's `bits.Mul64` -- becomes one `mul` for the low half and `umulh`, or `smulh` for sign-extended operands, for the high |
 | `ifconv` | if-conversion: a diamond or triangle whose arms are cheap and cannot trap becomes selects (`csel`), and so does a small `br_table` of cheap arms, its default dropped where the index is provably in range |
 | `thread` | jump threading through a block that only switches on a parameter, such as the dispatch Go's compiler puts around every function, or only compares one with a constant, when an edge passes that parameter a constant |
@@ -994,7 +995,8 @@ than wasm's:
 45 kernels print a different result natively, though they do the same work.
 Go's `int`, Rust's `usize`, C's `long` and Haskell's `Int` are 32 bits on
 wasm32 and 64 natively. Native floating-point code is also not always rounded
-as wasm's is: clang fuses multiply-adds natively, for one. Without those 45
+as wasm's is: clang fuses multiply-adds natively, for one, which warmc does
+only when asked to with `-ffma`. Without those 45
 kernels the geometric mean is 1.10×. The Haskell natives are built with
 `-with-rtsopts=-V0`: without it the runtime's exit waits out its 10 ms ticker,
 which made the empty program's time mostly that wait and credited every

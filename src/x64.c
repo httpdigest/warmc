@@ -726,3 +726,14 @@ void x64_vfmadd231p(Buf *b, int d, int dst, int a, int c) {
 void x64_vfnmadd231p(Buf *b, int d, int dst, int a, int c) {
   vex_rr(b, 2, d, 1, 0, 0xbc, dst, a, c);
 }
+/* the scalar forms, ss or sd by VEX.W too: dst = a * c + dst, -(a * c) + dst
+   and a * c - dst */
+void x64_vfmadd231s(Buf *b, int d, int dst, int a, int c) {
+  vex_rr(b, 2, d, 1, 0, 0xb9, dst, a, c);
+}
+void x64_vfnmadd231s(Buf *b, int d, int dst, int a, int c) {
+  vex_rr(b, 2, d, 1, 0, 0xbd, dst, a, c);
+}
+void x64_vfmsub231s(Buf *b, int d, int dst, int a, int c) {
+  vex_rr(b, 2, d, 1, 0, 0xbb, dst, a, c);
+}

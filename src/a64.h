@@ -302,6 +302,7 @@ void a64_vfdiv(Buf *b, int sz, int rd, int rn, int rm);
 void a64_vfmax(Buf *b, int sz, int rd, int rn, int rm);
 
 void a64_vfmla(Buf *b, int sz, int rd, int rn, int rm);
+void a64_fmadd(Buf *b, int ft, int form, int rd, int rn, int rm, int ra);
 void a64_vfmls(Buf *b, int sz, int rd, int rn, int rm);
 void a64_vfmin(Buf *b, int sz, int rd, int rn, int rm);
 void a64_vfneg(Buf *b, int sz, int rd, int rn);

@@ -580,6 +580,18 @@ int main(int argc, char **argv) {
             "vfnmadd231p%c xmm1, xmm2, xmm3", d ? 'd' : 's');
       CASEF(x64_vfnmadd231p(b, d, X_XMM13, X_XMM14, X_XMM15),
             "vfnmadd231p%c xmm13, xmm14, xmm15", d ? 'd' : 's');
+      CASEF(x64_vfmadd231s(b, d, X_XMM1, X_XMM2, X_XMM3),
+            "vfmadd231s%c xmm1, xmm2, xmm3", d ? 'd' : 's');
+      CASEF(x64_vfmadd231s(b, d, X_XMM10, X_XMM11, X_XMM12),
+            "vfmadd231s%c xmm10, xmm11, xmm12", d ? 'd' : 's');
+      CASEF(x64_vfnmadd231s(b, d, X_XMM1, X_XMM2, X_XMM3),
+            "vfnmadd231s%c xmm1, xmm2, xmm3", d ? 'd' : 's');
+      CASEF(x64_vfnmadd231s(b, d, X_XMM13, X_XMM14, X_XMM15),
+            "vfnmadd231s%c xmm13, xmm14, xmm15", d ? 'd' : 's');
+      CASEF(x64_vfmsub231s(b, d, X_XMM4, X_XMM5, X_XMM6),
+            "vfmsub231s%c xmm4, xmm5, xmm6", d ? 'd' : 's');
+      CASEF(x64_vfmsub231s(b, d, X_XMM9, X_XMM8, X_XMM15),
+            "vfmsub231s%c xmm9, xmm8, xmm15", d ? 'd' : 's');
     }
   }
   CASE("vshufps xmm1, xmm2, xmm3, 136", x64_vshufps(b, X_XMM1, X_XMM2, X_XMM3, 0x88));

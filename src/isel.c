@@ -143,6 +143,7 @@ static bool isel_fp_remat_ok(Isel *s, const Inst *in) {
 #define RA_RETAREA_REG R8
 #define RA_ALLOC_RES_REG R0
 #define RA_HAVE_PIECES 1
+#define RA_FMA_TIED 0
 /* a constant zero is read as wzr/xzr where it has no register (rd_zr) */
 #define RA_ZERO_REG 1
 

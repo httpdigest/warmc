@@ -1185,7 +1185,7 @@ bool ir_is_pure(const Inst *in) {
     case I_FADD: case I_FSUB: case I_FMUL: case I_FDIV:
     case I_FMIN: case I_FMAX: case I_FCOPYSIGN:
     case I_FABS: case I_FNEG: case I_FSQRT:
-    case I_FCEIL: case I_FFLOOR: case I_FTRUNC: case I_FNEAREST:
+    case I_FCEIL: case I_FFLOOR: case I_FTRUNC: case I_FNEAREST: case I_FMA:
     case I_FEQ: case I_FNE: case I_FLT: case I_FGT: case I_FLE: case I_FGE:
     case I_WRAP: case I_EXTENDS: case I_EXTENDU:
     case I_TRUNC_SATS: case I_TRUNC_SATU:
@@ -1285,7 +1285,7 @@ const char *ir_op_name(uint16_t op) {
     N(I_FMIN, "fmin"), N(I_FMAX, "fmax"), N(I_FCOPYSIGN, "fcopysign"),
     N(I_FABS, "fabs"), N(I_FNEG, "fneg"), N(I_FSQRT, "fsqrt"),
     N(I_FCEIL, "fceil"), N(I_FFLOOR, "ffloor"), N(I_FTRUNC, "ftrunc"),
-    N(I_FNEAREST, "fnearest"),
+    N(I_FNEAREST, "fnearest"), N(I_FMA, "fma"),
     N(I_FEQ, "feq"), N(I_FNE, "fne"), N(I_FLT, "flt"), N(I_FGT, "fgt"),
     N(I_FLE, "fle"), N(I_FGE, "fge"),
     N(I_WRAP, "wrap"), N(I_EXTENDS, "extends"), N(I_EXTENDU, "extendu"),

@@ -508,6 +508,13 @@ static void fp2(Buf *b, int ft, int opcode, int rd, int rn, int rm) {
 void a64_fmul(Buf *b, int ft, int rd, int rn, int rm) { fp2(b, ft, 0x0, rd, rn, rm); }
 void a64_fdiv(Buf *b, int ft, int rd, int rn, int rm) { fp2(b, ft, 0x1, rd, rn, rm); }
 void a64_fadd(Buf *b, int ft, int rd, int rn, int rm) { fp2(b, ft, 0x2, rd, rn, rm); }
+/* rd = ra + rn * rm rounded once (form 0, FMADD); ra - rn * rm (1, FMSUB);
+   rn * rm - ra (2, FNMSUB) */
+void a64_fmadd(Buf *b, int ft, int form, int rd, int rn, int rm, int ra) {
+  uint32_t o1 = form == 2, o0 = form != 0;
+  W((0x1Fu << 24) | ((uint32_t)ft << 22) | (o1 << 21) | (M5(rm) << 16) |
+    (o0 << 15) | (M5(ra) << 10) | (M5(rn) << 5) | M5(rd));
+}
 void a64_fsub(Buf *b, int ft, int rd, int rn, int rm) { fp2(b, ft, 0x3, rd, rn, rm); }
 void a64_fmax(Buf *b, int ft, int rd, int rn, int rm) { fp2(b, ft, 0x4, rd, rn, rm); }
 void a64_fmin(Buf *b, int ft, int rd, int rn, int rm) { fp2(b, ft, 0x5, rd, rn, rm); }

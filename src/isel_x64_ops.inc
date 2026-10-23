@@ -934,6 +934,18 @@ static void emit_inst(Isel *s, Ref v) {
     FBIN(I_FMUL, x64_vmuls)
     FBIN(I_FDIV, x64_vdivs)
 #undef FBIN
+    case I_FMA: {
+      int x = rd(s, a[0], F0), y = rd(s, a[1], F1), c = rd(s, a[2], F2);
+      int d = wr(s, v, FTMP);
+      if (d == x || d == y) d = FTMP;
+      if (d != c) simd_mov(s, d, c);
+      if (in->imm == 1) x64_vfnmadd231s(B, wide, d, x, y);
+      else if (in->imm == 2) x64_vfmsub231s(B, wide, d, x, y);
+      else x64_vfmadd231s(B, wide, d, x, y);
+      canon_nan(s, d, wide);
+      commit(s, v, d);
+      break;
+    }
     case I_FMIN: emit_fminmax(s, v, true); break;
     case I_FMAX: emit_fminmax(s, v, false); break;
     case I_FCOPYSIGN: emit_copysign(s, v); break;
@@ -1892,10 +1904,12 @@ static void emit_inst(Isel *s, Ref v) {
     case I_VFMADD: {
       int x = rd(s, a[0], F0), y = rd(s, a[1], F1), c = rd(s, a[2], F2);
       int fd = (in->imm2 == VLANE_F64);
-      simd_mov(s, FTMP, c);
-      if (in->imm & 1) x64_vfnmadd231p(B, fd, FTMP, x, y);
-      else x64_vfmadd231p(B, fd, FTMP, x, y);
-      commit(s, v, FTMP);
+      int d = wr(s, v, FTMP);
+      if (d == x || d == y) d = FTMP;
+      if (d != c) simd_mov(s, d, c);
+      if (in->imm & 1) x64_vfnmadd231p(B, fd, d, x, y);
+      else x64_vfmadd231p(B, fd, d, x, y);
+      commit(s, v, d);
       break;
     }
 

@@ -25,6 +25,7 @@ prepare cases   ./test/run_tests.sh --prepare
 prepare traps   ./test/run_traps.sh --prepare
 prepare gc      ./test/run_gc.sh --prepare
 prepare relaxed ./test/run_relaxed.sh --prepare
+prepare fma     ./test/run_fma.sh --prepare
 prepare components python3 test/run_components.py --prepare
 prepare wit     python3 test/run_wit.py --prepare
 prepare wl-O2   env WORKLOAD_CLANG_OPT=-O2 ./test/run_workload.sh --prepare
@@ -231,6 +232,7 @@ start gowasip2 ./test/run_gowasip2.sh
 start rswasip2 ./test/run_rswasip2.sh
 start bincases ./test/run_binary_cases.sh
 start relaxed  ./test/run_relaxed.sh
+start fma      ./test/run_fma.sh
 start components python3 test/run_components.py
 start wit       python3 test/run_wit.py
 start canon     python3 test/run_canon.py
