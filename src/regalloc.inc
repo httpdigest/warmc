@@ -1120,6 +1120,50 @@ static uint32_t share_slots(Isel *s, const Interval *iv, uint32_t n,
   return nnew;
 }
 
+/* Whether two webs' intervals meet: two that start together, or one that
+   starts before another of the other web, started earlier, ends.  Each
+   web's members are kept in order of their starts (web_merge), so one walk
+   in that order over both answers it: comparing every pair was a web's
+   size times the other's, and a Go function's stack pointer gathers a web
+   of hundreds. */
+static bool web_conflict(const Interval *iv, uint32_t a, uint32_t b,
+                         const uint32_t *next) {
+  int32_t end_a = INT32_MIN, end_b = INT32_MIN;
+  while (a != UINT32_MAX || b != UINT32_MAX) {
+    if (b == UINT32_MAX || (a != UINT32_MAX && iv[a].start < iv[b].start)) {
+      if (iv[a].start < end_b) return true;
+      if (iv[a].end > end_a) end_a = iv[a].end;
+      a = next[a];
+    } else if (a == UINT32_MAX || iv[b].start < iv[a].start) {
+      if (iv[b].start < end_a) return true;
+      if (iv[b].end > end_b) end_b = iv[b].end;
+      b = next[b];
+    } else {
+      return true;
+    }
+  }
+  return false;
+}
+
+/* web b's members merged into web a's, both in order of their starts */
+static void web_merge(const Interval *iv, uint32_t *head, uint32_t *tail,
+                      uint32_t b, uint32_t *next) {
+  uint32_t a = *head, h = UINT32_MAX, t = UINT32_MAX;
+  while (a != UINT32_MAX || b != UINT32_MAX) {
+    uint32_t x;
+    if (b == UINT32_MAX || (a != UINT32_MAX && iv[a].start <= iv[b].start)) {
+      x = a; a = next[a];
+    } else {
+      x = b; b = next[b];
+    }
+    if (t == UINT32_MAX) h = x; else next[t] = x;
+    t = x;
+  }
+  next[t] = UINT32_MAX;
+  *head = h;
+  *tail = t;
+}
+
 static void regalloc_linear(Isel *s) {
   IrFunc *f = s->f;
   uint32_t n = f->ninsts;
@@ -1309,16 +1353,7 @@ static void regalloc_linear(Isel *s) {
           if (ra == rp) continue;
           if (s->pinned[arg] || s->pinned[ra] || s->pinned[rp]) continue;
 
-          bool conflict = false;
-          for (uint32_t u = mem_head[ra]; u != UINT32_MAX && !conflict;
-               u = mem_next[u])
-            for (uint32_t w = mem_head[rp]; w != UINT32_MAX; w = mem_next[w]) {
-
-              if (iv[u].start == iv[w].start) { conflict = true; break; }
-
-              if (iv[u].start < iv[w].end && iv[w].start < iv[u].end) { conflict = true; break; }
-            }
-          if (conflict) continue;
+          if (web_conflict(iv, mem_head[ra], mem_head[rp], mem_next)) continue;
           if (co_max >= 0 && co_done >= co_max) continue;
           if (co_dbg)
             fprintf(stderr, "coalesce[%u] #%d: v%u[%d,%d) <- v%u[%d,%d)"
@@ -1333,8 +1368,7 @@ static void regalloc_linear(Isel *s) {
               mem_head[rp] = mem_head[ra];
               mem_tail[rp] = mem_tail[ra];
             } else {
-              mem_next[mem_tail[rp]] = mem_head[ra];
-              mem_tail[rp] = mem_tail[ra];
+              web_merge(iv, &mem_head[rp], &mem_tail[rp], mem_head[ra], mem_next);
             }
             mem_head[ra] = mem_tail[ra] = UINT32_MAX;
           }
