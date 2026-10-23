@@ -117,6 +117,7 @@ void ir_free(IrFunc *f) {
   if (!f) return;
   xfree(f->kb_epoch);
   xfree(f->kb_bits);
+  xfree(f->ord_tmp);
   struct IrChunk *c = f->chunks;
   while (c) {
     struct IrChunk *n = c->next;
@@ -373,13 +374,20 @@ static int layout_score_of(const IrFunc *f, const Block *b, uint32_t si) {
   return score;
 }
 
+/* stk0 holds cap entries; a search that needs more moves to the heap */
 static void dfs_post(IrFunc *f, uint32_t entry, uint8_t *seen, uint32_t *post,
-                     uint32_t *n, bool by_score) {
-  uint32_t cap = f->nblocks + 8, sp = 0;
-  uint32_t *stk = xmalloc(cap * 2 * sizeof(uint32_t));
+                     uint32_t *n, bool by_score, uint32_t *stk0, uint32_t cap) {
+  uint32_t sp = 0;
+  uint32_t *stk = stk0;
 
 #define DFS_PUSH(blk, ph) do {                                                 \
-    if (sp == cap) { cap *= 2; stk = xrealloc(stk, cap * 2 * sizeof(uint32_t)); } \
+    if (sp == cap) {                                                           \
+      cap *= 2;                                                                \
+      if (stk == stk0) {                                                       \
+        stk = xmalloc(cap * 2 * sizeof(uint32_t));                             \
+        memcpy(stk, stk0, sp * 2 * sizeof(uint32_t));                          \
+      } else stk = xrealloc(stk, cap * 2 * sizeof(uint32_t));                  \
+    }                                                                          \
     stk[sp * 2] = (blk); stk[sp * 2 + 1] = (ph); sp++;                         \
   } while (0)
 
@@ -413,7 +421,7 @@ static void dfs_post(IrFunc *f, uint32_t entry, uint8_t *seen, uint32_t *post,
     for (uint32_t i = ns; i-- > 0;) DFS_PUSH(b->succs[idx[i]].target, 0);
   }
 #undef DFS_PUSH
-  xfree(stk);
+  if (stk != stk0) xfree(stk);
 }
 
 /* Returns whether every retreating edge was natural, which makes the graph
@@ -423,10 +431,35 @@ static void dfs_post(IrFunc *f, uint32_t entry, uint8_t *seen, uint32_t *post,
    the order -- rpo, and the dominator tree's interval numbering. */
 static bool order_once(IrFunc *f, bool by_score, bool keep) {
   bool reducible = true;
-  uint8_t *seen = xcalloc(f->nblocks, 1);
-  uint32_t *post = xmalloc(f->nblocks * sizeof(uint32_t));
+  /* Every array below is the function's blocks long, or one more, and the
+     search's stack twice that: carved from one buffer the function keeps.
+     An ordering is redone after most passes that touch the graph, and this
+     runs twice for each -- 118,000 times in compiling stdgotests/webtext --
+     where allocating its dozen arrays each time was half a percent. */
+  uint32_t nb = f->nblocks;
+  size_t words = 14 * (size_t)nb + 64;
+  if (words > f->ord_tmp_cap) {
+    xfree(f->ord_tmp);
+    f->ord_tmp_cap = words + words / 2;
+    f->ord_tmp = xmalloc(f->ord_tmp_cap * sizeof(uint32_t));
+  }
+  uint32_t *w = f->ord_tmp;
+  uint32_t *post = w;      w += nb;
+  uint32_t *dstk = w;      w += 2 * ((size_t)nb + 8);
+  uint32_t *stamp = w;     w += nb + 1;
+  uint32_t *kids_at = w;   w += nb + 1;
+  uint32_t *kids = w;      w += nb + 1;
+  uint32_t *fill = w;      w += nb + 1;
+  uint32_t *dstack = w;    w += nb + 1;
+  uint32_t *taken = w;     w += nb + 1;
+  uint32_t *lstack = w;    w += nb + 1;
+  uint32_t *body = w;      w += nb + 1;
+  uint8_t *seen = (uint8_t *)w;   w += nb / 4 + 1;
+  uint8_t *inloop = (uint8_t *)w; w += nb / 4 + 1;
+  uint8_t *fwd = (uint8_t *)w;
+  memset(seen, 0, nb);
   uint32_t n = 0;
-  dfs_post(f, f->entry, seen, post, &n, by_score);
+  dfs_post(f, f->entry, seen, post, &n, by_score, dstk, nb + 8);
 
   if (n > f->cap_order) {
     f->order = ir_grow(f, f->order, (size_t)f->cap_order * sizeof(uint32_t),
@@ -452,7 +485,7 @@ static bool order_once(IrFunc *f, bool by_score, bool keep) {
      one already has its answer.  Without the stamps a landing pad that
      thousands of calls unwind to walked the dominator chain once for each
      of them: Kotlin's main, nine tenths of its compile. */
-  uint32_t *stamp = xcalloc(f->nblocks ? f->nblocks : 1, sizeof(uint32_t));
+  memset(stamp, 0, nb * sizeof(uint32_t));
   uint32_t cur = 0;
   bool changed = true;
   while (changed) {
@@ -484,7 +517,6 @@ static bool order_once(IrFunc *f, bool by_score, bool keep) {
       if (newidom != REF_NONE && b->idom != newidom) { b->idom = newidom; changed = true; }
     }
   }
-  xfree(stamp);
   }
 
   for (uint32_t i = 0; i < f->nblocks; i++) {
@@ -492,22 +524,19 @@ static bool order_once(IrFunc *f, bool by_score, bool keep) {
     f->blocks[i].dom_out = 0;
   }
   if (n) {
-    uint32_t *kids_at = xcalloc((size_t)f->nblocks + 1, sizeof(uint32_t));
-    uint32_t *kids = xmalloc((n ? n : 1) * sizeof(uint32_t));
+    memset(kids_at, 0, ((size_t)nb + 1) * sizeof(uint32_t));
     for (uint32_t i = 1; i < n; i++) {
       uint32_t bi = f->order[i], d = f->blocks[bi].idom;
       if (d != REF_NONE && d != bi) kids_at[d + 1]++;
     }
     for (uint32_t i = 0; i < f->nblocks; i++) kids_at[i + 1] += kids_at[i];
-    uint32_t *fill = xmalloc(((size_t)f->nblocks ? f->nblocks : 1) * sizeof(uint32_t));
     for (uint32_t i = 0; i < f->nblocks; i++) fill[i] = kids_at[i];
     for (uint32_t i = 1; i < n; i++) {
       uint32_t bi = f->order[i], d = f->blocks[bi].idom;
       if (d != REF_NONE && d != bi) kids[fill[d]++] = bi;
     }
 
-    uint32_t *stack = xmalloc(((size_t)n + 1) * sizeof(uint32_t));
-    uint32_t *taken = xmalloc(((size_t)n + 1) * sizeof(uint32_t));
+    uint32_t *stack = dstack;
     uint32_t sp = 0, clock = 0;
     stack[sp] = f->entry; taken[sp] = 0;
     f->blocks[f->entry].dom_in = clock++;
@@ -524,22 +553,16 @@ static bool order_once(IrFunc *f, bool by_score, bool keep) {
       if (!sp) break;
       sp--;
     }
-    xfree(kids_at); xfree(kids); xfree(fill); xfree(stack); xfree(taken);
   }
 
   /* Each back edge's loop body, walked up from the latch.  The walk lists
      the blocks it marks, so a loop costs its own size: clearing and scanning
      every block per back edge made this blocks times loops, which in a
      function of 78,000 blocks and 300 loops was most of the compile. */
-  if (keep) {
-    xfree(seen);
-    xfree(post);
-    return true;
-  }
-  uint8_t *inloop = xcalloc(f->nblocks ? f->nblocks : 1, 1);
-  uint8_t *fwd = xcalloc(f->nblocks ? f->nblocks : 1, 1);
-  uint32_t *stack = xmalloc((f->nblocks ? f->nblocks : 1) * sizeof(uint32_t));
-  uint32_t *body = xmalloc((f->nblocks ? f->nblocks : 1) * sizeof(uint32_t));
+  if (keep) return true;
+  memset(inloop, 0, nb);
+  memset(fwd, 0, nb);
+  uint32_t *stack = lstack;
   for (uint32_t i = 0; i < n; i++) {
     uint32_t bi = f->order[i];
     Block *b = &f->blocks[bi];
@@ -594,10 +617,6 @@ static bool order_once(IrFunc *f, bool by_score, bool keep) {
       }
     }
   }
-  xfree(inloop); xfree(fwd); xfree(stack); xfree(body);
-
-  xfree(seen);
-  xfree(post);
   return reducible;
 }
 
@@ -747,11 +766,12 @@ bool ir_order_changed(IrFunc *f) {
    edge reads.  The order is kept, so every comparison of values decides as
    it did; the few decisions that read the whole array rather than the code
    get what it held from made_insts, made_maxargs and the ghost flags.
-   Pending substitutions are left alone, uncompacted. */
+   Substitutions are applied first, and the renumbering starts the map
+   afresh: refusing to compact while any was recorded skipped all but six of
+   stdgotests/webtext's 5243 functions, since one applied stays recorded. */
 void ir_compact(IrFunc *f) {
+  ir_apply_subst(f);
   uint32_t n = f->ninsts;
-  for (uint32_t v = 0; v < n; v++)
-    if (f->subst[v] != v) return;
   uint8_t *keep = xcalloc(n ? n : 1, 1);
   Ref *stack = xmalloc((n ? n : 1) * sizeof(Ref));
   uint32_t sp = 0;

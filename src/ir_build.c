@@ -1233,7 +1233,7 @@ static void gc_build(Bld *b, uint32_t sub, const char *sym) {
   }
 }
 
-IrFunc *ir_build(Module *m, uint32_t fi, const OptOpts *opt) {
+IrFunc *ir_build_unordered(Module *m, uint32_t fi, const OptOpts *opt) {
   Func *fn = &m->funcs[fi];
   IrFunc *f = ir_new(m, fi);
   Bld bld;
@@ -1898,12 +1898,17 @@ done:
     f->blocks[i].term_imm = TRAP_UNREACHABLE;
   }
   finalize_params(b);
-  ir_order(f);
 
   xfree(f->curdef); f->curdef = NULL; f->cap_curdef = 0;
   xfree(b->stack); xfree(b->ctl); xfree(b->nexplicit); xfree(b->param_local);
   xfree(b->pads); xfree(b->ldef_out);
   for (uint32_t i = 0; i < b->nbtypes; i++) xfree(b->btypes[i]);
   xfree(b->btypes);
+  return f;
+}
+
+IrFunc *ir_build(Module *m, uint32_t fi, const OptOpts *opt) {
+  IrFunc *f = ir_build_unordered(m, fi, opt);
+  ir_order(f);
   return f;
 }

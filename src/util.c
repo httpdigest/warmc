@@ -275,6 +275,7 @@ static void wenv_init(void) {
 
 const char *warmc_getenv(const char *name) {
   pthread_once(&g_wenv_once, wenv_init);
+  if (!g_nwenv) return NULL;
   size_t len = strlen(name);
   for (size_t i = 0; i < g_nwenv; i++)
     if (!strncmp(g_wenv[i], name, len) && g_wenv[i][len] == '=')
