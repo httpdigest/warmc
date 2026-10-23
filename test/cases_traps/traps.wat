@@ -148,6 +148,17 @@
   (func (export "div0_u")   (result i32) (i32.div_u (i32.const 1) (i32.const 0)))
   (func (export "rem0")     (result i32) (i32.rem_s (i32.const 1) (i32.const 0)))
   (func (export "div_ovf")  (result i32) (i32.div_s (i32.const -2147483648) (i32.const -1)))
+  ;; A divisor of -1 is a negation, which has to trap on the minimum still,
+  ;; with the dividend where nothing can fold it.
+  (global $min32 (mut i32) (i32.const 0x80000000))
+  (global $min64 (mut i64) (i64.const 0x8000000000000000))
+  (func (export "div_ovf_var") (result i32) (i32.div_s (global.get $min32) (i32.const -1)))
+  (func (export "div_ovf64_var") (result i64) (i64.div_s (global.get $min64) (i64.const -1)))
+  (func (export "rem_m1_min_ok") (result i32)
+    (if (i32.or (i32.wrap_i64 (i64.rem_s (global.get $min64) (i64.const -1)))
+                (i32.rem_s (global.get $min32) (i32.const -1)))
+      (then (unreachable)))
+    (i32.const 0))
   (func (export "div0_64")  (result i64) (i64.div_s (i64.const 1) (i64.const 0)))
   (func (export "div_ovf64") (result i64)
     (i64.div_s (i64.const -9223372036854775808) (i64.const -1)))

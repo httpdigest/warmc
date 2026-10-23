@@ -831,6 +831,16 @@ static void emit_inst(Isel *s, Ref v) {
       commit(s, v, d);
       break;
     }
+    case I_MULHS: {
+      /* no signed mulx: the one-operand imul, edx:eax or rdx:rax, both
+         scratch here as for a divide */
+      int x = rd(s, a[0], TMP0);
+      if (x != X_RAX) x64_mov_rr(B, 1, X_RAX, x);
+      int y = rd(s, a[1], S0);
+      x64_imul_r(B, sf, y);
+      commit(s, v, X_RDX);
+      break;
+    }
     case I_SHL: case I_SHRS: case I_SHRU: case I_ROTR: case I_ROTL: {
       int width = sf ? 64 : 32;
       int x = rd(s, a[0], S0);

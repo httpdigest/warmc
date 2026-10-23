@@ -540,6 +540,8 @@ static bool fold_int_binop(uint16_t op, ValType t, uint64_t a, uint64_t b, uint6
     case I_ADD: r = ua + ub; break;
     case I_SUB: r = ua - ub; break;
     case I_MUL: r = ua * ub; break;
+    case I_MULHU: r = w64 ? (uint64_t)(((unsigned __int128)ua * ub) >> 64) : (ua * ub) >> 32; break;
+    case I_MULHS: r = w64 ? (uint64_t)(((__int128)sa * sb) >> 64) : (uint64_t)((sa * sb) >> 32); break;
     case I_AND: r = ua & ub; break;
     case I_OR:  r = ua | ub; break;
     case I_XOR: r = ua ^ ub; break;
@@ -878,15 +880,70 @@ Magic opt_magic_unsigned(uint64_t d, bool wide) {
   return wide ? magic_u64(d) : magic_u32((uint32_t)d);
 }
 
-static bool magic_worth_it(const Magic *mg, bool wide) {
-  if (!mg->add) return true;
-  return wide;
+/* Signed magic numbers (Hacker's Delight, figure 10-1) for 2 <= |d| <
+   2^(w-1), d not a power of two: q = mulhs(n, m), plus n where d > 0 > m
+   and minus n where d < 0 < m, shifted right by sh, plus one where that is
+   negative.  m is the w-bit pattern. */
+static Magic magic_s32(int32_t d) {
+  Magic mg = { 0, 0, 0 };
+  const uint32_t two31 = 0x80000000u;
+  uint32_t ad = d < 0 ? 0u - (uint32_t)d : (uint32_t)d;
+  uint32_t t = two31 + ((uint32_t)d >> 31);
+  uint32_t anc = t - 1 - t % ad;
+  uint32_t q1 = two31 / anc, r1 = two31 - q1 * anc;
+  uint32_t q2 = two31 / ad, r2 = two31 - q2 * ad, delta;
+  int p = 31;
+  do {
+    p++;
+    q1 *= 2; r1 *= 2;
+    if (r1 >= anc) { q1++; r1 -= anc; }
+    q2 *= 2; r2 *= 2;
+    if (r2 >= ad) { q2++; r2 -= ad; }
+    delta = ad - r2;
+  } while (q1 < delta || (q1 == delta && r1 == 0));
+  mg.m = d < 0 ? 0u - (q2 + 1) : q2 + 1;
+  mg.sh = p - 32;
+  return mg;
+}
+
+static Magic magic_s64(int64_t d) {
+  Magic mg = { 0, 0, 0 };
+  const uint64_t two63 = (uint64_t)1 << 63;
+  uint64_t ad = d < 0 ? 0u - (uint64_t)d : (uint64_t)d;
+  uint64_t t = two63 + ((uint64_t)d >> 63);
+  uint64_t anc = t - 1 - t % ad;
+  uint64_t q1 = two63 / anc, r1 = two63 - q1 * anc;
+  uint64_t q2 = two63 / ad, r2 = two63 - q2 * ad, delta;
+  int p = 63;
+  do {
+    p++;
+    q1 *= 2; r1 *= 2;
+    if (r1 >= anc) { q1++; r1 -= anc; }
+    q2 *= 2; r2 *= 2;
+    if (r2 >= ad) { q2++; r2 -= ad; }
+    delta = ad - r2;
+  } while (q1 < delta || (q1 == delta && r1 == 0));
+  mg.m = d < 0 ? 0u - (q2 + 1) : q2 + 1;
+  mg.sh = p - 64;
+  return mg;
 }
 
 static Ref emit_magic_udiv(IrFunc *f, uint32_t bi, uint32_t *idx, Ref n,
                            ValType t, uint64_t d) {
   bool wide = vt_is_64(t);
   Magic mg = opt_magic_unsigned(d, wide);
+  if (!wide && mg.add) {
+    /* A 33-bit magic number needs the add fix-up, four steps after the
+       multiply.  A 32-bit n and d have one that needs none in 64 bits:
+       with M = floor(2^64 / d) + 1 = (2^64 + e) / d, 0 < e < d,
+       n * M / 2^64 = n / d + n * e / (d * 2^64), and n * e < 2^64 keeps the
+       excess below 1 / d, too little to reach the next multiple. */
+    Ref n64 = emit_before(f, bi, idx, I_EXTENDU, VT_I64, &n, 1, 0);
+    Ref mc = emit_before(f, bi, idx, I_CONST, VT_I64, NULL, 0, ~(uint64_t)0 / d + 1);
+    Ref ma[2] = { n64, mc };
+    Ref q = emit_before(f, bi, idx, I_MULHU, VT_I64, ma, 2, 0);
+    return emit_before(f, bi, idx, I_WRAP, VT_I32, &q, 1, 0);
+  }
   Ref mc = emit_before(f, bi, idx, I_CONST, t, NULL, 0, mg.m);
   Ref ma[2] = { n, mc };
   Ref q = emit_before(f, bi, idx, I_MULHU, t, ma, 2, 0);
@@ -907,6 +964,41 @@ static Ref emit_magic_udiv(IrFunc *f, uint32_t bi, uint32_t *idx, Ref n,
     q = emit_before(f, bi, idx, I_SHRU, t, qa, 2, 0);
   }
   return q;
+}
+
+static Ref emit_magic_sdiv(IrFunc *f, uint32_t bi, uint32_t *idx, Ref n,
+                           ValType t, uint64_t dc) {
+  bool wide = vt_is_64(t);
+  int64_t d = wide ? (int64_t)dc : (int64_t)(int32_t)(uint32_t)dc;
+  Magic mg = wide ? magic_s64(d) : magic_s32((int32_t)d);
+  int64_t m = wide ? (int64_t)mg.m : (int64_t)(int32_t)(uint32_t)mg.m;
+  Ref mc = emit_before(f, bi, idx, I_CONST, t, NULL, 0, mg.m);
+  Ref ma[2] = { n, mc };
+  Ref q = emit_before(f, bi, idx, I_MULHS, t, ma, 2, 0);
+  if ((d > 0 && m < 0) || (d < 0 && m > 0)) {
+    Ref fa[2] = { q, n };
+    q = emit_before(f, bi, idx, d > 0 ? I_ADD : I_SUB, t, fa, 2, 0);
+  }
+  if (mg.sh > 0) {
+    Ref sc = emit_before(f, bi, idx, I_CONST, t, NULL, 0, (uint64_t)mg.sh);
+    Ref sa[2] = { q, sc };
+    q = emit_before(f, bi, idx, I_SHRS, t, sa, 2, 0);
+  }
+  Ref wc = emit_before(f, bi, idx, I_CONST, t, NULL, 0, wide ? 63 : 31);
+  Ref ga[2] = { q, wc };
+  Ref neg = emit_before(f, bi, idx, I_SHRU, t, ga, 2, 0);
+  Ref aa[2] = { q, neg };
+  return emit_before(f, bi, idx, I_ADD, t, aa, 2, 0);
+}
+
+/* n >= d for a divisor of 2^(w-1) or more, which goes into n at most once,
+   as a value of n's type. */
+static Ref emit_geu_const(IrFunc *f, uint32_t bi, uint32_t *idx, Ref n,
+                          ValType t, uint64_t d) {
+  Ref dc = emit_before(f, bi, idx, I_CONST, t, NULL, 0, d);
+  Ref ca[2] = { n, dc };
+  Ref c = emit_before(f, bi, idx, I_GEU, VT_I32, ca, 2, 0);
+  return t == VT_I64 ? emit_before(f, bi, idx, I_EXTENDU, VT_I64, &c, 1, 0) : c;
 }
 
 static bool is_pow2(uint64_t v, int *log2out) {
@@ -939,11 +1031,11 @@ static uint16_t cmp_inverse(uint16_t op) {
   }
 }
 
-static void strength_divs_pow2(IrFunc *f, uint32_t bi, uint32_t *idx, Ref v, int k) {
-  ValType t = (ValType)f->insts[v].type;
+/* x plus 2^k - 1 where x is negative: arithmetic shifted right by k, the
+   quotient rounded toward zero. */
+static Ref emit_divs_pow2_sum(IrFunc *f, uint32_t bi, uint32_t *idx, Ref x,
+                              ValType t, int k) {
   int w = (t == VT_I64) ? 64 : 32;
-  Ref x = ir_args(f, v)[0];
-
   Ref bias;
   if (k == 1) {
 
@@ -959,7 +1051,12 @@ static void strength_divs_pow2(IrFunc *f, uint32_t bi, uint32_t *idx, Ref v, int
     bias = emit_before(f, bi, idx, I_SHRU, t, bargs, 2, 0);
   }
   Ref aargs[2] = { x, bias };
-  Ref sum = emit_before(f, bi, idx, I_ADD, t, aargs, 2, 0);
+  return emit_before(f, bi, idx, I_ADD, t, aargs, 2, 0);
+}
+
+static void strength_divs_pow2(IrFunc *f, uint32_t bi, uint32_t *idx, Ref v, int k) {
+  ValType t = (ValType)f->insts[v].type;
+  Ref sum = emit_divs_pow2_sum(f, bi, idx, ir_args(f, v)[0], t, k);
   Ref shc = emit_before(f, bi, idx, I_CONST, t, NULL, 0, (uint64_t)k);
 
   Inst *in = &f->insts[v];
@@ -1574,10 +1671,10 @@ static bool fold_block(IrFunc *f, uint32_t bi, const OptOpts *o, const uint32_t 
           int k;
           uint64_t dc = trunc_to(t, y);
 
-          Magic mgd = opt_magic_unsigned(dc, vt_is_64(t));
-          if (dc > 2 && !is_pow2(dc, &k) && !(dc >> (vt_is_64(t) ? 63 : 31)) &&
-              (warmc_getenv("WARMC_MAGIC_ALL") || magic_worth_it(&mgd, vt_is_64(t)))) {
-            Ref q = emit_magic_udiv(f, bi, &i, a[0], t, dc);
+          if (dc > 2 && !is_pow2(dc, &k)) {
+            Ref q = dc >> (vt_is_64(t) ? 63 : 31)
+                        ? emit_geu_const(f, bi, &i, a[0], t, dc)
+                        : emit_magic_udiv(f, bi, &i, a[0], t, dc);
             in = &f->insts[v]; a = ir_args(f, v);
             ir_replace(f, v, q);
             in->op = I_NOP;
@@ -1614,7 +1711,95 @@ static bool fold_block(IrFunc *f, uint32_t bi, const OptOpts *o, const uint32_t 
             in = &f->insts[v]; a = ir_args(f, v);
             g_stats.strength_reduced++;
             changed = true;
+          } else if (c != 0) {
+            /* every other divisor: -1 is a negation that traps on the
+               minimum, the minimum itself goes into n only when n is the
+               minimum, -2^k is the negated quotient by 2^k, and the rest
+               take a magic number */
+            int w = vt_is_64(t) ? 64 : 32;
+            uint64_t smin = (uint64_t)1 << (w - 1);
+            uint64_t ac = (c & smin) ? trunc_to(t, 0 - c) : c;
+            Ref n = a[0], q;
+            if (c == trunc_to(t, ~0ull)) {
+              Ref mc = emit_before(f, bi, &i, I_CONST, t, NULL, 0, smin);
+              Ref ca[2] = { n, mc };
+              Ref ok = emit_before(f, bi, &i, I_NE, VT_I32, ca, 2, 0);
+              emit_before(f, bi, &i, I_TRAP_IF, VT_BOT, &ok, 1, TRAP_DIV_OVERFLOW);
+              Ref zc = emit_before(f, bi, &i, I_CONST, t, NULL, 0, 0);
+              Ref na[2] = { zc, n };
+              q = emit_before(f, bi, &i, I_SUB, t, na, 2, 0);
+            } else if (c == smin) {
+              Ref mc = emit_before(f, bi, &i, I_CONST, t, NULL, 0, smin);
+              Ref ca[2] = { n, mc };
+              q = emit_before(f, bi, &i, I_EQ, VT_I32, ca, 2, 0);
+              if (t == VT_I64) q = emit_before(f, bi, &i, I_EXTENDU, VT_I64, &q, 1, 0);
+            } else if (is_pow2(ac, &k)) {
+              Ref sum = emit_divs_pow2_sum(f, bi, &i, n, t, k);
+              Ref kc = emit_before(f, bi, &i, I_CONST, t, NULL, 0, (uint64_t)k);
+              Ref sa[2] = { sum, kc };
+              Ref pq = emit_before(f, bi, &i, I_SHRS, t, sa, 2, 0);
+              Ref zc = emit_before(f, bi, &i, I_CONST, t, NULL, 0, 0);
+              Ref na[2] = { zc, pq };
+              q = emit_before(f, bi, &i, I_SUB, t, na, 2, 0);
+            } else {
+              q = emit_magic_sdiv(f, bi, &i, n, t, c);
+            }
+            in = &f->insts[v]; a = ir_args(f, v);
+            ir_replace(f, v, q);
+            in->op = I_NOP;
+            g_stats.strength_reduced++;
+            changed = true;
           }
+        }
+        break;
+      case I_REMS:
+        if (o->strength && has_c1) {
+          /* n - q * d, the sign the dividend's: by +-1 nothing is left (and
+             wasm's rem_s does not trap on the minimum), by the minimum n
+             is left unless it is the minimum, by +-2^k the bits under 2^k
+             of n rounded toward zero, and the rest through the magic
+             quotient */
+          int k;
+          uint64_t c = trunc_to(t, y);
+          int w = vt_is_64(t) ? 64 : 32;
+          uint64_t smin = (uint64_t)1 << (w - 1);
+          uint64_t ac = (c & smin) ? trunc_to(t, 0 - c) : c;
+          if (c == 0) break;
+          if (ac == 1) {
+            replace_with_const(f, v, 0);
+            g_stats.strength_reduced++;
+            changed = true;
+            break;
+          }
+          Ref n = a[0], r;
+          if (c == smin) {
+            Ref mc = emit_before(f, bi, &i, I_CONST, t, NULL, 0, smin);
+            Ref ca[2] = { n, mc };
+            Ref is_min = emit_before(f, bi, &i, I_EQ, VT_I32, ca, 2, 0);
+            Ref zc = emit_before(f, bi, &i, I_CONST, t, NULL, 0, 0);
+            Ref sa[3] = { zc, n, is_min };
+            r = emit_before(f, bi, &i, I_SELECT, t, sa, 3, 0);
+          } else {
+            Ref p;
+            if (is_pow2(ac, &k)) {
+              Ref sum = emit_divs_pow2_sum(f, bi, &i, n, t, k);
+              Ref mk = emit_before(f, bi, &i, I_CONST, t, NULL, 0, trunc_to(t, ~0ull << k));
+              Ref ma[2] = { sum, mk };
+              p = emit_before(f, bi, &i, I_AND, t, ma, 2, 0);
+            } else {
+              Ref q = emit_magic_sdiv(f, bi, &i, n, t, c);
+              Ref dcv = emit_before(f, bi, &i, I_CONST, t, NULL, 0, c);
+              Ref mula[2] = { q, dcv };
+              p = emit_before(f, bi, &i, I_MUL, t, mula, 2, 0);
+            }
+            Ref suba[2] = { n, p };
+            r = emit_before(f, bi, &i, I_SUB, t, suba, 2, 0);
+          }
+          in = &f->insts[v]; a = ir_args(f, v);
+          ir_replace(f, v, r);
+          in->op = I_NOP;
+          g_stats.strength_reduced++;
+          changed = true;
         }
         break;
       case I_EXT8S: case I_EXT16S: case I_EXT32S: {
@@ -1758,10 +1943,10 @@ static bool fold_block(IrFunc *f, uint32_t bi, const OptOpts *o, const uint32_t 
           int k;
           uint64_t dc = trunc_to(t, y);
 
-          Magic mgr = opt_magic_unsigned(dc, vt_is_64(t));
-          if (dc > 2 && !is_pow2(dc, &k) && !(dc >> (vt_is_64(t) ? 63 : 31)) &&
-              (warmc_getenv("WARMC_MAGIC_ALL") || magic_worth_it(&mgr, vt_is_64(t)))) {
-            Ref q = emit_magic_udiv(f, bi, &i, a[0], t, dc);
+          if (dc > 2 && !is_pow2(dc, &k)) {
+            Ref q = dc >> (vt_is_64(t) ? 63 : 31)
+                        ? emit_geu_const(f, bi, &i, a[0], t, dc)
+                        : emit_magic_udiv(f, bi, &i, a[0], t, dc);
             Ref dcv = emit_before(f, bi, &i, I_CONST, t, NULL, 0, dc);
             Ref mula[2] = { q, dcv };
             Ref prod = emit_before(f, bi, &i, I_MUL, t, mula, 2, 0);
@@ -14047,7 +14232,7 @@ static bool uac_witness(IrFunc *f, const UseIdx *ui, Ref root, Ref v,
    and either order traps identically on an unchanged state. */
 static bool uac_pure(uint16_t op) {
   switch (op) {
-    case I_CONST: case I_ADD: case I_SUB: case I_MUL: case I_MULHU:
+    case I_CONST: case I_ADD: case I_SUB: case I_MUL: case I_MULHU: case I_MULHS:
     case I_AND: case I_OR: case I_XOR: case I_SHL: case I_SHRS: case I_SHRU:
     case I_ROTL: case I_ROTR: case I_CLZ: case I_CTZ: case I_POPCNT:
     case I_BSWAP:
