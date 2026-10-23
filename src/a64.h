@@ -283,6 +283,9 @@ void a64_vuqxtn(Buf *b, int q, int size, int rd, int rn);
 void a64_vsqxtun(Buf *b, int q, int size, int rd, int rn);
 void a64_vsaddlp(Buf *b, int size, int rd, int rn);
 void a64_vuaddlp(Buf *b, int size, int rd, int rn);
+/* add-accumulate long pairwise: rd += pairs of rn, size the source lanes' */
+void a64_vsadalp(Buf *b, int size, int rd, int rn);
+void a64_vuadalp(Buf *b, int size, int rd, int rn);
 void a64_vsmull(Buf *b, int q, int size, int rd, int rn, int rm);
 void a64_vumull(Buf *b, int q, int size, int rd, int rn, int rm);
 void a64_vumlal(Buf *b, int q, int size, int rd, int rn, int rm);

@@ -84,6 +84,14 @@ typedef struct Target {
   uint8_t arg_slot;
 
   uint32_t max_frame;
+
+  // How many copies of its body an iteration of a vectorised loop holds
+  // where nothing keeps it to fewer (vectorize_one in opt.c): what the
+  // vector registers hold with every copy's loads in flight at once.
+  uint8_t vec_copies;
+  // The integer lane sizes (bit n for VLANE_SIZE n) where a vector multiply
+  // is one instruction, no dearer than the shift and add it can stand for.
+  uint8_t vec_mul_lanes;
 } Target;
 
 extern const Target warmc_target_a64;

@@ -1751,6 +1751,22 @@ static void emit_inst(Isel *s, Ref v) {
             res = wr(s, v, F1);
             if (sgn) x64_vpmaddubsw(B, res, FTMP, x);
             else x64_vpmaddubsw(B, res, x, FTMP);
+          } else if (sz == 3) {
+            /* doublewords into quadwords, which wasm has no instruction
+               for but the vectoriser's widening sums make: the even and
+               the odd lanes each widened, then added */
+            if (sgn) {
+              x64_vpshufd(B, FTMP, x, 0x88);
+              x64_vpmovsx(B, 2, F2, FTMP);
+              x64_vpshufd(B, FTMP, x, 0xdd);
+              x64_vpmovsx(B, 2, F1, FTMP);
+            } else {
+              vsplat_const(s, FTMP, 3, 0xffffffffull);
+              x64_vpand(B, F2, x, FTMP);
+              x64_vpsrl_i(B, 3, F1, x, 32);
+            }
+            res = wr(s, v, FTMP);
+            x64_vpadd(B, 3, res, F2, F1);
           } else if (sgn) {
             vsplat_const(s, FTMP, 1, 1);
             res = wr(s, v, F1);

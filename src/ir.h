@@ -353,6 +353,8 @@ static inline uint64_t mem_guaranteed_bytes(const Module *m, uint32_t k) {
 }
 int ir_const_cost(uint64_t bits, bool wide);
 int ir_vconst_cost(uint64_t lo, uint64_t hi);
+uint32_t ir_vec_copies(void);
+bool ir_vec_mul_one(uint32_t lane);
 
 bool ir_imm_ok(IrFunc *f, Ref user, uint32_t idx, uint64_t cval, ValType ct);
 bool ir_mem_disp_ok(uint64_t off, uint32_t size_log2);

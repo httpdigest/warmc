@@ -1101,6 +1101,17 @@ static void emit_inst(Isel *s, Ref v) {
         commit(s, v, F2);
         break;
       }
+      if (in->op == I_VADD && s->vadal && s->vadal[v]) {
+        Ref e = a[s->vadal[v] - 1], acc = a[2 - s->vadal[v]];
+        int x = rd(s, ir_args(f, e)[0], F0), y = rd(s, acc, F1);
+        int d = wr(s, v, F2);
+        if (d != y && d == x) d = FTMP;
+        if (d != y) a64_vmov(B, d, y);
+        if (f->insts[e].imm & 1) a64_vsadalp(B, VLANE_SIZE(in->imm2) - 1, d, x);
+        else a64_vuadalp(B, VLANE_SIZE(in->imm2) - 1, d, x);
+        commit(s, v, d);
+        break;
+      }
       if (in->op == I_VOR && s->vrot && s->vrot[v]) {
         /* The shifts are folded (analyse_immediates): a[0] is the left one.
            The source dies at the earliest here, so the result never shares
@@ -2471,10 +2482,70 @@ static bool narrow_reloaded(Isel *s, Ref base, int64_t off) {
   return bsearch(&key, s->nl, s->nnl, sizeof *s->nl, nl_cmp) != NULL;
 }
 
+/* Two vector loads, or two vector stores, of neighbouring sixteen bytes
+   off one pointer are one ldp or stp of q registers.  The vectoriser's
+   copies of its body load and store side by side, and its pointers are its
+   loop's parameters: only those pair, in a block that is its own loop.
+   Anywhere else a vector access may be a struct of two v128 stored and one
+   reloaded, or the reverse, which a pair cannot forward (see
+   narrow_reloaded); the vector loop reads nothing it has just written. */
+static bool maybe_pair_q(Isel *s, Block *b, uint32_t idx) {
+  IrFunc *f = s->f;
+  Ref vi = b->insts[idx];
+  Inst *in = &f->insts[vi];
+  bool st = in->op == I_VSTORE;
+  Ref base = ir_args(f, vi)[0];
+  const Inst *bi = &f->insts[base];
+  if (bi->op != I_PARAM || bi->block != s->cur_block) return false;
+  bool self = false;
+  for (uint32_t k = 0; k < b->nsuccs && !self; k++)
+    self = b->succs[k].target == s->cur_block && !b->succs[k].eh;
+  if (!self) return false;
+  if (st ? !pair_reg(s, ir_args(f, vi)[1]) : !pair_reg(s, vi)) return false;
+  uint32_t lim = idx + 9;
+  if (lim > b->ninsts) lim = b->ninsts;
+  for (uint32_t j = idx + 1; j < lim; j++) {
+    Ref vj = b->insts[j];
+    Inst *jn = &f->insts[vj];
+    if (jn->op == in->op) {
+      int64_t oi = (int64_t)in->imm, oj = (int64_t)jn->imm;
+      int64_t lo = oi < oj ? oi : oj, hi = oi < oj ? oj : oi;
+      if (ir_args(f, vj)[0] == base && hi - lo == 16 && lo % 16 == 0 &&
+          lo / 16 >= -64 && lo / 16 <= 63 &&
+          (st ? pair_store_ok(s, b, idx, j) : pair_load_ok(s, b, idx, j))) {
+        Ref vlo = oi <= oj ? vi : vj, vhi = vlo == vi ? vj : vi;
+        s->t1_was = s->t1_ok;
+        s->t1_ok = false;
+        int p = rd(s, base, TMP1);
+        if (st) {
+          int rlo = rd(s, ir_args(f, vlo)[1], F0);
+          int rhi = rd(s, ir_args(f, vhi)[1], F1);
+          a64_stp_q(B, rlo, rhi, p, (int)lo);
+          g_stats.stpairs++;
+        } else {
+          int rlo = s->loc[vlo], rhi = s->loc[vhi];
+          a64_ldp_q(B, rlo, rhi, p, (int)lo);
+          commit(s, vlo, rlo);
+          commit(s, vhi, rhi);
+          g_stats.ldpairs++;
+        }
+        s->paired[vj] = 1;
+        return true;
+      }
+      /* loads may pass one another; a store is a barrier to a store */
+      if (st) return false;
+      continue;
+    }
+    if (!pair_pure_op(jn->op)) return false;
+  }
+  return false;
+}
+
 static bool maybe_pair(Isel *s, Block *b, uint32_t idx) {
   IrFunc *f = s->f;
   Ref vi = b->insts[idx];
   Inst *in = &f->insts[vi];
+  if (in->op == I_VLOAD || in->op == I_VSTORE) return maybe_pair_q(s, b, idx);
   if (in->op != I_LOAD && in->op != I_STORE && in->op != I_FIELD_GET &&
       in->op != I_FIELD_SET)
     return false;

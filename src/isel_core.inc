@@ -158,6 +158,9 @@ typedef struct {
   /* A vector or that is a rotate: its left shift amount, the shifts folded
      into it (arm64 only). */
   uint8_t *vrot;
+  /* A vector add of a pairwise widening add: which operand that is, plus
+     one, folded into the add as an add-accumulate (arm64 only). */
+  uint8_t *vadal;
   uint32_t *uses;
 
   uint32_t prof_skip;
