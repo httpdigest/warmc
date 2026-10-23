@@ -49,6 +49,7 @@ typedef struct {
   int32_t sym;
   uint64_t addr;
   bool defined, weak, imported;
+  bool exported;             /* a shared library's dynamic symbol */
   uint32_t got_slot;
   uint32_t stub;
 } GSym;
@@ -66,11 +67,19 @@ typedef struct {
   uint64_t bss_addr, bss_size;
 
   uint64_t *rebase; uint32_t nrebase, cap_rebase;
+  uint64_t *rebase_val;      /* what each slot holds at base 0 (ELF RELA) */
   uint32_t *got;  uint32_t ngot,  cap_got;
   uint32_t *stub; uint32_t nstub, cap_stub;
   uint64_t got_addr, stub_addr;
 
   TargetFmt fmt;
+
+  /* A shared library (warmc --shared) rather than a program: the image
+     sits at base 0, and only the symbols marked exported are seen from
+     outside.  base is the program's fixed address otherwise. */
+  bool shared;
+  uint64_t base;
+  const char *install_name;
 
   /* PE: the import blob (IAT, ILT, directory, names) placed at the start of
      .rdata; got_addr doubles as the IAT address and got_slot as the final
@@ -88,6 +97,8 @@ void chmod_exec(const char *path);
 
 /* pe.c */
 #define PE_BASE 0x140000000ull
+/* a DLL's preferred base, where the usual ones load: away from programs' */
+#define PE_DLL_BASE 0x180000000ull
 const char *pe_dll_for(const char *name);
 void layout_windows(Linker *L);
 void write_pe_exec(Linker *L, const char *path, uint64_t entry);

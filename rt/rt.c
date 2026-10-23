@@ -266,6 +266,9 @@ static void *arena_alloc(u64 bytes) {
   return p;
 }
 
+/* Zeroed memory that lives as long as the process, for rt/lib.c. */
+void *warmc_rt_zalloc(u64 bytes) { return arena_alloc(bytes); }
+
 static Instance *instances[MAX_INSTANCES];
 static u32 ninstances;
 
@@ -556,6 +559,12 @@ static void catch_restore(const u64 *buf, int was) {
 }
 
 WarmInstance *warmc_instantiate_catching(const ModuleDesc *md, u32 *err) {
+  return warmc_instantiate_bound_catching(md, 0, err);
+}
+
+WarmInstance *warmc_instantiate_bound_catching(const ModuleDesc *md,
+                                               const WarmBinding *binds,
+                                               u32 *err) {
   u64 depth = warmc_gc_invoke_depth;
   u64 outer[sizeof g_catch_buf / sizeof g_catch_buf[0]];
   int was;
@@ -568,7 +577,7 @@ WarmInstance *warmc_instantiate_catching(const ModuleDesc *md, u32 *err) {
     return 0;
   }
   g_catching = 1;
-  WarmInstance *v = warmc_instantiate(md);
+  WarmInstance *v = warmc_instantiate_bound(md, binds);
   catch_restore(outer, was);
   *err = 0;
   return v;
@@ -1113,8 +1122,46 @@ static int gcth_on_collector(void);
 #define SI_ADDR_OFF 16
 #endif
 
+#if defined(WARMC_DARWIN)
+extern int sigaction(int, const void *, void *);
+typedef struct { void *h; unsigned int mask; int flags; } SigAct;
+#define SIGACT_SIGINFO 0x0040
+#define SIGACT_FN(a) ((a)->h)
+#define SIG_BUS 10
+static void set_sigaction(int sig, const SigAct *a, SigAct *old) {
+  sigaction(sig, a, old);
+}
+#else
+typedef struct k_sigaction SigAct;
+#define SIGACT_SIGINFO SA_SIGINFO
+#define SIGACT_FN(a) ((a)->handler)
+#define SIG_BUS 7
+static void set_sigaction(int sig, const SigAct *a, SigAct *old) {
+  sys(SYS_rt_sigaction, sig, (long)a, (long)old, 8, 0, 0);
+}
+#endif
+
+/* What handled SIGSEGV and SIGBUS before the runtime did.  A program warmc
+   linked has nothing there, and a fault outside linear memory ends it; a
+   library (rt/lib.c) runs in someone else's process, whose faults -- a
+   crash, or a JVM's implicit null check -- are passed on to that. */
+static SigAct g_prev_segv, g_prev_bus;
+static int g_library;
+
+static void chain_fault(int sig, void *info, void *uc) {
+  SigAct *p = sig == 11 ? &g_prev_segv : &g_prev_bus;
+  uptr h = (uptr)SIGACT_FN(p);
+  if (h > 1) {
+    if (p->flags & SIGACT_SIGINFO) ((void (*)(int, void *, void *))h)(sig, info, uc);
+    else ((void (*)(int))h)(sig);
+    return;
+  }
+  /* SIG_DFL or SIG_IGN: put it back, and the faulting instruction meets it
+     when the handler returns. */
+  set_sigaction(sig, p, 0);
+}
+
 static void fault_handler(int sig, void *info, void *uc) {
-  (void)sig; (void)uc;
   u8 *addr = info ? *(u8 **)((u8 *)info + SI_ADDR_OFF) : 0;
 
   if (gcth_on_collector()) {
@@ -1122,28 +1169,28 @@ static void fault_handler(int sig, void *info, void *uc) {
     sys_exit(139);
   }
   if (addr_in_a_guard(addr)) warmc_trap(TRAP_MEM_OOB);
+  if (g_library) { chain_fault(sig, info, uc); return; }
   eputs("warmc-rt: fault outside linear memory\n");
   sys_exit(139);
 }
 
 static void install_fault_handler(void) {
+  static int installed;
+  if (installed) return;
+  installed = 1;
+  SigAct act;
 #if defined(WARMC_DARWIN)
-  extern int sigaction(int, const void *, void *);
-  struct { void *h; unsigned int mask; int flags; } act;
   act.h = (void *)fault_handler;
   act.mask = 0;
-  act.flags = 0x0040 | 0x0010;
-  sigaction(11, &act, 0);
-  sigaction(10, &act, 0);
+  act.flags = SIGACT_SIGINFO | 0x0010;
 #else
-  struct k_sigaction act;
   act.handler = (void *)fault_handler;
   act.flags = SA_SIGINFO | SA_RESTORER | SA_NODEFER;
   act.restorer = (void *)sig_restorer;
   act.mask = 0;
-  sys(SYS_rt_sigaction, 11 , (long)&act, 0, 8, 0, 0);
-  sys(SYS_rt_sigaction, 7 , (long)&act, 0, 8, 0, 0);
 #endif
+  set_sigaction(11, &act, &g_prev_segv);
+  set_sigaction(SIG_BUS, &act, &g_prev_bus);
 }
 
 #endif /* !WARMC_WINDOWS */
@@ -1334,6 +1381,144 @@ static void die(const char *msg) {
 }
 
 static u64 g_stack_limit;
+static char **g_environ;
+
+#if !defined(WARMC_DARWIN) && !defined(WARMC_WINDOWS)
+/* A library's environment on Linux, where no entry point hands it over:
+   /proc/self/environ, the one the process started with. */
+static char **proc_environ(void) {
+  usz cap = 1u << 20, len = 0;
+  char *buf = (char *)sys_mmap(0, cap + 1, PROT_READ | PROT_WRITE,
+                               MAP_PRIVATE | MAP_ANONYMOUS);
+  if (!buf) return 0;
+  long fd = sys(56 /* openat */, -100 /* AT_FDCWD */, (long)"/proc/self/environ",
+                0, 0, 0, 0);
+  if (fd >= 0) {
+    long n;
+    while (len < cap &&
+           (n = sys(63 /* read */, fd, (long)(buf + len), (long)(cap - len), 0, 0, 0)) > 0)
+      len += (usz)n;
+    sys(57 /* close */, fd, 0, 0, 0, 0, 0);
+  }
+  /* a variable the cap cut short is left out */
+  while (len && buf[len - 1]) len--;
+  u32 nent = 0;
+  for (usz i = 0; i < len; i++) nent += !buf[i];
+  char **envp = (char **)arena_alloc(((u64)nent + 1) * sizeof(char *));
+  u32 k = 0;
+  for (usz i = 0; i < len; i++)
+    if (i == 0 || !buf[i - 1]) envp[k++] = buf + i;
+  envp[k] = 0;
+  return envp;
+}
+#endif
+
+#if defined(WARMC_DARWIN)
+extern char ***_NSGetEnviron(void);
+#endif
+static void gc_read_options(void);
+
+/* For the library face (rt/lib.c, warmc --shared), which runs in a process
+   the runtime does not own: it says so, reads the WARMC_* options from
+   the environment as a program's start does, and returns 0 when the code
+   cannot run on this machine.  It also sets the stack limit an instance starts with,
+   and needs who is calling, where that thread's stack ends, and a wait to
+   block a contended call on. */
+int warmc_rt_library_mode(void) {
+#if defined(WARMC_DARWIN)
+  g_library = 1;
+  g_environ = *_NSGetEnviron();
+#elif defined(WARMC_WINDOWS)
+  if (!warmc_win_isa_ok()) {
+    eputs("warmc-rt: this library needs an x86-64-v3 CPU (AVX2, BMI2, FMA)\n");
+    return 0;
+  }
+  g_environ = warmc_win_environ();
+#else
+  g_library = 1;
+  g_environ = proc_environ();
+#endif
+  gc_read_options();
+  return 1;
+}
+void warmc_rt_set_stack_limit(u64 limit) { g_stack_limit = limit; }
+void warmc_rt_wait(u32 *w, u32 expect) { gcth_wait(w, expect, 0); }
+void warmc_rt_wake(u32 *w) { gcth_wake(w); }
+
+#if defined(WARMC_DARWIN)
+extern void *pthread_get_stackaddr_np(void *);
+extern usz pthread_get_stacksize_np(void *);
+u64 warmc_rt_thread_id(void) { return (u64)(uptr)pthread_self(); }
+void warmc_rt_stack_bounds(u64 *lo, u64 *hi) {
+  void *t = pthread_self();
+  *hi = (u64)(uptr)pthread_get_stackaddr_np(t);
+  *lo = *hi - pthread_get_stacksize_np(t);
+}
+#elif defined(WARMC_WINDOWS)
+u64 warmc_rt_thread_id(void) { return GetCurrentThreadId(); }
+void warmc_rt_stack_bounds(u64 *lo, u64 *hi) {
+  uptr l = 0, h = 0;
+  GetCurrentThreadStackLimits(&l, &h);
+  *lo = l;
+  *hi = h;
+}
+#else
+u64 warmc_rt_thread_id(void) { return (u64)sys(178 /* gettid */, 0, 0, 0, 0, 0, 0); }
+
+static u64 hex_at(const char **p) {
+  u64 v = 0;
+  for (;; (*p)++) {
+    char c = **p;
+    if (c >= '0' && c <= '9') v = v * 16 + (u64)(c - '0');
+    else if (c >= 'a' && c <= 'f') v = v * 16 + (u64)(c - 'a' + 10);
+    else return v;
+  }
+}
+
+/* The mapping that holds the stack pointer, read from /proc/self/maps: a
+   thread's stack is one mapping, its guard page another.  The main
+   thread's [stack] grows down on demand, so its floor is RLIMIT_STACK
+   below its top.  Slow -- rt/lib.c keeps the answer per thread. */
+void warmc_rt_stack_bounds(u64 *lo, u64 *hi) {
+  *lo = *hi = 0;
+  u64 sp;
+  __asm__("mov %0, sp" : "=r"(sp));
+  long fd = sys(56 /* openat */, -100 /* AT_FDCWD */, (long)"/proc/self/maps",
+                0, 0, 0, 0);
+  if (fd < 0) return;
+  char buf[4096], line[512];
+  u32 ln = 0;
+  long n;
+  int found = 0;
+  while (!found && (n = sys(63 /* read */, fd, (long)buf, sizeof buf, 0, 0, 0)) > 0) {
+    for (long i = 0; i < n && !found; i++) {
+      if (buf[i] != '\n') { if (ln < sizeof line - 1) line[ln++] = buf[i]; continue; }
+      line[ln] = 0;
+      ln = 0;
+      const char *p = line;
+      u64 a = hex_at(&p);
+      if (*p++ != '-') continue;
+      u64 b = hex_at(&p);
+      if (sp < a || sp >= b) continue;
+      *lo = a;
+      *hi = b;
+      found = 1;
+      for (const char *q = p; *q; q++)
+        if (q[0] == '[' && q[1] == 's' && q[2] == 't' && q[3] == 'a' &&
+            q[4] == 'c' && q[5] == 'k' && q[6] == ']') {
+          /* unlimited, or unknown: as much as a default limit allows */
+          u64 rl[2] = { 0, 0 }, cap = 8u << 20;
+          if (sys(261 /* prlimit64 */, 0, 3 /* RLIMIT_STACK */, 0, (long)rl, 0, 0) == 0 &&
+              rl[0] && rl[0] < b)
+            cap = rl[0];
+          *lo = b > cap ? b - cap : 0;
+          break;
+        }
+    }
+  }
+  sys(57 /* close */, fd, 0, 0, 0, 0, 0);
+}
+#endif
 
 static int name_eq(const char *a, u32 an, const char *b, u32 bn) {
   if (an != bn) return 0;
@@ -3947,8 +4132,6 @@ static int call_export(const ExportDesc *e, const char *name,
 }
 
 extern int (*warmc_driver_hook)(int argc, char **argv);
-
-static char **g_environ;
 
 char **warmc_rt_environ(void) { return g_environ; }
 

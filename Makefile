@@ -55,10 +55,10 @@ WARMC_SRC := src/main.c src/util.c src/a64.c src/x64.c src/parse.c src/opcodes.c
              src/validate.c src/component.c src/wit.c src/wat.c \
              src/module_data.c src/elf.c src/macho.c src/coff.c src/pe.c src/ir.c src/ir_build.c \
              src/opt.c src/isel.c src/isel_x64.c src/codegen.c src/inline.c src/compile.c src/link.c src/canon.c src/witgen.c \
-             src/clink.c
+             src/clink.c src/shlib.c
 RT_OBJS   := $(BUILD)/rt/rt.o $(BUILD)/rt/start.o $(BUILD)/rt/hook.o \
              $(BUILD)/rt/gcthook.o \
-             $(BUILD)/rt/modules.o $(BUILD)/rt/component.o
+             $(BUILD)/rt/modules.o $(BUILD)/rt/component.o $(BUILD)/rt/lib.o
 
 WARMC_HDRS := $(wildcard src/*.h src/*.inc) rt/const_ops.inc
 RT_HDRS    := $(wildcard rt/*.h rt/*.inc)
@@ -78,7 +78,7 @@ DEPFLAGS   := -MMD -MP
 MAC_OBJS  := $(BUILD)/rt/rt-macos.o $(BUILD)/rt/start-macos.o \
              $(BUILD)/rt/hook-macos.o $(BUILD)/rt/gcthook-macos.o \
              $(BUILD)/rt/modules-macos.o \
-             $(BUILD)/rt/component-macos.o
+             $(BUILD)/rt/component-macos.o $(BUILD)/rt/lib-macos.o
 MACFLAGS  ?= --target=arm64-apple-macos11 -DWARMC_DARWIN=1 -O2 $(RT_TUNE) -ffreestanding \
              -fno-stack-protector -fno-builtin -nostdlib -mno-outline-atomics \
              -Wall -Wextra -Wno-unused-parameter
@@ -87,7 +87,7 @@ MACFLAGS  ?= --target=arm64-apple-macos11 -DWARMC_DARWIN=1 -O2 $(RT_TUNE) -ffree
 WIN_OBJS  := $(BUILD)/rt/rt-windows.o $(BUILD)/rt/start-windows.o \
              $(BUILD)/rt/hook-windows.o $(BUILD)/rt/gcthook-windows.o \
              $(BUILD)/rt/modules-windows.o \
-             $(BUILD)/rt/component-windows.o
+             $(BUILD)/rt/component-windows.o $(BUILD)/rt/lib-windows.o
 WINFLAGS  ?= --target=x86_64-pc-windows-gnu -DWARMC_WINDOWS=1 -O2 $(RT_TUNE) -ffreestanding \
              -fno-stack-protector -fno-builtin -nostdlib \
              -ffunction-sections -fdata-sections \

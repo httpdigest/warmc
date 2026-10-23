@@ -456,6 +456,18 @@ typedef struct {
   void *code;
 } WarmBinding;
 WarmInstance *warmc_instantiate_bound(const ModuleDesc *md, const WarmBinding *binds);
+WarmInstance *warmc_instantiate_bound_catching(const ModuleDesc *md,
+                                               const WarmBinding *binds,
+                                               u32 *err);
+
+/* What the library face (rt/lib.c) needs of the platform layer in rt.c. */
+int warmc_rt_library_mode(void);
+void warmc_rt_set_stack_limit(u64 limit);
+void warmc_rt_wait(u32 *w, u32 expect);
+void warmc_rt_wake(u32 *w);
+u64 warmc_rt_thread_id(void);
+void warmc_rt_stack_bounds(u64 *lo, u64 *hi);
+void *warmc_rt_zalloc(u64 bytes);
 
 extern void *(*warmc_host_lookup)(const char *name);
 

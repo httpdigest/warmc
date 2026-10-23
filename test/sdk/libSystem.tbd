@@ -17,6 +17,11 @@ exports:
                # in this cross-build and not a surprise on somebody's machine.
                _pthread_create, _pthread_detach, _pthread_self,
                ___ulock_wait, ___ulock_wake,
+               # A shared library's stack limit (rt/lib.c): the stack of
+               # whichever thread of the host program calls it.
+               _pthread_get_stackaddr_np, _pthread_get_stacksize_np,
+               # and the environment its WARMC_* options are read from
+               _NSGetEnviron,
                # The WASI host's filesystem.  Listing them here is not
                # bookkeeping: this file is what says which of libSystem the
                # runtime is allowed to reach, and a call added without a line

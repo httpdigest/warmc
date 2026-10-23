@@ -682,6 +682,7 @@ static uint64_t emit_supers(ObjBuilder *o, const Module *m, HeapType h) {
 bool g_guard_pages = false;
 bool g_det_profile = false;
 bool g_no_export_names = false;
+bool g_stack_probes = false;
 
 bool g_profile = false;
 

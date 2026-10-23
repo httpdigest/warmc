@@ -520,6 +520,19 @@ void write_coff64(ObjBuilder *o, const char *path);
 void warmc_link_exec(TargetFmt fmt, const char *out, const char *objpath,
                      const char *wasi, const char *rt, const char *entry,
                      bool strip);
+/* A shared library whose dynamic symbols are exactly exports[] (C names). */
+void warmc_link_shared(TargetFmt fmt, const char *out, const char *objpath,
+                       const char *rt, char *const *exports, uint32_t nexports,
+                       bool strip);
+
+/* shlib.c: warmc --shared */
+typedef struct Shlib Shlib;
+Shlib *shlib_plan(Module *m, const char *prefix, const char *input);
+void shlib_emit(Shlib *p, ObjBuilder *o);
+char **shlib_symbols(Shlib *p, uint32_t *n);
+void shlib_write_header(Shlib *p, const char *path, const char *libname);
+void shlib_write_def(Shlib *p, const char *path, const char *dllname);
+void shlib_free(Shlib *p);
 uint32_t obj_intern_sym(ObjBuilder *o, const char *name, SymKind kind, int section, uint64_t value);
 void obj_add_reloc(ObjBuilder *o, RelKind kind, int section, uint64_t off, uint32_t sym, int64_t addend);
 
@@ -543,6 +556,10 @@ extern bool g_guard_pages;
 extern bool g_det_profile;
 
 extern bool g_no_export_names;
+/* Touch each page of a frame over one before taking it: a Windows DLL runs
+   on its host's threads, whose stacks are committed a guard page at a time
+   (warmc --shared). */
+extern bool g_stack_probes;
 
 extern bool g_profile;
 

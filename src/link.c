@@ -7,7 +7,7 @@
 #include <string.h>
 
 static void layout_macos(Linker *L);
-static void write_macho_exec(Linker *L, const char *path, uint64_t entry);
+static void write_macho(Linker *L, const char *path, uint64_t entry);
 
 static uint32_t gs_hash(const char *s) {
   uint32_t h = 2166136261u;
@@ -1090,11 +1090,13 @@ uint64_t place(Linker *L, SecKind k, uint64_t at) {
   return at;
 }
 
-static void add_rebase(Linker *L, uint64_t addr) {
+static void add_rebase(Linker *L, uint64_t addr, uint64_t val) {
   if (L->nrebase == L->cap_rebase) {
     L->cap_rebase = L->cap_rebase ? L->cap_rebase * 2 : 64;
     L->rebase = xrealloc(L->rebase, L->cap_rebase * sizeof(uint64_t));
+    L->rebase_val = xrealloc(L->rebase_val, L->cap_rebase * sizeof(uint64_t));
   }
+  L->rebase_val[L->nrebase] = val;
   L->rebase[L->nrebase++] = addr;
 }
 
@@ -1257,7 +1259,7 @@ static void apply_relocs(Linker *L) {
 
             if (ir->length == 3) {
               wr64(p, S + (uint64_t)A + rd64(p));
-              if (is->kind == K_DATA) add_rebase(L, is->addr + ir->off);
+              if (is->kind == K_DATA) add_rebase(L, is->addr + ir->off, rd64(p));
               else warmc_fatal("link: %s puts an absolute pointer in %s, which "
                                "is not writable and so cannot be slid",
                                o->name, is->name);
@@ -1287,12 +1289,14 @@ static void apply_relocs(Linker *L) {
                           "only rip-relative references to an import are supported",
                           o->name, nm);
             wr64(p, S + (uint64_t)A);
+            /* a DLL may load elsewhere: the loader adds the difference */
+            if (L->shared && S) add_rebase(L, is->addr + ir->off, S + (uint64_t)A);
             break;
           case IMAGE_REL_AMD64_ADDR32NB:
             if (imp)
               warmc_fatal("link: %s takes the image-relative address of the "
                           "imported symbol %s", o->name, nm);
-            wr32(p, (uint32_t)(S + (uint64_t)A - PE_BASE));
+            wr32(p, (uint32_t)(S + (uint64_t)A - L->base));
             break;
           case IMAGE_REL_AMD64_REL32:
           case IMAGE_REL_AMD64_REL32 + 1: case IMAGE_REL_AMD64_REL32 + 2:
@@ -1324,8 +1328,24 @@ static void apply_relocs(Linker *L) {
         case R_AARCH64_LDST32_ABS_LO12_NC: patch_lo12(p, S + (uint64_t)A, 2); break;
         case R_AARCH64_LDST64_ABS_LO12_NC: patch_lo12(p, S + (uint64_t)A, 3); break;
         case R_AARCH64_LDST128_ABS_LO12_NC: patch_lo12(p, S + (uint64_t)A, 4); break;
-        case R_AARCH64_ABS64:  wr64(p, S + (uint64_t)A); break;
-        case R_AARCH64_ABS32:  wr32(p, (uint32_t)(S + (uint64_t)A)); break;
+        case R_AARCH64_ABS64:
+          wr64(p, S + (uint64_t)A);
+          /* A library is loaded anywhere: the loader adds its base to each
+             such pointer, which has to sit where it may write.  A pointer
+             to an undefined weak symbol stays null. */
+          if (L->shared && S) {
+            if (is->kind != K_DATA)
+              warmc_fatal("link: %s puts an absolute pointer in %s, which a "
+                          "shared library cannot relocate", o->name, is->name);
+            add_rebase(L, is->addr + ir->off, S + (uint64_t)A);
+          }
+          break;
+        case R_AARCH64_ABS32:
+          if (L->shared)
+            warmc_fatal("link: %s: a 32-bit absolute address of %s cannot be "
+                        "relocated in a shared library", o->name, nm);
+          wr32(p, (uint32_t)(S + (uint64_t)A));
+          break;
         case R_AARCH64_PREL32: wr32(p, (uint32_t)((int64_t)(S + (uint64_t)A) - (int64_t)pc)); break;
         case R_AARCH64_PREL64: wr64(p, (uint64_t)((int64_t)(S + (uint64_t)A) - (int64_t)pc)); break;
         case R_AARCH64_ADR_GOT_PAGE: {
@@ -1412,6 +1432,8 @@ static void resolve_addrs(Linker *L) {
 #define PF_R 4
 #define ELF_PAGE 0x10000ull
 #define ELF_BASE 0x400000ull
+/* A program has two program headers; a library five (write_elf_shared). */
+#define ELF_SHARED_PHDRS 5
 
 void emit_secs(Buf *b, Linker *L, SecKind k, uint64_t seg_addr, uint64_t seg_off) {
   for (uint32_t i = 0; i < L->nobjs; i++) {
@@ -1599,6 +1621,237 @@ static void write_elf_exec(Linker *L, const char *path, uint64_t entry) {
   xfree(out.data);
 }
 
+#define PT_DYNAMIC   2
+#define PT_GNU_STACK 0x6474e551u
+#define SHT_RELA_E    4
+#define SHT_HASH_E    5
+#define SHT_DYNAMIC_E 6
+#define SHT_DYNSYM_E  11
+#define SHF_WRITE_E   0x1
+#define R_AARCH64_RELATIVE 1027
+
+static uint32_t elf_hash(const char *s) {
+  uint32_t h = 0, g;
+  while (*s) {
+    h = (h << 4) + (uint8_t)*s++;
+    g = h & 0xf0000000u;
+    if (g) h ^= g >> 24;
+    h &= ~g;
+  }
+  return h;
+}
+
+typedef struct { uint32_t name, type; uint64_t flags, addr, off, size;
+                 uint32_t link, info; uint64_t align, entsize; } ElfShdr;
+
+/* A shared object.  The program's two segments sit at base 0, and a third
+   follows them for what the dynamic loader reads: the dynamic section --
+   which glibc relocates in place on AArch64, so it is writable -- the
+   exported symbols with their hash table, and a relative relocation for
+   each absolute pointer.  There is no DT_NEEDED: the runtime asks nothing
+   of libc, so the library loads into whatever process opens it. */
+static void write_elf_shared(Linker *L, const char *path) {
+  const uint64_t hdr = 64 + ELF_SHARED_PHDRS * 56;
+  const char *soname = strrchr(path, '/') ? strrchr(path, '/') + 1 : path;
+  uint64_t ro_end = L->rodata_addr + L->rodata_size;
+  uint64_t rw_off = L->got_addr;
+  uint64_t rw_file = (L->data_addr + L->data_size) - L->got_addr;
+  uint64_t rw_mem = (L->bss_addr + L->bss_size) - L->got_addr;
+
+  /* the dynamic symbols: the null symbol, then each export */
+  Buf dstr; memset(&dstr, 0, sizeof dstr);
+  buf_u8(&dstr, 0);
+  uint32_t soname_at = (uint32_t)dstr.len;
+  buf_bytes(&dstr, soname, strlen(soname) + 1);
+  Buf dsym; memset(&dsym, 0, sizeof dsym);
+  for (int i = 0; i < 24; i++) buf_u8(&dsym, 0);
+  uint32_t nsym = 1;
+  for (uint32_t i = 0; i < L->ngsyms; i++) {
+    GSym *g = &L->gsyms[i];
+    if (!g->exported) continue;
+    buf_u32(&dsym, (uint32_t)dstr.len);
+    buf_bytes(&dstr, g->name, strlen(g->name) + 1);
+    buf_u8(&dsym, (1 << 4) | 2);
+    buf_u8(&dsym, 0);
+    buf_u16(&dsym, 1);
+    buf_u64(&dsym, g->addr);
+    buf_u64(&dsym, 0);
+    nsym++;
+  }
+  while (dstr.len & 7) buf_u8(&dstr, 0);
+
+  Buf hash; memset(&hash, 0, sizeof hash);
+  {
+    uint32_t nb = nsym | 1;
+    uint32_t *bucket = xcalloc(nb, sizeof(uint32_t));
+    uint32_t *chain = xcalloc(nsym, sizeof(uint32_t));
+    for (uint32_t k = 1; k < nsym; k++) {
+      uint32_t nm = rd32(dsym.data + 24 * k);
+      uint32_t b = elf_hash((const char *)dstr.data + nm) % nb;
+      chain[k] = bucket[b];
+      bucket[b] = k;
+    }
+    buf_u32(&hash, nb);
+    buf_u32(&hash, nsym);
+    for (uint32_t k = 0; k < nb; k++) buf_u32(&hash, bucket[k]);
+    for (uint32_t k = 0; k < nsym; k++) buf_u32(&hash, chain[k]);
+    while (hash.len & 7) buf_u8(&hash, 0);
+    xfree(bucket);
+    xfree(chain);
+  }
+
+  /* the relative relocations: every GOT slot, all of them local, and every
+     absolute pointer apply_relocs recorded */
+  Buf rela; memset(&rela, 0, sizeof rela);
+  uint32_t nrela = 0;
+  for (uint32_t i = 0; i < L->ngot; i++, nrela++) {
+    buf_u64(&rela, L->got_addr + (uint64_t)i * 8);
+    buf_u64(&rela, R_AARCH64_RELATIVE);
+    buf_u64(&rela, L->gsyms[L->got[i]].addr);
+  }
+  for (uint32_t i = 0; i < L->nrebase; i++, nrela++) {
+    buf_u64(&rela, L->rebase[i]);
+    buf_u64(&rela, R_AARCH64_RELATIVE);
+    buf_u64(&rela, L->rebase_val[i]);
+  }
+
+  uint64_t dyn_addr = align_up(L->got_addr + rw_mem, ELF_PAGE);
+  uint64_t dyn_off = align_up(rw_off + rw_file, ELF_PAGE);
+  const uint32_t ndyn = 12;
+  uint64_t dynsym_addr = dyn_addr + 16 * ndyn;
+  uint64_t dynstr_addr = dynsym_addr + dsym.len;
+  uint64_t hash_addr = dynstr_addr + dstr.len;
+  uint64_t rela_addr = hash_addr + hash.len;
+  uint64_t dynseg = rela_addr + rela.len - dyn_addr;
+
+  Buf dyn; memset(&dyn, 0, sizeof dyn);
+#define DYN(tag, val) do { buf_u64(&dyn, (tag)); buf_u64(&dyn, (val)); } while (0)
+  DYN(14, soname_at);
+  DYN(4, hash_addr);
+  DYN(5, dynstr_addr);
+  DYN(6, dynsym_addr);
+  DYN(10, dstr.len);
+  DYN(11, 24);
+  DYN(7, rela_addr);
+  DYN(8, rela.len);
+  DYN(9, 24);
+  DYN(0x6ffffff9, nrela);
+  DYN(0x6ffffffb, 0);
+  DYN(0, 0);
+#undef DYN
+  if (dyn.len != 16 * ndyn) warmc_fatal("link: dynamic section miscounted");
+
+  Buf out; memset(&out, 0, sizeof out);
+  buf_bytes(&out, "\177ELF\2\1\1", 7);
+  for (int i = 7; i < 16; i++) buf_u8(&out, 0);
+  buf_u16(&out, 3);
+  buf_u16(&out, 183);
+  buf_u32(&out, 1);
+  buf_u64(&out, 0);
+  buf_u64(&out, 64);
+  buf_u64(&out, 0);
+  buf_u32(&out, 0);
+  buf_u16(&out, 64); buf_u16(&out, 56); buf_u16(&out, ELF_SHARED_PHDRS);
+  buf_u16(&out, 64); buf_u16(&out, 0); buf_u16(&out, 0);
+
+#define PHDR(type, flags, off, addr, fsz, msz, align) do { \
+    buf_u32(&out, (type)); buf_u32(&out, (flags)); buf_u64(&out, (off)); \
+    buf_u64(&out, (addr)); buf_u64(&out, (addr)); buf_u64(&out, (fsz)); \
+    buf_u64(&out, (msz)); buf_u64(&out, (align)); } while (0)
+  PHDR(PT_LOAD, PF_R | PF_X, 0, 0, ro_end, ro_end, ELF_PAGE);
+  PHDR(PT_LOAD, PF_R | PF_W, rw_off, L->got_addr, rw_file, rw_mem, ELF_PAGE);
+  PHDR(PT_LOAD, PF_R | PF_W, dyn_off, dyn_addr, dynseg, dynseg, ELF_PAGE);
+  PHDR(PT_DYNAMIC, PF_R | PF_W, dyn_off, dyn_addr, dyn.len, dyn.len, 8);
+  PHDR(PT_GNU_STACK, PF_R | PF_W, 0, 0, 0, 0, 16);
+#undef PHDR
+  if (out.len != hdr) warmc_fatal("link: program headers miscounted");
+
+  emit_secs(&out, L, K_TEXT, L->text_addr, L->text_addr);
+  emit_secs(&out, L, K_RODATA, L->rodata_addr, L->rodata_addr);
+  while (out.len < rw_off) buf_u8(&out, 0);
+  for (uint32_t i = 0; i < L->ngot; i++) buf_u64(&out, L->gsyms[L->got[i]].addr);
+  emit_secs(&out, L, K_DATA, L->data_addr, L->data_addr - L->got_addr + rw_off);
+  while (out.len < dyn_off) buf_u8(&out, 0);
+  buf_bytes(&out, dyn.data, dyn.len);
+  buf_bytes(&out, dsym.data, dsym.len);
+  buf_bytes(&out, dstr.data, dstr.len);
+  buf_bytes(&out, hash.data, hash.len);
+  buf_bytes(&out, rela.data, rela.len);
+
+  /* .symtab for debuggers and profilers, the exports global in it */
+  uint32_t n;
+  TextSym *v = text_syms(L, false, &n);
+  Buf str; memset(&str, 0, sizeof str);
+  buf_u8(&str, 0);
+  Buf sym; memset(&sym, 0, sizeof sym);
+  for (int i = 0; i < 24; i++) buf_u8(&sym, 0);
+  uint32_t nlocal = 1;
+  for (int pass = 0; pass < 2; pass++)
+    for (uint32_t i = 0; i < n; i++) {
+      int32_t g = v[i].global ? gs_find(L, v[i].name) : -1;
+      bool global = g >= 0 && L->gsyms[g].exported;
+      if (global != (pass == 1)) continue;
+      buf_u32(&sym, (uint32_t)str.len);
+      buf_bytes(&str, v[i].name, strlen(v[i].name) + 1);
+      buf_u8(&sym, (uint8_t)(((global ? 1 : 0) << 4) | 2));
+      buf_u8(&sym, 0);
+      buf_u16(&sym, 1);
+      buf_u64(&sym, v[i].addr);
+      buf_u64(&sym, v[i].size);
+      if (!global) nlocal++;
+    }
+  xfree(v);
+
+  static const char shstr[] = "\0.text\0.dynamic\0.dynsym\0.dynstr\0.hash\0"
+                              ".rela.dyn\0.symtab\0.strtab\0.shstrtab";
+  while (out.len & 7) buf_u8(&out, 0);
+  uint64_t sym_off = out.len;
+  buf_bytes(&out, sym.data, sym.len);
+  uint64_t str_off = out.len;
+  buf_bytes(&out, str.data, str.len);
+  uint64_t shstr_off = out.len;
+  buf_bytes(&out, shstr, sizeof shstr);
+  while (out.len & 7) buf_u8(&out, 0);
+  uint64_t sh_off = out.len;
+  uint64_t dpos = dyn_off;
+  ElfShdr sh[10] = {
+    { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+    { 1, SHT_PROGBITS_E, SHF_ALLOC_E | SHF_EXEC_E, L->text_addr, L->text_addr,
+      L->text_size, 0, 0, 16, 0 },
+    { 7, SHT_DYNAMIC_E, SHF_ALLOC_E | SHF_WRITE_E, dyn_addr, dpos, dyn.len, 4, 0, 8, 16 },
+    { 16, SHT_DYNSYM_E, SHF_ALLOC_E, dynsym_addr, dpos + (dynsym_addr - dyn_addr),
+      dsym.len, 4, 1, 8, 24 },
+    { 24, SHT_STRTAB_E, SHF_ALLOC_E, dynstr_addr, dpos + (dynstr_addr - dyn_addr),
+      dstr.len, 0, 0, 1, 0 },
+    { 32, SHT_HASH_E, SHF_ALLOC_E, hash_addr, dpos + (hash_addr - dyn_addr),
+      hash.len, 3, 0, 8, 4 },
+    { 38, SHT_RELA_E, SHF_ALLOC_E, rela_addr, dpos + (rela_addr - dyn_addr),
+      rela.len, 3, 0, 8, 24 },
+    { 48, SHT_SYMTAB_E, 0, 0, sym_off, sym.len, 8, nlocal, 8, 24 },
+    { 56, SHT_STRTAB_E, 0, 0, str_off, str.len, 0, 0, 1, 0 },
+    { 64, SHT_STRTAB_E, 0, 0, shstr_off, sizeof shstr, 0, 0, 1, 0 },
+  };
+  for (int i = 0; i < 10; i++) {
+    buf_u32(&out, sh[i].name); buf_u32(&out, sh[i].type);
+    buf_u64(&out, sh[i].flags); buf_u64(&out, sh[i].addr);
+    buf_u64(&out, sh[i].off); buf_u64(&out, sh[i].size);
+    buf_u32(&out, sh[i].link); buf_u32(&out, sh[i].info);
+    buf_u64(&out, sh[i].align); buf_u64(&out, sh[i].entsize);
+  }
+  wr64(out.data + 0x28, sh_off);
+  wr16(out.data + 0x3c, 10);
+  wr16(out.data + 0x3e, 9);
+
+  FILE *f = fopen(path, "wb");
+  if (!f) warmc_fatal("link: cannot write %s", path);
+  if (out.len && fwrite(out.data, 1, out.len, f) != out.len)
+    warmc_fatal("link: short write on %s", path);
+  fclose(f);
+  chmod_exec(path);
+  xfree(out.data); xfree(dyn.data); xfree(dsym.data); xfree(dstr.data);
+  xfree(hash.data); xfree(rela.data); xfree(sym.data); xfree(str.data);
+}
+
 static void load_main(Linker *L, const char *objpath) {
   size_t len; uint8_t *buf = read_file(objpath, &len);
   InObj *o = obj_new(L, objpath, buf, len);
@@ -1612,8 +1865,9 @@ static void load_main(Linker *L, const char *objpath) {
 }
 
 static void layout_linux(Linker *L) {
-  uint64_t hdr = 64 + 2 * 56;
-  L->text_addr = ELF_BASE + hdr;
+  uint64_t hdr = 64 + (L->shared ? ELF_SHARED_PHDRS : 2) * 56;
+  L->base = L->shared ? 0 : ELF_BASE;
+  L->text_addr = L->base + hdr;
   uint64_t at = place(L, K_TEXT, L->text_addr);
   L->text_size = at - L->text_addr;
   at = align_up(at, 16);
@@ -1635,13 +1889,21 @@ static void layout_linux(Linker *L) {
   L->bss_size = at - L->bss_addr;
 }
 
-void warmc_link_exec(TargetFmt fmt, const char *out, const char *objpath,
-                     const char *wasi, const char *rt, const char *entry,
-                     bool strip) {
+static void link_image(TargetFmt fmt, const char *out, const char *objpath,
+                       const char *wasi, const char *rt, const char *entry,
+                       bool strip, char *const *exports, uint32_t nexports) {
   bool macho = fmt == TGT_MACHO;
   Linker L;
   memset(&L, 0, sizeof L);
   L.fmt = fmt;
+  L.shared = exports != NULL;
+  if (fmt == TGT_PE) L.base = L.shared ? PE_DLL_BASE : PE_BASE;
+  char install[4096];
+  if (L.shared) {
+    const char *b = strrchr(out, '/');
+    snprintf(install, sizeof install, "@rpath/%s", b ? b + 1 : out);
+    L.install_name = install;
+  }
 
   bool tm = warmc_getenv("WARMC_TIME") != NULL;
   double t0 = tm ? lk_ms() : 0, t_read, t_pull, t_lay, t_rel;
@@ -1664,7 +1926,7 @@ void warmc_link_exec(TargetFmt fmt, const char *out, const char *objpath,
       if (g->defined) continue;
       if (!strcmp(g->name, "__ImageBase")) {
         g->defined = true;
-        g->addr = PE_BASE;
+        g->addr = L.base;
       } else if (pe_dll_for(g->name)) {
         g->imported = true;
       }
@@ -1695,6 +1957,15 @@ void warmc_link_exec(TargetFmt fmt, const char *out, const char *objpath,
 
   for (uint32_t i = 0; i < L.ngsyms; i++)
     if (!L.gsyms[i].defined) L.gsyms[i].imported = true;
+
+  for (uint32_t i = 0; i < nexports; i++) {
+    char name[1024];
+    snprintf(name, sizeof name, "%s%s", macho ? "_" : "", exports[i]);
+    int32_t g = gs_find(&L, name);
+    if (g < 0 || !L.gsyms[g].defined || L.gsyms[g].imported)
+      warmc_fatal("link: the library's export %s is not defined", exports[i]);
+    L.gsyms[g].exported = true;
+  }
 
   if (strip) dead_strip(&L, entry);
   reserve_indirection(&L);
@@ -1747,7 +2018,8 @@ void warmc_link_exec(TargetFmt fmt, const char *out, const char *objpath,
               (unsigned long long)L.gsyms[L.got[i]].addr, L.gsyms[L.got[i]].name,
               L.gsyms[L.got[i]].imported ? " (imported)" : "");
   int32_t e = gs_find(&L, entry);
-  if (e < 0 || !L.gsyms[e].defined) warmc_fatal("link: no entry point %s", entry);
+  if (!L.shared && (e < 0 || !L.gsyms[e].defined))
+    warmc_fatal("link: no entry point %s", entry);
   apply_relocs(&L);
   if (warmc_getenv("WARMC_LINK_DEBUG")) {
     uint32_t own = 0;
@@ -1759,12 +2031,27 @@ void warmc_link_exec(TargetFmt fmt, const char *out, const char *objpath,
   }
 
   if (tm) { t_rel = lk_ms() - t0; t0 = lk_ms(); }
-  if (macho) write_macho_exec(&L, out, L.gsyms[e].addr);
-  else if (fmt == TGT_PE) write_pe_exec(&L, out, L.gsyms[e].addr);
+  if (macho) write_macho(&L, out, L.shared ? 0 : L.gsyms[e].addr);
+  else if (fmt == TGT_PE) write_pe_exec(&L, out, L.shared ? 0 : L.gsyms[e].addr);
+  else if (L.shared) write_elf_shared(&L, out);
   else write_elf_exec(&L, out, L.gsyms[e].addr);
   if (tm)
     fprintf(stderr, "link time: read %.1f pull %.1f layout %.1f reloc %.1f write %.1f\n",
             t_read, t_pull, t_lay, t_rel, lk_ms() - t0);
+}
+
+void warmc_link_exec(TargetFmt fmt, const char *out, const char *objpath,
+                     const char *wasi, const char *rt, const char *entry,
+                     bool strip) {
+  link_image(fmt, out, objpath, wasi, rt, entry, strip, NULL, 0);
+}
+
+void warmc_link_shared(TargetFmt fmt, const char *out, const char *objpath,
+                       const char *rt, char *const *exports, uint32_t nexports,
+                       bool strip) {
+  link_image(fmt, out, objpath, NULL, rt,
+             fmt == TGT_MACHO ? "_warmc_lib_thunk" : "warmc_lib_thunk", strip,
+             exports, nexports);
 }
 
 #if defined(__APPLE__)
@@ -1850,7 +2137,7 @@ static void sha_final(Sha256 *s, uint8_t out[32]) {
 #define MACHO_DYLIB "/usr/lib/libSystem.B.dylib"
 #define MACHO_DYLD  "/usr/lib/dyld"
 
-static uint64_t macho_hdr_size(void) {
+static uint64_t macho_hdr_size(const Linker *L) {
   uint64_t n = 32;
   n += 4 * 72;
   n += 6 * 80;
@@ -1858,11 +2145,15 @@ static uint64_t macho_hdr_size(void) {
 
   n += align_up(12 + strlen(MACHO_DYLD) + 1, 8);
   n += align_up(24 + strlen(MACHO_DYLIB) + 1, 8);
+  /* A library names itself in LC_ID_DYLIB; it has no __PAGEZERO, dyld or
+     LC_MAIN, so what they would take is spare. */
+  if (L->shared) n += align_up(24 + strlen(L->install_name) + 1, 8);
   return align_up(n, 16);
 }
 
 static void layout_macos(Linker *L) {
-  L->text_addr = MACHO_BASE + macho_hdr_size();
+  if (!L->shared) L->base = MACHO_BASE;
+  L->text_addr = L->base + macho_hdr_size(L);
   uint64_t at = place(L, K_TEXT, L->text_addr);
   at = align_up(at, 4);
   L->stub_addr = at;
@@ -1915,6 +2206,9 @@ static void lc_str16(Buf *b, const char *s) {
 #define LC_BUILD_VERSION  0x32
 
 #define MH_EXECUTE  2
+#define MH_DYLIB    6
+#define LC_ID_DYLIB 0x0d
+#define MH_NO_REEXPORTED_DYLIBS 0x100000
 #define MH_NOUNDEFS 0x1
 #define MH_DYLDLINK 0x4
 #define MH_TWOLEVEL 0x80
@@ -1954,6 +2248,119 @@ static void sect_cmd(Buf *b, const char *sect, const char *seg, uint64_t addr,
   buf_u32(b, 0); buf_u32(b, 0); buf_u32(b, 0);
 }
 
+/* A library's export trie, what dlsym and a linker read its symbols from:
+   a radix tree over the names, each node its terminal information -- the
+   address, for a name that ends there -- and its edges, each a run of the
+   name and the ULEB128 offset of the node it leads to.  The offsets size
+   the nodes they sit in, so the layout is redone until it holds still. */
+typedef struct TNode {
+  bool term;
+  uint64_t addr;
+  uint32_t nkids, off;
+  struct TKid { const char *lab; uint32_t len; struct TNode *to; } *kids;
+} TNode;
+
+static uint32_t uleb_len(uint64_t v) {
+  uint32_t n = 1;
+  while (v >= 0x80) { v >>= 7; n++; }
+  return n;
+}
+
+/* names[lo, hi) share their first depth characters and are sorted. */
+static TNode *trie_build(char **names, const uint64_t *addrs, uint32_t lo,
+                         uint32_t hi, uint32_t depth) {
+  TNode *t = xcalloc(1, sizeof *t);
+  t->kids = xcalloc(hi - lo + 1, sizeof *t->kids);
+  uint32_t i = lo;
+  if (i < hi && !names[i][depth]) { t->term = true; t->addr = addrs[i]; i++; }
+  while (i < hi) {
+    char c = names[i][depth];
+    uint32_t j = i;
+    while (j < hi && names[j][depth] == c) j++;
+    uint32_t len = 1;
+    for (;;) {
+      char d = names[i][depth + len];
+      bool same = d != 0;
+      for (uint32_t k = i + 1; k < j && same; k++)
+        if (names[k][depth + len] != d) same = false;
+      if (!same) break;
+      len++;
+    }
+    struct TKid *kd = &t->kids[t->nkids++];
+    kd->lab = names[i] + depth;
+    kd->len = len;
+    kd->to = trie_build(names, addrs, i, j, depth + len);
+    i = j;
+  }
+  return t;
+}
+
+static void trie_order(TNode *t, TNode ***v, uint32_t *n, uint32_t *cap) {
+  if (*n == *cap) { *cap = *cap ? *cap * 2 : 16; *v = xrealloc(*v, *cap * sizeof **v); }
+  (*v)[(*n)++] = t;
+  for (uint32_t i = 0; i < t->nkids; i++) trie_order(t->kids[i].to, v, n, cap);
+}
+
+static uint32_t trie_term_len(const TNode *t) {
+  return uleb_len(0) + uleb_len(t->addr);
+}
+
+static void export_trie(Linker *L, Buf *out) {
+  uint32_t n = 0;
+  for (uint32_t i = 0; i < L->ngsyms; i++) if (L->gsyms[i].exported) n++;
+  if (!n) return;
+  char **names = xmalloc(n * sizeof(char *));
+  uint64_t *addrs = xmalloc(n * sizeof(uint64_t));
+  uint32_t k = 0;
+  for (uint32_t i = 0; i < L->ngsyms; i++)
+    if (L->gsyms[i].exported) names[k++] = L->gsyms[i].name;
+  for (uint32_t i = 1; i < n; i++) {
+    char *v = names[i]; uint32_t j = i;
+    while (j && strcmp(names[j - 1], v) > 0) { names[j] = names[j - 1]; j--; }
+    names[j] = v;
+  }
+  for (uint32_t i = 0; i < n; i++)
+    addrs[i] = L->gsyms[gs_find(L, names[i])].addr - L->base;
+
+  TNode *root = trie_build(names, addrs, 0, n, 0);
+  TNode **order = NULL;
+  uint32_t nn = 0, cap = 0;
+  trie_order(root, &order, &nn, &cap);
+  for (bool moved = true; moved;) {
+    moved = false;
+    uint32_t off = 0;
+    for (uint32_t i = 0; i < nn; i++) {
+      TNode *t = order[i];
+      if (t->off != off) { t->off = off; moved = true; }
+      off += t->term ? uleb_len(trie_term_len(t)) + trie_term_len(t) : 1;
+      off += 1;
+      for (uint32_t c = 0; c < t->nkids; c++)
+        off += t->kids[c].len + 1 + uleb_len(t->kids[c].to->off);
+    }
+  }
+  for (uint32_t i = 0; i < nn; i++) {
+    TNode *t = order[i];
+    if (t->term) {
+      uleb(out, trie_term_len(t));
+      uleb(out, 0);
+      uleb(out, t->addr);
+    } else {
+      buf_u8(out, 0);
+    }
+    buf_u8(out, (uint8_t)t->nkids);
+    for (uint32_t c = 0; c < t->nkids; c++) {
+      buf_bytes(out, t->kids[c].lab, t->kids[c].len);
+      buf_u8(out, 0);
+      uleb(out, t->kids[c].to->off);
+    }
+  }
+  while (out->len & 7) buf_u8(out, 0);
+  for (uint32_t i = 0; i < nn; i++) { xfree(order[i]->kids); xfree(order[i]); }
+  xfree(order);
+  xfree(names);
+  xfree(addrs);
+}
+
 static uint32_t macho_sect_of(Linker *L, uint64_t a) {
   if (a < L->stub_addr) return 1;
   if (a < L->rodata_addr) return 2;
@@ -1963,19 +2370,22 @@ static uint32_t macho_sect_of(Linker *L, uint64_t a) {
   return 6;
 }
 
-static void write_macho_exec(Linker *L, const char *path, uint64_t entry) {
+static void write_macho(Linker *L, const char *path, uint64_t entry) {
+  const uint64_t base = L->base;
   const char *dylib = MACHO_DYLIB;
   const char *dyld  = MACHO_DYLD;
   const char *ident = strrchr(path, '/') ? strrchr(path, '/') + 1 : path;
 
   uint64_t text_end = align_up(L->rodata_addr + L->rodata_size, 16);
-  uint64_t text_fsz = text_end - MACHO_BASE;
-  uint64_t data_foff = L->got_addr - MACHO_BASE;
+  uint64_t text_fsz = text_end - base;
+  uint64_t data_foff = L->got_addr - base;
   uint64_t data_fsz  = (L->data_addr + L->data_size) - L->got_addr;
   uint64_t data_vsz  = (L->bss_addr + L->bss_size) - L->got_addr;
   uint64_t link_foff = align_up(data_foff + data_fsz, MACHO_PAGE);
   uint64_t link_vaddr = align_up(L->got_addr + data_vsz, MACHO_PAGE);
 
+  /* __DATA's segment index: a program's __PAGEZERO comes first. */
+  uint8_t dseg = L->shared ? 1 : 2;
   Buf reb; memset(&reb, 0, sizeof reb);
   {
     uint64_t *all = xmalloc(((size_t)L->ngot + L->nrebase + 1) * sizeof(uint64_t));
@@ -1991,7 +2401,7 @@ static void write_macho_exec(Linker *L, const char *path, uint64_t entry) {
 
     if (n) {
       buf_u8(&reb, 0x10 | 1);
-      buf_u8(&reb, 0x20 | 2);
+      buf_u8(&reb, 0x20 | dseg);
       uleb(&reb, all[0] - L->got_addr);
       uint32_t i = 0;
       while (i < n) {
@@ -2016,12 +2426,15 @@ static void write_macho_exec(Linker *L, const char *path, uint64_t entry) {
     buf_u8(&bind, BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM | 0);
     buf_bytes(&bind, g->name, strlen(g->name) + 1);
     buf_u8(&bind, BIND_OPCODE_SET_TYPE_IMM | BIND_TYPE_POINTER);
-    buf_u8(&bind, BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB | 2);
+    buf_u8(&bind, BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB | dseg);
     uleb(&bind, (uint64_t)i * 8);
     buf_u8(&bind, BIND_OPCODE_DO_BIND);
   }
   buf_u8(&bind, BIND_OPCODE_DONE);
   while (bind.len & 7) buf_u8(&bind, 0);
+
+  Buf exp; memset(&exp, 0, sizeof exp);
+  if (L->shared) export_trie(L, &exp);
 
   Buf strt; memset(&strt, 0, sizeof strt);
   buf_u8(&strt, 0);
@@ -2041,9 +2454,23 @@ static void write_macho_exec(Linker *L, const char *path, uint64_t entry) {
     }
     xfree(v);
   }
+  /* A library keeps the runtime's globals to itself: local, like its
+     functions, so that nothing outside binds to them. */
+  if (L->shared)
+    for (uint32_t i = 0; i < L->ngsyms; i++) {
+      GSym *g = &L->gsyms[i];
+      if (!g->defined || g->imported || g->exported) continue;
+      buf_u32(&symt, (uint32_t)strt.len);
+      buf_bytes(&strt, g->name, strlen(g->name) + 1);
+      buf_u8(&symt, N_SECT);
+      buf_u8(&symt, (uint8_t)macho_sect_of(L, g->addr));
+      buf_u16(&symt, 0);
+      buf_u64(&symt, g->addr);
+      nlocal++;
+    }
   for (uint32_t i = 0; i < L->ngsyms; i++) {
     GSym *g = &L->gsyms[i];
-    if (!g->defined || g->imported) continue;
+    if (!g->defined || g->imported || (L->shared && !g->exported)) continue;
     uint32_t sx = (uint32_t)strt.len;
     buf_bytes(&strt, g->name, strlen(g->name) + 1);
     buf_u32(&symt, sx);
@@ -2069,32 +2496,33 @@ static void write_macho_exec(Linker *L, const char *path, uint64_t entry) {
 
   uint64_t reb_off  = link_foff;
   uint64_t bind_off = reb_off + reb.len;
-  uint64_t sym_off  = bind_off + bind.len;
+  uint64_t exp_off  = bind_off + bind.len;
+  uint64_t sym_off  = exp_off + exp.len;
   uint64_t str_off  = sym_off + symt.len;
   uint64_t sig_off  = align_up(str_off + strt.len, 16);
 
   Buf lc; memset(&lc, 0, sizeof lc);
   uint32_t ncmds = 0;
 
-  seg_cmd(&lc, "__PAGEZERO", 0, MACHO_BASE, 0, 0, 0, 0, 0); ncmds++;
+  if (!L->shared) { seg_cmd(&lc, "__PAGEZERO", 0, base, 0, 0, 0, 0, 0); ncmds++; }
 
-  seg_cmd(&lc, "__TEXT", MACHO_BASE, align_up(text_fsz, MACHO_PAGE), 0, text_fsz,
+  seg_cmd(&lc, "__TEXT", base, align_up(text_fsz, MACHO_PAGE), 0, text_fsz,
           VM_PROT_READ | VM_PROT_EXEC, VM_PROT_READ | VM_PROT_EXEC, 3); ncmds++;
   sect_cmd(&lc, "__text", "__TEXT", L->text_addr, L->stub_addr - L->text_addr,
-           (uint32_t)(L->text_addr - MACHO_BASE), 2,
+           (uint32_t)(L->text_addr - base), 2,
            S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS);
   sect_cmd(&lc, "__stubs", "__TEXT", L->stub_addr, (uint64_t)L->nstub * STUB_SIZE,
-           (uint32_t)(L->stub_addr - MACHO_BASE), 2,
+           (uint32_t)(L->stub_addr - base), 2,
            S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS);
   sect_cmd(&lc, "__const", "__TEXT", L->rodata_addr, L->rodata_size,
-           (uint32_t)(L->rodata_addr - MACHO_BASE), 4, 0);
+           (uint32_t)(L->rodata_addr - base), 4, 0);
 
   seg_cmd(&lc, "__DATA", L->got_addr, align_up(data_vsz, MACHO_PAGE), data_foff, data_fsz,
           VM_PROT_READ | VM_PROT_WRITE, VM_PROT_READ | VM_PROT_WRITE, 3); ncmds++;
   sect_cmd(&lc, "__got", "__DATA", L->got_addr, (uint64_t)L->ngot * 8,
            (uint32_t)data_foff, 3, 0);
   sect_cmd(&lc, "__data", "__DATA", L->data_addr, L->data_size,
-           (uint32_t)(L->data_addr - MACHO_BASE), 4, 0);
+           (uint32_t)(L->data_addr - base), 4, 0);
   sect_cmd(&lc, "__bss", "__DATA", L->bss_addr, L->bss_size, 0, 4, S_ZEROFILL);
 
   uint32_t np0 = (uint32_t)((sig_off + 4095) / 4096);
@@ -2108,7 +2536,7 @@ static void write_macho_exec(Linker *L, const char *path, uint64_t entry) {
   buf_u32(&lc, (uint32_t)bind_off); buf_u32(&lc, (uint32_t)bind.len);
   buf_u32(&lc, 0); buf_u32(&lc, 0);
   buf_u32(&lc, 0); buf_u32(&lc, 0);
-  buf_u32(&lc, 0); buf_u32(&lc, 0);
+  buf_u32(&lc, exp.len ? (uint32_t)exp_off : 0); buf_u32(&lc, (uint32_t)exp.len);
   ncmds++;
 
   buf_u32(&lc, LC_SYMTAB_C); buf_u32(&lc, 24);
@@ -2123,20 +2551,33 @@ static void write_macho_exec(Linker *L, const char *path, uint64_t entry) {
   for (int i = 0; i < 12; i++) buf_u32(&lc, 0);
   ncmds++;
 
-  uint32_t dl = (uint32_t)align_up(12 + strlen(dyld) + 1, 8);
-  buf_u32(&lc, LC_LOAD_DYLINKER); buf_u32(&lc, dl); buf_u32(&lc, 12);
-  buf_bytes(&lc, dyld, strlen(dyld) + 1);
-  while ((lc.len % 8) != 0) buf_u8(&lc, 0);
-  ncmds++;
+  if (!L->shared) {
+    uint32_t dl = (uint32_t)align_up(12 + strlen(dyld) + 1, 8);
+    buf_u32(&lc, LC_LOAD_DYLINKER); buf_u32(&lc, dl); buf_u32(&lc, 12);
+    buf_bytes(&lc, dyld, strlen(dyld) + 1);
+    while ((lc.len % 8) != 0) buf_u8(&lc, 0);
+    ncmds++;
+  }
 
   buf_u32(&lc, LC_BUILD_VERSION); buf_u32(&lc, 24);
   buf_u32(&lc, 1);
   buf_u32(&lc, 11 << 16); buf_u32(&lc, 11 << 16); buf_u32(&lc, 0);
   ncmds++;
 
-  buf_u32(&lc, LC_MAIN); buf_u32(&lc, 24);
-  buf_u64(&lc, entry - MACHO_BASE); buf_u64(&lc, 0);
-  ncmds++;
+  if (L->shared) {
+    const char *id = L->install_name;
+    uint32_t idsz = (uint32_t)align_up(24 + strlen(id) + 1, 8);
+    buf_u32(&lc, LC_ID_DYLIB); buf_u32(&lc, idsz);
+    buf_u32(&lc, 24); buf_u32(&lc, 0);
+    buf_u32(&lc, 1 << 16); buf_u32(&lc, 1 << 16);
+    buf_bytes(&lc, id, strlen(id) + 1);
+    while ((lc.len % 8) != 0) buf_u8(&lc, 0);
+    ncmds++;
+  } else {
+    buf_u32(&lc, LC_MAIN); buf_u32(&lc, 24);
+    buf_u64(&lc, entry - base); buf_u64(&lc, 0);
+    ncmds++;
+  }
 
   /* Filled in below from a hash of the image.  Instruments, dsymutil and the
      crash reporter pair a binary with its symbols by this; without it every
@@ -2158,27 +2599,28 @@ static void write_macho_exec(Linker *L, const char *path, uint64_t entry) {
   buf_u32(&lc, (uint32_t)sig_off); buf_u32(&lc, (uint32_t)sig_len);
   ncmds++;
 
-  if (32 + lc.len > L->text_addr - MACHO_BASE)
+  if (32 + lc.len > L->text_addr - base)
     warmc_fatal("link: load commands are %llu bytes and __text was placed at "
                 "%llu; update macho_hdr_size",
                 (unsigned long long)(32 + lc.len),
-                (unsigned long long)(L->text_addr - MACHO_BASE));
+                (unsigned long long)(L->text_addr - base));
 
   Buf out; memset(&out, 0, sizeof out);
   buf_u32(&out, MH_MAGIC_64);
   buf_u32(&out, 0x0100000c);
   buf_u32(&out, 0);
-  buf_u32(&out, MH_EXECUTE);
+  buf_u32(&out, L->shared ? MH_DYLIB : MH_EXECUTE);
   buf_u32(&out, ncmds); buf_u32(&out, (uint32_t)lc.len);
 
-  buf_u32(&out, MH_DYLDLINK | MH_TWOLEVEL | MH_PIE |
+  buf_u32(&out, MH_DYLDLINK | MH_TWOLEVEL |
+                (L->shared ? (uint32_t)MH_NO_REEXPORTED_DYLIBS : (uint32_t)MH_PIE) |
                 (nundef ? 0u : (uint32_t)MH_NOUNDEFS));
   buf_u32(&out, 0);
   buf_bytes(&out, lc.data, lc.len);
 
-  while (out.len < L->text_addr - MACHO_BASE) buf_u8(&out, 0);
-  emit_secs(&out, L, K_TEXT, L->text_addr, L->text_addr - MACHO_BASE);
-  while (out.len < L->stub_addr - MACHO_BASE) buf_u8(&out, 0);
+  while (out.len < L->text_addr - base) buf_u8(&out, 0);
+  emit_secs(&out, L, K_TEXT, L->text_addr, L->text_addr - base);
+  while (out.len < L->stub_addr - base) buf_u8(&out, 0);
   for (uint32_t i = 0; i < L->nstub; i++) {
     uint64_t at = L->stub_addr + (uint64_t)i * STUB_SIZE;
     uint64_t ga = L->got_addr + (uint64_t)L->gsyms[L->stub[i]].got_slot * 8;
@@ -2190,20 +2632,21 @@ static void write_macho_exec(Linker *L, const char *path, uint64_t entry) {
     patch_lo12(ins + 4, ga, 3);
     buf_bytes(&out, ins, 12);
   }
-  while (out.len < L->rodata_addr - MACHO_BASE) buf_u8(&out, 0);
-  emit_secs(&out, L, K_RODATA, L->rodata_addr, L->rodata_addr - MACHO_BASE);
+  while (out.len < L->rodata_addr - base) buf_u8(&out, 0);
+  emit_secs(&out, L, K_RODATA, L->rodata_addr, L->rodata_addr - base);
 
   while (out.len < data_foff) buf_u8(&out, 0);
   for (uint32_t i = 0; i < L->ngot; i++) {
     GSym *g = &L->gsyms[L->got[i]];
     buf_u64(&out, g->imported ? 0 : g->addr);
   }
-  while (out.len < L->data_addr - MACHO_BASE) buf_u8(&out, 0);
-  emit_secs(&out, L, K_DATA, L->data_addr, L->data_addr - MACHO_BASE);
+  while (out.len < L->data_addr - base) buf_u8(&out, 0);
+  emit_secs(&out, L, K_DATA, L->data_addr, L->data_addr - base);
 
   while (out.len < reb_off) buf_u8(&out, 0);
   buf_bytes(&out, reb.data, reb.len);
   buf_bytes(&out, bind.data, bind.len);
+  buf_bytes(&out, exp.data, exp.len);
   buf_bytes(&out, symt.data, symt.len);
   buf_bytes(&out, strt.data, strt.len);
   while (out.len < sig_off) buf_u8(&out, 0);
@@ -2246,7 +2689,7 @@ static void write_macho_exec(Linker *L, const char *path, uint64_t entry) {
   be64(&cd, 0);
   be64(&cd, 0);
   be64(&cd, text_fsz);
-  be64(&cd, 1);
+  be64(&cd, L->shared ? 0 : 1);
   buf_bytes(&cd, ident, idlen);
   for (uint32_t p = 0; p < npages; p++) {
     size_t off = (size_t)p * 4096;
@@ -2282,5 +2725,6 @@ static void write_macho_exec(Linker *L, const char *path, uint64_t entry) {
   fclose(f);
   chmod_exec(path);
   xfree(out.data); xfree(lc.data); xfree(cd.data);
-  xfree(reb.data); xfree(bind.data); xfree(symt.data); xfree(strt.data);
+  xfree(reb.data); xfree(bind.data); xfree(exp.data); xfree(symt.data);
+  xfree(strt.data);
 }
