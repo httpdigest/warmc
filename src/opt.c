@@ -12272,7 +12272,31 @@ typedef struct {
   bool failed;
 
   const char *fail;
+  /* the body's accesses, for v_same_load */
+  const VAcc *acc;
+  uint32_t nacc;
 } VecCtx;
+
+/* Whether loads a and b of the scalar body read one address the same way.
+   In the vector loop every load comes before every store, and a store
+   that could overlap a load is checked apart from it, so the two read one
+   value there: a load the producer repeats after a store it could not see
+   past -- copies of an unrolled body reading a[i + 1] again after storing
+   c[i] -- is in one group or the other, and either serves. */
+static bool v_same_load(const VecCtx *c, Ref a, Ref b) {
+  if (a == b) return true;
+  const VAcc *x = NULL, *y = NULL;
+  for (uint32_t i = 0; i < c->nacc; i++) {
+    if (c->acc[i].inst == a) x = &c->acc[i];
+    if (c->acc[i].inst == b) y = &c->acc[i];
+  }
+  if (!x || !y || x->store || y->store) return false;
+  const Inst *ia = &c->f->insts[a], *ib = &c->f->insts[b];
+  return x->base == y->base && x->ivx == y->ivx && x->coeff == y->coeff &&
+         x->disp == y->disp && x->mem == y->mem && x->width == y->width &&
+         x->spec == y->spec && x->cond == y->cond && x->pol == y->pol &&
+         ia->imm2 == ib->imm2 && ia->type == ib->type;
+}
 
 static bool v_affine(IrFunc *f, const uint8_t *inloop, Ref iv, Ref v, int depth,
                      uint64_t amask, Ref *base, uint64_t *coeff, uint64_t *off) {
@@ -12945,7 +12969,8 @@ static Ref v_build(VecCtx *c, const Ref *tuple, uint32_t k, uint32_t st, int dep
         for (uint32_t off = 0; off < st; off++) {
           bool same = true;
           for (uint32_t j = 0; j < k && same; j++)
-            same = G->member[v_slot(G, c->mpv, v, off + j * st)] == tuple[j];
+            same = v_same_load(c, G->member[v_slot(G, c->mpv, v, off + j * st)],
+                               tuple[j]);
           if (!same) continue;
           Ref ld = G->loaded[c->copy][v];
           if (st == 1) { out = ld; goto done; }
@@ -13324,7 +13349,7 @@ static uint32_t v_log2(uint64_t x) {
 }
 
 /* Emits into gb the runtime count of U-wide rounds for a counted loop whose
-   step is the power of two K: how many full U-iteration groups run before
+   step is the constant K: how many full U-iteration groups run before
    the last 1..U iterations, i.e. cnt = (T-1) >> log2(U) with T the exact
    iteration count derived from |bound - q0|.  *ok_out accumulates every
    safety term (an NE bound off the step grid, no headroom for the final
@@ -13335,7 +13360,15 @@ static uint32_t v_log2(uint64_t x) {
    continue-relation, down the normalized direction, and bound REF_NONE
    means an implicit zero.  With whole the count is of every full group,
    T >> log2(U), for a caller that can leave past the loop when no
-   iteration is left over; *T_out, if asked for, is then T itself. */
+   iteration is left over; *T_out, if asked for, is then T itself.  A step
+   that is not a power of two divides instead of shifting: a loop LLVM
+   unrolled by three walks its array 12 or 24 bytes at a time. */
+/* D >> ks, its shift amount made even when it is zero, as it always was */
+static Ref gt_shr(IrFunc *f, uint32_t gb, ValType ct, Ref D, uint32_t ks) {
+  Ref sh = ir_emit(f, gb, I_CONST, ct, NULL, 0, ks, 0);
+  return ks ? vemit(f, gb, I_SHRU, ct, D, sh, 0, 0) : D;
+}
+
 static Ref guard_trip_count(IrFunc *f, uint32_t gb, ValType ct, IrOp rel,
                             uint64_t K, bool down, Ref q0, Ref bound,
                             bool clone_bound, uint32_t U, bool whole,
@@ -13355,15 +13388,20 @@ static Ref guard_trip_count(IrFunc *f, uint32_t gb, ValType ct, IrOp rel,
         ? Dfrom : vemit(f, gb, I_SUB, ct, Dfrom, Dsub, 0, 0);
   Ref T, ok;
   uint64_t cmask = ct == VT_I64 ? ~0ull : 0xffffffffu;
+  bool p2 = (K & (K - 1)) == 0;
+  Ref Kc = p2 ? REF_NONE : ir_emit(f, gb, I_CONST, ct, NULL, 0, K & cmask, 0);
+#define GT_REM() (p2 ? vemit(f, gb, I_AND, ct, D,                           \
+                         ir_emit(f, gb, I_CONST, ct, NULL, 0, (K - 1) & cmask, 0), 0, 0) \
+                     : vemit(f, gb, I_REMU, ct, D, Kc, 0, 0))
+#define GT_QUO() (p2 ? gt_shr(f, gb, ct, D, ks)                            \
+                     : vemit(f, gb, I_DIVU, ct, D, Kc, 0, 0))
   if (rel == I_NE) {
 
-    Ref kmask = ir_emit(f, gb, I_CONST, ct, NULL, 0, (K - 1) & cmask, 0);
-    Ref rem = vemit(f, gb, I_AND, ct, D, kmask, 0, 0);
+    Ref rem = GT_REM();
     Ref remz = vemit(f, gb, I_EQ, VT_I32, rem, zero, 0, 0);
     Ref dnz = vemit(f, gb, I_NE, VT_I32, D, zero, 0, 0);
     ok = vemit(f, gb, I_AND, VT_I32, remz, dnz, 0, 0);
-    Ref sh = ir_emit(f, gb, I_CONST, ct, NULL, 0, ks, 0);
-    T = ks ? vemit(f, gb, I_SHRU, ct, D, sh, 0, 0) : D;
+    T = GT_QUO();
   } else {
     bool sgn = (rel == I_LTS || rel == I_LES || rel == I_GTS || rel == I_GES);
     bool incl = (rel == I_LEU || rel == I_LES || rel == I_GEU || rel == I_GES);
@@ -13381,14 +13419,12 @@ static Ref guard_trip_count(IrFunc *f, uint32_t gb, ValType ct, IrOp rel,
       ok = vemit(f, gb, sgn ? I_GTS : I_GTU, VT_I32, q0, N, 0, 0);
     }
     ok = vemit(f, gb, I_AND, VT_I32, ok, room, 0, 0);
-    Ref sh = ir_emit(f, gb, I_CONST, ct, NULL, 0, ks, 0);
-    Ref quo = ks ? vemit(f, gb, I_SHRU, ct, D, sh, 0, 0) : D;
+    Ref quo = GT_QUO();
     if (incl) {
 
       T = vemit(f, gb, I_ADD, ct, quo, one, 0, 0);
-    } else if (ks) {
-      Ref kmask = ir_emit(f, gb, I_CONST, ct, NULL, 0, (K - 1) & cmask, 0);
-      Ref rem = vemit(f, gb, I_AND, ct, D, kmask, 0, 0);
+    } else if (K > 1) {
+      Ref rem = GT_REM();
       Ref rnz = vemit(f, gb, I_NE, VT_I32, rem, zero, 0, 0);
       if (ct == VT_I64) rnz = vemit(f, gb, I_EXTENDU, VT_I64, rnz, REF_NONE, 0, 0);
       T = vemit(f, gb, I_ADD, ct, quo, rnz, 0, 0);
@@ -13411,6 +13447,8 @@ static Ref guard_trip_count(IrFunc *f, uint32_t gb, ValType ct, IrOp rel,
   *ok_out = ok;
   if (T_out) *T_out = T;
   return cnt;
+#undef GT_REM
+#undef GT_QUO
 }
 
 /* How many copies of the body an iteration of the vector loop holds where
@@ -13489,6 +13527,50 @@ static bool v_exit_live(IrFunc *f, const uint8_t *inloop, uint32_t latch,
   return ok;
 }
 
+/* The loop's constants that something past it reads -- CSE gives the code
+   after a loop the loop's own 12345 -- move to the preheader.  v_exit_live
+   takes a constant as readable anywhere, but the vector loop's exit can go
+   past the scalar loop, or a trip count that fills every vector replace it
+   whole, and a constant defined only on the scalar path was then read where
+   it was never made: the next loop added garbage, or ran out of memory on
+   a bound it never had.  The preheader is above both paths. */
+static void v_hoist_out_consts(IrFunc *f, const uint8_t *inloop, uint32_t pre) {
+#define V_HOIST(x) do {                                                       \
+    Ref r_ = (x);                                                             \
+    if (r_ < f->ninsts && f->insts[r_].op == I_CONST &&                       \
+        inloop[f->insts[r_].block]) {                                         \
+      Block *ob_ = &f->blocks[f->insts[r_].block];                            \
+      uint32_t k_ = 0;                                                        \
+      for (uint32_t j_ = 0; j_ < ob_->ninsts; j_++)                           \
+        if (ob_->insts[j_] != r_) ob_->insts[k_++] = ob_->insts[j_];          \
+      ob_->ninsts = k_;                                                       \
+      ifc_append(f, pre, r_);                                                 \
+    }                                                                         \
+  } while (0)
+  for (uint32_t oi = 0; oi < f->norder; oi++) {
+    uint32_t bi = f->order[oi];
+    Block *b = &f->blocks[bi];
+    if (inloop[bi]) {
+      /* what the loop's exits hand on, which the vector exit hands on too */
+      for (uint32_t s = 0; s < b->nsuccs; s++)
+        if (!inloop[b->succs[s].target])
+          for (uint32_t j = 0; j < b->succs[s].nargs; j++) V_HOIST(b->succs[s].args[j]);
+      continue;
+    }
+    for (uint32_t i = 0; i < b->ninsts; i++) {
+      Ref v = b->insts[i];
+      Ref *a = ir_args(f, v);
+      for (uint32_t j = 0; j < f->insts[v].nargs; j++) V_HOIST(a[j]);
+      b = &f->blocks[bi];
+    }
+    if (b->term == T_BRIF || b->term == T_BRTABLE) V_HOIST(b->term_arg);
+    for (uint32_t j = 0; j < b->nret; j++) V_HOIST(b->ret_args[j]);
+    for (uint32_t s = 0; s < b->nsuccs; s++)
+      for (uint32_t j = 0; j < b->succs[s].nargs; j++) V_HOIST(b->succs[s].args[j]);
+  }
+#undef V_HOIST
+}
+
 /* Every read of back[p] outside the loop now reads the exit block's
    parameter par[p]: in the blocks v_exit_live looked at, the ones reached
    before the vector loop was made (f->order is not yet redone). */
@@ -13503,7 +13585,50 @@ static void v_exit_rewrite(IrFunc *f, const uint8_t *inloop, const Ref *back,
 }
 #undef V_EACH_USE
 
-static bool vectorize_one(IrFunc *f, uint32_t hb, uint8_t *reach, uint8_t *inloop) {
+/* The factor to unroll a loop by whose stride of Sa bytes neither divides a
+   vector nor is a whole number of them -- LLVM's unroll by three of an i32
+   or an f64 loop, 12 or 24 bytes -- so that it spans a whole number of
+   vectors, at most VEC_MAX_VEC; 0 if none does. */
+static uint32_t v_unroll_for(uint64_t Sa) {
+  for (uint32_t u = 2; u <= 8; u *= 2)
+    if ((Sa * u) % VEC_BYTES == 0)
+      return Sa * u / VEC_BYTES <= VEC_MAX_VEC ? u : 0;
+  return 0;
+}
+
+/* The accesses like group G's at disp + t * width, t < kG, into pick: ones
+   no group has yet, or with reuse a load another group holds where no such
+   one is there (and it is speculated as spec, pol say).  How many were not
+   yet in a group, or -1 if a place has none. */
+static int v_window(const VAcc *acc, uint32_t nacc, const uint8_t *used,
+                    const VGroup *G, uint64_t disp, uint32_t kG, uint32_t width,
+                    uint64_t amask, bool reuse, bool spec, bool pol,
+                    uint32_t *pick) {
+  int fresh = 0;
+  for (uint32_t t = 0; t < kG; t++) {
+    uint64_t want = (disp + (uint64_t)t * width) & amask;
+    uint32_t found = UINT32_MAX, again = UINT32_MAX;
+    for (uint32_t j = 0; j < nacc && found == UINT32_MAX; j++) {
+      if (acc[j].store != G->store || acc[j].base != G->base ||
+          acc[j].mem != G->mem || acc[j].ivx != G->ivx || acc[j].disp != want)
+        continue;
+      if (!used[j]) found = j;
+      else if (reuse && again == UINT32_MAX && !acc[j].store &&
+               acc[j].spec == spec && acc[j].pol == pol)
+        again = j;
+    }
+    if (found == UINT32_MAX) found = again;
+    if (found == UINT32_MAX) return -1;
+    if (!used[found]) fresh++;
+    pick[t] = found;
+  }
+  return fresh;
+}
+
+/* *want, when the stride is all that stands in the way, is v_unroll_for's
+   factor (see pass_vectorize). */
+static bool vectorize_one(IrFunc *f, uint32_t hb, uint8_t *reach, uint8_t *inloop,
+                          uint32_t *want) {
 #define VREJ(w) do { if (warmc_getenv("WARMC_VEC_DEBUG")) \
     fprintf(stderr, "vec %s b%u reject: %s\n", \
             f->m->funcs[f->func_index].sym, hb, w); return false; } while (0)
@@ -13792,11 +13917,11 @@ static bool vectorize_one(IrFunc *f, uint32_t hb, uint8_t *reach, uint8_t *inloo
   if (Sa == 0 || Sa % width) VREJ("stride is not a multiple of the element");
   uint32_t U, nvec;
   if (Sa <= VEC_BYTES) {
-    if (VEC_BYTES % Sa) VREJ("stride");
+    if (VEC_BYTES % Sa) { *want = v_unroll_for(Sa); VREJ("stride"); }
     U = (uint32_t)(VEC_BYTES / Sa);
     nvec = 1;
   } else {
-    if (Sa % VEC_BYTES) VREJ("stride");
+    if (Sa % VEC_BYTES) { *want = v_unroll_for(Sa); VREJ("stride"); }
     U = 1;
     nvec = (uint32_t)(Sa / VEC_BYTES);
     if (nvec > VEC_MAX_VEC) VREJ("stride spans too many vectors");
@@ -13815,6 +13940,7 @@ static bool vectorize_one(IrFunc *f, uint32_t hb, uint8_t *reach, uint8_t *inloo
   ctx.nsel = nsel;
   ctx.lane = lane; ctx.width = width; ctx.k = k;
   ctx.mpv = mpv; ctx.nvec = nvec; ctx.gran = gran;
+  ctx.acc = acc; ctx.nacc = nacc;
 
   uint8_t used[VEC_MAX_ACC];
   memset(used, 0, sizeof used);
@@ -13849,33 +13975,43 @@ static bool vectorize_one(IrFunc *f, uint32_t hb, uint8_t *reach, uint8_t *inloo
       if (found == 0xffffffffu) break;
       lowest = found;
     }
-    G->disp = acc[lowest].disp;
+    uint32_t kG = G->m * mpv * nvec;
+    if (kG > VEC_MAX_MEMB) VREJ("group width");
+    uint32_t pick[VEC_MAX_MEMB];
+    uint64_t gdisp = acc[lowest].disp;
+    if (v_window(acc, nacc, used, G, gdisp, kG, width, amask, false, false,
+                 false, pick) < 0) {
+      /* A load the producer shares between copies -- copy c's a[i + 1] the
+         same instruction as copy c + 1's a[i], once nothing between could
+         have changed it -- is wanted by two groups, a window apart, and
+         this one may take it again: of the windows holding the first
+         access no group has yet, the one with most such accesses. */
+      int best = 0;
+      if (!G->store && G->m == 1)
+        for (uint32_t t0 = 0; t0 < kG; t0++) {
+          uint64_t st = (acc[i].disp - (uint64_t)t0 * width) & amask;
+          uint32_t tmp[VEC_MAX_MEMB];
+          int fr = v_window(acc, nacc, used, G, st, kG, width, amask, true,
+                            acc[i].spec, acc[i].pol, tmp);
+          if (fr > best) { best = fr; gdisp = st; memcpy(pick, tmp, kG * sizeof *pick); }
+        }
+      if (best <= 0) VREJ("group not contiguous");
+    }
+    G->disp = gdisp;
 
     uint64_t ev;
     G->stat = G->base == REF_NONE && is_const(f, iventry[G->ivx], &ev);
     if (G->stat) G->stat_addr = (G->coeff * ev + G->disp) & amask;
-    G->member[0] = acc[lowest].inst; G->pos[0] = acc[lowest].pos; G->n = 1;
-    G->spec = acc[lowest].spec; G->pol = acc[lowest].pol;
-    G->mcond[0] = acc[lowest].cond;
-    used[lowest] = 1;
-    uint32_t kG = G->m * mpv * nvec;
-    if (kG > VEC_MAX_MEMB) VREJ("group width");
-    for (uint32_t t = 1; t < kG; t++) {
-      uint64_t want = (G->disp + (uint64_t)t * width) & amask;
-      uint32_t found = 0xffffffffu;
-      for (uint32_t j = 0; j < nacc; j++)
-        if (!used[j] && acc[j].store == G->store && acc[j].base == G->base &&
-            acc[j].mem == G->mem &&
-            acc[j].ivx == G->ivx && acc[j].disp == want) { found = j; break; }
-      if (found == 0xffffffffu) VREJ("group not contiguous");
-      G->member[t] = acc[found].inst;
-      G->pos[t] = acc[found].pos;
-      G->mcond[t] = acc[found].cond;
-
-      if (acc[found].spec != G->spec || acc[found].pol != G->pol)
+    G->spec = acc[pick[0]].spec; G->pol = acc[pick[0]].pol;
+    for (uint32_t t = 0; t < kG; t++) {
+      uint32_t j = pick[t];
+      G->member[t] = acc[j].inst;
+      G->pos[t] = acc[j].pos;
+      G->mcond[t] = acc[j].cond;
+      if (t && (acc[j].spec != G->spec || acc[j].pol != G->pol))
         VREJ("group partly speculated");
-      G->n++;
-      used[found] = 1;
+      G->n = t + 1;
+      used[j] = 1;
     }
   }
 
@@ -14328,7 +14464,7 @@ static bool vectorize_one(IrFunc *f, uint32_t hb, uint8_t *reach, uint8_t *inloo
   bool gform = (rel == I_GTU || rel == I_GTS || rel == I_GEU || rel == I_GES);
   if (down && !gform && rel != I_NE) VREJ("counter runs down");
   if (!down && gform) VREJ("counter runs up against a downward test");
-  if (K == 0 || (K & (K - 1))) VREJ("counter step is not a power of two");
+  if (K == 0) VREJ("counter step is zero");
   if (K >= (1ull << (cbits - 2))) VREJ("counter step");
 
   uint64_t tmax = ~0ull;
@@ -14381,6 +14517,7 @@ static bool vectorize_one(IrFunc *f, uint32_t hb, uint8_t *reach, uint8_t *inloo
   uint32_t xb = lb->succs[xsucc].target;
   uint8_t xneed[16];
   bool skip = v_exit_live(f, inloop, latch, xsucc, back_args, np, xneed);
+  v_hoist_out_consts(f, inloop, pre);
 
   uint32_t vguard = ir_new_block(f);
   uint32_t vbody = ir_new_block(f);
@@ -15509,6 +15646,8 @@ static bool pass_vec_search(IrFunc *f) {
   return changed;
 }
 
+static bool unroll_by(IrFunc *f, uint32_t hb, uint32_t want, uint32_t *newh);
+
 static bool pass_vectorize(IrFunc *f) {
   bool changed = false;
   uint32_t norig = f->nblocks;
@@ -15523,10 +15662,21 @@ static bool pass_vectorize(IrFunc *f) {
     if (hb >= norig || done[hb]) continue;
     if (f->ninsts > rcap) { rcap = f->ninsts; reach = xrealloc(reach, rcap); }
     if (f->nblocks > lcap) { lcap = f->nblocks; inloop = xrealloc(inloop, lcap); }
-    if (vectorize_one(f, hb, reach, inloop)) {
+    uint32_t want = 0, nh = hb;
+    if (vectorize_one(f, hb, reach, inloop, &want)) {
       done[hb] = 1;
       changed = true;
       ir_order(f);
+      oi = 0;
+    } else if (want && unroll_by(f, hb, want, &nh)) {
+      /* Unrolled to a whole number of vectors, the loop goes on; whatever
+         happens to it next, it is not taken again. */
+      done[hb] = 1;
+      changed = true;
+      if (f->ninsts > rcap) { rcap = f->ninsts; reach = xrealloc(reach, rcap); }
+      if (f->nblocks > lcap) { lcap = f->nblocks; inloop = xrealloc(inloop, lcap); }
+      uint32_t w2 = 0;
+      if (vectorize_one(f, nh, reach, inloop, &w2)) ir_order(f);
       oi = 0;
     }
   }
@@ -15675,8 +15825,13 @@ static bool unr_in_cycle(IrFunc *f, const uint32_t *cyc, uint32_t ncyc, Ref r) {
    so uses inside the defining loop itself stay untouched.  One walk at pass
    end applies the lot -- doing it per fired loop would rescan the function
    once per loop. */
+/* want, if not 0, is the factor the vectoriser asks for (see
+   v_unroll_for): that one only, and in the guarded form a step that is not
+   a power of two too.  *newh, if asked for, is the loop that holds the
+   copies: hb itself, or the guarded form's new one. */
 static bool unroll_one(IrFunc *f, uint32_t hb, Ref *fixmap, uint32_t *cycleid,
-                       uint32_t loopord, uint32_t ninsts0) {
+                       uint32_t loopord, uint32_t ninsts0, uint32_t want,
+                       uint32_t *newh) {
 #define UREJ(w, ctr) do { g_stats.ctr++; if (g_unr.dbg) \
     fprintf(stderr, "unroll %s b%u reject: %s\n", \
             f->m->funcs[f->func_index].sym, hb, w); return false; } while (0)
@@ -15868,8 +16023,10 @@ static bool unroll_one(IrFunc *f, uint32_t hb, Ref *fixmap, uint32_t *cycleid,
   uint32_t uk = 0;
   bool guarded = false;
   if (cst && unr_trip_count(rel, top, down, cbits, K, c_init, c_bound, &trip))
-    for (uint32_t k = g_unr.k; k >= 2; k--)
+    for (uint32_t k = want ? want : g_unr.k; k >= 2; k--) {
       if (trip >= k && trip % k == 0) { uk = k; break; }
+      if (want) break;
+    }
   if (big && !(uk && trip == uk)) UREJ("body too large", unr_rej_body);
   if (!uk) {
     /* Guarded form: version the loop behind a runtime trip count (the
@@ -15882,13 +16039,14 @@ static bool unroll_one(IrFunc *f, uint32_t hb, Ref *fixmap, uint32_t *cycleid,
        the re-entered original re-tests before every remainder iteration. */
     guarded = true;
     if (g_unr.noguard) return false;
-    if (K & (K - 1)) UREJ("dynamic step is not a power of two", unr_rej_trip);
+    if ((K & (K - 1)) && !want) UREJ("dynamic step is not a power of two", unr_rej_trip);
     if (K >= (1ull << (cbits - 2))) UREJ("dynamic step too large", unr_rej_trip);
     if (bound != REF_NONE && unr_in_cycle(f, cyc, ncyc, bound) &&
         f->insts[bound].op != I_CONST)
       UREJ("bound is not loop-invariant", unr_rej_trip);
     uk = 2;
     while (uk * 2 <= g_unr.k) uk *= 2;   /* the guard divides by shifting */
+    if (want) uk = want;
     if (cst && trip && trip <= uk)
       UREJ("trip too short for the guard", unr_rej_trip);
   }
@@ -15987,6 +16145,7 @@ static bool unroll_one(IrFunc *f, uint32_t hb, Ref *fixmap, uint32_t *cycleid,
       fprintf(stderr, "unroll %s b%u: guarded %s K=%u body=%u\n",
               f->m->funcs[f->func_index].sym, hb, shape, uk, nbody);
     g_stats.unr_guarded++;
+    if (newh) *newh = ubody;
     return true;
   }
 
@@ -16091,6 +16250,7 @@ static bool unroll_one(IrFunc *f, uint32_t hb, Ref *fixmap, uint32_t *cycleid,
             f->m->funcs[f->func_index].sym, hb, shape,
             (unsigned long long)trip, uk, nbody);
   g_stats.unrolled++;
+  if (newh) *newh = hb;
   return true;
 #undef UREJ
 }
@@ -16594,6 +16754,32 @@ static bool pass_once_loops(IrFunc *f) {
   return changed;
 }
 
+/* Code after an unrolled loop reads what the last copy made (fixmap, by
+   the loop's cycleid).  All reachable blocks, not f->order: guarded fires
+   add blocks whose clones may read values an earlier in-place fire
+   repaired. */
+static void unroll_fix(IrFunc *f, const Ref *fixmap, const uint32_t *cycleid,
+                       uint32_t nblocks0, uint32_t ninsts0) {
+  for (uint32_t bi = 0; bi < f->nblocks; bi++) {
+    Block *b = &f->blocks[bi];
+    if (!b->reachable) continue;
+    uint32_t cid = bi < nblocks0 ? cycleid[bi] : 0xffffffffu;
+#define UFIX(r) do { if ((r) < ninsts0 && fixmap[r] != REF_NONE && \
+      cycleid[f->insts[r].block] != cid) (r) = fixmap[r]; } while (0)
+    for (uint32_t j = 0; j < b->ninsts; j++) {
+      Ref *a = ir_args(f, b->insts[j]);
+      for (uint32_t x = 0; x < f->insts[b->insts[j]].nargs; x++) UFIX(a[x]);
+    }
+    if (b->term == T_BRIF || b->term == T_BRTABLE) UFIX(b->term_arg);
+    for (uint32_t x = 0; x < b->nret; x++) UFIX(b->ret_args[x]);
+    for (uint32_t s = 0; s < b->nsuccs; s++) {
+      Edge *e = &b->succs[s];
+      for (uint32_t x = 0; x < e->nargs; x++) UFIX(e->args[x]);
+    }
+#undef UFIX
+  }
+}
+
 static bool pass_unroll(IrFunc *f) {
   pthread_once(&g_unr_once, unr_init);
   if (g_unr.off) return false;
@@ -16610,34 +16796,78 @@ static bool pass_unroll(IrFunc *f) {
       fixmap = xmalloc((size_t)ninsts0 * sizeof *fixmap);
       memset(fixmap, 0xff, (size_t)ninsts0 * sizeof *fixmap);
     }
-    if (unroll_one(f, f->order[oi], fixmap, cycleid, oi, ninsts0))
+    if (unroll_one(f, f->order[oi], fixmap, cycleid, oi, ninsts0, 0, NULL))
       changed = true;
   }
-  if (changed) {
-    /* All reachable blocks, not f->order: guarded fires add blocks whose
-       clones may read values an earlier in-place fire repaired. */
-    for (uint32_t bi = 0; bi < f->nblocks; bi++) {
-      Block *b = &f->blocks[bi];
-      if (!b->reachable) continue;
-      uint32_t cid = bi < nblocks0 ? cycleid[bi] : 0xffffffffu;
-#define UFIX(r) do { if ((r) < ninsts0 && fixmap[r] != REF_NONE && \
-        cycleid[f->insts[r].block] != cid) (r) = fixmap[r]; } while (0)
-      for (uint32_t j = 0; j < b->ninsts; j++) {
-        Ref *a = ir_args(f, b->insts[j]);
-        for (uint32_t x = 0; x < f->insts[b->insts[j]].nargs; x++) UFIX(a[x]);
-      }
-      if (b->term == T_BRIF || b->term == T_BRTABLE) UFIX(b->term_arg);
-      for (uint32_t x = 0; x < b->nret; x++) UFIX(b->ret_args[x]);
-      for (uint32_t s = 0; s < b->nsuccs; s++) {
-        Edge *e = &b->succs[s];
-        for (uint32_t x = 0; x < e->nargs; x++) UFIX(e->args[x]);
-      }
-#undef UFIX
-    }
-  }
+  if (changed) unroll_fix(f, fixmap, cycleid, nblocks0, ninsts0);
   xfree(fixmap);
   xfree(cycleid);
   return changed;
+}
+
+/* The copies step each counter one copy at a time, ((i + c) + c) + c, and
+   a counter is what the vectoriser takes only as one add of a constant to
+   its parameter: the last link, which the loop carries round and its exit
+   tests, becomes i + 3c, the copies' own values left as they are. */
+static void unroll_iv_sum(IrFunc *f, uint32_t hb) {
+  Block *h = &f->blocks[hb];
+  uint32_t latch = REF_NONE;
+  for (uint32_t p = 0; p < h->npreds; p++)
+    if (f->blocks[h->preds[p]].rpo >= h->rpo) latch = h->preds[p];
+  if (latch == REF_NONE) return;
+  Edge *back = iv_edge(f, latch, hb);
+  if (!back || back->nargs != h->nparams) return;
+  for (uint32_t p = 0; p < h->nparams; p++) {
+    Ref par = h->params[p], cur = back->args[p];
+    ValType t = (ValType)f->insts[par].type;
+    if (t != VT_I32 && t != VT_I64) continue;
+    uint64_t sum = 0, c;
+    uint32_t links = 0;
+    while (cur != par && links < 64) {
+      const Inst *in = &f->insts[cur];
+      if ((in->op != I_ADD && in->op != I_SUB) || in->nargs != 2 ||
+          !is_const(f, ir_args(f, cur)[1], &c))
+        break;
+      sum += in->op == I_ADD ? c : (uint64_t)0 - c;
+      cur = ir_args(f, cur)[0];
+      links++;
+    }
+    if (cur != par || links < 2) continue;
+    if (t == VT_I32) sum &= 0xffffffffu;
+    Ref last = back->args[p];
+    uint32_t lb = f->insts[last].block, at = UINT32_MAX;
+    for (uint32_t j = 0; j < f->blocks[lb].ninsts; j++)
+      if (f->blocks[lb].insts[j] == last) { at = j; break; }
+    if (at == UINT32_MAX) continue;
+    Ref k = emit_before(f, lb, &at, I_CONST, t, NULL, 0, sum);
+    Ref *la = ir_args(f, last);
+    f->insts[last].op = I_ADD;
+    la[0] = par;
+    la[1] = k;
+    back = iv_edge(f, latch, hb);
+  }
+}
+
+/* One loop unrolled by the factor the vectoriser asks for, as pass_unroll
+   would with that factor, and the function's order redone; *newh is the
+   loop that holds the copies. */
+static bool unroll_by(IrFunc *f, uint32_t hb, uint32_t want, uint32_t *newh) {
+  pthread_once(&g_unr_once, unr_init);
+  if (g_unr.off) return false;
+  uint32_t ninsts0 = f->ninsts, nblocks0 = f->nblocks;
+  Ref *fixmap = xmalloc((size_t)ninsts0 * sizeof *fixmap);
+  memset(fixmap, 0xff, (size_t)ninsts0 * sizeof *fixmap);
+  uint32_t *cycleid = xmalloc((size_t)nblocks0 * sizeof *cycleid);
+  memset(cycleid, 0xff, (size_t)nblocks0 * sizeof *cycleid);
+  bool ok = unroll_one(f, hb, fixmap, cycleid, 0, ninsts0, want, newh);
+  if (ok) {
+    unroll_fix(f, fixmap, cycleid, nblocks0, ninsts0);
+    ir_order(f);
+    unroll_iv_sum(f, *newh);
+  }
+  xfree(fixmap);
+  xfree(cycleid);
+  return ok;
 }
 
 #define LDC_LANES 8

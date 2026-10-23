@@ -3802,6 +3802,196 @@ def gen_downloop():
 '    (local.get $s))\n' % (tag, n, n - 1, floor, AL, rel, floor))
     return "".join(out)
 
+
+# ---- loop shapes for the vectoriser and the unroller -------------------------
+#
+# Loops the way producers leave them, P copies of the body to an iteration
+# addressed by memarg offsets off one byte counter (LLVM's unrolling), in
+# every element type, over trip counts that fall on and between vector
+# boundaries, constant and read from a data segment the compiler cannot see
+# through, with != and < exits and a counter running down; an output that
+# overlaps the input it reads at small distances, the bases both constant
+# and loaded; and the constant a loop uses read again after it.  Every
+# export hashes what its loop wrote, a few elements past the end included,
+# so a vector loop that runs over, under, or out of order shows.
+
+VL_TYPES = {
+    #       value  load            store          size  integer
+    "i8":  ("i32", "i32.load8_u",  "i32.store8",  1, True),
+    "i16": ("i32", "i32.load16_u", "i32.store16", 2, True),
+    "i32": ("i32", "i32.load",     "i32.store",   4, True),
+    "i64": ("i64", "i64.load",     "i64.store",   8, True),
+    "f32": ("f32", "f32.load",     "f32.store",   4, False),
+    "f64": ("f64", "f64.load",     "f64.store",   8, False),
+}
+VL_N = 400                       # elements each array is filled with
+VL_A, VL_B, VL_C = 4096, 8192, 12288
+VL_TAB = 64                      # i32 table in a data segment: ends, bases
+
+def gen_vecloops(tn):
+    vt, ld, st, S, isint = VL_TYPES[tn]
+    A, B, C = VL_A, VL_B, VL_C
+    tab = []                      # the data segment's values, i32 each
+
+    def dyn(v):
+        tab.append(v)
+        return "(i32.load (i32.const %d))" % (VL_TAB + 4 * (len(tab) - 1))
+
+    def k_int(c):
+        return "(%s.const %d)" % (vt, c)
+    def binop(op, x, y):
+        return "(%s.%s %s %s)" % (vt, op, x, y)
+    ops = ["add", "sub", "mul", "xor"] if isint else ["add", "mul", "sub"]
+    K = k_int(37) if isint else "(%s.const 1.5)" % vt
+    K2 = k_int(12345) if isint else "(%s.const -0.75)" % vt
+
+    def bits(addr):
+        if tn == "f32":
+            return "(i64.extend_i32_u (i32.reinterpret_f32 (f32.load %s)))" % addr
+        if tn == "f64":
+            return "(i64.reinterpret_f64 (f64.load %s))" % addr
+        if vt == "i64":
+            return "(%s %s)" % (ld, addr)
+        return "(i64.extend_i32_u (%s %s))" % (ld, addr)
+
+    def hash_region(base, n, plus=None):
+        el = "(i32.add %s (i32.mul (local.get $k) (i32.const %d)))" % (base, S)
+        val = bits(el)
+        if plus is not None:
+            # the element plus the loop's own constant, read again after it
+            v = "(%s %s)" % (ld, el)
+            val = bits_of_value(binop("add", v, plus))
+        return ("    (local.set $k (i32.const 0))\n"
+                "    (block $hd (loop $hl\n"
+                "      (br_if $hd (i32.ge_u (local.get $k) (i32.const %d)))\n"
+                "      (local.set $h (i64.add (i64.mul (local.get $h) (i64.const 0x100000001b3)) %s))\n"
+                "      (local.set $k (i32.add (local.get $k) (i32.const 1)))\n"
+                "      (br $hl)))\n" % (n, val))
+
+    def bits_of_value(v):
+        if tn == "f32":
+            return "(i64.extend_i32_u (i32.reinterpret_f32 %s))" % v
+        if tn == "f64":
+            return "(i64.reinterpret_f64 %s)" % v
+        if vt == "i64":
+            return v
+        return "(i64.extend_i32_u %s)" % v
+
+    out = []
+    # the fill: a and b pseudo-random, c a pattern of its own
+    def fill(addr_k, which):
+        kk = "(local.get $k)"
+        if isint:
+            if vt == "i64":
+                v = "(i64.add (i64.mul (i64.extend_i32_u %s) (i64.const 0x9E3779B97F4A7C15)) (i64.const %d))" % (kk, which * 977)
+            else:
+                v = "(i32.add (i32.mul %s (i32.const %d)) (i32.const %d))" % (kk, (2654435761, 40503, 2246822519)[which], which * 977 + 5)
+        else:
+            v = "(%s.mul (%s.convert_i32_s (i32.sub (i32.rem_u (i32.mul %s (i32.const %d)) (i32.const 1001)) (i32.const 500))) (%s.const 0.25))" % (
+                vt, vt, kk, (37, 53, 71)[which], vt)
+        return "      (%s %s %s)\n" % (st, addr_k, v)
+    init = ["  (func $init (local $k i32)\n    (loop $l\n"]
+    for base, w in ((A, 0), (B, 1), (C, 2)):
+        init.append(fill("(i32.add (i32.const %d) (i32.mul (local.get $k) (i32.const %d)))" % (base, S), w))
+    init.append("      (br_if $l (i32.lt_u (local.tee $k (i32.add (local.get $k) (i32.const 1))) (i32.const %d)))))\n" % VL_N)
+
+    exports = []
+    def export(name, body, locals_="(local $i i32) (local $e i32) (local $pa i32) (local $pb i32) (local $pc i32) (local $k i32) (local $h i64) (local $acc %s)" % vt):
+        exports.append('  (func (export "%s") (result i64)\n    %s\n    (call $init)\n%s    (local.get $h))\n' % (name, locals_, body))
+
+    def loop(P, shape, rel, T, dynend, base_mode, outb=C, op="add"):
+        """One loop of P copies; returns its body text and the region it wrote."""
+        step = P * S
+        end_bytes = T * S
+        endv = dyn(end_bytes) if dynend else "(i32.const %d)" % end_bytes
+        b = []
+        if base_mode == "dyn":
+            b.append("    (local.set $pa %s)\n    (local.set $pb %s)\n    (local.set $pc %s)\n" % (
+                dyn(A), dyn(B), dyn(outb)))
+        else:
+            b.append("    (local.set $pa (i32.const %d))\n    (local.set $pb (i32.const %d))\n    (local.set $pc (i32.const %d))\n" % (A, B, outb))
+        b.append("    (local.set $e %s)\n" % endv)
+        if rel == "down":
+            b.append("    (local.set $i (local.get $e))\n")
+        else:
+            b.append("    (local.set $i (i32.const 0))\n")
+        if shape == "red":
+            b.append("    (local.set $acc %s)\n" % ("(%s.const 1)" % vt))
+        b.append("    (loop $l\n")
+        if rel == "down":
+            b.append("      (local.set $i (i32.sub (local.get $i) (i32.const %d)))\n" % step)
+        pa = "(i32.add (local.get $pa) (local.get $i))"
+        pb = "(i32.add (local.get $pb) (local.get $i))"
+        pc = "(i32.add (local.get $pc) (local.get $i))"
+        for c in range(P):
+            la = "(%s offset=%d %s)" % (ld, c * S, pa)
+            la1 = "(%s offset=%d %s)" % (ld, (c + 1) * S, pa)
+            lb = "(%s offset=%d %s)" % (ld, c * S, pb)
+            if shape == "elem":
+                b.append("      (%s offset=%d %s %s)\n" % (st, c * S, pc, binop(op, la, lb)))
+            elif shape == "neigh":
+                b.append("      (%s offset=%d %s %s)\n" % (st, c * S, pc, binop(op, la, la1)))
+            elif shape == "scale":
+                b.append("      (%s offset=%d %s %s)\n" % (st, c * S, pc, binop("add", binop("mul", la, K), K2)))
+            elif shape == "inplace":
+                b.append("      (%s offset=%d %s %s)\n" % (st, c * S, pa, binop("add", la, K2)))
+            elif shape == "red":
+                rop = "xor" if (isint and op == "xor") else "add"
+                b.append("      (local.set $acc %s)\n" % binop(rop, "(local.get $acc)", la))
+        if rel == "down":
+            b.append("      (br_if $l (i32.ne (local.get $i) (i32.const 0))))\n")
+        else:
+            cmpop = "i32.ne" if rel == "ne" else "i32.lt_u"
+            b.append("      (br_if $l (%s (local.tee $i (i32.add (local.get $i) (i32.const %d))) (local.get $e))))\n" % (cmpop, step))
+        ran = -(-T // P) * P if rel == "lt" else T
+        return "".join(b), ran
+
+    VARIANTS = [("ne", 16, False), ("ne", 17, False), ("lt", None, False), ("ne", 31, True),
+                ("down", 9, False), ("lt", None, True), ("ne", 1, False), ("ne", 64, False),
+                ("down", 33, True), ("lt", None, False)]
+    LT_T = [61, 5, 129, 2, 100, 7]
+    vi = 0
+    for P in (1, 2, 3, 4, 5):
+        for si, shape in enumerate(("elem", "neigh", "scale", "inplace", "red")):
+            for j in range(3):
+                rel, mult, dynend = VARIANTS[vi % len(VARIANTS)]
+                T = LT_T[vi % len(LT_T)] if rel == "lt" else mult * P
+                op = ops[vi % len(ops)]
+                base_mode = "dyn" if vi % 4 == 3 else "const"
+                vi += 1
+                body, ran = loop(P, shape, rel, T, dynend, base_mode, op=op)
+                if shape == "red":
+                    body += "    (local.set $h %s)\n" % bits_of_value("(local.get $acc)")
+                elif shape == "inplace":
+                    body += hash_region("(i32.const %d)" % A, ran + 4)
+                elif shape == "scale":
+                    body += hash_region("(i32.const %d)" % C, ran + 4, plus=K2)
+                else:
+                    body += hash_region("(i32.const %d)" % C, ran + 4)
+                export("%s_p%d_%s_%s%d%s%s" % (tn, P, shape, rel, T, "_dyn" if dynend else "",
+                                               "_dynbase" if base_mode == "dyn" else ""), body)
+    # an output that overlaps the input it reads: c[e] = a[e] + 1 with c at a + d
+    for P in (1, 3, 4):
+        for d in (-4, -1, 1, 2, 3, 4, 16):
+            for base_mode in ("const", "dyn"):
+                outb = A + d * S
+                T = 12 * P
+                body, ran = loop(P, "elem", "ne", T, False, base_mode, outb=outb, op="add")
+                # elem reads b too; make it a read of a alone
+                body = body.replace("(local.get $pb)", "(local.get $pa)")
+                body += hash_region("(i32.const %d)" % min(A, outb), ran + abs(d) + 4)
+                export("%s_overlap_p%d_d%s%d_%s" % (tn, P, "m" if d < 0 else "", abs(d), base_mode), body)
+
+    seg = "".join("\\%02x" % ((v >> (8 * i)) & 0xff) for v in tab for i in range(4))
+    return ("  (memory 1)\n  (data (i32.const %d) \"%s\")\n" % (VL_TAB, seg) +
+            "".join(init) + "".join(exports))
+
+write("vecloops_i8", gen_vecloops("i8"))
+write("vecloops_i16", gen_vecloops("i16"))
+write("vecloops_i32", gen_vecloops("i32"))
+write("vecloops_i64", gen_vecloops("i64"))
+write("vecloops_f32", gen_vecloops("f32"))
+write("vecloops_f64", gen_vecloops("f64"))
 write("downloop", gen_downloop())
 write("bulkcopy", gen_bulkcopy())
 write("magicdiv", gen_magicdiv())
