@@ -66,6 +66,7 @@ to the decision it justified, which is good for explaining a choice and no use a
 all for noticing that something drifted.
 """
 
+import atexit
 import json
 import os
 import shutil
@@ -297,6 +298,18 @@ def host_flags():
                        executable="/bin/bash")
     return r.stdout.strip().split()
 
+def staging():
+    """This process's directory to build in before moving a module into place:
+    one of its own, because two rows may build one corpus at once (gobench and
+    gobench-gssa do), and with a shared one the first to finish moved the other's
+    module away from under it -- `make check` in a fresh tree failed with "No
+    such file or directory: .../.part/mandel.wasm"."""
+    d = os.path.join(WORK, ".part", str(os.getpid()))
+    if not os.path.isdir(d):
+        os.makedirs(d)
+        atexit.register(shutil.rmtree, d, True)
+    return d
+
 def build_wasm(name, lang):
     """Compile one kernel to wasm.  `empty` is synthesised rather than kept as
     a directory: it exists only to be the floor that is subtracted."""
@@ -359,8 +372,7 @@ def build_wasm(name, lang):
     # hidden ones.  It would not have failed on a partial module -- an oracle
     # cannot disassemble one either, so it counts as a module with no oracle --
     # but a file nobody has finished writing is not a corpus member.
-    part = os.path.join(WORK, ".part")
-    os.makedirs(part, exist_ok=True)
+    part = staging()
     out = os.path.join(part, name + ".wasm")
     if lang == "go":
         cmd = ["tinygo", "build", "-o", out] + FLAGS_FOR["go"] + [src]
@@ -382,7 +394,7 @@ def build_wasm(name, lang):
     elif lang == "hs":
         # GHC writes its .hi and .o files beside the source unless told
         # otherwise, and the source directory is the repository's.
-        hwork = os.path.join(WORK, name + ".hsbuild")
+        hwork = os.path.join(part, name + ".hsbuild")
         shutil.rmtree(hwork, ignore_errors=True)
         cmd = [GHC_WASM, src, "-o", out, "-outputdir", hwork] + GHC_FLAGS
     elif lang == "kt":
@@ -415,7 +427,7 @@ def build_kotlin(name, src, wasm, stampf, stamp):
         print("ktbench needs the Kotlin/Wasm standard library matching the "
               "compiler: run `make kotlin-stdlib`", file=sys.stderr)
         return None
-    work = os.path.join(WORK, name + ".ktbuild")
+    work = os.path.join(staging(), name + ".ktbuild")
     shutil.rmtree(work, ignore_errors=True)
     os.makedirs(work, exist_ok=True)
     lib = os.path.join(work, "lib")
