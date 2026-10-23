@@ -747,6 +747,78 @@ static bool pass_reassoc_carried(IrFunc *f) {
   return changed;
 }
 
+/* A br_table with few distinct edges as a tree of compares: the index
+   ranges that share an edge -- consecutive cases with the same target and
+   arguments, and the default past the last case -- searched with unsigned
+   compares.  A jump table makes the indirect branch wait on the index's
+   load, its scaling and the table's own load, so a mispredicted one, which
+   a random selector makes every time, resolves two loads later than a
+   compare tree on the index; Zig's 6-way tagged-union dispatch ran 1.23x
+   native through the table and 1.05x through native's tree, and LLVM
+   builds such switches as trees on AArch64.  Past BRT_TREE_MAX ranges the
+   table's one branch is worth its loads. */
+#define BRT_TREE_MAX 8
+typedef struct { uint64_t lo; uint32_t edge; } BrtSeg;
+
+static bool brt_edge_eq(const Edge *a, const Edge *b) {
+  if (a->target != b->target || a->nargs != b->nargs || a->eh || b->eh) return false;
+  for (uint32_t i = 0; i < a->nargs; i++)
+    if (a->args[i] != b->args[i]) return false;
+  return true;
+}
+
+static void brt_node(IrFunc *f, uint32_t nb, Ref idx, const BrtSeg *seg,
+                     uint32_t nseg, const Edge *edges) {
+  uint32_t mid = nseg / 2;
+  Ref k = ir_emit(f, nb, I_CONST, VT_I32, NULL, 0, seg[mid].lo, 0);
+  Ref a[2] = { idx, k };
+  Ref c = ir_emit(f, nb, I_LTU, VT_I32, a, 2, 0, 0);
+  f->blocks[nb].term = T_BRIF;
+  f->blocks[nb].term_arg = c;
+  for (int side = 0; side < 2; side++) {
+    const BrtSeg *s = side ? seg + mid : seg;
+    uint32_t n = side ? nseg - mid : mid;
+    if (n == 1) {
+      const Edge *e = &edges[s[0].edge];
+      ir_add_edge(f, nb, e->target, e->args, e->nargs);
+      continue;
+    }
+    uint32_t child = ir_new_block(f);
+    ir_add_edge(f, nb, child, NULL, 0);
+    brt_node(f, child, idx, s, n, edges);
+  }
+}
+
+static bool pass_brtable_tree(IrFunc *f) {
+  bool changed = false;
+  uint32_t nb = f->nblocks;
+  for (uint32_t bi = 0; bi < nb; bi++) {
+    Block *b = &f->blocks[bi];
+    if (!b->reachable || b->term != T_BRTABLE || b->nsuccs < 2) continue;
+    uint32_t n = b->nsuccs - 1;
+    BrtSeg seg[BRT_TREE_MAX + 1];
+    uint32_t nseg = 0;
+    bool ok = true;
+    for (uint32_t i = 0; i <= n && ok; i++) {
+      if (b->succs[i].eh) ok = false;
+      else if (nseg && brt_edge_eq(&b->succs[seg[nseg - 1].edge], &b->succs[i])) continue;
+      else if (nseg == BRT_TREE_MAX) ok = false;
+      else seg[nseg++] = (BrtSeg){ i, i };
+    }
+    if (!ok || nseg < 2) continue;
+    /* the edges are copied out: the block's own list is rebuilt */
+    Edge *edges = xmalloc((n + 1) * sizeof(Edge));
+    memcpy(edges, b->succs, (n + 1) * sizeof(Edge));
+    Ref idx = b->term_arg;
+    b->nsuccs = 0;
+    brt_node(f, bi, idx, seg, nseg, edges);
+    xfree(edges);
+    changed = true;
+  }
+  if (changed) ir_recompute_preds(f);
+  return changed;
+}
+
 static Magic magic_u32(uint32_t d) {
   Magic mg = { 0, 0, 0 };
   uint32_t nc, delta, q1, r1, q2, r2;
@@ -15031,6 +15103,8 @@ void ir_optimize(IrFunc *f, const OptOpts *o) {
   if (reassoced && o->dce) pass_dce(f);
 
   if (o->barelide) TP("bar_elide", pass_bar_elide(f));
+  if (!warmc_getenv("WARMC_NO_BRT_TREE") && TP("brtable_tree", pass_brtable_tree(f)))
+    ir_order(f);
   if (o->print_ir) ir_print(f, "optimised");
   ir_verify(f, "post-opt");
 }
