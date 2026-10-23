@@ -23,7 +23,10 @@
 ;;     shift of bytes, which stay shifts;
 ;;   * red32: a sum, a xor, an or and an and in one loop (four reductions,
 ;;     each its own accumulator per copy); smin/umax: min and max by select;
-;;   * fmin32/fmax64: float min and max over values with NaNs, -0 and +0;
+;;   * fmin32/fmax64: float min and max over values with NaNs, -0 and +0
+;;     (a NaN result is hashed as the canonical NaN: its sign is the
+;;     implementation's, and x64's vector min sets it where the scalar loop
+;;     passes the input's through);
 ;;   * wsum8u/wsum8s/wsum16u/wsum32u/wsum32s: widening sums, one and two
 ;;     steps wide (the second fused into uadalp), signed and unsigned;
 ;;   * count: a sum of compare results (the counted-mask form);
@@ -800,24 +803,28 @@
       (br $each)))
     (local.get $h))
   (func (export "fmin32") (result i32)
-    (local $m i32) (local $n i32) (local $h i32) (local $a i32) (local $t i64)
+    (local $m i32) (local $n i32) (local $h i32) (local $a i32) (local $t i64) (local $r f32)
     (local.set $a (global.get $base))
     (block $out (loop $each
       (br_if $out (i32.ge_u (local.get $m) (i32.const 79)))
       (local.set $n (call $len (local.get $m)))
       (call $fillf32 (local.get $a) (i32.add (i32.mul (local.get $n) (i32.const 1)) (i32.const 32)) (i32.add (local.get $m) (i32.const 3)))
-      (local.set $h (i32.add (i32.mul (local.get $h) (i32.const 17)) (i32.reinterpret_f32 (call $fmin32 (local.get $a) (local.get $n)))))
+      (local.set $r (call $fmin32 (local.get $a) (local.get $n)))
+      (local.set $h (i32.add (i32.mul (local.get $h) (i32.const 17))
+        (select (i32.const 0x7fc00000) (i32.reinterpret_f32 (local.get $r)) (f32.ne (local.get $r) (local.get $r)))))
       (local.set $m (i32.add (local.get $m) (i32.const 1)))
       (br $each)))
     (local.get $h))
   (func (export "fmax64") (result i32)
-    (local $m i32) (local $n i32) (local $h i32) (local $a i32) (local $t i64)
+    (local $m i32) (local $n i32) (local $h i32) (local $a i32) (local $t i64) (local $d f64)
     (local.set $a (global.get $base))
     (block $out (loop $each
       (br_if $out (i32.ge_u (local.get $m) (i32.const 79)))
       (local.set $n (call $len (local.get $m)))
       (call $fillf64 (local.get $a) (i32.add (i32.mul (local.get $n) (i32.const 1)) (i32.const 32)) (i32.add (local.get $m) (i32.const 3)))
-      (local.set $h (i32.add (i32.mul (local.get $h) (i32.const 17)) (i32.wrap_i64 (i64.xor (local.tee $t (i64.reinterpret_f64 (call $fmax64 (local.get $a) (local.get $n)))) (i64.shr_u (local.get $t) (i64.const 32))))))
+      (local.set $d (call $fmax64 (local.get $a) (local.get $n)))
+      (local.set $t (select (i64.const 0x7ff8000000000000) (i64.reinterpret_f64 (local.get $d)) (f64.ne (local.get $d) (local.get $d))))
+      (local.set $h (i32.add (i32.mul (local.get $h) (i32.const 17)) (i32.wrap_i64 (i64.xor (local.get $t) (i64.shr_u (local.get $t) (i64.const 32))))))
       (local.set $m (i32.add (local.get $m) (i32.const 1)))
       (br $each)))
     (local.get $h))
