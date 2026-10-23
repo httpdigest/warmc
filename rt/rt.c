@@ -172,6 +172,62 @@ static usz slen(const char *s) { const char *p = s; while (*p) p++; return (usz)
 static void puts_(const char *s) { out(s, slen(s)); }
 static void eputs(const char *s) { sys_write(2, s, slen(s)); }
 
+/* ---- memory committed where it is first touched ----
+
+   The collector reserves its heap and side tables at full size, some 2 GB
+   for the default heap, and touches a fraction of them.  Windows charges
+   whatever is committed against the system's commit limit at once, and so
+   does Linux for writable private memory, though only under strict
+   overcommit (vm.overcommit_memory=2) does that limit refuse anything: a
+   few collecting programs at a time exhausted it, as they did a CI
+   runner's Windows ("cannot reserve the managed heap").  A lazy mapping is
+   reserved inaccessible, which neither charges, and the fault handler
+   makes a chunk of it read-write where it is first touched.  macOS keeps
+   no commit charge, so there it is an ordinary mapping. */
+#if defined(WARMC_DARWIN)
+static void *sys_mmap_lazy(usz len) {
+  return sys_mmap(0, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS);
+}
+#else
+#define LAZY_MAX   8
+#define LAZY_CHUNK (1ull << 20)
+static struct { u8 *base; usz len; } lazy_maps[LAZY_MAX];
+static u32 nlazy;
+static void install_fault_handler(void);
+
+static void *sys_mmap_lazy(usz len) {
+  if (nlazy == LAZY_MAX)
+    return sys_mmap(0, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS);
+  u8 *p = (u8 *)sys_mmap(0, len, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS);
+  if (!p) return 0;
+  install_fault_handler();
+  lazy_maps[nlazy].base = p;
+  lazy_maps[nlazy].len = len;
+  __atomic_store_n(&nlazy, nlazy + 1, __ATOMIC_RELEASE);
+  return p;
+}
+
+/* From the fault handler: 1 when addr lies in a lazy mapping, which now
+   has memory under it.  Out of commit, the program stops, as one the
+   kernel refused a page would. */
+static int lazy_commit(u8 *addr) {
+  u32 n = __atomic_load_n(&nlazy, __ATOMIC_ACQUIRE);
+  for (u32 i = 0; i < n; i++) {
+    u8 *b = lazy_maps[i].base;
+    usz len = lazy_maps[i].len;
+    if (addr < b || addr >= b + len) continue;
+    usz off = (usz)(addr - b) & ~(usz)(LAZY_CHUNK - 1);
+    usz bytes = len - off < LAZY_CHUNK ? len - off : LAZY_CHUNK;
+    if (sys_mprotect(b + off, bytes, PROT_READ | PROT_WRITE) != 0) {
+      eputs("warmc-rt: out of memory: the system will commit no more\n");
+      sys_exit(1);
+    }
+    return 1;
+  }
+  return 0;
+}
+#endif
+
 static void put_u64(u64 v) {
   char buf[24];
   int i = 24;
@@ -1164,6 +1220,9 @@ static void chain_fault(int sig, void *info, void *uc) {
 static void fault_handler(int sig, void *info, void *uc) {
   u8 *addr = info ? *(u8 **)((u8 *)info + SI_ADDR_OFF) : 0;
 
+#if !defined(WARMC_DARWIN)
+  if (lazy_commit(addr)) return;
+#endif
   if (gcth_on_collector()) {
     eputs("warmc-rt: fault on the collector's thread\n");
     sys_exit(139);
@@ -1869,9 +1928,7 @@ static void gc_init(void) {
      separate scalars and lays them out as it likes -- padding and line gone. */
   __asm__ volatile("" : : "r"(&gc_mut), "r"(&gc_mqp), "r"(&gc_col) : "memory");
 
-  gc_base = (u8 *)sys_mmap(0, (usz)(gc_heap_bytes + GC_GRAN),
-                           PROT_READ | PROT_WRITE,
-                           MAP_PRIVATE | MAP_ANONYMOUS);
+  gc_base = (u8 *)sys_mmap_lazy((usz)(gc_heap_bytes + GC_GRAN));
   if (!gc_base || gc_base == (u8 *)-1) die("cannot reserve the managed heap");
 
   gc_base += (u64)(-(long)(u64)gc_base) & (GC_GRAN - 1);
@@ -1890,18 +1947,13 @@ static void gc_init(void) {
                                 PROT_READ | PROT_WRITE,
                                 MAP_PRIVATE | MAP_ANONYMOUS);
 
-  gc_markbits = (u64 *)sys_mmap(0, (usz)(gc_heap_bytes / GC_UNIT / 8),
-                                PROT_READ | PROT_WRITE,
-                                MAP_PRIVATE | MAP_ANONYMOUS);
+  gc_markbits = (u64 *)sys_mmap_lazy((usz)(gc_heap_bytes / GC_UNIT / 8));
 
+  /* Each as large as the heap's units, 512 MB a piece by default, and
+     touched only as far as a cycle's grey objects reach. */
   gc_capgrey = gc_heap_bytes / GC_UNIT;
-  gc_grey = (u8 **)sys_mmap(0, (usz)(gc_capgrey * sizeof(u8 *)),
-                            PROT_READ | PROT_WRITE,
-                            MAP_PRIVATE | MAP_ANONYMOUS);
-
-  gc_mq = (u8 **)sys_mmap(0, (usz)(gc_capgrey * sizeof(u8 *)),
-                          PROT_READ | PROT_WRITE,
-                          MAP_PRIVATE | MAP_ANONYMOUS);
+  gc_grey = (u8 **)sys_mmap_lazy((usz)(gc_capgrey * sizeof(u8 *)));
+  gc_mq = (u8 **)sys_mmap_lazy((usz)(gc_capgrey * sizeof(u8 *)));
   if (!gc_pages || gc_pages == (GcPage *)-1 || !gc_granfree ||
       gc_granfree == (u64 *)-1 || !gc_markbits || gc_markbits == (u64 *)-1 ||
       !gc_grey || gc_grey == (u8 **)-1 || !gc_page_epoch ||
@@ -1910,9 +1962,8 @@ static void gc_init(void) {
   gc_gran_mark_free(0, gc_ngran, 1);
   gc_check_tbi();
 
-  gc_typetab = (const GcTypeInfo **)sys_mmap(
-      0, (usz)(GC_MAX_TYPES * sizeof(void *)),
-      PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS);
+  gc_typetab = (const GcTypeInfo **)sys_mmap_lazy(
+      (usz)(GC_MAX_TYPES * sizeof(void *)));
   if (!gc_typetab || gc_typetab == (const GcTypeInfo **)-1)
     die("cannot reserve the type table");
 

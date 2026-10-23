@@ -6,7 +6,9 @@
    Memory model: sys_mmap(PROT_NONE) reserves, sys_mprotect(READ|WRITE)
    commits (idempotent on already-committed pages), sys_mprotect(PROT_NONE)
    decommits, sys_munmap releases a whole reservation.  rt.c never unmaps a
-   sub-range, so MEM_RELEASE with size 0 is always correct. */
+   sub-range, so MEM_RELEASE with size 0 is always correct.  rt.c's
+   sys_mmap_lazy reserves, and the fault handler commits where it is first
+   touched. */
 
 /* ---- Win32 declarations ---- */
 
@@ -32,8 +34,10 @@ extern void WakeByAddressSingle(void *addr);
 extern u16 *GetCommandLineW(void);
 extern u16 *GetEnvironmentStringsW(void);
 
-/* defined later in rt.c */
+/* defined later in rt.c, or below */
 static void eputs(const char *s);
+__attribute__((noreturn)) static void sys_exit(int code);
+static int lazy_commit(u8 *addr);
 static int addr_in_a_guard(const u8 *addr);
 static int gcth_on_collector(void);
 
@@ -56,6 +60,7 @@ static void *sys_mmap(void *addr, usz len, int prot, int flags) {
   return VirtualAlloc(addr, len, WIN_MEM_RESERVE | WIN_MEM_COMMIT,
                       WIN_PAGE_READWRITE);
 }
+
 static int sys_mprotect(void *addr, usz len, int prot) {
   if (prot == PROT_NONE)
     return VirtualFree(addr, len, WIN_MEM_DECOMMIT) ? 0 : -1;
@@ -146,6 +151,7 @@ static long warmc_win_veh(void *info) {
   u8 *ctx = ((u8 **)info)[1];
   if (*(u32 *)rec != WIN_EXC_ACCESS_VIOLATION) return 0;
   u8 *addr = (u8 *)*(uptr *)(rec + 0x28);
+  if (lazy_commit(addr)) return -1;
   if (gcth_on_collector()) {
     eputs("warmc-rt: fault on the collector's thread\n");
     sys_exit(139);
@@ -160,6 +166,8 @@ static long warmc_win_veh(void *info) {
 }
 
 static void install_fault_handler(void) {
+  static u32 installed;
+  if (__atomic_exchange_n(&installed, 1, __ATOMIC_ACQ_REL)) return;
   AddVectoredExceptionHandler(1, warmc_win_veh);
 }
 
