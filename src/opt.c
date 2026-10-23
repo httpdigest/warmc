@@ -4873,10 +4873,10 @@ typedef struct {
   bool frozen;
   uint32_t nentries;
   uint32_t init_fi;
-  uint32_t *entry;
+  const uint32_t *entry;   /* the module's Table0Facts own it */
 } FxTable0;
 
-#define FX_TBL_NULL 0xffffffffu
+#define FX_TBL_NULL TABLE0_NULL
 
 static FxTable0 fx_table0;
 
@@ -4946,7 +4946,6 @@ void opt_effects_begin(Module *m, const OptOpts *o) {
   if (fx_direct)
     for (uint32_t i = 0; i < fx_nfuncs; i++) xfree(fx_direct[i].vtst);
   xfree(fx_direct);
-  xfree(fx_table0.entry);
   memset(&fx_table0, 0, sizeof(fx_table0));
   xfree(fx_vt); fx_vt = NULL;
   xfree(fx_vtbase); fx_vtbase = NULL;
@@ -5225,7 +5224,11 @@ static const CallFx *call_effects(Module *m, const OptOpts *o, uint32_t fi,
   return e;
 }
 
-static bool scan_writes_table(const uint8_t *p, const uint8_t *end) {
+/* One walk of a body for table 0's facts: does it write a table (an
+   undecodable body counts as one), and which types do its call_indirects
+   through table 0 name. */
+static bool scan_table_ops(const uint8_t *p, const uint8_t *end,
+                           uint32_t *sites, uint32_t ntypes) {
   Rd r = rd_make(p, end, p);
   while (!rd_eof(&r)) {
     uint32_t op = wasm_read_op(&r);
@@ -5236,6 +5239,11 @@ static bool scan_writes_table(const uint8_t *p, const uint8_t *end) {
       case OP_PREFIXED(0xfc, 15):
       case OP_PREFIXED(0xfc, 17):
         return true;
+      case 0x11: case 0x13: {
+        uint32_t ti = rd_u32(&r), tab = rd_u32(&r);
+        if (tab == 0 && ti < ntypes) sites[ti]++;
+        continue;
+      }
       default: break;
     }
     if (!wasm_skip_imm(&r, op)) return true;
@@ -5248,59 +5256,76 @@ static bool scan_writes_table(const uint8_t *p, const uint8_t *end) {
    filled only by single-instruction ref.func/ref.null elem items.  A table
    init expression is a writer the elem walk never sees — its default value
    reaches every slot no segment covers — so it must be a single ref.null or
-   ref.func too, and the ref.func case is kept for the effect meet. */
-static void fx_table_freeze(Module *m) {
-  if (fx_table0.computed) return;
-  fx_table0.computed = true;
-  fx_table0.init_fi = FX_TBL_NULL;
+   ref.func too, and the ref.func case is kept for the effect meet.  Known
+   once per module, and first asked for by compile_module before any worker
+   runs: the devirtualiser and module_data.c's code tables read the same
+   answer. */
+const Table0Facts *module_table0_facts(Module *m) {
+  if (m->t0) return m->t0;
+  Table0Facts *t0 = xcalloc(1, sizeof *t0);
+  m->t0 = t0;
+  t0->init_fi = TABLE0_NULL;
 
-  if (m->ntables != 1 || m->tables[0].imported) return;
+  if (m->ntables != 1 || m->tables[0].imported) return t0;
   for (uint32_t i = 0; i < m->nexports; i++)
-    if (m->exports[i].kind == EK_TABLE) return;
+    if (m->exports[i].kind == EK_TABLE) return t0;
+  t0->sites = xcalloc(m->ntypes ? m->ntypes : 1, sizeof(uint32_t));
   for (uint32_t i = m->nimported_funcs; i < m->nfuncs; i++)
-    if (m->funcs[i].body && scan_writes_table(m->funcs[i].body, m->funcs[i].body_end))
-      return;
+    if (m->funcs[i].body &&
+        scan_table_ops(m->funcs[i].body, m->funcs[i].body_end, t0->sites, m->ntypes))
+      return t0;
 
   Table *t = &m->tables[0];
   if (t->has_init) {
-    if (t->init.n != 1) return;
+    if (t->init.n != 1) return t0;
     if (t->init.ins[0].op == IOP_REF_FUNC)
-      fx_table0.init_fi = (uint32_t)t->init.ins[0].lo;
+      t0->init_fi = (uint32_t)t->init.ins[0].lo;
     else if (t->init.ins[0].op != IOP_REF_NULL)
-      return;
+      return t0;
   }
   for (uint32_t s = 0; s < m->nelems; s++) {
     ElemSeg *e = &m->elems[s];
     if (e->mode != SEG_ACTIVE) continue;
-    if (e->table_index != 0) return;
+    if (e->table_index != 0) return t0;
     for (uint32_t k = 0; k < e->n; k++) {
       const InitExpr *it = &e->items[k];
-      if (it->n != 1) return;
+      if (it->n != 1) return t0;
       if (it->ins[0].op != IOP_REF_FUNC && it->ins[0].op != IOP_REF_NULL)
-        return;
+        return t0;
     }
   }
-  fx_table0.frozen = true;
+  t0->frozen = true;
 
-  if (t->min > (1u << 20)) return;
+  if (t->min > (1u << 20)) return t0;
   uint32_t n = (uint32_t)t->min;
   uint32_t *entry = xmalloc((n ? n : 1) * sizeof(uint32_t));
-  for (uint32_t i = 0; i < n; i++) entry[i] = fx_table0.init_fi;
+  for (uint32_t i = 0; i < n; i++) entry[i] = t0->init_fi;
   for (uint32_t s = 0; s < m->nelems; s++) {
     ElemSeg *e = &m->elems[s];
     if (e->mode != SEG_ACTIVE) continue;
     if (e->offset.n != 1 || e->offset.ins[0].op != IOP_I32_CONST ||
         e->offset.ins[0].lo + (uint64_t)e->n > n) {
       xfree(entry);
-      return;
+      return t0;
     }
     for (uint32_t k = 0; k < e->n; k++)
       entry[(uint32_t)e->offset.ins[0].lo + k] =
           e->items[k].ins[0].op == IOP_REF_FUNC ? (uint32_t)e->items[k].ins[0].lo
-                                                : FX_TBL_NULL;
+                                                : TABLE0_NULL;
   }
-  fx_table0.nentries = n;
-  fx_table0.entry = entry;
+  t0->n = n;
+  t0->entry = entry;
+  return t0;
+}
+
+static void fx_table_freeze(Module *m) {
+  if (fx_table0.computed) return;
+  fx_table0.computed = true;
+  const Table0Facts *t0 = module_table0_facts(m);
+  fx_table0.frozen = t0->frozen;
+  fx_table0.init_fi = t0->init_fi;
+  fx_table0.nentries = t0->entry ? t0->n : 0;
+  fx_table0.entry = t0->entry;
 }
 
 static void fx_meet(CallFx *meet, const CallFx *c) {

@@ -198,6 +198,208 @@ void codegen_set_symbol_prefix(const char *prefix) {
 
 static const char *module_sym(void) { return g_module_sym; }
 
+/* ---- call_indirect code tables ------------------------------------------
+
+   A call_indirect through a table nothing changes after instantiation
+   (module_table0_facts) can know, for its own type, what the checks of
+   every slot come to, and a code table per call type, in the module's
+   data, writes the answers down: slot k holds the code of table 0's entry
+   lo + k where that entry passes the call's type check, and otherwise a
+   stub trapping with what the check would have said -- an uninitialized
+   element, a type mismatch, or past the table's end where the window is
+   rounded up to a length a compare takes as an immediate.  The call is
+   then a compare of the index against a constant, one load and the
+   branch.  Through the funcref cells it was the table base off the
+   instance, a compare against the length, the cell and its null test, the
+   code, the type id built in a register and compared, and the callee's
+   instance: 16 instructions around each Rust dyn call (rsbench/dyntrait),
+   12 around a TinyGo closure (gobench/methodval), and Go's wasm port makes
+   every call of a closure or method value this way (stdgo/closures).
+
+   The callee's instance is the caller's, because every function the table
+   holds is the module's own: an import's cell carries another instance, so
+   one in the table keeps the cells.  The window is where the passing
+   entries are, so Go's table, whose first 4096 slots are empty, costs the
+   1615 slots after them, not 5711; an index outside it takes the full
+   lookup out of line, which traps as before.  Tables are planned by how
+   many calls name the type, until ICT_BUDGET slots are spent.  The type
+   check is the runtime's: a final type's id against the cell's, or a
+   non-final one's id in the entry's display at its depth (emit_type_check),
+   with the display of a type the module never uses empty, as module data
+   emits it. */
+#define ICT_BUDGET (1u << 16)
+
+/* Whether the call's check passes for a function of type ei. */
+static bool ict_passes(const Module *m, const CompType *w, uint32_t ei) {
+  const CompType *e = &m->types[ei];
+  if (w->final_) return e->id == w->id;
+  if (m->type_live && !m->type_live[ei]) return false;
+  return e->depth >= w->depth && e->display[w->depth] == w->id;
+}
+
+/* A window length a compare takes as an immediate. */
+static uint32_t ict_round(uint32_t n) {
+  return n <= 0xfff ? n : (n + 0xfff) & ~0xfffu;
+}
+
+typedef struct { uint64_t id; uint32_t ti, sites, k; } IctCand;
+
+static int ict_by_id(const void *a, const void *b) {
+  const IctCand *x = a, *y = b;
+  if (x->id != y->id) return x->id < y->id ? -1 : 1;
+  return x->ti < y->ti ? -1 : x->ti > y->ti;
+}
+
+static int ict_by_sites(const void *a, const void *b) {
+  const IctCand *x = a, *y = b;
+  if (x->sites != y->sites) return x->sites > y->sites ? -1 : 1;
+  return x->ti < y->ti ? -1 : x->ti > y->ti;
+}
+
+void codegen_plan_icall_tables(Module *m, ObjBuilder *o, bool on) {
+  if (!on || !g_target->emit_trap_stub) return;
+  const Table0Facts *t0 = module_table0_facts(m);
+  if (!t0->frozen || !t0->entry || !t0->n || m->tables[0].index64) return;
+  uint32_t len = t0->n;
+
+  /* where the functions of each type sit: the first and the last slot */
+  uint32_t nt = m->ntypes ? m->ntypes : 1;
+  uint32_t *elo = xmalloc(nt * sizeof(uint32_t));
+  uint32_t *ehi = xmalloc(nt * sizeof(uint32_t));
+  uint32_t *ety = xmalloc(nt * sizeof(uint32_t));
+  uint32_t ne = 0;
+  for (uint32_t ti = 0; ti < m->ntypes; ti++) elo[ti] = UINT32_MAX;
+  bool imported = false;
+  for (uint32_t i = 0; i < len && !imported; i++) {
+    uint32_t fi = t0->entry[i];
+    if (fi == TABLE0_NULL) continue;
+    if (fi < m->nimported_funcs) imported = true;
+    uint32_t ei = m->funcs[fi].type_index;
+    if (elo[ei] == UINT32_MAX) { elo[ei] = i; ety[ne++] = ei; }
+    ehi[ei] = i;
+  }
+
+  /* one candidate per distinct type, with the calls of every index of it */
+  IctCand *cand = xmalloc(nt * sizeof(IctCand));
+  uint32_t nc = 0;
+  for (uint32_t ti = 0; ti < m->ntypes && !imported; ti++)
+    if (t0->sites[ti] && m->types[ti].kind == CT_FUNC)
+      cand[nc++] = (IctCand){ m->types[ti].id, ti, t0->sites[ti], 0 };
+  if (nc) qsort(cand, nc, sizeof *cand, ict_by_id);
+  uint32_t nd = 0;
+  for (uint32_t c = 0; c < nc; c++) {
+    if (nd && cand[nd - 1].id == cand[c].id) cand[nd - 1].sites += cand[c].sites;
+    else cand[nd++] = cand[c];
+  }
+  if (nd) qsort(cand, nd, sizeof *cand, ict_by_sites);
+
+  uint32_t used = 0;
+  for (uint32_t c = 0; c < nd; c++) {
+    const CompType *w = &m->types[cand[c].ti];
+    uint32_t lo = UINT32_MAX, hi = 0;
+    for (uint32_t j = 0; j < ne; j++) {
+      if (!ict_passes(m, w, ety[j])) continue;
+      if (elo[ety[j]] < lo) lo = elo[ety[j]];
+      if (ehi[ety[j]] > hi) hi = ehi[ety[j]];
+    }
+    cand[c].k = UINT32_MAX;
+    if (lo == UINT32_MAX) continue;
+    /* An index below the window is subtracted away; a window starting near
+       0 starts at 0 instead, and one ending near the table's end ends
+       there, so that every index past it is out of bounds and the call
+       needs no lookup out of line.  A start or length past an immediate's
+       twelve bits is a multiple of 4096, which `lsl #12` takes, and a
+       window from 0 is taken too when, rounded so, it costs at most a
+       quarter more: hsbench/printf's types start at 3951, and a window
+       from there costs the 8192 slots the whole table does. */
+    uint32_t span = hi - lo + 1;
+    if (lo <= 64 || lo <= span / 4) {
+      lo = 0;
+    } else {
+      if (lo > 0xfff) lo &= ~0xfffu;
+      uint32_t z = hi + 1, nl = ict_round(hi - lo + 1);
+      if (len - z <= (z > 64 ? z : 64)) z = len;
+      if (ict_round(z) <= nl + (nl / 4 > 64 ? nl / 4 : 64)) lo = 0;
+    }
+    uint32_t n = hi - lo + 1;
+    if (!lo && len - n <= (n > 64 ? n : 64)) n = len;
+    n = ict_round(n);
+    if (lo > 0xfff000u || n > 0xfff000u || used + n > ICT_BUDGET) continue;
+    used += n;
+    if (m->nict % 8 == 0)
+      m->ict = xrealloc(m->ict, (m->nict + 8) * sizeof(IcTable));
+    IcTable *t = &m->ict[m->nict];
+    t->type_id = w->id;
+    t->ti = cand[c].ti;
+    t->lo = lo;
+    t->n = n;
+    t->whole = !lo && n >= len;
+    char name[200];
+    snprintf(name, sizeof name, "%s_ict%u", g_anchor[2], m->nict);
+    t->sym = obj_intern_sym(o, name, SYM_LOCAL_DATA, -1, 0);
+    cand[c].k = m->nict++;
+    if (warmc_getenv("WARMC_ICT_DEBUG"))
+      fprintf(stderr, "ictab: type %u (%u calls): slots %u..%u of %u%s\n",
+              t->ti, cand[c].sites, lo, lo + n - 1, len,
+              t->whole ? ", the whole table" : "");
+  }
+  xfree(elo); xfree(ehi); xfree(ety);
+
+  if (m->nict) {
+    qsort(cand, nd, sizeof *cand, ict_by_id);
+    m->ict_of = xmalloc(m->ntypes * sizeof(uint32_t));
+    for (uint32_t ti = 0; ti < m->ntypes; ti++) {
+      m->ict_of[ti] = UINT32_MAX;
+      if (m->types[ti].kind != CT_FUNC) continue;
+      uint64_t id = m->types[ti].id;
+      uint32_t a = 0, b = nd;
+      while (a < b) {
+        uint32_t mid = (a + b) / 2;
+        if (cand[mid].id < id) a = mid + 1; else b = mid;
+      }
+      if (a < nd && cand[a].id == id) m->ict_of[ti] = cand[a].k;
+    }
+  }
+  xfree(cand);
+}
+
+static uint32_t ict_stub(ObjBuilder *o, uint32_t *have, int code) {
+  if (*have != UINT32_MAX) return *have;
+  char name[200];
+  snprintf(name, sizeof name, "%s_ictrap%d", g_anchor[0], code);
+  *have = obj_intern_sym(o, name, SYM_LOCAL_FUNC, 0, o->text.len);
+  uint32_t trap = obj_intern_sym(o, "warmc_trap", SYM_UNDEF_FUNC, -1, 0);
+  g_target->emit_trap_stub(o, trap, code);
+  return *have;
+}
+
+/* After the functions are placed: the stubs go at the end of the text, the
+   tables at the end of the data. */
+static void emit_icall_tables(Module *m, ObjBuilder *o) {
+  if (!m->nict) return;
+  const Table0Facts *t0 = m->t0;
+  uint32_t s_oob = UINT32_MAX, s_null = UINT32_MAX, s_type = UINT32_MAX;
+  buf_align(&o->data, 8);
+  for (uint32_t k = 0; k < m->nict; k++) {
+    const IcTable *t = &m->ict[k];
+    const CompType *w = &m->types[t->ti];
+    obj_intern_sym(o, o->syms[t->sym].name, SYM_LOCAL_DATA, 2, o->data.len);
+    for (uint32_t j = 0; j < t->n; j++) {
+      uint32_t i = t->lo + j, sym;
+      uint32_t fi = i < t0->n ? t0->entry[i] : TABLE0_NULL;
+      if (i >= t0->n) sym = ict_stub(o, &s_oob, TRAP_INDIRECT_OOB);
+      else if (fi == TABLE0_NULL) sym = ict_stub(o, &s_null, TRAP_INDIRECT_NULL);
+      else if (!ict_passes(m, w, m->funcs[fi].type_index))
+        sym = ict_stub(o, &s_type, TRAP_INDIRECT_TYPE);
+      else if (m->reached && !m->reached[fi])
+        sym = obj_intern_sym(o, "warmc_unreached", SYM_UNDEF_FUNC, -1, 0);
+      else sym = obj_intern_sym(o, m->funcs[fi].sym, SYM_UNDEF_FUNC, -1, 0);
+      obj_add_reloc(o, REL_ABS64, 2, o->data.len, sym, 0);
+      buf_u64(&o->data, 0);
+    }
+  }
+}
+
 static uint64_t emit_string(ObjBuilder *o, const char *s) {
   uint64_t off = o->rodata.len;
   buf_bytes(&o->rodata, s, strlen(s) + 1);
@@ -1274,6 +1476,9 @@ void codegen_emit_module_data(Module *m, ObjBuilder *o) {
   if (pool_have) data_ptr(o, 1, pool_off);
   else buf_u64(&o->data, 0);
 
+  uint64_t ictab_off = o->data.len;
+  emit_icall_tables(m, o);
+
   if (warmc_getenv("WARMC_TABLE_STATS")) {
     uint64_t dead_bytes = 0;
     uint32_t dead_segs = 0;
@@ -1313,11 +1518,12 @@ void codegen_emit_module_data(Module *m, ObjBuilder *o) {
 
     static const char *const NAMES[] = {
       "consts", "globals", "datasegs", "entries", "elemsegs", "exports",
-      "funcrefs", "imports", "tables", "memories", "tags", "unwind", "desc" };
+      "funcrefs", "imports", "tables", "memories", "tags", "unwind", "desc",
+      "ictabs" };
     const uint64_t offs[] = {
       consts_off, globals_off, datasegs_off, entries_off, elemsegs_off,
       exports_off, funcrefs_off, imports_off, tables_off, memories_off,
-      tags_off, unwind_off, desc_off, o->data.len };
+      tags_off, unwind_off, desc_off, ictab_off, o->data.len };
     for (size_t i = 0; i < sizeof NAMES / sizeof NAMES[0]; i++)
       fprintf(stderr, "  data %-9s %8llu\n", NAMES[i],
               (unsigned long long)(offs[i + 1] - offs[i]));

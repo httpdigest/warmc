@@ -388,6 +388,9 @@ typedef struct {
   bool gloop;
   bool loopclose;
   bool cpool;
+  /* call_indirect through table 0 by per-type code tables, at every level
+     (module_data.c's codegen_plan_icall_tables) */
+  bool ictab;
   bool gssa;
 
   bool labcache;
@@ -442,6 +445,9 @@ void codegen_merge_stats(uint32_t *bodies, uint64_t *bytes);
 void codegen_dead_stats(uint32_t *bodies, uint64_t *bytes);
 
 void codegen_prewarm_symbols(Module *m, ObjBuilder *o);
+/* Decide the call_indirect code tables (Module.ict) and intern their
+   symbols; codegen_emit_module_data emits them.  Before any worker runs. */
+void codegen_plan_icall_tables(Module *m, ObjBuilder *o, bool on);
 void compile_module(Module *m, ObjBuilder *o, const OptOpts *opts);
 void compile_set_jobs(long n);
 bool pass_inline(IrFunc *f, const OptOpts *o);

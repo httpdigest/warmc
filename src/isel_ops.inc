@@ -1746,12 +1746,18 @@ static void emit_inst(Isel *s, Ref v) {
     case I_CALL_INDIRECT: case I_CALL_REF: {
       CompType *sig = call_sig(s, in);
       csa_save(s, v);
+      bool own = false;
       if (in->op == I_CALL_REF) emit_ref_lookup(s, a[in->nargs - 1]);
-      else emit_indirect_lookup(s, in, a[in->nargs - 1]);
+      else if (!(own = emit_ictab_lookup(s, in, a[in->nargs - 1])))
+        emit_indirect_lookup(s, in, a[in->nargs - 1]);
 
       emit_ret_area(s, sig);
-      emit_call_args_novmctx(s, a, in->nargs - 1);
-      a64_ldr_imm(B, 3, R0, S1, FUNCREF_INSTANCE);
+      if (own) {
+        emit_call_args(s, a, in->nargs - 1);
+      } else {
+        emit_call_args_novmctx(s, a, in->nargs - 1);
+        a64_ldr_imm(B, 3, R0, S1, FUNCREF_INSTANCE);
+      }
       a64_blr(B, S2);
       note_site(s);
       note_safepoint(s, v);
@@ -1765,10 +1771,12 @@ static void emit_inst(Isel *s, Ref v) {
       Module *m = f->m;
       uint32_t nargs = in->nargs - (indirect ? 1u : 0u);
       int target = -1;
+      bool own = false;
 
       if (indirect) {
         if (in->op == I_RETURN_CALL_REF) emit_ref_lookup(s, a[in->nargs - 1]);
-        else emit_indirect_lookup(s, in, a[in->nargs - 1]);
+        else if (!(own = emit_ictab_lookup(s, in, a[in->nargs - 1])))
+          emit_indirect_lookup(s, in, a[in->nargs - 1]);
         target = S2;
       }
 
@@ -1785,7 +1793,7 @@ static void emit_inst(Isel *s, Ref v) {
       emit_call_args_to(s, a, nargs, base);
 
       if (indirect) {
-        a64_ldr_imm(B, 3, R0, S1, FUNCREF_INSTANCE);
+        if (!own) a64_ldr_imm(B, 3, R0, S1, FUNCREF_INSTANCE);
       } else if (m->funcs[in->imm].imported) {
         uint32_t off = VMCTX_IMPORTS(m->nglobals) + 16u * (uint32_t)in->imm;
         uint32_t disp;

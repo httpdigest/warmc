@@ -602,7 +602,10 @@ void compile_module(Module *m, ObjBuilder *o, const OptOpts *opts) {
 
   bool tm = warmc_getenv("WARMC_TIME") != NULL;
 
+  /* Workers read table 0's facts, so they are known before any starts. */
+  module_table0_facts(m);
   codegen_prewarm_symbols(m, o);
+  codegen_plan_icall_tables(m, o, opts->ictab);
   if (compile_parallel(m, o, opts, out_bytes, tm)) return;
 
   double t_warm0 = tm ? now_ms() : 0;

@@ -277,6 +277,36 @@ typedef struct {
   uint32_t len;
 } DataSeg;
 
+/* Table 0 as instantiation leaves it, when nothing can change it after
+   (opt.c's module_table0_facts): devirtualisation and the call_indirect code
+   tables both read it.  entry[k] is the function slot k holds, or
+   TABLE0_NULL, for n == the table's length slots, and is NULL when the
+   elem segments do not say statically what each slot holds.  sites counts,
+   per type index, the call_indirects through table 0 that name it. */
+#define TABLE0_NULL 0xffffffffu
+typedef struct {
+  bool frozen;
+  uint32_t init_fi;
+  uint32_t n;
+  uint32_t *entry;
+  uint32_t *sites;
+} Table0Facts;
+
+/* One call type's code table (module_data.c): slot k holds the code of
+   table 0's entry lo + k when that entry passes the call's type check, and
+   a stub that traps as the check would have otherwise, so a call through it
+   needs neither the check nor the funcref cell.  Indices outside
+   [lo, lo + n) take the full lookup out of line, unless `whole` says the
+   window covers every index below the table's length, so that an index past
+   it is out of bounds and nothing else. */
+typedef struct {
+  uint64_t type_id;
+  uint32_t ti;
+  uint32_t lo, n;
+  bool whole;
+  uint32_t sym;
+} IcTable;
+
 typedef struct {
   const uint8_t *bin;
   size_t bin_len;
@@ -312,7 +342,16 @@ typedef struct {
   uint32_t *func_map;
 
   uint32_t *type_slot;
+
+  Table0Facts *t0;
+
+  /* the call_indirect code tables, and per type index the one its calls
+     use, or UINT32_MAX (NULL when there are none) */
+  IcTable *ict; uint32_t nict;
+  uint32_t *ict_of;
 } Module;
+
+const Table0Facts *module_table0_facts(Module *m);
 
 static inline uint32_t gctype_slot(const Module *m, uint32_t ti) {
   return m->type_slot ? m->type_slot[ti] : ti;

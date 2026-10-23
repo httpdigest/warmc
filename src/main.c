@@ -52,9 +52,9 @@ static const char *usage_text =
   "                thread, nodesplit, mem, bce, strength, inline, reassoc,\n"
   "                rotate, addroff, memptr, align, regalloc, guard-pages,\n"
   "                vectorize, edge-tests, unroll, selftail, ldcomb, escape,\n"
-  "                partial-escape, gloop, gssa, loopclose, cpool, reach, prune,\n"
-  "                merge, devirt, reinline, throw-jump, closed-world, gcpure,\n"
-  "                split, labcache, barelide, small-loop-align\n"
+  "                partial-escape, gloop, gssa, loopclose, cpool, ictab, reach,\n"
+  "                prune, merge, devirt, reinline, throw-jump, closed-world,\n"
+  "                gcpure, split, labcache, barelide, small-loop-align\n"
   "                The last two are the passes built on a loop containing\n"
   "                no safepoint, which is the only assumption the compiler\n"
   "                makes about the collector: turning them off says whether\n"
@@ -292,6 +292,7 @@ int main(int argc, char **argv) {
   opt.gloop = true;
   opt.loopclose = true;
   opt.cpool = true;
+  opt.ictab = true;
   opt.reassoc = true;
   opt.labcache = true;
   opt.barelide = true;
@@ -428,6 +429,7 @@ int main(int argc, char **argv) {
       else if (!strcmp(name, "gloop")) opt.gloop = on;
       else if (!strcmp(name, "loopclose")) opt.loopclose = on;
       else if (!strcmp(name, "cpool")) opt.cpool = on;
+      else if (!strcmp(name, "ictab")) opt.ictab = on;
       else if (!strcmp(name, "gssa")) opt.gssa = on;
       else if (!strcmp(name, "gssa-all")) opt.gssa = opt.gssa_all = on;
       else if (!strcmp(name, "small-loop-align")) opt.small_loop_align = on;

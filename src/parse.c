@@ -906,5 +906,7 @@ void module_free(Module *m) {
   xfree(m->elems);
   for (uint32_t i = 0; i < m->ndatas; i++) xfree(m->datas[i].offset.ins);
   xfree(m->datas);
+  if (m->t0) { xfree(m->t0->entry); xfree(m->t0->sites); xfree(m->t0); }
+  xfree(m->ict); xfree(m->ict_of);
   xfree(m);
 }

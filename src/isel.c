@@ -606,7 +606,8 @@ static int mem_base_reg(Isel *s, uint64_t k, int scratch) {
 
 static void emit_type_check(Isel *s, const CompType *want) {
 
-  int want_reg = (s->tid_reg && want->id == s->tid_val) ? s->tid_reg : -1;
+  int want_reg = (s->tid_reg && !s->tid_tab && want->id == s->tid_val)
+                 ? s->tid_reg : -1;
   if (want->final_) {
     a64_ldr_imm(B, 3, S3, S1, FUNCREF_TYPE);
     if (want_reg >= 0) {
@@ -644,16 +645,20 @@ static void emit_type_check(Isel *s, const CompType *want) {
   trap_if_cc(s, CC_NE, TRAP_INDIRECT_TYPE);
 }
 
+/* A table nothing can grow keeps its initial length: one whose maximum is
+   its minimum, or a frozen table 0, which no instruction writes and no
+   other module sees. */
 static bool table_fixed_len(const Module *m, uint32_t ti, uint64_t *out) {
   const Table *t = &m->tables[ti];
-  if (t->imported || !t->has_max || t->max != t->min) return false;
+  if (t->imported) return false;
+  if ((!t->has_max || t->max != t->min) && !(ti == 0 && m->t0 && m->t0->frozen))
+    return false;
   *out = t->min;
   return true;
 }
 
-static void emit_indirect_lookup(Isel *s, Inst *in, Ref callee) {
+static void emit_indirect_lookup_reg(Isel *s, Inst *in, int idx) {
   IrFunc *f = s->f;
-  int idx = rd(s, callee, S0);
   uint64_t flen;
   bool fixed = table_fixed_len(f->m, (uint32_t)in->imm2, &flen) && flen <= 4095;
   if (in->imm2 == 0) {
@@ -688,6 +693,76 @@ static void emit_indirect_lookup(Isel *s, Inst *in, Ref callee) {
   trap_if_zero(s, SF64, S1, TRAP_INDIRECT_NULL);
   a64_ldr_imm(B, 3, S2, S1, FUNCREF_CODE);
   emit_type_check(s, &f->m->types[in->imm]);
+}
+
+static void emit_indirect_lookup(Isel *s, Inst *in, Ref callee) {
+  emit_indirect_lookup_reg(s, in, rd(s, callee, S0));
+}
+
+static void emit_ictab_addr(Isel *s, Buf *b, uint32_t sym, int reg, bool pro) {
+  uint64_t in_pro = pro ? 0x8000000000000000ull : 0;
+  isel_reloc(s, REL_ADR_PAGE21, b->len | in_pro, sym, 0);
+  a64_adrp(b, reg, 0);
+  isel_reloc(s, REL_ADD_LO12, b->len | in_pro, sym, 0);
+  a64_add_imm(b, SF64, reg, reg, 0, 0);
+}
+
+/* call_indirect through its type's code table (Module.ict), when it has
+   one: the index less the window's start against the window's length, and
+   the code from the slot, left in S2 as the full lookup leaves it.  Every
+   function the table holds is the module's own, so the caller passes its
+   own vmctx and the cell is never read.  The address is the pinned
+   register's when the function's hot type is this one, as the type id was.
+   An index outside the window is out of bounds when the window is the
+   whole table, and otherwise goes through the full lookup out of line,
+   which traps as the call always did. */
+static bool emit_ictab_lookup(Isel *s, Inst *in, Ref callee) {
+  const Module *m = s->f->m;
+  if (!m->ict_of || in->imm2 != 0 || in->imm >= m->ntypes ||
+      m->ict_of[in->imm] == UINT32_MAX)
+    return false;
+  uint32_t k = m->ict_of[in->imm];
+  const IcTable *t = &m->ict[k];
+  int idx = rd(s, callee, S0);
+  int base = S1;
+  if (s->tid_tab && s->tid_ict == k) base = s->tid_reg;
+  else emit_ictab_addr(s, B, t->sym, S1, false);
+  int x = idx;
+  if (t->lo) {
+    if (t->lo <= 0xfff) a64_sub_imm(B, SF32, TMP1, idx, t->lo, 0);
+    else a64_sub_imm(B, SF32, TMP1, idx, t->lo >> 12, 1);
+    x = TMP1;
+  }
+  if (t->n <= 0xfff) a64_cmp_imm(B, SF32, x, t->n);
+  else a64_subs_imm(B, SF32, RZR, x, t->n >> 12, 1);
+  size_t site = 0;
+  if (t->whole) trap_if_cc(s, CC_HS, TRAP_INDIRECT_OOB);
+  else site = br_cc(s, 0, CC_HS, 0, 0);
+  a64_ldr_reg(B, 3, S2, base, x, 2, 1);
+  if (!t->whole) {
+    struct IctFix *fx = xmalloc(sizeof *fx);
+    fx->site = site;
+    fx->back = B->len;
+    fx->idx = idx;
+    fx->in = in;
+    fx->next = s->icts;
+    s->icts = fx;
+  }
+  return true;
+}
+
+static void emit_ictab_slow_arms(Isel *s) {
+  for (struct IctFix *fx = s->icts; fx;) {
+    struct IctFix *n = fx->next;
+    br_patch(s, fx->site, B->len);
+    emit_indirect_lookup_reg(s, fx->in, fx->idx);
+    size_t site = B->len;
+    a64_b(B, 0);
+    patch_b26_checked(s, site, fx->back);
+    xfree(fx);
+    fx = n;
+  }
+  s->icts = NULL;
 }
 
 static void emit_ref_lookup(Isel *s, Ref callee) {
@@ -2012,7 +2087,8 @@ static void emit_prologue(Isel *s, Buf *b) {
     a64_ldr_imm(b, 3, REG_MEMBASE, REG_VMCTX, VMCTX_MEM_BASE);
     if (s->needs_memsize) a64_ldr_imm(b, 3, REG_MEMSIZE, REG_VMCTX, VMCTX_MEM_SIZE);
   }
-  if (s->tid_reg) a64_load_imm(b, SF64, s->tid_reg, s->tid_val);
+  if (s->tid_tab) emit_ictab_addr(s, b, f->m->ict[s->tid_ict].sym, s->tid_reg, true);
+  else if (s->tid_reg) a64_load_imm(b, SF64, s->tid_reg, s->tid_val);
 }
 
 static void emit_teardown(Isel *s) {
@@ -2297,6 +2373,15 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
       s->tid_reg = r;
       s->tid_val = best_id;
       s->used_gpr_cs |= 1u << r;
+      /* The hot type's code table, when it has one, is what the register
+         holds: its address is an adrp and an add at each call otherwise.
+         A second register for the second hottest type's table, where one
+         loop calls through both (Rust's fmt::write, rsbench/fmtfloat; a
+         trait object's two methods, rsbench/dyntrait), measured nothing
+         either way, and cost asbench/hofarr 23% in spills where the two
+         were different loops' of one big function. */
+      for (uint32_t k = 0; k < f->m->nict; k++)
+        if (f->m->ict[k].type_id == best_id) { s->tid_tab = true; s->tid_ict = k; }
     }
   }
 
@@ -2497,6 +2582,7 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
   xfree(blk_end); xfree(rec);
 
   emit_alloc_slow_arms(s);
+  emit_ictab_slow_arms(s);
   emit_gc_load_stubs(s);
 
   for (struct EdgeStub *st = s->edge_stubs; st;) {
@@ -2766,6 +2852,14 @@ static void emit_dead_call_a64(ObjBuilder *obj, uint32_t sym) {
   a64_b(&obj->text, 0);
 }
 
+/* Entered by blr from the call site, so the branch leaves the caller's
+   return address in lr, as a trap at the site would have. */
+static void emit_trap_stub_a64(ObjBuilder *obj, uint32_t sym, int code) {
+  a64_load_imm(&obj->text, SF32, R0, (uint64_t)code);
+  obj_add_reloc(obj, REL_CALL26, 0, obj->text.len, sym, 0);
+  a64_b(&obj->text, 0);
+}
+
 const Target warmc_target_a64 = {
   .name = "a64",
   .is_x64 = false,
@@ -2776,6 +2870,7 @@ const Target warmc_target_a64 = {
   .produce_body = produce_body,
   .pad_nop = pad_nop_a64,
   .emit_dead_call = emit_dead_call_a64,
+  .emit_trap_stub = emit_trap_stub_a64,
   .narg_int = 8,
   .narg_fp = 8,
   .arg_slot = ARG_STACK_SLOT,

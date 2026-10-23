@@ -73,6 +73,10 @@ typedef struct Target {
   void (*pad_nop)(Buf *b);
   // The call-to-warmc_unreached body of the shared dead-function stub.
   void (*emit_dead_call)(ObjBuilder *obj, uint32_t sym);
+  // A function that traps with `code` through warmc_trap (`sym`): what a
+  // call_indirect code table holds for a slot the call's checks reject.
+  // NULL where call_indirect has no code tables.
+  void (*emit_trap_stub)(ObjBuilder *obj, uint32_t sym, int code);
 
   // Register capacity for outgoing call arguments (int slots include the
   // implicit vmctx); sizes the shared out-area computation.
