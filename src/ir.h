@@ -446,6 +446,7 @@ bool pass_inline_more(IrFunc *f, const OptOpts *o);
 bool opt_const_object(IrFunc *f, Ref r);
 uint32_t opt_direct_callsite_count(const Module *m, uint32_t fi);
 bool opt_call_frame_only(const Module *m, uint32_t fi);
+uint32_t opt_table0_target(const Module *m, uint32_t site_ti, uint64_t idx);
 
 typedef struct {
   uint64_t folded, dce_removed, cse_removed, licm_hoisted, branch_simplified;
