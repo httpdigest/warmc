@@ -40,27 +40,40 @@ static uint32_t module_max_outgoing(Module *m) {
    writes them where its own arrived, in its caller's outgoing area, so every
    function that calls a wasm function makes room for them as well as for
    the stack arguments of its own calls. */
-static uint32_t module_tail_outgoing(Module *m) {
-  uint32_t worst = 0;
-  for (uint32_t i = m->nimported_funcs; i < m->nfuncs; i++) {
-    const Func *fn = &m->funcs[i];
-    if (!fn->body) continue;
-    Rd r = rd_make(fn->body, fn->body_end, m->bin);
-    while (!rd_eof(&r)) {
-      uint32_t op = wasm_read_op(&r);
-      if (op == 0x12 || op == 0x13 || op == 0x15) {
-        Rd at = r;
-        uint32_t k = rd_u32(&at);
-        uint32_t ti = op == 0x12 ? (k < m->nfuncs ? m->funcs[k].type_index
-                                                   : UINT32_MAX)
-                                 : k;
-        uint32_t bytes = ti < m->ntypes ? sig_stack_bytes(&m->types[ti])
-                                        : module_max_outgoing(m);
-        if (bytes > worst) worst = bytes;
-      }
-      if (!wasm_skip_imm(&r, op)) break;
+typedef struct { Module *m; uint32_t *worst; } TailScan;
+
+static void tail_scan_one(void *ctx, uint32_t k, uint32_t w) {
+  TailScan *ts = ctx;
+  Module *m = ts->m;
+  const Func *fn = &m->funcs[m->nimported_funcs + k];
+  if (!fn->body) return;
+  Rd r = rd_make(fn->body, fn->body_end, m->bin);
+  while (!rd_eof(&r)) {
+    uint32_t op = wasm_read_op(&r);
+    if (op == 0x12 || op == 0x13 || op == 0x15) {
+      Rd at = r;
+      uint32_t x = rd_u32(&at);
+      uint32_t ti = op == 0x12 ? (x < m->nfuncs ? m->funcs[x].type_index
+                                                 : UINT32_MAX)
+                               : x;
+      uint32_t bytes = ti < m->ntypes ? sig_stack_bytes(&m->types[ti])
+                                      : module_max_outgoing(m);
+      if (bytes > ts->worst[w]) ts->worst[w] = bytes;
     }
+    if (!wasm_skip_imm(&r, op)) break;
   }
+}
+
+/* Every body is walked for its tail calls, on the compiler's threads, each
+   keeping its own largest: 15 ms of a serial front end for stdgo. */
+static uint32_t module_tail_outgoing(Module *m) {
+  uint32_t nb = m->nfuncs - m->nimported_funcs;
+  uint32_t nt = compile_want_threads(m, nb);
+  TailScan ts = { m, xcalloc(nt, sizeof(uint32_t)) };
+  warmc_par_for(nb, nt, tail_scan_one, &ts);
+  uint32_t worst = 0;
+  for (uint32_t w = 0; w < nt; w++) if (ts.worst[w] > worst) worst = ts.worst[w];
+  xfree(ts.worst);
   return (worst + 15) & ~15u;
 }
 
