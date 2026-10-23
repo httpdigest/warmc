@@ -5,17 +5,75 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #ifndef _WIN32
 #include <sys/resource.h>
 #include <sys/mman.h>
 #endif
 
+static _Thread_local DiagCatch *g_catch;
+
+void warmc_diag_catch(DiagCatch *c) { g_catch = c; }
+
+void warmc_diag_rethrow(const DiagCatch *c) {
+  fprintf(stderr, "warmc: %s: %s\n", c->tag, c->msg);
+  exit(c->code);
+}
+
 __attribute__((noreturn))
 static void diag(const char *tag, int code, const char *fmt, va_list ap) {
+  if (g_catch) {
+    DiagCatch *c = g_catch;
+    va_list aq;
+    va_copy(aq, ap);
+    int n = vsnprintf(NULL, 0, fmt, aq);
+    va_end(aq);
+    c->msg = n >= 0 ? malloc((size_t)n + 1) : NULL;
+    if (c->msg) {
+      vsnprintf(c->msg, (size_t)n + 1, fmt, ap);
+      c->tag = tag;
+      c->code = code;
+      longjmp(c->jb, 1);
+    }
+  }
   fprintf(stderr, "warmc: %s: ", tag);
   vfprintf(stderr, fmt, ap);
   fputc('\n', stderr);
   exit(code);
+}
+
+typedef struct {
+  _Atomic uint32_t next, w;
+  uint32_t n;
+  void (*fn)(void *, uint32_t, uint32_t);
+  void *ctx;
+} ParFor;
+
+static void *par_worker(void *arg) {
+  ParFor *p = arg;
+  uint32_t w = atomic_fetch_add(&p->w, 1);
+  for (;;) {
+    uint32_t i = atomic_fetch_add(&p->next, 1);
+    if (i >= p->n) break;
+    p->fn(p->ctx, i, w);
+  }
+  xcache_release();
+  return NULL;
+}
+
+void warmc_par_for(uint32_t n, uint32_t nthreads,
+                   void (*fn)(void *ctx, uint32_t i, uint32_t w), void *ctx) {
+  ParFor p = { 0, 0, n, fn, ctx };
+  if (nthreads <= 1) {
+    for (uint32_t i = 0; i < n; i++) fn(ctx, i, 0);
+    return;
+  }
+  pthread_t th[64];
+  uint32_t started = 0;
+  for (uint32_t i = 0; i < nthreads && i < 64; i++)
+    if (pthread_create(&th[started], NULL, par_worker, &p) == 0) started++;
+  if (!started) par_worker(&p);
+  for (uint32_t i = 0; i < started; i++) pthread_join(th[i], NULL);
 }
 
 void warmc_fatal(const char *fmt, ...) {
@@ -291,8 +349,8 @@ const char *vt_name(ValType t) {
   }
   if (!vt_is_ref(t)) return "?";
 
-  static char buf[4][48];
-  static unsigned next;
+  static _Thread_local char buf[4][48];
+  static _Thread_local unsigned next;
   char *b = buf[next++ & 3];
   const char *h = ht_name(vt_heap(t));
   if (h) snprintf(b, sizeof buf[0], "(ref %s%s)", vt_nullable(t) ? "null " : "", h);

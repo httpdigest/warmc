@@ -164,6 +164,10 @@ static uint32_t want_threads(Module *m, uint32_t nfuncs) {
   return (uint32_t)n;
 }
 
+uint32_t compile_want_threads(Module *m, uint32_t nfuncs) {
+  return want_threads(m, nfuncs);
+}
+
 typedef struct {
   bool *fn;    uint32_t *fstack; uint32_t fntop; uint32_t nfuncs;
   bool *glob;  uint32_t *gstack; uint32_t gntop; uint32_t nglobals;
