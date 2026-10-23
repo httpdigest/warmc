@@ -4146,6 +4146,14 @@ typedef struct {
   Ref addr; uint64_t off; uint32_t size; uint32_t mem; Ref inst;
 } PendStore;
 
+/* Accesses that ran, without a trap, on every path to a point: a scan's
+   entries, valid or not, and its pending stores.  same_access_after takes
+   them as witnesses that an address did not wrap. */
+typedef struct {
+  const MemEnt *ent; uint32_t nent;
+  const PendStore *pend; uint32_t npend;
+} MemRan;
+
 #define MEMOPT_ENTS 64
 
 /* A MemEnt with this mem index tracks a GC struct field keyed by
@@ -4334,6 +4342,59 @@ static bool same_access(IrFunc *f, Ref addr_a, uint64_t imm_a, uint32_t size_a,
   if (ra == REF_NONE || ra != rb || wa != wb) return false;
   uint64_t mask = wa ? ~0ull : 0xffffffffull;
   return ((ca - cb) & mask) == 0 && ia + imm_a == ib + imm_b;
+}
+
+/* same_access, for an access b known to run after a, on every path to it,
+   with a having run without a trap.  Then a constant may sit in the i32
+   add of one and the offset of the other: a at (r + cs) + is and b at
+   (r + cl) + il, with cs + is = cl + il, are at one address when the later
+   one's add is the larger by d = cl - cs (mod 2^32) with d <= is, because a
+   reached zext(r + cs) + is < 2^32 without trapping and so r + cs + d
+   cannot wrap.  After inlining, a caller's store at sp[416] and the
+   callee's load from (sp + 416)[0] are such a pair -- C's struct copies,
+   Go's arguments at (sp - 8) + 8, Rust's i128 results -- and none of them
+   was forwarded.  32-bit memories only, and not where neither access ran
+   first (two predecessors' entries at a join).
+
+   The later one's add may also be the smaller, by e = cs - cl < 2^16, with
+   il = is + e: Go's callee loads an argument the caller stored at sp + 8
+   from (sp - 8) + 16.  r + cl wraps below zero only if r + cs < e, and then
+   zext(r + cl) >= 2^32 - 2^16, past any memory the runtime makes (it caps
+   wasm32 memories at 65535 pages, rt.c make_memory).  So an access at
+   zext(r + cl) that ran -- in `ran`, as the callee's store of its return
+   PC at (sp - 8)[0] is -- proves the wrap did not happen. */
+static bool addr_ran(IrFunc *f, const MemRan *ran, Ref r, uint64_t c) {
+  for (uint32_t pass = 0; pass < 2; pass++) {
+    uint32_t n = pass ? ran->npend : ran->nent;
+    for (uint32_t k = 0; k < n; k++) {
+      Ref ra;
+      uint64_t ca, ia;
+      bool wa;
+      access_parts(f, pass ? ran->pend[k].addr : ran->ent[k].addr, &ra, &ca, &ia, &wa);
+      if (ra == r && !wa && ((ca - c) & 0xffffffffull) == 0) return true;
+    }
+  }
+  return false;
+}
+
+static bool same_access_after(IrFunc *f, Ref addr_a, uint64_t imm_a, uint32_t size_a,
+                              uint32_t mem_a,
+                              Ref addr_b, uint64_t imm_b, uint32_t size_b,
+                              uint32_t mem_b, const MemRan *ran) {
+  if (same_access(f, addr_a, imm_a, size_a, mem_a, addr_b, imm_b, size_b, mem_b))
+    return true;
+  if (size_a != size_b || mem_a != mem_b) return false;
+  Ref ra, rb;
+  uint64_t ca, cb, ia, ib;
+  bool wa, wb;
+  access_parts(f, addr_a, &ra, &ca, &ia, &wa);
+  access_parts(f, addr_b, &rb, &cb, &ib, &wb);
+  if (ra == REF_NONE || ra != rb || wa || wb) return false;
+  uint64_t is = ia + imm_a, il = ib + imm_b;
+  uint64_t d = (cb - ca) & 0xffffffffull;
+  if (d <= is) return is - d == il;
+  uint64_t e = (ca - cb) & 0xffffffffull;
+  return ran && e < 0x10000 && il == is + e && addr_ran(f, ran, rb, cb);
 }
 
 #define FRAME_SPAN ((int64_t)1 << 30)
@@ -5895,8 +5956,9 @@ static Ref materialise_param(IrFunc *f, MemState *st, const MemEnt *e) {
     for (uint32_t k = 0; k < st[x].nent; k++) {
       const MemEnt *pe = &st[x].ent[k];
       if (!pe->valid || pe->pending) continue;
-      if (!same_access(f, pe->addr, pe->off, pe->size, pe->mem,
-                       e->addr, e->off, e->size, e->mem))
+      MemRan ran = { st[x].ent, st[x].nent, st[x].pend, st[x].npend };
+      if (!same_access_after(f, pe->addr, pe->off, pe->size, pe->mem,
+                             e->addr, e->off, e->size, e->mem, &ran))
         continue;
       if (f->insts[pe->value].type == e->vtype && pe->sgn == e->sgn &&
           pe->low == e->low)
@@ -6065,6 +6127,7 @@ static bool pass_memopt(IrFunc *f, const OptOpts *o) {
       Ref v = b->insts[i];
       Inst *in = &f->insts[v];
       Ref *a = ir_args(f, v);
+      MemRan ran = { ent, nent, pend, npend };
       if (in->op == I_LOAD) {
         uint32_t size = (uint32_t)MEMF_SIZE(in->imm2);
         uint32_t mem = MEMF_MEM(in->imm2);
@@ -6079,8 +6142,8 @@ static bool pass_memopt(IrFunc *f, const OptOpts *o) {
         }
         for (uint32_t k = 0; k < nent; k++) {
           if (!ent[k].valid ||
-              !same_access(f, ent[k].addr, ent[k].off, ent[k].size, ent[k].mem,
-                           a[0], in->imm, size, mem))
+              !same_access_after(f, ent[k].addr, ent[k].off, ent[k].size, ent[k].mem,
+                           a[0], in->imm, size, mem, &ran))
             continue;
 
           int pun = mem_pun(f, &ent[k], (ValType)in->type, size, sgn);
@@ -6119,8 +6182,8 @@ static bool pass_memopt(IrFunc *f, const OptOpts *o) {
         bool holds = false;
         for (uint32_t k = 0; k < nent && !holds; k++)
           holds = ent[k].valid && !ent[k].pending && ent[k].value == a[1] &&
-                  same_access(f, ent[k].addr, ent[k].off, ent[k].size, ent[k].mem,
-                              a[0], in->imm, size, mem);
+                  same_access_after(f, ent[k].addr, ent[k].off, ent[k].size, ent[k].mem,
+                              a[0], in->imm, size, mem, &ran);
         if (holds) {
           if (apply) {
             in->op = I_NOP;
@@ -6131,8 +6194,8 @@ static bool pass_memopt(IrFunc *f, const OptOpts *o) {
         }
 
         for (uint32_t k = 0; k < npend; k++) {
-          if (!same_access(f, pend[k].addr, pend[k].off, pend[k].size, pend[k].mem,
-                           a[0], in->imm, size, mem))
+          if (!same_access_after(f, pend[k].addr, pend[k].off, pend[k].size, pend[k].mem,
+                           a[0], in->imm, size, mem, &ran))
             continue;
           if (apply) {
             f->insts[pend[k].inst].op = I_NOP;
@@ -6158,8 +6221,8 @@ static bool pass_memopt(IrFunc *f, const OptOpts *o) {
         if (whole || low) {
           bool found = false;
           for (uint32_t k = 0; k < nent; k++)
-            if (same_access(f, ent[k].addr, ent[k].off, ent[k].size, ent[k].mem,
-                            a[0], in->imm, size, mem)) {
+            if (same_access_after(f, ent[k].addr, ent[k].off, ent[k].size, ent[k].mem,
+                            a[0], in->imm, size, mem, &ran)) {
               ent[k].value = a[1]; ent[k].valid = true; ent[k].pending = false;
               ent[k].sgn = false; ent[k].low = low;
               found = true;
