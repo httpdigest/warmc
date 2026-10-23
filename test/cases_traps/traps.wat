@@ -260,6 +260,19 @@
   (func (export "ind_type") (result i32)
     (call_indirect (type $binary) (i32.const 0) (i32.const 0) (i32.const 0)))
 
+  ;; The same three through a callee's parameter, at sites that pass the
+  ;; index as a constant: the inliner takes a callee's indirect calls on a
+  ;; parameter as direct where the constant resolves (param_indirect_calls
+  ;; in src/inline.c), and none of these does, so each still traps as the
+  ;; call_indirect does.  test/cases/inline_icall.wat has the ones that
+  ;; return.
+  (func $ind_param (param $f i32) (result i32)
+    (i32.add (call_indirect (type $binary) (i32.const 1) (i32.const 2) (local.get $f))
+             (call_indirect (type $binary) (i32.const 3) (i32.const 4) (local.get $f))))
+  (func (export "ind_param_type") (result i32) (call $ind_param (i32.const 0)))
+  (func (export "ind_param_null") (result i32) (call $ind_param (i32.const 1)))
+  (func (export "ind_param_oob") (result i32) (call $ind_param (i32.const 2)))
+
   (func $recurse (param i32) (result i32)
     (i32.add (i32.const 1) (call $recurse (local.get 0))))
   (func (export "stack_overflow") (result i32) (call $recurse (i32.const 1)))

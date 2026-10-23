@@ -5568,6 +5568,24 @@ static bool devirt_abi_ok(const Module *m, uint32_t site_ti, uint32_t fi) {
   return true;
 }
 
+/* The function pass_devirt makes a call_indirect of type site_ti through
+   table 0 at constant index idx into, or UINT32_MAX: for the inliner,
+   which counts a callee's indirect calls on a parameter as direct ones at a
+   site that passes that parameter a constant. */
+uint32_t opt_table0_target(const Module *m, uint32_t site_ti, uint64_t idx) {
+  pthread_once(&g_dv_once, dv_init);
+  if (g_dv.off || !(g_dv.rungs & DV_RUNG_INDIRECT)) return UINT32_MAX;
+  if (fx_mod != m || !fx_resolved || !fx_table0.computed || !fx_table0.frozen ||
+      !fx_table0.entry || idx >= fx_table0.nentries || site_ti >= m->ntypes)
+    return UINT32_MAX;
+  uint32_t fi = fx_table0.entry[idx];
+  if (fi == FX_TBL_NULL) return UINT32_MAX;
+  if (m->types[site_ti].id != m->types[m->funcs[fi].type_index].id ||
+      !devirt_abi_ok(m, site_ti, fi))
+    return UINT32_MAX;
+  return fi;
+}
+
 /* Follow the funcref operand of a call_ref to a compile-time-known target:
    ref.func directly, global.get of an immutable ref.func global, a read
    through a constant object, or a load from a monomorphic vtable slot,

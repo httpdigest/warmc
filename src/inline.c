@@ -41,6 +41,7 @@
    to; a dispatch on one is recorded for the first INL_DISP_PARAMS. */
 #define INL_KEEP_DEPTH 3
 #define INL_DISP_PARAMS 8
+#define INL_ICALLS 8
 #define INL_NO_DISP 0xffffffffu
 
 /* The 2026-08-07 cap sweeps needed a rebuild per point; every future sweep
@@ -588,6 +589,11 @@ typedef struct {
   uint32_t ninsts, eparams, retcalls;
   /* the indirect ones among them that sit in a loop of the callee */
   uint32_t loopcalls;
+  /* The indirect calls through table 0 whose index is a parameter: a site
+     that passes it a constant makes them direct calls, so they are not
+     calls the caller has to keep crossing. */
+  uint32_t nicall;
+  struct { uint8_t param, in_loop; uint32_t type; } icall[INL_ICALLS];
   /* What the callee does with each reference parameter, bit p for p:
      keeps it to itself (no call, store, return or global sees it), lets it
      out by anything but a direct call or a return, returns it, or
@@ -646,6 +652,39 @@ void inl_memos_release(void) {
   memset(ms, 0, sizeof *ms);
 }
 
+static bool is_const_arg(IrFunc *f, Ref r, uint64_t *v) {
+  Inst *in = &f->insts[ir_resolve(f, r)];
+  if (in->op != I_CONST) return false;
+  *v = in->imm;
+  return true;
+}
+
+/* Of those, the call_indirects through table 0 whose index is one of the
+   callee's own parameters: what TinyGo passes a closure's function as, and
+   what LLVM unrolls into several calls when it unrolls the loop around one. */
+static void param_indirect_calls(IrFunc *g, InlMemo *e) {
+  Block *en = &g->blocks[g->entry];
+  e->nicall = 0;
+  for (uint32_t bi = 0; bi < g->nblocks; bi++) {
+    Block *b = &g->blocks[bi];
+    if (!b->reachable || b->term == T_TRAP || b->diverges) continue;
+    for (uint32_t i = 0; i < b->ninsts; i++) {
+      Inst *in = &g->insts[b->insts[i]];
+      if (in->op != I_CALL_INDIRECT || (uint32_t)in->imm2 != 0 || !in->nargs)
+        continue;
+      Ref ix = ir_resolve(g, ir_args(g, b->insts[i])[in->nargs - 1]);
+      for (uint32_t p = 0; p < en->nparams && p < 256; p++)
+        if (en->params[p] == ix && e->nicall < INL_ICALLS) {
+          e->icall[e->nicall].param = (uint8_t)p;
+          e->icall[e->nicall].in_loop = b->loop_depth != 0;
+          e->icall[e->nicall].type = (uint32_t)in->imm;
+          e->nicall++;
+          break;
+        }
+    }
+  }
+}
+
 static void inl_summarize(InlMemo *e, IrFunc *g) {
   e->summed = true;
   for (uint32_t p = 0; p < INL_DISP_PARAMS; p++) e->disp_off[p] = INL_NO_DISP;
@@ -695,13 +734,14 @@ static IrFunc *inl_callee(IrFunc *f, const OptOpts *o, InlMemos *memo,
     inl_summarize(e, g);
     uint32_t lc;
     uint32_t r = warm_returning_calls(g, &lc);
+    param_indirect_calls(g, e);
     if (has_tail_call(g)) {
       g_stats.inl_rej_tailcall++;
       inl_dbg(f, fidx, bi, "tail call");
       ir_free(g);
     } else if (g_inl.leafonly ? !callee_calls_are_cold(g)
-                              : r > (g_inl.retcalls > INL_ESC_RETCALLS
-                                     ? g_inl.retcalls : INL_ESC_RETCALLS)) {
+                              : r - e->nicall > (g_inl.retcalls > INL_ESC_RETCALLS
+                                                 ? g_inl.retcalls : INL_ESC_RETCALLS)) {
       /* up to INL_ESC_RETCALLS calls stays a candidate: whether it is
          taken is the site's question, and only escape evidence says yes */
       g_stats.inl_rej_retcalls++;
@@ -890,7 +930,20 @@ static bool inl_score_site(IrFunc *f, const OptOpts *o, InlMemos *memo,
   uint32_t nfreed = 0;
   for (uint64_t x = freed; x; x &= x - 1) nfreed++;
 
-  if (e->retcalls > g_inl.retcalls && !escape && !g_inl.leafonly) {
+  /* The callee's indirect calls this site's constants turn direct. */
+  uint32_t retcalls = e->retcalls, loopcalls = e->loopcalls;
+  if (o->devirt)
+    for (uint32_t k = 0; k < e->nicall; k++) {
+      uint32_t p = e->icall[k].param;
+      uint64_t ix;
+      if (p < cin->nargs && is_const_arg(f, ir_args(f, call)[p], &ix) &&
+          opt_table0_target(m, e->icall[k].type, ix) != UINT32_MAX) {
+        retcalls--;
+        if (e->icall[k].in_loop) loopcalls--;
+      }
+    }
+
+  if (retcalls > g_inl.retcalls && !escape && !g_inl.leafonly) {
     g_stats.inl_rej_retcalls++;
     inl_dbg(f, fidx, bi, "returning calls");
     return false;
@@ -919,14 +972,14 @@ static bool inl_score_site(IrFunc *f, const OptOpts *o, InlMemos *memo,
      loop, which the trips amortise to nothing -- a dispatch loop over a
      table of method thunks ran 20% more instructions merged into its
      caller's loop. */
-  if (e->retcalls) {
-    bool dies = once && !e->loopcalls;
+  if (retcalls) {
+    bool dies = once && !loopcalls;
     if (b->loop_depth >= 1 && !dies && nconst == 0 && !fonly && !escape) {
       g_stats.inl_rej_retcalls++;
       inl_dbg(f, fidx, bi, "retcall in loop without evidence");
       return false;
     }
-    charged += e->retcalls * g_inl.retcall_cost * (b->loop_depth ? 2 : 1);
+    charged += retcalls * g_inl.retcall_cost * (b->loop_depth ? 2 : 1);
   }
 
   /* A cold site is worth taking when what it frees is made on a warm path:
