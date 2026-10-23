@@ -404,6 +404,12 @@ bench-record: all
 	  python3 test/gobench.py --corpus $$c --rounds 5 --record --native | tail -1; \
 	done
 
+# warmc's column only, against the wasmtime and native times already recorded
+bench-record-warmc: all
+	@for c in $(BENCH_CORPORA); do \
+	  python3 test/gobench.py --corpus $$c --record --reuse-baseline | tail -1; \
+	done
+
 FUZZ_SEED  ?= 1
 FUZZ_COUNT ?= 300
 
@@ -427,6 +433,6 @@ clean:
 	rm -rf $(BUILD)
 
 .PHONY: all asan tsan check smoke check-tools check-linux check-encoder check-spec conformance testsuite wasm-tools \
-        kotlin-stdlib wasi-sdk fuzz clean bench-compare bench-record gc-jitter gc-jitter-full
+        kotlin-stdlib wasi-sdk fuzz clean bench-compare bench-record bench-record-warmc gc-jitter gc-jitter-full
 
 -include $(WARMC_DEPS)
