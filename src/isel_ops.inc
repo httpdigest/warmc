@@ -182,6 +182,66 @@ static void emit_compare_raw(Isel *s, Ref v) {
   a64_cmp_reg(B, sf, x, y);
 }
 
+/* Apple's M4 issues a 32-bit cmp or cmn and the csel right after it as one
+   operation when the two read at most two registers between them, the
+   minimum and the clamp (cmp a, b; csel d, a, b, cc, or cmp a, #k with any
+   second register): the select is a cycle sooner on a chain through it.
+   Measured, any condition does; csinc, csinv, csneg, cset, a 64-bit pair, a
+   flag setter other than cmp and cmn, and a pair with a third register --
+   wzr counts -- do not.  cbench/vla's edit-distance cell, min(cur + 1, t),
+   costs native code three cycles (add, cmp, csinc) and this two.  Whether
+   select v is such a pair, with its compare: a plain csel of two i32 values
+   on an i32 compare, not one of the forms below that become cset or csinc,
+   whose compare and operands come to two registers at most.  *imm is the
+   compare's second operand as an immediate, or UINT64_MAX for a register.
+   A condition that is no compare is the compare of itself with 0. */
+static bool sel_fuses(Isel *s, Ref v, uint64_t *imm) {
+  IrFunc *f = s->f;
+  Ref *a = ir_args(f, v);
+  if (is64(f, v) || is_fp_value(f, v) || is_vec_value(f, v)) return false;
+  Ref c = a[2];
+  Inst *ci = &f->insts[c];
+  bool icmp = (ci->op >= I_EQ && ci->op <= I_GEU) || ci->op == I_EQZ;
+  bool value = !icmp && !is_flt_cmp(ci->op);
+  if (!icmp && !value) return false;
+  if (value && s->folded && s->folded[c]) return false;
+  Ref *ca = value ? &a[2] : ir_args(f, c);
+  if (is64(f, ca[0]) || is_fp_value(f, ca[0])) return false;
+  if (!value && s->folded && s->folded[ca[0]] && f->insts[ca[0]].op == I_AND) return false;
+  uint64_t m = 0xffffffffu;
+  bool xc = f->insts[a[0]].op == I_CONST, yc = f->insts[a[1]].op == I_CONST;
+  uint64_t xv = f->insts[a[0]].imm & m, yv = f->insts[a[1]].imm & m;
+  if ((xc && yc && (yv == 0 || xv == 0)) || (s->csinc && s->csinc[v]) ||
+      (xc && !yc && (xv == 1 || xv == m)) || (yc && !xc && (yv == 1 || yv == m)) ||
+      (xc && yc && (xv == ((yv + 1) & m) || yv == ((xv + 1) & m))))
+    return false;
+  Ref regs[4];
+  uint32_t n = 0;
+#define SF_ADD(r) do { Ref r_ = (r); bool seen_ = false; \
+    for (uint32_t k_ = 0; k_ < n; k_++) seen_ |= regs[k_] == r_; \
+    if (!seen_) regs[n++] = r_; } while (0)
+  SF_ADD(ca[0]);
+  *imm = UINT64_MAX;
+  if (value || ci->op == I_EQZ) *imm = 0;
+  else if (is_imm_at(s, c, 1, ca[1])) {
+    uint64_t k = imm_of(s, ca[1]) & m;
+    uint64_t neg = (uint64_t)(-(int64_t)(int32_t)k) & m;
+    if (k <= 0xfff || neg <= 0xfff) *imm = k;
+  }
+  if (*imm == UINT64_MAX) SF_ADD(ca[1]);
+  /* a zero operand is wzr, a register of its own */
+  SF_ADD(xc && xv == 0 ? REF_NONE : a[0]);
+  SF_ADD(yc && yv == 0 ? REF_NONE : a[1]);
+#undef SF_ADD
+  if (n > 2) return false;
+  /* The compare is made again at the select, so what it reads must be live
+     there: folded into the select, or read by the select too. */
+  if (!value && !(s->folded && s->folded[c]))
+    for (uint32_t k = 0; k < (*imm == UINT64_MAX ? 2u : 1u); k++)
+      if (ca[k] != a[0] && ca[k] != a[1]) return false;
+  return true;
+}
+
 static int cond_of(Isel *s, Ref v) {
   Inst *in = &s->f->insts[v];
   if (in->op == I_EQZ) return CC_EQ;
@@ -650,10 +710,20 @@ static void emit_inst(Isel *s, Ref v) {
     case I_EQ: case I_NE: case I_LTS: case I_LTU: case I_GTS: case I_GTU:
     case I_LES: case I_LEU: case I_GES: case I_GEU: case I_EQZ:
     case I_FEQ: case I_FNE: case I_FLT: case I_FGT: case I_FLE: case I_FGE: {
+      bool bare = flags_only(s, v);
+      uint64_t fimm;
+      /* Read only by selects, the first of which makes the compare itself,
+         right before its csel: this one would be a second copy. */
+      if (bare && !s->no_csel_fuse &&
+          sel_fuses(s, f->blocks[s->cur_block].insts[s->cur_pos + 1], &fimm)) {
+        commit(s, v, wr(s, v, S0));
+        s->cmp_ref = REF_NONE;
+        s->cmp_bare = v;
+        break;
+      }
       emit_compare(s, v);
       int d = wr(s, v, S0);
       int cc = cond_of(s, v);
-      bool bare = flags_only(s, v);
       if (!bare) a64_cset(B, SF32, d, cc);
       commit(s, v, d);
       s->cmp_ref = v; s->cmp_cc = cc; s->cmp_epoch = B->flags_epoch;
@@ -760,6 +830,46 @@ static void emit_inst(Isel *s, Ref v) {
 
     case I_SELECT: {
       int fp = is_fp_value(f, v);
+      uint64_t fimm;
+      if (!s->no_csel_fuse && sel_fuses(s, v, &fimm)) {
+        /* the compare's operands and the select's first, then the pair */
+        Ref c = a[2];
+        Inst *ci = &f->insts[c];
+        bool value = !((ci->op >= I_EQ && ci->op <= I_GEU) || ci->op == I_EQZ);
+        Ref *ca = value ? &a[2] : ir_args(f, c);
+        int d = wr(s, v, S3);
+        int r0 = rd(s, ca[0], S0);
+        int r1 = fimm == UINT64_MAX ? (ca[1] == ca[0] ? r0 : rd(s, ca[1], S1)) : -1;
+        int ro[2];
+        for (int k = 0; k < 2; k++) {
+          Ref x = a[k];
+          if (f->insts[x].op == I_CONST && (f->insts[x].imm & 0xffffffffu) == 0) ro[k] = RZR;
+          else if (x == ca[0]) ro[k] = r0;
+          else if (r1 >= 0 && x == ca[1]) ro[k] = r1;
+          else if (k == 1 && a[1] == a[0]) ro[k] = ro[0];
+          else ro[k] = rd(s, x, S1);
+        }
+        if (fimm == UINT64_MAX) a64_cmp_reg(B, SF32, r0, r1);
+        else if (fimm <= 0xfff) a64_cmp_imm(B, SF32, r0, (uint32_t)fimm);
+        else a64_adds_imm(B, SF32, RZR, r0,
+                          (uint32_t)((uint64_t)(-(int64_t)(int32_t)fimm) & 0xffffffffu), 0);
+        int cc = value ? CC_NE : cond_of(s, c);
+        a64_csel(B, SF32, d, ro[0], ro[1], cc);
+        commit(s, v, d);
+        /* the flags are the compare's, for the selects after this one */
+        s->cmp_ref = c; s->cmp_cc = cc; s->cmp_epoch = B->flags_epoch;
+        int kind, csf;
+        Ref fa, fb;
+        uint64_t fk;
+        if (!value && describe_compare(s, c, &kind, &fa, &fb, &fk, &csf)) {
+          s->fl_kind = kind; s->fl_a = fa; s->fl_b = fb;
+          s->fl_imm = fk; s->fl_sf = csf; s->fl_epoch = B->flags_epoch;
+        } else {
+          s->fl_kind = 0;
+        }
+        g_stats.csel_fused++;
+        break;
+      }
 
       int cc = CC_NE;
       bool folded_cond = s->folded && s->folded[a[2]];

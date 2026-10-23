@@ -624,7 +624,7 @@ int main(int argc, char **argv) {
             "             reloads=%llu caller_saves=%llu csa_restores=%llu"
             " v128_spills=%llu rb_trips=%llu split_cuts=%llu split_invs=%llu pieces=%llu\n"
             "             escape_removed=%llu escape_forwarded=%llu escape_made=%llu gloop=%llu\n"
-            "             loop_closed=%llu reassoc=%llu cmp_reused=%llu gssa=%llu\n"
+            "             loop_closed=%llu reassoc=%llu cmp_reused=%llu csel_fused=%llu gssa=%llu\n"
             "             bar_masks=%llu bar_elided=%llu\n"
             "             devirt_ref=%llu devirt_indirect=%llu"
             " devirt_null_kept=%llu const_reads=%llu throw_jumps=%llu"
@@ -670,6 +670,7 @@ int main(int argc, char **argv) {
             (unsigned long long)g_stats.loops_closed,
             (unsigned long long)g_stats.reassoc,
             (unsigned long long)g_stats.cmp_reused,
+            (unsigned long long)g_stats.csel_fused,
             (unsigned long long)g_stats.globals_ssa,
             (unsigned long long)g_stats.bar_masks,
             (unsigned long long)g_stats.bar_elided,
