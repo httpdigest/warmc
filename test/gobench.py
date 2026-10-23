@@ -454,7 +454,12 @@ NATIVE_FLAGS = {"c": ["-O2"], "cpp": ["-O2", "-std=c++20"],
                 "rs": ["-C", "opt-level=2", "-C", "panic=abort", "-C", "lto=fat",
                        "-C", "codegen-units=1"],
                 "zig": ["-O", "ReleaseFast", "-lc"],
-                "go": ["-opt=2", "-scheduler=none"], "gostd": [], "hs": ["-O2"]}
+                "go": ["-opt=2", "-scheduler=none"], "gostd": [],
+                # -V0: no RTS timer.  With it, exit joins the ticker thread
+                # in its 10 ms sleep, the empty program's floor is mostly that
+                # wait, and every kernel, which waits only for the rest of its
+                # tick, came out about 10 ms faster than it ran.
+                "hs": ["-O2", "-with-rtsopts=-V0"]}
 NATIVE_TOOL = {"c": "clang", "cpp": "clang++", "rs": "rustc", "zig": "zig",
                "go": "tinygo", "gostd": "go", "hs": "ghc"}
 NATIVE_VERSION = {"c": ["clang", "--version"], "cpp": ["clang++", "--version"],
