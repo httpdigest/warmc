@@ -440,11 +440,12 @@ static void emit_inst(Isel *s, Ref v) {
         Ref *ca = ir_args(f, a[1]);
         int x = rd(s, a[0], S0);
         int d = wr(s, v, S2);
-        if (ci->op == I_SHL) {
+        if (ci->op == I_SHL || ci->op == I_SHRU || ci->op == I_SHRS) {
           int y = rd(s, ca[0], S1);
           int sh = (int)(f->insts[ca[1]].imm % (uint64_t)(sf ? 64 : 32));
-          if (in->op == I_ADD) a64_add_reg_lsl(B, sf, d, x, y, sh);
-          else a64_sub_reg_lsl(B, sf, d, x, y, sh);
+          int kind = ci->op == I_SHL ? SH_LSL : ci->op == I_SHRU ? SH_LSR : SH_ASR;
+          if (in->op == I_ADD) a64_add_reg_sh(B, sf, d, x, y, kind, sh);
+          else a64_sub_reg_sh(B, sf, d, x, y, kind, sh);
         } else if (ci->op == I_EXTENDU || ci->op == I_EXTENDS || ci->op == I_EXT32S) {
           int y = rd(s, ca[0], S1);
           a64_addsub_extw(B, in->op == I_SUB, d, x, y, ci->op != I_EXTENDU, 0);
@@ -577,6 +578,15 @@ static void emit_inst(Isel *s, Ref v) {
     case I_SHL: case I_SHRS: case I_SHRU: case I_ROTR: case I_ROTL: {
       int width = sf ? 64 : 32;
       if (emit_bfx(s, v)) break;
+      if (in->op == I_SHRU && s->folded[a[0]] && f->insts[a[0]].op == I_MULHU) {
+        Ref *ma = ir_args(f, a[0]);
+        int x = rd(s, ma[0], S0), y = rd(s, ma[1], S1);
+        int d = wr(s, v, S2);
+        a64_umull(B, d, x, y);
+        a64_lsr_imm(B, SF64, d, d, 32 + (int)(imm_of(s, a[1]) & 31));
+        commit(s, v, d);
+        break;
+      }
       int x = rd(s, a[0], S0);
       int d = wr(s, v, S2);
       if (is_imm_at(s, v, 1, a[1])) {

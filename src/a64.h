@@ -55,6 +55,9 @@ void a64_adds_reg(Buf *b, int sf, int rd, int rn, int rm);
 void a64_subs_reg(Buf *b, int sf, int rd, int rn, int rm);
 void a64_add_reg_lsl(Buf *b, int sf, int rd, int rn, int rm, int shift);
 void a64_sub_reg_lsl(Buf *b, int sf, int rd, int rn, int rm, int shift);
+/* kind SH_LSL, SH_LSR or SH_ASR */
+void a64_add_reg_sh(Buf *b, int sf, int rd, int rn, int rm, int kind, int shift);
+void a64_sub_reg_sh(Buf *b, int sf, int rd, int rn, int rm, int kind, int shift);
 
 void a64_add_uxtw(Buf *b, int rd, int rn, int rm, int shift);
 

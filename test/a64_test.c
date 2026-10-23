@@ -175,6 +175,11 @@ int main(int argc, char **argv) {
   CASE("subs w17, w18, w19", a64_subs_reg(b, SF32, R17, R18, R19));
   CASE("add x20, x21, x22, lsl #3", a64_add_reg_lsl(b, SF64, R20, R21, R22, 3));
   CASE("sub w0, w1, w2, lsl #5", a64_sub_reg_lsl(b, SF32, R0, R1, R2, 5));
+  CASE("add w3, w4, w5, lsr #31", a64_add_reg_sh(b, SF32, R3, R4, R5, SH_LSR, 31));
+  CASE("add x6, x7, x8, asr #63", a64_add_reg_sh(b, SF64, R6, R7, R8, SH_ASR, 63));
+  CASE("sub x9, x10, x11, lsr #17", a64_sub_reg_sh(b, SF64, R9, R10, R11, SH_LSR, 17));
+  CASE("sub w12, w13, w14, asr #3", a64_sub_reg_sh(b, SF32, R12, R13, R14, SH_ASR, 3));
+  CASE("add x15, x16, x17, lsl #40", a64_add_reg_sh(b, SF64, R15, R16, R17, SH_LSL, 40));
   CASE("add x3, x4, w5, uxtw", a64_add_uxtw(b, R3, R4, R5, 0));
   CASE("add x6, x7, w8, uxtw #3", a64_add_uxtw(b, R6, R7, R8, 3));
   /* The base is the stack pointer, which the shifted-register form cannot
