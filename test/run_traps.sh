@@ -8,10 +8,12 @@ export PATH="$PATH:$HOME/.npm-global/bin"
 WORK="$BUILD/testrun"
 mkdir -p "$WORK"
 
-if [ ! -s "$WORK/traps.wasm" ] || [ test/cases_traps/traps.wat -nt "$WORK/traps.wasm" ]; then
-  wat2wasm $WABT_FLAGS test/cases_traps/traps.wat -o "$WORK/traps.wasm.$$" || exit 1
-  mv -f "$WORK/traps.wasm.$$" "$WORK/traps.wasm"
-fi
+for t in traps ictraps; do
+  if [ ! -s "$WORK/$t.wasm" ] || [ test/cases_traps/$t.wat -nt "$WORK/$t.wasm" ]; then
+    wat2wasm $WABT_FLAGS test/cases_traps/$t.wat -o "$WORK/$t.wasm.$$" || exit 1
+    mv -f "$WORK/$t.wasm.$$" "$WORK/$t.wasm"
+  fi
+done
 
 [ "${1:-}" = --prepare ] && exit 0
 
@@ -180,6 +182,36 @@ expect exn_caught_deep_ok        "OK"
 expect exn_caught_past_pads_ok   "OK"
 expect tail_into_catcher_ok      "OK"
 expect dead_table_get            "out of bounds table access"
+
+# call_indirect through the code tables of a table nothing writes: every
+# slot a stub stands in must say what the full lookup says
+BIN="$WORK/ictraps$FTAG"
+wtimeout ./$BUILD/warmc ${WARMC_FLAGS:-} $WARMC_TARGET_FLAGS -o "$BIN" "$WORK/ictraps.wasm" || exit 1
+expect ict_ok                "OK"
+expect ict_x_null            "uninitialized element"
+expect ict_x_type            "indirect call type mismatch"
+expect ict_x_oob_pad         "undefined element"
+expect ict_x_oob_end         "undefined element"
+expect ict_x_oob             "undefined element"
+expect ict_x_oob_top         "undefined element"
+expect ict_x_tail_null       "uninitialized element"
+expect ict_x_tail_oob        "undefined element"
+expect ict_y_null_below      "uninitialized element"
+expect ict_y_type_below      "indirect call type mismatch"
+expect ict_y_null_in         "uninitialized element"
+expect ict_y_type_in         "indirect call type mismatch"
+expect ict_y_type_in_end     "indirect call type mismatch"
+expect ict_y_oob_pad         "undefined element"
+expect ict_y_oob_past        "undefined element"
+expect ict_y_oob_far         "undefined element"
+expect ict_y_oob_2p31        "undefined element"
+expect ict_y_oob_wrap        "undefined element"
+expect ict_y_tail_type_below "indirect call type mismatch"
+expect ict_y_tail_null_in    "uninitialized element"
+expect ict_z_type            "indirect call type mismatch"
+expect ict_z_null            "uninitialized element"
+expect ict_z_oob             "undefined element"
+expect ict_loop_type         "indirect call type mismatch"
 
 echo "traps: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

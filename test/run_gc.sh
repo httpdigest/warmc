@@ -27,6 +27,7 @@ assemble test/cases_gc/gccollect.wat gccollect
 assemble test/cases_gc/constroot.wat constroot
 assemble test/cases_gc/exnpayload.wat exnpayload
 assemble test/cases_gc/devirt_vt.wat devirt_vt
+assemble test/cases_gc/ictab_sub.wat ictab_sub
 assemble test/cases_gc/escape.wat escape
 assemble test/cases_gc/castfacts.wat castfacts
 assemble test/cases_gc/castfacts.wat castfacts_nt
@@ -294,6 +295,15 @@ expect vt_nullslot_ok     "OK"
 expect vt_nulltrap        "null reference"
 expect vt_mut             "OK"
 expect vt_dup             "OK"
+
+build_one ictab_sub
+expect sub_ok             "OK"
+expect sub_f_other        "indirect call type mismatch"
+expect sub_f_null         "uninitialized element"
+expect sub_g_super        "indirect call type mismatch"
+expect sub_g_sibling      "indirect call type mismatch"
+expect sub_h_sibling      "indirect call type mismatch"
+expect sub_o_struct       "indirect call type mismatch"
 
 # The objects by index: 0 null, 1 i31, 2 $base, 3 $d1, 4 $d2, 5 $leaf,
 # 6 $other, 7 $twin1, 8 $twin2, 9 $arr, 10 $d3, 11 $pad.

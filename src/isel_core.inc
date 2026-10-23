@@ -229,6 +229,20 @@ typedef struct {
 
   int tid_reg;
   uint64_t tid_val;
+  /* tid_reg holds the address of code table tid_ict (Module.ict) instead
+     of the type id, when the hot type has one */
+  bool tid_tab;
+  uint32_t tid_ict;
+
+  /* A code-table call_indirect's index outside its window: the full lookup
+     out of line, from the register the index was in, back to `back` with
+     the code in S2. */
+  struct IctFix {
+    size_t site, back;
+    int idx;
+    Inst *in;
+    struct IctFix *next;
+  } *icts;
 
   struct AllocFix {
     size_t site;
