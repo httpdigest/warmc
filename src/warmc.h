@@ -1,6 +1,7 @@
 #ifndef WARMC_H
 #define WARMC_H
 
+#include <setjmp.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -15,6 +16,17 @@ void warmc_malformed(const char *fmt, ...)
   __attribute__((noreturn, format(printf, 1, 2)));
 void warmc_invalid(const char *fmt, ...)
   __attribute__((noreturn, format(printf, 1, 2)));
+/* A thread doing one item of a parallel walk catches the diagnostic that
+   would end the process: warmc_fatal and its kin longjmp to jb with the
+   message, and the walk reports the one of the first item in order, as a
+   walk in order would have (util.c). */
+typedef struct { jmp_buf jb; const char *tag; int code; char *msg; } DiagCatch;
+void warmc_diag_catch(DiagCatch *c);
+void warmc_diag_rethrow(const DiagCatch *c) __attribute__((noreturn));
+/* fn(ctx, i, w) for every i below n, on nthreads threads (w the thread's
+   number below nthreads), in no order; returns when all are done. */
+void warmc_par_for(uint32_t n, uint32_t nthreads,
+                   void (*fn)(void *ctx, uint32_t i, uint32_t w), void *ctx);
 void *xmalloc(size_t n);
 void *xcalloc(size_t n, size_t sz);
 void *xrealloc(void *p, size_t n);
@@ -350,6 +362,9 @@ typedef struct {
   IcTable *ict; uint32_t nict;
   uint32_t *ict_of;
 } Module;
+
+/* The threads compile_module uses for a module of nfuncs functions. */
+uint32_t compile_want_threads(Module *m, uint32_t nfuncs);
 
 const Table0Facts *module_table0_facts(Module *m);
 

@@ -1,5 +1,8 @@
 #include "opcodes.h"
 
+#include <pthread.h>
+#include <stdatomic.h>
+
 static const OpInfo OPCODES[] = {
 
   { 0x00, "unreachable", IMM_NONE, 0, NULL },
@@ -541,28 +544,37 @@ static const OpInfo OPCODES[] = {
 
 #define NOPCODES ((uint32_t)(sizeof OPCODES / sizeof OPCODES[0]))
 
-const OpInfo *wasm_op_info(uint32_t op) {
-  enum { NSLOT = 2048 };
-  static int16_t slot[NSLOT];
-  static bool built;
-  if (!built) {
-    for (uint32_t i = 0; i < NSLOT; i++) slot[i] = -1;
-    for (uint32_t i = 0; i < NOPCODES; i++) {
+/* The two lookup tables are built on first use, which may be on several
+   threads at once now that bodies are validated in parallel: two building
+   one table together filled it with duplicates until a probe never ended.
+   Built once, then, and read behind one acquire load. */
+enum { OP_NSLOT = 2048 };
+static int16_t g_op_slot[OP_NSLOT];
+static _Atomic bool g_op_built;
+static pthread_once_t g_op_once = PTHREAD_ONCE_INIT;
 
-      if (OPCODES[i].op > 0xff && (OPCODES[i].op & 0xffffu) == OP_SUB_UNKNOWN)
-        warmc_fatal("internal: opcode table uses the reserved sub-opcode %u",
-                    OP_SUB_UNKNOWN);
-      uint32_t h = (OPCODES[i].op * 2654435761u) & (NSLOT - 1);
-      while (slot[h] >= 0) h = (h + 1) & (NSLOT - 1);
-      slot[h] = (int16_t)i;
-    }
-    built = true;
+static void op_build(void) {
+  for (uint32_t i = 0; i < OP_NSLOT; i++) g_op_slot[i] = -1;
+  for (uint32_t i = 0; i < NOPCODES; i++) {
+
+    if (OPCODES[i].op > 0xff && (OPCODES[i].op & 0xffffu) == OP_SUB_UNKNOWN)
+      warmc_fatal("internal: opcode table uses the reserved sub-opcode %u",
+                  OP_SUB_UNKNOWN);
+    uint32_t h = (OPCODES[i].op * 2654435761u) & (OP_NSLOT - 1);
+    while (g_op_slot[h] >= 0) h = (h + 1) & (OP_NSLOT - 1);
+    g_op_slot[h] = (int16_t)i;
   }
-  uint32_t h = (op * 2654435761u) & (NSLOT - 1);
-  while (slot[h] >= 0) {
-    const OpInfo *oi = &OPCODES[slot[h]];
+  atomic_store_explicit(&g_op_built, true, memory_order_release);
+}
+
+const OpInfo *wasm_op_info(uint32_t op) {
+  if (!atomic_load_explicit(&g_op_built, memory_order_acquire))
+    pthread_once(&g_op_once, op_build);
+  uint32_t h = (op * 2654435761u) & (OP_NSLOT - 1);
+  while (g_op_slot[h] >= 0) {
+    const OpInfo *oi = &OPCODES[g_op_slot[h]];
     if (oi->op == op) return oi;
-    h = (h + 1) & (NSLOT - 1);
+    h = (h + 1) & (OP_NSLOT - 1);
   }
   return NULL;
 }
@@ -572,42 +584,46 @@ const char *wasm_op_name(uint32_t op) {
   return oi ? oi->name : "?";
 }
 
-bool wasm_op_by_name(const char *name, size_t n, uint32_t *op_out) {
-  enum { NSLOT = 2048 };
-  static int16_t slot[NSLOT];
-  static bool built;
-  if (!built) {
-    for (uint32_t i = 0; i < NSLOT; i++) slot[i] = -1;
-    for (uint32_t i = 0; i < NOPCODES; i++) {
-      if (strchr(OPCODES[i].name, ' ')) continue;
-      size_t len = strlen(OPCODES[i].name);
-      uint32_t h = 2166136261u;
-      for (size_t j = 0; j < len; j++) {
-        h ^= (uint8_t)OPCODES[i].name[j];
-        h *= 16777619u;
-      }
-      h &= NSLOT - 1;
-      while (slot[h] >= 0) {
+static int16_t g_name_slot[OP_NSLOT];
+static _Atomic bool g_name_built;
+static pthread_once_t g_name_once = PTHREAD_ONCE_INIT;
 
-        if (!strcmp(OPCODES[slot[h]].name, OPCODES[i].name))
-          warmc_fatal("internal: opcode table spells '%s' twice",
-                      OPCODES[i].name);
-        h = (h + 1) & (NSLOT - 1);
-      }
-      slot[h] = (int16_t)i;
+static void name_build(void) {
+  for (uint32_t i = 0; i < OP_NSLOT; i++) g_name_slot[i] = -1;
+  for (uint32_t i = 0; i < NOPCODES; i++) {
+    if (strchr(OPCODES[i].name, ' ')) continue;
+    size_t len = strlen(OPCODES[i].name);
+    uint32_t h = 2166136261u;
+    for (size_t j = 0; j < len; j++) {
+      h ^= (uint8_t)OPCODES[i].name[j];
+      h *= 16777619u;
     }
-    built = true;
+    h &= OP_NSLOT - 1;
+    while (g_name_slot[h] >= 0) {
+
+      if (!strcmp(OPCODES[g_name_slot[h]].name, OPCODES[i].name))
+        warmc_fatal("internal: opcode table spells '%s' twice",
+                    OPCODES[i].name);
+      h = (h + 1) & (OP_NSLOT - 1);
+    }
+    g_name_slot[h] = (int16_t)i;
   }
+  atomic_store_explicit(&g_name_built, true, memory_order_release);
+}
+
+bool wasm_op_by_name(const char *name, size_t n, uint32_t *op_out) {
+  if (!atomic_load_explicit(&g_name_built, memory_order_acquire))
+    pthread_once(&g_name_once, name_build);
   uint32_t h = 2166136261u;
   for (size_t j = 0; j < n; j++) { h ^= (uint8_t)name[j]; h *= 16777619u; }
-  h &= NSLOT - 1;
-  while (slot[h] >= 0) {
-    const OpInfo *oi = &OPCODES[slot[h]];
+  h &= OP_NSLOT - 1;
+  while (g_name_slot[h] >= 0) {
+    const OpInfo *oi = &OPCODES[g_name_slot[h]];
     if (!strncmp(oi->name, name, n) && oi->name[n] == 0) {
       *op_out = oi->op;
       return true;
     }
-    h = (h + 1) & (NSLOT - 1);
+    h = (h + 1) & (OP_NSLOT - 1);
   }
   return false;
 }

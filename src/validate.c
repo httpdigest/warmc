@@ -1,6 +1,8 @@
 #include "warmc.h"
 #include "opcodes.h"
 
+#include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -75,7 +77,7 @@ static ValType pop_expect(V *v, ValType want) {
 
   if (got == BOT || want == BOT) return got;
   if (!vt_subtype(v->m, got, want)) {
-    static char msg[128];
+    static _Thread_local char msg[128];
     snprintf(msg, sizeof msg, "type mismatch: expected %s, found %s",
              vt_name(want), vt_name(got));
     invalid(v, msg);
@@ -86,7 +88,7 @@ static ValType pop_expect(V *v, ValType want) {
 static ValType pop_ref(V *v, const char *what) {
   ValType t = pop(v);
   if (t != BOT && !vt_is_ref(t)) {
-    static char msg[128];
+    static _Thread_local char msg[128];
     snprintf(msg, sizeof msg, "type mismatch: %s needs a reference, found %s",
              what, vt_name(t));
     invalid(v, msg);
@@ -304,7 +306,7 @@ static void check_catch(V *v) {
   }
   bool carries_ref = (kind == 1 || kind == 3);
   if (n != np + (carries_ref ? 1u : 0u)) {
-    static char msg[128];
+    static _Thread_local char msg[128];
     snprintf(msg, sizeof msg,
              "type mismatch: catch label takes %u values, the clause transfers %u",
              n, np + (carries_ref ? 1u : 0u));
@@ -1215,6 +1217,61 @@ static void check_declared_subtyping(Module *m) {
   }
 }
 
+static void validate_func(Module *m, uint32_t i) {
+  V v;
+  memset(&v, 0, sizeof v);
+  v.m = m;
+  v.fn = &m->funcs[i];
+  v.func_index = i;
+  v.rd = rd_make(m->funcs[i].body, m->funcs[i].body_end, m->bin);
+
+  v.init = xcalloc(v.fn->ntotal_locals ? v.fn->ntotal_locals : 1, sizeof(bool));
+  for (uint32_t j = 0; j < v.fn->ntotal_locals; j++)
+    v.init[j] = j < m->types[v.fn->type_index].nparams ||
+                vt_defaultable(v.fn->local_types[j]);
+  validate_body(&v);
+  xfree(v.stack);
+  xfree(v.ctl);
+  xfree(v.init);
+  xfree(v.inits);
+  for (uint32_t j = 0; j < v.nowned; j++) xfree(v.owned[j]);
+  xfree(v.owned);
+}
+
+/* the first function a diagnostic came from, and that diagnostic; later
+   functions are not started once one has failed */
+typedef struct {
+  Module *m;
+  _Atomic uint32_t bad;
+  pthread_mutex_t lock;
+  DiagCatch bad_diag;
+} VPar;
+
+static void validate_par(void *ctx, uint32_t k, uint32_t w) {
+  (void)w;
+  VPar *vp = ctx;
+  if (k > atomic_load(&vp->bad)) return;
+  DiagCatch c;
+  if (setjmp(c.jb)) {
+    warmc_diag_catch(NULL);
+    pthread_mutex_lock(&vp->lock);
+    if (k < atomic_load(&vp->bad)) {
+      free(vp->bad_diag.msg);
+      vp->bad_diag.tag = c.tag;
+      vp->bad_diag.code = c.code;
+      vp->bad_diag.msg = c.msg;
+      atomic_store(&vp->bad, k);
+    } else {
+      free(c.msg);
+    }
+    pthread_mutex_unlock(&vp->lock);
+    return;
+  }
+  warmc_diag_catch(&c);
+  validate_func(vp->m, vp->m->nimported_funcs + k);
+  warmc_diag_catch(NULL);
+}
+
 void wasm_validate(Module *m) {
   check_declared_subtyping(m);
 
@@ -1327,25 +1384,19 @@ void wasm_validate(Module *m) {
 
   collect_declared(m);
 
-  for (uint32_t i = m->nimported_funcs; i < m->nfuncs; i++) {
-    V v;
-    memset(&v, 0, sizeof v);
-    v.m = m;
-    v.fn = &m->funcs[i];
-    v.func_index = i;
-    v.rd = rd_make(m->funcs[i].body, m->funcs[i].body_end, m->bin);
-
-    v.init = xcalloc(v.fn->ntotal_locals ? v.fn->ntotal_locals : 1, sizeof(bool));
-    for (uint32_t j = 0; j < v.fn->ntotal_locals; j++)
-      v.init[j] = j < m->types[v.fn->type_index].nparams ||
-                  vt_defaultable(v.fn->local_types[j]);
-    validate_body(&v);
-    xfree(v.stack);
-    xfree(v.ctl);
-    xfree(v.init);
-    xfree(v.inits);
-    for (uint32_t j = 0; j < v.nowned; j++) xfree(v.owned[j]);
-    xfree(v.owned);
+  /* The bodies are independent of one another and read only what is above
+     them, so they are validated on the compiler's threads -- a module's
+     largest serial step was validating stdgo's: 19 ms of webtext's 350.
+     Each thread catches its own diagnostic, and the first function's is the
+     one reported, as walking them in order would. */
+  uint32_t nb = m->nfuncs - m->nimported_funcs;
+  uint32_t nt = compile_want_threads(m, nb);
+  if (nt <= 1) {
+    for (uint32_t i = m->nimported_funcs; i < m->nfuncs; i++) validate_func(m, i);
+  } else {
+    VPar vp = { m, UINT32_MAX, PTHREAD_MUTEX_INITIALIZER, { 0 } };
+    warmc_par_for(nb, nt, validate_par, &vp);
+    if (vp.bad != UINT32_MAX) warmc_diag_rethrow(&vp.bad_diag);
   }
 
   xfree(g_declared);
