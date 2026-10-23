@@ -302,7 +302,14 @@ void a64_csetm(Buf *b, int sf, int rd, int cond) { a64_csinv(b, sf, rd, RZR, RZR
 
 static void ldst_uimm(Buf *b, int size, int V, int opc, int rt, int rn, uint32_t off) {
 
-  if (off & ((1u << size) - 1u)) enc_fail("unaligned scaled offset", off);
+  /* An offset the scaled form cannot carry, not a multiple of the size, is
+     the unscaled form's (ldur and its kin) when it is below 256. */
+  if (off & ((1u << size) - 1u)) {
+    uint32_t imm9 = FITU("unscaled load/store offset", off, 0xff);
+    W(((uint32_t)size << 30) | (0x7u << 27) | ((uint32_t)V << 26) |
+      ((uint32_t)opc << 22) | (imm9 << 12) | (M5(rn) << 5) | M5(rt));
+    return;
+  }
   uint32_t scaled = FITU("scaled load/store offset", off >> size, 0xfff);
   W(((uint32_t)size << 30) | (0x7u << 27) | ((uint32_t)V << 26) | (1u << 24) |
     ((uint32_t)opc << 22) | (scaled << 10) | (M5(rn) << 5) | M5(rt));
@@ -571,12 +578,12 @@ void a64_addv_8b(Buf *b, int rd, int rn) { W(0x0E31B800u | (M5(rn) << 5) | M5(rd
 #define V2(op, rd, rn)     W((op) | (M5(rn) << 5) | M5(rd))
 
 void a64_ldr_q(Buf *b, int rt, int rn, uint32_t off) {
-  if (off & 15u) enc_fail("unaligned scaled offset", off);
+  if (off & 15u) { a64_ldur_q(b, rt, rn, (int)FITU("unscaled load/store offset", off, 0xff)); return; }
   W(0x3DC00000u | (FITU("scaled load/store offset", off >> 4, 0xfff) << 10) |
     (M5(rn) << 5) | M5(rt));
 }
 void a64_str_q(Buf *b, int rt, int rn, uint32_t off) {
-  if (off & 15u) enc_fail("unaligned scaled offset", off);
+  if (off & 15u) { a64_stur_q(b, rt, rn, (int)FITU("unscaled load/store offset", off, 0xff)); return; }
   W(0x3D800000u | (FITU("scaled load/store offset", off >> 4, 0xfff) << 10) |
     (M5(rn) << 5) | M5(rt));
 }
