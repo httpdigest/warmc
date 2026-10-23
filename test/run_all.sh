@@ -62,14 +62,15 @@ export GC_PAUSE_CHECK=0
 # `make smoke` (CHECK_SMOKE=1) runs only these: between them the hand-written
 # cases at every level, traps, the collector, relaxed SIMD, the C, SIMD,
 # control-flow and addressing workloads, WASI, linking, rejection, register
-# pressure, far branches, the canonical ABI and component linking -- most of
-# warmc, in under 30 CPU-seconds of a workstation and well under a minute of
-# a CI runner, against the fifteen minutes the whole of this takes there.  CI
-# runs it on every push.  adapter and wit are left out: their wasmtime runs
-# and subprocesses cost a minute and more of a macOS or Windows runner.
+# pressure, far branches, the canonical ABI, component linking and shared
+# libraries -- most of warmc, in under 30 CPU-seconds of a workstation and
+# well under a minute of a CI runner, against the fifteen minutes the whole
+# of this takes there.  CI runs it on every push.  adapter and wit are left
+# out: their wasmtime runs and subprocesses cost a minute and more of a macOS
+# or Windows runner.
 SMOKE_ROWS="cases-O0 cases-O1 cases-O2 traps-O0 traps-O2 gc-O2 gcthread relaxed
   workload-O2 vecwork-O2 simd-O2 control-O2 addr32-O2 addrmulti-O2 addr64-O2
-  wasi link reject pressure bincases canon clink"
+  wasi link reject pressure bincases canon clink shared"
 # Under MSYS2 every process costs a tenth of a second to start, and reject
 # starts warmc two hundred times to ask what no host can answer differently
 # -- whether the front end refuses a malformed module, and why -- so on
@@ -193,6 +194,7 @@ done
 
 start pressure ./test/run_pressure.sh
 start link     ./test/run_link.sh
+start shared   ./test/run_shared.sh
 start macho    ./test/run_macho.sh
 
 start elf      ./test/run_elf.sh

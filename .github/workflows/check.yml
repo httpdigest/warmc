@@ -198,7 +198,8 @@ jobs:
           path: *toolcache
           key: *toolcache-key
 
-      # Temurin's newest release, for Kotlin.
+      # Temurin's newest release, for Kotlin and for the Java that calls a
+      # warmc shared library through the foreign function API.
       - &setup-java
         name: Install a JDK
         if: inputs.full
@@ -673,6 +674,7 @@ jobs:
       - *setup-zig
       - *setup-node
       - *save-toolcache
+      - *setup-java
 
       # Kotlin/Wasm and GHC's wasm backend have no Windows builds here; their
       # corpora skip themselves.
