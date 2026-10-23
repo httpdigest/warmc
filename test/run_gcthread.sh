@@ -77,12 +77,20 @@ if run_test nospin 0 WARMC_GC_THREADTEST="$M" WARMC_GC_THREAD_SPIN=0; then
     bad nospin "WARMC_GC_THREAD_SPIN=0 reached the kernel ${k:-no} times in $M"
 fi
 
-t0=$(perl -MTime::HiRes=time -e 'print time')
+# How long leaving takes with the round driver running, against the same
+# launch without it: a launch on its own is no measure, since MSYS2 took 5s
+# and 8s over one on a Windows runner starting fifty rows at once, and a plain
+# one there is as slow.
+now() { perl -MTime::HiRes=time -e 'print time'; }
+t0=$(now)
+run_test exit_plain 0 WARMC_GC_STATS=1
+plain=$(perl -e "printf \"%.2f\", $(now)-$t0")
+t0=$(now)
 if run_test exit 0 WARMC_GC_ROUNDS=0 WARMC_GC_STATS=1; then
-  el=$(perl -e "printf \"%.2f\", $(perl -MTime::HiRes=time -e 'print time')-$t0")
+  el=$(perl -e "printf \"%.2f\", $(now)-$t0")
 
-  if [ "$(perl -e "print(($el > 2.0) ? 1 : 0)")" = 1 ]; then
-    bad exit "a module that never allocates took ${el}s to leave"
+  if [ "$(perl -e "print(($el - $plain > 2.0) ? 1 : 0)")" = 1 ]; then
+    bad exit "a module that never allocates took ${el}s to leave, ${plain}s without the round driver"
   fi
   grep -q "  rounds: " "$WORK/exit.log" ||
     bad exit "the round driver never ran"

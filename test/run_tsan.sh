@@ -32,7 +32,13 @@ BUILD=${BUILD:-build}
 # the row failed on one of four full runs with SIGALRM, which reads exactly like
 # a race report when it is nothing of the kind.  The alarm is still here for the
 # thing it is worth having, a pool that wedges rather than one that is slow.
-: "${WARMC_TIMEOUT:=${TSAN_TIMEOUT:-60}}"
+#
+# A caller's WARMC_TIMEOUT is sized for the plain build, and under the thread
+# sanitizer the compiler runs five to fifteen times slower, so it is given five
+# times over: CI's 120s was spent on one of these by a nightly macOS runner,
+# three cores under run_all.sh's fan-out, while 400 runs here, eight at once,
+# never passed 10s.  TSAN_TIMEOUT still names the budget outright.
+WARMC_TIMEOUT=${TSAN_TIMEOUT:-$(( ${WARMC_TIMEOUT:-12} * 5 ))}
 export WARMC_TIMEOUT
 
 . test/hostenv.sh
