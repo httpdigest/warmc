@@ -22,6 +22,8 @@ extern void GetSystemTimePreciseAsFileTime(u64 *ft);
 extern int ProcessPrng(u8 *buf, usz n);
 extern void *AddVectoredExceptionHandler(u32 first, long (*handler)(void *));
 extern u32 GetCurrentThreadId(void);
+/* the calling thread's reserved stack, for a DLL's stack limit (lib.c) */
+extern void GetCurrentThreadStackLimits(uptr *low, uptr *high);
 extern void *CreateThread(void *attr, usz stack, u32 (*fn)(void *), void *arg,
                           u32 flags, u32 *tid);
 extern int CloseHandle(void *h);
@@ -169,7 +171,7 @@ static void win_cpuid(u32 leaf, u32 sub, u32 *o) {
                    : "a"(leaf), "c"(sub));
 }
 
-static void warmc_win_check_isa(void) {
+static int warmc_win_isa_ok(void) {
   u32 r[4];
   win_cpuid(1, 0, r);
   u32 need1 = (1u << 27) | (1u << 28) | (1u << 12);   /* OSXSAVE, AVX, FMA */
@@ -184,7 +186,11 @@ static void warmc_win_check_isa(void) {
     __asm__ volatile("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
     ok = (lo & 6) == 6;                               /* XMM and YMM state */
   }
-  if (!ok) {
+  return ok;
+}
+
+static void warmc_win_check_isa(void) {
+  if (!warmc_win_isa_ok()) {
     eputs("warmc-rt: this executable needs an x86-64-v3 CPU "
           "(AVX2, BMI2, FMA)\n");
     sys_exit(1);

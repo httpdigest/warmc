@@ -1120,6 +1120,12 @@ static void emit_prologue(Isel *s, Buf *b) {
   int list[NCS_GPR];
   int n = cs_gpr_list(s, list);
   for (int i = 0; i < n; i++) x64_push(b, list[i]);
+  /* A page at a time from the top, so that each touch meets the guard page
+     the last one moved down; RAX is free until the stack check below. */
+  if (g_stack_probes)
+    for (uint32_t off = 4096; off - 4096 < s->frame && s->frame >= 4096; off += 4096)
+      x64_load32(b, TMP0, X_RSP, X64_NOIDX, 0,
+                 -(int32_t)(off < s->frame ? off : s->frame));
   if (s->frame) x64_sub_ri(b, 1, X_RSP, (int32_t)s->frame);
 
   int fl[8];

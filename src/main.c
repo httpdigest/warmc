@@ -114,6 +114,18 @@ static const char *usage_text =
   "                deterministic.  Unrelated to the bare --profile above,\n"
   "                which is warmc's own instruction counter\n"
   "  -c            emit a relocatable object and stop\n"
+  "  --shared      build a shared library (.dylib, .so, .dll) that other\n"
+  "                programs call through their C FFI: each exported function\n"
+  "                of i32, i64, f32 and f64 becomes a C function of its name,\n"
+  "                and a header declares them with the library's helpers\n"
+  "                PREFIX_last_trap, _trap_name, _memory and _bind_import.\n"
+  "                PREFIX is --symbol-prefix, or the output's name less any\n"
+  "                lib and extension.  Imports must be functions, which the\n"
+  "                loading program binds before its first call\n"
+  "  --header PATH where --shared writes the header (default PREFIX.h beside\n"
+  "                the library).  A Windows library also gets PREFIX.def\n"
+  "                beside it, which `lib /def:` or `llvm-dlltool -d` makes an\n"
+  "                import library of\n"
   "  --target T    linux (ELF, default), macos (Mach-O) or windows (PE,\n"
   "                x64; default output a.exe).  With --system-ld the macOS\n"
   "                link needs libSystem, found through\n"
@@ -188,6 +200,36 @@ static const char *macos_libdir(void) {
 #endif
 }
 
+/* The prefix of a --shared library's helpers: --symbol-prefix, or the
+   output's file name less a leading lib and its extensions, as C. */
+static void shared_prefix(const char *given, const char *output, char *out,
+                          size_t cap) {
+  const char *b = given;
+  size_t n;
+  if (b) {
+    n = strlen(b);
+  } else {
+    b = strrchr(output, '/');
+#ifdef _WIN32
+    const char *bs = strrchr(output, '\\');
+    if (bs && (!b || bs > b)) b = bs;
+#endif
+    b = b ? b + 1 : output;
+    if (!strncmp(b, "lib", 3) && b[3] && b[3] != '.') b += 3;
+    n = strcspn(b, ".");
+  }
+  size_t k = 0;
+  if (n && b[0] >= '0' && b[0] <= '9' && k + 1 < cap) out[k++] = '_';
+  for (size_t i = 0; i < n && k + 1 < cap; i++) {
+    char c = b[i];
+    bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+              (c >= '0' && c <= '9') || c == '_';
+    out[k++] = ok ? c : '_';
+  }
+  if (!k) { snprintf(out, cap, "lib"); return; }
+  out[k] = 0;
+}
+
 static uint8_t *read_file(const char *path, size_t *len_out) {
   FILE *f = fopen(path, "rb");
   if (!f) warmc_fatal("cannot open %s", path);
@@ -216,6 +258,8 @@ int main(int argc, char **argv) {
   bool want_wasi = false;
   bool obj_only = false, keep_obj = false, verbose = false, validate_only = false;
   bool dead_strip = true;
+  bool shared = false;
+  const char *header = NULL, *sym_prefix = NULL;
 
   bool system_ld = warmc_getenv("WARMC_SYSTEM_LD") != NULL;
   bool dump_component = false, dump_wit = false, emit_wasm = false;
@@ -278,7 +322,10 @@ int main(int argc, char **argv) {
     else if (!strcmp(a, "--no-dead-strip")) dead_strip = false;
     else if (!strcmp(a, "--no-export-names")) g_no_export_names = true;
     else if (!strcmp(a, "-fno-loadbar")) codegen_set_load_barrier(false);
-    else if (!strncmp(a, "--symbol-prefix=", 16)) codegen_set_symbol_prefix(a + 16);
+    else if (!strncmp(a, "--symbol-prefix=", 16)) sym_prefix = a + 16;
+    else if (!strcmp(a, "--shared")) shared = true;
+    else if (!strncmp(a, "--header=", 9)) header = a + 9;
+    else if (!strcmp(a, "--header") && i + 1 < argc) header = argv[++i];
     else if (!strncmp(a, "--target=", 9)) target = a + 9;
     else if (!strncmp(a, "--rt=", 5)) rt = a + 5;
     else if (!strncmp(a, "--ld=", 5)) { ld = a + 5; system_ld = true; }
@@ -399,6 +446,14 @@ int main(int argc, char **argv) {
     else input = a;
   }
   if (!input) { fputs(usage_text, stderr); return 2; }
+  /* A library's runtime finds its module as warmc_module; the prefix names
+     the library's C helpers instead. */
+  if (sym_prefix && !shared) codegen_set_symbol_prefix(sym_prefix);
+  if (shared && want_wasi)
+    warmc_fatal("--shared and --wasi: a library's imports are bound by the "
+                "program that loads it, so there is no wasi host to link");
+  if (shared && g_no_export_names)
+    warmc_fatal("--shared needs the export names --no-export-names drops");
 
   TargetFmt fmt = TGT_ELF;
   if (!strcmp(target, "macos") || !strcmp(target, "darwin")) fmt = TGT_MACHO;
@@ -444,6 +499,9 @@ int main(int argc, char **argv) {
 
   if (wasm_is_component(bin, len)) {
 
+    if (shared)
+      warmc_fatal("--shared: %s is a component; only a core module can be "
+                  "built as a library so far", input);
     if (g_no_export_names)
       warmc_fatal("--no-export-names: %s is a component, and a component binds "
                   "one instance to another by export name", input);
@@ -515,7 +573,7 @@ int main(int argc, char **argv) {
                    _t1 - _t0, _t2 - _t1, peak_rss_mb());
   if (validate_only) { module_free(m); xfree(bin); return 0; }
 
-  if (!obj_only && !want_wasi)
+  if (!obj_only && !want_wasi && !shared)
     for (uint32_t i = 0; i < m->nimports; i++) {
       const Import *im = &m->imports[i];
       if (im->module_len == 22 &&
@@ -526,9 +584,26 @@ int main(int argc, char **argv) {
                     input, (int)im->name_len, im->name);
     }
 
+  char libout[4096], prefix[256];
+  Shlib *lib = NULL;
+  if (shared) {
+    if (!output) {
+      const char *b = strrchr(input, '/');
+      b = b ? b + 1 : input;
+      size_t n = strcspn(b, ".");
+      snprintf(libout, sizeof libout, "%s%.*s%s", fmt == TGT_PE ? "" : "lib",
+               (int)n, b, macho ? ".dylib" : fmt == TGT_PE ? ".dll" : ".so");
+      output = libout;
+    }
+    shared_prefix(sym_prefix, output, prefix, sizeof prefix);
+    lib = shlib_plan(m, prefix, input);
+    if (fmt == TGT_PE) g_stack_probes = true;
+  }
+
   ObjBuilder o;
   memset(&o, 0, sizeof o);
   compile_module(m, &o, &opt);
+  if (lib) shlib_emit(lib, &o);
   STAMP(_t3);
   if (wtm) fprintf(stderr, "front: compile_module total %.1f (peak %.0f MB)\n",
                    _t3 - _t2, peak_rss_mb());
@@ -628,6 +703,38 @@ int main(int argc, char **argv) {
   if (macho) write_macho64(&o, objpath);
   else if (fmt == TGT_PE) write_coff64(&o, objpath);
   else write_elf64(&o, objpath);
+
+  if (lib) {
+    char hdr[4096];
+    if (!header) {
+      const char *slash = strrchr(output, '/');
+      snprintf(hdr, sizeof hdr, "%.*s%s.h",
+               slash ? (int)(slash - output + 1) : 0, output, prefix);
+      header = hdr;
+    }
+    shlib_write_header(lib, header, output);
+    if (fmt == TGT_PE) {
+      char def[4096];
+      const char *slash = strrchr(output, '/');
+      snprintf(def, sizeof def, "%.*s%s.def",
+               slash ? (int)(slash - output + 1) : 0, output, prefix);
+      shlib_write_def(lib, def, output);
+    }
+    if (!obj_only) {
+      if (!rt) warmc_fatal("no runtime specified; pass --rt or set WARMC_RT");
+      if (system_ld)
+        warmc_fatal("--shared links with the built-in linker only");
+      uint32_t nsyms;
+      char **syms = shlib_symbols(lib, &nsyms);
+      warmc_link_shared(fmt, output, objpath, rt, syms, nsyms, dead_strip);
+      xfree(syms);
+      if (!keep_obj) remove(objpath);
+    }
+    shlib_free(lib);
+    module_free(m);
+    xfree(bin);
+    return 0;
+  }
 
   if (obj_only) return 0;
 

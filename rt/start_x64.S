@@ -1,8 +1,10 @@
 /* x64 Windows assembly support.  The PE entry point is warmc_win_entry (plain
    C in rt.c via win.inc), so this file carries only what cannot be C:
 
-   - __chkstk stubs: generated and runtime code never probes, because the PE
-     header commits the whole 8 MiB stack up front (reserve == commit).
+   - __chkstk, which clang calls for a runtime frame over a page.  A
+     program's stack is committed whole (reserve == commit), but a DLL's
+     runtime runs on its host's threads, whose stacks grow a guard page at
+     a time, so the pages are touched in order.
    - warmc_setjmp/warmc_longjmp over the Win64 callee-saved set.
    - the throw/GC entries, which capture or restore the exact register state
      of compiled wasm code.  The WarmRegs/GcCtx gpr index map is fixed by
@@ -14,12 +16,26 @@
 
     .text
 
+/* RAX bytes below the caller's stack pointer, a page at a time from the
+   top; every register is kept, RAX too, as the caller subtracts it next. */
     .globl ___chkstk_ms
-___chkstk_ms:
-    ret
-
     .globl __chkstk
+___chkstk_ms:
 __chkstk:
+    pushq  %rcx
+    pushq  %rax
+    leaq   24(%rsp), %rcx
+    cmpq   $0x1000, %rax
+    jb     2f
+1:  subq   $0x1000, %rcx
+    orq    $0, (%rcx)
+    subq   $0x1000, %rax
+    cmpq   $0x1000, %rax
+    ja     1b
+2:  subq   %rax, %rcx
+    orq    $0, (%rcx)
+    popq   %rax
+    popq   %rcx
     ret
 
 /* jmpbuf layout (fits g_catch_buf's u64[32]):
