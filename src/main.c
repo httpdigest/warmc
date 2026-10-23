@@ -51,10 +51,10 @@ static const char *usage_text =
   "  -f[no-]PASS   enable or disable one pass: fold, dce, cse, licm, branch,\n"
   "                thread, nodesplit, mem, bce, strength, inline, reassoc,\n"
   "                rotate, addroff, memptr, align, regalloc, guard-pages,\n"
-  "                vectorize, unroll, selftail, ldcomb, escape, partial-escape,\n"
-  "                gloop, gssa, loopclose, cpool, reach, prune, merge, devirt,\n"
-  "                reinline, throw-jump, closed-world, gcpure, split, labcache,\n"
-  "                barelide, small-loop-align\n"
+  "                vectorize, edge-tests, unroll, selftail, ldcomb, escape,\n"
+  "                partial-escape, gloop, gssa, loopclose, cpool, reach, prune,\n"
+  "                merge, devirt, reinline, throw-jump, closed-world, gcpure,\n"
+  "                split, labcache, barelide, small-loop-align\n"
   "                The last two are the passes built on a loop containing\n"
   "                no safepoint, which is the only assumption the compiler\n"
   "                makes about the collector: turning them off says whether\n"
@@ -284,6 +284,7 @@ int main(int argc, char **argv) {
   opt.regalloc = true;
   opt.split = true;
   opt.vectorize = true;
+  opt.edgetests = true;
   opt.selftail = true;
   opt.ldcomb = true;
   opt.escape = true;
@@ -419,6 +420,7 @@ int main(int argc, char **argv) {
       else if (!strcmp(name, "regalloc")) opt.regalloc = on;
       else if (!strcmp(name, "split")) opt.split = on;
       else if (!strcmp(name, "vectorize")) opt.vectorize = on;
+      else if (!strcmp(name, "edge-tests")) opt.edgetests = on;
       else if (!strcmp(name, "selftail")) opt.selftail = on;
       else if (!strcmp(name, "ldcomb")) opt.ldcomb = on;
       else if (!strcmp(name, "escape")) opt.escape = on;

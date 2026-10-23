@@ -694,6 +694,9 @@ int main(int argc, char **argv) {
   CASE("umlal v0.2d, v1.2s, v2.2s", a64_vumlal(b, 0, 2, 0, 1, 2));
   CASE("umlal2 v3.2d, v4.4s, v5.4s", a64_vumlal(b, 1, 2, 3, 4, 5));
   CASE("rev64 v6.4s, v7.4s", a64_vrev64(b, 2, 6, 7));
+  CASE("rev64 v1.16b, v2.16b", a64_vrev64(b, 0, 1, 2));
+  CASE("rev32 v3.16b, v4.16b", a64_vrev32(b, 0, 3, 4));
+  CASE("rev16 v5.16b, v6.16b", a64_vrev16(b, 5, 6));
   CASE("xtn v8.2s, v9.2d", a64_vxtn(b, 0, 2, 8, 9));
   CASE("xtn2 v10.4s, v11.2d", a64_vxtn(b, 1, 2, 10, 11));
 

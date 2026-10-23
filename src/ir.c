@@ -1174,7 +1174,7 @@ bool ir_is_pure(const Inst *in) {
     case I_VFNEG: case I_VFABS: case I_VFSQRT:
     case I_VSPLAT: case I_VREDUCE:
     case I_VNOT: case I_VANDNOT:
-    case I_VNEG: case I_VABS: case I_VPOPCNT:
+    case I_VNEG: case I_VABS: case I_VPOPCNT: case I_VREV:
     case I_VADDSATS: case I_VADDSATU: case I_VSUBSATS: case I_VSUBSATU:
     case I_VAVGRU: case I_VQ15MULR: case I_VDOT:
     case I_VEXTADD: case I_VEXTMUL: case I_VEXTEND: case I_VNARROW:
@@ -1294,6 +1294,7 @@ const char *ir_op_name(uint16_t op) {
     N(I_VSPLAT, "vsplat"), N(I_VREDUCE, "vreduce"),
     N(I_VNOT, "vnot"), N(I_VANDNOT, "vandnot"),
     N(I_VNEG, "vneg"), N(I_VABS, "vabs"), N(I_VPOPCNT, "vpopcnt"),
+    N(I_VREV, "vrev"),
     N(I_VADDSATS, "vaddsats"), N(I_VADDSATU, "vaddsatu"),
     N(I_VSUBSATS, "vsubsats"), N(I_VSUBSATU, "vsubsatu"),
     N(I_VAVGRU, "vavgru"), N(I_VQ15MULR, "vq15mulr"), N(I_VDOT, "vdot"),
@@ -1398,7 +1399,7 @@ static uint32_t ir_vec_arity(uint16_t op) {
     case I_VLOAD: case I_VSPLAT: case I_VREDUCE:
     case I_VSHL: case I_VSHRU: case I_VSHRS:
     case I_VFNEG: case I_VFABS: case I_VFSQRT:
-    case I_VNOT: case I_VNEG: case I_VABS: case I_VPOPCNT:
+    case I_VNOT: case I_VNEG: case I_VABS: case I_VPOPCNT: case I_VREV:
     case I_VEXTADD: case I_VEXTEND:
     case I_VANYTRUE: case I_VALLTRUE:
     case I_VEXTRACTS: case I_VEXTRACTU:

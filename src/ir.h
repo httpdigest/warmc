@@ -77,6 +77,9 @@ typedef enum {
 
   I_VNOT, I_VANDNOT,
   I_VNEG, I_VABS, I_VPOPCNT,
+  /* the bytes of each lane (imm2) reversed: a lane's bswap, which only the
+     vectoriser makes -- wasm has no instruction for it */
+  I_VREV,
   I_VADDSATS, I_VADDSATU, I_VSUBSATS, I_VSUBSATU,
   I_VAVGRU,
   I_VQ15MULR,
@@ -375,6 +378,7 @@ typedef struct {
   bool regalloc;
   bool split;      /* cut a spilled loop web where the loop meets the rest */
   bool vectorize;
+  bool edgetests;  /* tests a dominating branch decided, before vectorize */
   bool selftail;
   bool ldcomb;
   bool escape;

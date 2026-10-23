@@ -1192,7 +1192,7 @@ static void emit_inst(Isel *s, Ref v) {
 
     case I_VSHL: case I_VSHRU: case I_VSHRS:
     case I_VFNEG: case I_VFABS: case I_VFSQRT:
-    case I_VNOT: case I_VNEG: case I_VABS: case I_VPOPCNT:
+    case I_VNOT: case I_VNEG: case I_VABS: case I_VPOPCNT: case I_VREV:
     case I_VEXTADD: case I_VEXTEND:
     case I_VFCEIL: case I_VFFLOOR: case I_VFTRUNC: case I_VFNEAREST:
     case I_VDEMOTE: case I_VPROMOTE: {
@@ -1211,6 +1211,12 @@ static void emit_inst(Isel *s, Ref v) {
         case I_VNEG:   a64_vneg(B, sz, d, x); break;
         case I_VABS:   a64_vabs(B, sz, d, x); break;
         case I_VPOPCNT: a64_vcnt(B, d, x); break;
+        /* bytes reversed within each halfword, word or doubleword */
+        case I_VREV:
+          if (sz == 1) a64_vrev16(B, d, x);
+          else if (sz == 2) a64_vrev32(B, 0, d, x);
+          else a64_vrev64(B, 0, d, x);
+          break;
         case I_VEXTADD:
           if (in->imm & 1) a64_vsaddlp(B, sz - 1, d, x);
           else a64_vuaddlp(B, sz - 1, d, x);
