@@ -1669,7 +1669,7 @@ static void emit_inst(Isel *s, Ref v) {
     /* One-operand SIMD.  Only a[0] is read, so F1/F2/FTMP are all free. */
     case I_VSHL: case I_VSHRU: case I_VSHRS:
     case I_VFNEG: case I_VFABS: case I_VFSQRT:
-    case I_VNOT: case I_VNEG: case I_VABS: case I_VPOPCNT:
+    case I_VNOT: case I_VNEG: case I_VABS: case I_VPOPCNT: case I_VREV:
     case I_VEXTADD: case I_VEXTEND:
     case I_VFCEIL: case I_VFFLOOR: case I_VFTRUNC: case I_VFNEAREST:
     case I_VDEMOTE: case I_VPROMOTE:
@@ -1729,6 +1729,19 @@ static void emit_inst(Isel *s, Ref v) {
           res = wr(s, v, FTMP);
           x64_vpadd(B, 0, res, F2, F1);
           break;
+        case I_VREV: {
+          /* one vpshufb whose index names, for each byte, its mirror in
+             the same lane */
+          uint64_t m[2] = { 0, 0 };
+          int lb = 1 << sz;
+          for (int i = 0; i < 16; i++)
+            m[i >> 3] |= (uint64_t)((i & ~(lb - 1)) + (lb - 1 - (i & (lb - 1))))
+                         << (8 * (i & 7));
+          vconst(s, FTMP, m[0], m[1]);
+          res = wr(s, v, F1);
+          x64_vpshufb(B, res, x, FTMP);
+          break;
+        }
         case I_VEXTADD: {
           bool sgn = (in->imm & 1) != 0;
           if (sz == 1) {

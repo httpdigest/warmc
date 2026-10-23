@@ -3742,6 +3742,138 @@ static bool pass_branch(IrFunc *f) {
   return changed;
 }
 
+/* ---- tests a dominating branch has decided ------------------------------
+
+   A block with one predecessor, which reaches it on one arm of a two-way
+   branch, runs only where that branch's condition had the arm's value, and
+   so does every block it dominates: the last time the branch ran before
+   them it took that arm, and no value the condition read has been made
+   again since.  A test there of the same value against a constant is then
+   often known.  Rotation leaves exactly that behind a loop whose body was
+   inlined with its lengths constant: rsbench's f32ops loop continues on
+   i != 2047 and then checks i + 1 == 2048 against each slice's length, a
+   bounds check that can never fail, twice, and those two exits out of the
+   body were all that kept the loop from the vectoriser. */
+#define ET_DEPTH 8
+
+/* eq, ne or eqz of a value, or of the value plus or minus a constant,
+   against a constant: a test of whether *x is *k, mod 2^n, for equality
+   when *eq. */
+static bool et_form(IrFunc *f, Ref v, Ref *x, uint64_t *k, bool *eq) {
+  Inst *in = &f->insts[v];
+  uint64_t c, d;
+  Ref y;
+  if (in->op == I_EQZ && in->nargs == 1) {
+    y = ir_args(f, v)[0];
+    c = 0;
+    *eq = true;
+  } else if ((in->op == I_EQ || in->op == I_NE) && in->nargs == 2) {
+    Ref *a = ir_args(f, v);
+    if (is_const(f, a[1], &c)) y = a[0];
+    else if (is_const(f, a[0], &c)) y = a[1];
+    else return false;
+    *eq = in->op == I_EQ;
+  } else {
+    return false;
+  }
+  ValType t = (ValType)f->insts[y].type;
+  if (t != VT_I32 && t != VT_I64) return false;
+  Inst *yi = &f->insts[y];
+  if ((yi->op == I_ADD || yi->op == I_SUB) && yi->nargs == 2 &&
+      is_const(f, ir_args(f, y)[1], &d)) {
+    c = yi->op == I_ADD ? c - d : c + d;
+    y = ir_args(f, y)[0];
+  }
+  *x = y;
+  *k = trunc_to(t, c);
+  return true;
+}
+
+/* The condition the branch into b decided, and *truth its value there, or
+   REF_NONE when b is not one arm of a two-way branch it alone reaches. */
+static Ref et_edge_fact(IrFunc *f, uint32_t b, bool *truth) {
+  const Block *bb = &f->blocks[b];
+  if (bb->npreds != 1 || bb->is_pad || bb->preds[0] == b) return REF_NONE;
+  const Block *pb = &f->blocks[bb->preds[0]];
+  if (pb->term != T_BRIF || pb->nsuccs != 2 ||
+      pb->succs[0].target == pb->succs[1].target ||
+      pb->succs[0].eh || pb->succs[1].eh)
+    return REF_NONE;
+  *truth = pb->succs[0].target == b;
+  return pb->term_arg;
+}
+
+/* v's value where c is truth: 0 or 1, or -1 for either. */
+static int et_decide(IrFunc *f, Ref v, Ref c, bool truth) {
+  if (v == c) return truth;
+  if (f->insts[v].op == I_EQZ && f->insts[v].nargs == 1 && ir_args(f, v)[0] == c)
+    return !truth;
+  Ref xv, xc;
+  uint64_t kv, kc;
+  bool ev, ec;
+  if (!et_form(f, v, &xv, &kv, &ev) || !et_form(f, c, &xc, &kc, &ec) || xv != xc)
+    return -1;
+  if (ec == truth) return ev == (kv == kc);
+  if (kv == kc) return !ev;
+  return -1;
+}
+
+/* v's value throughout block b, as the branches into the blocks that
+   dominate it decided it, or -1. */
+static int et_known(IrFunc *f, uint32_t b, Ref v) {
+  uint32_t d = b;
+  for (int step = 0; step < ET_DEPTH; step++) {
+    bool truth;
+    Ref c = et_edge_fact(f, d, &truth);
+    if (c != REF_NONE) {
+      int r = et_decide(f, v, c, truth);
+      if (r >= 0) return r;
+    }
+    uint32_t up = f->blocks[d].idom;
+    if (up == REF_NONE || up == d) break;
+    d = up;
+  }
+  return -1;
+}
+
+/* A test decided where it is made becomes its constant, and a branch on
+   one decided where the branch is goes the one way; pass_branch removes
+   what that leaves.  Only edges that never run go, so what the walk read of
+   the others stays true while it changes them.  Loops only: it is there for
+   the vectoriser. */
+static bool pass_edge_tests(IrFunc *f) {
+  bool changed = false;
+  for (uint32_t oi = 0; oi < f->norder; oi++) {
+    uint32_t bi = f->order[oi];
+    Block *b = &f->blocks[bi];
+    if (!b->loop_depth) continue;
+    for (uint32_t i = 0; i < b->ninsts; i++) {
+      Ref v = b->insts[i];
+      uint16_t op = f->insts[v].op;
+      if (op != I_EQ && op != I_NE && op != I_EQZ) continue;
+      int r = et_known(f, bi, v);
+      if (r < 0) continue;
+      replace_with_const(f, v, (uint64_t)r);
+      g_stats.folded++;
+      changed = true;
+    }
+    if (b->term == T_BRIF && b->nsuccs == 2 && !ir_block_has_eh(f, bi)) {
+      int r = et_known(f, bi, b->term_arg);
+      if (r < 0) continue;
+      b->succs[0] = b->succs[r ? 0 : 1];
+      b->nsuccs = 1;
+      b->term = T_JUMP;
+      g_stats.branch_simplified++;
+      changed = true;
+    }
+  }
+  if (changed) {
+    ir_recompute_preds(f);
+    ir_order(f);
+  }
+  return changed;
+}
+
 /* Jump threading through a dispatch block.  Go's back end compiles every
    function to a loop around a br_table over the function's resume points,
    and sends each jump inside the function -- a loop's back edge among them --
@@ -11293,27 +11425,77 @@ static bool v_fits_lane(IrFunc *f, Ref v, uint32_t lane) {
   return v_fits_lane_d(f, v, lane, VEC_DEPTH);
 }
 
+/* v is the lane's signed value, sign-extended: a signed load as narrow as
+   the lane, a sign extension from it, or a constant in its range. */
+static bool v_fits_lane_signed(IrFunc *f, Ref v, uint32_t lane) {
+  const Inst *in = &f->insts[v];
+  uint32_t bits = 8u << (uint32_t)VLANE_SIZE(lane);
+  if (bits >= 64) return true;
+  if (in->op == I_CONST) {
+    int64_t x = vt_is_64((ValType)in->type) ? (int64_t)in->imm
+                                            : (int64_t)(int32_t)(uint32_t)in->imm;
+    return x >= -(1ll << (bits - 1)) && x < (1ll << (bits - 1));
+  }
+  if (in->op == I_LOAD && (in->imm2 & MEMF_SIGNED) &&
+      MEMF_SIZE(in->imm2) <= (uint32_t)VLANE_SIZE(lane))
+    return true;
+  return (in->op == I_EXT8S && bits >= 8) || (in->op == I_EXT16S && bits >= 16);
+}
+
+/* The integer lane of a value carried narrower than its type, in a loop
+   whose accesses are w bytes wide. */
+static uint32_t v_int_lane(uint32_t w) {
+  return w == 1 ? VLANE_I8 : w == 2 ? VLANE_I16 : w == 4 ? VLANE_I32 : VLANE_I64;
+}
+
+static bool v_is_fcmp(uint16_t op) {
+  return op == I_FEQ || op == I_FNE || op == I_FLT || op == I_FGT ||
+         op == I_FLE || op == I_FGE;
+}
+
+/* The mask of a tuple of compares, for a value in c->lane.  An integer
+   compare is made in that lane's integer form (an f32 select on i32 compares
+   compares 32-bit lanes); a float compare in its operands' lane, which must
+   be as wide: NEON's and SSE's compares are wasm's lane by lane, unordered
+   operands included, so an f32 compare can choose between i32 values -- the
+   bounds tests TinyGo puts around a saturating conversion -- but nothing
+   narrower. */
 static Ref v_mask(VecCtx *c, const Ref *tuple, uint32_t k, uint32_t st, int depth,
                   bool *swap_arms) {
   IrFunc *f = c->f;
   uint16_t op0 = f->insts[tuple[0]].op;
   uint64_t vop;
   bool swap_ops;
-  if (!v_cmp_form(op0, &vop, &swap_ops, swap_arms)) return REF_NONE;
+  bool fcmp = v_is_fcmp(op0);
+  if (fcmp) {
+    /* ne is not eq, unordered operands included, so it is eq's mask with
+       the arms the other way round, as for integers */
+    vop = op0 == I_FNE ? I_FEQ : op0;
+    swap_ops = false;
+    *swap_arms = op0 == I_FNE;
+  } else if (!v_cmp_form(op0, &vop, &swap_ops, swap_arms)) {
+    return REF_NONE;
+  }
   for (uint32_t j = 0; j < k; j++) {
     Inst *ij = &f->insts[tuple[j]];
     if (ij->op != op0 || ij->nargs != 2 || !c->inloop[ij->block]) return REF_NONE;
   }
 
   ValType ct = (ValType)f->insts[ir_args(f, tuple[0])[0]].type;
-  if (VLANE_IS_FLOAT(c->lane)) return REF_NONE;
-  if (v_lane_of(ct) != c->lane) {
+  uint32_t ml;
+  if (fcmp) {
+    ml = v_lane_of(ct);
+    if (!vt_is_float(ct) || VLANE_SIZE(ml) != VLANE_SIZE(c->lane)) return REF_NONE;
+  } else {
+    ml = VLANE_IS_FLOAT(c->lane) ? c->lane - VLANE_F32 + VLANE_I32 : c->lane;
+    if (v_lane_of(ct) != ml) {
 
-    if (op0 != I_EQ && op0 != I_NE) return REF_NONE;
-    for (uint32_t j = 0; j < k; j++) {
-      const Ref *aj = ir_args(f, tuple[j]);
-      if (!v_fits_lane(f, aj[0], c->lane) || !v_fits_lane(f, aj[1], c->lane))
-        return REF_NONE;
+      if (op0 != I_EQ && op0 != I_NE) return REF_NONE;
+      for (uint32_t j = 0; j < k; j++) {
+        const Ref *aj = ir_args(f, tuple[j]);
+        if (!v_fits_lane(f, aj[0], ml) || !v_fits_lane(f, aj[1], ml))
+          return REF_NONE;
+      }
     }
   }
   Ref sub[VEC_MAX_MEMB], x, y;
@@ -11323,7 +11505,140 @@ static Ref v_mask(VecCtx *c, const Ref *tuple, uint32_t k, uint32_t st, int dept
   for (uint32_t j = 0; j < k; j++) sub[j] = ir_args(f, tuple[j])[swap_ops ? 0 : 1];
   y = v_build(c, sub, k, st, depth - 1);
   if (y == REF_NONE) return REF_NONE;
-  return vemit(f, c->vbody, I_VCMP, VT_V128, x, y, vop, c->lane);
+  return vemit(f, c->vbody, I_VCMP, VT_V128, x, y, vop, ml);
+}
+
+/* The unsigned saturating add and subtract of a narrow lane, as a producer
+   without SIMD writes them in the wider type, where nothing wraps: x + y
+   with a min against the lane's top -- TinyGo's s := a + b; if s < a
+   { s = 255 } on bytes arrives as select(255, s, s >=u 255) on the sum of
+   two load8_u -- and x - y with a signed max against zero, or taken only
+   where x >= y and zero elsewhere.  Each is exact when x and y fit the lane
+   unsigned: the sum is at most twice the top and the difference at least
+   minus it, so the clamp is the saturation, and a compare of x with y sees
+   the lanes' own values, signed or not.  The lane's UQADD or UQSUB, then;
+   *x and *y are the operands. */
+static IrOp v_mirror(IrOp op);
+
+static IrOp v_sat_form(IrFunc *f, Ref sel, uint32_t lane, Ref *x, Ref *y) {
+  Inst *in = &f->insts[sel];
+  if (in->op != I_SELECT || in->nargs != 3) return I_NOP;
+  Ref *a = ir_args(f, sel);
+  uint32_t bits = 8u << (uint32_t)VLANE_SIZE(lane);
+  uint64_t top = (1ull << bits) - 1, cv;
+  IrOp mm = v_minmax_of(f, sel);
+  for (uint32_t s = 0; s < 2; s++) {
+    if (!is_const(f, a[s], &cv)) continue;
+    Ref o = a[s ^ 1];
+    Inst *oi = &f->insts[o];
+    if ((oi->op != I_ADD && oi->op != I_SUB) || oi->nargs != 2) continue;
+    Ref *oa = ir_args(f, o);
+    IrOp op = I_NOP;
+    if (oi->op == I_ADD && cv == top && (mm == I_VUMIN || mm == I_VSMIN)) {
+      op = I_VADDSATU;
+    } else if (oi->op == I_SUB && cv == 0 && mm == I_VSMAX) {
+      op = I_VSUBSATU;
+    } else if (oi->op == I_SUB && cv == 0) {
+      Inst *ci = &f->insts[a[2]];
+      if (ci->nargs != 2) continue;
+      Ref *ca = ir_args(f, a[2]);
+      IrOp r;
+      if (ca[0] == oa[0] && ca[1] == oa[1]) r = (IrOp)ci->op;
+      else if (ca[0] == oa[1] && ca[1] == oa[0]) r = v_mirror((IrOp)ci->op);
+      else continue;
+      bool below;
+      switch (r) {
+        case I_LTU: case I_LEU: case I_LTS: case I_LES: below = true; break;
+        case I_GTU: case I_GEU: case I_GTS: case I_GES: below = false; break;
+        default: continue;
+      }
+      /* the zero is the arm taken where x is below y */
+      if (below != (s == 0)) continue;
+      op = I_VSUBSATU;
+    }
+    if (op == I_NOP) continue;
+    if (!v_fits_lane(f, oa[0], lane) || !v_fits_lane(f, oa[1], lane)) continue;
+    *x = oa[0];
+    *y = oa[1];
+    return op;
+  }
+  /* The signed forms: x + y or x - y clamped to the lane's signed range by
+     a min and a max, either way round, which is how Zig's +| on i16 comes
+     out.  Exact for x and y the lane's signed values, for the same reasons:
+     the sum or difference is within twice the range, and the clamp is the
+     saturation.  SQADD and SQSUB. */
+  if (mm != I_VSMIN && mm != I_VSMAX) return I_NOP;
+  bool w64 = vt_is_64((ValType)in->type);
+  int64_t lo = -(1ll << (bits - 1)), hi = (1ll << (bits - 1)) - 1;
+  for (uint32_t s = 0; s < 2; s++) {
+    if (!is_const(f, a[s], &cv)) continue;
+    int64_t outer = w64 ? (int64_t)cv : (int64_t)(int32_t)(uint32_t)cv;
+    if (outer != (mm == I_VSMIN ? hi : lo)) continue;
+    Ref inner = a[s ^ 1];
+    if (f->insts[inner].op != I_SELECT ||
+        v_minmax_of(f, inner) != (mm == I_VSMIN ? I_VSMAX : I_VSMIN))
+      continue;
+    Ref *ia = ir_args(f, inner);
+    for (uint32_t t = 0; t < 2; t++) {
+      if (!is_const(f, ia[t], &cv)) continue;
+      int64_t bound = w64 ? (int64_t)cv : (int64_t)(int32_t)(uint32_t)cv;
+      if (bound != (mm == I_VSMIN ? lo : hi)) continue;
+      Inst *oi = &f->insts[ia[t ^ 1]];
+      if ((oi->op != I_ADD && oi->op != I_SUB) || oi->nargs != 2) continue;
+      Ref *oa = ir_args(f, ia[t ^ 1]);
+      if (!v_fits_lane_signed(f, oa[0], lane) || !v_fits_lane_signed(f, oa[1], lane))
+        continue;
+      *x = oa[0];
+      *y = oa[1];
+      return oi->op == I_ADD ? I_VADDSATS : I_VSUBSATS;
+    }
+  }
+  return I_NOP;
+}
+
+/* The high half of a product a narrow lane cannot hold: (x * y) >> w, for
+   x and y of the lane's w bits and the shift the lane's width, which is
+   fixed-point code (mulhi16's uint16(uint32(a) * uint32(b) >> 16)).  Both
+   fit the lane unsigned, or both signed, so the product is exact in the
+   wider type, its bits w..2w-1 are the w bits kept whichever way it is
+   shifted, and those are what NEON's widening multiply of each half (UMULL
+   and UMULL2, or SMULL) puts in the odd lanes of the pair, which UZP2
+   gathers. */
+static Ref v_mulhi(VecCtx *c, const Ref *tuple, uint32_t k, uint32_t st, int depth) {
+  IrFunc *f = c->f;
+  if (c->lane != VLANE_I8 && c->lane != VLANE_I16) return REF_NONE;
+  uint32_t w = 8u << (uint32_t)VLANE_SIZE(c->lane);
+  uint16_t op0 = f->insts[tuple[0]].op;
+  if (op0 != I_SHRU && op0 != I_SHRS) return REF_NONE;
+  Ref xs[VEC_MAX_MEMB], ys[VEC_MAX_MEMB];
+  int sgn = -1;
+  for (uint32_t j = 0; j < k; j++) {
+    Inst *ij = &f->insts[tuple[j]];
+    uint64_t sh;
+    if (ij->op != op0 || ij->nargs != 2 || !c->inloop[ij->block] ||
+        !is_const(f, ir_args(f, tuple[j])[1], &sh) ||
+        (sh & (vt_is_64((ValType)ij->type) ? 63u : 31u)) != w)
+      return REF_NONE;
+    Ref m = ir_args(f, tuple[j])[0];
+    Inst *mi = &f->insts[m];
+    if (mi->op != I_MUL || mi->nargs != 2 || !c->inloop[mi->block]) return REF_NONE;
+    Ref *ma = ir_args(f, m);
+    int sj = (v_fits_lane(f, ma[0], c->lane) && v_fits_lane(f, ma[1], c->lane)) ? 0
+           : (v_fits_lane_signed(f, ma[0], c->lane) &&
+              v_fits_lane_signed(f, ma[1], c->lane)) ? 1 : -1;
+    if (sj < 0 || (j && sj != sgn)) return REF_NONE;
+    sgn = sj;
+    xs[j] = ma[0];
+    ys[j] = ma[1];
+  }
+  Ref x = v_build(c, xs, k, st, depth - 1);
+  if (x == REF_NONE) return REF_NONE;
+  Ref y = v_build(c, ys, k, st, depth - 1);
+  if (y == REF_NONE) return REF_NONE;
+  Ref lo = vemit(c->f, c->vbody, I_VEXTMUL, VT_V128, x, y, (uint64_t)sgn, c->lane + 1);
+  Ref hi = vemit(c->f, c->vbody, I_VEXTMUL, VT_V128, x, y, (uint64_t)sgn | 2u,
+                 c->lane + 1);
+  return vemit(c->f, c->vbody, I_VUZP2, VT_V128, lo, hi, VLANE_SIZE(c->lane), c->lane);
 }
 
 #define VBFAIL(w) do { if (!c->fail) c->fail = (w); return REF_NONE; } while (0)
@@ -11344,11 +11659,28 @@ static Ref v_build(VecCtx *c, const Ref *tuple, uint32_t k, uint32_t st, int dep
 
   bool narrow = c->width < v_natural_width(t);
 
+  /* A value takes the lane of its own type where the loop's lanes are its
+     natural width -- the f32 between cvtf32's i32 load and i32 store, the
+     i32 an f32 loop compares -- and the loop's integer lane where it is
+     carried narrower than its type.  The lanes are as wide either way, so
+     a vector holds as many of each; c->lane is the lane of the value being
+     built while it is built. */
+  uint32_t want = c->lane;
   if (narrow) {
     if (vt_is_float(t) || vt_is_ref(t) || t == VT_V128)
       VBFAIL("a narrow access of a type that has no narrow lane");
+    want = v_int_lane(c->width);
   } else if (v_lane_of(t) != c->lane) {
-    VBFAIL("value is not the loop's lane shape");
+    if (c->width != v_natural_width(t) || vt_is_ref(t) || t == VT_V128)
+      VBFAIL("value is not the loop's lane shape");
+    want = v_lane_of(t);
+  }
+  if (want != c->lane) {
+    uint32_t outer = c->lane;
+    c->lane = want;
+    Ref r = v_build(c, tuple, k, st, depth);
+    c->lane = outer;
+    return r;
   }
 
   Ref out = REF_NONE;
@@ -11392,7 +11724,8 @@ static Ref v_build(VecCtx *c, const Ref *tuple, uint32_t k, uint32_t st, int dep
   {
     uint64_t cvop;
     bool cswap_ops, cswap_arms;
-    if (v_cmp_form(op0, &cvop, &cswap_ops, &cswap_arms) && !vt_is_float(t)) {
+    if ((v_cmp_form(op0, &cvop, &cswap_ops, &cswap_arms) || v_is_fcmp(op0)) &&
+        !vt_is_float(t)) {
       Ref mask = v_mask(c, tuple, k, st, depth, &cswap_arms);
       if (mask == REF_NONE) return REF_NONE;
 
@@ -11450,7 +11783,9 @@ static Ref v_build(VecCtx *c, const Ref *tuple, uint32_t k, uint32_t st, int dep
 
   IrOp vop = I_NOP;
   bool flt = VLANE_IS_FLOAT(c->lane);
-  if (narrow && !v_narrow_safe(op0)) {
+  /* A select is as narrow as its arms, given a mask exact in the lane,
+     which v_mask makes sure of. */
+  if (narrow && !v_narrow_safe(op0) && op0 != I_SELECT) {
 
     bool ok = true;
     for (uint32_t j = 0; j < k && ok; j++) {
@@ -11458,7 +11793,11 @@ static Ref v_build(VecCtx *c, const Ref *tuple, uint32_t k, uint32_t st, int dep
       ok = ij->op == I_SHRU && ij->nargs == 2 &&
            v_fits_lane(f, ir_args(f, tuple[j])[0], c->lane);
     }
-    if (!ok) VBFAIL(ir_op_name(op0));
+    if (!ok) {
+      out = v_mulhi(c, tuple, k, st, depth);
+      if (out != REF_NONE) goto done;
+      VBFAIL(ir_op_name(op0));
+    }
   }
   switch (op0) {
     case I_ADD: if (!flt) vop = I_VADD; break;
@@ -11481,15 +11820,87 @@ static Ref v_build(VecCtx *c, const Ref *tuple, uint32_t k, uint32_t st, int dep
     case I_FMAX: if (flt) vop = I_VFMAX; break;
     case I_SHL: case I_SHRU: case I_SHRS:
     case I_ROTL: case I_ROTR: if (!flt) vop = (IrOp)op0; break;
+    /* REV16, REV32 or REV64 on bytes: bswap's lane form, one instruction
+       for four of bits.ReverseBytes32 (vecbench/bswap) where the scalar loop
+       has a REV each */
+    case I_BSWAP: if (!flt) vop = I_VREV; break;
     default: break;
   }
   if (op0 == I_SELECT) {
-
-    if (flt || narrow || c->width > 4) return REF_NONE;
-    vop = v_minmax_of(f, tuple[0]);
-    if (vop == I_NOP) VBFAIL(ir_op_name(op0));
-    for (uint32_t j = 1; j < k; j++)
-      if (v_minmax_of(f, tuple[j]) != vop) return REF_NONE;
+    Ref sub[VEC_MAX_MEMB];
+    /* NEON's and SSE's saturating forms are of bytes and halfwords only */
+    if (narrow && (c->lane == VLANE_I8 || c->lane == VLANE_I16)) {
+      Ref ys[VEC_MAX_MEMB];
+      IrOp sop = v_sat_form(f, tuple[0], c->lane, &sub[0], &ys[0]);
+      for (uint32_t j = 1; j < k && sop != I_NOP; j++)
+        if (v_sat_form(f, tuple[j], c->lane, &sub[j], &ys[j]) != sop) sop = I_NOP;
+      if (sop != I_NOP) {
+        Ref x = v_build(c, sub, k, st, depth - 1);
+        if (x == REF_NONE) return REF_NONE;
+        Ref y = v_build(c, ys, k, st, depth - 1);
+        if (y == REF_NONE) return REF_NONE;
+        out = vemit(f, c->vbody, sop, VT_V128, x, y, 0, c->lane);
+        goto done;
+      }
+    }
+    vop = (flt || narrow || c->width > 4) ? I_NOP : v_minmax_of(f, tuple[0]);
+    if (vop != I_NOP) {
+      for (uint32_t j = 1; j < k; j++)
+        if (v_minmax_of(f, tuple[j]) != vop) return REF_NONE;
+      for (uint32_t j = 0; j < k; j++) sub[j] = ir_args(f, tuple[j])[0];
+      Ref x = v_build(c, sub, k, st, depth - 1);
+      if (x == REF_NONE) return REF_NONE;
+      for (uint32_t j = 0; j < k; j++) sub[j] = ir_args(f, tuple[j])[1];
+      Ref y = v_build(c, sub, k, st, depth - 1);
+      if (y == REF_NONE) return REF_NONE;
+      out = vemit(f, c->vbody, vop, VT_V128, x, y, 0, c->lane);
+      goto done;
+    }
+    /* Any other select on a compare is a bitwise select on the compare's
+       mask, exact for floats too: wasm's select moves bits.  f32::min and
+       max arrive as x != x ? y : x and a compare of the results (rsbench's
+       f32ops), and TinyGo's saturating float-to-int conversion as selects
+       of the bounds on f32 compares (vecbench/cvtf32). */
+    Ref ct[VEC_MAX_MEMB], tt[VEC_MAX_MEMB], ft[VEC_MAX_MEMB];
+    for (uint32_t j = 0; j < k; j++) {
+      Ref *aj = ir_args(f, tuple[j]);
+      tt[j] = aj[0]; ft[j] = aj[1]; ct[j] = aj[2];
+    }
+    bool swap_arms;
+    Ref mask = v_mask(c, ct, k, st, depth, &swap_arms);
+    if (mask == REF_NONE) VBFAIL(ir_op_name(op0));
+    Ref vt = v_build(c, swap_arms ? ft : tt, k, st, depth - 1);
+    if (vt == REF_NONE) return REF_NONE;
+    Ref vf = v_build(c, swap_arms ? tt : ft, k, st, depth - 1);
+    if (vf == REF_NONE) return REF_NONE;
+    out = vemit3(f, c->vbody, I_VSEL, VT_V128, mask, vt, vf, 0, c->lane);
+    goto done;
+  }
+  /* i32 and f32 convert lane for lane, SCVTF and FCVTZS on .4s, rounding
+     and saturating as the scalar forms do; the pairs with f64 work on half
+     a vector of i32, so this pair is the only one with a lane each way. */
+  if (op0 == I_CONVERTS || op0 == I_CONVERTU ||
+      op0 == I_TRUNC_SATS || op0 == I_TRUNC_SATU) {
+    bool tof = op0 == I_CONVERTS || op0 == I_CONVERTU;
+    if (narrow || t != (tof ? VT_F32 : VT_I32)) VBFAIL(ir_op_name(op0));
+    Ref sub[VEC_MAX_MEMB];
+    for (uint32_t j = 0; j < k; j++) {
+      if (f->insts[tuple[j]].imm != (uint64_t)(tof ? VT_I32 : VT_F32))
+        VBFAIL(ir_op_name(op0));
+      sub[j] = ir_args(f, tuple[j])[0];
+    }
+    Ref x = v_build(c, sub, k, st, depth - 1);
+    if (x == REF_NONE) return REF_NONE;
+    bool sgn = op0 == I_CONVERTS || op0 == I_TRUNC_SATS;
+    out = vemit(f, c->vbody, tof ? I_VCONVERT : I_VTRUNCSAT, VT_V128, x,
+                REF_NONE, sgn ? 1u : 0u, VLANE_F32);
+    goto done;
+  }
+  /* The high word of a 32-bit product, which is how a division by a
+     constant arrives: UMULL and UMULL2 into .2d and the odd words of the
+     pair. */
+  if (op0 == I_MULHU) {
+    if (narrow || t != VT_I32) VBFAIL(ir_op_name(op0));
     Ref sub[VEC_MAX_MEMB];
     for (uint32_t j = 0; j < k; j++) sub[j] = ir_args(f, tuple[j])[0];
     Ref x = v_build(c, sub, k, st, depth - 1);
@@ -11497,7 +11908,9 @@ static Ref v_build(VecCtx *c, const Ref *tuple, uint32_t k, uint32_t st, int dep
     for (uint32_t j = 0; j < k; j++) sub[j] = ir_args(f, tuple[j])[1];
     Ref y = v_build(c, sub, k, st, depth - 1);
     if (y == REF_NONE) return REF_NONE;
-    out = vemit(f, c->vbody, vop, VT_V128, x, y, 0, c->lane);
+    Ref lo = vemit(f, c->vbody, I_VEXTMUL, VT_V128, x, y, 0, VLANE_I64);
+    Ref hi = vemit(f, c->vbody, I_VEXTMUL, VT_V128, x, y, 2, VLANE_I64);
+    out = vemit(f, c->vbody, I_VUZP2, VT_V128, lo, hi, 2, VLANE_I32);
     goto done;
   }
   if (vop == I_NOP) VBFAIL(ir_op_name(op0));
@@ -11928,6 +12341,9 @@ static bool vectorize_one(IrFunc *f, uint32_t hb, uint8_t *reach, uint8_t *inloo
       case I_EQ: case I_NE: case I_LTU: case I_LTS: case I_GTU: case I_GTS:
       case I_LEU: case I_LES: case I_GEU: case I_GES: case I_EQZ:
       case I_SELECT:
+      case I_FEQ: case I_FNE: case I_FLT: case I_FGT: case I_FLE: case I_FGE:
+      case I_BSWAP: case I_MULHU:
+      case I_CONVERTS: case I_CONVERTU: case I_TRUNC_SATS: case I_TRUNC_SATU:
 
       case I_EXTENDU: case I_EXTENDS: case I_WRAP:
       case I_NOP: case I_PARAM:
@@ -11988,8 +12404,15 @@ static bool vectorize_one(IrFunc *f, uint32_t hb, uint8_t *reach, uint8_t *inloo
 
   uint32_t lane = acc[0].lane;
   uint32_t width = acc[0].width;
-  for (uint32_t i = 1; i < nacc; i++)
-    if (acc[i].width != width || acc[i].lane != lane) VREJ("mixed lane shape");
+  /* Accesses as wide as one another with an integer lane beside a float
+     one -- an i32 array converted into an f32 one -- hold as many elements
+     to a vector, and each value is built in its own type's lane.  Only the
+     reductions assume a single lane, so such a loop has none. */
+  bool mixlane = false;
+  for (uint32_t i = 1; i < nacc; i++) {
+    if (acc[i].width != width) VREJ("mixed lane shape");
+    if (acc[i].lane != lane) mixlane = true;
+  }
 
   for (uint32_t i = 0; i < nacc; i++) {
     bool found = false;
@@ -12173,6 +12596,7 @@ static bool vectorize_one(IrFunc *f, uint32_t hb, uint8_t *reach, uint8_t *inloo
   uint32_t nred = 0;
   for (uint32_t p = 0; p < np; p++) {
     if (isiv[p]) continue;
+    if (mixlane) VREJ("mixed lane shape");
     Ref par = hparam[p], nx = back_args[p];
     if (nx == par) VREJ("carried value with no update");
     ValType pt = (ValType)f->insts[par].type;
@@ -12512,10 +12936,31 @@ static bool vectorize_one(IrFunc *f, uint32_t hb, uint8_t *reach, uint8_t *inloo
     for (uint32_t p = 0; p < np; p++)
       if (isiv[p] && back_args[p] == ivside) { tp = p; break; }
   }
+  /* Rotation leaves a loop that tests its counter before the step it
+     carries round, i != N going on with i + S (rsbench's f32ops once its
+     bounds checks are gone): the test of the next value against N + S,
+     mod 2^n, since adding S is a bijection.  With N a constant, so is the
+     bound the trip count is then made from. */
+  bool prestep = false;
+  uint64_t pre_bound = 0;
+  if (tp == 0xffffffffu && rel == I_NE && bound != REF_NONE) {
+    uint64_t nc;
+    for (uint32_t p = 0; p < np && tp == 0xffffffffu; p++) {
+      if (!isiv[p]) continue;
+      if (hparam[p] == bound && is_const(f, ivside, &nc)) {
+        Ref t = ivside; ivside = bound; bound = t;
+      }
+      if (hparam[p] != ivside || !is_const(f, bound, &nc)) continue;
+      tp = p;
+      prestep = true;
+      pre_bound = nc + (ivadd[p] ? ivstep[p] : (uint64_t)0 - ivstep[p]);
+      if ((ValType)f->insts[hparam[p]].type != VT_I64) pre_bound &= 0xffffffffu;
+    }
+  }
   if (tp == 0xffffffffu || rel == I_NOP) VREJ("exit test counter");
 
   bool clone_bound = false;
-  if (bound != REF_NONE && inloop[f->insts[bound].block]) {
+  if (!prestep && bound != REF_NONE && inloop[f->insts[bound].block]) {
     if (f->insts[bound].op != I_CONST) VREJ("bound is not loop-invariant");
     clone_bound = true;
   }
@@ -12542,7 +12987,10 @@ static bool vectorize_one(IrFunc *f, uint32_t hb, uint8_t *reach, uint8_t *inloo
 
   {
     uint64_t dmax = ~0ull, zc;
-    if (down) {
+    if (prestep) {
+      if (down ? pre_bound == 0 : (is_const(f, iventry[tp], &zc) && zc == 0))
+        dmax = down ? ir_value_max(f, iventry[tp], 6) : pre_bound;
+    } else if (down) {
       if (bound == REF_NONE || (is_const(f, bound, &zc) && zc == 0))
         dmax = ir_value_max(f, iventry[tp], 6);
     } else if (bound != REF_NONE && is_const(f, iventry[tp], &zc) && zc == 0) {
@@ -12559,6 +13007,7 @@ static bool vectorize_one(IrFunc *f, uint32_t hb, uint8_t *reach, uint8_t *inloo
   ctx.vguard = vguard;
   h = &f->blocks[hb];
 
+  if (prestep) bound = ir_emit(f, vguard, I_CONST, ct, NULL, 0, pre_bound, 0);
   uint32_t us = v_log2(U);
   Ref q0 = iventry[tp];
   Ref ok;
@@ -15236,6 +15685,18 @@ void ir_optimize(IrFunc *f, const OptOpts *o) {
     ir_verify(f, "post-iv");
   }
   if (o->dce) pass_dce(f);
+
+  /* the bounds checks rotation leaves decided behind a loop's own exit
+     test, which are body exits to the vectoriser */
+  if (o->vectorize && o->edgetests && o->guard_pages && o->branch &&
+      TP("edge_tests", pass_edge_tests(f))) {
+    pass_branch(f);
+    if (o->dce) pass_dce(f);
+    pass_branch(f);
+    prune_params(f);
+    ir_order(f);
+    ir_verify(f, "post-edge-tests");
+  }
 
   if (o->vectorize && o->guard_pages && TP("vec_search", pass_vec_search(f))) {
     ir_order(f);
