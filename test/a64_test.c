@@ -706,6 +706,15 @@ int main(int argc, char **argv) {
 
   CASE("umlal v0.2d, v1.2s, v2.2s", a64_vumlal(b, 0, 2, 0, 1, 2));
   CASE("umlal2 v3.2d, v4.4s, v5.4s", a64_vumlal(b, 1, 2, 3, 4, 5));
+  CASE("umlal v6.8h, v7.8b, v8.8b", a64_vumlal(b, 0, 0, 6, 7, 8));
+  CASE("smlal v9.8h, v10.8b, v11.8b", a64_vsmlal(b, 0, 0, 9, 10, 11));
+  CASE("smlal2 v12.4s, v13.8h, v14.8h", a64_vsmlal(b, 1, 1, 12, 13, 14));
+  CASE("addhn v15.8b, v16.8h, v17.8h", a64_vaddhn(b, 0, 0, 15, 16, 17));
+  CASE("addhn2 v18.8h, v19.4s, v20.4s", a64_vaddhn(b, 1, 1, 18, 19, 20));
+  CASE("ld3 { v29.16b, v30.16b, v31.16b }, [x0]", a64_vldn(b, 3, 0, 29, 0));
+  CASE("ld3 { v29.8h, v30.8h, v31.8h }, [x17]", a64_vldn(b, 3, 1, 29, 17));
+  CASE("ld4 { v28.4s, v29.4s, v30.4s, v31.4s }, [x1]", a64_vldn(b, 4, 2, 28, 1));
+  CASE("ld2 { v30.2d, v31.2d }, [x2]", a64_vldn(b, 2, 3, 30, 2));
   CASE("rev64 v6.4s, v7.4s", a64_vrev64(b, 2, 6, 7));
   CASE("rev64 v1.16b, v2.16b", a64_vrev64(b, 0, 1, 2));
   CASE("rev32 v3.16b, v4.16b", a64_vrev32(b, 0, 3, 4));

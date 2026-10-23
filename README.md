@@ -75,7 +75,7 @@ Hello world!
 - **Fast code.** Across 335 benchmark kernels compiled from Go, TinyGo, Rust,
   Zig, AssemblyScript, Kotlin, C, C++ and Haskell, warmc's steady-state code
   takes 0.47× wasmtime's time (geometric mean), with much lower peak memory.
-  Against the same programs compiled natively at `-O2` it takes 1.08× the
+  Against the same programs compiled natively at `-O2` it takes 1.07× the
   time. See [Performance](#performance).
 - **Runtime for modern languages:**
   - a concurrent, compacting, ZGC-style collector with coloured pointers,
@@ -704,7 +704,7 @@ command-line order, so put them **after** `-O`.
 | `reassoc` | rebalance associative integer chains for latency, also through a wrap to 32 bits, and add the value a loop carries round last in its chain, so that an iteration waits on one op of it, in v128 lanes too |
 | `rotate` | loop rotation, of loops whose latch ends in an unconditional jump |
 | `unroll` | 4× unrolling of constant-trip-count loops; complete unrolling of short ones, and of a loop nest whose outer loop runs at most 8 times; a loop that runs once loses its back edge |
-| `vectorize` | auto-vectoriser: contiguous and interleaved accesses, if-converted bodies, integer, widening and float min/max reductions, argmin and argmax (an index kept beside a min or max), search loops, saturating arithmetic, high-half multiplies, byte reversal and int/float conversions; several copies of the body per iteration, each with its own accumulator; a loop a producer unrolled by three, unrolled again until it spans whole vectors; with runtime alias checks and a scalar fallback |
+| `vectorize` | auto-vectoriser: contiguous accesses and ones interleaved two, three or four ways (`ld3` and `ld4` on arm64), if-converted bodies, bytes and halfwords computed in lanes twice as wide where their values need it (widening multiply-adds, a rounding shift as an add-high-narrow), integer, widening and float min/max reductions, argmin and argmax (an index kept beside a min or max), search loops, saturating arithmetic, high-half multiplies, byte reversal and int/float conversions; several copies of the body per iteration, each with its own accumulator; a loop a producer unrolled by three, unrolled again until it spans whole vectors; with runtime alias checks and a scalar fallback |
 | `addroff`, `memptr` | fold address arithmetic into displacements; compute a native pointer once per base, and once per block for constant addresses too large for a displacement |
 | `ldcomb` | merge byte-assembling loads into one wide load |
 | `selftail` | turn self `return_call` into a loop |
@@ -910,7 +910,7 @@ AssemblyScript and Kotlin/Wasm have no native compiler to compare with.
 |---|---|---:|---:|---|---:|---|---|
 | `gobench` | TinyGo | 39 | 0.59 | 0.06 – 1.00 | 0.87 | 0.13 – 3.26 | 2.0 / 8.9 / 1.9 |
 | `stdgo` | Go | 49 | 0.58 | 0.02 – 1.07 | 1.59 | 0.08 – 9.38 | 7.3 / 27.4 / 4.7 |
-| `vecbench` | TinyGo (vectorisable loops) | 43 | 0.19 | 0.03 – 0.96 | 0.74 | 0.10 – 8.60 | 2.0 / 8.9 / 1.9 |
+| `vecbench` | TinyGo (vectorisable loops) | 43 | 0.18 | 0.03 – 0.96 | 0.70 | 0.10 – 1.20 | 2.0 / 8.9 / 1.9 |
 | `asbench` | AssemblyScript | 37 | 0.59 | 0.16 – 0.97 | – | – | 1.9 / 8.7 / – |
 | `rsbench` | Rust | 39 | 0.63 | 0.13 – 0.99 | 1.06 | 0.63 – 2.63 | 2.0 / 9.1 / 1.9 |
 | `zigbench` | Zig | 22 | 0.73 | 0.17 – 1.04 | 0.97 | 0.22 – 2.02 | 2.0 / 8.9 / 1.9 |
@@ -956,9 +956,9 @@ at 0.04×.
 
 ### Against native code
 
-Over the 272 kernels with a native build, warmc's code takes **1.08×** the
-native time (median 1.07), and 1.02× without Haskell. wasmtime's code takes
-2.05× the native time on the same kernels. 107 kernels run faster under warmc
+Over the 272 kernels with a native build, warmc's code takes **1.07×** the
+native time (median 1.07), and 1.01× without Haskell. wasmtime's code takes
+2.05× the native time on the same kernels. 108 kernels run faster under warmc
 than natively, and another 38 are within 10% of the native build.
 
 The native builds start ahead of the wasm in a few ways that have nothing to
@@ -970,8 +970,8 @@ do with warmc's compiler:
   and runs several copies of a loop's body per iteration with an accumulator
   each: `satadd`, `mulhi16` and `bswap` run at 0.63×, 0.68× and 0.86×
   native, and `vecbench/neighbour`, a loop LLVM unrolled by three, at 0.91×.
-  The widest gap is a loop it does not vectorise: `vecbench/rgbgrey` (8.6×),
-  which reads pixels three bytes apart.
+  `vecbench/rgbgrey` reads pixels three bytes apart, loads them with one
+  `ld3` and computes in 16-bit lanes as the native build does, at 0.95×.
 - **Hand-written assembly.** `stdgo/sha256` is 9× because native Go computes
   SHA-256 with the ARMv8 SHA-256 instructions, where the wasm build runs the
   portable Go code.
@@ -997,7 +997,7 @@ Go's `int`, Rust's `usize`, C's `long` and Haskell's `Int` are 32 bits on
 wasm32 and 64 natively. Native floating-point code is also not always rounded
 as wasm's is: clang fuses multiply-adds natively, for one, which warmc does
 only when asked to with `-ffma`. Without those 45
-kernels the geometric mean is 1.10×. The Haskell natives are built with
+kernels the geometric mean is 1.09×. The Haskell natives are built with
 `-with-rtsopts=-V0`: without it the runtime's exit waits out its 10 ms ticker,
 which made the empty program's time mostly that wait and credited every
 kernel with time it never spent. One native time is too short to time

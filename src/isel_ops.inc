@@ -47,6 +47,14 @@ static int vec_base(Isel *s, int p, uint64_t off, uint32_t *disp) {
   return TMP0;
 }
 
+/* ld2 to ld4 take a bare register for the address */
+static int ldn_base(Isel *s, int p, uint64_t off) {
+  if (!off) return p;
+  if (off <= 0xfffu) a64_add_imm(B, SF64, TMP0, p, (uint32_t)off, 0);
+  else { a64_load_imm(B, SF64, TMP0, off); a64_add_reg(B, SF64, TMP0, p, TMP0); }
+  return TMP0;
+}
+
 static uint32_t global_off(uint32_t i) {
   return VMCTX_GLOBALS + GLOBAL_SLOT_SIZE * i;
 }
@@ -1217,6 +1225,18 @@ static void emit_inst(Isel *s, Ref v) {
       break;
     }
 
+    /* ld3 or ld4 into the scratch registers that end at v31, and this
+       stream copied out of its one; maybe_ldn loads the siblings beside it
+       with it */
+    case I_VLDN: {
+      if (s->loc[v] == LOC_NONE) break;
+      int m = (int)VLDN_M(in->imm2), r0 = 32 - m;
+      int base = ldn_base(s, rd(s, a[0], TMP1), in->imm);
+      a64_vldn(B, m, VLANE_SIZE(VLDN_LANE(in->imm2)), r0, base);
+      commit(s, v, r0 + (int)VLDN_S(in->imm2));
+      break;
+    }
+
     case I_VSTORE: {
       int p = rd(s, a[0], TMP1);
       int val = rd(s, a[1], F0);
@@ -1478,6 +1498,34 @@ static void emit_inst(Isel *s, Ref v) {
       if (d != c) a64_vmov(B, d, c);
       if (in->imm & 1) a64_vfmls(B, fsz, d, x, y);
       else             a64_vfmla(B, fsz, d, x, y);
+      commit(s, v, d);
+      break;
+    }
+
+    case I_VEXTMLA: {
+      int c = rd(s, a[0], F2), x = rd(s, a[1], F0), y = rd(s, a[2], F1);
+      int sz = VLANE_SIZE(in->imm2);
+      bool hi = (in->imm & 2) != 0;
+      /* umlal adds into its destination: the accumulator's register where
+         the allocator tied them, unless it is a factor */
+      int d = wr(s, v, FTMP);
+      if (d == x || d == y) d = FTMP;
+      if (d != c) a64_vmov(B, d, c);
+      if (in->imm & 1) a64_vsmlal(B, hi, sz - 1, d, x, y);
+      else a64_vumlal(B, hi, sz - 1, d, x, y);
+      commit(s, v, d);
+      break;
+    }
+
+    case I_VADDHN: {
+      int x0 = rd(s, a[0], F0), y0 = rd(s, a[1], F1);
+      int x1 = rd(s, a[2], F2), y1 = rd(s, a[3], F3);
+      int sz = VLANE_SIZE(in->imm2);
+      /* addhn2 keeps the low half addhn wrote */
+      int d = wr(s, v, FTMP);
+      if (d == x1 || d == y1) d = FTMP;
+      a64_vaddhn(B, 0, sz - 1, d, x0, y0);
+      a64_vaddhn(B, 1, sz - 1, d, x1, y1);
       commit(s, v, d);
       break;
     }
@@ -2705,11 +2753,63 @@ static bool maybe_pair_q(Isel *s, Block *b, uint32_t idx) {
   return false;
 }
 
+/* The streams of one interleaved group the vectoriser loads side by side
+   are one ld3 or ld4: the first lowers all of them, each copied from the
+   scratch register it lands in to its own, as an ldp lowers its pair. */
+static bool maybe_ldn(Isel *s, Block *b, uint32_t idx) {
+  IrFunc *f = s->f;
+  Ref vi = b->insts[idx];
+  const Inst *in = &f->insts[vi];
+  Ref base = ir_args(f, vi)[0];
+  uint32_t m = VLDN_M(in->imm2);
+  Ref sib[4] = { REF_NONE, REF_NONE, REF_NONE, REF_NONE };
+  if (m < 2 || m > 4 || !pair_reg(s, vi)) return false;
+  sib[VLDN_S(in->imm2)] = vi;
+  uint32_t nsib = 1, lim = idx + 2 * m;
+  if (lim > b->ninsts) lim = b->ninsts;
+  for (uint32_t j = idx + 1; j < lim && nsib < m; j++) {
+    Ref vj = b->insts[j];
+    const Inst *jn = &f->insts[vj];
+    if (jn->op == I_VLDN && ir_args(f, vj)[0] == base && jn->imm == in->imm &&
+        jn->imm2 != in->imm2 && VLDN_M(jn->imm2) == m &&
+        VLDN_LANE(jn->imm2) == VLDN_LANE(in->imm2) &&
+        sib[VLDN_S(jn->imm2)] == REF_NONE) {
+      if (!pair_load_ok(s, b, idx, j)) break;
+      bool clash = false;
+      for (uint32_t k = 0; k < m; k++)
+        clash |= sib[k] != REF_NONE && s->loc[sib[k]] == s->loc[vj];
+      if (clash) break;
+      sib[VLDN_S(jn->imm2)] = vj;
+      nsib++;
+      continue;
+    }
+    if (jn->op != I_VLDN && jn->op != I_VLOAD && !pair_pure_op(jn->op)) break;
+  }
+  if (nsib == 1) return false;
+  s->t1_was = s->t1_ok;
+  s->t1_ok = false;
+  /* straight into the streams' registers where the allocator gave them
+     consecutive ones, as it does values made one after another */
+  int r0 = 32 - (int)m;
+  bool direct = nsib == m && s->loc[sib[0]] + (int)m <= r0;
+  for (uint32_t k = 1; k < m && direct; k++) direct = s->loc[sib[k]] == s->loc[sib[0]] + (int)k;
+  if (direct) r0 = s->loc[sib[0]];
+  int p = ldn_base(s, rd(s, base, TMP1), in->imm);
+  a64_vldn(B, (int)m, VLANE_SIZE(VLDN_LANE(in->imm2)), r0, p);
+  for (uint32_t k = 0; k < m; k++) {
+    if (sib[k] == REF_NONE) continue;
+    commit(s, sib[k], r0 + (int)k);
+    if (sib[k] != vi) s->paired[sib[k]] = 1;
+  }
+  return true;
+}
+
 static bool maybe_pair(Isel *s, Block *b, uint32_t idx) {
   IrFunc *f = s->f;
   Ref vi = b->insts[idx];
   Inst *in = &f->insts[vi];
   if (in->op == I_VLOAD || in->op == I_VSTORE) return maybe_pair_q(s, b, idx);
+  if (in->op == I_VLDN) return maybe_ldn(s, b, idx);
   if (in->op != I_LOAD && in->op != I_STORE && in->op != I_FIELD_GET &&
       in->op != I_FIELD_SET)
     return false;

@@ -1197,7 +1197,7 @@ bool ir_is_pure(const Inst *in) {
     case I_REF_NULL: case I_REF_IS_NULL: case I_REF_FUNC:
     case I_MEM_ADDR: case I_MEM_PTR: case I_MEM_BASE:
 
-    case I_VLOAD:
+    case I_VLOAD: case I_VLDN:
     case I_VADD: case I_VSUB: case I_VMUL:
     case I_VAND: case I_VOR: case I_VXOR:
     case I_VSMAX: case I_VSMIN: case I_VUMAX: case I_VUMIN:
@@ -1213,6 +1213,7 @@ bool ir_is_pure(const Inst *in) {
     case I_VADDSATS: case I_VADDSATU: case I_VSUBSATS: case I_VSUBSATU:
     case I_VAVGRU: case I_VQ15MULR: case I_VDOT:
     case I_VEXTADD: case I_VEXTMUL: case I_VEXTEND: case I_VNARROW:
+    case I_VEXTMLA: case I_VADDHN:
     case I_VSHLV: case I_VSHRUV: case I_VSHRSV:
     case I_VANYTRUE: case I_VALLTRUE: case I_VBITMASK:
     case I_VEXTRACTS: case I_VEXTRACTU: case I_VREPLACE:
@@ -1314,7 +1315,7 @@ const char *ir_op_name(uint16_t op) {
     N(I_REF_FUNC, "ref.func"),
     N(I_MEM_ADDR, "mem_addr"), N(I_BOUNDS_CHECK, "bounds_check"),
     N(I_MEM_PTR, "mem_ptr"), N(I_MEM_BASE, "mem_base"),
-    N(I_VLOAD, "vload"), N(I_VSTORE, "vstore"),
+    N(I_VLOAD, "vload"), N(I_VSTORE, "vstore"), N(I_VLDN, "vldn"),
     N(I_VADD, "vadd"), N(I_VSUB, "vsub"), N(I_VMUL, "vmul"),
     N(I_VAND, "vand"), N(I_VOR, "vor"), N(I_VXOR, "vxor"),
     N(I_VSMAX, "vsmax"), N(I_VSMIN, "vsmin"),
@@ -1335,6 +1336,7 @@ const char *ir_op_name(uint16_t op) {
     N(I_VAVGRU, "vavgru"), N(I_VQ15MULR, "vq15mulr"), N(I_VDOT, "vdot"),
     N(I_VEXTADD, "vextadd"), N(I_VEXTMUL, "vextmul"),
     N(I_VEXTEND, "vextend"), N(I_VNARROW, "vnarrow"),
+    N(I_VEXTMLA, "vextmla"), N(I_VADDHN, "vaddhn"),
     N(I_VSHLV, "vshlv"), N(I_VSHRUV, "vshruv"), N(I_VSHRSV, "vshrsv"),
     N(I_VANYTRUE, "vanytrue"), N(I_VALLTRUE, "valltrue"),
     N(I_VBITMASK, "vbitmask"),
@@ -1431,7 +1433,7 @@ void ir_print(IrFunc *f, const char *stage) {
 
 static uint32_t ir_vec_arity(uint16_t op) {
   switch (op) {
-    case I_VLOAD: case I_VSPLAT: case I_VREDUCE:
+    case I_VLOAD: case I_VLDN: case I_VSPLAT: case I_VREDUCE:
     case I_VSHL: case I_VSHRU: case I_VSHRS:
     case I_VFNEG: case I_VFABS: case I_VFSQRT:
     case I_VNOT: case I_VNEG: case I_VABS: case I_VPOPCNT: case I_VREV:
@@ -1461,8 +1463,10 @@ static uint32_t ir_vec_arity(uint16_t op) {
     case I_VDOTI7:
       return 2;
     case I_VSEL:
-    case I_VFMADD: case I_VDOTI7ADD:
+    case I_VFMADD: case I_VDOTI7ADD: case I_VEXTMLA:
       return 3;
+    case I_VADDHN:
+      return 4;
     default:
       return 0xffffffffu;
   }

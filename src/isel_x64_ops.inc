@@ -35,6 +35,34 @@ static void simd_not(Isel *s, int d, int x, int tmp) {
   x64_vpxor(B, d, x, tmp);
 }
 
+/* VEXTMUL's product, in lanes 8 << sz from the low or high halves of x
+   and y, into FTMP; F2 is clobbered. */
+static void simd_extmul(Isel *s, int sz, bool sgn, bool high, int x, int y) {
+  if (sz == 1) {
+    if (high) {
+      x64_vpsrldq(B, FTMP, x, 8);
+      x64_vpsrldq(B, F2, y, 8);
+    } else {
+      simd_mov(s, FTMP, x);
+      simd_mov(s, F2, y);
+    }
+    if (sgn) { x64_vpmovsx(B, 0, FTMP, FTMP); x64_vpmovsx(B, 0, F2, F2); }
+    else { x64_vpmovzx(B, 0, FTMP, FTMP); x64_vpmovzx(B, 0, F2, F2); }
+    x64_vpmullw(B, FTMP, FTMP, F2);
+  } else if (sz == 2) {
+    x64_vpmullw(B, FTMP, x, y);
+    if (sgn) x64_vpmulhw(B, F2, x, y);
+    else x64_vpmulhuw(B, F2, x, y);
+    if (high) x64_vpunpckh(B, 1, FTMP, FTMP, F2);
+    else x64_vpunpckl(B, 1, FTMP, FTMP, F2);
+  } else {
+    x64_vpshufd(B, FTMP, x, high ? 0xfa : 0x50);
+    x64_vpshufd(B, F2, y, high ? 0xfa : 0x50);
+    if (sgn) x64_vpmuldq(B, FTMP, FTMP, F2);
+    else x64_vpmuludq(B, FTMP, FTMP, F2);
+  }
+}
+
 /* A vectorised memory access is a raw pointer plus a byte offset; only an
    offset past disp32 has to be folded into the pointer. */
 static int32_t vec_disp(Isel *s, int *p, uint64_t off) {
@@ -1357,6 +1385,64 @@ static void emit_inst(Isel *s, Ref v) {
       break;
     }
 
+    /* x86 has no deinterleaving load: each of the m vectors is loaded and
+       shuffled into the lanes of the stream it holds, and the pieces or'ed */
+    case I_VLDN: {
+      if (s->loc[v] == LOC_NONE) break;
+      int m = (int)VLDN_M(in->imm2), st = (int)VLDN_S(in->imm2);
+      int L = 1 << VLANE_SIZE(VLDN_LANE(in->imm2));
+      int p = rd(s, a[0], TMP1);
+      int32_t disp = vec_disp(s, &p, in->imm + 16u * (uint64_t)(m - 1)) - 16 * (m - 1);
+      bool first = true;
+      for (int q = 0; q < m; q++) {
+        uint64_t mk[2] = { 0, 0 };
+        bool any = false;
+        for (int i = 0; i < 16; i++) {
+          int sb = ((i / L) * m + st) * L + i % L;
+          uint64_t by = sb / 16 == q ? (uint64_t)(sb % 16) : 0x80u;
+          any |= by != 0x80u;
+          mk[i >> 3] |= by << (8 * (i & 7));
+        }
+        if (!any) continue;
+        x64_vmovdqu_load(B, F0, p, X64_NOIDX, 0, disp + 16 * q);
+        load_vconst(s, F1, mk[0], mk[1]);
+        if (first) x64_vpshufb(B, F2, F0, F1);
+        else { x64_vpshufb(B, F0, F0, F1); x64_vpor(B, F2, F2, F0); }
+        first = false;
+      }
+      commit(s, v, F2);
+      break;
+    }
+
+    /* the product's lanes added to the accumulator's */
+    case I_VEXTMLA: {
+      int x = rd(s, a[1], F0), y = rd(s, a[2], F1);
+      int sz = VLANE_SIZE(in->imm2);
+      simd_extmul(s, sz, (in->imm & 1) != 0, (in->imm & 2) != 0, x, y);
+      int c = rd(s, a[0], F0);
+      int res = wr(s, v, F2);
+      x64_vpadd(B, sz, res, c, FTMP);
+      commit(s, v, res);
+      break;
+    }
+
+    /* each sum's high halves, which fit the narrow lane: the unsigned
+       saturating pack keeps them */
+    case I_VADDHN: {
+      int sz = VLANE_SIZE(in->imm2), sh = 4 << sz;
+      int x0 = rd(s, a[0], F0), y0 = rd(s, a[1], F1);
+      x64_vpadd(B, sz, F2, x0, y0);
+      x64_vpsrl_i(B, sz, F2, F2, sh);
+      int x1 = rd(s, a[2], F0), y1 = rd(s, a[3], F1);
+      x64_vpadd(B, sz, FTMP, x1, y1);
+      x64_vpsrl_i(B, sz, FTMP, FTMP, sh);
+      int res = wr(s, v, F2);
+      if (sz == 1) x64_vpackuswb(B, res, F2, FTMP);
+      else x64_vpackusdw(B, res, F2, FTMP);
+      commit(s, v, res);
+      break;
+    }
+
     case I_VSTORE: {
       int val = rd(s, a[1], F0);
       int p = rd(s, a[0], TMP1);
@@ -1633,34 +1719,10 @@ static void emit_inst(Isel *s, Ref v) {
           break;
         }
 
-        case I_VEXTMUL: {
-          bool sgn = (in->imm & 1) != 0, high = (in->imm & 2) != 0;
-          if (sz == 1) {
-            if (high) {
-              x64_vpsrldq(B, FTMP, x, 8);
-              x64_vpsrldq(B, F2, y, 8);
-            } else {
-              simd_mov(s, FTMP, x);
-              simd_mov(s, F2, y);
-            }
-            if (sgn) { x64_vpmovsx(B, 0, FTMP, FTMP); x64_vpmovsx(B, 0, F2, F2); }
-            else { x64_vpmovzx(B, 0, FTMP, FTMP); x64_vpmovzx(B, 0, F2, F2); }
-            x64_vpmullw(B, FTMP, FTMP, F2);
-          } else if (sz == 2) {
-            x64_vpmullw(B, FTMP, x, y);
-            if (sgn) x64_vpmulhw(B, F2, x, y);
-            else x64_vpmulhuw(B, F2, x, y);
-            if (high) x64_vpunpckh(B, 1, FTMP, FTMP, F2);
-            else x64_vpunpckl(B, 1, FTMP, FTMP, F2);
-          } else {
-            x64_vpshufd(B, FTMP, x, high ? 0xfa : 0x50);
-            x64_vpshufd(B, F2, y, high ? 0xfa : 0x50);
-            if (sgn) x64_vpmuldq(B, FTMP, FTMP, F2);
-            else x64_vpmuludq(B, FTMP, FTMP, F2);
-          }
+        case I_VEXTMUL:
+          simd_extmul(s, sz, (in->imm & 1) != 0, (in->imm & 2) != 0, x, y);
           res = FTMP;
           break;
-        }
 
         /* out-of-range swizzle indices must read zero; adding 0x70 with
            unsigned saturation pushes every index >= 16 past 0x7f, which is

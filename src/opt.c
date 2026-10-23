@@ -1115,7 +1115,7 @@ static uint32_t ifc_depth(IrFunc *f, IfcCtx *cx, Ref v, int lim) {
   uint32_t lat;
   if (ifc_cost(f, v, &lat) < 0) lat = rd_latency(in->op);
   switch (in->op) {
-    case I_LOAD: case I_VLOAD: case I_FIELD_GET: case I_ARRAY_GET:
+    case I_LOAD: case I_VLOAD: case I_VLDN: case I_FIELD_GET: case I_ARRAY_GET:
     case I_ARRAY_LEN: case I_TABLE_GET:
       lat = 4;
       if (f->blocks[in->block].loop_depth) ld = IFC_LOADED;
@@ -10638,7 +10638,8 @@ static bool lh_collect(IrFunc *f, Ref v, const uint8_t *inloop, uint8_t *moved,
   if (!inloop[f->insts[v].block]) return true;
   if (depth > 16) return false;
   Inst *in = &f->insts[v];
-  if (in->op == I_PARAM || !ir_is_pure(in) || in->op == I_VLOAD) return false;
+  if (in->op == I_PARAM || !ir_is_pure(in) || in->op == I_VLOAD || in->op == I_VLDN)
+    return false;
   if (in->op == I_GLOBAL_GET && in->imm < f->m->nglobals &&
       f->m->globals[in->imm].mutable_ && (!gset || gset[in->imm]))
     return false;
@@ -11006,6 +11007,7 @@ static bool pass_loop_hoist(IrFunc *f) {
             if (o == r) break;
             uint32_t op = f->insts[o].op;
             if (op != I_LOAD && op != I_STORE && op != I_VLOAD && op != I_VSTORE &&
+                op != I_VLDN &&
                 !lh_can_trap(f, o))
               continue;
             bool ours = false;
@@ -11275,7 +11277,8 @@ static bool rotate_one(IrFunc *f, uint32_t hb) {
       if (op == I_CALL || op == I_CALL_INDIRECT || op == I_CALL_REF ||
           op == I_RETURN_CALL || op == I_RETURN_CALL_INDIRECT ||
           op == I_RETURN_CALL_REF) body_calls = true;
-      else if (op == I_LOAD || op == I_STORE || op == I_VLOAD || op == I_VSTORE)
+      else if (op == I_LOAD || op == I_STORE || op == I_VLOAD || op == I_VSTORE ||
+               op == I_VLDN)
         body_mem = true;
     }
   }
@@ -12176,7 +12179,7 @@ static bool pass_mem_ptr(IrFunc *f) {
 #define VEC_MAX_ACC  128
 #define VEC_MAX_MEMB 32
 #define VEC_MAX_VEC  4
-#define VEC_MAX_ILV  2
+#define VEC_MAX_ILV  4
 #define VEC_MAX_BLK  16
 #define VEC_MAX_BODY 512
 #define VEC_MAX_SEL  32
@@ -12241,6 +12244,7 @@ static uint32_t v_slot(const VGroup *G, uint32_t mpv, uint32_t v, uint32_t j) {
 typedef struct {
   Ref key[VEC_MAX_MEMB];
   uint32_t n, st;
+  int half;
   Ref val;
 } VMemo;
 
@@ -12275,6 +12279,13 @@ typedef struct {
   /* the body's accesses, for v_same_load */
   const VAcc *acc;
   uint32_t nacc;
+  /* A loop of bytes or halfwords whose values need more bits than that
+     computes them in lanes twice as wide, a vector's worth as two halves
+     (v_build_wide): which half v_build is building, -1 outside one, and
+     the accesses' own width and lane. */
+  bool wide;
+  int half;
+  uint32_t awidth, alane;
 } VecCtx;
 
 /* Whether loads a and b of the scalar body read one address the same way.
@@ -12594,6 +12605,7 @@ static IrOp v_minmax_of(IrFunc *f, Ref sel) {
 }
 
 static Ref v_build(VecCtx *c, const Ref *tuple, uint32_t k, uint32_t st, int depth);
+static uint32_t v_log2(uint64_t x);
 
 static bool v_is_arm(IrFunc *f, uint32_t b, uint32_t other) {
   Block *bb = &f->blocks[b];
@@ -12613,7 +12625,7 @@ static bool v_fits_lane_d(IrFunc *f, Ref v, uint32_t lane, int depth) {
   if (bits >= 64) return true;
   if (in->op == I_CONST) return in->imm < (1ull << bits);
   if (in->op == I_LOAD && !(in->imm2 & MEMF_SIGNED) &&
-      MEMF_SIZE(in->imm2) == (uint32_t)VLANE_SIZE(lane))
+      MEMF_SIZE(in->imm2) <= (uint32_t)VLANE_SIZE(lane))
     return true;
   if (depth <= 0) return false;
 
@@ -12862,12 +12874,194 @@ static Ref v_mulhi(VecCtx *c, const Ref *tuple, uint32_t k, uint32_t st, int dep
   return vemit(c->f, c->vbody, I_VUZP2, VT_V128, lo, hi, VLANE_SIZE(c->lane), c->lane);
 }
 
+/* From inside a half (see VecCtx): a value in the accesses' own lane, a
+   whole vector of them. */
+static Ref v_build_narrow(VecCtx *c, const Ref *tuple, uint32_t k, int depth) {
+  int half = c->half;
+  uint32_t w = c->width, l = c->lane;
+  c->half = -1; c->width = c->awidth; c->lane = c->alane;
+  Ref r = v_build(c, tuple, k, 1, depth);
+  c->half = half; c->width = w; c->lane = l;
+  return r;
+}
+
+/* Whether a tuple is of products of operands the accesses' lane holds,
+   unsigned in every lane or signed in every lane, which a lane twice as
+   wide holds exactly: what a widening multiply of the narrow lanes makes
+   (umull, smull).  The operands in xs and ys, *sgn whether signed. */
+static bool v_ext_product(VecCtx *c, const Ref *tuple, uint32_t k, Ref *xs,
+                          Ref *ys, int *sgn) {
+  IrFunc *f = c->f;
+  *sgn = -1;
+  for (uint32_t j = 0; j < k; j++) {
+    const Inst *ij = &f->insts[tuple[j]];
+    if (ij->op != I_MUL || ij->nargs != 2 || !c->inloop[ij->block]) return false;
+    Ref *a = ir_args(f, tuple[j]);
+    int sj = (v_fits_lane(f, a[0], c->alane) && v_fits_lane(f, a[1], c->alane)) ? 0
+           : (v_fits_lane_signed(f, a[0], c->alane) &&
+              v_fits_lane_signed(f, a[1], c->alane)) ? 1 : -1;
+    if (sj < 0 || (j && sj != *sgn)) return false;
+    *sgn = sj;
+    xs[j] = a[0];
+    ys[j] = a[1];
+  }
+  return true;
+}
+
+static bool v_term_invariant(VecCtx *c, const Ref *tuple, uint32_t k) {
+  for (uint32_t j = 1; j < k; j++)
+    if (tuple[j] != tuple[0]) return false;
+  const Inst *in = &c->f->insts[tuple[0]];
+  return in->op == I_CONST || !c->inloop[in->block];
+}
+
+#define VEC_MAX_TERMS 8
+
+/* The terms of a tuple of sums, flattened through the adds every lane has
+   at the same place in the loop; false past VEC_MAX_TERMS of them. */
+static bool v_sum_terms(VecCtx *c, const Ref *tuple, uint32_t k,
+                        Ref (*terms)[VEC_MAX_MEMB], uint32_t *nt, int depth) {
+  IrFunc *f = c->f;
+  bool add = depth > 0;
+  for (uint32_t j = 0; j < k && add; j++) {
+    const Inst *ij = &f->insts[tuple[j]];
+    add = ij->op == I_ADD && ij->nargs == 2 && c->inloop[ij->block];
+  }
+  if (add) {
+    Ref sub[VEC_MAX_MEMB];
+    for (uint32_t side = 0; side < 2; side++) {
+      for (uint32_t j = 0; j < k; j++) sub[j] = ir_args(f, tuple[j])[side];
+      if (!v_sum_terms(c, sub, k, terms, nt, depth - 1)) return false;
+    }
+    return true;
+  }
+  if (*nt == VEC_MAX_TERMS) return false;
+  memcpy(terms[(*nt)++], tuple, k * sizeof(Ref));
+  return true;
+}
+
+/* The sum of terms, in a half: products of narrow operands are a widening
+   multiply and multiply-adds (umull, umlal), into the terms the loop
+   computes if there are any, and what it does not change is added last. */
+static Ref v_build_sum(VecCtx *c, Ref (*terms)[VEC_MAX_MEMB], uint32_t nt,
+                       uint32_t k, int depth) {
+  IrFunc *f = c->f;
+  Ref acc = REF_NONE;
+  for (int pass = 0; pass < 3; pass++)
+    for (uint32_t i = 0; i < nt; i++) {
+      Ref xs[VEC_MAX_MEMB], ys[VEC_MAX_MEMB];
+      int sgn;
+      bool prod = v_ext_product(c, terms[i], k, xs, ys, &sgn);
+      int want = prod ? 1 : v_term_invariant(c, terms[i], k) ? 2 : 0;
+      if (want != pass) continue;
+      if (!prod) {
+        Ref t = v_build(c, terms[i], k, 1, depth - 1);
+        if (t == REF_NONE) return REF_NONE;
+        acc = acc == REF_NONE ? t
+            : vemit(f, c->vbody, I_VADD, VT_V128, acc, t, 0, c->lane);
+        continue;
+      }
+      Ref x = v_build_narrow(c, xs, k, depth - 1);
+      if (x == REF_NONE) return REF_NONE;
+      Ref y = v_build_narrow(c, ys, k, depth - 1);
+      if (y == REF_NONE) return REF_NONE;
+      uint64_t imm = (uint64_t)sgn | (uint64_t)c->half << 1;
+      acc = acc == REF_NONE
+          ? vemit(f, c->vbody, I_VEXTMUL, VT_V128, x, y, imm, c->lane)
+          : vemit3(f, c->vbody, I_VEXTMLA, VT_V128, acc, x, y, imm, c->lane);
+    }
+  return acc;
+}
+
+/* In a half: a product of narrow operands, or a sum with such products
+   among its terms, is v_build_sum's; *took says whether the tuple was
+   one. */
+static Ref v_build_ext(VecCtx *c, const Ref *tuple, uint32_t k, int depth,
+                       bool *took) {
+  Ref terms[VEC_MAX_TERMS][VEC_MAX_MEMB];
+  uint32_t nt = 0;
+  if (!v_sum_terms(c, tuple, k, terms, &nt, depth)) return REF_NONE;
+  bool any = false;
+  for (uint32_t i = 0; i < nt && !any; i++) {
+    Ref xs[VEC_MAX_MEMB], ys[VEC_MAX_MEMB];
+    int sgn;
+    any = v_ext_product(c, terms[i], k, xs, ys, &sgn);
+  }
+  if (!any) return REF_NONE;
+  *took = true;
+  return v_build_sum(c, terms, nt, k, depth);
+}
+
+/* A value stored to the loop's bytes or halfwords, computed in lanes twice
+   as wide, one half at a time: the halves' low halves (uzp1), or for
+   x >> w, w the narrow lane's bits, their high halves -- addhn's where x
+   is a sum with a term the loop does not change, the rounding constant of
+   fixed-point code (vecbench/rgbgrey's (77r + 150g + 29b + 128) >> 8),
+   and uzp2's otherwise. */
+static Ref v_build_wide(VecCtx *c, const Ref *tuple, uint32_t k) {
+  IrFunc *f = c->f;
+  uint32_t bits = c->awidth * 8;
+  Ref sub[VEC_MAX_MEMB];
+  bool high = true;
+  for (uint32_t j = 0; j < k && high; j++) {
+    const Inst *ij = &f->insts[tuple[j]];
+    uint64_t sh;
+    high = ij->op == I_SHRU && ij->nargs == 2 && c->inloop[ij->block] &&
+           is_const(f, ir_args(f, tuple[j])[1], &sh) &&
+           (sh & (vt_is_64((ValType)ij->type) ? 63u : 31u)) == bits;
+    if (high) sub[j] = ir_args(f, tuple[j])[0];
+  }
+  c->width = 2 * c->awidth;
+  c->lane = c->alane + 1;
+  Ref terms[VEC_MAX_TERMS][VEC_MAX_MEMB], add[VEC_MAX_MEMB];
+  uint32_t nt = 0, inv = UINT32_MAX;
+  if (high && v_sum_terms(c, sub, k, terms, &nt, VEC_DEPTH) && nt > 1)
+    for (uint32_t i = 0; i < nt && inv == UINT32_MAX; i++)
+      if (v_term_invariant(c, terms[i], k)) inv = i;
+  Ref h[2] = { REF_NONE, REF_NONE }, y[2] = { REF_NONE, REF_NONE }, out = REF_NONE;
+  if (inv != UINT32_MAX) {
+    memcpy(add, terms[inv], k * sizeof(Ref));
+    for (uint32_t i = inv + 1; i < nt; i++) memcpy(terms[i - 1], terms[i], sizeof terms[0]);
+    nt--;
+  }
+  for (int hf = 0; hf < 2; hf++) {
+    c->half = hf;
+    if (inv == UINT32_MAX) {
+      h[hf] = v_build(c, high ? sub : tuple, k, 1, VEC_DEPTH);
+    } else {
+      h[hf] = v_build_sum(c, terms, nt, k, VEC_DEPTH);
+      if (h[hf] != REF_NONE) y[hf] = v_build(c, add, k, 1, VEC_DEPTH);
+      if (y[hf] == REF_NONE) h[hf] = REF_NONE;
+    }
+    if (h[hf] == REF_NONE) break;
+  }
+  if (h[0] != REF_NONE && h[1] != REF_NONE) {
+    if (inv != UINT32_MAX) {
+      Ref a4[4] = { h[0], y[0], h[1], y[1] };
+      out = ir_emit(f, c->vbody, I_VADDHN, VT_V128, a4, 4, 0, c->lane);
+    } else {
+      out = vemit(f, c->vbody, high ? I_VUZP2 : I_VUZP1, VT_V128, h[0], h[1],
+                  v_log2(c->awidth), c->alane);
+    }
+  }
+  c->half = -1;
+  c->width = c->awidth;
+  c->lane = c->alane;
+  return out;
+}
+
 #define VBFAIL(w) do { if (!c->fail) c->fail = (w); return REF_NONE; } while (0)
 
 static Ref v_build(VecCtx *c, const Ref *tuple, uint32_t k, uint32_t st, int depth) {
   IrFunc *f = c->f;
   for (uint32_t i = 0; i < c->nmemo; i++) {
-    if (c->memo[i].n != k || c->memo[i].st != st) continue;
+    /* the halves' lanes are alike: what one made before the loop serves
+       the other */
+    if (c->memo[i].n != k || c->memo[i].st != st ||
+        (c->memo[i].half != c->half &&
+         (c->memo[i].half < 0 || c->half < 0 ||
+          f->insts[c->memo[i].val].block != c->vguard)))
+      continue;
     bool same = true;
     for (uint32_t j = 0; j < k && same; j++) same = c->memo[i].key[j] == tuple[j];
     if (same) return c->memo[i].val;
@@ -12973,6 +13167,17 @@ static Ref v_build(VecCtx *c, const Ref *tuple, uint32_t k, uint32_t st, int dep
                                tuple[j]);
           if (!same) continue;
           Ref ld = G->loaded[c->copy][v];
+          /* a half of the lanes, zero- or sign-extended as the loads are */
+          if (c->half >= 0) {
+            if (st != 1) VBFAIL("every other lane of a widened load");
+            bool sg = (f->insts[tuple[0]].imm2 & MEMF_SIGNED) != 0;
+            for (uint32_t j = 1; j < k; j++)
+              if (((f->insts[tuple[j]].imm2 & MEMF_SIGNED) != 0) != sg)
+                VBFAIL("signed and unsigned loads in a lane");
+            out = vemit(f, c->vbody, I_VEXTEND, VT_V128, ld, REF_NONE,
+                        (sg ? 1u : 0u) | (uint64_t)c->half << 1, c->lane);
+            goto done;
+          }
           if (st == 1) { out = ld; goto done; }
 
           if (st != 2) return REF_NONE;
@@ -12993,7 +13198,7 @@ static Ref v_build(VecCtx *c, const Ref *tuple, uint32_t k, uint32_t st, int dep
   }
   if (!c->inloop[block0]) return REF_NONE;
   if (mixed) {
-    if (st != 1 || (k & 1) || k < 2 || depth <= 0) return REF_NONE;
+    if (st != 1 || (k & 1) || k < 2 || depth <= 0 || c->half >= 0) return REF_NONE;
     Ref half[2], sub[VEC_MAX_MEMB];
     for (uint32_t p = 0; p < 2; p++) {
       for (uint32_t j = 0; j * 2 + p < k; j++) sub[j] = tuple[j * 2 + p];
@@ -13002,6 +13207,15 @@ static Ref v_build(VecCtx *c, const Ref *tuple, uint32_t k, uint32_t st, int dep
     }
     out = vemit(f, c->vbody, I_VZIP1, VT_V128, half[0], half[1], c->gran, c->lane);
     goto done;
+  }
+
+  if (c->half >= 0 && (op0 == I_ADD || op0 == I_MUL)) {
+    bool took = false;
+    out = v_build_ext(c, tuple, k, depth, &took);
+    if (took) {
+      if (out == REF_NONE) return REF_NONE;
+      goto done;
+    }
   }
 
   IrOp vop = I_NOP;
@@ -13274,7 +13488,7 @@ shift_var:
 done:
   if (c->nmemo < VEC_MAX_MEMO) {
     VMemo *m = &c->memo[c->nmemo++];
-    m->n = k; m->st = st;
+    m->n = k; m->st = st; m->half = c->half;
     for (uint32_t j = 0; j < k; j++) m->key[j] = tuple[j];
     m->val = out;
   }
@@ -13941,6 +14155,7 @@ static bool vectorize_one(IrFunc *f, uint32_t hb, uint8_t *reach, uint8_t *inloo
   ctx.lane = lane; ctx.width = width; ctx.k = k;
   ctx.mpv = mpv; ctx.nvec = nvec; ctx.gran = gran;
   ctx.acc = acc; ctx.nacc = nacc;
+  ctx.half = -1; ctx.awidth = width; ctx.alane = lane;
 
   uint8_t used[VEC_MAX_ACC];
   memset(used, 0, sizeof used);
@@ -13962,6 +14177,7 @@ static bool vectorize_one(IrFunc *f, uint32_t hb, uint8_t *reach, uint8_t *inloo
     }
     if (G->m > VEC_MAX_ILV) VREJ("interleave factor");
     if (G->m > 1 && nvec > 1) VREJ("interleaved group across several vectors");
+    if (G->m > 2 && G->store) VREJ("store interleaved three or four ways");
     G->nv = G->m > 1 ? G->m : nvec;
 
     uint32_t lowest = i;
@@ -14039,7 +14255,13 @@ static bool vectorize_one(IrFunc *f, uint32_t hb, uint8_t *reach, uint8_t *inloo
       if (A->mem != Bg->mem) continue;
 
       bool same_root = A->base == Bg->base && A->ivx == Bg->ivx && A->m == Bg->m;
-      if (!same_root && !(A->stat && Bg->stat)) {
+      /* Two groups apart by a constant stay that far apart only when they
+         move as fast: one interleaved m ways steps m times as far as one
+         that is not, and sweeps over what lies ahead of the other however
+         far apart they start (test/cases/ilvloops_*.wat's overlap rows,
+         c[i] = a[2i] + a[2i + 1] with c 16 elements past a), so those are
+         checked as their whole extents. */
+      if (!same_root && !(A->stat && Bg->stat && A->m == Bg->m)) {
         if (nchk == VEC_MAX_CHECK) VREJ("too many alias checks");
         chk[nchk][0] = g;
         chk[nchk][1] = g2;
@@ -14670,6 +14892,13 @@ static bool vectorize_one(IrFunc *f, uint32_t hb, uint8_t *reach, uint8_t *inloo
     }
   }
 
+  /* Bytes or halfwords may be computed in lanes twice as wide (see VecCtx)
+     where everything the loop does is store them. */
+  bool can_widen = (width == 1 || width == 2) && !VLANE_IS_FLOAT(lane) &&
+                   !mixlane && !nred && !npay;
+  for (uint32_t g = 0; g < ctx.ngrp; g++)
+    if (ctx.grp[g].store && ctx.grp[g].spec) can_widen = false;
+
   /* The bodies: the loop of R copies, and with more than one the loop of
      one copy after it. */
   uint32_t vbody1 = R > 1 ? ir_new_block(f) : REF_NONE;
@@ -14700,6 +14929,14 @@ static bool vectorize_one(IrFunc *f, uint32_t hb, uint8_t *reach, uint8_t *inloo
     for (uint32_t g = 0; g < ctx.ngrp; g++) {
       VGroup *G = &ctx.grp[g];
       if (G->store) continue;
+      /* three or four interleaved ways are streams of one ld3 or ld4 */
+      if (G->m > 2) {
+        for (uint32_t c = 0; c < RC; c++)
+          for (uint32_t v = 0; v < G->m; v++)
+            G->loaded[c][v] = vemit(f, vb, I_VLDN, VT_V128, B->pptr[g], REF_NONE,
+                                    c * G->m * VEC_BYTES, VLDN_IMM2(lane, v, G->m));
+        continue;
+      }
       Ref raw[VEC_MAX_COPY][VEC_MAX_VEC];
       for (uint32_t c = 0; c < RC; c++)
         for (uint32_t v = 0; v < G->nv; v++)
@@ -14723,16 +14960,26 @@ static bool vectorize_one(IrFunc *f, uint32_t hb, uint8_t *reach, uint8_t *inloo
       ctx.copy = c;
       if (c) v_memo_next_copy(&ctx);
       bool bad = false;
-      for (uint32_t g = 0; g < ctx.ngrp && !bad; g++) {
-        VGroup *G = &ctx.grp[g];
-        if (!G->store) continue;
-        for (uint32_t v = 0; v < G->nv && !bad; v++) {
-          Ref tuple[VEC_MAX_MEMB];
-          for (uint32_t t = 0; t < mpv; t++)
-            tuple[t] = ir_args(f, G->member[v_slot(G, mpv, v, t)])[1];
-          stored[g][c][v] = v_build(&ctx, tuple, mpv, 1, VEC_DEPTH);
-          if (stored[g][c][v] == REF_NONE) bad = true;
+      for (;;) {
+        for (uint32_t g = 0; g < ctx.ngrp && !bad; g++) {
+          VGroup *G = &ctx.grp[g];
+          if (!G->store) continue;
+          for (uint32_t v = 0; v < G->nv && !bad; v++) {
+            Ref tuple[VEC_MAX_MEMB];
+            for (uint32_t t = 0; t < mpv; t++)
+              tuple[t] = ir_args(f, G->member[v_slot(G, mpv, v, t)])[1];
+            stored[g][c][v] = ctx.wide ? v_build_wide(&ctx, tuple, mpv)
+                                       : v_build(&ctx, tuple, mpv, 1, VEC_DEPTH);
+            if (stored[g][c][v] == REF_NONE) bad = true;
+          }
         }
+        if (!bad || ctx.wide || !can_widen) break;
+        /* values that need more bits than the loop's lanes hold: in lanes
+           twice as wide, what the first try made left for DCE */
+        ctx.wide = true;
+        ctx.nmemo = 0;
+        ctx.fail = NULL;
+        bad = false;
       }
 
       for (uint32_t r = 0; r < nred && !bad; r++)

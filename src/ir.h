@@ -65,6 +65,11 @@ typedef enum {
 
   I_VLOAD,
   I_VSTORE,
+  /* stream VLDN_S(imm2) of VLDN_M(imm2) interleaved ones, in lanes
+     VLDN_LANE(imm2), from the VLDN_M(imm2) vectors at a[0] + imm: the
+     lanes s, s + m, s + 2m ... of them, which only the vectoriser makes
+     (arm64's ld3 and ld4, which load all m streams at once) */
+  I_VLDN,
   I_VADD, I_VSUB, I_VMUL, I_VAND, I_VOR, I_VXOR,
   I_VSMAX, I_VSMIN, I_VUMAX, I_VUMIN,
 
@@ -89,6 +94,11 @@ typedef enum {
   I_VDOT,
 
   I_VEXTADD, I_VEXTMUL, I_VEXTEND, I_VNARROW,
+  /* a[0] + VEXTMUL(a[1], a[2]) with VEXTMUL's imm and imm2, and the high
+     half of each lane imm2 of a[0] + a[1], narrowed, then of a[2] + a[3]
+     (addhn, addhn2): the vectoriser's, for lanes computed twice as wide as
+     the loop's bytes or halfwords */
+  I_VEXTMLA, I_VADDHN,
 
   I_VSHLV, I_VSHRUV, I_VSHRSV,
   I_VANYTRUE, I_VALLTRUE, I_VBITMASK,
@@ -181,6 +191,10 @@ typedef enum {
 #define VLANE_F64  5u
 #define VLANE_IS_FLOAT(x) ((x) >= VLANE_F32)
 #define VLANE_SIZE(x)     ((int)(VLANE_IS_FLOAT(x) ? (x) - VLANE_F32 + 2u : (x)))
+#define VLDN_IMM2(lane, s, m) ((uint64_t)(lane) | (uint64_t)(s) << 8 | (uint64_t)(m) << 16)
+#define VLDN_LANE(x)      ((uint32_t)(x) & 0xffu)
+#define VLDN_S(x)         ((uint32_t)((x) >> 8) & 0xffu)
+#define VLDN_M(x)         ((uint32_t)((x) >> 16) & 0xffu)
 
 #define MEMF_SIZE(x)   ((x) & 7u)
 #define MEMF_SIGNED    8u

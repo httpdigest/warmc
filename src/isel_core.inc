@@ -887,7 +887,7 @@ static void analyse_function(Isel *s) {
           if (in->imm2 == 0) s->needs_mem = true;
           touches_instance = true;
           break;
-        case I_VLOAD: case I_VSTORE:
+        case I_VLOAD: case I_VSTORE: case I_VLDN:
           s->needs_mem = true;
           touches_instance = true;
           break;
