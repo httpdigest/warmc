@@ -639,10 +639,14 @@ static Ref emit_before(IrFunc *f, uint32_t bi, uint32_t *idx, IrOp op, ValType t
    they always were, while the previous iteration finishes.  LLVM writes
    n += popcount(v) + clz(v) as (n + clz) + popcount, and an unrolled copy of
    the body makes the chain four times as long.  Integer ops only, which are
-   associative and commutative mod 2^n. */
+   associative and commutative mod 2^n -- in a v128 too, lane by lane, when
+   every link has the same lanes: Zig's unrolled vector sum adds four vectors
+   into one accumulator a link at a time, four add.4s each waiting on the
+   last, where native keeps four. */
 #define RC_LINKS 64
 static uint32_t rc_path(IrFunc *f, Ref v, Ref p, uint16_t op, uint8_t ty,
-                        const uint32_t *uses, uint32_t lo, Ref *link, uint32_t n) {
+                        uint64_t lane, const uint32_t *uses, uint32_t lo,
+                        Ref *link, uint32_t n) {
   if (n == RC_LINKS) return 0;
   link[n] = v;
   Ref *a = ir_args(f, v);
@@ -650,10 +654,10 @@ static uint32_t rc_path(IrFunc *f, Ref v, Ref p, uint16_t op, uint8_t ty,
   for (int k = 0; k < 2; k++) {
     Inst *in = &f->insts[a[k]];
     /* a link computed before the loop, its invariant part, stays a term */
-    if (in->op != op || in->type != ty || in->nargs != 2 || uses[a[k]] != 1 ||
-        f->blocks[in->block].rpo < lo)
+    if (in->op != op || in->type != ty || in->imm2 != lane || in->nargs != 2 ||
+        uses[a[k]] != 1 || f->blocks[in->block].rpo < lo)
       continue;
-    uint32_t m = rc_path(f, a[k], p, op, ty, uses, lo, link, n + 1);
+    uint32_t m = rc_path(f, a[k], p, op, ty, lane, uses, lo, link, n + 1);
     if (m) return m;
   }
   return 0;
@@ -672,11 +676,16 @@ static bool pass_reassoc_carried(IrFunc *f) {
         Inst *ri = &f->insts[r];
         uint16_t op = ri->op;
         ValType ty = (ValType)ri->type;
-        if (op != I_ADD && op != I_MUL && op != I_AND && op != I_OR && op != I_XOR) continue;
-        if (ri->nargs != 2 || (ty != VT_I32 && ty != VT_I64)) continue;
+        bool vec = ty == VT_V128;
+        if (vec ? op != I_VADD && op != I_VMUL && op != I_VAND && op != I_VOR && op != I_VXOR
+                : op != I_ADD && op != I_MUL && op != I_AND && op != I_OR && op != I_XOR)
+          continue;
+        if (ri->nargs != 2 || (ty != VT_I32 && ty != VT_I64 && !vec)) continue;
+        uint64_t lane = ri->imm2;
+        if (vec && VLANE_IS_FLOAT(lane)) continue;
         /* link[0] is r, link[n - 1] the one that reads p */
         Ref link[RC_LINKS], term[RC_LINKS];
-        uint32_t n = rc_path(f, r, p, op, ty, uses, f->blocks[h].rpo, link, 0);
+        uint32_t n = rc_path(f, r, p, op, ty, lane, uses, f->blocks[h].rpo, link, 0);
         if (n < 2) continue;
         bool twice = false;
         for (uint32_t k = 0; k < n; k++) {
@@ -691,17 +700,17 @@ static bool pass_reassoc_carried(IrFunc *f) {
            counter's steps are */
         uint64_t kv = 0, c;
         bool have_k = false;
-        for (uint32_t k = 0; k < n; k++)
+        for (uint32_t k = 0; k < n && !vec; k++)
           if (is_const(f, term[k], &c)) {
             if (!have_k) kv = c;
             else fold_int_binop(op, ty, kv, c, &kv);
             have_k = true;
           }
-        uint64_t ident = op == I_MUL ? 1 : op == I_AND ? trunc_to(ty, ~0ull) : 0;
+        uint64_t ident = vec ? 0 : op == I_MUL ? 1 : op == I_AND ? trunc_to(ty, ~0ull) : 0;
 
         Ref acc = REF_NONE;
         for (uint32_t k = n; k-- > 1;) {
-          if (is_const(f, term[k], &c)) continue;
+          if (!vec && is_const(f, term[k], &c)) continue;
           if (acc == REF_NONE) { acc = term[k]; continue; }
           Ref *a = ir_args(f, link[k]);
           a[0] = acc;
@@ -712,9 +721,13 @@ static bool pass_reassoc_carried(IrFunc *f) {
         Block *b = &f->blocks[rb];
         while (at < b->ninsts && b->insts[at] != r) at++;
         if (at == b->ninsts) continue;
-        if (!is_const(f, term[0], &c)) {
+        if (vec || !is_const(f, term[0], &c)) {
           Ref pr[2] = { acc, term[0] };
-          acc = acc == REF_NONE ? term[0] : emit_before(f, rb, &at, (IrOp)op, ty, pr, 2, 0);
+          if (acc == REF_NONE) acc = term[0];
+          else {
+            acc = emit_before(f, rb, &at, (IrOp)op, ty, pr, 2, 0);
+            f->insts[acc].imm2 = lane;
+          }
         }
         if (have_k && (trunc_to(ty, kv) != ident || acc == REF_NONE)) {
           Ref kc = emit_before(f, rb, &at, I_CONST, ty, NULL, 0, trunc_to(ty, kv));
@@ -722,7 +735,7 @@ static bool pass_reassoc_carried(IrFunc *f) {
           acc = acc == REF_NONE ? kc : emit_before(f, rb, &at, (IrOp)op, ty, pr, 2, 0);
         }
         Ref *ra = ir_args(f, r);
-        bool kl = is_const(f, acc, &c);
+        bool kl = !vec && is_const(f, acc, &c);
         ra[0] = kl ? p : acc;
         ra[1] = kl ? acc : p;
         changed = true;
