@@ -8422,6 +8422,23 @@ static bool lh_writes_mem(uint32_t op) {
 typedef struct { uint32_t from, succ; Ref val; } GlEdge;
 #define GL_MAX_EDGES 32
 
+/* An exit into a block that traps needs no write-back -- unless the block
+   reads the global first: a return_call is built as the call followed by
+   trap #1, and the callee, or any call before an unreachable, sees the
+   global as memory has it.  GHC's tail calls out of a loop that kept Sp in
+   a register made bintree hang, and a counter promoted around a loop that
+   ends in return_call returned 0. */
+static bool gl_exit_reads(IrFunc *f, uint32_t t, uint32_t gidx) {
+  Block *b = &f->blocks[t];
+  if (b->term != T_TRAP) return true;
+  for (uint32_t i = 0; i < b->ninsts; i++) {
+    Inst *in = &f->insts[b->insts[i]];
+    if (is_call_op(in->op)) return true;
+    if (in->op == I_GLOBAL_GET && (uint32_t)in->imm == gidx) return true;
+  }
+  return false;
+}
+
 static bool gl_walk(IrFunc *f, uint32_t hb, const uint8_t *inloop,
                     uint32_t gidx, Ref hval, Ref *cur, Ref *subst,
                     GlEdge *back, uint32_t *nback,
@@ -8451,7 +8468,7 @@ static bool gl_walk(IrFunc *f, uint32_t hb, const uint8_t *inloop,
       } else if (inloop[t]) {
         if (cur[t] == REF_NONE) cur[t] = v;
         else if (cur[t] != v) return false;
-      } else if (f->blocks[t].term != T_TRAP) {
+      } else if (gl_exit_reads(f, t, gidx)) {
 
         if (*nout == GL_MAX_EDGES) return false;
         out[(*nout)++] = (GlEdge){ bi, s, v };
