@@ -2,6 +2,16 @@
 
 : "${BUILD:=build}"
 
+# TinyGo's wasip2 target runs wasm-tools itself to make the component, and a
+# CI runner has none on PATH: give it the pinned one `make wasm-tools` builds.
+if [ -x "$BUILD/tools/bin/wasm-tools" ]; then
+  case "$BUILD" in
+    /*) PATH="$BUILD/tools/bin:$PATH" ;;
+    *)  PATH="$PWD/$BUILD/tools/bin:$PATH" ;;
+  esac
+  export PATH
+fi
+
 # wabt 1.0.42 turned most of these proposals on by default and removed their
 # --enable flags, which it now rejects; pass only the ones this wat2wasm still
 # lists.  test/hostbuild.py's wabt_flags() makes the same choice.
