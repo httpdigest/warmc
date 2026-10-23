@@ -661,19 +661,33 @@ jobs:
           path: *rust
           key: ${{ steps.rust.outputs.cache-primary-key }}
 
+      # Not Go: setup-go puts it on D: and only a link to it in the tool cache
+      # on C:, so the cache kept the link, a fresh runner restored it pointing
+      # at a D: without Go, and setup-go then failed to make the link again
+      # (EEXIST).  It downloads Go each time instead.
       - name: Restore the toolchains
         if: inputs.full
         id: toolcache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: *toolcache
-          key: *toolcache-key
+          path: &toolcache-windows |
+            ${{ runner.tool_cache }}/tinygo/0.43.0
+            ${{ runner.tool_cache }}/binaryen
+            ${{ runner.tool_cache }}/node/26.12.1
+          key: &toolcache-windows-key toolcache-${{ runner.os }}-${{ runner.arch }}-tinygo0.43.0-binaryen133-node26.12.1
 
       - *setup-go
       - *setup-tinygo
       - *setup-zig
       - *setup-node
-      - *save-toolcache
+
+      - name: Save the toolchains
+        if: inputs.full && steps.toolcache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: *toolcache-windows
+          key: *toolcache-windows-key
+
       - *setup-java
 
       # Kotlin/Wasm and GHC's wasm backend have no Windows builds here; their
