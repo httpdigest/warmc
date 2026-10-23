@@ -101,6 +101,32 @@
       (i32.shl (i32.load8_u offset=0 (global.get $zero)) (i32.const 8))
                (i32.load8_u offset=2 (i32.add (global.get $zero) (i32.const -1)))))
 
+  ;; Store-to-load forwarding where the load's i32 add is the smaller
+  ;; constant (test/cases/fwdwrap.wat): the store at sp + 8 and the load at
+  ;; (sp - 8) + 16 are one address unless sp - 8 wraps, and at sp = 4 it
+  ;; does.  With an access at sp - 8 first, that one traps; without one, or
+  ;; with one at sp, the load must stay and trap instead of reading the
+  ;; stored value.
+  (global $four (mut i32) (i32.const 4))
+  (func (export "fwd_wrap_witness") (result i32)
+    (local $sp i32) (local $c i32)
+    (local.set $sp (global.get $four))
+    (i32.store offset=8 (local.get $sp) (i32.const 42))
+    (local.set $c (i32.sub (local.get $sp) (i32.const 8)))
+    (i64.store (local.get $c) (i64.const 7))
+    (i32.load offset=16 (local.get $c)))
+  (func (export "fwd_wrap_no_witness") (result i32)
+    (local $sp i32)
+    (local.set $sp (global.get $four))
+    (i32.store offset=8 (local.get $sp) (i32.const 42))
+    (i32.load offset=16 (i32.sub (local.get $sp) (i32.const 8))))
+  (func (export "fwd_wrap_other_witness") (result i32)
+    (local $sp i32)
+    (local.set $sp (global.get $four))
+    (i32.store offset=8 (local.get $sp) (i32.const 42))
+    (i64.store (local.get $sp) (i64.const 7))
+    (i32.load offset=16 (i32.sub (local.get $sp) (i32.const 8))))
+
   ;; A vector access is sixteen bytes wide, so it reaches past the end from
   ;; fifteen bytes short of it -- a width the bounds check has to be told
   ;; about, and one no scalar access can produce.
