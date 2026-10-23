@@ -3915,9 +3915,10 @@ WarmInstance *warmc_instantiate_bound(const ModuleDesc *md,
     u32 mem = DSEG_MEM_INDEX(d->info);
     WarmMemory *M = mem < md->nmemories ? in->mems[mem] : 0;
     if (!M || off > M->size || d->len > M->size - off) warmc_trap(TRAP_MEM_OOB);
-    const u8 *src = md->data_blob + d->blob_off;
-    u8 *dst = M->base + off;
-    for (u64 k = 0; k < d->len; k++) dst[k] = src[k];
+    // The blob is in the image, never in a linear memory, so the two cannot
+    // overlap.  A byte loop here was 2% of stdgo/regex, whose 1 MB of data
+    // comes in 30000 segments.
+    mem_move(M->base + off, md->data_blob + d->blob_off, d->len);
     in->data_dropped[i] = 1;
   }
 
