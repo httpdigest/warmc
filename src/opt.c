@@ -12664,6 +12664,15 @@ typedef struct {
   uint64_t memflags;
   IrOp pred;
   bool exit_on_true;
+  /* LLVM's unrolled form (vs_match_unrolled): the element is at
+     (base + iv) + disp, summed in i32 as the scalar code sums it; the latch
+     is a != test, so the count left is bound - iv however the two compare;
+     and a bound of REF_NONE is zero, for a latch that branches on the
+     stepped counter itself. */
+  uint64_t disp;
+  uint64_t want_imm;
+  bool wrap32;
+  bool ne_latch;
 } VSearch;
 
 static bool vs_pure(uint16_t op) {
@@ -12671,7 +12680,7 @@ static bool vs_pure(uint16_t op) {
     case I_CONST: case I_ADD: case I_SUB: case I_MUL:
     case I_AND: case I_OR: case I_XOR:
     case I_SHL: case I_SHRU: case I_SHRS:
-    case I_EQ: case I_NE:
+    case I_EQ: case I_NE: case I_EQZ:
     case I_LTS: case I_LES: case I_GTS: case I_GES:
     case I_LTU: case I_LEU: case I_GTU: case I_GEU:
     case I_EXTENDU: case I_EXTENDS: case I_WRAP:
@@ -12839,6 +12848,160 @@ static bool vs_match(IrFunc *f, uint32_t hb, uint8_t *inloop, VSearch *S) {
   return true;
 }
 
+/* The same search as LLVM unrolls it, TinyGo's -opt=2 among others: the
+   counter steps by U, and each of U blocks in a row tests one byte, at
+   (base + iv) + C + k, and leaves the loop when it matches.  vs_emit's
+   vector loop finds the sixteen-byte block the match is in and enters this
+   loop at that block's first byte, where the unrolled tests say which byte
+   it was -- so U has to divide sixteen, for the vector loop's counter to be
+   one the scalar loop reaches too. */
+static bool vs_match_unrolled(IrFunc *f, uint32_t hb, uint8_t *inloop,
+                              VSearch *S) {
+  Block *h = &f->blocks[hb];
+  if (h->nparams != 1 || h->is_pad || h->term != T_BRIF || h->nsuccs != 2)
+    return false;
+  uint32_t nback = 0, nfwd = 0;
+  S->latch = S->entry = UINT32_MAX;
+  for (uint32_t i = 0; i < h->npreds; i++) {
+    uint32_t p = h->preds[i];
+    if (!f->blocks[p].reachable) continue;
+    if (f->blocks[p].rpo >= h->rpo) { S->latch = p; nback++; }
+    else { S->entry = p; nfwd++; }
+  }
+  if (nback != 1 || nfwd != 1) return false;
+  uint32_t lrpo = f->blocks[S->latch].rpo;
+  for (uint32_t b = 0; b < f->nblocks; b++)
+    inloop[b] = f->blocks[b].reachable && f->blocks[b].rpo >= h->rpo &&
+                f->blocks[b].rpo <= lrpo;
+  for (uint32_t b = 0; b < f->nblocks; b++) {
+    if (!inloop[b] || b == hb) continue;
+    for (uint32_t p = 0; p < f->blocks[b].npreds; p++)
+      if (!inloop[f->blocks[b].preds[p]]) VSREJ("unrolled: a body block has a second way in");
+  }
+  S->iv = h->params[0];
+  if ((ValType)f->insts[S->iv].type != VT_I32) VSREJ("unrolled: counter is not i32");
+
+  /* The tests, header first, each one block. */
+  uint32_t U = 0, cur = hb;
+  uint64_t want = 0;
+  Ref row = REF_NONE;
+  while (cur != S->latch) {
+    Block *cb = &f->blocks[cur];
+    if (cb->term != T_BRIF || cb->nsuccs != 2) VSREJ("unrolled: a test is not a two-way branch");
+    if (cur != hb && cb->nparams) VSREJ("unrolled: a test block takes values");
+    uint32_t a = cb->succs[0].target, b = cb->succs[1].target, next, ni;
+    bool exit_true;
+    if (!inloop[a] && inloop[b]) { exit_true = true; next = b; ni = 1; }
+    else if (inloop[a] && !inloop[b]) { exit_true = false; next = a; ni = 0; }
+    else VSREJ("unrolled: a test does not leave the loop");
+    if (cb->succs[ni].nargs) VSREJ("unrolled: a test passes values on");
+    if (U == 16) VSREJ("unrolled: more than sixteen tests");
+
+    Ref cond = cb->term_arg, ld;
+    uint64_t w = 0;
+    bool is_eq;
+    Inst *ci = &f->insts[cond];
+    if (ci->op == I_LOAD) { ld = cond; is_eq = false; }
+    else if (ci->op == I_EQZ && ci->nargs == 1) { ld = ir_args(f, cond)[0]; is_eq = true; }
+    else if ((ci->op == I_EQ || ci->op == I_NE) && ci->nargs == 2) {
+      Ref *ca = ir_args(f, cond);
+      Ref other;
+      if (f->insts[ca[0]].op == I_LOAD) { ld = ca[0]; other = ca[1]; }
+      else { ld = ca[1]; other = ca[0]; }
+      if (!is_const(f, other, &w)) VSREJ("unrolled: compared value is not a constant");
+      is_eq = ci->op == I_EQ;
+    } else VSREJ("unrolled: a test is not of an element");
+    IrOp pred = (is_eq == exit_true) ? I_EQ : I_NE;
+    if (f->insts[ld].op != I_LOAD || f->insts[ld].block != cur || f->insts[ld].nargs != 1)
+      VSREJ("unrolled: the element is not loaded where it is tested");
+    uint64_t mf = f->insts[ld].imm2;
+    if (MEMF_SIZE(mf) != 0 || (mf & MEMF_SIGNED) || f->insts[ld].imm != 0 ||
+        (ValType)f->insts[ld].type != VT_I32)
+      VSREJ("unrolled: the element is not an unsigned byte");
+    if (w > 0xff) VSREJ("unrolled: compared value does not fit a byte");
+
+    Ref ma = ir_args(f, ld)[0];
+    if (f->insts[ma].op != I_MEM_ADDR || f->insts[ma].nargs != 1 || f->insts[ma].imm != 0)
+      VSREJ("unrolled: address is not a plain memory address");
+    Ref s = ir_args(f, ma)[0];
+    uint64_t c = 0;
+    Inst *si = &f->insts[s];
+    if (si->op == I_ADD && si->nargs == 2 && is_const(f, ir_args(f, s)[1], &c))
+      s = ir_args(f, s)[0];
+    else if (si->op == I_ADD && si->nargs == 2 && is_const(f, ir_args(f, s)[0], &c))
+      s = ir_args(f, s)[1];
+    if (U == 0) {
+      Inst *ri = &f->insts[s];
+      if (ri->op != I_ADD || ri->nargs != 2) VSREJ("unrolled: address is not base plus counter");
+      Ref *ra = ir_args(f, s);
+      if (ra[0] == S->iv && vs_invariant(f, inloop, ra[1])) S->base = ra[1];
+      else if (ra[1] == S->iv && vs_invariant(f, inloop, ra[0])) S->base = ra[0];
+      else VSREJ("unrolled: address is not base plus counter");
+      row = s;
+      S->disp = c;
+      S->pred = pred;
+      S->memflags = mf;
+      want = w;
+    } else {
+      if (s != row) VSREJ("unrolled: tests address different rows");
+      if (c != ((S->disp + U) & 0xffffffffu)) VSREJ("unrolled: tests are not of consecutive bytes");
+      if (pred != S->pred || w != want || MEMF_MEM(mf) != MEMF_MEM(S->memflags))
+        VSREJ("unrolled: tests differ");
+    }
+    U++;
+    cur = next;
+  }
+  if (U < 2 || 16 % U) VSREJ("unrolled: count does not divide sixteen");
+
+  Block *lb = &f->blocks[S->latch];
+  if (lb->term != T_BRIF || lb->nsuccs != 2) VSREJ("unrolled: latch is not a two-way branch");
+  uint32_t back = lb->succs[0].target == hb ? 0 : 1;
+  if (lb->succs[back].target != hb || lb->succs[!back].target == hb)
+    VSREJ("unrolled: latch does not branch back");
+  if (lb->succs[back].nargs != 1) VSREJ("unrolled: latch carries the wrong number of values");
+  S->ivnext = lb->succs[back].args[0];
+  if (vs_addk(f, S->ivnext, S->iv) != U) VSREJ("unrolled: counter does not step by the count");
+  Ref lc = lb->term_arg;
+  if (lc == S->ivnext && back == 0) {
+    S->bound = REF_NONE;
+    S->ne_latch = true;
+  } else {
+    Inst *li = &f->insts[lc];
+    if (li->nargs != 2) VSREJ("unrolled: latch test has the wrong shape");
+    Ref *la = ir_args(f, lc);
+    if (li->op == I_EQ && back == 1) S->ne_latch = true;
+    else if (li->op == I_NE && back == 0) S->ne_latch = true;
+    else if (!(((li->op == I_LTU || li->op == I_LTS) && back == 0 && la[0] == S->ivnext) ||
+               ((li->op == I_GTU || li->op == I_GTS) && back == 0 && la[1] == S->ivnext)))
+      VSREJ("unrolled: latch test is not a counted one");
+    if (la[0] == S->ivnext) S->bound = la[1];
+    else if (la[1] == S->ivnext) S->bound = la[0];
+    else VSREJ("unrolled: bound is not the counter compared with something");
+    if (!vs_invariant(f, inloop, S->bound) || (ValType)f->insts[S->bound].type != VT_I32)
+      VSREJ("unrolled: bound is not a loop-invariant i32");
+  }
+
+  uint32_t nloads = 0;
+  for (uint32_t b = 0; b < f->nblocks; b++) {
+    if (!inloop[b]) continue;
+    Block *bb = &f->blocks[b];
+    for (uint32_t i = 0; i < bb->ninsts; i++) {
+      uint16_t op = f->insts[bb->insts[i]].op;
+      if (!vs_pure(op)) VSREJ("unrolled: body does something besides compute");
+      if (op == I_LOAD) nloads++;
+    }
+  }
+  if (nloads != U) VSREJ("unrolled: the loop loads something besides the bytes it searches");
+
+  S->want = REF_NONE;
+  S->want_imm = want;
+  S->width = 1;
+  S->lane = 0;
+  S->wrap32 = true;
+  S->exit_on_true = true;
+  return true;
+}
+
 static Ref vs_mem_bytes(IrFunc *f, uint32_t bi, const VSearch *S) {
   Ref pages = ir_emit(f, bi, I_MEM_SIZE, VT_I32, NULL, 0,
                       MEMF_MEM(S->memflags), 0);
@@ -12849,6 +13012,16 @@ static Ref vs_mem_bytes(IrFunc *f, uint32_t bi, const VSearch *S) {
 
 static Ref vs_block_in_bounds(IrFunc *f, uint32_t bi, const VSearch *S,
                               Ref idx, Ref memsz) {
+  if (S->wrap32) {
+    Ref a = vemit(f, bi, I_ADD, VT_I32, S->base, idx, 0, 0);
+    if (S->disp)
+      a = vemit(f, bi, I_ADD, VT_I32, a,
+                ir_emit(f, bi, I_CONST, VT_I32, NULL, 0, S->disp, 0), 0, 0);
+    Ref a64 = vemit(f, bi, I_EXTENDU, VT_I64, a, REF_NONE, 0, 0);
+    Ref end = vemit(f, bi, I_ADD, VT_I64, a64,
+                    ir_emit(f, bi, I_CONST, VT_I64, NULL, 0, 16, 0), 0, 0);
+    return vemit(f, bi, I_LEU, VT_I32, end, memsz, 0, 0);
+  }
   Ref base64 = vemit(f, bi, I_EXTENDU, VT_I64, S->base, REF_NONE, 0, 0);
   Ref idx64 = vemit(f, bi, I_EXTENDU, VT_I64, idx, REF_NONE, 0, 0);
   Ref off64 = S->lane == 0 ? idx64
@@ -12879,10 +13052,14 @@ static void vs_emit(IrFunc *f, uint32_t hb, const VSearch *S) {
 
   Ref vfc = ir_emit(f, vguard, I_CONST, VT_I32, NULL, 0, VF, 0);
 
-  Ref le = vemit(f, vguard, I_LEU, VT_I32, i0, S->bound, 0, 0);
-  Ref room = vemit(f, vguard, I_SUB, VT_I32, S->bound, i0, 0, 0);
+  /* A != latch counts bound - i0 however the two compare; the others
+     need i0 below the bound first.  REF_NONE is a bound of zero. */
+  Ref bnd = S->bound != REF_NONE ? S->bound
+          : ir_emit(f, vguard, I_CONST, VT_I32, NULL, 0, 0, 0);
+  Ref le = S->ne_latch ? REF_NONE : vemit(f, vguard, I_LEU, VT_I32, i0, bnd, 0, 0);
+  Ref room = vemit(f, vguard, I_SUB, VT_I32, bnd, i0, 0, 0);
   Ref fits = vemit(f, vguard, I_GTU, VT_I32, room, vfc, 0, 0);
-  Ref ok = vemit(f, vguard, I_AND, VT_I32, le, fits, 0, 0);
+  Ref ok = S->ne_latch ? fits : vemit(f, vguard, I_AND, VT_I32, le, fits, 0, 0);
 
   Ref memsz = vs_mem_bytes(f, vguard, S);
   ok = vemit(f, vguard, I_AND, VT_I32, ok,
@@ -12896,12 +13073,15 @@ static void vs_emit(IrFunc *f, uint32_t hb, const VSearch *S) {
           : vemit(f, vbody, I_SHL, VT_I32, bj,
                   ir_emit(f, vbody, I_CONST, VT_I32, NULL, 0, S->lane, 0), 0, 0);
   Ref sum = vemit(f, vbody, I_ADD, VT_I32, S->base, off, 0, 0);
+  if (S->disp)
+    sum = vemit(f, vbody, I_ADD, VT_I32, sum,
+                ir_emit(f, vbody, I_CONST, VT_I32, NULL, 0, S->disp, 0), 0, 0);
 
   Ref ptr = vemit(f, vbody, I_MEM_PTR, VT_I64, sum, REF_NONE, 0,
                   MEMF_MEM(S->memflags));
   Ref vec = vemit(f, vbody, I_VLOAD, VT_V128, ptr, REF_NONE, 0, S->lane);
   Ref wantc = S->want != REF_NONE ? S->want
-            : ir_emit(f, vbody, I_CONST, VT_I32, NULL, 0, 0, 0);
+            : ir_emit(f, vbody, I_CONST, VT_I32, NULL, 0, S->want_imm, 0);
   Ref spl = vemit(f, vbody, I_VSPLAT, VT_V128, wantc, REF_NONE, 0, S->lane);
   Ref m = vemit(f, vbody, I_VCMP, VT_V128, vec, spl, S->pred, S->lane);
   Ref any = vemit(f, vbody, I_VANYTRUE, VT_I32, m, REF_NONE, 0, S->lane);
@@ -12912,7 +13092,9 @@ static void vs_emit(IrFunc *f, uint32_t hb, const VSearch *S) {
 
   Ref vfc2 = ir_emit(f, vnext, I_CONST, VT_I32, NULL, 0, VF, 0);
   Ref j2 = vemit(f, vnext, I_ADD, VT_I32, nj, vfc2, 0, 0);
-  Ref room2 = vemit(f, vnext, I_SUB, VT_I32, S->bound, j2, 0, 0);
+  Ref bnd2 = S->bound != REF_NONE ? S->bound
+           : ir_emit(f, vnext, I_CONST, VT_I32, NULL, 0, 0, 0);
+  Ref room2 = vemit(f, vnext, I_SUB, VT_I32, bnd2, j2, 0, 0);
   Ref more = vemit(f, vnext, I_GTU, VT_I32, room2, vfc2, 0, 0);
 
   Ref memsz2 = vs_mem_bytes(f, vnext, S);
@@ -12934,7 +13116,11 @@ static bool pass_vec_search(IrFunc *f) {
     if (hb >= norig) continue;
     if (f->nblocks > lcap) { lcap = f->nblocks; inloop = xrealloc(inloop, lcap); }
     VSearch S;
-    if (!vs_match(f, hb, inloop, &S)) continue;
+    memset(&S, 0, sizeof S);
+    if (!vs_match(f, hb, inloop, &S)) {
+      memset(&S, 0, sizeof S);
+      if (!vs_match_unrolled(f, hb, inloop, &S)) continue;
+    }
     if (warmc_getenv("WARMC_VEC_DEBUG"))
       fprintf(stderr, "vecsearch %s b%u: width=%u lanes=%u\n",
               f->m->funcs[f->func_index].sym, hb, S.width, 16u / S.width);
