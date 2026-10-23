@@ -265,6 +265,8 @@ int main(int argc, char **argv) {
   CASE("cset w6, ne", a64_cset(b, SF32, R6, CC_NE));
   CASE("cset x7, ge", a64_cset(b, SF64, R7, CC_GE));
   CASE("csinv x8, x9, x10, hi", a64_csinv(b, SF64, R8, R9, R10, CC_HI));
+  CASE("csneg w11, w12, w13, ge", a64_csneg(b, SF32, R11, R12, R13, CC_GE));
+  CASE("csneg x14, x15, x16, lo", a64_csneg(b, SF64, R14, R15, R16, CC_LO));
   CASE("csetm w11, lo", a64_csetm(b, SF32, R11, CC_LO));
   CASE("csetm x12, eq", a64_csetm(b, SF64, R12, CC_EQ));
 

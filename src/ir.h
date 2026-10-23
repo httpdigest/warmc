@@ -407,6 +407,8 @@ typedef struct {
 
   bool unroll;
 
+  bool ifconv;
+
   bool gcpure;
 
   bool closed_world;

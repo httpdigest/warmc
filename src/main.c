@@ -54,7 +54,8 @@ static const char *usage_text =
   "                vectorize, edge-tests, unroll, selftail, ldcomb, escape,\n"
   "                partial-escape, gloop, gssa, loopclose, cpool, ictab, reach,\n"
   "                prune, merge, devirt, reinline, throw-jump, closed-world,\n"
-  "                gcpure, split, labcache, barelide, small-loop-align\n"
+  "                gcpure, split, labcache, ifconv, barelide,\n"
+  "                small-loop-align\n"
   "                The last two are the passes built on a loop containing\n"
   "                no safepoint, which is the only assumption the compiler\n"
   "                makes about the collector: turning them off says whether\n"
@@ -302,6 +303,7 @@ int main(int argc, char **argv) {
   opt.reinline = true;
   opt.throwjump = true;
   opt.unroll = true;
+  opt.ifconv = true;
   opt.gcpure = true;
   opt.closed_world = true;
 
@@ -442,6 +444,7 @@ int main(int argc, char **argv) {
       else if (!strcmp(name, "reinline")) opt.reinline = on;
       else if (!strcmp(name, "throw-jump")) opt.throwjump = on;
       else if (!strcmp(name, "unroll")) opt.unroll = on;
+      else if (!strcmp(name, "ifconv")) opt.ifconv = on;
       else if (!strcmp(name, "gcpure")) opt.gcpure = on;
       else if (!strcmp(name, "closed-world")) opt.closed_world = on;
       else warmc_fatal("unknown pass %s", name);

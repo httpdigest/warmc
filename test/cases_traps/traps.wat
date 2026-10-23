@@ -127,6 +127,38 @@
     (i64.store (local.get $sp) (i64.const 7))
     (i32.load offset=16 (i32.sub (local.get $sp) (i32.const 8))))
 
+  ;; If-conversion (test/cases/ifconv.wat): the arms that must stay
+  ;; branches, taken where they trap.  Each arm is one the pass turns down
+  ;; -- a division by a variable, a signed one by -1, a load, a trapping
+  ;; truncation -- and the other arm is cheap, so a conversion that ran it
+  ;; anyway, or picked the wrong side, would return instead of trapping.
+  (global $ifc_one (mut i32) (i32.const 1))
+  (global $ifc_min (mut i32) (i32.const 0x80000000))
+  (global $ifc_nan (mut f32) (f32.const nan))
+  (func $ifc_div (param $c i32) (param $x i32) (param $d i32) (result i32)
+    (if (result i32) (local.get $c)
+      (then (i32.div_u (local.get $x) (local.get $d)))
+      (else (i32.add (local.get $x) (i32.const 1)))))
+  (func (export "ifc_div0_taken") (result i32)
+    (call $ifc_div (global.get $ifc_one) (global.get $ifc_min) (global.get $zero)))
+  (func (export "ifc_divovf_taken") (result i32)
+    (if (result i32) (global.get $ifc_one)
+      (then (i32.div_s (global.get $ifc_min) (i32.const -1)))
+      (else (global.get $ifc_min))))
+  (func (export "ifc_load_oob_taken") (result i32)
+    (if (result i32) (i32.eqz (global.get $zero))
+      (then (i32.load (global.get $top)))
+      (else (i32.const -1))))
+  (func (export "ifc_trunc_taken") (result i32)
+    (if (result i32) (global.get $ifc_one)
+      (then (i32.trunc_f32_s (global.get $ifc_nan)))
+      (else (i32.const 0))))
+  (func (export "ifc_untaken_ok") (result i32)
+    (if (i32.ne (call $ifc_div (global.get $zero) (global.get $ifc_min) (global.get $zero))
+                (i32.const 0x80000001))
+      (then (unreachable)))
+    (i32.const 0))
+
   ;; A vector access is sixteen bytes wide, so it reaches past the end from
   ;; fifteen bytes short of it -- a width the bounds check has to be told
   ;; about, and one no scalar access can produce.

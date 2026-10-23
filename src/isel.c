@@ -1804,17 +1804,38 @@ static void analyse_immediates(Isel *s) {
       if (in->op != I_SELECT || in->nargs != 3 || is_fp_value(f, u) || is_vec_value(f, u))
         continue;
       Ref *a = ir_args(f, u);
+      uint64_t m = vt_is_64((ValType)in->type) ? ~0ull : 0xffffffffull;
+      /* An arm one instruction from a value -- x + 1, 0 - x, x ^ -1 -- is
+         that value through csinc, csneg or csinv, which do the step where
+         the condition fails.  If-conversion makes these: cbench/fnptr's
+         c ? s + 1 : s - a, and an absolute value from a branch. */
       for (int slot = 0; slot < 2; slot++) {
         Ref cand = a[slot];
         Inst *ci = &f->insts[cand];
-        if (ci->op != I_ADD || ci->nargs != 2 || ci->type != in->type) continue;
+        if (ci->nargs != 2 || ci->type != in->type) continue;
         if (uses[cand] != 1 || blocked[cand] || s->folded[cand] || ci->block != bi) continue;
         Ref *ca = ir_args(f, cand);
-        if (ca[0] != a[slot ^ 1] || f->insts[ca[1]].op != I_CONST ||
-            (f->insts[ca[1]].imm & (vt_is_64((ValType)in->type) ? ~0ull : 0xffffffffull)) != 1)
+        uint8_t kind;
+        if (ci->op == I_ADD && f->insts[ca[1]].op == I_CONST &&
+            (f->insts[ca[1]].imm & m) == 1)
+          kind = 0;
+        else if (ci->op == I_SUB && f->insts[ca[0]].op == I_CONST &&
+                 (f->insts[ca[0]].imm & m) == 0)
+          kind = CS_NEG;
+        else if (ci->op == I_XOR && f->insts[ca[1]].op == I_CONST &&
+                 (f->insts[ca[1]].imm & m) == m)
+          kind = CS_INV;
+        else
+          continue;
+        /* the other arm a constant the cases below make better; and x is
+           read here, so it must be a value of its own, not one a fusion
+           above put into the arm (a shifted operand, an eon) */
+        Ref x = ca[kind == CS_NEG ? 1 : 0];
+        if (f->insts[a[slot ^ 1]].op == I_CONST || f->insts[x].op == I_CONST ||
+            s->folded[x] || s->folded[a[slot ^ 1]])
           continue;
         s->folded[cand] = 1;
-        s->csinc[u] = (uint8_t)(slot + 1);
+        s->csinc[u] = (uint8_t)((slot + 1) | kind);
         break;
       }
     }
@@ -3155,11 +3176,14 @@ static bool imm_ok_a64(IrFunc *f, Ref user, uint32_t idx, uint64_t cval, ValType
 
       if (idx > 1 || vt_is_float(ct)) return false;
       if (masked == 0) return true;
+      if (masked != 1 && masked != (sf ? ~0ull : 0xffffffffu)) return false;
+      /* 1 or -1 against a register is csinc or csinv of the zero
+         register; against 0 it is cset or csetm */
       Ref other = ir_args(f, user)[idx ^ 1u];
-      if (f->insts[other].op != I_CONST) return false;
+      if (f->insts[other].op != I_CONST) return !vt_is_float((ValType)f->insts[other].type) &&
+                                               f->insts[other].type != VT_V128;
       uint64_t om = sf ? f->insts[other].imm : (f->insts[other].imm & 0xffffffffu);
-      if (om != 0) return false;
-      return masked == 1 || masked == (sf ? ~0ull : 0xffffffffu);
+      return om == 0;
     }
     case I_LOAD: case I_STORE: {
 

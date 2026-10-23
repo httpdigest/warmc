@@ -126,6 +126,7 @@ void a64_uxtw(Buf *b, int rd, int rn);
 void a64_csel(Buf *b, int sf, int rd, int rn, int rm, int cond);
 void a64_csinc(Buf *b, int sf, int rd, int rn, int rm, int cond);
 void a64_csinv(Buf *b, int sf, int rd, int rn, int rm, int cond);
+void a64_csneg(Buf *b, int sf, int rd, int rn, int rm, int cond);
 void a64_cset(Buf *b, int sf, int rd, int cond);
 void a64_csetm(Buf *b, int sf, int rd, int cond);
 

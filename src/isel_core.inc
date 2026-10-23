@@ -125,9 +125,13 @@ typedef struct {
   uint8_t *addr_fuse;
   uint8_t *ptr_fuse;
   uint8_t *zx_fuse;
-  /* select(c, k + 1, k), either way round: 1 + the arm that is the add,
-     which is folded, and the select is a csinc of k */
+  /* select(c, x + 1, y), select(c, 0 - x, y) or select(c, x ^ -1, y),
+     either way round: 1 + the arm that is the add, negation or not, which
+     is folded, plus CS_NEG or CS_INV for the second and third, and the
+     select is a csinc, csneg or csinv of y and x */
   uint8_t *csinc;
+#define CS_NEG 4u
+#define CS_INV 8u
   /* an or or xor of x << k and y >> (width - k), both folded: one extr */
   uint8_t *extr;
   /* Use-cluster pieces: a value with no register of its own (a slot or a
