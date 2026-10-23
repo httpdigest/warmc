@@ -1,3 +1,5 @@
+#include "sort.h"
+
 static bool op_clobbers_caller_saved(uint16_t op) {
   switch (op) {
     case I_CALL: case I_CALL_INDIRECT: case I_CALL_REF:
@@ -473,18 +475,15 @@ static void csa_list_sites(Isel *s, IrFunc *f, Ref site, const Ref *live,
 /* One block's range for one value, filed under the value's web. */
 typedef struct { uint32_t rep; int32_t lo, hi; } BlkRange;
 
-static int blk_range_cmp(const void *a, const void *b) {
-  const BlkRange *x = a, *y = b;
-  if (x->rep != y->rep) return x->rep < y->rep ? -1 : 1;
-  if (x->lo != y->lo) return x->lo < y->lo ? -1 : 1;
-  return x->hi < y->hi ? -1 : x->hi > y->hi;
-}
+#define BLK_RANGE_LESS(x, y)                                                   \
+  ((x)->rep != (y)->rep ? (x)->rep < (y)->rep                                  \
+   : (x)->lo != (y)->lo ? (x)->lo < (y)->lo : (x)->hi < (y)->hi)
+WARMC_SORT(sort_blk_ranges, BlkRange, BLK_RANGE_LESS)
 
-static int interval_cmp(const void *a, const void *b) {
-  const Interval *x = a, *y = b;
-  if (x->start != y->start) return x->start < y->start ? -1 : 1;
-  return x->value < y->value ? -1 : 1;
-}
+/* by start, then by value: no two compare equal, so any sort agrees */
+#define INTERVAL_LESS(x, y)                                                    \
+  ((x)->start != (y)->start ? (x)->start < (y)->start : (x)->value < (y)->value)
+WARMC_SORT(sort_intervals, Interval, INTERVAL_LESS)
 
 static void extend(Interval *iv, int32_t at) {
   if (at < iv->start) iv->start = at;
@@ -727,14 +726,12 @@ static inline void lw_del(LiveWalk *w, Ref v) {
   w->idx[last] = k;
 }
 
-static int ref_cmp(const void *a, const void *b) {
-  Ref x = *(const Ref *)a, y = *(const Ref *)b;
-  return x < y ? -1 : x > y;
-}
+#define REF_LESS(x, y) (*(x) < *(y))
+WARMC_SORT(sort_refs, Ref, REF_LESS)
 
 static const Ref *lw_sorted(LiveWalk *w) {
   memcpy(w->sorted, w->mem, w->nmem * sizeof(Ref));
-  qsort(w->sorted, w->nmem, sizeof(Ref), ref_cmp);
+  sort_refs(w->sorted, w->nmem);
   return w->sorted;
 }
 
@@ -808,10 +805,11 @@ static bool split_reg_free(const OccHeap *h, const uint8_t *gone,
   return true;
 }
 
-static int split_range_cmp(const void *a, const void *b) {
-  const Range *x = a, *y = b;
-  return x->lo < y->lo ? -1 : x->lo > y->lo ? 1 : 0;
-}
+/* by lo: what is sorted is the ranges one register holds, or the spans of
+   one loop's blocks, both disjoint, so no two start together and any sort
+   gives qsort's order */
+#define RANGE_LO_LESS(x, y) ((x)->lo < (y)->lo)
+WARMC_SORT(sort_ranges_lo, Range, RANGE_LO_LESS)
 
 typedef struct {
   Ref v;
@@ -1478,7 +1476,7 @@ static void regalloc_linear(Isel *s) {
           bent[ne++] = (BlkRange){ rep, fpos[v], lpos[v] };
         }
         if (over_budget) break;
-        if (dup) qsort(bent, ne, sizeof(BlkRange), blk_range_cmp);
+        if (dup) sort_blk_ranges(bent, ne);
         for (uint32_t k = 0; k < ne; k++) {
           uint32_t rep = bent[k].rep;
           int32_t lo = bent[k].lo, hi = bent[k].hi;
@@ -1517,7 +1515,7 @@ static void regalloc_linear(Isel *s) {
   for (uint32_t i = 0; i < n; i++)
     if (iv[i].end >= 0 && value_needs_location(f, i) && web[i] == i &&
         !skip_location(s, i) && !s->pinned[i]) sorted[ns++] = iv[i];
-  qsort(sorted, ns, sizeof(Interval), interval_cmp);
+  sort_intervals(sorted, ns);
 
   /* weight prices a spill the classic way, one operation per reference, and
      stays the eviction currency.  wlat prices what the emitter would really
@@ -2059,7 +2057,7 @@ static void regalloc_linear(Isel *s) {
       for (int c = 0; c < 2; c++)
         for (int r = 0; r < 32; r++)
           if (rl[c][r].n > 1)
-            qsort(rl[c][r].v, rl[c][r].n, sizeof(Range), split_range_cmp);
+            sort_ranges_lo(rl[c][r].v, rl[c][r].n);
       if (!no_refill) qsort(rc, nrc, sizeof(RefillCand), refill_cmp);
       for (uint32_t a = 0; a < nrc && !no_refill; a++) {
         Interval *X = &sorted[rc[a].idx];
@@ -2291,7 +2289,7 @@ static void regalloc_linear(Isel *s) {
     for (int c = 0; c < 2; c++)
       for (int r = 0; r < 32; r++)
         if (rl[c][r].n > 1)
-          qsort(rl[c][r].v, rl[c][r].n, sizeof(Range), split_range_cmp);
+          sort_ranges_lo(rl[c][r].v, rl[c][r].n);
     PieceUse *pu = NULL; uint32_t npu = 0, cap_pu = 0;
     PieceCand *pcd = NULL; uint32_t npcd = 0, cap_pcd = 0;
     uint32_t *clob = NULL; uint32_t cap_clob = 0;
@@ -2500,7 +2498,7 @@ static void regalloc_linear(Isel *s) {
 
         for (uint32_t i2 = 0; i2 < nm; i2++)
           mrng[i2] = (Range){ blk_start[mblk[i2]], blk_end[mblk[i2]] };
-        qsort(mrng, nm, sizeof(Range), split_range_cmp);
+        sort_ranges_lo(mrng, nm);
         bool lclob = false;
         for (uint32_t i2 = 0; i2 < nm && !lclob; i2++) {
           uint32_t a = 0, b2 = ncalls;

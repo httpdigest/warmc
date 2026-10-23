@@ -254,6 +254,9 @@ typedef struct {
   uint32_t entry;
 
   uint32_t *kb_epoch;
+  /* order_once's working arrays, kept from one ordering to the next */
+  uint32_t *ord_tmp;
+  size_t ord_tmp_cap;
   uint64_t *kb_bits;
   size_t kb_cap;
   uint32_t kb_gen;
@@ -422,6 +425,9 @@ typedef struct {
 bool ir_op_is_gc_safepoint(uint16_t op);
 
 IrFunc *ir_build(Module *m, uint32_t func_index, const OptOpts *o);
+/* ir_build without the ordering -- no rpo, dominators or loop depths -- for
+   a reader that only walks each block's instructions. */
+IrFunc *ir_build_unordered(Module *m, uint32_t func_index, const OptOpts *o);
 void ir_optimize(IrFunc *f, const OptOpts *o);
 
 typedef struct {

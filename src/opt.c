@@ -49,18 +49,19 @@ static uint32_t rd_latency(uint16_t op) {
   }
 }
 
+/* memo[v] is v's depth when seen[v] is the stamp of the block asked about */
 static uint32_t rd_depth(IrFunc *f, Ref v, uint32_t bi, uint32_t *memo,
-                         uint8_t *seen) {
+                         uint32_t *seen, uint32_t stamp) {
   if (v >= f->ninsts) return 0;
-  if (seen[v]) return memo[v];
-  seen[v] = 1;
+  if (seen[v] == stamp) return memo[v];
+  seen[v] = stamp;
   memo[v] = 0;
   Inst *in = &f->insts[v];
   if (in->block != bi || in->op == I_PARAM || in->op == I_CONST) return 0;
   uint32_t worst = 0;
   Ref *a = ir_args(f, v);
   for (uint32_t j = 0; j < in->nargs; j++) {
-    uint32_t d = rd_depth(f, a[j], bi, memo, seen);
+    uint32_t d = rd_depth(f, a[j], bi, memo, seen, stamp);
     if (d > worst) worst = d;
   }
   memo[v] = worst + rd_latency(in->op);
@@ -86,7 +87,10 @@ static bool pass_reassoc(IrFunc *f) {
   uint32_t *uses = count_uses(f);
   uint32_t cap = f->ninsts ? f->ninsts : 1;
   uint32_t *memo = xcalloc(cap, sizeof(uint32_t));
-  uint8_t *seen = xcalloc(cap, 1);
+  /* a new stamp per block, and after each chain rebuilt, forgets every
+     depth: clearing a flag per instruction of the function there made the
+     pass blocks times instructions */
+  uint32_t *seen = xcalloc(cap, sizeof(uint32_t)), stamp = 0;
 
   uint8_t *inner = xcalloc(cap, 1);
   uint32_t *pos = xmalloc(cap * sizeof(uint32_t));
@@ -100,7 +104,7 @@ static bool pass_reassoc(IrFunc *f) {
   for (uint32_t oi = 0; oi < f->norder; oi++) {
     uint32_t bi = f->order[oi];
     Block *b = &f->blocks[bi];
-    memset(seen, 0, f->ninsts);
+    stamp++;
     for (uint32_t i = 0; i < b->ninsts; i++) pos[b->insts[i]] = i;
     if (b->ninsts + 65 > tmpcap) { tmpcap = b->ninsts * 2 + 72;
       tmp = xrealloc(tmp, tmpcap * sizeof(uint32_t)); }
@@ -149,11 +153,11 @@ static bool pass_reassoc(IrFunc *f) {
 
       uint32_t worst = 0, wi = 0;
       for (uint32_t k = 0; k < nl; k++) {
-        uint32_t d = rd_depth(f, leaf[k], bi, memo, seen);
+        uint32_t d = rd_depth(f, leaf[k], bi, memo, seen, stamp);
         if (d > worst) { worst = d; wi = k; }
       }
       if (wi + 1 == nl) continue;
-      uint32_t last_d = rd_depth(f, leaf[nl - 1], bi, memo, seen);
+      uint32_t last_d = rd_depth(f, leaf[nl - 1], bi, memo, seen, stamp);
       if (worst < last_d + 4) continue;
 
       if (n > 8) continue;
@@ -186,13 +190,13 @@ static bool pass_reassoc(IrFunc *f) {
         if (f->ninsts > cap) {
           uint32_t nc = f->ninsts * 2;
           memo = xrealloc(memo, nc * sizeof(uint32_t));
-          seen = xrealloc(seen, nc);
+          seen = xrealloc(seen, nc * sizeof(uint32_t));
           inner = xrealloc(inner, nc);
           link = xrealloc(link, nc);
           pos = xrealloc(pos, nc * sizeof(uint32_t));
           uses = xrealloc(uses, nc * sizeof(uint32_t));
           memset(memo + cap, 0, (nc - cap) * sizeof(uint32_t));
-          memset(seen + cap, 0, nc - cap);
+          memset(seen + cap, 0, (nc - cap) * sizeof(uint32_t));
           memset(inner + cap, 0, nc - cap);
           memset(link + cap, 0, nc - cap);
           memset(uses + cap, 0, (nc - cap) * sizeof(uint32_t));
@@ -232,7 +236,7 @@ static bool pass_reassoc(IrFunc *f) {
       changed = true;
       g_stats.reassoc++;
       for (uint32_t k = 0; k < b->ninsts; k++) pos[b->insts[k]] = k;
-      memset(seen, 0, f->ninsts);
+      stamp++;
       i = pos[chain[0]];
     }
   }
@@ -428,12 +432,25 @@ static void replace_with_const(IrFunc *f, Ref v, uint64_t bits) {
    pending) the counts are kept as a recount would find them and the edges'
    arguments resolved in place, and the rest of the function is resolved
    once at the end: a recount and a full ir_apply_subst every round was
-   rounds times the function, and a Go function can take hundreds. */
+   rounds times the function, and a Go function can take hundreds.  A
+   param's verdict rests on its count and its edges' arguments alone, so
+   from the third round on, only the blocks where the round before changed
+   one are looked at again, not every param against all its edges.  And
+   the only arguments a round leaves to resolve are the params it
+   replaced, so from the first round that resolves in place, an index of
+   the edges each param is passed on is kept, and only those edges are
+   rewritten: resolving every edge's arguments each round had become the
+   largest part of the pass. */
 static bool prune_params(IrFunc *f) {
   bool any = false, changed = true, lazy = false, lazy_changed = false;
   IrEdgeIdx ei = ir_edge_index(f);
   uint32_t *uses = NULL;
-  uint8_t *inord = NULL;
+  uint8_t *inord = NULL, *redo = NULL;
+  /* px_at/px_src/px_si: by value, the edges that passed it when the index
+     was made; px_next chains to them the runs of the params it has since
+     replaced, and px_tail names the last (UINT32_MAX: the value's own) */
+  uint32_t *px_at = NULL, *px_src = NULL, *px_si = NULL;
+  uint32_t *px_next = NULL, *px_tail = NULL;
   Ref *gone = NULL, *dropped = NULL;
   uint32_t ngone = 0, capgone = 0, ndropped = 0, capdropped = 0;
   while (changed) {
@@ -444,6 +461,10 @@ static bool prune_params(IrFunc *f) {
       uint32_t bi = f->order[oi];
       Block *b = &f->blocks[bi];
       if (bi == f->entry) continue;
+      if (redo) {
+        if (!redo[bi]) continue;
+        redo[bi] = 0;
+      }
       for (uint32_t p = 0; p < b->nparams;) {
         Ref param = b->params[p];
         Ref same = REF_NONE;
@@ -505,22 +526,69 @@ static bool prune_params(IrFunc *f) {
        leave: the removed arguments uncounted, a replaced param's uses its
        replacement's */
     lazy_changed = true;
-    for (uint32_t k = 0; k < ndropped; k++) uses[dropped[k]]--;
+    if (!redo) redo = xcalloc(f->nblocks ? f->nblocks : 1, 1);
+#define PP_REDO(r) do { const Inst *x_ = &f->insts[r];                      \
+                        if (x_->op == I_PARAM) redo[x_->block] = 1; } while (0)
+    for (uint32_t k = 0; k < ndropped; k++) {
+      uses[dropped[k]]--;
+      PP_REDO(dropped[k]);
+    }
     for (uint32_t k = 0; k < ngone; k++) {
       Ref g = gone[k], to = ir_resolve(f, g);
       uses[to] += uses[g];
       uses[g] = 0;
+      PP_REDO(to);
     }
-    for (uint32_t bi = 0; bi < f->nblocks; bi++) {
-      Block *b = &f->blocks[bi];
-      for (uint32_t k = 0; k < b->nsuccs; k++) {
-        Edge *e = &b->succs[k];
-        for (uint32_t j = 0; j < e->nargs; j++) e->args[j] = ir_resolve(f, e->args[j]);
+#undef PP_REDO
+    if (!px_at) {
+      uint32_t ni = f->ninsts;
+      px_at = xcalloc((size_t)ni + 2, sizeof(uint32_t));
+      for (uint32_t bi = 0; bi < f->nblocks; bi++) {
+        const Block *b = &f->blocks[bi];
+        for (uint32_t k = 0; k < b->nsuccs; k++)
+          for (uint32_t j = 0; j < b->succs[k].nargs; j++) {
+            Ref a = b->succs[k].args[j];
+            if (a < ni && f->insts[a].op == I_PARAM) px_at[a + 2]++;
+          }
+      }
+      for (uint32_t v = 0; v < ni; v++) px_at[v + 2] += px_at[v + 1];
+      uint32_t total = px_at[ni + 1];
+      px_src = xmalloc((total ? total : 1) * sizeof(uint32_t));
+      px_si = xmalloc((total ? total : 1) * sizeof(uint32_t));
+      for (uint32_t bi = 0; bi < f->nblocks; bi++) {
+        const Block *b = &f->blocks[bi];
+        for (uint32_t k = 0; k < b->nsuccs; k++)
+          for (uint32_t j = 0; j < b->succs[k].nargs; j++) {
+            Ref a = b->succs[k].args[j];
+            if (a < ni && f->insts[a].op == I_PARAM) {
+              uint32_t t = px_at[a + 1]++;
+              px_src[t] = bi; px_si[t] = k;
+            }
+          }
+      }
+      px_next = xmalloc(((size_t)ni ? ni : 1) * sizeof(uint32_t));
+      px_tail = xmalloc(((size_t)ni ? ni : 1) * sizeof(uint32_t));
+      memset(px_next, 0xff, (size_t)ni * sizeof(uint32_t));
+      memset(px_tail, 0xff, (size_t)ni * sizeof(uint32_t));
+    }
+    for (uint32_t k = 0; k < ngone; k++) {
+      Ref g = gone[k], r = ir_resolve(f, g);
+      for (uint32_t u = g; u != UINT32_MAX; u = px_next[u])
+        for (uint32_t t = px_at[u]; t < px_at[u + 1]; t++) {
+          Edge *e = &f->blocks[px_src[t]].succs[px_si[t]];
+          for (uint32_t j = 0; j < e->nargs; j++)
+            if (e->args[j] == g) { e->args[j] = r; redo[e->target] = 1; }
+        }
+      if (r != g && f->insts[r].op == I_PARAM) {
+        uint32_t rt = px_tail[r] == UINT32_MAX ? r : px_tail[r];
+        px_next[rt] = g;
+        px_tail[r] = px_tail[g] == UINT32_MAX ? g : px_tail[g];
       }
     }
   }
   if (lazy_changed) ir_apply_subst(f);
-  xfree(uses); xfree(inord); xfree(gone); xfree(dropped);
+  xfree(px_at); xfree(px_src); xfree(px_si); xfree(px_next); xfree(px_tail);
+  xfree(uses); xfree(inord); xfree(redo); xfree(gone); xfree(dropped);
   ir_edge_index_free(&ei);
   return any;
 }
@@ -4465,8 +4533,16 @@ static void td_push(TdVec *x, uint32_t b) {
 }
 
 /* Dominance frontiers, and the dominator tree as child lists, of the CFG
-   ir_order last saw. */
-typedef struct { TdVec *df; uint32_t *kids_at, *kids, nb; } TdDom;
+   ir_order last saw; the blocks it does not reach that branch somewhere;
+   and td_repair's working arrays, each entry of which counts only when its
+   stamp is the call's. */
+typedef struct {
+  TdVec *df; uint32_t *kids_at, *kids, nb;
+  uint32_t *unreached, nunreached;
+  uint32_t stamp, *st_live, *st_inwl, *st_phi, *st_def, *st_cur, *st_done;
+  Ref *phi, *def, *cur;
+  uint32_t *wl, *path;
+} TdDom;
 
 static void td_dom_build(IrFunc *f, TdDom *d) {
   uint32_t nb = d->nb = f->nblocks;
@@ -4496,114 +4572,173 @@ static void td_dom_build(IrFunc *f, TdDom *d) {
   for (uint32_t x = 0; x < nb; x++)
     if (f->blocks[x].reachable && x != f->entry) d->kids[fill[f->blocks[x].idom]++] = x;
   xfree(fill);
+  d->unreached = xmalloc((nb ? nb : 1) * sizeof(uint32_t));
+  d->nunreached = 0;
+  for (uint32_t x = 0; x < nb; x++)
+    if (!f->blocks[x].reachable && f->blocks[x].nsuccs) d->unreached[d->nunreached++] = x;
+  size_t n1 = nb ? nb : 1;
+  d->stamp = 0;
+  uint32_t **st[] = { &d->st_live, &d->st_inwl, &d->st_phi, &d->st_def,
+                      &d->st_cur, &d->st_done };
+  for (size_t k = 0; k < sizeof st / sizeof st[0]; k++) *st[k] = xcalloc(n1, sizeof(uint32_t));
+  d->phi = xmalloc(n1 * sizeof(Ref));
+  d->def = xmalloc(n1 * sizeof(Ref));
+  d->cur = xmalloc(n1 * sizeof(Ref));
+  d->wl = xmalloc(n1 * sizeof(uint32_t));
+  d->path = xmalloc(n1 * sizeof(uint32_t));
 }
 
 static void td_dom_free(TdDom *d) {
   for (uint32_t i = 0; i < d->nb; i++) xfree(d->df[i].v);
-  xfree(d->df); xfree(d->kids_at); xfree(d->kids);
+  xfree(d->df); xfree(d->kids_at); xfree(d->kids); xfree(d->unreached);
+  xfree(d->st_live); xfree(d->st_inwl); xfree(d->st_phi);
+  xfree(d->st_def); xfree(d->st_cur); xfree(d->st_done);
+  xfree(d->phi); xfree(d->def); xfree(d->cur); xfree(d->wl); xfree(d->path);
+}
+
+/* What reaches the end of block x in the call stamped st: its own
+   definition or merge, or else what reaches the end of its immediate
+   dominator.  Each block's answer is kept for the rest of the call. */
+static Ref td_cur(const IrFunc *f, TdDom *d, uint32_t x, uint32_t st) {
+  uint32_t n = 0;
+  Ref c;
+  for (;;) {
+    if (d->st_cur[x] == st) { c = d->cur[x]; break; }
+    if (d->st_def[x] == st) { c = d->def[x]; break; }
+    if (d->st_phi[x] == st) { c = d->phi[x]; break; }
+    if (x == f->entry) { c = REF_NONE; break; }
+    d->path[n++] = x;
+    x = f->blocks[x].idom;
+  }
+  d->st_cur[x] = st; d->cur[x] = c;
+  while (n) { uint32_t z = d->path[--n]; d->st_cur[z] = st; d->cur[z] = c; }
+  return c;
 }
 
 /* Put value p back into SSA form once more than one block defines it:
-   defval[b] is what block b defines it as, and REF_NONE elsewhere.  Merges
-   go at the iterated dominance frontier of the defining blocks, and a walk
-   down the dominator tree renames every read of p outside them to the
-   value that reaches it.  A merge can also be reached on a path that never
-   defined p, where nothing reads it either; that path brings a zero, which
-   is why p has to be a number.
+   def[k] is what block defb[k] defines it as, the blocks rising.  Merges
+   go at the iterated dominance frontier of the defining blocks, and every
+   read of p outside them is renamed to the value that reaches it.  A merge
+   can also be reached on a path that never defined p, where nothing reads
+   it either; that path brings a zero, which is why p has to be a number.
 
    use[] lists the blocks that read p, other than the defining ones.  A
    merge goes only where p is live: one at every frontier would merge p
    into each loop header above a definition, and those merges, reading only
-   each other, are more than prune_params can see is dead. */
-static void td_repair(IrFunc *f, Ref p, const Ref *defval, const uint32_t *use,
-                      uint32_t nuse, const TdDom *d) {
-  uint32_t nb = d->nb;
+   each other, are more than prune_params can see is dead.
+
+   Only the blocks that read p or end in an edge to a merge are touched,
+   each asking td_cur what reaches it: a walk of the whole dominator tree,
+   and arrays the function's length cleared, for each value repaired was a
+   sixth of Go's jump threading, which repairs dozens of a dispatch's
+   parameters at a time.  No order of visits changes what is written,
+   since the one instruction made, the zero, is made once. */
+static void td_repair(IrFunc *f, Ref p, const uint32_t *defb, const Ref *def,
+                      uint32_t ndef, const uint32_t *use, uint32_t nuse,
+                      TdDom *d) {
+  uint32_t nb = d->nb, st = ++d->stamp;
   ValType t = (ValType)f->insts[p].type;
-  Ref *phi = xmalloc(nb * sizeof(Ref));
-  uint8_t *inwl = xcalloc(nb, 1), *live = xcalloc(nb, 1);
-  /* use[] lists every block outside the definitions that reads p, so only
-     those need their instructions searched for it */
-  uint8_t *reads = xcalloc(nb, 1);
-  for (uint32_t i = 0; i < nuse; i++)
-    if (use[i] < nb) reads[use[i]] = 1;
-  uint32_t *wl = xmalloc(nb * sizeof(uint32_t)), nwl = 0;
+  uint32_t *wl = d->wl, nwl = 0;
+  for (uint32_t k = 0; k < ndef; k++)
+    if (defb[k] < nb) { d->st_def[defb[k]] = st; d->def[defb[k]] = def[k]; }
+#define TD_ISDEF(x) (d->st_def[x] == st)
   for (uint32_t i = 0; i < nuse; i++) {
     uint32_t x = use[i];
-    if (x < nb && !live[x] && defval[x] == REF_NONE) { live[x] = 1; wl[nwl++] = x; }
+    if (x < nb && d->st_live[x] != st && !TD_ISDEF(x)) { d->st_live[x] = st; wl[nwl++] = x; }
   }
   while (nwl) {
     Block *xb = &f->blocks[wl[--nwl]];
     for (uint32_t q = 0; q < xb->npreds; q++) {
       uint32_t y = xb->preds[q];
-      if (live[y] || defval[y] != REF_NONE) continue;
-      live[y] = 1;
+      if (d->st_live[y] == st || TD_ISDEF(y)) continue;
+      d->st_live[y] = st;
       wl[nwl++] = y;
     }
   }
-  for (uint32_t i = 0; i < nb; i++) {
-    phi[i] = REF_NONE;
-    if (defval[i] != REF_NONE && f->blocks[i].reachable) { inwl[i] = 1; wl[nwl++] = i; }
+  /* rising, as the defining blocks were */
+  uint32_t *phib = NULL, nphi = 0, capphi = 0;
+  for (uint32_t k = 0; k < ndef; k++) {
+    uint32_t x = defb[k];
+    if (x < nb && f->blocks[x].reachable && d->st_inwl[x] != st) {
+      d->st_inwl[x] = st; wl[nwl++] = x;
+    }
   }
   while (nwl) {
     uint32_t x = wl[--nwl];
     for (uint32_t k = 0; k < d->df[x].n; k++) {
       uint32_t y = d->df[x].v[k];
-      if (!live[y] || defval[y] != REF_NONE || phi[y] != REF_NONE) continue;
-      phi[y] = ir_add_param(f, y, t);
-      if (!inwl[y]) { inwl[y] = 1; wl[nwl++] = y; }
+      if (d->st_live[y] != st || TD_ISDEF(y) || d->st_phi[y] == st) continue;
+      d->st_phi[y] = st;
+      d->phi[y] = ir_add_param(f, y, t);
+      if (nphi == capphi) {
+        capphi = capphi ? capphi * 2 : 8;
+        phib = xrealloc(phib, capphi * sizeof(uint32_t));
+      }
+      phib[nphi++] = y;
+      if (d->st_inwl[y] != st) { d->st_inwl[y] = st; wl[nwl++] = y; }
     }
   }
-  xfree(live);
 
   Ref undef = REF_NONE;
-  Ref *cur = xmalloc(nb * sizeof(Ref));
-  uint32_t *stk = xmalloc(nb * sizeof(uint32_t)), sp = 0;
-  stk[sp++] = f->entry;
-  while (sp) {
-    uint32_t x = stk[--sp];
+  for (uint32_t i = 0; i < nuse; i++) {
+    uint32_t x = use[i];
+    if (x >= nb || TD_ISDEF(x) || !f->blocks[x].reachable || d->st_done[x] == st)
+      continue;
+    d->st_done[x] = st;
+    Ref c = td_cur(f, d, x, st);
+    if (c == REF_NONE) continue;
     Block *xb = &f->blocks[x];
-    Ref c = phi[x] != REF_NONE ? phi[x]
-          : x == f->entry ? REF_NONE : cur[xb->idom];
-    if (defval[x] != REF_NONE) c = defval[x];
-    else if (c != REF_NONE && reads[x]) {
-      for (uint32_t i = 0; i < xb->ninsts; i++) {
-        Ref *a = ir_args(f, xb->insts[i]);
-        for (uint32_t q = 0; q < f->insts[xb->insts[i]].nargs; q++)
-          if (a[q] == p) a[q] = c;
-      }
-      if ((xb->term == T_BRIF || xb->term == T_BRTABLE) && xb->term_arg == p)
-        xb->term_arg = c;
-      for (uint32_t q = 0; q < xb->nret; q++)
-        if (xb->ret_args[q] == p) xb->ret_args[q] = c;
-      for (uint32_t s = 0; s < xb->nsuccs; s++) {
-        Edge *e = &xb->succs[s];
-        for (uint32_t q = 0; q < e->nargs; q++)
-          if (e->args[q] == p) e->args[q] = c;
-      }
+    for (uint32_t i2 = 0; i2 < xb->ninsts; i2++) {
+      Ref *a = ir_args(f, xb->insts[i2]);
+      for (uint32_t q = 0; q < f->insts[xb->insts[i2]].nargs; q++)
+        if (a[q] == p) a[q] = c;
     }
-    cur[x] = c;
+    if ((xb->term == T_BRIF || xb->term == T_BRTABLE) && xb->term_arg == p)
+      xb->term_arg = c;
+    for (uint32_t q = 0; q < xb->nret; q++)
+      if (xb->ret_args[q] == p) xb->ret_args[q] = c;
     for (uint32_t s = 0; s < xb->nsuccs; s++) {
-      uint32_t y = xb->succs[s].target;
-      if (phi[y] == REF_NONE) continue;
-      if (c == REF_NONE && undef == REF_NONE)
-        undef = ir_emit(f, f->entry, I_CONST, t, NULL, 0, 0, 0);
-      edge_push_arg_at(f, x, s, c != REF_NONE ? c : undef);
+      Edge *e = &xb->succs[s];
+      for (uint32_t q = 0; q < e->nargs; q++)
+        if (e->args[q] == p) e->args[q] = c;
     }
-    for (uint32_t k = d->kids_at[x]; k < d->kids_at[x + 1]; k++) stk[sp++] = d->kids[k];
   }
-  /* Edges the walk never reached, from unreachable blocks, still need an
-     argument for every merge they lead to. */
-  for (uint32_t x = 0; x < nb; x++) {
+  /* the edges into merges: from the blocks the tree reaches, what reaches
+     their end; from the others, which nothing reaches, the zero.  A second
+     stamp marks the blocks done here. */
+  uint32_t st2 = ++d->stamp;
+  for (uint32_t k = 0; k < nphi; k++) {
+    Block *yb = &f->blocks[phib[k]];
+    for (uint32_t q = 0; q < yb->npreds; q++) {
+      uint32_t x = yb->preds[q];
+      if (x >= nb || !f->blocks[x].reachable || d->st_done[x] == st2) continue;
+      d->st_done[x] = st2;
+      Block *xb = &f->blocks[x];
+      Ref c = REF_NONE;
+      bool have = false;
+      for (uint32_t s = 0; s < xb->nsuccs; s++) {
+        uint32_t y = xb->succs[s].target;
+        if (y >= nb || d->st_phi[y] != st) continue;
+        if (!have) { c = td_cur(f, d, x, st); have = true; }
+        if (c == REF_NONE && undef == REF_NONE)
+          undef = ir_emit(f, f->entry, I_CONST, t, NULL, 0, 0, 0);
+        edge_push_arg_at(f, x, s, c != REF_NONE ? c : undef);
+      }
+    }
+  }
+  for (uint32_t k = 0; k < d->nunreached && nphi; k++) {
+    uint32_t x = d->unreached[k];
     Block *xb = &f->blocks[x];
     for (uint32_t s = 0; s < xb->nsuccs; s++) {
       uint32_t y = xb->succs[s].target;
-      if (y >= nb || phi[y] == REF_NONE || xb->succs[s].nargs >= f->blocks[y].nparams)
+      if (y >= nb || d->st_phi[y] != st || xb->succs[s].nargs >= f->blocks[y].nparams)
         continue;
       if (undef == REF_NONE) undef = ir_emit(f, f->entry, I_CONST, t, NULL, 0, 0, 0);
       edge_push_arg_at(f, x, s, undef);
     }
   }
-  xfree(phi); xfree(inwl); xfree(wl); xfree(cur); xfree(stk); xfree(reads);
+#undef TD_ISDEF
+  xfree(phib);
 }
 
 static bool td_numeric(ValType t) {
@@ -4736,14 +4871,18 @@ static bool thread_dispatch(IrFunc *f, uint32_t B, const uint32_t *nread,
   if (any) {
     TdDom d;
     td_dom_build(f, &d);
-    Ref *defval = xmalloc(nb * sizeof(Ref));
+    /* B and the fresh blocks define each parameter, in the order made */
+    uint32_t *defb = xmalloc((made.n + 1) * sizeof(uint32_t));
+    Ref *defv = xmalloc((made.n + 1) * sizeof(Ref));
+    defb[0] = B;
+    memcpy(defb + 1, made.v, made.n * sizeof(uint32_t));
     for (uint32_t q = 0; q < np; q++) {
       if (!need[q]) continue;
-      for (uint32_t i = 0; i < nb; i++)
-        defval[i] = i == B ? f->blocks[B].params[q] : fresh[i] ? f->blocks[i].params[q] : REF_NONE;
-      td_repair(f, f->blocks[B].params[q], defval, uses[q].v, uses[q].n, &d);
+      for (uint32_t k = 0; k <= made.n; k++) defv[k] = f->blocks[defb[k]].params[q];
+      td_repair(f, f->blocks[B].params[q], defb, defv, made.n + 1,
+                uses[q].v, uses[q].n, &d);
     }
-    xfree(defval);
+    xfree(defb); xfree(defv);
     td_dom_free(&d);
   }
   for (uint32_t q = 0; q < np; q++) xfree(uses[q].v);
@@ -4879,17 +5018,14 @@ static void repair_copies(IrFunc *f, uint32_t ni0, const uint8_t *esc, const uin
                           const TdVec *use, const uint32_t *bcopy, const Ref *map) {
   TdDom d;
   td_dom_build(f, &d);
-  Ref *defval = xmalloc(f->nblocks * sizeof(Ref));
-  for (uint32_t i = 0; i < f->nblocks; i++) defval[i] = REF_NONE;
   for (uint32_t v = 0; v < ni0; v++) {
     if (!esc[v] || map[v] == REF_NONE) continue;
-    uint32_t ob = f->insts[v].block, cb = bcopy[ob];
-    defval[ob] = v;
-    defval[cb] = map[v];
-    td_repair(f, v, defval, use[slot[v]].v, use[slot[v]].n, &d);
-    defval[ob] = defval[cb] = REF_NONE;
+    /* the copy is made after its original */
+    uint32_t ob = f->insts[v].block;
+    uint32_t defb[2] = { ob, bcopy[ob] };
+    Ref defv[2] = { v, map[v] };
+    td_repair(f, v, defb, defv, 2, use[slot[v]].v, use[slot[v]].n, &d);
   }
-  xfree(defval);
   td_dom_free(&d);
 }
 
@@ -5565,7 +5701,8 @@ static void fx_scan_direct(Module *m, const OptOpts *o, uint32_t fi) {
   if (m->funcs[fi].imported || !m->funcs[fi].body) return;
   d->has_body = true;
 
-  IrFunc *g = ir_build(m, fi, o);
+  /* every block is read, reached or not, and nothing here asks the order */
+  IrFunc *g = ir_build_unordered(m, fi, o);
   uint32_t *callees = d->callees;
   uint32_t ncallees = 0;
   bool frame_only = true, writes_globals = false, writes_mem = false;
@@ -7102,11 +7239,27 @@ static bool pass_memopt(IrFunc *f, const OptOpts *o) {
         break;
       }
   }
+  /* After the first sweep a block's end state depends on its
+     predecessors' alone, so a sweep that only looks redoes just the blocks
+     some predecessor of which ended differently since they last ran: the
+     states, the number of sweeps and so what is applied are the same.  Go's
+     functions are all inside the dispatch loop, and in compiling
+     stdgotests/webtext 94 of every 100 blocks a later sweep came to were
+     left as they were. */
+  bool *redo = NULL;
+  if (!apply) {
+    redo = xmalloc(f->nblocks ? f->nblocks : 1);
+    memset(redo, 1, f->nblocks);
+  }
   for (int sweep = 0; ; sweep++) {
     bool moved = false;
   for (uint32_t oi = 0; oi < f->norder; oi++) {
     uint32_t bi = f->order[oi];
     Block *b = &f->blocks[bi];
+    if (!apply) {
+      if (!redo[bi]) continue;
+      redo[bi] = false;
+    }
     uint32_t nent = 0;
     npend = 0;
 
@@ -7415,8 +7568,10 @@ static bool pass_memopt(IrFunc *f, const OptOpts *o) {
         }
       }
     }
-    if (!apply && !memstate_same(&st[bi], ent, nent, pend, npend, gval, gok))
+    if (!apply && !memstate_same(&st[bi], ent, nent, pend, npend, gval, gok)) {
       moved = true;
+      for (uint32_t s = 0; s < b->nsuccs; s++) redo[b->succs[s].target] = true;
+    }
     memstate_store(&st[bi], ent, nent, pend, npend, gval, gok);
   }
     if (apply) break;
@@ -7425,6 +7580,7 @@ static bool pass_memopt(IrFunc *f, const OptOpts *o) {
   }
   for (uint32_t i = 0; i < f->nblocks; i++) memstate_free(&st[i]);
   xfree(st);
+  xfree(redo);
   if (changed) ir_apply_subst(f);
   return changed;
 }
@@ -7879,6 +8035,24 @@ static void gc_way_add(const GcWay *w, Ref y, Ref *set, uint32_t *n,
    dominating (or earlier same-block) proof; branch facts ride single-pred
    edges. */
 static bool pass_gc_nullchk(IrFunc *f) {
+  /* Only an access, an i31.get or a ref.test can change, so without one --
+     every function of a module in linear memory -- there is nothing to do,
+     and three sets for every block to build: 70 ms of compiling
+     stdgotests/webtext. */
+  bool any = false;
+  for (uint32_t oi = 0; oi < f->norder && !any; oi++) {
+    const Block *b = &f->blocks[f->order[oi]];
+    for (uint32_t i = 0; i < b->ninsts && !any; i++)
+      switch (f->insts[b->insts[i]].op) {
+        case I_FIELD_GET: case I_FIELD_SET: case I_ARRAY_GET:
+        case I_ARRAY_SET: case I_ARRAY_LEN: case I_I31_GET: case I_REF_TEST:
+          any = true;
+          break;
+        default: break;
+      }
+  }
+  if (!any) return false;
+
   bool changed = false;
   Ref **sets = xcalloc(f->nblocks, sizeof(Ref *));
   uint32_t *counts = xcalloc(f->nblocks, sizeof(uint32_t));
@@ -16417,6 +16591,17 @@ static bool ldc_block(IrFunc *f, uint32_t bi, const uint32_t *uses,
 }
 
 static bool pass_load_combine(IrFunc *f, const OptOpts *o) {
+  /* every combination is rooted at an integer or */
+  bool any = false;
+  for (uint32_t oi = 0; oi < f->norder && !any; oi++) {
+    const Block *b = &f->blocks[f->order[oi]];
+    for (uint32_t i = 0; i < b->ninsts && !any; i++) {
+      const Inst *in = &f->insts[b->insts[i]];
+      any = in->op == I_OR && in->nargs == 2 &&
+            (in->type == VT_I32 || in->type == VT_I64);
+    }
+  }
+  if (!any) return false;
   uint32_t nuses = f->ninsts;
   uint32_t *uses = count_uses(f);
   uint8_t *or_operand = xcalloc(nuses ? nuses : 1, 1);
