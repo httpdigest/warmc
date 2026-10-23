@@ -77,6 +77,15 @@ typedef struct {
   bool tail_done;
 
   bool has_call;
+  /* has_call for something other than a wasm call */
+  bool call_other;
+  /* Every call is a quasi-leaf's cold one, made in a frame of its own
+     (cold_calls_only in isel.c); cold_out is that frame's outgoing area. */
+  bool cold_frame;
+  uint32_t cold_out;
+  /* With an early return tested ahead of the prologue (early_ret_shape):
+     1 + the entry's edge the rest of the function goes by, else 0. */
+  uint32_t early_main;
   bool needs_mem;
   bool needs_memsize;
   bool needs_vmctx;
@@ -853,6 +862,7 @@ static bool small_memop_ok(Isel *s, const Inst *in, bool fill) {
 static void analyse_function(Isel *s) {
   IrFunc *f = s->f;
   s->has_call = false;
+  s->call_other = false;
   s->needs_mem = false;
   s->needs_memsize = false;
   s->needs_retarea = false;
@@ -891,7 +901,7 @@ static void analyse_function(Isel *s) {
 
         case I_FIELD_GET: case I_ARRAY_GET: case I_EXN_PAYLOAD:
           if (load_needs_barrier(f, in)) {
-            s->has_call = true;
+            s->has_call = s->call_other = true;
             touches_instance = true;
           }
           break;
@@ -914,7 +924,7 @@ static void analyse_function(Isel *s) {
           break;
         case I_MEM_COPY: case I_MEM_FILL:
           if (small_memop_ok(s, in, in->op == I_MEM_FILL)) s->needs_mem = true;
-          s->has_call = true;
+          s->has_call = s->call_other = true;
           touches_instance = true;
           break;
         case I_MEM_GROW: case I_MEM_INIT:
@@ -923,12 +933,12 @@ static void analyse_function(Isel *s) {
         case I_TABLE_INIT: case I_ELEM_DROP:
         case I_STRUCT_NEW: case I_ARRAY_NEW: case I_ARRAY_NEW_SEG:
         case I_ARRAY_OP: case I_REF_TEST:
-          s->has_call = true;
+          s->has_call = s->call_other = true;
           touches_instance = true;
           break;
         case I_TABLE_SIZE:
 
-          if (in->imm != 0) s->has_call = true;
+          if (in->imm != 0) s->has_call = s->call_other = true;
           touches_instance = true;
           break;
         case I_GLOBAL_GET: case I_GLOBAL_SET: case I_MEM_SIZE:
@@ -945,7 +955,7 @@ static void analyse_function(Isel *s) {
 
         case I_THROW_REF:
 
-          s->has_call = true;
+          s->has_call = s->call_other = true;
           break;
         default: break;
       }

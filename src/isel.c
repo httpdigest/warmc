@@ -143,6 +143,8 @@ static bool isel_fp_remat_ok(Isel *s, const Inst *in) {
 #define RA_RETAREA_REG R8
 #define RA_ALLOC_RES_REG R0
 #define RA_HAVE_PIECES 1
+/* a constant zero is read as wzr/xzr where it has no register (rd_zr) */
+#define RA_ZERO_REG 1
 
 #define A64_IDX_UXTW 2
 #define A64_IDX_LSL  3
@@ -292,6 +294,20 @@ static int rd(Isel *s, Ref v, int scratch) {
             slot_off(s, SLOT_OF(l)));
   g_stats.reloads++;
   return scratch;
+}
+
+/* The zero register for an integer constant 0 with no register of its
+   own, where the reader takes one as its value -- a store's, a result's --
+   and what rd() makes of anything else.  The allocator keeps such zeros
+   out of callee-saved registers (ra_zero_const), and a store of one should
+   cost no more than it did from the register it had. */
+static int rd_zr(Isel *s, Ref v, int scratch) {
+  const Inst *in = &s->f->insts[v];
+  if (in->op == I_CONST && s->loc[v] == LOC_NONE &&
+      !vt_is_float((ValType)in->type) && (ValType)in->type != VT_V128 &&
+      (is64(s->f, v) ? in->imm : (in->imm & 0xffffffffu)) == 0)
+    return RZR;
+  return rd(s, v, scratch);
 }
 
 /* Fill a piece's register before the first read of its cluster: from the
@@ -1222,6 +1238,7 @@ static uint32_t loop_span(Isel *s, uint32_t h, uint32_t oi, const uint32_t *blk_
 
 static void emit_teardown(Isel *s);
 static void emit_epilogue(Isel *s);
+static void emit_cold_frame(Isel *s);
 static void emit_block(Isel *s, uint32_t bi, uint32_t next_bi);
 
 static int shift_fuse_kind(IrFunc *f, Ref v, ValType t, bool no_imm) {
@@ -2120,6 +2137,20 @@ static void emit_epilogue(Isel *s) {
   a64_ret(B);
 }
 
+/* The frame a quasi-leaf's cold call is made in (cold_calls_only), set up
+   with the arguments in their registers, just before the bl: the leaf's
+   own frame comes down as at a return, so that every callee-saved
+   register holds its caller's value again and x30 the return address, and
+   a frame record goes in its place, with the outgoing area a callee's tail
+   call may write below it -- the layout the function's unwind entry
+   describes, for an exception or a collection that walks through the call.
+   A callee that comes back finds a trap next, which needs no more. */
+static void emit_cold_frame(Isel *s) {
+  emit_teardown(s);
+  a64_stp(B, SF64, R29, R30, RSP, -16, LSP_PRE);
+  if (s->cold_out) a64_sub_imm(B, SF64, RSP, RSP, s->cold_out, 0);
+}
+
 static void regalloc_naive(Isel *s);
 static void regalloc_linear(Isel *s);
 
@@ -2259,6 +2290,297 @@ static uint32_t call_out_bytes(IrFunc *f, uint32_t tail_bytes) {
   return (need + 15u) & ~15u;
 }
 
+/* Whether a quasi-leaf -- each of its calls followed by nothing but a trap,
+   a panic helper's -- can make every one of them in a frame of its own
+   (emit_cold_frame) and be a leaf everywhere else: no frame record, no
+   stack check, x29 and x30 free for values.  TinyGo's method thunks, the
+   less closure sort.Slice calls and unicode's is16 call nilPanic or
+   lookupPanic and nothing else, and paid the record and the four
+   instructions of the stack check on every run for those calls
+   (gobench/methodval, sortints, unicode).  The cold frame is built once
+   the arguments are in place, so a call qualifies when they are all in
+   registers and it returns at most one value -- a stack argument or a
+   result area would be in the frame just torn down -- and when nothing is
+   live after it: the trap that follows takes no block arguments.  Any
+   other call -- a runtime helper, a load barrier -- keeps the function an
+   ordinary one.  The cold frame needs no stack check of its own: it is a
+   frame record and an outgoing area below a caller that made its check,
+   and a callee that calls makes its own. */
+static bool cold_calls_only(Isel *s) {
+  IrFunc *f = s->f;
+  if (s->call_other || s->lab_reg || s->opt->profile || s->out_bytes > 0xfff)
+    return false;
+  for (uint32_t oi = 0; oi < f->norder; oi++) {
+    Block *b = &f->blocks[f->order[oi]];
+    for (uint32_t i = 0; i < b->ninsts; i++) {
+      Ref v = b->insts[i];
+      Inst *in = &f->insts[v];
+      if (!op_clobbers_caller_saved(in->op)) continue;
+      if (in->op != I_CALL && in->op != I_CALL_INDIRECT && in->op != I_CALL_REF)
+        return false;
+      if (i + 1 != b->ninsts) return false;
+      if (b->term == T_JUMP) {
+        const Block *t = &f->blocks[b->succs[0].target];
+        if (t->term != T_TRAP || t->ninsts || b->succs[0].nargs) return false;
+      } else if (b->term != T_TRAP) {
+        return false;
+      }
+      if (call_sig(s, in)->nresults > 1) return false;
+      uint32_t nargs = in->nargs - (in->op == I_CALL ? 0u : 1u);
+      uint32_t ints = 0, flts = 0;
+      for (uint32_t j = 0; j < nargs; j++) {
+        Ref a = ir_args(f, v)[j];
+        if (is_fp_value(f, a) || is_vec_value(f, a)) flts++;
+        else ints++;
+      }
+      if (ints > 7 || flts > 8) return false;
+    }
+  }
+  return true;
+}
+
+/* ---- an early return ahead of the prologue ----
+   A function whose entry block only tests its parameters and branches to a
+   return that makes no call pays the whole prologue on the way to that
+   return: TinyGo's walk of a tree, `if n == nil { return 0 }`, which half
+   of its calls take, ran its frame, four callee-saved pairs and the stack
+   check, fifteen instructions, before the cbz (gobench/alloc).  The test
+   goes ahead of the prologue instead, on the parameters' own registers,
+   and branches to a return of its own that makes its result from
+   constants and parameters; the entry block, emitted after the prologue as
+   before, then only goes the other way.  The early path skips what the
+   entry block and the return block compute but the result, so all of that
+   must be pure and unable to trap. */
+typedef struct {
+  uint32_t edge;       /* the entry's edge to the return */
+  int kind;            /* 1 cbz, 2 cbnz, 0 a compare and b.cc */
+  int sf, cc, ra, rb;  /* rb < 0: against imm, by cmn when neg */
+  uint32_t imm;
+  bool neg;
+  Ref res;             /* what it returns, REF_NONE for nothing */
+} EarlyRet;
+
+/* The register an integer parameter of the function arrives in, or -1. */
+static int entry_param_reg(IrFunc *f, Ref v) {
+  const Inst *in = &f->insts[v];
+  if (in->op != I_PARAM || in->block != f->entry) return -1;
+  const Block *e = &f->blocks[f->entry];
+  int ni = 1;
+  for (uint32_t i = 0; i < f->sig->nparams && i < e->nparams; i++) {
+    bool fp = vt_is_vec_reg(f->sig->params[i]);
+    if (e->params[i] == v) return fp || ni > 7 ? -1 : ni;
+    if (!fp) ni++;
+  }
+  return -1;
+}
+
+static bool early_pure_op(uint16_t op) {
+  switch (op) {
+    case I_CONST: case I_PARAM: case I_NOP:
+    case I_ADD: case I_SUB: case I_MUL: case I_AND: case I_OR: case I_XOR:
+    case I_SHL: case I_SHRS: case I_SHRU: case I_ROTL: case I_ROTR:
+    case I_EQ: case I_NE: case I_LTS: case I_LTU: case I_GTS: case I_GTU:
+    case I_LES: case I_LEU: case I_GES: case I_GEU: case I_EQZ:
+    case I_WRAP: case I_EXTENDS: case I_EXTENDU: case I_SELECT:
+    case I_EXT8S: case I_EXT16S: case I_EXT32S:
+    case I_MEM_ADDR: case I_MEM_PTR: case I_MEM_BASE:
+    /* the shadow stack pointer TinyGo and Rust read on entry, which only
+       the path past the test goes on to use */
+    case I_GLOBAL_GET:
+      return true;
+    default:
+      return false;
+  }
+}
+
+/* v with the return block's parameters replaced by what the edge passes */
+static Ref early_arg(IrFunc *f, const Edge *ed, Ref v) {
+  const Inst *in = &f->insts[v];
+  if (in->op != I_PARAM || in->block != ed->target) return v;
+  const Block *r = &f->blocks[ed->target];
+  for (uint32_t j = 0; j < r->nparams && j < ed->nargs; j++)
+    if (r->params[j] == v) return ed->args[j];
+  return REF_NONE;
+}
+
+/* Makes v, an integer computed by the return block or the entry from the
+   entry's parameters and constants, in d -- which no parameter arrives in
+   -- writing no other register; with b NULL only says whether it can.
+   Rust's fib returns acc + n, both arguments of the return block, and the
+   entry passes it 0 and n. */
+static bool early_make(IrFunc *f, const Edge *ed, Ref v, int d, Buf *b, int depth) {
+  const Inst *in = &f->insts[v];
+  ValType t = (ValType)in->type;
+  if ((t != VT_I32 && t != VT_I64) || depth > 6) return false;
+  int sf = t == VT_I64 ? SF64 : SF32;
+  if (in->op == I_CONST) {
+    if (b) a64_load_imm(b, sf, d, in->imm);
+    return true;
+  }
+  int p = entry_param_reg(f, v);
+  if (p >= 0) {
+    if (b) a64_mov_reg(b, SF64, d, p);
+    return true;
+  }
+  if (in->op == I_PARAM) {
+    Ref x = early_arg(f, ed, v);
+    return x != v && x != REF_NONE && early_make(f, ed, x, d, b, depth + 1);
+  }
+  if (in->block != ed->target && in->block != f->entry) return false;
+  Ref *a = ir_args(f, v);
+  switch (in->op) {
+    case I_EXTENDU: case I_EXTENDS: {
+      if ((ValType)f->insts[a[0]].type != VT_I32) return false;
+      Ref x = early_arg(f, ed, a[0]);
+      int q = x == REF_NONE ? -1 : entry_param_reg(f, x);
+      if (in->op == I_EXTENDU && q >= 0) {
+        if (b) a64_mov_reg(b, SF32, d, q);
+        return true;
+      }
+      if (!early_make(f, ed, a[0], d, b, depth + 1)) return false;
+      if (b && in->op == I_EXTENDU) a64_uxtw(b, d, d);
+      else if (b) a64_sxtw(b, d, d);
+      return true;
+    }
+    case I_WRAP:
+      return early_make(f, ed, a[0], d, b, depth + 1);
+    case I_ADD: case I_SUB: case I_AND: case I_OR: case I_XOR: {
+      Ref x = early_arg(f, ed, a[0]), y = early_arg(f, ed, a[1]);
+      if (x == REF_NONE || y == REF_NONE) return false;
+      if (in->op != I_SUB && f->insts[x].op == I_CONST) { Ref z = x; x = y; y = z; }
+      const Inst *yi = &f->insts[y];
+      if (yi->op == I_CONST) {
+        uint64_t k = sf ? yi->imm : (yi->imm & 0xffffffffu);
+        if (k == 0 && in->op != I_AND) return early_make(f, ed, x, d, b, depth + 1);
+        if (in->op == I_ADD || in->op == I_SUB) {
+          bool sub = in->op == I_SUB;
+          uint64_t neg = sf ? 0 - k : (uint32_t)(0 - (uint32_t)k);
+          uint32_t imm;
+          if (k <= 0xfff) imm = (uint32_t)k;
+          else if (neg <= 0xfff) { imm = (uint32_t)neg; sub = !sub; }
+          else return false;
+          if (!early_make(f, ed, x, d, b, depth + 1)) return false;
+          if (b && sub) a64_sub_imm(b, sf, d, d, imm, 0);
+          else if (b) a64_add_imm(b, sf, d, d, imm, 0);
+          return true;
+        }
+        uint32_t enc;
+        if (!a64_logical_imm(k, sf, &enc) || !early_make(f, ed, x, d, b, depth + 1))
+          return false;
+        if (b && in->op == I_AND) a64_and_imm(b, sf, d, d, enc);
+        else if (b && in->op == I_OR) a64_orr_imm(b, sf, d, d, enc);
+        else if (b) a64_eor_imm(b, sf, d, d, enc);
+        return true;
+      }
+      int q = entry_param_reg(f, y);
+      if (q < 0 || !early_make(f, ed, x, d, b, depth + 1)) return false;
+      if (!b) return true;
+      switch (in->op) {
+        case I_ADD: a64_add_reg(b, sf, d, d, q); break;
+        case I_SUB: a64_sub_reg(b, sf, d, d, q); break;
+        case I_AND: a64_and_reg(b, sf, d, d, q); break;
+        case I_OR: a64_orr_reg(b, sf, d, d, q); break;
+        default: a64_eor_reg(b, sf, d, d, q); break;
+      }
+      return true;
+    }
+    default:
+      return false;
+  }
+}
+
+static bool early_ret_shape(Isel *s, EarlyRet *er) {
+  IrFunc *f = s->f;
+  if (s->far_br || s->opt->profile || f->sig->nresults > 1 || !f->norder ||
+      f->order[0] != f->entry)
+    return false;
+  const Block *e = &f->blocks[f->entry];
+  if (e->term != T_BRIF || e->npreds || e->is_pad || e->nsuccs != 2 ||
+      e->succs[0].eh || e->succs[1].eh || e->succs[0].target == e->succs[1].target)
+    return false;
+  for (uint32_t i = 0; i < e->ninsts; i++)
+    if (!early_pure_op(f->insts[e->insts[i]].op)) return false;
+  int which = -1;
+  for (int k = 0; k < 2 && which < 0; k++) {
+    const Edge *ed = &e->succs[k];
+    const Block *r = &f->blocks[ed->target];
+    if (r->term != T_RETURN || r->is_pad || r->nret != f->sig->nresults) continue;
+    bool ok = true;
+    for (uint32_t i = 0; i < r->ninsts && ok; i++)
+      if (!early_pure_op(f->insts[r->insts[i]].op)) ok = false;
+    Ref res = r->nret ? r->ret_args[0] : REF_NONE;
+    if (ok && res != REF_NONE)
+      ok = !vt_is_float(f->sig->results[0]) && f->sig->results[0] != VT_V128 &&
+           early_make(f, ed, res, R0, NULL, 0);
+    if (ok) { which = k; er->res = res; }
+  }
+  if (which < 0) return false;
+  er->edge = (uint32_t)which;
+  bool on_true = which == 0;
+
+  Ref c = e->term_arg;
+  const Inst *ci = &f->insts[c];
+  Ref *a = ir_args(f, c);
+  er->rb = -1; er->imm = 0; er->neg = false; er->cc = CC_AL;
+  if ((er->ra = entry_param_reg(f, c)) >= 0) {
+    er->kind = on_true ? 2 : 1;
+    er->sf = is64(f, c) ? SF64 : SF32;
+    return true;
+  }
+  if (ci->op == I_EQZ) {
+    if ((er->ra = entry_param_reg(f, a[0])) < 0) return false;
+    er->kind = on_true ? 1 : 2;
+    er->sf = is64(f, a[0]) ? SF64 : SF32;
+    return true;
+  }
+  if (!is_int_cmp(ci->op) || (er->ra = entry_param_reg(f, a[0])) < 0) return false;
+  er->sf = is64(f, a[0]) ? SF64 : SF32;
+  if (f->insts[a[1]].op == I_CONST) {
+    uint64_t m = er->sf ? f->insts[a[1]].imm : (f->insts[a[1]].imm & 0xffffffffu);
+    if ((ci->op == I_EQ || ci->op == I_NE) && m == 0) {
+      er->kind = (ci->op == I_EQ) == on_true ? 1 : 2;
+      return true;
+    }
+    uint64_t neg = (uint64_t)(-(int64_t)(er->sf ? (int64_t)m : (int64_t)(int32_t)m));
+    if (m <= 0xfff) er->imm = (uint32_t)m;
+    else if (neg <= 0xfff) { er->imm = (uint32_t)neg; er->neg = true; }
+    else return false;
+  } else if ((er->rb = entry_param_reg(f, a[1])) < 0) {
+    return false;
+  }
+  er->kind = 0;
+  er->cc = on_true ? cc_for(ci->op) : cc_invert(cc_for(ci->op));
+  return true;
+}
+
+/* The test, its branch left for early_ret_stub to aim; the branch's offset. */
+static size_t early_ret_test(Buf *b, const EarlyRet *er) {
+  if (er->kind == 0) {
+    if (er->rb >= 0) a64_cmp_reg(b, er->sf, er->ra, er->rb);
+    else if (er->neg) a64_adds_imm(b, er->sf, RZR, er->ra, er->imm, 0);
+    else a64_cmp_imm(b, er->sf, er->ra, er->imm);
+  }
+  size_t site = b->len;
+  if (er->kind == 0) a64_bcond(b, er->cc, 0);
+  else if (er->kind == 1) a64_cbz(b, er->sf, er->ra, 0);
+  else a64_cbnz(b, er->sf, er->ra, 0);
+  return site;
+}
+
+/* The return the test goes to, after the body: the result, and ret with
+   nothing to undo. */
+static void early_ret_stub(Isel *s, const EarlyRet *er, Buf *pro, size_t site) {
+  IrFunc *f = s->f;
+  if (!a64_patch_b19_ok(pro, site, pro->len + B->len)) {
+    s->far_br_needed = true;
+    return;
+  }
+  if (er->res != REF_NONE &&
+      !early_make(f, &f->blocks[f->entry].succs[er->edge], er->res, R0, B, 0))
+    warmc_fatal("internal: an early return's result could not be made");
+  a64_ret(B);
+}
+
 static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
                         uint32_t out_bytes, FuncOut *fout, bool far,
                         SplitCtl *sc, bool split_collect) {
@@ -2331,6 +2653,12 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
     if (leaf || quasi) {
       if (s->needs_vmctx) s->vmctx_reg = R9;
       if (s->needs_mem) s->membase_reg = R10;
+    }
+    if (quasi && !leaf && cold_calls_only(s)) {
+      s->has_call = false;
+      s->cold_frame = true;
+      s->cold_out = s->out_bytes;
+      s->out_bytes = 0;
     }
   }
 
@@ -2467,7 +2795,23 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
   s->block_off = xmalloc(f->nblocks * sizeof(uint32_t));
   for (uint32_t i = 0; i < f->nblocks; i++) s->block_off[i] = 0xffffffffu;
 
+  /* An empty prologue leaves an early return nothing to skip. */
+  EarlyRet er;
+  size_t er_site = 0;
+  bool early = early_ret_shape(s, &er);
+  if (early) er_site = early_ret_test(&pro, &er);
+  size_t pro_from = pro.len;
   emit_prologue(s, &pro);
+  if (early && pro.len == pro_from) { pro.len = 0; early = false; }
+  if (early) s->early_main = 1u + (er.edge ^ 1u);
+  /* A return block only the entry went to is gone with that edge: laid out
+     after the entry, it would cost the rest of the function a branch over
+     it (cbench/bintree's wrappers, dlfree). */
+  uint32_t dead_ret = UINT32_MAX;
+  if (early) {
+    uint32_t r = f->blocks[f->entry].succs[er.edge].target;
+    if (f->blocks[r].npreds == 1 && f->blocks[r].preds[0] == f->entry) dead_ret = r;
+  }
 
   /* WARMC_LOOP_ALIGN=0|16|32 pads each loop-header label to that boundary
      within the function (the entry is 64-aligned whenever the function has
@@ -2508,6 +2852,7 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
   s->prev_bi = UINT32_MAX;
   for (uint32_t oi = 0; oi < f->norder; oi++) {
     uint32_t bi = f->order[oi];
+    if (bi == dead_ret) continue;
     if (lalign && opt->align && f->blocks[bi].loop_depth) {
       Block *lb = &f->blocks[bi];
       bool header = false;
@@ -2546,7 +2891,8 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
       s->prof_start[bi] = B->len;
       s->prof_skip = 0;
     }
-    emit_block(s, bi, oi + 1 < f->norder ? f->order[oi + 1] : 0xffffffffu);
+    uint32_t ni = oi + 1 < f->norder && f->order[oi + 1] == dead_ret ? oi + 2 : oi + 1;
+    emit_block(s, bi, ni < f->norder ? f->order[ni] : 0xffffffffu);
     s->prev_bi = bi;
     if (blk_end) blk_end[bi] = (uint32_t)B->len;
     if (opt->profile) {
@@ -2581,6 +2927,7 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
   }
   xfree(blk_end); xfree(rec);
 
+  if (early) early_ret_stub(s, &er, &pro, er_site);
   emit_alloc_slow_arms(s);
   emit_ictab_slow_arms(s);
   emit_gc_load_stubs(s);
@@ -2656,6 +3003,8 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
     goto give_up;
   }
 
+  if (s->cold_frame) g_stats.cold_frames++;
+  if (early) g_stats.early_rets++;
   memset(fout, 0, sizeof *fout);
   fout->want_align = opt->align && has_loop;
   fout->code_len = (uint32_t)(pro.len + s->body.len);
@@ -2696,6 +3045,15 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
     int fl[8];
     int nfl = cs_fpr_list(s, fl);
     for (int i = 0; i < nfl; i++) u.saved |= 1u << (UW_FPR_SHIFT + fl[i] - 8);
+    /* Only a cold call is ever below a frame of this function on the
+       stack, so the entry describes the frame that call is made in, a
+       record and the outgoing area, with no register saved in it. */
+    if (s->cold_frame) {
+      u.frame = s->cold_out;
+      u.saved_bytes = 16;
+      u.exn_slot = u.fpsave_off = 0;
+      u.saved = UW_HAS_LR;
+    }
     for (uint32_t i = 0; i < s->nsites; i++) {
       s->sites[i].pc += (uint32_t)pro.len;
 
