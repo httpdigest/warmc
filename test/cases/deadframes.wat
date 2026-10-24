@@ -1,14 +1,15 @@
 ;; -fdead-frames's shapes (test/run_all.sh runs the cases with it too): a
 ;; module with C's stack -- $sp, which each function moves down by its frame
 ;; and back -- where each store into a frame that something reads is read:
-;; by the function itself after a loop's back edge, in a landing pad and
-;; through a later read of the stack pointer, by a callee through a pointer
-;; at a known offset, through one it walks, through one it passes on, by
-;; one that keeps the pointer, through an indirect call, by memory.copy, and
-;; by functions that scan the stack up from the stack pointer or from a
-;; local's address, as collectors do.  Each export's answer depends on those
-;; stores; the frames' other stores, which nothing reads, are the ones the
-;; pass takes.
+;; by the function itself after a loop's back edge, in a landing pad, through
+;; a later read of the stack pointer and through one after a call that
+;; leaves it moved; by a callee through a pointer at a known offset, through
+;; one it walks, through one it passes on, through an indirect call, by one
+;; that keeps the pointer before or after the stores, and by one reading a
+;; frame within the frame before its pop; by memory.copy; and by functions
+;; that scan the stack up from the stack pointer or from a local's address,
+;; as collectors do.  Each export's answer depends on those stores; the
+;; frames' other stores, which nothing reads, are the ones the pass takes.
 ;; Every frame a scan reads is written whole first: under the flag, bytes a
 ;; frame never wrote are whatever the stores it dropped left.
 
@@ -51,6 +52,11 @@
   (func $keep (param $p i32)
     (if (global.get $deep) (then (return_call $keep (local.get $p))))
     (global.set $kept (local.get $p)))
+  ;; keeps the pointer and reads through it, in the one call
+  (func $keep_read (param $p i32) (result i32)
+    (if (global.get $deep) (then (return_call $keep_read (local.get $p))))
+    (global.set $kept (local.get $p))
+    (i32.load (global.get $kept)))
   (func $use_kept (result i32)
     (if (global.get $deep) (then (return_call $use_kept)))
     (i32.load (global.get $kept)))
@@ -97,6 +103,12 @@
         (br $l)))
     (global.set $sp (i32.add (local.get $fp) (i32.const 16)))
     (local.get $s))
+
+  ;; moves the stack pointer down and leaves it there: a call to it does not
+  ;; return with the stack pointer as it found it
+  (func $leak
+    (if (global.get $deep) (then (return_call $leak)))
+    (global.set $sp (i32.sub (global.get $sp) (i32.const 16))))
 
   ;; writes memory elsewhere, so nothing in a frame is forwarded across it
   (func $touch
@@ -185,6 +197,47 @@
     (i32.store offset=12 (local.get $fp) (i32.const 8))
     (local.set $r (call $scan_from_local))
     (global.set $sp (i32.add (local.get $fp) (i32.const 16)))
+    (local.get $r))
+
+  ;; the pointer escapes after the stores it can reach
+  (func (export "escape_after") (result i32)
+    (local $fp i32) (local $r i32)
+    (local.set $fp (i32.sub (global.get $sp) (i32.const 16)))
+    (global.set $sp (local.get $fp))
+    (i32.store (local.get $fp) (i32.const 51))
+    (local.set $r (call $keep_read (local.get $fp)))
+    (global.set $sp (i32.add (local.get $fp) (i32.const 16)))
+    (local.get $r))
+
+  ;; a frame within the frame, as an inlined callee's is: its stores die at
+  ;; its pop, and one a callee reads before then stays
+  (func (export "nested_pop") (result i32)
+    (local $fp i32) (local $ip i32) (local $r i32)
+    (local.set $fp (i32.sub (global.get $sp) (i32.const 16)))
+    (global.set $sp (local.get $fp))
+    (i32.store offset=12 (local.get $fp) (i32.const 1000))
+    (local.set $ip (i32.sub (local.get $fp) (i32.const 16)))
+    (global.set $sp (local.get $ip))
+    (i32.store (local.get $ip) (i32.const 60))
+    (i32.store offset=4 (local.get $ip) (i32.const 3))
+    (i32.store offset=8 (local.get $ip) (i32.const 99))
+    (local.set $r (call $sum2 (local.get $ip)))
+    (global.set $sp (local.get $fp))
+    (i32.store (local.get $fp) (local.get $r))
+    (local.set $r (i32.add (call $sum2 (local.get $fp)) (i32.load offset=12 (local.get $fp))))
+    (global.set $sp (i32.add (local.get $fp) (i32.const 16)))
+    (local.get $r))
+
+  ;; the stack pointer read after a call that leaves it moved is not the
+  ;; caller's: the frame is reached from it at another offset
+  (func (export "moved_sp") (result i32)
+    (local $fp i32) (local $r i32)
+    (local.set $fp (i32.sub (global.get $sp) (i32.const 32)))
+    (global.set $sp (local.get $fp))
+    (i32.store offset=4 (local.get $fp) (i32.const 5))
+    (call $leak)
+    (local.set $r (i32.load offset=20 (global.get $sp)))
+    (global.set $sp (i32.add (local.get $fp) (i32.const 32)))
     (local.get $r))
 
   (func (export "loop_carried") (result i32)

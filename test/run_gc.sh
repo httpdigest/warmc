@@ -447,10 +447,13 @@ expect keep_dispatch_mutable "OK" 10 3 150
 # no allocation in an sr_ function may be left standing -- one made at an
 # escape point on the way must go too -- and a pe_ function must have one
 # made at its escape points, with nothing else standing but the objects so
-# made, which escape on every path.
+# made, which escape on every path.  A verdict counts only for an
+# allocation still standing in the function as optimised: one the pass saw
+# while a branch that cannot be taken still made it, and that went with the
+# branch, is not left standing.
 # WARMC_ESCAPE_DEBUG names functions by index; wasm-tools maps them back.
 if [ -z "${WARMC_FLAGS:-}" ] || [ "${WARMC_FLAGS:-}" = -O2 ]; then
-  if why=$(WARMC_ESCAPE_DEBUG=1 wtimeout ./$BUILD/warmc -O2 -j1 -c -o /dev/null \
+  if why=$(WARMC_ESCAPE_DEBUG=1 wtimeout ./$BUILD/warmc -O2 -j1 --print-ir -c -o /dev/null \
              "$WORK/escape.wasm" 2>&1 >/dev/null |
            python3 -c '
 import re, subprocess, sys
@@ -461,13 +464,24 @@ names = {}
 for m in re.finditer(r"\(export \"((?:sr|pe)_\w+)\" \(func (\d+|\$[^\s()]+)\)\)", text):
     names[int(m.group(2)) if m.group(2).isdigit() else ids[m.group(2)]] = m.group(1)
 last = {}
+standing = set()
+cur = None
 for line in sys.stdin:
+    h = re.match(r"; ---- (\w+): wasm_func_(\d+) ", line)
+    if h:
+        cur = int(h.group(2)) if h.group(1) == "optimised" else None
+        continue
+    if cur is not None:
+        a = re.match(r"\s+(v\d+):.*? = (struct\.new|array\.new)", line)
+        if a: standing.add((cur, a.group(1)))
+        continue
     m = re.match(r"escape wasm_func_(\d+) (v\d+) \w+ d\d+: (.*)", line.strip())
     if m and int(m.group(1)) in names: last[(int(m.group(1)), m.group(2))] = m.group(3)
 def fine(n, w):
     if n.startswith("sr_"): return w == "replaced" or w.startswith("partial:")
     return w == "replaced" or w.startswith("partial:") or w.endswith(" on every path")
-bad = ["%s %s: %s" % (names[f], v, w) for (f, v), w in sorted(last.items()) if not fine(names[f], w)]
+bad = ["%s %s: %s" % (names[f], v, w) for (f, v), w in sorted(last.items())
+       if not fine(names[f], w) and (f, v) in standing]
 bad += ["%s: no allocation reached the pass" % n for f, n in sorted(names.items())
         if not any(k[0] == f for k in last)]
 bad += ["%s: nothing was made at an escape point" % n for f, n in sorted(names.items())

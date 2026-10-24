@@ -586,7 +586,10 @@ static InlEsc *inl_caller_evidence(IrFunc *f) {
 typedef struct {
   uint8_t verdict;
   IrFunc *plain, *split;
-  uint32_t ninsts, eparams, retcalls;
+  /* returning calls: the ones a splice leaves, and all in the body as
+     built, which a site that does not run on every call goes by (see
+     inl_runs_every) */
+  uint32_t ninsts, eparams, retcalls, retcalls_built;
   /* the indirect ones among them that sit in a loop of the callee */
   uint32_t loopcalls;
   /* The indirect calls through table 0 whose index is a parameter: a site
@@ -724,6 +727,49 @@ static void inl_summarize(InlMemo *e, IrFunc *g) {
   }
 }
 
+/* Of a callee's returning calls, the ones that stay calls once it is
+   inlined: a call the callee makes every time it runs, to a function small
+   enough to take in that makes no call of its own, goes with the splice.
+   C's struct helpers are such calls in a body as built and nothing once
+   inlined -- cbench/structval's step made nine, all but one to three-line
+   vector functions, and for them stayed a call in its caller's loop, its
+   arguments copied through two frames.  A call on some of the callee's
+   paths only goes if what it calls is not much more than tiny -- step's
+   bounce, a v3scale of 18 instructions: inlined, it brings that path's
+   whole body into the caller, as AssemblyScript's collector marking a white
+   object, 73, did into the loops that visit them, 5% slower.  And a callee too
+   big for the usual cap that has loops of its own keeps all its calls: its
+   call is paid for over its loops, and taken in, the caller's live values
+   crowd them -- cbench/lexer's scanner, a single site so growth-sized,
+   spilled in its token loop inside main's.  Whether a function makes a
+   call is the effect summaries', read off its body once. */
+static uint32_t surviving_calls(IrFunc *f, IrFunc *g, uint32_t fidx, uint32_t *in_loop) {
+  Module *m = f->m;
+  uint32_t n = warm_returning_calls(g, in_loop);
+  bool loops = false;
+  for (uint32_t oi = 0; oi < g->norder && !loops; oi++)
+    if (g->blocks[g->order[oi]].loop_depth) loops = true;
+  if (loops && g->ninsts > g_inl.max_callee) return n;
+  for (uint32_t oi = 0; oi < g->norder && n; oi++) {
+    uint32_t gb = g->order[oi];
+    Block *b = &g->blocks[gb];
+    if (!b->reachable || b->term == T_TRAP || b->diverges) continue;
+    bool every = true;
+    for (uint32_t oj = 0; oj < g->norder && every; oj++) {
+      uint32_t r = g->order[oj];
+      if (g->blocks[r].term == T_RETURN && !ir_dominates_checked(g, gb, r)) every = false;
+    }
+    for (uint32_t i = 0; i < b->ninsts; i++) {
+      Inst *in = &g->insts[b->insts[i]];
+      uint32_t ni;
+      if (in->op == I_CALL && in->imm != fidx && opt_func_leaf(m, (uint32_t)in->imm, &ni) &&
+          ni <= (every ? g_inl.max_callee : 2 * g_inl.tiny))
+        n--;
+    }
+  }
+  return n;
+}
+
 static IrFunc *inl_callee(IrFunc *f, const OptOpts *o, InlMemos *memo,
                           uint32_t fidx, uint32_t bi, bool want_split) {
   Module *m = f->m;
@@ -733,7 +779,8 @@ static IrFunc *inl_callee(IrFunc *f, const OptOpts *o, InlMemos *memo,
     IrFunc *g = ir_build(m, fidx, o);
     inl_summarize(e, g);
     uint32_t lc;
-    uint32_t r = warm_returning_calls(g, &lc);
+    uint32_t built = warm_returning_calls(g, &lc);
+    uint32_t r = surviving_calls(f, g, fidx, &lc);
     param_indirect_calls(g, e);
     if (has_tail_call(g)) {
       g_stats.inl_rej_tailcall++;
@@ -758,6 +805,7 @@ static IrFunc *inl_callee(IrFunc *f, const OptOpts *o, InlMemos *memo,
       e->ninsts = g->ninsts;
       e->eparams = g->blocks[g->entry].nparams;
       e->retcalls = r;
+      e->retcalls_built = built;
       e->loopcalls = lc;
     }
   }
@@ -829,6 +877,7 @@ typedef struct {
   uint32_t rpo, idx;
   bool once;
   bool escape;   /* the inline frees an allocation for pass_escape */
+  bool every;    /* runs on every call, or in a loop: see inl_runs_every */
   uint16_t idepth;
   uint32_t anc[INLINE_MAX_DEPTH];
 } InlSite;
@@ -859,6 +908,22 @@ static int inl_site_cmp(const void *pa, const void *pb) {
    the rounds right after, so both are discounted, floored so nothing is
    ever free. A transitive site carries the chain of callees it was copied
    out of; a candidate already on its own chain is a cycle. */
+/* Whether the block a call sits in runs whenever its function returns --
+   it dominates each return -- or in a loop.  There a callee's calls to leaf
+   functions small enough to inline are taken as gone with the splice;
+   elsewhere a branch may lead to a slow path whose callee its calls kept out
+   of line, as libm's argument reduction for large angles was.  A site in a
+   body spliced this round has no dominators yet and goes by its loop. */
+static bool inl_runs_every(IrFunc *f, uint32_t bi, bool spliced) {
+  if (f->blocks[bi].loop_depth) return true;
+  if (spliced) return false;
+  for (uint32_t oi = 0; oi < f->norder; oi++) {
+    uint32_t r = f->order[oi];
+    if (f->blocks[r].term == T_RETURN && !ir_dominates_checked(f, bi, r)) return false;
+  }
+  return true;
+}
+
 static bool inl_score_site(IrFunc *f, const OptOpts *o, InlMemos *memo,
                            const InlEsc *ev, Ref call, uint32_t ord1,
                            uint32_t ord2, const InlSite *parent,
@@ -930,8 +995,20 @@ static bool inl_score_site(IrFunc *f, const OptOpts *o, InlMemos *memo,
   uint32_t nfreed = 0;
   for (uint64_t x = freed; x; x &= x - 1) nfreed++;
 
+  /* off the path every call takes, what the callee's own gate was before
+     the splice's discount */
+  bool every = inl_runs_every(f, bi, parent != NULL);
+  if (!every &&
+      e->retcalls_built - e->nicall > (g_inl.retcalls > INL_ESC_RETCALLS
+                                       ? g_inl.retcalls : INL_ESC_RETCALLS)) {
+    g_stats.inl_rej_retcalls++;
+    inl_dbg(f, fidx, bi, "returning calls");
+    return false;
+  }
+
   /* The callee's indirect calls this site's constants turn direct. */
-  uint32_t retcalls = e->retcalls, loopcalls = e->loopcalls;
+  uint32_t retcalls = every ? e->retcalls : e->retcalls_built;
+  uint32_t loopcalls = e->loopcalls;
   if (o->devirt)
     for (uint32_t k = 0; k < e->nicall; k++) {
       uint32_t p = e->icall[k].param;
@@ -1008,6 +1085,7 @@ static bool inl_score_site(IrFunc *f, const OptOpts *o, InlMemos *memo,
   out->rpo = ord1;
   out->idx = ord2;
   out->once = once;
+  out->every = every;
   out->escape = escape;
   out->idepth = idepth;
   if (parent) {
@@ -1084,8 +1162,10 @@ static bool inl_apply(IrFunc *f, const OptOpts *o, InlMemos *memo,
   }
 
   /* the frame-cap pressure valve: surviving calls a caller absorbs */
-  if (memo_at(memo, fidx)->retcalls &&
-      *retsum + memo_at(memo, fidx)->retcalls >
+  uint32_t rc = site->every ? memo_at(memo, fidx)->retcalls
+                            : memo_at(memo, fidx)->retcalls_built;
+  if (rc &&
+      *retsum + rc >
           g_inl.retcall_total + (site->escape ? INL_ESC_SLACK : 0)) {
     g_stats.inl_rej_retcalls++;
     inl_dbg(f, fidx, bi, "caller absorbed enough calls");
@@ -1100,9 +1180,9 @@ static bool inl_apply(IrFunc *f, const OptOpts *o, InlMemos *memo,
 
   if (site->once && memo_at(memo, fidx)->ninsts > g_inl.max_callee)
     g_stats.inl_once_forced++;
-  if (memo_at(memo, fidx)->retcalls) g_stats.inl_retcall_sites++;
+  if (rc) g_stats.inl_retcall_sites++;
   if (site->escape) g_stats.inl_escape++;
-  *retsum += memo_at(memo, fidx)->retcalls;
+  *retsum += rc;
 
   if (!nehe && !any_eh && g->norder == 1 && g->order[0] == g->entry &&
       g->blocks[g->entry].term == T_RETURN &&
