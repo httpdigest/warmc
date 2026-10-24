@@ -21,7 +21,8 @@ list and fails if a pass is missing from both PASSES and LEFT_OUT, so a new
 pass joins the combinations.
 
   python3 test/run_combos.py                    # make check: pairs, cases + traps + gc
-  python3 test/run_combos.py --strength 3 --suites all   # make check-combos
+  python3 test/run_combos.py --strength 3 --suites cases,traps,gc &&
+    python3 test/run_combos.py --suites corpora          # make check-combos
 """
 import argparse
 import itertools

@@ -1644,8 +1644,7 @@ static int drive(int argc, char **argv) {
 
     err("warmc-wasi: trap: ");
     err(warmc_trap_name(trap));
-    err("\n  (an unimplemented wasi_snapshot_preview1 call traps like this;\n"
-        "   rt/wasi.c lists what this host implements)\n");
+    err("\n");
     return 73;
   }
 

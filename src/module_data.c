@@ -223,9 +223,9 @@ void codegen_set_symbol_prefix(const char *prefix) {
      u32 count
      count x { u32 name_off, name_len, data_off, data_len }, from the table
      the names and the payloads
-   By default the name section, whose names warmc's symbols already carry,
-   and DWARF's .debug_* sections are left out: --custom-sections=all keeps
-   them, =none every section out. */
+   By default the debug information is left out -- the name section, which
+   warmc does not read, and DWARF's .debug_* sections: --custom-sections=all
+   keeps them, =none every section out. */
 static CustomMode g_custom_mode = CUSTOM_DEFAULT;
 void codegen_set_custom_sections(CustomMode mode) { g_custom_mode = mode; }
 

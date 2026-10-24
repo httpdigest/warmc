@@ -108,7 +108,7 @@ C_FLAGS = ["-O3", "--no-wasm-opt", "-mllvm", "-wasm-enable-sjlj", "-mllvm",
 CXX_FLAGS = ["-O3", "--no-wasm-opt", "-std=c++20", "-fwasm-exceptions",
              "-mllvm", "-wasm-use-legacy-eh=false", "-lunwind"]
 
-# GHC's wasm backend, wherever ghc-wasm-meta's setup.sh put it: on PATH after
+# GHC's wasm backend, wherever ghc-wasm-meta's bootstrap.sh put it: on PATH after
 # `source ~/.ghc-wasm/env`, or in its default prefix.
 GHC_WASM = (shutil.which("wasm32-wasi-ghc") or
             os.path.expanduser("~/.ghc-wasm/wasm32-wasi-ghc/bin/wasm32-wasi-ghc"))

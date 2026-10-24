@@ -261,8 +261,6 @@ static void put_hex_raw(u64 v, int digits) {
   out(buf, (usz)digits);
 }
 
-#define MAX_GLOBALS 4096
-#define MAX_DATA_SEGS 4096
 #define MAX_TABLE_ENTRIES (1u << 20)
 #define MAX_INSTANCES 4096
 #define ARENA_WORDS (1u << 21)
@@ -4685,7 +4683,9 @@ static void *builtin_host(const char *name) {
   return 0;
 }
 
-void warmc_component_instantiate(void) {
+/* Each core instance of the component in order; with err, a trap or link
+   failure is caught, its code stored and the rest left uninstantiated. */
+static u32 component_instantiate(u32 *err) {
   const ComponentDesc *cd = warmc_component;
   u32 maxb = 1;
   for (u32 i = 0; i < cd->ninsts; i++)
@@ -4707,8 +4707,18 @@ void warmc_component_instantiate(void) {
         if (!code) binds[j].inst = (WarmInstance *)(void *)ci->binds[j].host;
       }
     }
-    g_cinsts[i] = warmc_instantiate_bound(ci->md, n ? binds : 0);
+    g_cinsts[i] = err ? warmc_instantiate_bound_catching(ci->md, n ? binds : 0, err)
+                      : warmc_instantiate_bound(ci->md, n ? binds : 0);
+    if (!g_cinsts[i]) return *err;
   }
+  return 0;
+}
+
+void warmc_component_instantiate(void) { component_instantiate(0); }
+
+u32 warmc_component_instantiate_catching(void) {
+  u32 err = 0;
+  return component_instantiate(&err);
 }
 
 WarmInstance *warmc_component_export(const char *name, const ExportDesc **out) {

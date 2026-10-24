@@ -223,6 +223,40 @@ if [ -f "$BUILD/components/restable.wasm" ]; then
     ./$BUILD/warmc --wasi $WARMC_TARGET_FLAGS "$BUILD/components/restable.wasm"
 fi
 
+# A core instance that fails to instantiate -- here its start function traps
+# -- ends the program with 71 and says why, as the preview1 host does.
+cat > "$WORK/starttrap.wat" <<'WAT'
+(component
+  (core module $m
+    (func $boom unreachable)
+    (start $boom)
+    (func (export "run") (result i32) (i32.const 0)))
+  (core instance $i (instantiate $m))
+  (type $res (result))
+  (func $run (result $res) (canon lift (core func $i "run")))
+  (instance $cli (export "run" (func $run)))
+  (export "wasi:cli/run@0.2.0" (instance $cli)))
+WAT
+if "$BUILD/tools/bin/wasm-tools" parse "$WORK/starttrap.wat" -o "$WORK/starttrap.wasm" \
+     2>"$WORK/starttrap.err" &&
+   ./$BUILD/warmc --wasi $WARMC_TARGET_FLAGS -o "$WORK/starttrap" "$WORK/starttrap.wasm" \
+     2>>"$WORK/starttrap.err"; then
+  "$WORK/starttrap" >/dev/null 2>"$WORK/starttrap.out"
+  rc=$?
+  if [ "$rc" = 71 ] &&
+     grep -q "failed to instantiate or link: unreachable executed" "$WORK/starttrap.out"; then
+    pass=$((pass + 1))
+  else
+    echo "FAIL[wasip2/start-trap]: exit $rc, not 71 with the trap named:"
+    sed 's/^/    /' "$WORK/starttrap.out"
+    fail=1
+  fi
+else
+  echo "FAIL[wasip2/start-trap]: the component does not build"
+  sed 's/^/    /' "$WORK/starttrap.err"
+  fail=1
+fi
+
 # Coverage, in the direction the gowasip2 surface check does not go: every
 # wasi:* function rt/wasip2.c binds has to be one some component here asks
 # for, or it is host code no test reaches.  All 43 are asked for.

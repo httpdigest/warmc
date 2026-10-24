@@ -477,6 +477,8 @@ void *warmc_rt_zalloc(u64 bytes);
 extern void *(*warmc_host_lookup)(const char *name);
 
 void warmc_component_instantiate(void);
+/* the same, returning the trap or link failure that stops it, or 0 */
+u32 warmc_component_instantiate_catching(void);
 WarmInstance *warmc_component_export(const char *name, const ExportDesc **out);
 
 u32 warmc_res_new(u32 rt, u64 rep);
