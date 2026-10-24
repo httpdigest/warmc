@@ -1,5 +1,6 @@
 #include "ir.h"
 #include "opcodes.h"
+#include "target.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -493,7 +494,13 @@ static MemArg rd_memarg(Bld *b) {
   return ma;
 }
 
-static Ref mem_ea(Bld *b, Ref addr, uint64_t offset, uint32_t width, uint32_t mem) {
+/* store: the access writes, which with -fexact-trap and guard pages is
+   still checked when it is wider than a byte, on AArch64: a store that
+   crosses into the guard page may there have written its bytes before the
+   page when it faults, which wasm's trap leaves unwritten.  On x64 a store
+   that faults writes nothing. */
+static Ref mem_ea(Bld *b, Ref addr, uint64_t offset, uint32_t width, uint32_t mem,
+                  bool store) {
   IrFunc *f = b->f;
   if (mem < f->m->nmemories && f->m->memories[mem].index64) {
 
@@ -514,8 +521,13 @@ static Ref mem_ea(Bld *b, Ref addr, uint64_t offset, uint32_t width, uint32_t me
   }
   Ref ea = ir_emit(f, b->cur, I_MEM_ADDR, VT_I64, &addr, 1, offset, 0);
 
-  if (!b->opt->guard_pages || offset + width > WASM_GUARD_OFFSET_MAX)
+  bool straddle = store && width > 1 && b->opt->exact_trap && !g_target->is_x64;
+  if (!b->opt->guard_pages || offset + width > WASM_GUARD_OFFSET_MAX) {
     ir_emit(f, b->cur, I_BOUNDS_CHECK, 0, &ea, 1, mem, width);
+  } else if (straddle) {
+    ir_emit(f, b->cur, I_BOUNDS_CHECK, 0, &ea, 1, mem, width);
+    g_stats.exact_store_checks++;
+  }
   return ea;
 }
 
@@ -605,7 +617,7 @@ static ValType lane_scalar(uint64_t lane) {
 
 static Ref vec_narrow_load(Bld *b, int size) {
   MemArg ma = rd_memarg(b);
-  Ref ea = mem_ea(b, pop(b), ma.offset, 1u << size, ma.mem);
+  Ref ea = mem_ea(b, pop(b), ma.offset, 1u << size, ma.mem, false);
   return ir_emit(b->f, b->cur, I_LOAD, VT_V128, &ea, 1, 0,
                  MEMF_MK_AT(size, 0, ma.mem));
 }
@@ -636,7 +648,7 @@ static void simd_build(Bld *b, uint32_t sub, const char *sym) {
 
     case 0: {
       MemArg ma = rd_memarg(b);
-      Ref ea = mem_ea(b, pop(b), ma.offset, 16, ma.mem);
+      Ref ea = mem_ea(b, pop(b), ma.offset, 16, ma.mem, false);
       push(b, ir_emit(f, b->cur, I_LOAD, VT_V128, &ea, 1, 0,
                       MEMF_MK_AT(4, 0, ma.mem)));
       break;
@@ -644,7 +656,7 @@ static void simd_build(Bld *b, uint32_t sub, const char *sym) {
     case 11: {
       MemArg ma = rd_memarg(b);
       Ref val = pop(b), addr = pop(b);
-      Ref ea = mem_ea(b, addr, ma.offset, 16, ma.mem);
+      Ref ea = mem_ea(b, addr, ma.offset, 16, ma.mem, true);
       Ref a[2] = { ea, val };
       ir_emit(f, b->cur, I_STORE, 0, a, 2, 0, MEMF_MK_AT(4, 0, ma.mem));
       break;
@@ -672,7 +684,7 @@ static void simd_build(Bld *b, uint32_t sub, const char *sym) {
       MemArg ma = rd_memarg(b);
       uint8_t idx = rd8(b);
       Ref vec = pop(b);
-      Ref ea = mem_ea(b, pop(b), ma.offset, 1u << size, ma.mem);
+      Ref ea = mem_ea(b, pop(b), ma.offset, 1u << size, ma.mem, false);
       Ref sc = ir_emit(f, b->cur, I_LOAD, lane_scalar(lane), &ea, 1, 0,
                        MEMF_MK_AT(size, 0, ma.mem));
       push(b, vec2(b, I_VREPLACE, VT_V128, vec, sc, idx, lane));
@@ -685,7 +697,7 @@ static void simd_build(Bld *b, uint32_t sub, const char *sym) {
       uint8_t idx = rd8(b);
       Ref vec = pop(b), addr = pop(b);
       Ref sc = vec1(b, I_VEXTRACTU, lane_scalar(lane), vec, idx, lane);
-      Ref ea = mem_ea(b, addr, ma.offset, 1u << size, ma.mem);
+      Ref ea = mem_ea(b, addr, ma.offset, 1u << size, ma.mem, true);
       Ref a[2] = { ea, sc };
       ir_emit(f, b->cur, I_STORE, 0, a, 2, 0, MEMF_MK_AT(size, 0, ma.mem));
       break;
@@ -1873,12 +1885,12 @@ IrFunc *ir_build_unordered(Module *m, uint32_t fi, const OptOpts *opt) {
           uint32_t width = 1u << mo.size;
           if (mo.store) {
             Ref val = pop(b), addr = pop(b);
-            Ref ea = mem_ea(b, addr, ma.offset, width, ma.mem);
+            Ref ea = mem_ea(b, addr, ma.offset, width, ma.mem, true);
             Ref a[2] = { ea, val };
             ir_emit(f, b->cur, I_STORE, 0, a, 2, 0,
                     MEMF_MK_AT(mo.size, 0, ma.mem));
           } else {
-            Ref ea = mem_ea(b, pop(b), ma.offset, width, ma.mem);
+            Ref ea = mem_ea(b, pop(b), ma.offset, width, ma.mem, false);
             push(b, ir_emit(f, b->cur, I_LOAD, mo.type, &ea, 1, 0,
                             MEMF_MK_AT(mo.size, mo.sign, ma.mem)));
           }

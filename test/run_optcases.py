@@ -24,6 +24,7 @@ import tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import gen_gosp
+import hostbuild
 
 LEVELS = ["-O0", "-O1", "-O2", "-O3"]
 RUN_LINE = re.compile(r"^;; run: (\S+)((?: \S+)*) => (.*)$")
@@ -50,7 +51,7 @@ def check(path, build, warmc, target, run, tmp):
         return ["%s: not assembled: %s" % (name, r.stderr.strip()[:200])]
     fails = []
     for level in LEVELS:
-        exe = os.path.join(tmp, name + level)
+        exe = hostbuild.exe(os.path.join(tmp, name + level))
         r = subprocess.run([warmc, level] + target + ["-o", exe, wasm], capture_output=True,
                            text=True, timeout=120)
         if r.returncode:

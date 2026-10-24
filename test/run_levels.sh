@@ -6,7 +6,8 @@
 # -O2, -O3 and -O2 -ffma -fdead-frames -- and -O3 is not -O2 where those
 # passes have something to do.  The modules are ones each level-decided
 # pass changes: Go's stack pointer (go-sp), a trampoline, C frames, fusable
-# floats.  And the -fno- form of a flag that turns another on as well.
+# floats.  And the -fno- form of a flag that turns another on as well, and
+# -fexact-trap, which turns others off.
 
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -66,6 +67,15 @@ check differ test/cases/gosp.wat "-O2 -fgssa-all" "-O2"
 check same test/cases_gc/castfacts.wat "-O2 -floadbar" "-O2"
 check same test/cases_gc/castfacts.wat "-O2 -fno-loadbar -floadbar" "-O2"
 check differ test/cases_gc/castfacts.wat "-O2 -fno-loadbar" "-O2"
+# -fexact-trap is on at no level, -fno-exact-trap undoes it, and with it the
+# passes that keep a trap's state where a trap cannot see it stay off
+# whatever their own flags say, before it or after.
+check differ test/cases_trapstate/gloop_global_at_trap.wat "-O2" "-O2 -fexact-trap"
+check same test/cases_trapstate/gloop_global_at_trap.wat "-O3 -fexact-trap -fno-exact-trap" "-O3"
+check same test/cases/deadframes.wat "-O3 -fexact-trap -fdead-frames" "-O3 -fexact-trap"
+check same test/cases/deadframes.wat "-O3 -fdead-frames -fexact-trap" "-O3 -fexact-trap"
+check same test/cases/gosp.wat "-O2 -fexact-trap -fgo-sp" "-O2 -fexact-trap"
+check same test/cases/trampoline.wat "-O2 -fexact-trap -ftrampoline" "-O2 -fexact-trap"
 
 [ "$fail" = 0 ] && echo "levels: $n pairs of levels compile as they should"
 [ "$fail" = 0 ]

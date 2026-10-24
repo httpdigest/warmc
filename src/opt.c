@@ -8722,6 +8722,10 @@ static bool pass_memopt(IrFunc *f, const OptOpts *o) {
       Ref v = b->insts[i];
       Inst *in = &f->insts[v];
       Ref *a = ir_args(f, v);
+      /* -fexact-trap: a store before a trap has happened, so none is dead
+         that something after it can trap before -- a load, a division, a
+         check, a GC access.  A store has its own test, below. */
+      if (o->exact_trap && in->op != I_STORE && lh_can_trap(f, v)) npend = 0;
       MemRan ran = { ent, nent, pend, npend };
       if (in->op == I_LOAD) {
         uint32_t size = (uint32_t)MEMF_SIZE(in->imm2);
@@ -8800,6 +8804,10 @@ static bool pass_memopt(IrFunc *f, const OptOpts *o) {
           pend[k] = pend[--npend];
           break;
         }
+        /* -fexact-trap: nor one this store can trap after; the one at its
+           own place, gone above, ran the same check first, so this one
+           cannot trap after it */
+        if (o->exact_trap && lh_can_trap(f, v)) npend = 0;
         if (npend < MEMOPT_ENTS) pend[npend++] = (PendStore){ a[0], in->imm, size, mem, v };
         for (uint32_t k = 0; k < nent; k++)
           if (may_alias(f, ent[k].addr, ent[k].off, ent[k].size, ent[k].mem,
@@ -10482,6 +10490,13 @@ static bool gs_observes(IrFunc *f, const OptOpts *o, Ref v, uint32_t gidx,
   return (fx->gmask & ((uint64_t)1 << gidx)) != 0;
 }
 
+/* -fexact-trap: where memory must hold the value the function has given a
+   global, for a trap there to see -- whatever can trap, a call included,
+   whose callee can, or which can run out of stack.  A global.set cannot. */
+static bool gs_trap_point(IrFunc *f, const OptOpts *o, Ref v) {
+  return o->exact_trap && f->insts[v].op != I_GLOBAL_SET && lh_can_trap(f, v);
+}
+
 static uint64_t gs_weight(const Block *b) {
   if (b->cold) return 0;
   uint32_t d = b->loop_depth < 4 ? b->loop_depth : 4;
@@ -10494,6 +10509,24 @@ static uint64_t gs_weight(const Block *b) {
 #define GS_TOKEN(n) ((Ref)(0x80000000u + (n)))
 static Ref gs_res(IrFunc *f, Ref r) {
   return r != REF_NONE && r < f->ninsts ? ir_resolve(f, r) : r;
+}
+
+/* -fexact-trap: memory made to hold cur, the global's value, before the
+   instruction at *at of block bi -- or at the block's end, with at null --
+   where mv, what memory holds, is not it already; the dry run counts the
+   store instead. */
+static void gs_sync(IrFunc *f, uint32_t bi, uint32_t *at, uint32_t gidx, Ref cur,
+                    Ref *mv, uint64_t *dry) {
+  if (cur == REF_NONE || (*mv != GS_MV_UNKNOWN && gs_res(f, cur) == gs_res(f, *mv)))
+    return;
+  if (dry) {
+    *dry += gs_weight(&f->blocks[bi]);
+  } else {
+    Ref v = ir_resolve(f, cur);
+    ir_emit(f, bi, I_GLOBAL_SET, 0, &v, 1, gidx, 0);
+    if (at) { gs_move_to(f, bi, *at); (*at)++; }
+  }
+  *mv = cur;
 }
 
 /* With dry set, change nothing and answer in *dry the memory operations the
@@ -10609,7 +10642,11 @@ static bool gs_promote_one(IrFunc *f, const OptOpts *o, uint32_t gidx,
         if (!dry) f->insts[r].op = I_NOP;
       } else if (gl_opaque(op)) {
         bool tail = false;
-        if (!gs_observes(f, o, r, gidx, &tail)) continue;
+        if (!gs_observes(f, o, r, gidx, &tail)) {
+          /* -fexact-trap: a call that cannot see g can trap, which sees it */
+          if (gs_trap_point(f, o, r)) gs_sync(f, bi, &i, gidx, cur, &mv, dry);
+          continue;
+        }
 
         if (cur != REF_NONE &&
             (mv == GS_MV_UNKNOWN || gs_res(f, cur) != gs_res(f, mv))) {
@@ -10641,8 +10678,13 @@ static bool gs_promote_one(IrFunc *f, const OptOpts *o, uint32_t gidx,
           cur = REF_NONE;
           mv = GS_MV_UNKNOWN;
         }
+      } else if (gs_trap_point(f, o, r)) {
+        gs_sync(f, bi, &i, gidx, cur, &mv, dry);
       }
     }
+    /* -fexact-trap: and a trap that ends the block */
+    if (o->exact_trap && f->blocks[bi].term == T_TRAP)
+      gs_sync(f, bi, NULL, gidx, cur, &mv, dry);
     outv[bi] = cur;
     memv[bi] = mv;
     done[bi] = 1;
@@ -11172,6 +11214,12 @@ static bool pass_licm(IrFunc *f, const OptOpts *o) {
         if (!hoist) {
           if (stops_block(in)) reach_any = false;
           if (stops_with_other_code(in)) reach_mem = false;
+          /* -fexact-trap: nor may a load that can trap go above a write
+             that stays, which a trap in the preheader would undo */
+          if (o->exact_trap &&
+              (in->op == I_STORE || in->op == I_MEM_COPY || in->op == I_MEM_FILL ||
+               in->op == I_MEM_INIT))
+            reach_mem = false;
           b->insts[k++] = v;
           continue;
         }
@@ -11265,10 +11313,12 @@ static bool gl_exit_reads(IrFunc *f, uint32_t t, uint32_t gidx) {
   return false;
 }
 
+/* exact: -fexact-trap, where a trap after the loop sees the global too, so
+   every exit writes it back */
 static bool gl_walk(IrFunc *f, uint32_t hb, const uint8_t *inloop,
                     uint32_t gidx, Ref hval, Ref *cur, Ref *subst,
                     GlEdge *back, uint32_t *nback,
-                    GlEdge *out, uint32_t *nout) {
+                    GlEdge *out, uint32_t *nout, bool exact) {
   for (uint32_t i = 0; i < f->nblocks; i++) cur[i] = REF_NONE;
   for (uint32_t i = 0; i < f->ninsts; i++) subst[i] = REF_NONE;
   cur[hb] = hval;
@@ -11294,7 +11344,7 @@ static bool gl_walk(IrFunc *f, uint32_t hb, const uint8_t *inloop,
       } else if (inloop[t]) {
         if (cur[t] == REF_NONE) cur[t] = v;
         else if (cur[t] != v) return false;
-      } else if (gl_exit_reads(f, t, gidx)) {
+      } else if (exact || gl_exit_reads(f, t, gidx)) {
 
         if (*nout == GL_MAX_EDGES) return false;
         out[(*nout)++] = (GlEdge){ bi, s, v };
@@ -11348,7 +11398,7 @@ static uint32_t gl_split_edge(IrFunc *f, uint32_t from, uint32_t si) {
 
 static bool gl_promote_one(IrFunc *f, uint32_t hb, uint32_t pre,
                            const uint8_t *inloop, uint32_t gidx,
-                           ValType gtype, bool may_carry) {
+                           ValType gtype, bool may_carry, bool exact) {
 
   Ref entry = ir_emit(f, pre, I_GLOBAL_GET, gtype, NULL, 0, gidx, 0);
   bool w64 = vt_is_64(gtype);
@@ -11358,7 +11408,7 @@ static bool gl_promote_one(IrFunc *f, uint32_t hb, uint32_t pre,
   GlEdge back[GL_MAX_EDGES], out[GL_MAX_EDGES];
   uint32_t nback = 0, nout = 0;
   bool ok = gl_walk(f, hb, inloop, gidx, entry, cur, subst,
-                    back, &nback, out, &nout);
+                    back, &nback, out, &nout, exact);
 
   bool round = ok;
   for (uint32_t i = 0; i < nback && round; i++)
@@ -11472,6 +11522,9 @@ static bool pass_global_loop(IrFunc *f, const OptOpts *o) {
       if (b->is_pad || ir_block_has_eh(f, bi)) { clear = false; break; }
       for (uint32_t i = 0; i < b->ninsts; i++) {
         Inst *in = &f->insts[b->insts[i]];
+        /* -fexact-trap: a trap in the loop -- a call's included -- would
+           see the global as memory has it */
+        if (gs_trap_point(f, o, b->insts[i])) { clear = false; break; }
         if (gl_opaque(in->op)) {
           if (!no_throw || !gl_call_mask(f, o, b->insts[i], &callmask)) {
             clear = false; break;
@@ -11499,7 +11552,8 @@ static bool pass_global_loop(IrFunc *f, const OptOpts *o) {
     for (uint32_t j = 0; j < ngset; j++) {
 
       if (gset[j] >= FX_GBITS || (callmask & ((uint64_t)1 << gset[j]))) continue;
-      if (gl_promote_one(f, hb, pre, inloop, gset[j], gtype[j], no_throw))
+      if (gl_promote_one(f, hb, pre, inloop, gset[j], gtype[j], no_throw,
+                         o->exact_trap))
         changed = true;
 
       if (f->nblocks > cap) {
@@ -12049,6 +12103,7 @@ static bool lh_merge_down(IrFunc *f, uint32_t hb) {
   b->nsuccs = 0;
   b->term = tb->term;
   b->term_arg = tb->term_arg;
+  b->term_imm = tb->term_imm;
   b->nret = tb->nret;
   b->ret_args = tb->ret_args;
   tb->ret_args = NULL; tb->nret = 0;
@@ -15044,9 +15099,12 @@ static int v_window(const VAcc *acc, uint32_t nacc, const uint8_t *used,
 }
 
 /* *want, when the stride is all that stands in the way, is v_unroll_for's
-   factor (see pass_vectorize). */
+   factor (see pass_vectorize).  exact: -fexact-trap, where every group's
+   range is checked against the memory's size, so that a vector loop never
+   faults: a guard page would take a whole vector's trap ahead of the scalar
+   iterations before it. */
 static bool vectorize_one(IrFunc *f, uint32_t hb, uint8_t *reach, uint8_t *inloop,
-                          uint32_t *want) {
+                          uint32_t *want, bool exact) {
 #define VREJ(w) do { if (warmc_getenv("WARMC_VEC_DEBUG")) \
     fprintf(stderr, "vec %s b%u reject: %s\n", \
             f->m->funcs[f->func_index].sym, hb, w); return false; } while (0)
@@ -15231,6 +15289,16 @@ static bool vectorize_one(IrFunc *f, uint32_t hb, uint8_t *reach, uint8_t *inloo
 
       case I_EXTENDU: case I_EXTENDS: case I_WRAP:
       case I_NOP: case I_PARAM:
+        break;
+      /* -fexact-trap's check of a store's range (ir_build.c's mem_ea), or
+         one of an offset past the guard region: each is of one of the
+         body's accesses, whose group's range the vector loop's guard tests
+         against the memory's size with the flag.  The vector body, built
+         from what the stores store, leaves it out; the scalar loop keeps
+         it.  Without the flag only an offset past the guard region has one
+         here, and such a loop is left to the scalar code, as it was. */
+      case I_BOUNDS_CHECK:
+        if (!exact) VREJ_OP("body op", in->op);
         break;
       default: VREJ_OP("body op", in->op);
     }
@@ -15980,7 +16048,7 @@ static bool vectorize_one(IrFunc *f, uint32_t hb, uint8_t *reach, uint8_t *inloo
   Ref memsz[VEC_MAX_GRP];
   for (uint32_t g = 0; g < ctx.ngrp; g++) memsz[g] = REF_NONE;
   for (uint32_t g = 0; g < ctx.ngrp; g++) {
-    if (!ctx.grp[g].spec && !idx64) continue;
+    if (!ctx.grp[g].spec && !idx64 && !exact) continue;
 
     for (uint32_t q = 0; q < g; q++)
       if (memsz[q] != REF_NONE && ctx.grp[q].mem == ctx.grp[g].mem)
@@ -16056,7 +16124,9 @@ static bool vectorize_one(IrFunc *f, uint32_t hb, uint8_t *reach, uint8_t *inloo
     Ref fits = vemit(f, vguard, I_LEU, VT_I32, hi,
                      idx64 ? memsz[g] : limit, 0, 0);
     ok = vemit(f, vguard, I_AND, VT_I32, ok, fits, 0, 0);
-    if (G->spec && !idx64)
+    /* a 32-bit group whose size was read above, a speculative one or any
+       with -fexact-trap, is tested against it */
+    if (!idx64 && memsz[g] != REF_NONE)
       ok = vemit(f, vguard, I_AND, VT_I32, ok,
                  vemit(f, vguard, I_LEU, VT_I32, hi, memsz[g], 0, 0), 0, 0);
     G->lo = lo;
@@ -17099,7 +17169,7 @@ static bool pass_vec_search(IrFunc *f) {
 
 static bool unroll_by(IrFunc *f, uint32_t hb, uint32_t want, uint32_t *newh);
 
-static bool pass_vectorize(IrFunc *f) {
+static bool pass_vectorize(IrFunc *f, bool exact) {
   bool changed = false;
   uint32_t norig = f->nblocks;
   uint8_t *reach = NULL, *inloop = NULL;
@@ -17114,7 +17184,7 @@ static bool pass_vectorize(IrFunc *f) {
     if (f->ninsts > rcap) { rcap = f->ninsts; reach = xrealloc(reach, rcap); }
     if (f->nblocks > lcap) { lcap = f->nblocks; inloop = xrealloc(inloop, lcap); }
     uint32_t want = 0, nh = hb;
-    if (vectorize_one(f, hb, reach, inloop, &want)) {
+    if (vectorize_one(f, hb, reach, inloop, &want, exact)) {
       done[hb] = 1;
       changed = true;
       ir_order(f);
@@ -17127,7 +17197,7 @@ static bool pass_vectorize(IrFunc *f) {
       if (f->ninsts > rcap) { rcap = f->ninsts; reach = xrealloc(reach, rcap); }
       if (f->nblocks > lcap) { lcap = f->nblocks; inloop = xrealloc(inloop, lcap); }
       uint32_t w2 = 0;
-      if (vectorize_one(f, nh, reach, inloop, &w2)) ir_order(f);
+      if (vectorize_one(f, nh, reach, inloop, &w2, exact)) ir_order(f);
       oi = 0;
     }
   }
@@ -19079,7 +19149,7 @@ void ir_optimize(IrFunc *f, const OptOpts *o) {
   if (o->vectorize && o->guard_pages && TP("vec_search", pass_vec_search(f))) {
     ir_order(f);
   }
-  if (o->vectorize && o->guard_pages && TP("vectorize", pass_vectorize(f))) {
+  if (o->vectorize && o->guard_pages && TP("vectorize", pass_vectorize(f, o->exact_trap))) {
     ir_order(f);
     /* the guards a vector loop is entered by are often constants */
     if (o->fold) pass_fold(f, o);

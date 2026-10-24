@@ -14,9 +14,11 @@ such sets for the 46 passes.  --strength 3 covers every triple in all eight
 combinations instead, with rows a seeded greedy search picks, which takes
 about thirty.
 
-The passes are all of -f's but three: fma and dead-frames change what a
+The passes are all of -f's but four: fma and dead-frames change what a
 program can see, which these suites compare, and have rows of their own;
-gssa-all is not a pass but a stronger gssa.  This script reads src/main.c's
+gssa-all is not a pass but a stronger gssa; and exact-trap is none either,
+but a mode that turns trampoline, go-sp and dead-frames off, with rows of
+its own too.  This script reads src/main.c's
 list and fails if a pass is missing from both PASSES and LEFT_OUT, so a new
 pass joins the combinations.
 
@@ -39,7 +41,7 @@ rotate addroff memptr align guard-pages regalloc split vectorize edge-tests
 selftail ldcomb escape partial-escape gloop loopclose cpool ictab trampoline
 go-sp gssa small-loop-align labcache barelide merge reach prune devirt
 reinline throw-jump unroll ifconv mulwide gcpure closed-world""".split()
-LEFT_OUT = {"fma", "dead-frames", "gssa-all"}
+LEFT_OUT = {"fma", "dead-frames", "gssa-all", "exact-trap"}
 
 SUITES = {
     "cases": ["./test/run_tests.sh"],

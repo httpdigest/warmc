@@ -1509,7 +1509,7 @@ def main():
 
     rng = random.Random(20260807)
     total = skipped = comps = listy = utf8n = xn = 0
-    for name, path in rc.components():
+    for name, path in rc.components(os.path.join(rc.WORK, "adapter", "components")):
         n, s, l, u, x = check_component(name, path, d, rng)
         total += n
         skipped += s

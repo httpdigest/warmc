@@ -318,6 +318,8 @@ def target_flags(build):
             sdk = subprocess.run(["xcrun", "--show-sdk-path"], capture_output=True, text=True).stdout.strip()
             os.environ["WARMC_MACOS_LIBDIR"] = os.path.join(sdk, "usr", "lib")
         return ["--target=macos", "--rt", os.path.join(build, "warmrt-macos.a")]
+    if hostbuild.WINDOWS:
+        return ["--target=windows", "--rt", os.path.join(build, "warmrt-windows.a")]
     return ["--rt", os.path.join(build, "warmrt.a")]
 
 def fuzz(seed, count, levels, flags, out):
@@ -351,7 +353,9 @@ def fuzz(seed, count, levels, flags, out):
             bad += 1
             continue
         for lv in levels:
-            binary = os.path.join(out, "m.bin")
+            # one of its own per seed and level, removed once run: Windows
+            # refuses to write over the image of one that has only just exited
+            binary = os.path.join(out, "m%d%s.bin" % (s, lv.replace(" ", "")))
             r = sh([warmc] + lv.split() + ["--stats"] + flags + target + ["-o", binary, wasm], timeout=30)
             if r.returncode:
                 print("seed %d %s: warmc: %s" % (s, lv, r.stderr[:400]))
@@ -362,6 +366,10 @@ def fuzz(seed, count, levels, flags, out):
                 bad += 1
                 break
             nexp, fails, msgs = cmp_mod.compare(ref, binary, "g%d%s" % (s, lv), run=[], timeout=30)
+            try:
+                os.remove(binary)
+            except OSError:
+                pass
             if fails:
                 print("seed %d %s: %d/%d failed" % (s, lv, fails, nexp))
                 for m in msgs[:6]:

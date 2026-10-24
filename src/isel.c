@@ -1153,11 +1153,14 @@ static size_t emit_small_memop(Isel *s, const Inst *in, const Ref *a, bool fill)
    the instruction requires, and once that store is in, so is every other.
    Its end is at most SMO_CONST_MAX past a 32-bit address, inside the guard
    region.  The two tests and the call path were a fifth of what C's struct
-   arguments cost (cbench/structval). */
+   arguments cost (cbench/structval).  That store faulting writes nothing
+   on Apple's cores, but AArch64 lets one that crosses into the guard page
+   write the bytes before it: with -fexact-trap the tests are made. */
 static size_t emit_const_memop(Isel *s, const Ref *a, bool fill, uint32_t n) {
   int d = rd(s, a[0], S0);
   int x = rd(s, a[1], S1);
-  bool guarded = g_guard_pages;
+  bool guarded = g_guard_pages && !s->opt->exact_trap;
+  if (g_guard_pages && !guarded) g_stats.exact_memop_checks++;
   size_t slow[2];
   int nslow = 0;
   if (!guarded) {

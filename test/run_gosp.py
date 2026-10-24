@@ -13,6 +13,8 @@ rewrite out:
 - a subtype, or Go's type not final;
 - an imported function of Go's type in the table, as a table's initial
   value, or taken by ref.func.
+With -fexact-trap, where a trap must see the pointer in its global, none
+is made, the control's included.
 Each must compile with the rewrite not made (--stats says gosp_funcs=0)
 and, where the interpreter can run it (no imports and no subtypes), give
 the interpreter's results.  Each is the one test of its condition: removing
@@ -134,7 +136,8 @@ def main():
     fails = []
     checked = 0
     with tempfile.TemporaryDirectory() as tmp:
-        for what, subs, runs in [("the control", {}, True), (COLLIDE, {"types": COLLIDE_TYPES}, False)] + CASES:
+        for ci, (what, subs, runs) in enumerate(
+                [("the control", {}, True), (COLLIDE, {"types": COLLIDE_TYPES}, False)] + CASES):
             wat, wasm = os.path.join(tmp, "m.wat"), os.path.join(tmp, "m.wasm")
             with open(wat, "w") as f:
                 f.write(module(subs))
@@ -143,7 +146,9 @@ def main():
             if r.returncode:
                 fails.append("%s: not assembled: %s" % (what, r.stderr.strip()[:200]))
                 continue
-            binary = os.path.join(tmp, "m.bin")
+            # one of its own per case: Windows refuses to write over the
+            # image of one that has only just exited
+            binary = os.path.join(tmp, "m%d.bin" % ci)
             out = ["-c", "-o", os.path.join(tmp, "m.o")] if not runs else target + ["-o", binary]
             r = sh([warmc, "-O2", "--stats"] + out + [wasm], timeout=60)
             if r.returncode:
@@ -155,6 +160,16 @@ def main():
                 fails.append("%s: gosp.c rewrote %s Go functions, not %d"
                              % (what, m.group(1) if m else "?", want))
                 continue
+            if want:
+                # and none with -fexact-trap, where a trap must see the
+                # pointer in its global
+                r = sh([warmc, "-O2", "-fexact-trap", "--stats", "-c", "-o",
+                        os.path.join(tmp, "x.o"), wasm], timeout=60)
+                m = re.search(r"\bgosp_funcs=(\d+)\b", r.stderr)
+                if r.returncode or not m or int(m.group(1)) != 0:
+                    fails.append("%s: gosp.c rewrote %s Go functions with -fexact-trap, not 0"
+                                 % (what, m.group(1) if m else "?"))
+                    continue
             if runs:
                 ref = os.path.join(tmp, "m.ref")
                 r = sh(["wasm-interp"] + wabt + ["--run-all-exports", wasm], timeout=60)
