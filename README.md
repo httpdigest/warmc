@@ -1354,10 +1354,11 @@ The other rows check what has no second engine to compare with:
 - the compiler under AddressSanitizer and ThreadSanitizer (`run_asan.sh`,
   `run_tsan.sh`)
 
-Four phases run last, each alone, because they need a quiet machine or would
+Five phases run last, each alone, because they need a quiet machine or would
 load it for the others: the collector's pause check, the Go- and GHC-shaped
-rewrites' modules with the Mach-O row, the corpora with `-fexact-trap`, and
-the pass combinations.
+rewrites' modules with the Mach-O row, the corpora with `-fexact-trap`, the
+official testsuite at the levels `make check-spec` runs, and the pass
+combinations.
 
 `test/run_shared.sh` builds a shared library and calls it from C, C++,
 Python's `ctypes` and Java's foreign function API. The Java part needs Java 22
@@ -1380,8 +1381,8 @@ Requirements:
   (`make kotlin-stdlib`), is cached there too, in the version your `kotlinc`
   reports. Each cached copy is stamped with its version, so bumping a pin or
   upgrading `kotlinc` fetches it again.
-  `make check` brings `wasm-tools`, wasi-sdk and the Kotlin stdlib up to date
-  by itself; `make check-spec` does the same for the testsuite.
+  `make check` brings all four up to date by itself, and `make check-spec`
+  the testsuite.
 - Rows that need wasmtime, TinyGo, Go, Rust (`wasm32-wasip1` / `wasm32-wasip2`),
   Zig, `asc`, `kotlinc-wasm` or `wasm32-wasi-ghc` skip themselves when the tool
   is missing. GHC's wasm backend is not fetched by the Makefile: install it

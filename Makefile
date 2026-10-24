@@ -329,11 +329,12 @@ $(WASI_SDK_STAMP):
 
 wasi-sdk: $(WASI_SDK_STAMP)
 
-# `make check` brings the pinned tools up to date first; ktbench skips itself
-# without a Kotlin compiler, so the stdlib is only fetched when there is one,
-# and wasi-sdk only where it publishes a release.  hsbench's GHC is not
-# fetched: ghc-wasm-meta installs it, and the corpus skips itself without.
-CHECK_TOOLS := wasm-tools $(if $(KOTLIN_VERSION),kotlin-stdlib) \
+# `make check` brings the pinned tools up to date first, and the official
+# testsuite its spec row runs; ktbench skips itself without a Kotlin
+# compiler, so the stdlib is only fetched when there is one, and wasi-sdk
+# only where it publishes a release.  hsbench's GHC is not fetched:
+# ghc-wasm-meta installs it, and the corpus skips itself without.
+CHECK_TOOLS := wasm-tools testsuite $(if $(KOTLIN_VERSION),kotlin-stdlib) \
                $(if $(WASI_SDK_HOST),wasi-sdk)
 
 SPEC_LEVELS ?= -O1,-O2,-O2 --profile=deterministic

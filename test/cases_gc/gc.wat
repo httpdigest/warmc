@@ -915,6 +915,18 @@
   (func (export "arr_new_data_oob")
     (drop (array.new_data $ai32 $d (i32.const 0) (i32.const 8))))
 
+  ;; array.new whose length times the element size overruns 32 bits: the
+  ;; runtime sizes the allocation in 64 bits and traps -- the heap is far
+  ;; smaller -- rather than reserving a short buffer that an index up to the
+  ;; recorded length, which is kept in full, could then read past the end of.
+  ;; 0x20000000 i64s is 0x1_0000_0000 bytes, which is 0 in 32; 0x80000001
+  ;; i16s is 2.  The read that follows escapes only if the short buffer was
+  ;; made, so each export must trap in array.new, not return.
+  (func (export "arr_new_size_overflow") (result i64)
+    (array.get $ai64 (array.new_default $ai64 (i32.const 0x20000000)) (i32.const 7)))
+  (func (export "arr_new_size_overflow2") (result i32)
+    (array.get_u $ai16 (array.new_default $ai16 (i32.const 0x80000001)) (i32.const 1)))
+
   ;; Constant arrays, evaluated by the runtime rather than compiled.
   (global $ga (ref $ai32) (array.new $ai32 (i32.const 42) (i32.const 3)))
   (global $gad (ref $ai64) (array.new_default $ai64 (i32.const 2)))

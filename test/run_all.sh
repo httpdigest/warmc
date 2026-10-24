@@ -326,6 +326,12 @@ if [ -z "${CHECK_SMOKE:-}" ]; then
     bench "$c-exacttrap" python3 test/gobench.py --corpus "$c" --check --variant '-O2 -fexact-trap'
   done
   wait
+  # The official testsuite, as make check-spec runs it: every malformed and
+  # invalid module refused, and every assertion of the rest held -- the
+  # bounds, traps and type checks a module has no way round.  Alone, after
+  # the rest: it links and runs some 750 fresh binaries.
+  start spec python3 test/spec/run.py "--levels=${SPEC_LEVELS:--O1,-O2,-O2 --profile=deterministic}"
+  wait
   # Every pair of passes, off and on in all four combinations, over the
   # cases, traps and the collector: nine settings (make check-combos does
   # triples).  Last and alone, since each setting runs those suites on

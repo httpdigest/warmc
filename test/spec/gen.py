@@ -100,8 +100,14 @@ def value(v):
         if val is None:
             return SV["ref_nonnull"], 0, 0, 0, 0
 
-        if t in ("externref", "anyref", "eqref", "structref", "arrayref",
-                 "i31ref"):
+        # A host reference, as an embedder hands one in: an externref is any
+        # value with its low two bits clear (README, "Embedding compiled
+        # modules in C"), and the same reference in the any hierarchy is it
+        # tagged GC_HOST_TAG, which is what any.convert_extern makes of it
+        # and extern.convert_any takes off again.
+        if t == "externref":
+            return SV["externref"], (int(val) + 1) << 2, 0, 0, 0
+        if t in ("anyref", "eqref", "structref", "arrayref", "i31ref"):
             return SV["externref"], ((int(val) + 1) << 2) | 2, 0, 0, 0
         raise Unsupported("%s with identity %r" % (t, val))
     if t == "either":
