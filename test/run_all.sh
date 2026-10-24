@@ -216,11 +216,11 @@ bench hsbench  python3 test/gobench.py --corpus hsbench --check
 
 # The language test corpora: programs that print what they compute, line by
 # line, rather than a checksum, so a miscompile shows where it starts; each is
-# compared with wasmtime at every optimisation level.  Not benchmarks, so not
-# in the Makefile's BENCH_CORPORA.
+# compared with wasmtime at every optimisation level, and with -fdead-frames.
+# Not benchmarks, so not in the Makefile's BENCH_CORPORA.
 for c in ctests cpptests rstests gotests stdgotests astests kttests zigtests hstests; do
   start "$c" python3 test/gobench.py --corpus "$c" --check \
-    --variant -O0 --variant -O1 --variant -O2
+    --variant -O0 --variant -O1 --variant -O2 --variant '-O2 -fdead-frames'
 done
 
 start wasi     ./test/run_wasi.sh
@@ -266,6 +266,14 @@ start gc-naive    env WARMC_FLAGS="-O2 -fno-regalloc" ./test/run_gc.sh
 start cases-noguard env WARMC_FLAGS="-O2 -fno-guard-pages" ./test/run_tests.sh
 start traps-noguard env WARMC_FLAGS="-O2 -fno-guard-pages" ./test/run_traps.sh
 start gc-noguard    env WARMC_FLAGS="-O2 -fno-guard-pages" ./test/run_gc.sh
+# -fdead-frames removes stores into a frame that nothing reads again, so the
+# hand-written cases run with it too (deadframes.wat holds its shapes, and
+# deadframes_above.wat a stack it must leave alone), and so do the corpora
+# built on C's stack, whose output under it is wasmtime's.
+start cases-deadframes env WARMC_FLAGS="-O2 -fdead-frames" ./test/run_tests.sh
+for c in cbench cppbench rsbench zigbench; do
+  bench "$c-deadframes" python3 test/gobench.py --corpus "$c" --check --variant '-O2 -fdead-frames'
+done
 
 start magic    python3 test/magic.py
 start reject   ./test/run_reject.sh

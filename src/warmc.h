@@ -340,6 +340,10 @@ typedef struct {
   DataSeg *datas;   uint32_t ndatas;
   bool has_start; uint32_t start_func;
   bool has_datacount; uint32_t datacount;
+  /* a go:buildid section: Go's compiler made it, whose stack is not C's
+     (arguments above the callee's stack pointer, frames re-entered after
+     the wasm stack unwinds) */
+  bool go_stack;
 
   bool *reached;
 

@@ -1043,6 +1043,8 @@ static void call_helper_imm2(Isel *s, const char *name, const Ref *args, uint32_
    path could disturb, and it uses only scratch.  Returns the site of the
    fast path's branch past the call, or (size_t)-1 when there is none. */
 #define SMO_CONST_MAX 256u
+/* emit_small_memop's answer when it did the whole op and no call follows */
+#define SMO_INLINE ((size_t)-2)
 static size_t emit_const_memop(Isel *s, const Ref *a, bool fill, uint32_t n);
 
 static size_t emit_small_memop(Isel *s, const Inst *in, const Ref *a, bool fill) {
@@ -1143,22 +1145,33 @@ static size_t emit_small_memop(Isel *s, const Inst *in, const Ref *a, bool fill)
    and the size of most memcpy and memset calls LLVM leaves in a module.  A
    copy loads everything before it stores anything, as the dynamic path
    does, so an overlapping one is still a memmove; the op is a call site,
-   so v16-v31 hold nothing live. */
+   so v16-v31 hold nothing live.
+
+   Under guard pages it tests nothing either, and makes no call: the store
+   that ends highest goes first, so whichever range runs past the memory
+   faults -- a load, or that store -- before a byte is written, a trap as
+   the instruction requires, and once that store is in, so is every other.
+   Its end is at most SMO_CONST_MAX past a 32-bit address, inside the guard
+   region.  The two tests and the call path were a fifth of what C's struct
+   arguments cost (cbench/structval). */
 static size_t emit_const_memop(Isel *s, const Ref *a, bool fill, uint32_t n) {
   int d = rd(s, a[0], S0);
   int x = rd(s, a[1], S1);
+  bool guarded = g_guard_pages;
   size_t slow[2];
   int nslow = 0;
-  a64_ldr_imm(B, 3, TMP0, REG_VMCTX, VMCTX_MEM_SIZE);
-  a64_uxtw(B, S3, d);
-  a64_add_imm(B, SF64, S3, S3, n, 0);
-  a64_cmp_reg(B, SF64, S3, TMP0);
-  slow[nslow++] = br_cc(s, 0, CC_HI, 0, 0);
-  if (!fill) {
-    a64_uxtw(B, S3, x);
+  if (!guarded) {
+    a64_ldr_imm(B, 3, TMP0, REG_VMCTX, VMCTX_MEM_SIZE);
+    a64_uxtw(B, S3, d);
     a64_add_imm(B, SF64, S3, S3, n, 0);
     a64_cmp_reg(B, SF64, S3, TMP0);
     slow[nslow++] = br_cc(s, 0, CC_HI, 0, 0);
+    if (!fill) {
+      a64_uxtw(B, S3, x);
+      a64_add_imm(B, SF64, S3, S3, n, 0);
+      a64_cmp_reg(B, SF64, S3, TMP0);
+      slow[nslow++] = br_cc(s, 0, CC_HI, 0, 0);
+    }
   }
   a64_add_uxtw(B, TMP0, REG_MEMBASE, d, 0);
   if (!fill) a64_add_uxtw(B, TMP1, REG_MEMBASE, x, 0);
@@ -1171,13 +1184,13 @@ static size_t emit_const_memop(Isel *s, const Ref *a, bool fill, uint32_t n) {
       a64_uxtb(B, S1, x);
       a64_load_imm(B, SF64, S3, 0x0101010101010101ull);
       a64_mul(B, SF64, S1, S1, S3);
-      a64_str_imm(B, size, S1, TMP0, 0);
       if ((int)n > w) a64_stur(B, size, S1, TMP0, (int)n - w);
+      a64_str_imm(B, size, S1, TMP0, 0);
     } else {
       a64_ldr_imm(B, size, S1, TMP1, 0);
       if ((int)n > w) a64_ldur(B, size, S2, TMP1, (int)n - w);
-      a64_str_imm(B, size, S1, TMP0, 0);
       if ((int)n > w) a64_stur(B, size, S2, TMP0, (int)n - w);
+      a64_str_imm(B, size, S1, TMP0, 0);
     }
   } else {
     /* Pairs of q registers, then one more, then one overlapping the end:
@@ -1191,9 +1204,17 @@ static size_t emit_const_memop(Isel *s, const Ref *a, bool fill, uint32_t n) {
     if (fill) a64_vdup_gpr(B, 0, 16, x);
     for (int pass = fill ? 1 : 0; pass < 2; pass++) {
       int base = pass ? TMP0 : TMP1;
-      for (int i = 0; i < nq; i++) {
+      /* the last access ends at n: stored first */
+      int lim = nq;
+      if (pass) {
+        int r = fill ? 16 : 16 + nq - 1;
+        if (!(off[nq - 1] & 15)) a64_str_q(B, r, base, off[nq - 1]);
+        else a64_stur_q(B, r, base, (int)off[nq - 1]);
+        lim = nq - 1;
+      }
+      for (int i = 0; i < lim; i++) {
         int r = fill ? 16 : 16 + i;
-        bool pair = i + 1 < nq && off[i + 1] == off[i] + 16 && !(off[i] & 15);
+        bool pair = i + 1 < lim && off[i + 1] == off[i] + 16 && !(off[i] & 15);
         if (pair) {
           int r2 = fill ? 16 : 16 + i + 1;
           if (pass) a64_stp_q(B, r, r2, base, (int)off[i]);
@@ -1209,11 +1230,12 @@ static size_t emit_const_memop(Isel *s, const Ref *a, bool fill, uint32_t n) {
       }
     }
   }
+  s->smo_cond_zero = -1;
+  s->smo_ndone = 0;
+  if (guarded) return SMO_INLINE;
   size_t out = B->len;
   a64_b(B, 0);
   for (int i = 0; i < nslow; i++) br_patch(s, slow[i], B->len);
-  s->smo_cond_zero = -1;
-  s->smo_ndone = 0;
   s->smo_done[s->smo_ndone++] = out;
   return out;
 }

@@ -55,10 +55,15 @@ static const char *usage_text =
   "                partial-escape, gloop, gssa, loopclose, cpool, ictab, reach,\n"
   "                prune, merge, devirt, reinline, throw-jump, closed-world,\n"
   "                gcpure, split, labcache, ifconv, mulwide, barelide,\n"
-  "                small-loop-align, fma\n"
+  "                small-loop-align, fma, dead-frames\n"
   "                fma is off unless asked for: it fuses a float multiply\n"
   "                into the add that reads it, rounded once, which is not\n"
   "                wasm's arithmetic and can change a result's last bit\n"
+  "                dead-frames is off unless asked for: it assumes C's\n"
+  "                stack, where nothing reads a function's frame once it\n"
+  "                returns, and removes the stores into it nothing reads\n"
+  "                before then; wasm keeps them, so a program that reads\n"
+  "                stack memory it never wrote can see other bytes\n"
   "                The last two are the passes built on a loop containing\n"
   "                no safepoint, which is the only assumption the compiler\n"
   "                makes about the collector: turning them off says whether\n"
@@ -451,6 +456,7 @@ int main(int argc, char **argv) {
       else if (!strcmp(name, "ifconv")) opt.ifconv = on;
       else if (!strcmp(name, "mulwide")) opt.mulwide = on;
       else if (!strcmp(name, "fma")) opt.fma = on;
+      else if (!strcmp(name, "dead-frames")) opt.dead_frames = on;
       else if (!strcmp(name, "gcpure")) opt.gcpure = on;
       else if (!strcmp(name, "closed-world")) opt.closed_world = on;
       else warmc_fatal("unknown pass %s", name);
@@ -629,7 +635,7 @@ int main(int argc, char **argv) {
             "             ldpairs=%llu stpairs=%llu cold_frames=%llu early_rets=%llu\n"
             "             reloads=%llu caller_saves=%llu csa_restores=%llu"
             " v128_spills=%llu rb_trips=%llu split_cuts=%llu split_invs=%llu pieces=%llu"
-            " loop_pieces=%llu recomputes=%llu\n"
+            " loop_pieces=%llu recomputes=%llu dead_frame_stores=%llu\n"
             "             escape_removed=%llu escape_forwarded=%llu escape_made=%llu gloop=%llu\n"
             "             loop_closed=%llu reassoc=%llu cmp_reused=%llu csel_fused=%llu mul_wide=%llu fma=%llu gssa=%llu\n"
             "             bar_masks=%llu bar_elided=%llu\n"
@@ -672,6 +678,7 @@ int main(int argc, char **argv) {
             (unsigned long long)g_stats.pieces,
             (unsigned long long)g_stats.loop_pieces,
             (unsigned long long)g_stats.recomputes,
+            (unsigned long long)g_stats.dead_frame_stores,
             (unsigned long long)g_stats.escape_removed,
             (unsigned long long)g_stats.escape_forwarded,
             (unsigned long long)g_stats.escape_made,

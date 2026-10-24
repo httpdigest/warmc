@@ -2326,6 +2326,35 @@ static bool fold_block(IrFunc *f, uint32_t bi, const OptOpts *o, const uint32_t 
       changed = true;
       continue;
     }
+    /* Bits taken back to the type they came from are the value they came
+       from, and a store writes a value's bits whatever its type: the C ABI
+       copies a struct's doubles as i64 loads and stores, and forwarding
+       them through a frame left each one crossing to the integer file and
+       back with an fmov (cbench/structval). */
+    if (in->op == I_REINTERPRET && in->nargs == 1) {
+      Ref s = ir_resolve(f, a[0]);
+      Inst *si = &f->insts[s];
+      if (si->op == I_REINTERPRET && si->nargs == 1) {
+        Ref x0 = ir_resolve(f, ir_args(f, s)[0]);
+        if (f->insts[x0].type == in->type) {
+          ir_replace(f, v, x0);
+          in->op = I_NOP;
+          g_stats.folded++;
+          changed = true;
+          continue;
+        }
+      }
+    }
+    if (in->op == I_STORE && in->nargs == 2) {
+      Ref s = ir_resolve(f, a[1]);
+      Inst *si = &f->insts[s];
+      if (si->op == I_REINTERPRET && si->nargs == 1 && (ValType)si->type != VT_V128 &&
+          MEMF_SIZE(in->imm2) == (vt_is_64((ValType)si->type) ? 3u : 2u)) {
+        a[1] = ir_resolve(f, ir_args(f, s)[0]);
+        g_stats.folded++;
+        changed = true;
+      }
+    }
     if (in->nargs == 1 && !vt_is_float((ValType)f->insts[a[0]].type) && is_const(f, a[0], &x)) {
       ValType ot = (ValType)f->insts[a[0]].type;
       if (fold_int_unop(in->op, ot, x, &r)) {
@@ -3005,6 +3034,83 @@ static bool fold_block(IrFunc *f, uint32_t bi, const OptOpts *o, const uint32_t 
   return changed;
 }
 
+/* An integer load whose bits go only to stores and to reinterprets is loaded
+   as the float the reinterprets read: a load and a store copy bits in
+   either file, and the value then needs no fmov across.  The C ABI copies a
+   struct's doubles as i64 (cbench/structval). */
+static bool retype_bit_loads(IrFunc *f) {
+  uint32_t n = f->ninsts;
+  bool any = false;
+  for (uint32_t oi = 0; oi < f->norder && !any; oi++) {
+    Block *b = &f->blocks[f->order[oi]];
+    for (uint32_t i = 0; i < b->ninsts && !any; i++) {
+      Inst *in = &f->insts[b->insts[i]];
+      if (in->op != I_REINTERPRET || in->nargs != 1) continue;
+      Inst *l = &f->insts[ir_args(f, b->insts[i])[0]];
+      any = l->op == I_LOAD && (l->type == VT_I32 || l->type == VT_I64);
+    }
+  }
+  if (!any) return false;
+  /* 1: a full-width integer load, 2: one a reinterpret reads, 3: one read
+     otherwise */
+  uint8_t *st = xcalloc(n ? n : 1, 1);
+  for (uint32_t oi = 0; oi < f->norder; oi++) {
+    Block *b = &f->blocks[f->order[oi]];
+    for (uint32_t i = 0; i < b->ninsts; i++) {
+      Inst *in = &f->insts[b->insts[i]];
+      if (in->op == I_LOAD && (in->type == VT_I32 || in->type == VT_I64) &&
+          MEMF_SIZE(in->imm2) == (in->type == VT_I64 ? 3u : 2u))
+        st[b->insts[i]] = 1;
+    }
+  }
+  for (uint32_t oi = 0; oi < f->norder; oi++) {
+    Block *b = &f->blocks[f->order[oi]];
+    for (uint32_t i = 0; i < b->ninsts; i++) {
+      Ref u = b->insts[i];
+      Inst *in = &f->insts[u];
+      Ref *a = ir_args(f, u);
+      for (uint32_t j = 0; j < in->nargs; j++) {
+        Ref r = a[j];
+        if (r >= n || !st[r]) continue;
+        if (in->op == I_STORE && j == 1 &&
+            MEMF_SIZE(in->imm2) == (f->insts[r].type == VT_I64 ? 3u : 2u))
+          continue;
+        if (in->op == I_REINTERPRET && in->nargs == 1) { if (st[r] == 1) st[r] = 2; }
+        else st[r] = 3;
+      }
+    }
+    if ((b->term == T_BRIF || b->term == T_BRTABLE) && b->term_arg < n && st[b->term_arg])
+      st[b->term_arg] = 3;
+    for (uint32_t j = 0; j < b->nret; j++)
+      if (b->ret_args[j] < n && st[b->ret_args[j]]) st[b->ret_args[j]] = 3;
+    for (uint32_t s = 0; s < b->nsuccs; s++)
+      for (uint32_t j = 0; j < b->succs[s].nargs; j++) {
+        Ref r = b->succs[s].args[j];
+        if (r < n && st[r]) st[r] = 3;
+      }
+  }
+  bool changed = false;
+  for (uint32_t oi = 0; oi < f->norder; oi++) {
+    Block *b = &f->blocks[f->order[oi]];
+    for (uint32_t i = 0; i < b->ninsts; i++) {
+      Ref u = b->insts[i];
+      Inst *in = &f->insts[u];
+      if (in->op != I_REINTERPRET || in->nargs != 1) continue;
+      Ref r = ir_args(f, u)[0];
+      if (r >= n || st[r] != 2) continue;
+      f->insts[r].type = in->type;
+      f->insts[r].imm2 &= ~(uint64_t)MEMF_SIGNED;
+      ir_replace(f, u, r);
+      in->op = I_NOP;
+      g_stats.folded++;
+      changed = true;
+    }
+  }
+  xfree(st);
+  if (changed) ir_apply_subst(f);
+  return changed;
+}
+
 static bool pass_fold(IrFunc *f, const OptOpts *o) {
   bool changed = false;
   uint32_t *uses = count_uses(f);
@@ -3012,6 +3118,7 @@ static bool pass_fold(IrFunc *f, const OptOpts *o) {
     if (fold_block(f, f->order[oi], o, uses)) changed = true;
   xfree(uses);
   if (changed) ir_apply_subst(f);
+  if (retype_bit_loads(f)) changed = true;
   return changed;
 }
 
@@ -5876,6 +5983,34 @@ typedef struct {
   uint32_t nvtst, capvtst;
 } DirectFx;
 
+/* -fdead-frames's facts about each function, from its body as built (see
+   df_scan): the bytes it reads through each pointer parameter -- a hull of
+   offsets, or unknown when a parameter escapes or is read where no offset
+   is known -- and what it does with each global it reads as a stack
+   pointer. */
+#define DF_MAXP 8
+typedef struct { uint32_t callee; uint8_t arg, kind, id; int64_t off; } DfArg;
+typedef struct {
+  int64_t lo[DF_MAXP], hi[DF_MAXP];
+  /* per parameter: read where no offset is known; let escape, kept or
+     passed where it cannot be followed */
+  uint8_t unk, esc;
+  /* per global below 64: read or written at or above the value it held at
+     entry; read at an offset from it nothing bounds, or let escape; set to
+     less than that value, as a frame is taken */
+  uint64_t above, uncertain, push;
+  bool indirect, capped;
+  /* resolved: neither it nor anything it calls reads its callers' frames */
+  bool safe;
+  DfArg *args;
+  uint32_t nargs, cap;
+} DfFunc;
+static DfFunc *df_func;
+static uint32_t df_sp = UINT32_MAX;
+static bool df_scanfree;
+static void df_scan(Module *m, IrFunc *g, uint32_t fi);
+static void df_resolve(Module *m);
+
 static Module *fx_mod;
 static const OptOpts *fx_opts;
 static CallFx *fx_func;
@@ -5972,6 +6107,12 @@ void opt_effects_begin(Module *m, const OptOpts *o) {
   xfree(fx_cg_first); fx_cg_first = NULL;
   xfree(fx_cg_opnd); fx_cg_opnd = NULL;
   fx_vt_poisoned = false;
+  if (df_func)
+    for (uint32_t i = 0; i < fx_nfuncs; i++) xfree(df_func[i].args);
+  xfree(df_func);
+  df_func = o->dead_frames ? xcalloc(m->nfuncs ? m->nfuncs : 1, sizeof(DfFunc)) : NULL;
+  df_sp = UINT32_MAX;
+  df_scanfree = false;
   fx_mod = m;
   fx_opts = o;
   fx_nfuncs = m->nfuncs;
@@ -5994,6 +6135,7 @@ void opt_effects_end(Module *m, const OptOpts *o) {
   for (uint32_t fi = 0; fi < m->nfuncs; fi++) call_effects(m, o, fi, 0);
   indirect_effects(m, o);
   fx_facts_build(m);
+  if (df_func) df_resolve(m);
   fx_warming = false;
   fx_resolved = true;
 }
@@ -6161,6 +6303,7 @@ static void fx_scan_direct(Module *m, const OptOpts *o, uint32_t fi) {
       }
     }
   }
+  if (df_func) df_scan(m, g, fi);
   ir_free(g);
 
   d->writes_globals = writes_globals;
@@ -6174,6 +6317,617 @@ static void fx_scan_direct(Module *m, const OptOpts *o, uint32_t fi) {
   d->lo = lo;
   d->hi = hi;
   d->ncallees = ncallees;
+}
+
+/* ---- -fdead-frames: stores into a frame nothing reads again -------------
+
+   C's stack lives in linear memory, below a global the C ABI moves: a
+   function takes its frame below the value it finds there and gives it back
+   before it returns.  Structs passed and returned by value go through it --
+   each argument copied into the caller's frame, each result written through
+   a pointer into a slot there -- and once inlining has forwarded the copies
+   to the code that reads them, the stores are left writing bytes nothing
+   reads.  wasm keeps them: the bytes are still memory, which a later load
+   anywhere may read.  -fdead-frames assumes C's convention instead: nothing
+   reads a function's frame once it returns, and while it runs only the
+   function itself does, through addresses it derives from the stack
+   pointer, and its callees, through pointers it passes them.  A store into
+   the frame that nothing can read before the function returns is gone.
+
+   A module whose stack is not C's is left alone: Go's (a go:buildid
+   section), one asyncify unwinds and rewinds, and one where any function
+   reads or writes above the stack pointer it was entered with, as Go's and
+   GHC's do.  A callee that may read its callers' frames -- a collector
+   scanning the stack up from the stack pointer, a function reading off the
+   stack pointer where nothing bounds the offset, or one calling either --
+   reads the whole frame wherever it is called.  And a frame pointer that
+   escapes -- stored, returned, passed to an import, to an indirect call or
+   to a callee that keeps it or reads through it where the scan cannot
+   follow -- leaves the function's stores as they are. */
+
+#define DF_UNK INT64_MIN            /* an offset not known */
+#define DF_UNKIN (INT64_MIN + 1)    /* not known, from a base inside the frame */
+enum { DF_NONE = 0, DF_PARAM = 1, DF_ENTRY = 2, DF_LATER = 3, DF_MIXED = 0xff };
+#define DF_MAXARGS 256u
+#define DF_ALL INT64_MIN            /* a read of every byte */
+
+static bool df_known(int64_t o) { return o != DF_UNK && o != DF_UNKIN; }
+static int64_t df_vague(int64_t o) {
+  return o == DF_UNKIN || (df_known(o) && o < 0) ? DF_UNKIN : DF_UNK;
+}
+static int64_t df_meet(int64_t a, int64_t b) {
+  if (a == b) return a;
+  return df_vague(a) == DF_UNKIN && df_vague(b) == DF_UNKIN ? DF_UNKIN : DF_UNK;
+}
+static bool df_is_cmp(uint16_t op) {
+  return (op >= I_EQ && op <= I_EQZ) || (op >= I_FEQ && op <= I_FGE);
+}
+static bool df_stackish(const Module *m, uint64_t gi) {
+  return gi < 64 && gi < m->nglobals && m->globals[gi].type == VT_I32 &&
+         m->globals[gi].mutable_;
+}
+
+/* Per value: what it is an address from -- a parameter, the value a global
+   held at entry, or one read from it later -- and how far past it. */
+typedef struct {
+  uint8_t *kind, *id;
+  int64_t *off;
+  bool changed;
+  DfFunc *d;        /* the scan's, whose facts a value from two places spoils */
+} DfVals;
+
+static void df_poison(DfFunc *d, uint8_t kind, uint8_t id) {
+  if (!d) return;
+  if (kind == DF_PARAM) d->esc |= (uint8_t)(1u << id);
+  else if (kind == DF_ENTRY || kind == DF_LATER) d->uncertain |= 1ull << id;
+}
+
+static void df_set(DfVals *dv, Ref v, uint8_t k, uint8_t id, int64_t off) {
+  uint8_t ok = dv->kind[v];
+  if (ok == DF_MIXED) return;
+  if (k == DF_MIXED) { dv->kind[v] = DF_MIXED; dv->changed = true; return; }
+  if (ok == DF_NONE) {
+    dv->kind[v] = k; dv->id[v] = id; dv->off[v] = off;
+    dv->changed = true;
+    return;
+  }
+  if (ok == k && dv->id[v] == id) {
+    int64_t mo = df_meet(dv->off[v], off);
+    if (mo != dv->off[v]) { dv->off[v] = mo; dv->changed = true; }
+    return;
+  }
+  /* an address from two places: the scan gives up on both, and the pass,
+     which knows one place of its own, takes it as from a later read */
+  if (dv->d) {
+    df_poison(dv->d, ok, dv->id[v]);
+    df_poison(dv->d, k, id);
+    dv->kind[v] = DF_MIXED;
+    dv->changed = true;
+  } else if (ok != DF_LATER || dv->off[v] != DF_UNK) {
+    dv->kind[v] = DF_LATER; dv->id[v] = 0; dv->off[v] = DF_UNK;
+    dv->changed = true;
+  }
+}
+
+/* What v is an address from, given its operands. */
+static void df_derive(IrFunc *f, DfVals *dv, Ref v) {
+  Inst *in = &f->insts[v];
+  if (in->op == I_LOAD || in->op == I_VLOAD || in->op == I_VLDN ||
+      df_is_cmp(in->op) || !ir_is_pure(in))
+    return;
+  Ref *a = ir_args(f, v);
+  uint32_t n = f->ninsts;
+  bool w64 = vt_is_64((ValType)in->type);
+  for (uint32_t j = 0; j < in->nargs; j++) {
+    Ref x = a[j];
+    if (x >= n || dv->kind[x] == DF_NONE) continue;
+    int64_t o = dv->off[x], r = DF_UNK;
+    Ref y = in->nargs == 2 ? a[1 - j] : REF_NONE;
+    bool yc = y != REF_NONE && y < n && f->insts[y].op == I_CONST;
+    int64_t c = yc ? (w64 ? (int64_t)f->insts[y].imm : (int64_t)(int32_t)f->insts[y].imm) : 0;
+    switch (in->op) {
+      case I_ADD: r = yc ? (df_known(o) ? o + c : o) : df_vague(o); break;
+      case I_SUB: r = j == 0 && yc ? (df_known(o) ? o - c : o) : DF_UNK; break;
+      case I_MEM_ADDR: case I_MEM_PTR:
+        r = j == 0 && df_known(o) ? o + (int64_t)in->imm : j == 0 ? o : DF_UNK;
+        break;
+      case I_WRAP: case I_EXTENDU: case I_EXTENDS: r = o; break;
+      default: break;
+    }
+    df_set(dv, v, dv->kind[x], dv->id[x], r);
+  }
+}
+
+static void df_edges(IrFunc *f, DfVals *dv, uint32_t bi) {
+  Block *b = &f->blocks[bi];
+  uint32_t n = f->ninsts;
+  for (uint32_t s = 0; s < b->nsuccs; s++) {
+    Edge *e = &b->succs[s];
+    Block *t = &f->blocks[e->target];
+    for (uint32_t j = 0; j < e->nargs && j < t->nparams; j++) {
+      Ref x = e->args[j];
+      if (x < n && dv->kind[x] != DF_NONE)
+        df_set(dv, t->params[j], dv->kind[x], dv->id[x], dv->off[x]);
+    }
+  }
+}
+
+/* A read of w bytes at offset `at` from what (k, id) names. */
+static void df_scan_read(DfFunc *d, uint8_t k, uint8_t id, int64_t at, int64_t w) {
+  if (k == DF_PARAM) {
+    if (!df_known(at)) { d->unk |= (uint8_t)(1u << id); return; }
+    if (at < d->lo[id]) d->lo[id] = at;
+    if (at + w > d->hi[id]) d->hi[id] = at + w;
+  } else if (k == DF_ENTRY) {
+    /* a read where nothing bounds the offset, even from inside the frame,
+       may be one walking up the stack from a local's address, as a
+       conservative collector does: it is not told from an array's */
+    if (df_known(at) && at + w > 0) d->above |= 1ull << id;
+    else if (!df_known(at)) d->uncertain |= 1ull << id;
+  } else if (k == DF_LATER) {
+    d->uncertain |= 1ull << id;
+  }
+}
+
+static void df_scan_write(DfFunc *d, uint8_t k, uint8_t id, int64_t at, int64_t w) {
+  if (k == DF_ENTRY && df_known(at) && at + w > 0) d->above |= 1ull << id;
+}
+
+static void df_scan(Module *m, IrFunc *g, uint32_t fi) {
+  DfFunc *d = &df_func[fi];
+  for (int j = 0; j < DF_MAXP; j++) { d->lo[j] = INT64_MAX; d->hi[j] = INT64_MIN; }
+  uint32_t n = g->ninsts;
+  DfVals dv = { xcalloc(n ? n : 1, 1), xcalloc(n ? n : 1, 1),
+                xcalloc(n ? n : 1, sizeof(int64_t)), false, d };
+  const CompType *ft = &m->types[m->funcs[fi].type_index];
+  Block *eb = &g->blocks[g->entry];
+  for (uint32_t j = 0; j < eb->nparams && j < ft->nparams && j < DF_MAXP; j++)
+    if (ft->params[j] == VT_I32) {
+      Ref p = eb->params[j];
+      dv.kind[p] = DF_PARAM; dv.id[p] = (uint8_t)j; dv.off[p] = 0;
+    }
+  /* a stack pointer read before the entry block sets it or calls anything
+     is the value the function was entered with */
+  uint64_t set = 0;
+  bool cut = false;
+  for (uint32_t i = 0; i < eb->ninsts; i++) {
+    Ref v = eb->insts[i];
+    Inst *in = &g->insts[v];
+    if (in->op == I_GLOBAL_GET && df_stackish(m, in->imm) && !cut && !(set >> in->imm & 1)) {
+      dv.kind[v] = DF_ENTRY; dv.id[v] = (uint8_t)in->imm; dv.off[v] = 0;
+    }
+    if (in->op == I_GLOBAL_SET && in->imm < 64) set |= 1ull << in->imm;
+    if (is_call_op(in->op)) cut = true;
+  }
+  for (uint32_t bi = 0; bi < g->nblocks; bi++) {
+    Block *b = &g->blocks[bi];
+    for (uint32_t i = 0; i < b->ninsts; i++) {
+      Ref v = b->insts[i];
+      Inst *in = &g->insts[v];
+      if (in->op == I_GLOBAL_GET && df_stackish(m, in->imm) && dv.kind[v] == DF_NONE) {
+        dv.kind[v] = DF_LATER; dv.id[v] = (uint8_t)in->imm; dv.off[v] = DF_UNK;
+      }
+    }
+  }
+  for (int round = 0; round < 16; round++) {
+    dv.changed = false;
+    for (uint32_t bi = 0; bi < g->nblocks; bi++) {
+      Block *b = &g->blocks[bi];
+      for (uint32_t i = 0; i < b->ninsts; i++) df_derive(g, &dv, b->insts[i]);
+      df_edges(g, &dv, bi);
+    }
+    if (!dv.changed) break;
+    if (round == 15) { d->esc = 0xff; d->uncertain = ~0ull; }
+  }
+
+  for (uint32_t bi = 0; bi < g->nblocks; bi++) {
+    Block *b = &g->blocks[bi];
+    for (uint32_t i = 0; i < b->ninsts; i++) {
+      Ref v = b->insts[i];
+      Inst *in = &g->insts[v];
+      Ref *a = ir_args(g, v);
+      if (in->op == I_CALL_INDIRECT || in->op == I_CALL_REF ||
+          in->op == I_RETURN_CALL_INDIRECT || in->op == I_RETURN_CALL_REF)
+        d->indirect = true;
+      for (uint32_t j = 0; j < in->nargs; j++) {
+        Ref x = a[j];
+        if (x >= n || dv.kind[x] == DF_NONE || dv.kind[x] == DF_MIXED) continue;
+        uint8_t k = dv.kind[x], id = dv.id[x];
+        int64_t o = dv.off[x];
+        int64_t at = df_known(o) ? o + (int64_t)in->imm : o;
+        switch (in->op) {
+          case I_LOAD:
+            if (j == 0) df_scan_read(d, k, id, at, (int64_t)1 << MEMF_SIZE(in->imm2));
+            break;
+          case I_VLOAD: case I_VLDN:
+            if (j == 0) df_scan_read(d, k, id, at, 64);
+            break;
+          case I_STORE: case I_VSTORE:
+            if (j == 0) df_scan_write(d, k, id, at, (int64_t)1 << MEMF_SIZE(in->imm2));
+            else df_poison(d, k, id);
+            break;
+          case I_MEM_COPY: {
+            Ref ln = a[2];
+            bool lc = ln < n && g->insts[ln].op == I_CONST;
+            int64_t len = lc ? (int64_t)(uint32_t)g->insts[ln].imm : 0;
+            if (j == 0) df_scan_write(d, k, id, lc ? o : DF_UNK, len);
+            else if (j == 1) df_scan_read(d, k, id, lc ? o : DF_UNK, len);
+            else df_poison(d, k, id);
+            break;
+          }
+          case I_MEM_FILL: case I_MEM_INIT:
+            if (j != 0) df_poison(d, k, id);
+            break;
+          case I_CALL: case I_RETURN_CALL:
+            if (d->nargs == d->cap) {
+              if (d->cap >= DF_MAXARGS) { d->capped = true; df_poison(d, k, id); break; }
+              d->cap = d->cap ? d->cap * 2 : 8;
+              d->args = xrealloc(d->args, d->cap * sizeof(DfArg));
+            }
+            d->args[d->nargs++] = (DfArg){ (uint32_t)in->imm, (uint8_t)(j < 255 ? j : 255), k, id, o };
+            break;
+          case I_GLOBAL_SET:
+            if ((k == DF_ENTRY || k == DF_LATER) && id == in->imm) {
+              if (k == DF_ENTRY && df_known(o) && o < 0) d->push |= 1ull << id;
+            } else {
+              df_poison(d, k, id);
+            }
+            break;
+          case I_BOUNDS_CHECK: case I_TRAP_IF: case I_SELECT:
+            break;
+          default:
+            if (!df_is_cmp(in->op) && !ir_is_pure(in)) df_poison(d, k, id);
+            break;
+        }
+      }
+    }
+    for (uint32_t r = 0; r < b->nret; r++) {
+      Ref x = b->ret_args[r];
+      if (x < n && dv.kind[x] != DF_NONE && dv.kind[x] != DF_MIXED)
+        df_poison(d, dv.kind[x], dv.id[x]);
+    }
+  }
+  xfree(dv.kind); xfree(dv.id); xfree(dv.off);
+}
+
+static void df_resolve(Module *m) {
+  df_sp = UINT32_MAX;
+  if (m->go_stack) return;
+  for (uint32_t e = 0; e < m->nexports; e++)
+    if (m->exports[e].name && !strncmp(m->exports[e].name, "asyncify_", 9)) return;
+  uint32_t count[64] = {0};
+  for (uint32_t fi = 0; fi < m->nfuncs; fi++)
+    for (uint32_t gi = 0; gi < 64; gi++)
+      if (df_func[fi].push >> gi & 1) count[gi]++;
+  uint32_t sp = UINT32_MAX, best = 0;
+  for (uint32_t gi = 0; gi < 64; gi++)
+    if (count[gi] > best) { best = count[gi]; sp = gi; }
+  if (sp == UINT32_MAX) return;
+  uint64_t spb = 1ull << sp;
+  for (uint32_t fi = 0; fi < m->nfuncs; fi++)
+    if (df_func[fi].above & spb) return;
+
+  /* what a parameter passed on is read as, through the callee's */
+  bool changed = true;
+  for (int round = 0; changed && round < 8; round++) {
+    changed = false;
+    for (uint32_t fi = 0; fi < m->nfuncs; fi++) {
+      DfFunc *d = &df_func[fi];
+      for (uint32_t r = 0; r < d->nargs; r++) {
+        DfArg *x = &d->args[r];
+        if (x->kind != DF_PARAM) continue;
+        uint8_t bit = (uint8_t)(1u << x->id);
+        if (d->esc & bit) continue;
+        uint32_t c = x->callee;
+        if (c >= m->nfuncs || !fx_direct[c].has_body || x->arg >= DF_MAXP ||
+            (df_func[c].esc >> x->arg & 1)) {
+          d->esc |= bit;
+          changed = true;
+          continue;
+        }
+        const DfFunc *cd = &df_func[c];
+        if (d->unk & bit) continue;
+        if ((cd->unk >> x->arg & 1) ||
+            (!df_known(x->off) && cd->lo[x->arg] < cd->hi[x->arg])) {
+          d->unk |= bit;
+          changed = true;
+          continue;
+        }
+        if (cd->lo[x->arg] >= cd->hi[x->arg]) continue;
+        int64_t lo = x->off + cd->lo[x->arg], hi = x->off + cd->hi[x->arg];
+        if (lo < d->lo[x->id]) { d->lo[x->id] = lo; changed = true; }
+        if (hi > d->hi[x->id]) { d->hi[x->id] = hi; changed = true; }
+      }
+    }
+  }
+  if (changed)
+    for (uint32_t fi = 0; fi < m->nfuncs; fi++)
+      for (uint32_t r = 0; r < df_func[fi].nargs; r++)
+        if (df_func[fi].args[r].kind == DF_PARAM)
+          df_func[fi].esc |= (uint8_t)(1u << df_func[fi].args[r].id);
+
+  /* which functions may read their callers' frames, and whether any does */
+  df_scanfree = true;
+  for (uint32_t fi = 0; fi < m->nfuncs; fi++) {
+    DfFunc *d = &df_func[fi];
+    d->safe = true;
+    if (!fx_direct[fi].has_body) continue;
+    bool safe = !(d->uncertain & spb) && !d->capped;
+    for (uint32_t r = 0; r < d->nargs && safe; r++) {
+      DfArg *x = &d->args[r];
+      if ((x->kind != DF_ENTRY && x->kind != DF_LATER) || x->id != sp) continue;
+      uint32_t c = x->callee;
+      if (x->kind == DF_LATER || !df_known(x->off) || c >= m->nfuncs ||
+          !fx_direct[c].has_body || x->arg >= DF_MAXP ||
+          ((df_func[c].unk | df_func[c].esc) >> x->arg & 1))
+        safe = false;
+      else if (df_func[c].lo[x->arg] < df_func[c].hi[x->arg] &&
+               x->off + df_func[c].hi[x->arg] > 0)
+        safe = false;
+    }
+    d->safe = safe;
+    if (!safe) df_scanfree = false;
+  }
+  for (uint32_t fi = 0; fi < m->nfuncs; fi++)
+    if (df_func[fi].indirect && !df_scanfree) df_func[fi].safe = false;
+  for (changed = true; changed;) {
+    changed = false;
+    for (uint32_t fi = 0; fi < m->nfuncs; fi++) {
+      DfFunc *d = &df_func[fi];
+      const DirectFx *x = &fx_direct[fi];
+      if (!d->safe || !x->has_body) continue;
+      bool safe = !x->callees_capped;
+      for (uint32_t k = 0; k < x->ncallees && safe; k++) {
+        uint32_t c = x->callees[k];
+        if (c < m->nfuncs && fx_direct[c].has_body && !df_func[c].safe) safe = false;
+      }
+      if (!safe) { d->safe = false; changed = true; }
+    }
+  }
+  df_sp = sp;
+}
+
+typedef struct { uint32_t at; int64_t lo, hi; } DfRead;
+typedef struct { uint32_t block, at; Ref v; int64_t lo, hi; } DfCand;
+
+static bool df_overlap(const DfRead *r, int64_t lo, int64_t hi) {
+  return r->lo == DF_ALL || (r->lo < hi && lo < r->hi);
+}
+
+static bool pass_dead_frames(IrFunc *f) {
+  Module *m = f->m;
+  if (!df_func || df_sp == UINT32_MAX || fx_mod != m || !fx_resolved) return false;
+  Block *eb = &f->blocks[f->entry];
+  uint32_t n = f->ninsts;
+  bool any = false;
+  for (uint32_t i = 0; i < eb->ninsts && !any; i++) {
+    Inst *in = &f->insts[eb->insts[i]];
+    if (in->op == I_GLOBAL_GET && in->imm == df_sp) any = true;
+    else if ((in->op == I_GLOBAL_SET && in->imm == df_sp) || is_call_op(in->op)) break;
+  }
+  if (!any) return false;
+  DfVals dv = { xcalloc(n ? n : 1, 1), xcalloc(n ? n : 1, 1),
+                xcalloc(n ? n : 1, sizeof(int64_t)), false, NULL };
+  bool cut = false;
+  for (uint32_t i = 0; i < eb->ninsts; i++) {
+    Ref v = eb->insts[i];
+    Inst *in = &f->insts[v];
+    if (in->op == I_GLOBAL_GET && in->imm == df_sp && !cut) dv.kind[v] = DF_ENTRY;
+    if ((in->op == I_GLOBAL_SET && in->imm == df_sp) || is_call_op(in->op)) cut = true;
+  }
+  for (uint32_t oi = 0; oi < f->norder; oi++) {
+    Block *b = &f->blocks[f->order[oi]];
+    for (uint32_t i = 0; i < b->ninsts; i++) {
+      Ref v = b->insts[i];
+      Inst *in = &f->insts[v];
+      if (in->op == I_GLOBAL_GET && in->imm == df_sp && dv.kind[v] == DF_NONE) {
+        dv.kind[v] = DF_LATER; dv.off[v] = DF_UNK;
+      }
+    }
+  }
+  bool bail = true;
+  for (int round = 0; round < 16; round++) {
+    dv.changed = false;
+    for (uint32_t oi = 0; oi < f->norder; oi++) {
+      uint32_t bi = f->order[oi];
+      Block *b = &f->blocks[bi];
+      for (uint32_t i = 0; i < b->ninsts; i++) df_derive(f, &dv, b->insts[i]);
+      df_edges(f, &dv, bi);
+    }
+    if (!dv.changed) { bail = false; break; }
+  }
+
+  uint32_t nb = f->nblocks;
+  uint32_t *rstart = xcalloc(nb ? nb : 1, sizeof(uint32_t));
+  uint32_t *rcount = xcalloc(nb ? nb : 1, sizeof(uint32_t));
+  int64_t *hlo = xmalloc((nb ? nb : 1) * sizeof(int64_t));
+  int64_t *hhi = xmalloc((nb ? nb : 1) * sizeof(int64_t));
+  for (uint32_t bi = 0; bi < nb; bi++) { hlo[bi] = INT64_MAX; hhi[bi] = INT64_MIN; }
+  DfRead *rd = NULL;
+  DfCand *cd = NULL;
+  uint32_t nr = 0, cr = 0, nc = 0, cc = 0;
+#define DF_READ(i, l, h) do { \
+    if (nr == cr) { cr = cr ? cr * 2 : 64; rd = xrealloc(rd, cr * sizeof(DfRead)); } \
+    rd[nr++] = (DfRead){ (i), (l), (h) }; \
+    if ((l) == DF_ALL) { hlo[bi] = DF_ALL; hhi[bi] = INT64_MAX; } \
+    else if (hlo[bi] != DF_ALL) { \
+      if ((l) < hlo[bi]) hlo[bi] = (l); \
+      if ((h) > hhi[bi]) hhi[bi] = (h); \
+    } \
+  } while (0)
+#define DF_CAND(i, v, l, h) do { \
+    if (nc == cc) { cc = cc ? cc * 2 : 64; cd = xrealloc(cd, cc * sizeof(DfCand)); } \
+    cd[nc++] = (DfCand){ bi, (i), (v), (l), (h) }; \
+  } while (0)
+
+  for (uint32_t oi = 0; oi < f->norder && !bail; oi++) {
+    uint32_t bi = f->order[oi];
+    Block *b = &f->blocks[bi];
+    rstart[bi] = nr;
+    for (uint32_t i = 0; i < b->ninsts && !bail; i++) {
+      Ref v = b->insts[i];
+      Inst *in = &f->insts[v];
+      Ref *a = ir_args(f, v);
+      /* a call that may reach a function reading its callers' frames reads
+         this one whole */
+      if (is_call_op(in->op)) {
+        bool all;
+        if (in->op == I_CALL || in->op == I_RETURN_CALL) {
+          uint32_t c = (uint32_t)in->imm;
+          all = c < m->nfuncs && fx_direct[c].has_body && !df_func[c].safe;
+        } else {
+          all = !df_scanfree;
+        }
+        if (all) DF_READ(i, DF_ALL, 0);
+      }
+      for (uint32_t j = 0; j < in->nargs && !bail; j++) {
+        Ref x = a[j];
+        if (x >= n || dv.kind[x] == DF_NONE) continue;
+        bool ent = dv.kind[x] == DF_ENTRY && df_known(dv.off[x]);
+        int64_t at = ent ? dv.off[x] + (int64_t)in->imm : DF_UNK;
+        switch (in->op) {
+          case I_LOAD: {
+            int64_t w = (int64_t)1 << MEMF_SIZE(in->imm2);
+            if (MEMF_MEM(in->imm2) != 0 || (ent && at + w > 0)) { bail = true; break; }
+            if (ent) DF_READ(i, at, at + w); else DF_READ(i, DF_ALL, 0);
+            break;
+          }
+          case I_VLOAD: case I_VLDN:
+            DF_READ(i, DF_ALL, 0);
+            break;
+          case I_STORE: {
+            int64_t w = (int64_t)1 << MEMF_SIZE(in->imm2);
+            if (j != 0 || MEMF_MEM(in->imm2) != 0 || (ent && at + w > 0)) { bail = true; break; }
+            Ref y = a[1];
+            if (ent && at >= -FRAME_SPAN && !(y < n && dv.kind[y] != DF_NONE))
+              DF_CAND(i, v, at, at + w);
+            break;
+          }
+          case I_VSTORE:
+            if (j != 0) bail = true;
+            break;
+          case I_MEM_COPY: case I_MEM_FILL: {
+            Ref ln = a[2];
+            bool lc = ln < n && f->insts[ln].op == I_CONST;
+            int64_t len = lc ? (int64_t)(uint32_t)f->insts[ln].imm : 0;
+            int64_t o = ent ? dv.off[x] : DF_UNK;
+            if (in->imm != 0 || (in->op == I_MEM_COPY && in->imm2 != 0) || j == 2 ||
+                (j == 1 && in->op == I_MEM_FILL) || (ent && lc && o + len > 0)) {
+              bail = true;
+              break;
+            }
+            if (j == 1) {
+              if (ent && lc) DF_READ(i, o, o + len); else DF_READ(i, DF_ALL, 0);
+            } else if (ent && lc && len > 0 && o >= -FRAME_SPAN) {
+              DF_CAND(i, v, o, o + len);
+            }
+            break;
+          }
+          case I_MEM_INIT:
+            if (j != 0) bail = true;
+            break;
+          case I_CALL: {
+            uint32_t c = (uint32_t)in->imm;
+            if (c >= m->nfuncs || !fx_direct[c].has_body || j >= DF_MAXP ||
+                (df_func[c].esc >> j & 1)) {
+              bail = true;
+              break;
+            }
+            int64_t lo = df_func[c].lo[j], hi = df_func[c].hi[j];
+            if (df_func[c].unk >> j & 1) {
+              DF_READ(i, DF_ALL, 0);
+            } else if (lo < hi) {
+              if (ent) DF_READ(i, dv.off[x] + lo, dv.off[x] + hi);
+              else DF_READ(i, DF_ALL, 0);
+            }
+            break;
+          }
+          case I_GLOBAL_SET:
+            if (in->imm != df_sp) bail = true;
+            break;
+          case I_BOUNDS_CHECK: case I_TRAP_IF: case I_SELECT:
+            break;
+          default:
+            if (df_is_cmp(in->op)) break;
+            if (!ir_is_pure(in) || is_call_op(in->op)) bail = true;
+            break;
+        }
+      }
+    }
+    for (uint32_t r = 0; r < b->nret && !bail; r++) {
+      Ref x = b->ret_args[r];
+      if (x < n && dv.kind[x] != DF_NONE) bail = true;
+    }
+    rcount[bi] = nr - rstart[bi];
+  }
+#undef DF_READ
+#undef DF_CAND
+
+  /* a store is dead when no read it reaches before the function returns
+     overlaps it: its own block's later ones, and every one in a block it
+     can reach */
+  uint32_t removed = 0;
+  if (!bail && nc) {
+    uint32_t *seen = xcalloc(nb ? nb : 1, sizeof(uint32_t));
+    uint32_t *stk = xmalloc((nb ? nb : 1) * sizeof(uint32_t));
+    uint32_t *reach = xmalloc((nb ? nb : 1) * sizeof(uint32_t));
+    uint64_t budget = (uint64_t)1 << 22;
+    uint32_t epoch = 0;
+    for (uint32_t c0 = 0; c0 < nc && budget;) {
+      uint32_t bi = cd[c0].block, c1 = c0;
+      while (c1 < nc && cd[c1].block == bi) c1++;
+      epoch++;
+      uint32_t sp = 0, nreach = 0;
+      int64_t rlo = INT64_MAX, rhi = INT64_MIN;
+      Block *b = &f->blocks[bi];
+      for (uint32_t s = 0; s < b->nsuccs; s++) {
+        uint32_t t = b->succs[s].target;
+        if (seen[t] != epoch) { seen[t] = epoch; stk[sp++] = t; }
+      }
+      while (sp) {
+        uint32_t x = stk[--sp];
+        reach[nreach++] = x;
+        if (hlo[x] == DF_ALL) rlo = DF_ALL;
+        else if (rlo != DF_ALL && hlo[x] < hhi[x]) {
+          if (hlo[x] < rlo) rlo = hlo[x];
+          if (hhi[x] > rhi) rhi = hhi[x];
+        }
+        Block *xb = &f->blocks[x];
+        for (uint32_t s = 0; s < xb->nsuccs; s++) {
+          uint32_t t = xb->succs[s].target;
+          if (seen[t] != epoch) { seen[t] = epoch; stk[sp++] = t; }
+        }
+      }
+      budget = budget > nreach + 1 ? budget - nreach - 1 : 0;
+      for (uint32_t k = c0; k < c1; k++) {
+        DfCand *c = &cd[k];
+        bool dead = true;
+        for (uint32_t r = rstart[bi]; r < rstart[bi] + rcount[bi] && dead; r++)
+          if (rd[r].at > c->at && df_overlap(&rd[r], c->lo, c->hi)) dead = false;
+        if (dead && (rlo == DF_ALL || (rlo < c->hi && c->lo < rhi))) {
+          for (uint32_t q = 0; q < nreach && dead; q++) {
+            uint32_t x = reach[q];
+            if (hlo[x] != DF_ALL && !(hlo[x] < c->hi && c->lo < hhi[x])) continue;
+            for (uint32_t r = rstart[x]; r < rstart[x] + rcount[x] && dead; r++)
+              if (df_overlap(&rd[r], c->lo, c->hi)) dead = false;
+          }
+        }
+        if (dead) {
+          Inst *in = &f->insts[c->v];
+          in->op = I_NOP;
+          in->nargs = 0;
+          removed++;
+        }
+      }
+      c0 = c1;
+    }
+    xfree(seen); xfree(stk); xfree(reach);
+  }
+  g_stats.dead_frame_stores += removed;
+  xfree(rd); xfree(cd);
+  xfree(rstart); xfree(rcount); xfree(hlo); xfree(hhi);
+  xfree(dv.kind); xfree(dv.id); xfree(dv.off);
+  return removed > 0;
 }
 
 static void analyse_effects(Module *m, const OptOpts *o, uint32_t fi, int depth,
@@ -17817,6 +18571,7 @@ void ir_optimize(IrFunc *f, const OptOpts *o) {
      tipped stdgo/recurse's fib into leaving its stack pointer in memory,
      25% slower. */
   if (o->memopt && TP("global_dse", global_dse(f)) && o->dce) pass_dce(f);
+  if (o->dead_frames && TP("dead_frames", pass_dead_frames(f)) && o->dce) pass_dce(f);
 
   for (int shape = 0; shape < 6; shape++) {
     bool moved = false;

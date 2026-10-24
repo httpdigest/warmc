@@ -433,6 +433,11 @@ typedef struct {
 
   bool fma;       /* -ffma: fuse a float multiply into its add; off by default */
 
+  /* -fdead-frames: assume C's stack, where nothing reads a function's frame
+     once it returns, and remove the stores into it nothing reads before
+     then; off by default */
+  bool dead_frames;
+
   bool gcpure;
 
   bool closed_world;
@@ -505,7 +510,8 @@ typedef struct {
 
   uint64_t bar_masks, bar_elided;
   uint64_t caller_saves, csa_restores, spills_v128_xcall, range_budget_trips;
-  uint64_t split_cuts, split_invs, pieces, loop_pieces, recomputes;
+  uint64_t split_cuts, split_invs, pieces, loop_pieces, recomputes,
+           dead_frame_stores;
   uint64_t devirt_ref, devirt_indirect, devirt_null_kept;
   uint64_t const_reads, throw_jumps, inl_more;
   uint64_t inl_flat, inl_spliced, inl_once_forced, inl_retcall_sites;
