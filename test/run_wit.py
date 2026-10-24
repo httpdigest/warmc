@@ -475,7 +475,7 @@ def main():
 
     try:
         import run_canon
-        comps = run_canon.components()
+        comps = run_canon.components(os.path.join(WORK, "components"))
     except Exception:
         comps = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=JOBS) as pool:

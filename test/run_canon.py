@@ -379,15 +379,18 @@ NOT_VALID = {
     "mismatch.wat",
 }
 
-def components():
-    """(name, path) for everything worth dumping."""
-    os.makedirs(WORK, exist_ok=True)
+def components(work=WORK):
+    """(name, path) for everything worth dumping, assembled into work: a
+    directory of the caller's own, as test/run_wit.py and run_adapter.py call
+    this too, alongside this row -- sharing one, a parse into it truncated a
+    module another row was reading."""
+    os.makedirs(work, exist_ok=True)
     out = []
     src = os.path.join(ROOT, "test", "components")
     for f in sorted(os.listdir(src)):
         if not f.endswith(".wat") or f in NOT_VALID:
             continue
-        p = os.path.join(WORK, f[:-4] + ".wasm")
+        p = os.path.join(work, f[:-4] + ".wasm")
         rc, _, se = run([WASM_TOOLS, "parse", os.path.join(src, f), "-o", p])
         if rc != 0:
             continue
@@ -400,9 +403,9 @@ def components():
 
     import random
     for seed in range(1, SMITH + 1):
-        comp = os.path.join(WORK, "smith%03d.wasm" % seed)
+        comp = os.path.join(work, "smith%03d.wasm" % seed)
         if not os.path.exists(comp):
-            raw = os.path.join(WORK, "smith%03d.bin" % seed)
+            raw = os.path.join(work, "smith%03d.bin" % seed)
             rng = random.Random(seed)
             with open(raw, "wb") as f:
                 f.write(bytes(rng.randrange(256) for _ in range(600)))

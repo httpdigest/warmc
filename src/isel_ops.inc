@@ -2477,10 +2477,14 @@ static void emit_return(Isel *s, Block *b) {
 /* --- ldp/stp pairing ---------------------------------------------------
    Two same-width accesses at adjacent offsets off one base value become one
    pair instruction.  Reordering the second access up to the first is sound
-   because everything allowed between is pure and non-trapping (a trap moved
-   earlier over pure ops observes the same state, and the guard region sits
-   above valid memory, so a partially-completing pair can never write a byte
-   the split stores would not have).  Register safety: the partner's target
+   because everything allowed between is pure and non-trapping: a trap moved
+   earlier over pure ops observes the same state.  A pair of stores into
+   linear memory whose one half faults on the guard region can leave what
+   the split stores would not have -- the first one's bytes unwritten, or the
+   half the faulting first store never reached written -- which is within
+   what warmc leaves after a trap without -fexact-trap.  With it a store
+   wider than a byte is tested before it is made (ir_build.c's mem_ea), so
+   no pair that is made can fault.  Register safety: the partner's target
    register must not be read or written between the two sites -- an interval
    that dies there may legally share it. */
 

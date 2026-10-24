@@ -58,7 +58,8 @@ static const char *usage_text =
   "                partial-escape, gloop, gssa, loopclose, cpool, ictab, reach,\n"
   "                prune, merge, devirt, reinline, throw-jump, closed-world,\n"
   "                gcpure, split, labcache, ifconv, mulwide, barelide,\n"
-  "                small-loop-align, trampoline, go-sp, fma, dead-frames\n"
+  "                small-loop-align, trampoline, go-sp, fma, dead-frames,\n"
+  "                exact-trap\n"
   "                fma is off below -O3: it fuses a float multiply\n"
   "                into the add that reads it, rounded once, which is not\n"
   "                wasm's arithmetic and can change a result's last bit\n"
@@ -67,6 +68,22 @@ static const char *usage_text =
   "                returns, and removes the stores into it nothing reads\n"
   "                before then; wasm keeps them, so a program that reads\n"
   "                stack memory it never wrote can see other bytes\n"
+  "                exact-trap is off at every level: with it, memory,\n"
+  "                tables and globals hold what wasm says when a trap\n"
+  "                happens -- every write before the trapping instruction\n"
+  "                made, none after -- for an embedder that goes on using\n"
+  "                an instance after a trap.  Without it they are\n"
+  "                unspecified after one: a store a later one overwrites\n"
+  "                can be left out, a global kept in a register until the\n"
+  "                loop or function ends, a load that can trap moved above\n"
+  "                a store.  It keeps those stores and moves no such load,\n"
+  "                stores a global kept in a register before whatever can\n"
+  "                trap, has the vectoriser check its ranges against the\n"
+  "                memory's size, on AArch64 tests a store wider than a byte\n"
+  "                and a short bulk op before it is made, where a fault on\n"
+  "                the guard page could leave it half written, and turns\n"
+  "                off trampoline, go-sp and dead-frames, which no flag then\n"
+  "                turns back on\n"
   "                labcache and barelide build on what the collector\n"
   "                allows -- the allocation buffer kept open over a loop of\n"
   "                small allocations, the load-barrier mask kept over a loop\n"
@@ -459,6 +476,7 @@ int main(int argc, char **argv) {
       else if (!strcmp(name, "mulwide")) opt.mulwide = on;
       else if (!strcmp(name, "fma")) opt.fma = on;
       else if (!strcmp(name, "dead-frames")) opt.dead_frames = on;
+      else if (!strcmp(name, "exact-trap")) opt.exact_trap = on;
       else if (!strcmp(name, "gcpure")) opt.gcpure = on;
       else if (!strcmp(name, "closed-world")) opt.closed_world = on;
       else warmc_fatal("unknown pass %s", name);
@@ -466,6 +484,10 @@ int main(int argc, char **argv) {
     else if (a[0] == '-') warmc_fatal("unknown option %s (try --help)", a);
     else input = a;
   }
+  /* -fexact-trap: these keep what a trap would see where it cannot see it,
+     a global in an argument or a frame's stores left out, whatever their
+     own flags and their order say */
+  if (opt.exact_trap) opt.trampoline = opt.go_sp = opt.dead_frames = false;
   if (!input) { fputs(usage_text, stderr); return 2; }
   /* A library's runtime finds its module as warmc_module; the prefix names
      the library's C helpers instead. */
@@ -638,7 +660,8 @@ int main(int argc, char **argv) {
             "             loads_fwd=%llu dead_stores=%llu checks_removed=%llu params=%llu\n"
             "             strength=%llu inlined=%llu rotated=%llu vectorised=%llu\n"
             "             self_tail=%llu ldcomb=%llu spills=%llu insts=%llu\n"
-            "             ldpairs=%llu stpairs=%llu cold_frames=%llu early_rets=%llu\n"
+            "             ldpairs=%llu stpairs=%llu cold_frames=%llu early_rets=%llu"
+            " exact_store_checks=%llu exact_memop_checks=%llu\n"
             "             reloads=%llu caller_saves=%llu csa_restores=%llu"
             " v128_spills=%llu rb_trips=%llu split_cuts=%llu split_invs=%llu pieces=%llu"
             " loop_pieces=%llu recomputes=%llu dead_frame_stores=%llu tramp_funcs=%llu gosp_funcs=%llu\n"
@@ -674,6 +697,8 @@ int main(int argc, char **argv) {
             (unsigned long long)g_stats.stpairs,
             (unsigned long long)g_stats.cold_frames,
             (unsigned long long)g_stats.early_rets,
+            (unsigned long long)g_stats.exact_store_checks,
+            (unsigned long long)g_stats.exact_memop_checks,
             (unsigned long long)g_stats.reloads,
             (unsigned long long)g_stats.caller_saves,
             (unsigned long long)g_stats.csa_restores,

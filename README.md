@@ -492,6 +492,11 @@ The rest of the API, in [`rt/warm_rt.h`](rt/warm_rt.h):
 | `warmc_gc_collect()`, `warmc_gc_hold()` / `warmc_gc_release()` | drive the collector; register C-side roots |
 | `warmc_custom_section(md, name, index, &data, &size)` | the module's custom sections named `name`: how many there are, and the `index`-th one's payload (see [Custom sections](#custom-sections)) |
 
+After a trap that `warmc_invoke_catching` returns, the instance can be called
+again. What its memory, tables and globals then hold is the module's own
+only with `-fexact-trap` (see
+[What a trap leaves behind](#what-a-trap-leaves-behind)).
+
 An `externref` the host hands in is any 64-bit value with its low two bits
 clear -- a pointer to a C object is one -- or 0 for null. A module that
 turns it into an `anyref` (`any.convert_extern`) sees it as no object and no
@@ -886,6 +891,56 @@ and the `bce` pass removes the checks it can prove redundant. Stack overflow
 is detected by a prologue check in every function that makes calls. It traps
 as `call stack exhausted` rather than crashing.
 
+### What a trap leaves behind
+
+A trap is the same at every level and with every flag. What memory, tables
+and globals hold afterwards is unspecified unless the module is compiled with
+`-fexact-trap`, which no level turns on. That matters only to an embedder that
+calls an instance again after a trap, or reads its memory. Without the flag:
+- `mem` removes a store that a later one overwrites, even where a trap can
+  come between the two;
+- `gloop` and `gssa` keep a global in a register until a loop or the function
+  ends;
+- `trampoline` and `go-sp` keep globals in arguments;
+- `dead-frames` removes stores into a frame;
+- `licm` moves a load that can trap above a store that stays in its loop;
+- the vectoriser leaves a range that runs past the end of memory to the
+  guard page, which faults a whole vector before the scalar iterations ahead
+  of it have run;
+- on AArch64, a store that crosses the end of memory into the guard page may
+  have written its bytes before the page when it faults. Apple's cores write
+  none. The same holds for a short constant-length `memory.fill` or
+  `memory.copy`, and for two stores made one `stp`.
+
+With `-fexact-trap`, everything written before the trapping instruction is
+there, and nothing after it:
+- `mem` keeps a store when a trap can come before the one that overwrites it;
+- `gssa` stores a global it keeps in a register before whatever can trap,
+  calls included;
+- `gloop` leaves alone a loop that can trap, and writes the global back at
+  every way out;
+- `licm` moves no load above a store or bulk write that stays in the loop;
+- the vectoriser checks every range against the memory's size, and runs the
+  scalar loop for one past it;
+- on AArch64, a store wider than a byte and a constant-length bulk operation
+  are bounds-checked before they are made;
+- `trampoline`, `go-sp` and `dead-frames` are off, whatever their own flags
+  say and in whatever order.
+
+Where the stack runs out, and where an allocation fails, can still move:
+inlining checks a callee's frame at its caller's entry, and partial escape
+allocates an object only where it escapes. wasm leaves both to the
+implementation. `test/run_trapstate.py` checks each of these rules (see
+[Testing](#testing)).
+
+The cost, as the geometric mean of `-O2 -fexact-trap`'s speed over `-O2`'s
+on each corpus (Apple M-series):
+- 0.94 to 0.99 for C, C++, Rust, Zig, Kotlin, TinyGo and the vector kernels;
+- 0.82 for Go, whose stack pointer `go-sp` then leaves in memory;
+- 0.79 for AssemblyScript, whose shadow-stack stores must stay ahead of every
+  bounds check that can trap;
+- 0.65 for Haskell, without the trampoline.
+
 ---
 
 ## Command-line reference
@@ -901,6 +956,7 @@ as `call stack exhausted` rather than crashing.
 | `--wasi[=PATH]` | link a WASI host and run `_start` (core module) or `wasi:cli/run` (component) |
 | `-O0` `-O1` `-O2` `-O3` | optimisation level (default `-O2`) |
 | `-fPASS`, `-fno-PASS` | toggle one pass (see [Optimisation](#optimisation)) |
+| `-fexact-trap`, `-fno-exact-trap` | leave memory, tables and globals after a trap as wasm defines them (see [What a trap leaves behind](#what-a-trap-leaves-behind)); off at every level |
 | `-j N`, `-jN` | maximum number of compile threads |
 | `--profile=full\|deterministic` | the WebAssembly profile. `deterministic` makes relaxed-SIMD and NaN results platform-independent. |
 | `--symbol-prefix=P` | name the module descriptor `P_module`; with `--shared`, the prefix of the library's own functions instead; ignored for a component |
@@ -1228,7 +1284,8 @@ Most of the suite is **differential**. warmc's output is compared with:
 - wabt's `wasm-interp`, for the hand-written cases in `test/cases`: at `-O0`,
   `-O1` and `-O2`; with the register allocator and SSA verified; without
   inlining, without each of several passes, with `-fgssa-all`, without guard
-  pages, with `-fdead-frames`, and with far branches forced; and at nine
+  pages, with `-fdead-frames`, with `-fexact-trap`, and with far branches
+  forced; and at nine
   settings that turn every pair of passes off and on in all four
   combinations (`test/run_combos.py`, which runs the trap and GC tests at
   them too). wasmtime runs the cases as a second engine.
@@ -1238,7 +1295,8 @@ Most of the suite is **differential**. warmc's output is compared with:
 - wasmtime, for WASI preview 1 and 0.2 programs (stdout, stderr, exit code and
   the resulting directory tree), and for linked components (`test/run_clink.py`)
 - wasmtime, for the benchmark corpora in Go, Rust, Zig, AssemblyScript,
-  Kotlin, C, C++ and Haskell
+  Kotlin, C, C++ and Haskell; four of them also with `-fdead-frames`, and
+  four with `-fexact-trap`
 - wasmtime, at `-O0`, `-O1`, `-O2` and `-O2 -fdead-frames`, for 310 test
   programs that are not benchmarks: `test/ctests` (C, 36), `cpptests` (C++,
   40), `rstests` (Rust, 34), `gotests` (TinyGo, 36), `stdgotests` (Go, 44),
@@ -1272,11 +1330,18 @@ Most of the suite is **differential**. warmc's output is compared with:
 
 The other rows check what has no second engine to compare with:
 - the trap tests (`test/cases_traps`), against the trap each export must
-  raise, listed in `test/run_traps.sh`, at each level, at `-O3`, without the
-  register allocator and with far branches forced
+  raise, listed in `test/run_traps.sh`, at each level, at `-O3`, with
+  `-fexact-trap`, without the register allocator and with far branches
+  forced
+- what a trap leaves in memory and globals with `-fexact-trap`, read by the
+  calls after it on one instance (`test/run_trapstate.py`,
+  `test/cases_trapstate`, with `test/link/statedriver.c`), at each level,
+  against results worked out by hand. For what Apple's cores cannot show, a
+  store left half-made by a fault, it asks `--stats` whether the checks were
+  made.
 - the GC suite (`test/cases_gc`), whose exports check their own answers, at
-  each level, at `-O3`, without the register allocator, without each of
-  several passes, in every collector mode (`run_gc_modes.sh`) and with the
+  each level, at `-O3`, with `-fexact-trap`, without the register
+  allocator, without each of several passes, in every collector mode (`run_gc_modes.sh`) and with the
   collector thread under load (`run_gcthread.sh`); relaxed SIMD and `-ffma`
   (`test/cases_relaxed`, `cases_fma`) check their own answers too
 - that every spelling of an `-O` level compiles to the same bytes
@@ -1289,9 +1354,10 @@ The other rows check what has no second engine to compare with:
 - the compiler under AddressSanitizer and ThreadSanitizer (`run_asan.sh`,
   `run_tsan.sh`)
 
-Three phases run last, each alone, because they need a quiet machine or would
+Four phases run last, each alone, because they need a quiet machine or would
 load it for the others: the collector's pause check, the Go- and GHC-shaped
-rewrites' modules, and the pass combinations.
+rewrites' modules with the Mach-O row, the corpora with `-fexact-trap`, and
+the pass combinations.
 
 `test/run_shared.sh` builds a shared library and calls it from C, C++,
 Python's `ctypes` and Java's foreign function API. The Java part needs Java 22

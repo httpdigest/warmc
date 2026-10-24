@@ -457,6 +457,12 @@ typedef struct {
      then; off by default */
   bool dead_frames;
 
+  /* -fexact-trap: memory, tables and globals hold, when a trap happens,
+     exactly what they would without optimisation -- every write before the
+     trapping instruction made and none after -- for an embedder that goes
+     on using an instance after a trap; off by default, at every level */
+  bool exact_trap;
+
   bool gcpure;
 
   bool closed_world;
@@ -543,6 +549,9 @@ typedef struct {
   uint64_t gc_nullchk_removed;
   uint64_t ldpairs, stpairs;
   uint64_t cold_frames, early_rets;
+  /* -fexact-trap: stores checked that guard pages would have left to the
+     page, and constant-length bulk ops given their tests */
+  uint64_t exact_store_checks, exact_memop_checks;
 
   uint64_t max_frame_bytes;
 } OptStats;

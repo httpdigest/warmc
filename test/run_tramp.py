@@ -17,7 +17,8 @@ compile with it not made (--stats says tramp_funcs=0):
   named by a passive or declarative segment or a global, imported into
   the table, making a tail call, or handling an exception;
 - the register exported, imported or read outside.
-Others leave the rewrite made with what it must do besides:
+None is made with -fexact-trap, where a trap must see the registers in
+their globals.  Others leave the rewrite made with what it must do besides:
 - StgRun's loop with local.tee as well as with local.set and local.get;
 - a global it must not take as a register -- immutable, or an i64 --
   used more than the one it can take;
@@ -45,6 +46,7 @@ import tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import gen_gosp
+import hostbuild
 
 # $a adds 3 to the register and goes to $b, which multiplies it by 5 and
 # goes to $show, which leaves it in memory; $c adds 100, for the runs
@@ -210,7 +212,7 @@ def main():
     sh = lambda c, **kw: subprocess.run(c, capture_output=True, text=True, **kw)
     fails = []
     with tempfile.TemporaryDirectory() as tmp:
-        for what, subs, want_n, want, runs in CASES:
+        for ci, (what, subs, want_n, want, runs) in enumerate(CASES):
             wat, wasm = os.path.join(tmp, "m.wat"), os.path.join(tmp, "m.wasm")
             with open(wat, "w") as f:
                 f.write(module(subs))
@@ -219,10 +221,16 @@ def main():
                 fails.append("%s: not assembled: %s" % (what, r.stderr.strip()[:200]))
                 continue
             got = {}
-            for level in ("-O0", "-O2"):
-                binary = os.path.join(tmp, "m" + level)
+            # -fexact-trap turns the rewrite off: the registers in arguments
+            # are not where a trap would see them
+            for level in ("-O0", "-O2", "-O2 -fexact-trap"):
+                # a binary of its own per case: Windows refuses to write over
+                # the image of one that has only just exited
+                binary = os.path.join(tmp, "m%d%s" % (ci, level.replace(" ", "")))
+                if runs:
+                    binary = hostbuild.exe(binary)
                 out = target + ["-o", binary] if runs else ["-c", "-o", binary + ".o"]
-                r = sh([warmc, level, "--stats"] + out + [wasm], timeout=60)
+                r = sh([warmc] + level.split() + ["--stats"] + out + [wasm], timeout=60)
                 if r.returncode:
                     fails.append("%s: warmc %s: %s" % (what, level, r.stderr.strip()[:300]))
                     break
@@ -236,9 +244,10 @@ def main():
                     p = sh(run + [binary, "run"], timeout=30)
                     got[level] = p.stdout.strip() or p.stderr.strip()[:200]
             else:
-                if runs and not (got["-O0"] == got["-O2"] == "i32:%d" % want):
-                    fails.append("%s: run() is %s at -O0 and %s at -O2, not %d"
-                                 % (what, got["-O0"], got["-O2"], want))
+                if runs and not (got["-O0"] == got["-O2"] == got["-O2 -fexact-trap"] ==
+                                 "i32:%d" % want):
+                    fails.append("%s: run() is %s at -O0, %s at -O2 and %s with -fexact-trap, not %d"
+                                 % (what, got["-O0"], got["-O2"], got["-O2 -fexact-trap"], want))
     for f in fails:
         print("FAIL[tramp]: %s" % f)
     if not fails:

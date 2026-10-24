@@ -202,7 +202,6 @@ done
 start pressure ./test/run_pressure.sh
 start link     ./test/run_link.sh
 start shared   ./test/run_shared.sh
-start macho    ./test/run_macho.sh
 
 start elf      ./test/run_elf.sh
 start pe       ./test/run_pe.sh
@@ -283,8 +282,15 @@ for c in cbench cppbench rsbench zigbench; do
   bench "$c-deadframes" python3 test/gobench.py --corpus "$c" --check --variant '-O2 -fdead-frames'
 done
 
+# -fexact-trap: every hand-written case, trap and collection with what it
+# keeps exact (four corpora have it too, after the rows here)
+start cases-exacttrap env WARMC_FLAGS="-O2 -fexact-trap" ./test/run_tests.sh
+start traps-exacttrap env WARMC_FLAGS="-O2 -fexact-trap" ./test/run_traps.sh
+start gc-exacttrap    env WARMC_FLAGS="-O2 -fexact-trap" ./test/run_gc.sh
+
 start magic    python3 test/magic.py
 start optcases python3 test/run_optcases.py
+start trapstate python3 test/run_trapstate.py
 start reject   ./test/run_reject.sh
 start asan     ./test/run_asan.sh
 start tsan     ./test/run_tsan.sh
@@ -307,6 +313,18 @@ if [ -z "${CHECK_SMOKE:-}" ]; then
   # rows starves their runs.
   start gosp python3 test/run_gosp.py
   start tramp python3 test/run_tramp.py
+  # The Mach-O row builds a module per CPU, each with a 6 s limit, which the
+  # first half minute of the rows above, when all of them start at once,
+  # pushed past it; here it takes a second or two.
+  start macho ./test/run_macho.sh
+  wait
+  # -fexact-trap over programs in Go's, C's, Rust's and AssemblyScript's
+  # shape.  Each compiles a whole corpus, a module per CPU; with the rows
+  # above, which all start at once, they pushed the cases rows' compiles
+  # past their 6 s.
+  for c in stdgo cbench rsbench asbench; do
+    bench "$c-exacttrap" python3 test/gobench.py --corpus "$c" --check --variant '-O2 -fexact-trap'
+  done
   wait
   # Every pair of passes, off and on in all four combinations, over the
   # cases, traps and the collector: nine settings (make check-combos does
