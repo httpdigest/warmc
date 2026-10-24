@@ -922,7 +922,9 @@ static void analyse_function(Isel *s) {
           }
           break;
 
-        case I_GC_BADMASK:
+        /* a funcref is the instance's own cell, and the allocation
+           buffer's state lives in the instance too */
+        case I_GC_BADMASK: case I_REF_FUNC: case I_GC_LAB_OPEN: case I_GC_LAB_FLUSH:
           touches_instance = true;
           break;
         case I_CALL: case I_CALL_INDIRECT: case I_CALL_REF: {
@@ -951,6 +953,9 @@ static void analyse_function(Isel *s) {
         case I_ARRAY_OP: case I_REF_TEST:
           s->has_call = s->call_other = true;
           touches_instance = true;
+          break;
+        case I_ANY_OF_EXTERN: case I_EXTERN_OF_ANY:
+          s->has_call = s->call_other = true;
           break;
         case I_TABLE_SIZE:
 

@@ -66,7 +66,8 @@ void write_macho64(ObjBuilder *o, const char *path) {
   for (uint32_t i = 0; i < o->nrelocs; i++) {
     Reloc *r = &o->relocs[i];
     if (r->kind != REL_ABS64) continue;
-    Buf *sec = r->section == 1 ? &o->rodata : &o->data;
+    Buf *secb[3] = { &o->text, &o->rodata, &o->data };
+    Buf *sec = secb[r->section];
     if (r->offset + 8 > sec->len) warmc_fatal("internal: relocation past end of section");
     uint64_t v = (uint64_t)r->addend;
     for (int b = 0; b < 8; b++) sec->data[r->offset + b] = (uint8_t)(v >> (8 * b));

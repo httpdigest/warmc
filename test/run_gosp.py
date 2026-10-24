@@ -3,15 +3,25 @@
 Its rewrite changes the signature of every function of Go's type, so the
 conditions under which it is made are what keeps it unobservable.  Each
 module here is a small one in Go's shape with one thing more that rules the
-rewrite out -- the pointer exported or imported or not global 0, a Go
-function exported, taken by ref.func or in a declarative segment, a table
-exported or imported, a tail call, exception handling, table.get, call_ref,
-a subtype, Go's type not final, an imported function of Go's type in the
-table, no go:buildid -- and must compile with the rewrite not made (--stats
-says gosp_funcs=0), and where the interpreter can run it (no imports and no
-subtypes), give the interpreter's results.  Each is the one test of its
-condition: removing the condition from gosp.c fails it.  The module without the addition is the control: rewritten, and
-the same results.  wasm-tools assembles them, since wabt reads no subtypes.
+rewrite out:
+- no go:buildid section, or one whose name only starts with it and a NUL;
+- the pointer exported or imported or not global 0;
+- a Go function exported, taken by ref.func or in a declarative segment;
+- a table exported or imported;
+- a tail call, exception handling, table.get, call_ref, array.new_elem or
+  array.init_elem;
+- a subtype, or Go's type not final;
+- an imported function of Go's type in the table, as a table's initial
+  value, or taken by ref.func.
+Each must compile with the rewrite not made (--stats says gosp_funcs=0)
+and, where the interpreter can run it (no imports and no subtypes), give
+the interpreter's results.  Each is the one test of its condition: removing
+the condition from gosp.c fails it.  The module without the addition is the
+control, rewritten and with the same results; so is the module that writes
+the rec group gosp.c appends for its new type, which then takes another
+empty type.  wasm-tools assembles them, since wabt reads no subtypes.  A
+reference the host is handed to a function that reads the pointer is
+test/link/gosp_b.wat's.
 
 Then test/gen_gosp.py's random modules in Go's shape, against wasm-interp
 at -O1 and -O2, each of which gosp.c must rewrite whole.
@@ -61,6 +71,9 @@ CUSTOM = '(@custom "go:buildid" "run_gosp")'
 # (what, substitutions, whether the interpreter can run it)
 CASES = [
     ("no go:buildid section", {"custom": ""}, True),
+    # the name is the section's bytes, which may go on past a NUL
+    ("a section named go:buildid, a NUL and more", {"custom": '(@custom "go:buildid\\00x" "run_gosp")'},
+     True),
     ("the pointer exported", {"funcs": '(export "sp" (global $sp))'}, True),
     ("the pointer not global 0", {"globals": "(global $x (mut i64) (i64.const 0))"}, True),
     ("the pointer imported", {"imports": '(import "env" "x" (global $x (mut i32)))'}, False),
@@ -82,7 +95,26 @@ CASES = [
     ("Go's type not final", {"gotype": "(sub %s)" % GO}, False),
     ("an import of Go's type in the table",
      {"imports": '(import "env" "f" (func $imp (type $go)))', "elem": "$imp"}, False),
+    ("an import of Go's type as a table's initial value",
+     {"imports": '(import "env" "f" (func $imp (type $go)))',
+      "funcs": "(table $t2 2 funcref (ref.func $imp))"}, False),
+    ("an exported import of Go's type taken by ref.func",
+     {"imports": '(import "env" "f" (func $imp (type $go)))',
+      "funcs": '(export "imp" (func $imp)) (func $r (drop (ref.func $imp)))'}, False),
+    ("array.new_elem",
+     {"types": "(type $fa (array funcref))",
+      "funcs": "(elem $ps func $leaf) (func $an (drop (array.new_elem $fa $ps (i32.const 0) (i32.const 1))))"},
+     False),
+    ("array.init_elem",
+     {"types": "(type $fa (array (mut funcref)))",
+      "funcs": "(elem $ps func $leaf) (func $ai (array.init_elem $fa $ps (array.new_default $fa (i32.const 1))"
+               " (i32.const 0) (i32.const 0) (i32.const 1)))"}, False),
 ]
+
+# the rec group gosp.c appends for a type of its own, written by the module:
+# the rewrite is still made, its group taking another empty type to be new
+COLLIDE = "the rewrite's new type's rec group written by the module"
+COLLIDE_TYPES = "(rec (type $p (func (param i32 i32) (result i64))) (type $e (func)))"
 
 def module(subs):
     d = {"custom": CUSTOM, "gotype": GO, "types": "", "imports": "", "globals": "", "elem": "",
@@ -102,7 +134,7 @@ def main():
     fails = []
     checked = 0
     with tempfile.TemporaryDirectory() as tmp:
-        for what, subs, runs in [("the control", {}, True)] + CASES:
+        for what, subs, runs in [("the control", {}, True), (COLLIDE, {"types": COLLIDE_TYPES}, False)] + CASES:
             wat, wasm = os.path.join(tmp, "m.wat"), os.path.join(tmp, "m.wasm")
             with open(wat, "w") as f:
                 f.write(module(subs))
@@ -117,7 +149,7 @@ def main():
             if r.returncode:
                 fails.append("%s: warmc: %s" % (what, r.stderr.strip()[:300]))
                 continue
-            want = 2 if what == "the control" else 0
+            want = 2 if what in ("the control", COLLIDE) else 0
             m = re.search(r"\bgosp_funcs=(\d+)\b", r.stderr)
             if not m or int(m.group(1)) != want:
                 fails.append("%s: gosp.c rewrote %s Go functions, not %d"

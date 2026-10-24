@@ -13,10 +13,24 @@
 
 static _Thread_local DiagCatch *g_catch;
 
+/* The object a link is made from, while it exists only for that link: an
+   error that ends warmc removes it rather than leave it beside the output
+   that was never made. */
+static char g_temp[4096];
+
+void warmc_temp_output(const char *path) {
+  snprintf(g_temp, sizeof g_temp, "%s", path ? path : "");
+}
+
+static void remove_temp(void) {
+  if (g_temp[0]) remove(g_temp);
+}
+
 void warmc_diag_catch(DiagCatch *c) { g_catch = c; }
 
 void warmc_diag_rethrow(const DiagCatch *c) {
   fprintf(stderr, "warmc: %s: %s\n", c->tag, c->msg);
+  remove_temp();
   exit(c->code);
 }
 
@@ -39,6 +53,7 @@ static void diag(const char *tag, int code, const char *fmt, va_list ap) {
   fprintf(stderr, "warmc: %s: ", tag);
   vfprintf(stderr, fmt, ap);
   fputc('\n', stderr);
+  remove_temp();
   exit(code);
 }
 
@@ -429,6 +444,10 @@ uint32_t obj_intern_sym(ObjBuilder *o, const char *name, SymKind kind, int secti
 }
 
 void obj_add_reloc(ObjBuilder *o, RelKind kind, int section, uint64_t off, uint32_t sym, int64_t addend) {
+  /* text, rodata and data take relocations; the custom sections (3) are
+     the module's bytes as they were, and no writer has a table for them */
+  if (section < 0 || section > 2)
+    warmc_fatal("internal: a relocation in section %d, which takes none", section);
   if (o->nrelocs == o->cap_relocs) {
     o->cap_relocs = o->cap_relocs ? o->cap_relocs * 2 : 64;
     o->relocs = xrealloc(o->relocs, o->cap_relocs * sizeof(Reloc));

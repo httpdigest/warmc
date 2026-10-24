@@ -194,6 +194,27 @@ case("bad_canon_option", 2, "malformed canonical option",
           sec(7, vec([FUNCTYPE_EMPTY])),
           sec(8, vec([b"\x00\x00" + u32(0) + vec([b"\x09"]) + u32(0)]))))
 
+# A canonical definition's options, refused when validating as when
+# compiling: one of each kind at most, post-return on a lift alone and not
+# with async, a callback only with async.
+def lift_opts(*opts):
+    return comp(*CORE_FUNC_PRELUDE,
+                sec(7, vec([FUNCTYPE_EMPTY])),
+                sec(8, vec([b"\x00\x00" + u32(0) + vec(list(opts)) + u32(0)])))
+case("canon_two_encodings", 3, "more than one string encoding", lift_opts(b"\x00", b"\x01"))
+case("canon_two_reallocs", 3, "two reallocs", lift_opts(b"\x04" + u32(0), b"\x04" + u32(0)))
+case("canon_two_post_returns", 3, "two post-returns",
+     lift_opts(b"\x05" + u32(0), b"\x05" + u32(0)))
+case("canon_callback_without_async", 3, "callback is only allowed with async",
+     lift_opts(b"\x07" + u32(0)))
+case("canon_post_return_with_async", 3, "post-return and async cannot both be given",
+     lift_opts(b"\x06", b"\x05" + u32(0)))
+case("canon_post_return_on_lower", 3, "post-return is only allowed on canon lift",
+     comp(*CORE_FUNC_PRELUDE,
+          sec(7, vec([FUNCTYPE_EMPTY])),
+          sec(8, vec([b"\x00\x00" + u32(0) + u32(0) + u32(0),
+                      b"\x01\x00" + u32(0) + vec([b"\x05" + u32(0)])]))))
+
 case("canon_lift_with_prelude", 0, "",
      comp(*CORE_FUNC_PRELUDE,
           sec(7, vec([FUNCTYPE_EMPTY])),

@@ -13,6 +13,7 @@ static bool op_clobbers_caller_saved(uint16_t op) {
 
     case I_STRUCT_NEW: case I_ARRAY_NEW: case I_ARRAY_NEW_SEG:
     case I_ARRAY_OP: case I_REF_TEST:
+    case I_ANY_OF_EXTERN: case I_EXTERN_OF_ANY:
       return true;
     default:
       return false;

@@ -595,6 +595,17 @@ static void do_canon(Builder *b, Env *e, uint32_t ci) {
   if (lc->opts.has_memory) {
     si.core_sort = CMCS_MEMORY; si.index = lc->opts.memory;
     lc->memory = resolve_core(b, e, &si);
+    /* the canonical ABI is 32-bit here: a 64-bit memory is refused now,
+       not at the start of a program whose adapter imports a 32-bit one */
+    if (lc->memory.kind == LD_EXPORT) {
+      const Module *mm = b->p->modules[b->p->insts[lc->memory.inst].module].m;
+      const Export *x = &mm->exports[lc->memory.exp];
+      if (x->kind == EK_MEM && x->index < mm->nmemories && mm->memories[x->index].index64) {
+        blocked(b, "a canonical definition names a 64-bit memory, and the canonical ABI "
+                   "here is 32-bit");
+        return;
+      }
+    }
   }
   if (lc->opts.has_realloc) {
     si.core_sort = CMCS_FUNC; si.index = lc->opts.realloc;

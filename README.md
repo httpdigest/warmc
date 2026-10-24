@@ -353,17 +353,22 @@ Sandbox behaviour:
 - Paths are resolved one component at a time.
 - Absolute paths, and `..` that climbs above a preopen, are refused.
 - Symlinks are followed by hand: at most 8, and never to an absolute target.
+- A path that ends in a slash names a directory, as under wasmtime: making a
+  directory or renaming by it acts on the entry itself, which must be one;
+  creating a file by it is refused; anything else acts on what the name
+  leads into.
 - Rights are enforced per descriptor.
 
-The exit status is the guest's `proc_exit` code. The host reserves a few codes
-of its own:
+The exit status is the guest's `proc_exit` code. A code of 126 or more, which
+the system would cut to 8 bits or a shell takes for its own, is a trap, as
+under wasmtime. The host reserves a few codes of its own:
 
 | Code | Meaning |
 |---|---|
 | 70 | the host's own import stub failed to instantiate |
 | 71 | the module failed to link or to instantiate, a trap in its start function or segment initialisation included |
 | 72 | no `_start` |
-| 73 | a trap in `_start`, printed to stderr |
+| 73 | a trap in `_start`, printed to stderr, a `proc_exit` code of 126 or more included |
 | 74 | a `--dir` that cannot be opened, a `--tcplisten` that cannot listen, or no memory for the flags |
 
 On Linux a WASI program is a static executable with no libc, like every
@@ -384,7 +389,7 @@ build/warmc --target macos --rt build/warmrt-macos.a --wasi -o app app.wasm
 ./app --dir=. --env FOO=bar arg1 arg2
 ```
 
-The host implements 57 functions of `wasi:cli` (environment, exit, stdio,
+The host implements 58 functions of `wasi:cli` (environment, exit, stdio,
 terminal), `wasi:clocks`, `wasi:filesystem` (types and preopens), `wasi:io`
 (error, poll and streams) and `wasi:random` (`rt/wasip2.c` lists them). It
 does not implement all of each interface: no `wasi:random/insecure`, no
@@ -479,6 +484,11 @@ The rest of the API, in [`rt/warm_rt.h`](rt/warm_rt.h):
 | `warmc_global_cell(inst, idx)`, `inst->mem_base` / `mem_size` | access globals and linear memory 0 |
 | `warmc_gc_collect()`, `warmc_gc_hold()` / `warmc_gc_release()` | drive the collector; register C-side roots |
 | `warmc_custom_section(md, name, index, &data, &size)` | the module's custom sections named `name`: how many there are, and the `index`-th one's payload (see [Custom sections](#custom-sections)) |
+
+An `externref` the host hands in is any 64-bit value with its low two bits
+clear -- a pointer to a C object is one -- or 0 for null. A module that
+turns it into an `anyref` (`any.convert_extern`) sees it as no object and no
+`i31` of its own, and gets it back unchanged from `extern.convert_any`.
 
 Limits: at most 4096 instances per process, and instances are never freed.
 Every memory that a module compiled with guard pages (`-O2` and `-O3`)
@@ -835,8 +845,8 @@ and `ldcomb` need `guard-pages`; `small-loop-align` needs `align`; and
 | `escape` | remove GC objects that never escape and forward their fields |
 | `partial-escape` | allocate a GC object that escapes on some paths only where it escapes |
 | `devirt`, `closed-world` | turn `call_ref` and `call_indirect` into direct calls, also through vtables in immutable globals; with a closed world, use vtable slots too, and let `reach` drop what only a struct field of a global's initialiser names that no `struct.get` reads (on at every level, off for a component) |
-| `trampoline` | a module whose functions each return the table index of the next to run, to one loop that calls through the table until one returns 0, as GHC's code returns to its runtime's `StgRun`, has them tail-call the next themselves, directly when the index is a constant, with up to three globals they alone use, the most used, passed as arguments and written back when the loop ends; made only where nothing else can tell: the module has one table, the loop's is the module's one call of that type, nothing calls or takes a reference to those functions any other way, and a call through another type that reached one still traps |
-| `go-sp` | a module Go's compiler made (a `go:buildid` section) has each function of Go's one type take the stack pointer as an argument and return it beside its result, in place of reading and writing global 0 at every call; arguments, results and frames stay in Go's stack memory for its collector and stack growth, the global is stored before a call into a function of another type that can reach it -- the write barrier, the resume loop, an import an export could be called back through -- and loaded after, and a goroutine's switch to another stack goes through the resume loop, which hands each function the pointer it resumes on; made only where nothing else can tell: no function of Go's type exported, taken by `ref.func` or imported into a table, no table or stack pointer imported or exported, and no tail call, `call_ref`, `table.get`, function type with a supertype, or exception handling in the module |
+| `trampoline` | a module whose functions each return the table index of the next to run, to one loop that calls through the table until one returns 0, as GHC's code returns to its runtime's `StgRun`, has them tail-call the next themselves, directly when the index is a constant, with up to three globals they alone use, the most used, passed as arguments and written back when the loop ends, and stored before and loaded after a call that can run the loop again -- the loop's function, what calls it, an import other than WASI's when an export can run it -- or stored before every call in a module that catches exceptions; made only where nothing else can tell: the module has one table, the loop's is the module's one call of that type and alone in a loop that calls again with what it returns until that is 0, as `StgRun`'s is, nothing calls or takes a reference to those functions any other way, and a call through another type that reached one still traps |
+| `go-sp` | a module Go's compiler made (a `go:buildid` section) has each function of Go's one type take the stack pointer as an argument and return it beside its result, in place of reading and writing global 0 at every call; arguments, results and frames stay in Go's stack memory for its collector and stack growth, the global is stored before a call into a function of another type that can reach it -- the write barrier, the resume loop, an import the host could call back through, by an export or a reference it could be handed -- and loaded after, and a goroutine's switch to another stack goes through the resume loop, which hands each function the pointer it resumes on; made only where nothing else can tell: no function of Go's type exported or taken by `ref.func`, none imported into a table or taken by `ref.func`, no table or stack pointer imported or exported, and no tail call, `call_ref`, `table.get`, `array.new_elem`, `array.init_elem`, function type with a supertype, or exception handling in the module |
 | `ictab` | a `call_indirect` through table 0, when nothing writes it, it holds no imported function and it is not table64, loads its target from a code table per type, whose slots that fail the call's checks hold trap stubs, so the call needs no signature, null or instance check |
 | `reinline` | after the cleanup passes, inline again what devirtualisation made direct and the calls an allocation leaves by |
 | `throw-jump` | a `throw` caught in its own function, without the exnref, becomes a jump to the catch |
@@ -1238,6 +1248,16 @@ Most of the suite is **differential**. warmc's output is compared with:
   ones with one thing each that rules the rewrite out (`test/run_gosp.py`;
   those with imports or subtypes are only compiled, for the rewrite's
   absence)
+- `-O0`, which makes no `trampoline` rewrite, and results worked out by
+  hand, for small modules in GHC's shape with one thing each that rules the
+  rewrite out or needs more of it -- a trampoline run inside another, an
+  exception caught after it went through the loop (`test/run_tramp.py`); a
+  library whose import runs one inside another (`test/shared/tramp.wat`)
+  and a trampoline beside a global imported from another module
+  (`test/link/tramp_b.wat`) check the host's part
+- results worked out by hand, at `-O0`, `-O1`, `-O2` and `-O3`, for small
+  modules each of which some pass once compiled wrong (`test/run_optcases.py`,
+  `test/cases_opt`)
 - exact arithmetic, for every division's magic numbers (`test/magic.py`)
 - the module itself, for the custom sections each linked image carries, read
   back from Mach-O, ELF and PE (`test/check_macho.py`, `check_elf.py`,
@@ -1262,9 +1282,9 @@ The other rows check what has no second engine to compare with:
 - the compiler under AddressSanitizer and ThreadSanitizer (`run_asan.sh`,
   `run_tsan.sh`)
 
-Three rows run last, each alone, because they need a quiet machine or would
-load it for the others: the collector's pause check, the Go-shaped rewrite's
-fuzzing, and the pass combinations.
+Three phases run last, each alone, because they need a quiet machine or would
+load it for the others: the collector's pause check, the Go- and GHC-shaped
+rewrites' modules, and the pass combinations.
 
 `test/run_shared.sh` builds a shared library and calls it from C, C++,
 Python's `ctypes` and Java's foreign function API. The Java part needs Java 22
@@ -1354,8 +1374,7 @@ Makefile        the build, the pinned dependencies and the test targets
   as is an adapter between two sides with different string encodings. A
   component cannot be built `--shared`, and component text must be assembled
   with `wasm-tools`.
-- **Tables** hold at most 2^20 entries; one without a maximum grows by at
-  most 1024 past its initial size.
+- **Tables** hold at most 2^20 entries, without a maximum as with one.
 - **A function's frame** is at most 1 MiB on AArch64 and 128 MiB on x86-64.
 - **Guarded memories:** at most 1024 per process (see [Embedding compiled
   modules in C](#embedding-compiled-modules-in-c)).

@@ -145,6 +145,115 @@ else
   fail=1
 fi
 
+# An exit status the process cannot exit with as it is traps, as under
+# wasmtime, rather than leave the low 8 bits -- proc_exit(256) as 0, success.
+if build_driven exitwide; then
+  "$DRIVEN_EXE" 2>"$WORK/exitwide.err"; rc_wide=$?
+  "$DRIVEN_EXE" one 2>/dev/null; rc_126=$?
+  "$DRIVEN_EXE" one two 2>/dev/null; rc_125=$?
+  "$WASMTIME" "$DRIVEN_WASM" 2>/dev/null; rc_ref=$?
+  if [ "$rc_wide" != 73 ] || [ "$rc_126" != 73 ] || [ "$rc_125" != 125 ] || [ "$rc_ref" = 0 ] ||
+     ! grep -q 'outside \[0, 126)' "$WORK/exitwide.err"; then
+    echo "FAIL[wasi/exitwide]: proc_exit(256) exit $rc_wide, (126) $rc_126, (125) $rc_125" \
+         "(want 73, 73, 125, and the status named); wasmtime exit $rc_ref (want non-zero)"
+    fail=1
+  else
+    pass=$((pass + 1))
+  fi
+else
+  fail=1
+fi
+
+# A subscription that cannot be polled is an event at once, which ends the
+# wait: not the five seconds of the clock beside it.
+if build_driven pollbad; then
+  t0=$SECONDS
+  "$DRIVEN_EXE" 2>/dev/null; rc=$?
+  took=$((SECONDS - t0))
+  if [ "$rc" != 18 ] || [ "$took" -ge 3 ]; then
+    echo "FAIL[wasi/pollbad]: exit $rc after ${took}s (want 18, the EBADF event alone, at once)"
+    fail=1
+  else
+    pass=$((pass + 1))
+  fi
+else
+  fail=1
+fi
+
+# The host's errno as WASI's, against this host's own <errno.h>: every name
+# WASI has, through rt/wasifs.c's table, compiled for this host alone and
+# with the rest of that file dropped.  Windows answers in Linux's numbers
+# through rt/winposix.c, which its own errno.h does not name.
+if [ "$WIN" = 0 ]; then
+  case "$(uname -s)" in
+    Darwin) eflags=(-DWARMC_DARWIN=1 -Wl,-dead_strip) ;;
+    *)      eflags=(-Wl,--gc-sections) ;;
+  esac
+  if ! cc -O1 -ffunction-sections -fdata-sections -Irt "${eflags[@]}" -o "$WORK/errno_test" \
+         test/errno_test.c rt/wasifs.c 2>"$WORK/errno_test.err"; then
+    echo "FAIL[wasi/errno]: the table test does not build"
+    sed 's/^/    /' "$WORK/errno_test.err"
+    fail=1
+  elif "$WORK/errno_test" >"$WORK/errno_test.out"; then
+    pass=$((pass + 1))
+  else
+    cat "$WORK/errno_test.out"
+    fail=1
+  fi
+fi
+
+# iovecs that add up to more than the 32-bit count can say: it says 2^32 - 1.
+if build_driven bigiov; then
+  "$DRIVEN_EXE" >/dev/null 2>"$WORK/bigiov.err"; rc=$?
+  if [ "$rc" != 0 ]; then
+    echo "FAIL[wasi/bigiov]: exit $rc (1: the count was not 2^32 - 1, 2: the write failed)"
+    fail=1
+  else
+    pass=$((pass + 1))
+  fi
+else
+  fail=1
+fi
+
+# A directory that may be searched but not read is walked through.  Not on
+# Windows, whose directories have no such mode, nor as root, whom no mode
+# keeps out.
+if [ "$WIN" = 0 ] && [ "$(id -u)" != 0 ] && build_driven searchonly; then
+  d="$WORK/searchonly.dir"; rm -rf "$d"; mkdir -p "$d/sx"; printf 'f\n' > "$d/sx/f"
+  chmod 0111 "$d/sx"
+  env -i "$DRIVEN_EXE" --dir="$d::/d" 2>/dev/null; rc=$?
+  chmod 0755 "$d/sx"
+  if [ "$rc" != 0 ]; then
+    echo "FAIL[wasi/searchonly]: exit $rc (an errno: the walk could not go through sx; 100: read wrong)"
+    fail=1
+  else
+    pass=$((pass + 1))
+  fi
+elif [ "$WIN" = 0 ] && [ "$(id -u)" != 0 ]; then
+  fail=1
+fi
+
+# test/wasi/poll.wat reads stdin's event flags, which the corpus gives a
+# file that never hangs up: here stdin is a pipe whose writer has gone, so
+# the hangup flag is set where WASI puts it, the last line.  wasmtime
+# reports no hangup on it, so this is asserted rather than diffed.  Not on
+# Windows, where an anonymous pipe has no hangup to poll for.
+if [ "$WIN" = 1 ]; then
+  :
+elif ./$BUILD/warmc --wasi $WARMC_TARGET_FLAGS ${WARMC_FLAGS:-} -o "$WORK/pollhup" \
+     test/wasi/poll.wat 2>"$WORK/pollhup.err"; then
+  got=$(: | "$WORK/pollhup" 2>/dev/null | tail -1)
+  if [ "$got" != 1 ]; then
+    echo "FAIL[wasi/pollhup]: the hangup flag of a closed pipe is [$got], not 1"
+    fail=1
+  else
+    pass=$((pass + 1))
+  fi
+else
+  echo "FAIL[wasi/pollhup]: warmc could not build test/wasi/poll.wat"
+  fail=1
+fi
+
 # All four preview1 clocks answer.  wasmtime returns EBADF for ids 2 and 3, so
 # the expected output is written out here rather than diffed against it.
 if build_driven cpuclock; then
@@ -189,13 +298,13 @@ fi
 if build_driven fdextra; then
   d="$WORK/fdextra.dir"; rm -rf "$d"; mkdir -p "$d"
   got=$(env -i "$DRIVEN_EXE" --dir="$d::/d" 2>/dev/null)
-  want="0 0 32 28 0 0 4 48 8 8 0 "
+  want="0 0 32 28 8 0 0 4 48 8 8 0 "
   if [ "$got" != "$want" ]; then
     echo "FAIL[wasi/fdextra]: got [$got], want [$want]"
     echo "    (allocate, filestat_get, the size it left, advise with a seventh"
-    echo "     value, renumber, a read through the new number, its length, the"
-    echo "     byte it read, tell on the old number, renumber past the ceiling,"
-    echo "     close)"
+    echo "     value, renumber onto a number not open, renumber onto an open one,"
+    echo "     a read through the new number, its length, the byte it read, tell"
+    echo "     on the old number, renumber past the ceiling, close)"
     fail=1
   else
     pass=$((pass + 1))

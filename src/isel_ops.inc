@@ -2392,6 +2392,22 @@ static void emit_inst(Isel *s, Ref v) {
       break;
     }
 
+    case I_ANY_OF_EXTERN: case I_EXTERN_OF_ANY: {
+      int d = wr(s, v, S1);
+      csa_save(s, v);
+      emit_call_args(s, a, 1);
+      uint32_t sym = obj_intern_sym(s->o, in->op == I_ANY_OF_EXTERN ? "warmc_any_of_extern"
+                                                                     : "warmc_extern_of_any",
+                                    SYM_UNDEF_FUNC, -1, 0);
+      isel_reloc(s, REL_CALL26, B->len, sym, 0);
+      a64_bl(B, 0);
+      s->mem_valid = false;
+      if (d != R0) a64_mov_reg(B, SF64, d, R0);
+      csa_restore(s, v);
+      commit(s, v, d);
+      break;
+    }
+
     case I_REF_I31: {
 
       int y = rd(s, a[0], S0);

@@ -99,6 +99,10 @@ int main(void) {
   CHECK(own_faults == 1, "the program's own fault reached its handler %d times",
         own_faults);
 
+  take_twice();
+  CHECK(twice_is_tw() == 1 && basic_last_trap() == 0,
+        "ref.test of the bound import against its type: %d", (int)twice_is_tw());
+
   CHECK(quot(1, 0) == 0 && basic_last_trap() == 3, "quot(1, 0) traps");
   size_t size = 0;
   uint8_t *mem = basic_memory(&size);
@@ -106,6 +110,15 @@ int main(void) {
   CHECK(sum(65530, 10) == 0 && basic_last_trap() == 2,
         "a read past memory traps out of bounds: %u", basic_last_trap());
   CHECK(quot(9, 3) == 3 && basic_last_trap() == 0, "and the next call clears it");
+#if defined(__x86_64__)
+  /* 12 integer and 10 float parameters: 9 and 6 of them past the registers,
+     in the stack image the C entry builds */
+  {
+    double w = wide(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12,
+                    0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0);
+    CHECK(w == 1172.5 && basic_last_trap() == 0, "wide(...) = %g, not 1172.5", w);
+  }
+#endif
 
   /* Constant-length copies and fills: in bounds they move the bytes, an
      overlapping copy as memmove does; past the end by either range they

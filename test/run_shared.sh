@@ -80,6 +80,34 @@ elif ! "$WORK/gosphost"; then
   fail=1
 fi
 
+# A library in GHC's shape, whose trampoline tramp.c turns into tail calls,
+# and whose import runs another trampoline in it: the run inside starts from
+# and leaves the register the trampolined function inside the import holds.
+TLIB="$WORK/libtramp.$EXT"
+[ "$EXT" = dll ] && TLIB="$WORK/tramp.dll"
+if ! ./$BUILD/warmc "${TARGET[@]}" --shared --stats -o "$TLIB" test/shared/tramp.wat \
+       2>"$WORK/tramp.err"; then
+  echo "FAIL[shared]: test/shared/tramp.wat does not build"
+  sed 's/^/    /' "$WORK/tramp.err"
+  fail=1
+elif ! grep -q '\btramp_funcs=4\b' "$WORK/tramp.err"; then
+  echo "FAIL[shared]: tramp.c did not rewrite test/shared/tramp.wat's four functions"
+  fail=1
+elif [ "$EXT" = dll ] &&
+     ! llvm-dlltool -m i386:x86-64 -d "$WORK/tramp.def" -l "$WORK/libtramp.dll.a" \
+         2>"$WORK/dlltool.err"; then
+  echo "FAIL[shared]: no import library from tramp's .def"
+  sed 's/^/    /' "$WORK/dlltool.err"
+  fail=1
+elif ! cc -O2 -Wall -Werror -I "$WORK" -o "$WORK/tramphost" test/shared/tramphost.c \
+         -L "$WORK" -ltramp -Wl,-rpath,"$WORK" 2>"$WORK/tramphost.err"; then
+  echo "FAIL[shared]: the tramp host does not build against the header"
+  sed 's/^/    /' "$WORK/tramphost.err"
+  fail=1
+elif ! "$WORK/tramphost"; then
+  fail=1
+fi
+
 # The runtime's options reach a library through the environment as they do
 # a program: a heap of 4 MB cannot hold a million live nodes.
 cat > "$WORK/heap.c" <<'EOF'
@@ -156,5 +184,5 @@ refuse "a --wasi library" "no wasi host" '(module)' --wasi
 refuse "a library without export names" "export names" '(module)' \
   --no-export-names
 
-[ "$fail" = 0 ] && echo "shared: a library called from C, C++, Python and Java, one in Go's shape called back from its import, its options from the environment, and four refusals"
+[ "$fail" = 0 ] && echo "shared: a library called from C, C++, Python and Java, one in Go's shape and one in GHC's called back from their imports, its options from the environment, and four refusals"
 exit $fail

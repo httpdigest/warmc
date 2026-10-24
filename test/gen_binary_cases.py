@@ -302,11 +302,12 @@ def table64_limits():
     """A table64 whose declared minimum is past what the runtime can back.
 
     The spec's ceiling for an index64 table is 2^64-1, so validation has to
-    let this through and the refusal belongs at instantiation.  wabt 1.0.41
-    has no table64 in its text parser, so the module is written out here.
-    The entry count is chosen so that count * sizeof(TableEntry) is a whole
-    multiple of 2^64: the size computation used to wrap to nothing and hand
-    back a single page for a table that reported 2^61 entries.
+    let this through and the refusal belongs at instantiation, which says
+    it is past the runtime's 2^20 entries.  wabt 1.0.41 has no table64 in
+    its text parser, so the module is written out here.  The entry count is
+    chosen so that count * sizeof(TableEntry) is a whole multiple of 2^64:
+    the size computation used to wrap to nothing and hand back a single page
+    for a table that reported 2^61 entries.
     """
     def body(code, locals_=b"\x00"):
         return leb(len(locals_ + code)) + locals_ + code
@@ -320,7 +321,7 @@ def table64_limits():
         section(7, vec([name("get") + b"\x00" + leb(0)])),
         section(10, vec([body(i64c(100) + b"\x25\x00" + b"\xd1" + END)])),
     ])
-    return bin_, [("get", "trap:out of bounds table access")]
+    return bin_, [("get", "refused:a table of more than 2^20 entries")]
 
 def table64_small():
     """The same shape inside the runtime's reach, so the guard is not a wall."""

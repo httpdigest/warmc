@@ -2721,6 +2721,18 @@ static void emit_inst(Isel *s, Ref v) {
       break;
     }
 
+    case I_ANY_OF_EXTERN: case I_EXTERN_OF_ANY: {
+      int d = wr(s, v, S1);
+      csa_save(s, v);
+      emit_call_args_core(s, a, 1, 0, 1, true, true);
+      emit_call_sym(s, in->op == I_ANY_OF_EXTERN ? "warmc_any_of_extern" : "warmc_extern_of_any");
+      s->mem_valid = false;
+      if (d != X_RAX) x64_mov_rr(B, 1, d, X_RAX);
+      csa_restore(s, v);
+      commit(s, v, d);
+      break;
+    }
+
     case I_REF_I31: {
       int y = rd(s, a[0], S0);
       int d = wr(s, v, S1);

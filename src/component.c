@@ -1,4 +1,5 @@
 #include "component.h"
+#include "canon.h"
 #include "reader.h"
 
 #define CM_MAX_FIXED_LIST 65536u
@@ -605,6 +606,9 @@ static void rd_canon(Rd *r, Component *c, CmCanon *cn) {
       cn->func = rd_idx(r, c->n_core_func, "core function");
       rd_opts(r, c, cn);
       cn->type = rd_idx(r, c->n_type, "type");
+      /* the options' own rules, here so that validating a component
+         refuses what compiling it does */
+      { CanonOpts o; canon_options(cn, true, &o); }
       func_slot(c, CMFS_LIFT, (uint32_t)(cn - c->canons));
       break;
     case 0x01:
@@ -612,6 +616,7 @@ static void rd_canon(Rd *r, Component *c, CmCanon *cn) {
       cn->kind = CMC_LOWER;
       cn->func = rd_idx(r, c->n_func, "function");
       rd_opts(r, c, cn);
+      { CanonOpts o; canon_options(cn, false, &o); }
       cfunc_slot(c, CMCF_LOWER, (uint32_t)(cn - c->canons));
       break;
     case 0x02: case 0x03: case 0x04:

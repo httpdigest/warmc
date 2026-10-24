@@ -147,6 +147,11 @@ typedef enum {
   I_REF_I31,
   I_I31_GET,
 
+  /* any.convert_extern and extern.convert_any: a reference the host made
+     carries the host tag while it is an anyref, so that no type test takes
+     it for an object or an i31 (warmc_any_of_extern, rt.c) */
+  I_ANY_OF_EXTERN, I_EXTERN_OF_ANY,
+
   I_NOP,
   I_OP_COUNT
 } IrOp;
@@ -363,6 +368,14 @@ const char *ir_op_name(uint16_t op);
 void ir_verify(IrFunc *f, const char *stage);
 void ir_print(IrFunc *f, const char *stage);
 
+/* Two properties an instruction may have, which passes ask apart:
+   - ir_has_no_effect: running it or not changes nothing but its value, so
+     an unused one goes and one may run twice.  A read of memory checked
+     already, of a global, of the exception caught has none;
+   - ir_is_pure: besides, its value is its operands' alone, so two alike
+     are one (CSE) and it moves wherever its operands are (LICM).  None of
+     those reads is. */
+bool ir_has_no_effect(const Inst *in);
 bool ir_is_pure(const Inst *in);
 
 static inline uint64_t mem_guaranteed_bytes(const Module *m, uint32_t k) {

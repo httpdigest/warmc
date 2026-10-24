@@ -42,6 +42,17 @@ for lv in $LEVELS; do
           fi
           continue
           ;;
+        refused:*)
+          # instantiation refused, past a limit of the runtime's: exit 4
+          out=$(wruntimeout $WARMC_RUN "$bin" "$export" 2>&1); rc=$?
+          if [ "$rc" -eq 4 ] && [[ "$out" == *"${want#refused:}"* ]]; then
+            pass=$((pass + 1))
+          else
+            echo "FAIL[bincases] $case.$export $flags: want the refusal '${want#refused:}' got rc=$rc: $out"
+            fail=$((fail + 1))
+          fi
+          continue
+          ;;
       esac
       [ ${#invoke[@]} -eq 0 ] || invoke+=("--")
       invoke+=("$export")

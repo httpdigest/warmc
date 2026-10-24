@@ -258,6 +258,9 @@ enum {
 #define RTK_NULLABLE 0x80u
 
 u32 warmc_ref_test(WarmInstance *vm, u64 v, u32 kind, u64 id, u32 depth);
+/* called as warmc_ref_test is, the instance first */
+u64 warmc_any_of_extern(WarmInstance *vm, u64 e);
+u64 warmc_extern_of_any(WarmInstance *vm, u64 a);
 
 void *warmc_struct_new(WarmInstance *vm, u32 type_index);
 void *warmc_array_new(WarmInstance *vm, u32 type_index, u64 len);
@@ -454,11 +457,17 @@ typedef struct {
 
 extern const ComponentDesc *const warmc_component;
 
+/* What one import is bound to at instantiation: with code, a host function
+   called with inst as its context, or with the instance being made when
+   self is set (WASI's, which read its memory, from its start function on);
+   without, the export of inst named name; all zero, the module registered
+   under the import's module name. */
 typedef struct {
   WarmInstance *inst;
   const char *name;
 
   void *code;
+  int self;
 } WarmBinding;
 WarmInstance *warmc_instantiate_bound(const ModuleDesc *md, const WarmBinding *binds);
 WarmInstance *warmc_instantiate_bound_catching(const ModuleDesc *md,
@@ -553,7 +562,7 @@ enum {
   TRAP_INDIRECT_NULL = 6,
   TRAP_INDIRECT_TYPE = 7,
   TRAP_BAD_CONVERSION = 8,
-  TRAP_UNINIT_ELEM = 9,
+  /* 9 is no trap: a null in a table is TRAP_INDIRECT_NULL's */
   TRAP_TABLE_OOB = 10,
   TRAP_STACK_OVERFLOW = 11,
   TRAP_NULL_REF = 12,
@@ -616,7 +625,9 @@ void warmc_invoke(void *fn, WarmInstance *vm, const u64 *iargs,
    with more reads the rest from its incoming stack slots, which
    warmc_invoke cannot populate.  These variants also copy a caller-built
    image of those slots: 8 bytes per scalar parameter past its class's
-   register ceiling and 16 per v128, in parameter order. */
+   register ceiling and 16 per v128, in parameter order, at most
+   WARMC_X64_STACK_BYTES of it (the rest is not copied). */
+#define WARMC_X64_STACK_BYTES 480
 void warmc_invoke_s(void *fn, WarmInstance *vm, const u64 *iargs,
                     const u64 *fargs, u64 *retbuf,
                     const u64 *stk, u64 stk_bytes);

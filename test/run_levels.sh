@@ -6,7 +6,7 @@
 # -O2, -O3 and -O2 -ffma -fdead-frames -- and -O3 is not -O2 where those
 # passes have something to do.  The modules are ones each level-decided
 # pass changes: Go's stack pointer (go-sp), a trampoline, C frames, fusable
-# floats.
+# floats.  And the -fno- form of a flag that turns another on as well.
 
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -54,6 +54,18 @@ for src in test/cases/gosp.wat test/cases/trampoline.wat test/cases/deadframes.w
 done
 check differ test/cases_fma/fma.wat "-O2" "-O3"
 check differ test/cases/deadframes.wat "-O2" "-O3"
+
+# A flag's -fno- form turns that flag off and nothing else: -fgssa-all
+# turns gssa on as well, and -fno-gssa-all leaves it on.
+check same test/cases/gosp.wat "-O2 -fno-gssa-all" "-O2"
+check same test/cases/gosp.wat "-O2 -fgssa-all -fno-gssa-all" "-O2"
+check same test/cases/gosp.wat "-O2 -fno-gssa -fgssa-all" "-O2 -fgssa-all"
+check differ test/cases/gosp.wat "-O2 -fno-gssa" "-O2"
+check differ test/cases/gosp.wat "-O2 -fgssa-all" "-O2"
+# -floadbar is the default, and turns back on what -fno-loadbar turned off.
+check same test/cases_gc/castfacts.wat "-O2 -floadbar" "-O2"
+check same test/cases_gc/castfacts.wat "-O2 -fno-loadbar -floadbar" "-O2"
+check differ test/cases_gc/castfacts.wat "-O2 -fno-loadbar" "-O2"
 
 [ "$fail" = 0 ] && echo "levels: $n pairs of levels compile as they should"
 [ "$fail" = 0 ]

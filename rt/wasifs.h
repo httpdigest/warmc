@@ -177,9 +177,21 @@ extern int *warmc_lx_errno(void);
 
 extern int dup(int);
 
-#define PATHMAX  1024
-#define MAXDEPTH 64
+/* A guest path, as Linux takes one; how deep the walk goes below a preopen;
+   how many links it follows. */
+#define PATHMAX  4096
+#define MAXDEPTH 1024
 #define MAXLINKS 8
+
+/* to open a directory to walk through: for search, which a directory of
+   --x lets, where there is such an open; for reading where not */
+#if defined(WARMC_DARWIN)
+#define H_SEARCH 0x40000000
+#elif defined(WARMC_WINDOWS)
+#define H_SEARCH 0
+#else
+#define H_SEARCH 0x200000
+#endif
 
 u32 wasifs_errno(int e);
 u64 wasifs_st_u64(const u8 *st, int off);
@@ -189,6 +201,13 @@ u8 wasifs_filetype(const u8 *st);
 void wasifs_str_copy(char *d, const char *s, usz n);
 int wasifs_str_eq(const char *a, const char *b);
 u32 wasifs_walk(int root, const char *path, int *out_dir, char *leaf);
+/* A path that ends in a slash walks into its last component, so that what
+   is done is done to "." in it: as wasmtime has it, that is what opening,
+   stating, unlinking or removing such a path means.  Making a directory or
+   renaming by one takes the slashes off and acts on the entry itself, which
+   must then be a directory; this takes them off, all but a first
+   character, and says whether there were any. */
+int wasifs_trim_slash(char *path);
 void wasifs_walk_done(int root, int dir);
 u32 wasifs_walk_leaf(int root, char *path, int *out_dir, char *leaf, int follow);
 u32 wasifs_splice_leaf(char *path, const char *link);

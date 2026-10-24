@@ -1173,7 +1173,7 @@ bool ir_mem_disp_ok(uint64_t off, uint32_t size_log2) {
 
 const Target *g_target = &warmc_target_a64;
 
-bool ir_is_pure(const Inst *in) {
+bool ir_has_no_effect(const Inst *in) {
   switch (in->op) {
     case I_PARAM: case I_CONST:
     case I_ADD: case I_SUB: case I_MUL: case I_MULHU: case I_MULHS:
@@ -1227,7 +1227,7 @@ bool ir_is_pure(const Inst *in) {
 
     case I_REF_I31:
 
-    case I_REF_TEST: case I_REF_CONVERT:
+    case I_REF_TEST: case I_REF_CONVERT: case I_ANY_OF_EXTERN: case I_EXTERN_OF_ANY:
     case I_NOP:
       return true;
 
@@ -1266,6 +1266,24 @@ bool ir_is_pure(const Inst *in) {
     default:
       return false;
   }
+}
+
+/* What reads state its operands do not carry: memory, a mutable global,
+   the exception being caught.  It has no effect, but two of it are not one
+   value, nor is one of it the same before a write as after. */
+static bool ir_reads_state(const Inst *in) {
+  switch (in->op) {
+    case I_GLOBAL_GET: case I_VLOAD: case I_VLDN: case I_EXN_OBJ:
+      return true;
+    case I_LOAD:
+      return (in->imm2 & MEMF_NOCHECK) != 0;
+    default:
+      return false;
+  }
+}
+
+bool ir_is_pure(const Inst *in) {
+  return ir_has_no_effect(in) && !ir_reads_state(in);
 }
 
 const char *ir_op_name(uint16_t op) {
@@ -1362,6 +1380,7 @@ const char *ir_op_name(uint16_t op) {
     N(I_GC_LAB_OPEN, "gc.lab_open"), N(I_GC_LAB_FLUSH, "gc.lab_flush"),
     N(I_GC_BADMASK, "gc.badmask"),
     N(I_REF_TEST, "ref.test"), N(I_REF_CONVERT, "ref.convert"), N(I_REF_I31, "ref.i31"), N(I_I31_GET, "i31.get"),
+    N(I_ANY_OF_EXTERN, "any.convert_extern"), N(I_EXTERN_OF_ANY, "extern.convert_any"),
     N(I_NOP, "nop"),
   };
 #undef N

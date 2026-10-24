@@ -156,6 +156,7 @@ void codegen_prepare_module(Module *m, ObjBuilder *o) {
 
 void codegen_prewarm_symbols(Module *m, ObjBuilder *o) {
   static const char *const helpers[] = {
+    "warmc_any_of_extern",
     "warmc_array_copy",
     "warmc_array_fill",
     "warmc_array_init_data",
@@ -166,6 +167,7 @@ void codegen_prewarm_symbols(Module *m, ObjBuilder *o) {
     "warmc_array_new_fill",
     "warmc_data_drop",
     "warmc_elem_drop",
+    "warmc_extern_of_any",
     "warmc_gc_load_stub",
     "warmc_memory_copy",
     "warmc_memory_fill",

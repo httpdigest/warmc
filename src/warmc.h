@@ -23,6 +23,9 @@ void warmc_invalid(const char *fmt, ...)
 typedef struct { jmp_buf jb; const char *tag; int code; char *msg; } DiagCatch;
 void warmc_diag_catch(DiagCatch *c);
 void warmc_diag_rethrow(const DiagCatch *c) __attribute__((noreturn));
+/* The intermediate object of a link, removed if an error ends warmc before
+   the link does; NULL once it is removed or kept. */
+void warmc_temp_output(const char *path);
 /* fn(ctx, i, w) for every i below n, on nthreads threads (w the thread's
    number below nthreads), in no order; returns when all are done. */
 void warmc_par_for(uint32_t n, uint32_t nthreads,
@@ -410,6 +413,7 @@ void wasm_validate(Module *m);
 void module_free(Module *m);
 uint32_t module_add_distinct_func_type(Module *m, const ValType *params, uint32_t nparams,
                                        const ValType *results, uint32_t nresults);
+uint32_t *module_type_canon(const Module *m);
 void wasm_validate_funcs(Module *m, const uint32_t *fns, uint32_t n);
 uint32_t module_untrampoline(Module *m);
 uint32_t module_go_sp_args(Module *m);
@@ -489,7 +493,7 @@ enum {
   TRAP_INDIRECT_NULL = 6,
   TRAP_INDIRECT_TYPE = 7,
   TRAP_BAD_CONVERSION = 8,
-  TRAP_UNINIT_ELEM = 9,
+  /* 9 is no trap: a null in a table is TRAP_INDIRECT_NULL's */
   TRAP_TABLE_OOB = 10,
   TRAP_STACK_OVERFLOW = 11,
   TRAP_NULL_REF = 12,

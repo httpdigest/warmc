@@ -198,7 +198,7 @@ fi
 # with no run has nothing to start.
 refuses() {
   local what="$1" want="$2"; shift 2
-  rm -f "$WORK/refused"
+  rm -f "$WORK/refused" "$WORK/refused.o"
   if "$@" -o "$WORK/refused" 2>"$WORK/refused.err"; then
     echo "FAIL[wasip2/$what]: warmc built it instead of refusing"
     fail=1
@@ -206,8 +206,8 @@ refuses() {
     echo "FAIL[wasip2/$what]: refused without saying \"$want\":"
     sed 's/^/    /' "$WORK/refused.err"
     fail=1
-  elif [ -e "$WORK/refused" ]; then
-    echo "FAIL[wasip2/$what]: refused and left $WORK/refused behind"
+  elif [ -e "$WORK/refused" ] || [ -e "$WORK/refused.o" ]; then
+    echo "FAIL[wasip2/$what]: refused and left $WORK/refused or its object behind"
     fail=1
   else
     pass=$((pass + 1))
@@ -221,6 +221,39 @@ fi
 if [ -f "$BUILD/components/restable.wasm" ]; then
   refuses "wasi-needs-command" "does not export" \
     ./$BUILD/warmc --wasi $WARMC_TARGET_FLAGS "$BUILD/components/restable.wasm"
+fi
+# make builds no WASI 0.2 host for Windows, which a runtime of any name says
+if [ -f "$WORK/probe.wasm" ]; then
+  refuses "no-windows-host" "no WASI 0.2 host for Windows" \
+    ./$BUILD/warmc --wasi --target=windows --rt "$BUILD/warmrt.a" "$WORK/probe.wasm"
+fi
+
+# Preopens named by their host path (--dir=DIR, no ::GUEST), one and two of
+# them: the guest reaches each through that name, as under wasmtime.
+if tinygo build -o "$WORK/preopen.wasm" -target=wasip2 test/wasip2/preopen.go \
+     2>"$WORK/preopen.err" &&
+   ./$BUILD/warmc --wasi $WARMC_TARGET_FLAGS -o "$WORK/preopen" "$WORK/preopen.wasm" \
+     2>>"$WORK/preopen.err"; then
+  p1="$PWD/$WORK/pre1" p2="$PWD/$WORK/pre2"
+  mkdir -p "$p1" "$p2"; printf 'one\n' > "$p1/seed.txt"; printf 'two\n' > "$p2/seed.txt"
+  for dirs in "$p1" "$p1 $p2"; do
+    flags=(); for d in $dirs; do flags+=(--dir="$d"); done
+    wflags=(); for d in $dirs; do wflags+=(--dir "$d"); done
+    env -i "$WORK/preopen" "${flags[@]}" -- $dirs >"$WORK/preopen.out" 2>&1
+    env -i "$WASMTIME" run "${wflags[@]}" "$WORK/preopen.wasm" $dirs >"$WORK/preopen.ref" 2>&1
+    if cmp -s "$WORK/preopen.out" "$WORK/preopen.ref"; then
+      pass=$((pass + 1))
+    else
+      echo "FAIL[wasip2/preopen]: --dir by host path ($dirs) differs from wasmtime"
+      echo "  warmc:    $(tr '\n' '|' < "$WORK/preopen.out")"
+      echo "  wasmtime: $(tr '\n' '|' < "$WORK/preopen.ref")"
+      fail=1
+    fi
+  done
+else
+  echo "FAIL[wasip2/preopen]: it does not build"
+  sed 's/^/    /' "$WORK/preopen.err"
+  fail=1
 fi
 
 # A core instance that fails to instantiate -- here its start function traps

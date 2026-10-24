@@ -10,8 +10,10 @@
 ;;                   wasi:filesystem has nothing to build it out of.
 ;;   fd_renumber  -- wasmtime 47 answers EBADF(8) for the same reason: there is
 ;;                   no renumber in preview2 to adapt.  warmc moves the
-;;                   descriptor and closes the old number, which is what
-;;                   preview1 says.
+;;                   descriptor over the one it replaces and closes the old
+;;                   number, which is what preview1 says; one that is not open
+;;                   is no descriptor to overwrite, EBADF, as wasmtime's own
+;;                   preview1 host (wasi-common) answered.
 ;;   fd_advise    -- with an advice outside the six the enum defines, wasmtime
 ;;                   traps while converting the argument.  warmc answers
 ;;                   EINVAL(28).  A guest that sends a seventh advice is
@@ -20,9 +22,9 @@
 ;; So this is golden, for the same reason [[cpuclock]] is: a differential case
 ;; would pin warmc to the reference's gaps rather than to preview1.  What is
 ;; printed, in order: allocate, filestat_get, the size it left, advise with a
-;; seventh value, renumber, a read through the new number, its length, the
-;; first byte it read, tell on the old number, renumber past the host's
-;; ceiling, and close.
+;; seventh value, renumber onto a number not open, renumber onto an open one,
+;; a read through the new number, its length, the first byte it read, tell on
+;; the old number, renumber past the host's ceiling, and close.
 (module
   (import "wasi_snapshot_preview1" "path_open"
           (func $open (param i32 i32 i32 i32 i32 i64 i64 i32 i32) (result i32)))
@@ -63,7 +65,7 @@
   (func $emiti (param $v i32) (call $emit (i64.extend_i32_u (local.get $v))))
 
   (func (export "_start")
-    (local $fd i32)
+    (local $fd i32) (local $to i32)
 
     (drop (call $open (i32.const 3) (i32.const 0) (i32.const 0x100)
                       (i32.const 11) (i32.const 9) (i64.const 0x1fffffff)
@@ -81,17 +83,22 @@
     (call $emiti (call $advise (local.get $fd) (i64.const 0) (i64.const 4)
                                (i32.const 6)))
 
+    (drop (call $open (i32.const 3) (i32.const 0) (i32.const 0x100)
+                      (i32.const 11) (i32.const 0) (i64.const 0x1fffffff)
+                      (i64.const 0x1fffffff) (i32.const 0) (i32.const 0x300)))
+    (local.set $to (i32.load (i32.const 0x300)))
     (call $emiti (call $renumber (local.get $fd) (i32.const 9)))
-    (drop (call $seek (i32.const 9) (i64.const 0) (i32.const 0) (i32.const 0x310)))
+    (call $emiti (call $renumber (local.get $fd) (local.get $to)))
+    (drop (call $seek (local.get $to) (i64.const 0) (i32.const 0) (i32.const 0x310)))
     (i32.store (i32.const 0x200) (i32.const 0x500))
     (i32.store (i32.const 0x204) (i32.const 4))
-    (call $emiti (call $read (i32.const 9) (i32.const 0x200) (i32.const 1)
+    (call $emiti (call $read (local.get $to) (i32.const 0x200) (i32.const 1)
                              (i32.const 0x20c)))
     (call $emiti (i32.load (i32.const 0x20c)))
     (call $emiti (i32.load8_u (i32.const 0x500)))
     (call $emiti (call $tell (local.get $fd) (i32.const 0x310)))
-    (call $emiti (call $renumber (i32.const 9) (i32.const 1000000)))
-    (call $emiti (call $close (i32.const 9)))
+    (call $emiti (call $renumber (local.get $to) (i32.const 1000000)))
+    (call $emiti (call $close (local.get $to)))
 
     (i32.store8 (global.get $out) (i32.const 10))
     (i32.store (i32.const 0x200) (i32.const 0x800))

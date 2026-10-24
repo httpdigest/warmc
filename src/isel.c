@@ -1506,7 +1506,8 @@ static void analyse_immediates(Isel *s) {
                         in->op == I_TABLE_COPY || in->op == I_TABLE_INIT ||
                         in->op == I_STRUCT_NEW || in->op == I_ARRAY_NEW ||
                         in->op == I_ARRAY_NEW_SEG || in->op == I_ARRAY_OP ||
-                        in->op == I_REF_TEST);
+                        in->op == I_REF_TEST || in->op == I_ANY_OF_EXTERN ||
+                        in->op == I_EXTERN_OF_ANY);
       for (uint32_t j = 0; j < in->nargs; j++) {
         uses[a[j]]++;
         if (via_moves) s->no_remat[a[j]] = 1;

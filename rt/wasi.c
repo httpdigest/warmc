@@ -32,6 +32,12 @@ static void err(const char *s) {
   warmc_rt_write(2, s, (usz)(p - s));
 }
 
+static int bytes_eq(const char *a, const char *b, usz n) {
+  for (usz i = 0; i < n; i++)
+    if (a[i] != b[i]) return 0;
+  return 1;
+}
+
 static usz cstrlen(const char *s) {
   const char *p = s;
   while (*p) p++;
@@ -75,6 +81,8 @@ extern long warmc_win_write(int fd, const void *buf, usz n);
 #define host_write warmc_rt_write
 #endif
 
+#define IOV_MAX_TOTAL 0xffffffffull
+
 static u64 iov_walk_fd(WarmInstance *vm, int hostfd, int writing, u64 iovs_,
                        u64 niov_, u64 pn_) {
   u32 iovs = (u32)iovs_, niov = (u32)niov_, pn = (u32)pn_;
@@ -85,6 +93,9 @@ static u64 iov_walk_fd(WarmInstance *vm, int hostfd, int writing, u64 iovs_,
     if (!get32(vm, rec, &buf) || !get32(vm, rec + 4, &len)) return WASI_EFAULT;
     if (!ok(vm, buf, len)) return WASI_EFAULT;
     if (!len) continue;
+    /* the count comes back in 32 bits: no more than they can say moves */
+    if (len > IOV_MAX_TOTAL - total) len = (u32)(IOV_MAX_TOTAL - total);
+    if (!len) break;
     long r = writing ? host_write(hostfd, vm->mem_base + buf, len)
                      : host_read(hostfd, vm->mem_base + buf, len);
 
@@ -101,9 +112,17 @@ static u64 iov_walk_fd(WarmInstance *vm, int hostfd, int writing, u64 iovs_,
   return WASI_ESUCCESS;
 }
 
+/* An exit status is what the process exits with.  One the system cannot
+   carry -- it keeps 8 bits, so 256 would read as success -- or that a shell
+   takes for its own (126 and up) is a trap, as wasmtime makes it. */
 __attribute__((noreturn))
 static u64 wasi_proc_exit(WarmInstance *vm, u64 code) {
-
+  if ((u32)code >= 126) {
+    err("warmc-wasi: proc_exit(");
+    err_u64((u32)code);
+    err("): an exit status outside [0, 126)\n");
+    warmc_trap(TRAP_UNREACHABLE);
+  }
   warmc_report_run(vm);
   warmc_rt_exit((int)(u32)code);
 }
@@ -522,6 +541,8 @@ static u32 wasi_path_open(WarmInstance *vm, u64 dirfd_, u64 dirflags_,
   char path[PATHMAX], leaf[PATHMAX];
   u32 rc = copy_path(vm, path_, plen_, path);
   if (rc) return rc;
+  /* a file is not made by a name that says it is a directory */
+  if (((u32)oflags_ & 1) && plen_ && path[(u32)plen_ - 1] == '/') return WASI_EINVAL;
 
   u32 oflags = (u32)oflags_, fdflags = (u32)fdflags_;
   u64 rights = rights_ & d->rights_inh;
@@ -549,12 +570,15 @@ static u32 wasi_path_open(WarmInstance *vm, u64 dirfd_, u64 dirflags_,
     hostfd = openat(dir, name, hf | H_NOFOLLOW, 0666);
     if (hostfd >= 0) { walk_done(d->host, dir); break; }
     int e = h_errno;
-    if (!follow || e != H_ELOOP) { walk_done(d->host, dir); return to_wasi_errno(e); }
+    /* a link opened without following it: ELOOP, or on Linux ENOTDIR when
+       a directory is asked for, which a file answers too -- so ENOTDIR from
+       what is no link stays ENOTDIR */
+    if (!follow || (e != H_ELOOP && e != H_ENOTDIR)) { walk_done(d->host, dir); return to_wasi_errno(e); }
 
     char link[PATHMAX];
     long n = readlinkat(dir, name, link, PATHMAX - 1);
     walk_done(d->host, dir);
-    if (n < 0) return to_wasi_errno(h_errno);
+    if (n < 0) return to_wasi_errno(e == H_ENOTDIR ? e : h_errno);
     link[n] = 0;
     if (link[0] == '/') return WASI_EPERM;
     if (++links > MAXLINKS) return WASI_ELOOP;
@@ -593,10 +617,13 @@ static u64 wasi_fd_prestat_get2(WarmInstance *vm, u64 fd_, u64 buf_) {
 
 static u64 wasi_fd_prestat_dir_name(WarmInstance *vm, u64 fd_, u64 p_, u64 n_) {
   Fd *f = fd_get((u32)fd_);
-  if (!f || !f->preopen) return WASI_EBADF;
+  /* an open descriptor that is no preopen has no preopen's name, as
+     wasmtime answers it; one not open is none at all */
+  if (!f) return WASI_EBADF;
+  if (!f->preopen) return WASI_ENOTDIR;
   u32 p = (u32)p_, n = (u32)n_;
   usz len = cstrlen(f->pre_name);
-  if (n < len) return 28 ;
+  if (n < len) return 37 /* ENAMETOOLONG */;
   if (!ok(vm, p, len)) return WASI_EFAULT;
   for (usz i = 0; i < len; i++) vm->mem_base[p + i] = (u8)f->pre_name[i];
   return WASI_ESUCCESS;
@@ -712,6 +739,9 @@ static u64 fs_pio(WarmInstance *vm, u64 fd_, u64 iovs_, u64 niov_, u64 off_,
     if (!get32(vm, rec, &buf) || !get32(vm, rec + 4, &len)) return WASI_EFAULT;
     if (!ok(vm, buf, len)) return WASI_EFAULT;
     if (!len) continue;
+    /* the count comes back in 32 bits: no more than they can say moves */
+    if (len > IOV_MAX_TOTAL - total) len = (u32)(IOV_MAX_TOTAL - total);
+    if (!len) break;
     long r = writing ? pwrite(f->host, vm->mem_base + buf, len, off)
                      : pread(f->host, vm->mem_base + buf, len, off);
     if (r < 0) {
@@ -736,11 +766,13 @@ static u64 wasi_fd_pwrite(WarmInstance *vm, u64 a, u64 b, u64 c, u64 d, u64 e) {
 static u64 wasi_fd_seek2(WarmInstance *vm, u64 fd_, u64 off_, u64 whence_, u64 pn_) {
   Fd *f = fd_get((u32)fd_);
   if (!f) return WASI_EBADF;
-  if (!(f->rights & R_FD_SEEK)) return 70 ;
 
   static const int W[3] = { 0 , 1 , 2  };
   u32 w = (u32)whence_;
   if (w > 2) return 28 ;
+  /* a seek that leaves the offset where it is asks only for fd_tell */
+  u64 need = (off_ == 0 && w == 1) ? R_FD_SEEK | R_FD_TELL : R_FD_SEEK;
+  if (!(f->rights & need)) return WASI_ENOTCAPABLE;
   long long r = lseek(f->host, (long long)off_, W[w]);
   if (r < 0) return to_wasi_errno(h_errno);
   if (!put64(vm, (u32)pn_, (u64)r)) return WASI_EFAULT;
@@ -750,14 +782,14 @@ static u64 wasi_fd_seek2(WarmInstance *vm, u64 fd_, u64 off_, u64 whence_, u64 p
 static u64 wasi_fd_tell(WarmInstance *vm, u64 fd_, u64 pn_) {
   Fd *f = fd_get((u32)fd_);
   if (!f) return WASI_EBADF;
-  if (!(f->rights & R_FD_TELL)) return 70 ;
+  if (!(f->rights & R_FD_TELL)) return WASI_ENOTCAPABLE;
   long long r = lseek(f->host, 0, 1 );
   if (r < 0) return to_wasi_errno(h_errno);
   if (!put64(vm, (u32)pn_, (u64)r)) return WASI_EFAULT;
   return WASI_ESUCCESS;
 }
 
-#define WITH_LEAF(right, body)                                   \
+#define WITH_LEAF(right, trim, body)                             \
   Fd *d = fd_get((u32)fd_);                                      \
   if (!d) return WASI_EBADF;                                     \
   if (d->type != FT_DIR) return WASI_ENOTDIR;                    \
@@ -765,6 +797,7 @@ static u64 wasi_fd_tell(WarmInstance *vm, u64 fd_, u64 pn_) {
   char path[PATHMAX], leaf[PATHMAX];                             \
   u32 rc = copy_path(vm, p_, n_, path);                          \
   if (rc) return rc;                                             \
+  if (trim) wasifs_trim_slash(path);                             \
   int dir;                                                       \
   rc = walk(d->host, path, &dir, leaf);                          \
   if (rc) return rc;                                             \
@@ -774,15 +807,15 @@ static u64 wasi_fd_tell(WarmInstance *vm, u64 fd_, u64 pn_) {
   return r < 0 ? to_wasi_errno(h_errno) : WASI_ESUCCESS;
 
 static u64 wasi_path_create_directory(WarmInstance *vm, u64 fd_, u64 p_, u64 n_) {
-  WITH_LEAF(R_PATH_CREATE_DIRECTORY, mkdirat(dir, name, 0777))
+  WITH_LEAF(R_PATH_CREATE_DIRECTORY, 1, mkdirat(dir, name, 0777))
 }
 
 static u64 wasi_path_unlink_file(WarmInstance *vm, u64 fd_, u64 p_, u64 n_) {
-  WITH_LEAF(R_PATH_UNLINK_FILE, unlinkat(dir, name, 0))
+  WITH_LEAF(R_PATH_UNLINK_FILE, 0, unlinkat(dir, name, 0))
 }
 
 static u64 wasi_path_remove_directory(WarmInstance *vm, u64 fd_, u64 p_, u64 n_) {
-  WITH_LEAF(R_PATH_REMOVE_DIRECTORY, unlinkat(dir, name, H_AT_REMOVEDIR))
+  WITH_LEAF(R_PATH_REMOVE_DIRECTORY, 0, unlinkat(dir, name, H_AT_REMOVEDIR))
 }
 
 #if defined(WARMC_WINDOWS)
@@ -881,11 +914,25 @@ static u64 two_place(WarmInstance *vm, u64 sfd_, u64 sp_, u64 sn_, u64 dfd_,
   if (rc) return rc;
   rc = copy_path(vm, dp_, dn_, dp);
   if (rc) return rc;
+  /* a rename by a name that ends in a slash moves the entry itself, which
+     must be a directory */
+  int trailed = 0;
+  if (!hard) {
+    trailed |= wasifs_trim_slash(sp);
+    trailed |= wasifs_trim_slash(dp);
+  }
   int sdir, ddir;
   rc = walk(s->host, sp, &sdir, sl);
   if (rc) return rc;
   rc = walk(t->host, dp, &ddir, dl);
   if (rc) { walk_done(s->host, sdir); return rc; }
+  if (trailed) {
+    u8 st[ST_SIZE];
+    rc = 0;
+    if (fstatat(sdir, sl[0] ? sl : ".", st, H_AT_NOFOLLOW) < 0) rc = to_wasi_errno(h_errno);
+    else if (st_filetype(st) != FT_DIR) rc = WASI_ENOTDIR;
+    if (rc) { walk_done(s->host, sdir); walk_done(t->host, ddir); return rc; }
+  }
   int r = hard ? linkat(sdir, sl[0] ? sl : ".", ddir, dl[0] ? dl : ".",
                         follow ? H_AT_SYMLINK_FOLLOW : 0)
                : renameat(sdir, sl[0] ? sl : ".", ddir, dl[0] ? dl : ".");
@@ -902,9 +949,13 @@ static u64 wasi_path_rename(WarmInstance *vm, u64 a, u64 b, u64 c, u64 d,
 
 static u64 wasi_path_link(WarmInstance *vm, u64 sfd, u64 flags, u64 sp, u64 sn,
                           u64 dfd, u64 dp, u64 dn) {
-
+  /* Following a symlink at the source is refused, as wasmtime refuses it:
+     two_place resolves every component but the leaf, and linkat with
+     AT_SYMLINK_FOLLOW would follow a leaf link the guest made to anywhere
+     -- out of the preopen included -- and hard-link what it names. */
+  if ((u32)flags & 1) return WASI_EINVAL;
   return two_place(vm, sfd, sp, sn, dfd, dp, dn, R_PATH_LINK_SOURCE,
-                   R_PATH_LINK_TARGET, 1, ((u32)flags & 1) != 0);
+                   R_PATH_LINK_TARGET, 1, 0);
 }
 
 static u32 de_namlen(const u8 *de) { return wasifs_de_namlen(de); }
@@ -1078,9 +1129,9 @@ static u64 wasi_path_filestat_set_times(WarmInstance *vm, u64 fd_, u64 lf_,
 static u64 wasi_fd_renumber(WarmInstance *vm, u64 from_, u64 to_) {
   (void)vm;
   u32 a = (u32)from_, b = (u32)to_;
-  if (!fd_get(a)) return WASI_EBADF;
+  /* both must be open: renumbering moves one descriptor over another */
+  if (!fd_get(a) || !fd_get(b)) return WASI_EBADF;
 
-  if (!fds_reserve(b)) return WASI_EBADF;
   if (a == b) return WASI_ESUCCESS;
   if (g_fds[b].dir) closedir(g_fds[b].dir);
   if (g_fds[b].host >= 0 && !g_fds[b].keep_host) close(g_fds[b].host);
@@ -1185,6 +1236,9 @@ static u64 wasi_poll_oneoff(WarmInstance *vm, u64 in_, u64 out_, u64 n_, u64 pn_
     }
   }
 
+  /* an event already there -- a descriptor that cannot be polled -- ends
+     the wait before it starts, as a ready one would */
+  if (nout) { have_rel = 1; min_rel = 0; }
   long long timeout = have_rel ? (long long)ns_to_ms_up(min_rel) : -1;
 
   if (npfd) {
@@ -1321,6 +1375,9 @@ static u64 sock_io(WarmInstance *vm, Fd *f, u64 iovs_, u64 niov_, int mflags,
     if (!get32(vm, rec, &buf) || !get32(vm, rec + 4, &len)) return WASI_EFAULT;
     if (!ok(vm, buf, len)) return WASI_EFAULT;
     if (!len) continue;
+    /* the count comes back in 32 bits: no more than they can say moves */
+    if (len > IOV_MAX_TOTAL - total) len = (u32)(IOV_MAX_TOTAL - total);
+    if (!len) break;
     long r = sending ? send(f->host, vm->mem_base + buf, len, mflags)
                      : recv(f->host, vm->mem_base + buf, len, mflags);
 
@@ -1617,7 +1674,27 @@ static int drive(int argc, char **argv) {
   }
   warmc_register("wasi_snapshot_preview1", stub);
 
-  WarmInstance *app = warmc_instantiate_catching(&warmc_module, &e);
+  /* WASI's functions bound as the module is made, so that its start
+     function can call them; one this host does not have is the stub's,
+     which traps */
+  const ModuleDesc *md = &warmc_module;
+  WarmBinding *binds = md->nimports ? realloc(0, sizeof(WarmBinding) * md->nimports) : 0;
+  for (u32 i = 0; i < md->nimports; i++) {
+    const ImportDesc *im = &md->imports[i];
+    binds[i] = (WarmBinding){ 0, 0, 0, 0 };
+    if (im->kind != 0 || im->module_len != 22 ||
+        !bytes_eq(im->module, "wasi_snapshot_preview1", 22))
+      continue;
+    for (u32 k = 0; k < NBINDINGS; k++)
+      if (im->name_len == cstrlen(BINDINGS[k].name) &&
+          bytes_eq(im->name, BINDINGS[k].name, im->name_len)) {
+        binds[i].code = BINDINGS[k].fn;
+        binds[i].self = 1;
+        break;
+      }
+  }
+  WarmInstance *app = warmc_instantiate_bound_catching(md, binds, &e);
+  free(binds);
   if (!app) {
 
     err("warmc-wasi: the module failed to instantiate or link: ");
@@ -1625,10 +1702,6 @@ static int drive(int argc, char **argv) {
     err(" ("); err_u64(e); err(")\n");
     return 71;
   }
-
-  for (u32 i = 0; i < NBINDINGS; i++)
-    warmc_bind_import(app, "wasi_snapshot_preview1", BINDINGS[i].name,
-                      BINDINGS[i].fn, app);
 
   const ExportDesc *ex = warmc_find_export(app, "_start");
   if (!ex) {

@@ -294,11 +294,31 @@ void warmc_lib_call(u32 idx, const u64 *gpr, const u64 *fpr, const u8 *stk,
     u64 ret[WARMC_RETBUF_WORDS] = { 0 };
     CArgs a = { gpr, fpr, stk, 0, 0, 0, 0 };
     u32 ni = 0, nf = 0;
+#if defined(__x86_64__)
+    /* Parameters past the three integer and four float registers ride the
+       callee's stack slots, eight bytes each in parameter order; shlib.c
+       gives no C symbol to an export with more than the image holds. */
+    u64 stkimg[WARMC_X64_STACK_BYTES / 8];
+    u32 w = 0;
+    for (u32 i = 0; i < e->nparams; i++) {
+      u8 t = e->ptypes[i];
+      u64 v = is_float(t) ? c_float(&a, width(t)) : c_int(&a, width(t));
+      if (is_float(t) ? nf >= 4 : ni >= 3) {
+        if (w < WARMC_X64_STACK_BYTES / 8) stkimg[w++] = v;
+      } else if (is_float(t)) {
+        fargs[2 * nf] = v;
+      } else {
+        iargs[ni] = v;
+      }
+      if (is_float(t)) nf++; else ni++;
+    }
+#else
     for (u32 i = 0; i < e->nparams; i++) {
       u8 t = e->ptypes[i];
       if (is_float(t)) fargs[2 * nf++] = c_float(&a, width(t));
       else iargs[ni++] = c_int(&a, width(t));
     }
+#endif
     u8 *outs[WARMC_RET_MAX_RESULTS];
     if (e->nresults > 1)
       for (u32 i = 0; i < e->nresults; i++) outs[i] = (u8 *)(uptr)c_int(&a, 8);
@@ -307,14 +327,6 @@ void warmc_lib_call(u32 idx, const u64 *gpr, const u64 *fpr, const u8 *stk,
     if (lib_depth == 1) lib_vm->stack_limit = thread_stack_limit();
     FuncRef fr = warmc_export_func(lib_vm, e);
 #if defined(__x86_64__)
-    /* Parameters past the three integer and four float registers ride the
-       callee's stack slots, eight bytes each in parameter order. */
-    u64 stkimg[24];
-    u32 w = 0, i2 = 0, f2 = 0;
-    for (u32 i = 0; i < e->nparams; i++) {
-      if (is_float(e->ptypes[i])) { if (f2 >= 4) stkimg[w++] = fargs[2 * f2]; f2++; }
-      else { if (i2 >= 3) stkimg[w++] = iargs[i2]; i2++; }
-    }
     trap = warmc_invoke_catching_s(fr.code, (WarmInstance *)fr.instance, iargs,
                                    fargs, ret, stkimg, 8ull * w);
 #else
