@@ -55,7 +55,7 @@ static const char *usage_text =
   "                partial-escape, gloop, gssa, loopclose, cpool, ictab, reach,\n"
   "                prune, merge, devirt, reinline, throw-jump, closed-world,\n"
   "                gcpure, split, labcache, ifconv, mulwide, barelide,\n"
-  "                small-loop-align, fma, dead-frames\n"
+  "                small-loop-align, trampoline, fma, dead-frames\n"
   "                fma is off unless asked for: it fuses a float multiply\n"
   "                into the add that reads it, rounded once, which is not\n"
   "                wasm's arithmetic and can change a result's last bit\n"
@@ -302,6 +302,7 @@ int main(int argc, char **argv) {
   opt.loopclose = true;
   opt.cpool = true;
   opt.ictab = true;
+  opt.trampoline = true;
   opt.reassoc = true;
   opt.labcache = true;
   opt.barelide = true;
@@ -362,6 +363,7 @@ int main(int argc, char **argv) {
 
       opt.level = 0;
       opt.guard_pages = false;
+      opt.trampoline = false;
       opt.align = false;
       opt.split = false;
       opt.inl = false;
@@ -441,6 +443,7 @@ int main(int argc, char **argv) {
       else if (!strcmp(name, "loopclose")) opt.loopclose = on;
       else if (!strcmp(name, "cpool")) opt.cpool = on;
       else if (!strcmp(name, "ictab")) opt.ictab = on;
+      else if (!strcmp(name, "trampoline")) opt.trampoline = on;
       else if (!strcmp(name, "gssa")) opt.gssa = on;
       else if (!strcmp(name, "gssa-all")) opt.gssa = opt.gssa_all = on;
       else if (!strcmp(name, "small-loop-align")) opt.small_loop_align = on;
@@ -635,7 +638,7 @@ int main(int argc, char **argv) {
             "             ldpairs=%llu stpairs=%llu cold_frames=%llu early_rets=%llu\n"
             "             reloads=%llu caller_saves=%llu csa_restores=%llu"
             " v128_spills=%llu rb_trips=%llu split_cuts=%llu split_invs=%llu pieces=%llu"
-            " loop_pieces=%llu recomputes=%llu dead_frame_stores=%llu\n"
+            " loop_pieces=%llu recomputes=%llu dead_frame_stores=%llu tramp_funcs=%llu\n"
             "             escape_removed=%llu escape_forwarded=%llu escape_made=%llu gloop=%llu\n"
             "             loop_closed=%llu reassoc=%llu cmp_reused=%llu csel_fused=%llu mul_wide=%llu fma=%llu gssa=%llu\n"
             "             bar_masks=%llu bar_elided=%llu\n"
@@ -679,6 +682,7 @@ int main(int argc, char **argv) {
             (unsigned long long)g_stats.loop_pieces,
             (unsigned long long)g_stats.recomputes,
             (unsigned long long)g_stats.dead_frame_stores,
+            (unsigned long long)g_stats.tramp_funcs,
             (unsigned long long)g_stats.escape_removed,
             (unsigned long long)g_stats.escape_forwarded,
             (unsigned long long)g_stats.escape_made,

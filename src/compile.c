@@ -588,6 +588,8 @@ void compile_module(Module *m, ObjBuilder *o, const OptOpts *opts) {
   g_guard_pages = opts->guard_pages;
   g_det_profile = opts->det_profile;
   g_profile = opts->profile;
+  /* before anything reads a function's signature: it changes some */
+  if (opts->trampoline) g_stats.tramp_funcs += module_untrampoline(m);
   codegen_prepare_module(m, o);
 
   if (opts->reach && !m->reached) {

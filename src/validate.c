@@ -1402,3 +1402,12 @@ void wasm_validate(Module *m) {
   xfree(g_declared);
   g_declared = NULL;
 }
+
+/* Bodies a module transform rewrote, validated as wasm_validate validates
+   every body (tramp.c): what it writes must be wasm a validator accepts. */
+void wasm_validate_funcs(Module *m, const uint32_t *fns, uint32_t n) {
+  collect_declared(m);
+  for (uint32_t k = 0; k < n; k++) validate_func(m, fns[k]);
+  xfree(g_declared);
+  g_declared = NULL;
+}

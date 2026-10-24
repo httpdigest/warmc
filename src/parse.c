@@ -913,5 +913,33 @@ void module_free(Module *m) {
   xfree(m->datas);
   if (m->t0) { xfree(m->t0->entry); xfree(m->t0->sites); xfree(m->t0); }
   xfree(m->ict); xfree(m->ict_of);
+  for (uint32_t i = 0; i < m->nowned_bodies; i++) xfree(m->owned_bodies[i]);
+  xfree(m->owned_bodies);
   xfree(m);
+}
+
+/* A function type of its own rec group, appended as the parser appends
+   one: for a transform that gives functions a signature the module did not
+   have (tramp.c).  One not final has an identity of its own, which no type
+   the module wrote by the same structure shares. */
+uint32_t module_add_func_type(Module *m, const ValType *params, uint32_t nparams,
+                              const ValType *results, uint32_t nresults, bool final_) {
+  uint32_t i = m->ntypes;
+  m->types = xrealloc(m->types, (i + 1) * sizeof(CompType));
+  CompType *t = &m->types[i];
+  memset(t, 0, sizeof *t);
+  t->kind = CT_FUNC;
+  t->final_ = final_;
+  t->rec_first = i;
+  t->rec_n = 1;
+  t->params = xmalloc((nparams ? nparams : 1) * sizeof(ValType));
+  memcpy(t->params, params, nparams * sizeof(ValType));
+  t->nparams = nparams;
+  t->results = xmalloc((nresults ? nresults : 1) * sizeof(ValType));
+  memcpy(t->results, results, nresults * sizeof(ValType));
+  t->nresults = nresults;
+  m->ntypes = i + 1;
+  identify_group(m, i, 1);
+  build_display(m, i);
+  return i;
 }
