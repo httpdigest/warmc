@@ -1817,15 +1817,17 @@ static void emit_inst(Isel *s, Ref v) {
       call_helper_imm(s, "warmc_memory_grow", a, 1, in->imm, v, true);
       break;
     case I_MEM_COPY: {
-      bool fast = emit_small_memop(s, in, a, false) != (size_t)-1;
+      size_t site = emit_small_memop(s, in, a, false);
+      if (site == SMO_INLINE) break;
       call_helper_imm2(s, "warmc_memory_copy", a, 3, in->imm, in->imm2);
-      if (fast) emit_small_memop_done(s);
+      if (site != (size_t)-1) emit_small_memop_done(s);
       break;
     }
     case I_MEM_FILL: {
-      bool fast = emit_small_memop(s, in, a, true) != (size_t)-1;
+      size_t site = emit_small_memop(s, in, a, true);
+      if (site == SMO_INLINE) break;
       call_helper_imm(s, "warmc_memory_fill", a, 3, in->imm, 0, false);
-      if (fast) emit_small_memop_done(s);
+      if (site != (size_t)-1) emit_small_memop_done(s);
       break;
     }
     case I_MEM_INIT: {

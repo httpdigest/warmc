@@ -806,7 +806,12 @@ Module *wasm_parse(const uint8_t *bin, size_t len) {
       last_id = rank;
     }
     switch (id) {
-      case 0: xfree(rd_name(&sec, NULL)); break;
+      case 0: {
+        char *nm = rd_name(&sec, NULL);
+        if (!strcmp(nm, "go:buildid")) m->go_stack = true;
+        xfree(nm);
+        break;
+      }
       case 1: parse_types(m, &sec); break;
       case 2: parse_imports(m, &sec); break;
       case 3: parse_functions(m, &sec); break;

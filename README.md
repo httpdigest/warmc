@@ -686,13 +686,14 @@ command-line order, so put them **after** `-O`.
 
 | Pass | What it does |
 |---|---|
-| `fold` | constant folding and algebraic simplification, including a constant reinterpreted between integer and float and two xor-shifts that cancel |
+| `fold` | constant folding and algebraic simplification, including a constant reinterpreted between integer and float and two xor-shifts that cancel; a reinterpret undone, a store of reinterpreted bits, and an integer load read only as float bits, as the C ABI copies a struct's doubles, move the bits in the float registers |
 | `dce` | dead-code elimination |
 | `cse` | common-subexpression elimination over dominators |
 | `licm` | loop-invariant code motion, including hoisting invariant stores and trap guards; a value is taken out of the innermost loop that reads it and no further, and a native address stays by the access it serves, which folds it |
 | `branch` | constant-branch folding and block merging |
 | `edge-tests` | in loops, fold a test or branch that a dominating branch on the same value has already decided, such as an inlined bounds check behind a loop's own exit test |
 | `fma` | off unless asked for: a float multiply whose one reader is an add or a subtract becomes one fused multiply-add (`fmadd`, `fmla`), rounded once. wasm rounds the multiply and the add each, so a result can differ in its last bit; `-ffma` is for code that does not depend on that, as native C compilers assume by default |
+| `dead-frames` | off unless asked for: assumes C's stack, where nothing reads a function's frame once it returns, and while it runs only the function and the callees it passes pointers into it; a store into the frame that nothing can read before the function returns is removed, such as the copies the C ABI makes of struct arguments and results once inlining has forwarded them (`cbench/structval`, 45% fewer cycles). wasm keeps those stores, so a program that reads stack memory it never wrote can see other bytes. A module whose stack is not C's -- Go's, an asyncify one, or one where a function reads above the stack pointer it was entered with -- is left as it is, and a call that may reach a function scanning its callers' frames, as a collector does, reads the whole frame |
 | `mulwide` | a 64-by-64 multiply that wasm spells in 32-bit halves -- `__multi3` from Rust, C and Zig, Go's `bits.Mul64` -- becomes one `mul` for the low half and `umulh`, or `smulh` for sign-extended operands, for the high |
 | `ifconv` | if-conversion: a diamond or triangle whose arms are cheap and cannot trap becomes selects (`csel`), and so does a small `br_table` of cheap arms, its default dropped where the index is provably in range |
 | `thread` | jump threading through a block that only switches on a parameter, such as the dispatch Go's compiler puts around every function, or only compares one with a constant, when an edge passes that parameter a constant |

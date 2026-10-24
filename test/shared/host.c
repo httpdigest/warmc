@@ -107,6 +107,39 @@ int main(void) {
         "a read past memory traps out of bounds: %u", basic_last_trap());
   CHECK(quot(9, 3) == 3 && basic_last_trap() == 0, "and the next call clears it");
 
+  /* Constant-length copies and fills: in bounds they move the bytes, an
+     overlapping copy as memmove does; past the end by either range they
+     trap out of bounds and leave memory as it was. */
+  if (mem && size == 65536) {
+    uint8_t want[100];
+    for (int i = 0; i < 100; i++) mem[i] = (uint8_t)i;
+    copy72(8, 0);
+    for (int i = 0; i < 80; i++) want[i] = (uint8_t)(i < 8 ? i : i - 8);
+    CHECK(basic_last_trap() == 0 && !memcmp(mem, want, 80), "copy72 overlapping");
+    memset(mem + 65536 - 100, 0x11, 100);
+    copy72(65536 - 72, 0);
+    CHECK(basic_last_trap() == 0 && !memcmp(mem + 65536 - 72, mem, 72), "copy72 up to the end");
+    memset(mem + 65536 - 100, 0x11, 100);
+    memset(want, 0x11, 100);
+    copy72(65536 - 40, 0);
+    CHECK(basic_last_trap() == 2 && !memcmp(mem + 65536 - 100, want, 100),
+          "copy72 to past the end traps, writing nothing: %u", basic_last_trap());
+    copy12(65536 - 8, 0);
+    CHECK(basic_last_trap() == 2 && !memcmp(mem + 65536 - 100, want, 100),
+          "copy12 to past the end traps, writing nothing: %u", basic_last_trap());
+    fill40(65536 - 20);
+    CHECK(basic_last_trap() == 2 && !memcmp(mem + 65536 - 100, want, 100),
+          "fill40 past the end traps, writing nothing: %u", basic_last_trap());
+    memset(mem, 0x22, 100);
+    memset(want, 0x22, 100);
+    copy72(0, 65536 - 40);
+    CHECK(basic_last_trap() == 2 && !memcmp(mem, want, 100),
+          "copy72 from past the end traps, writing nothing: %u", basic_last_trap());
+    fill40(65536 - 40);
+    CHECK(basic_last_trap() == 0 && mem[65535] == 0xab && mem[65536 - 41] == 0x11,
+          "fill40 up to the end");
+  }
+
   int32_t before = calls();
   pthread_t th[THREADS];
   for (int i = 0; i < THREADS; i++)

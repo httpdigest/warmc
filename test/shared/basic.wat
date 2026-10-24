@@ -85,6 +85,12 @@
         (br $next)))
     (local.get $s))
 
+  ;; copies and a fill whose lengths are constants, done inline: one past
+  ;; the end of memory by either range traps before it writes a byte
+  (func (export "copy72") (param i32 i32) (memory.copy (local.get 0) (local.get 1) (i32.const 72)))
+  (func (export "copy12") (param i32 i32) (memory.copy (local.get 0) (local.get 1) (i32.const 12)))
+  (func (export "fill40") (param i32) (memory.fill (local.get 0) (i32.const 0xab) (i32.const 40)))
+
   ;; v128 cannot cross a C call: this one gets no symbol, with a warning
   (func (export "splat") (param i32) (result v128) (i32x4.splat (local.get 0)))
 
