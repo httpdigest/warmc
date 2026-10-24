@@ -152,9 +152,11 @@ expect guard_past_fault  "out of bounds memory access"
 expect stack_overflow    "call stack exhausted"
 # A memory past the runtime's limit of 65535 pages for a 32-bit one is
 # refused at instantiation, saying so, not trapped as an access.
-printf '(module (memory 65536) (func (export "f")))\n' > "$WORK/bigmem.wat"
-if wtimeout ./$BUILD/warmc $WARMC_TARGET_FLAGS -o "$WORK/bigmem" "$WORK/bigmem.wat" 2>"$WORK/bigmem.err"; then
-  out=$(wruntimeout $WARMC_RUN "$WORK/bigmem" f 2>&1); rc=$?
+# Every traps row shares $WORK, so the files are this row's own.
+BIG="$WORK/bigmem$FTAG"
+printf '(module (memory 65536) (func (export "f")))\n' > "$BIG.wat"
+if wtimeout ./$BUILD/warmc $WARMC_TARGET_FLAGS -o "$BIG" "$BIG.wat" 2>"$BIG.err"; then
+  out=$(wruntimeout $WARMC_RUN "$BIG" f 2>&1); rc=$?
   if [ "$rc" -ne 4 ] || [[ "$out" != *"cannot instantiate: a 32-bit memory of more than 65535 pages"* ]]; then
     echo "FAIL[traps] a memory of 65536 pages: expected the refusal, exit 4, got rc=$rc: $out"
     fail=$((fail+1))
@@ -162,7 +164,7 @@ if wtimeout ./$BUILD/warmc $WARMC_TARGET_FLAGS -o "$WORK/bigmem" "$WORK/bigmem.w
     pass=$((pass+1))
   fi
 else
-  echo "FAIL[traps] a memory of 65536 pages does not compile: $(head -1 "$WORK/bigmem.err")"
+  echo "FAIL[traps] a memory of 65536 pages does not compile: $(head -1 "$BIG.err")"
   fail=$((fail+1))
 fi
 

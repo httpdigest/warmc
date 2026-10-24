@@ -753,10 +753,17 @@ static u64 p2_open_at(WarmInstance *vm, u64 self, u64 pflags, u64 p, u64 n,
   Desc *d = desc_of(self);
   int dir = -1;
   char leaf[PATHMAX];
-  /* a file is not made by a name that says it is a directory */
+  /* a file is not made by a name that says it is a directory, and the
+     error-code is the host's open(2) as wasmtime passes it on: is-directory
+     on Linux, which answers EISDIR for any O_CREAT path that ends in a slash,
+     invalid on macOS, which answers EINVAL */
   if ((oflags & 1) && (n & 0xffffffffu) && ok(vm, p, n & 0xffffffffu) &&
       vm->mem_base[p + (n & 0xffffffffu) - 1] == '/') {
+#if defined(WARMC_DARWIN)
     res_err(vm, ret, 4, EC_INVALID);
+#else
+    res_err(vm, ret, 4, EC_ISDIR);
+#endif
     return 0;
   }
   u32 ec = at_leaf(d, vm, p, n, (int)(pflags & 1), &dir, leaf, 0);

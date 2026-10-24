@@ -62,6 +62,18 @@ run_case() {
   # wasmtime sleeps in whole Windows timer ticks, so it rounds nap's 100us up
   # and says `slow`; there warmc is held to what nap.wat promises instead.
   if [ "$WIN" = 1 ] && [ "$name" = nap ]; then printf 'ok\n' > "$WORK/$name.ref.out"; fi
+  # wasmtime on Windows answers paths that end in a slash by rules of its own:
+  # EACCES for every directory removed or unlinked through one, readlink
+  # through one reading the link, a link to nothing refused with ENOENT, and
+  # a create through one that fails ENOTDIR yet leaves the file behind.
+  # rt/winposix.c gives the Linux host's answers throughout, so a module whose
+  # $name.linux.out is recorded beside it -- what wasmtime prints on Linux, and
+  # $name.linux.tree the directory it leaves -- is held to those there.
+  local tree_ref="$WORK/$name.tree.ref"
+  if [ "$WIN" = 1 ] && [ -f "test/wasi/$name.linux.out" ]; then
+    cp "test/wasi/$name.linux.out" "$WORK/$name.ref.out"
+    tree_ref="test/wasi/$name.linux.tree"
+  fi
 
   local bad=0
   if ! cmp -s "$WORK/$name.warmc.out" "$WORK/$name.ref.out"; then
@@ -87,9 +99,9 @@ run_case() {
     > "$WORK/$name.tree.warmc" 2>/dev/null
   ( cd "$dr" && find . | LC_ALL=C sort && echo -- && find . -type f -exec cat {} + ) \
     > "$WORK/$name.tree.ref" 2>/dev/null
-  if ! cmp -s "$WORK/$name.tree.warmc" "$WORK/$name.tree.ref"; then
+  if ! cmp -s "$WORK/$name.tree.warmc" "$tree_ref"; then
     echo "FAIL[wasi/$name]: the directory each engine left differs"
-    diff "$WORK/$name.tree.ref" "$WORK/$name.tree.warmc" | head -12 | sed 's/^/    /'
+    diff "$tree_ref" "$WORK/$name.tree.warmc" | head -12 | sed 's/^/    /'
     bad=1
   fi
   if [ "$bad" = 0 ]; then pass=$((pass + 1)); else fail=1; fi

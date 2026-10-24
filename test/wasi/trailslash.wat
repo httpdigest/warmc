@@ -4,7 +4,9 @@
 ;; preopen.  The setup makes a directory d, a file f, links ld -> d, lf -> f
 ;; and lx -> x (not there), and a file d/x; each operation then prints its
 ;; errno, 0 for success, and the whole is diffed against wasmtime, the tree
-;; left behind included.
+;; left behind included -- on Windows against what wasmtime gives on Linux,
+;; trailslash.linux.out and trailslash.linux.tree, since rt/winposix.c keeps
+;; Linux's answers where wasmtime's Windows host has rules of its own.
 (module
   (import "wasi_snapshot_preview1" "path_open"
     (func $open (param i32 i32 i32 i32 i32 i64 i64 i32 i32) (result i32)))

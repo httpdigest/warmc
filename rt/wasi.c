@@ -541,8 +541,16 @@ static u32 wasi_path_open(WarmInstance *vm, u64 dirfd_, u64 dirflags_,
   char path[PATHMAX], leaf[PATHMAX];
   u32 rc = copy_path(vm, path_, plen_, path);
   if (rc) return rc;
-  /* a file is not made by a name that says it is a directory */
-  if (((u32)oflags_ & 1) && plen_ && path[(u32)plen_ - 1] == '/') return WASI_EINVAL;
+  /* a file is not made by a name that says it is a directory.  The errno is
+     the host's open(2), as wasmtime passes it on: Linux answers EISDIR for any
+     O_CREAT path that ends in a slash, macOS EINVAL; Windows takes Linux's,
+     as rt/winposix.c does throughout */
+  if (((u32)oflags_ & 1) && plen_ && path[(u32)plen_ - 1] == '/')
+#if defined(WARMC_DARWIN)
+    return WASI_EINVAL;
+#else
+    return WASI_EISDIR;
+#endif
 
   u32 oflags = (u32)oflags_, fdflags = (u32)fdflags_;
   u64 rights = rights_ & d->rights_inh;
