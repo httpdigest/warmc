@@ -246,6 +246,7 @@ start adapter   python3 test/run_adapter.py
 
 start clink     python3 test/run_clink.py
 start levels    ./test/run_levels.sh
+start customs   python3 test/run_customs.py
 
 start wat       python3 test/run_wat.py
 

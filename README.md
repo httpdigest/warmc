@@ -414,6 +414,7 @@ The rest of the API, in [`rt/warm_rt.h`](rt/warm_rt.h):
 | `warmc_invoke_s`, `warmc_invoke_catching_s` | x64 only: for functions with more than 3 integer or 4 float parameters, which take the rest from an image of their stack slots, 8 bytes per scalar and 16 per `v128`. On arm64 a function with more than 7 integer or 8 float parameters cannot be called from C. |
 | `warmc_global_cell(inst, idx)`, `inst->mem_base` / `mem_size` | access globals and linear memory 0 |
 | `warmc_gc_collect()`, `warmc_gc_hold()` / `warmc_gc_release()` | drive the collector; register C-side roots |
+| `warmc_custom_section(md, name, index, &data, &size)` | the module's custom sections named `name`: how many there are, and the `index`-th one's payload (see [Custom sections](#custom-sections)) |
 
 Limits: at most 4096 instances per process, and instances are never freed.
 At `-O2` each module's first memory, and each further one it defines, takes
@@ -451,7 +452,7 @@ $ ls
 calc.h  calc.wat  libcalc.dylib
 ```
 
-`calc.h` declares the exports, a type for each import, and four functions of
+`calc.h` declares the exports, a type for each import, and five functions of
 the library's own, named after it:
 
 ```c
@@ -465,6 +466,7 @@ uint32_t calc_last_trap(void);
 const char *calc_trap_name(uint32_t trap);
 uint8_t *calc_memory(size_t *size);
 int calc_bind_import(const char *module, const char *name, void *fn, void *ctx);
+size_t calc_custom_section(const char *name, size_t index, const uint8_t **data, size_t *size);
 ```
 
 ```c
@@ -520,6 +522,12 @@ How a library behaves:
   the program's own, keeps working.
 - **Options.** The first call reads the runtime's `WARMC_GC_*` variables from
   the environment, as a program does when it starts.
+- **Custom sections.** `calc_custom_section(name, index, &data, &size)`
+  returns how many of the module's custom sections are named `name`, as
+  `WebAssembly.Module.customSections` does, and gives the `index`-th one's
+  payload, or NULL and 0 when there is none. It needs no instance, and the
+  payload lives as long as the library. Which sections there are is
+  `--custom-sections`'s (see [Custom sections](#custom-sections)).
 
 Names:
 - `--symbol-prefix=P` sets the prefix of the library's own functions.
@@ -603,6 +611,32 @@ public class Calc {
 
 `test/shared/` has a fuller C program, C++ use of the header, and Python and
 Java tests; `test/run_shared.sh` runs them all.
+
+### Custom sections
+
+What warmc compiles carries the module's custom sections, in a read-only
+section of their own: `.wasm.custom` in ELF, `__TEXT,__wasm_custom` in
+Mach-O, `.wcustom` in COFF and PE. A tool finds them there
+(`otool -s __TEXT __wasm_custom`, `llvm-objcopy --dump-section`), and the
+runtime hands them out by name: `warmc_custom_section` for an embedder, and
+`PREFIX_custom_section` from a library. By default every one is kept but the
+name section, whose names the symbols already carry, and DWARF's `.debug_*`
+sections. `--custom-sections=all` keeps those too, and `--custom-sections=none`
+keeps none, so the output then has no such section.
+
+The section holds a table per module (a component has several), each
+8-aligned and little-endian:
+
+| Bytes | |
+|---|---|
+| 8 | `wcustom\0` |
+| 4 | the table's size, these 16 bytes included |
+| 4 | how many custom sections it lists, `n` |
+| 16 × `n` | for each, in the module's order: the offset and length of its name, then of its payload, from the table's start |
+| | the names and the payloads |
+
+The module descriptor's `custom` field points at the module's table, or is
+NULL when it carries none.
 
 ### Components and WIT
 
@@ -766,6 +800,7 @@ as `call stack exhausted` rather than crashing.
 | `-j N`, `-jN` | maximum number of compile threads |
 | `--profile=full\|deterministic` | the WebAssembly profile. `deterministic` makes relaxed-SIMD and NaN results platform-independent. |
 | `--symbol-prefix=P` | name the module descriptor `P_module`; with `--shared`, the prefix of the library's own functions instead; ignored for a component |
+| `--custom-sections=default\|all\|none` | which of the module's custom sections the output carries (see [Custom sections](#custom-sections)); `default` leaves out the name section and `.debug_*` |
 | `--no-export-names` | drop the export-name table, keeping only `_start` and `main` |
 | `--no-dead-strip` | keep unreferenced sections in the link |
 | `--system-ld`, `--ld PATH` | link with an external linker instead (Linux and macOS only, not with `--shared`) |
@@ -904,7 +939,10 @@ compare steady-state code rather than start-up or compile time. All three
 are timed interleaved, round by round, each kernel's figure the best of five
 rounds (`make bench-record`); `make bench-record-warmc` re-times warmc's
 column alone against the recorded wasmtime and native times, as the `stdgo`
-row is.
+row is. The `-O3` columns are each kernel's recorded ratio times its `-O3`
+time over its `-O2` time, the two timed interleaved, warmc alone, each the
+best of five rounds (`make bench-record-o3`), so that they differ from the
+`-O2` columns by what `-O3` changes and not by how either was timed.
 
 The wasm comes from each language's usual producer: TinyGo 0.43 at
 `-opt=2`, Go 1.27.3, rustc nightly 1.101 at `opt-level=3` with LTO, Zig 0.17
@@ -916,18 +954,18 @@ compiler at `-O2`, or its nearest equivalent: clang 23.1 `-O2`, rustc
 (with `-with-rtsopts=-V0`, see below).
 AssemblyScript and Kotlin/Wasm have no native compiler to compare with.
 
-| Corpus | Source language | Kernels | warmc / wasmtime | Range | warmc / native | Range | Median peak RSS, MiB (warmc / wasmtime / native) |
-|---|---|---:|---:|---|---:|---|---|
-| `gobench` | TinyGo | 39 | 0.59 | 0.06 – 1.01 | 0.88 | 0.13 – 3.09 | 2.0 / 8.9 / 1.9 |
-| `stdgo` | Go | 49 | 0.53 | 0.03 – 1.12 | 1.44 | 0.08 – 9.45 | 7.3 / 27.4 / 4.7 |
-| `vecbench` | TinyGo (vectorisable loops) | 43 | 0.18 | 0.03 – 0.96 | 0.72 | 0.11 – 1.19 | 2.0 / 8.9 / 1.9 |
-| `asbench` | AssemblyScript | 37 | 0.59 | 0.16 – 0.98 | – | – | 1.9 / 8.7 / – |
-| `rsbench` | Rust | 39 | 0.63 | 0.13 – 1.00 | 1.04 | 0.63 – 2.64 | 2.0 / 9.1 / 1.9 |
-| `zigbench` | Zig | 22 | 0.72 | 0.17 – 1.00 | 0.97 | 0.21 – 1.77 | 2.0 / 8.8 / 1.9 |
-| `ktbench` | Kotlin (Wasm GC) | 25 | 0.10 | 0.004 – 0.72 | – | – | 3.5 / 21.0 / – |
-| `cbench` | C | 27 | 0.75 | 0.26 – 1.01 | 1.03 | 0.008 – 4.29 | 2.0 / 9.0 / 1.8 |
-| `cppbench` | C++ | 26 | 0.69 | 0.22 – 1.04 | 0.90 | 0.03 – 1.58 | 2.4 / 9.5 / 2.1 |
-| `hsbench` | Haskell | 28 | 0.44 | 0.20 – 0.97 | 1.32 | 0.61 – 6.42 | 10.1 / 32.4 / 12.8 |
+| Corpus | Source language | Kernels | warmc / wasmtime | Range | `-O3` / wasmtime | warmc / native | Range | `-O3` / native | Median peak RSS, MiB (warmc / wasmtime / native) |
+|---|---|---:|---:|---|---:|---:|---|---:|---|
+| `gobench` | TinyGo | 39 | 0.59 | 0.06 – 1.01 | 0.59 | 0.88 | 0.13 – 3.09 | 0.87 | 2.0 / 8.9 / 1.9 |
+| `stdgo` | Go | 49 | 0.53 | 0.03 – 1.12 | 0.53 | 1.44 | 0.08 – 9.45 | 1.44 | 7.3 / 27.4 / 4.7 |
+| `vecbench` | TinyGo (vectorisable loops) | 43 | 0.18 | 0.03 – 0.96 | 0.18 | 0.72 | 0.11 – 1.19 | 0.71 | 2.0 / 8.9 / 1.9 |
+| `asbench` | AssemblyScript | 37 | 0.59 | 0.16 – 0.98 | 0.58 | – | – | – | 1.9 / 8.7 / – |
+| `rsbench` | Rust | 39 | 0.63 | 0.13 – 1.00 | 0.61 | 1.04 | 0.63 – 2.64 | 1.02 | 2.0 / 9.1 / 1.9 |
+| `zigbench` | Zig | 22 | 0.72 | 0.17 – 1.00 | 0.72 | 0.97 | 0.21 – 1.77 | 0.97 | 2.0 / 8.8 / 1.9 |
+| `ktbench` | Kotlin (Wasm GC) | 25 | 0.10 | 0.004 – 0.72 | 0.11 | – | – | – | 3.5 / 21.0 / – |
+| `cbench` | C | 27 | 0.75 | 0.26 – 1.01 | 0.73 | 1.03 | 0.008 – 4.29 | 1.00 | 2.0 / 9.0 / 1.8 |
+| `cppbench` | C++ | 26 | 0.69 | 0.22 – 1.04 | 0.69 | 0.90 | 0.03 – 1.58 | 0.89 | 2.4 / 9.5 / 2.1 |
+| `hsbench` | Haskell | 28 | 0.44 | 0.20 – 0.97 | 0.44 | 1.32 | 0.61 – 6.42 | 1.32 | 10.1 / 32.4 / 12.8 |
 
 ### Against wasmtime
 
@@ -1020,6 +1058,25 @@ kernel with time it never spent. Two native times are too short to time
 reliably, under 5 ms: `vecbench/rowsum` and `hsbench/fib`, which are left
 out of the native figures.
 
+### At `-O3`
+
+At `-O3` warmc's code takes **0.45×** wasmtime's time (0.446) and **1.01×**
+the native time, 0.991 of its time at `-O2`, over the same 335 and 271
+kernels. The gains are where the two passes `-O3` adds have something to do:
+- `dead-frames` removes the stores into C frames that nothing reads again:
+  `cbench/structval` takes 0.54× its `-O2` time.
+- `fma` fuses float multiplies into the adds that read them:
+  `vecbench/horner` takes 0.63×, `rsbench/f32ops` 0.66×, `asbench/mathfn`
+  0.77×, `asbench/stencil` 0.78× and `cbench/nbody` 0.84×.
+
+142 of the 335 kernels compile to the same code at both levels, most of
+`gobench`, `vecbench`, `rsbench`, `zigbench` and `ktbench`. Their `-O3`
+figures differ from `-O2`'s only by the spread between runs: between 0.93
+and 1.11 for single kernels, 1.002 on average. That spread is all that moves
+`ktbench` from 0.10 to 0.11 (0.104 and 0.106 unrounded). The 193 kernels
+whose code changes take 0.983 of their `-O2` time, and none is slower once
+timed again.
+
 Re-run the comparison on your own machine before relying on these numbers:
 
 ```sh
@@ -1028,6 +1085,7 @@ python3 test/gobench.py --corpus rsbench --native       # and against the native
 make bench-compare                                      # all corpora vs the recorded baseline
 make bench-record                                       # re-record it, native column included
 make bench-record-warmc                                 # re-time warmc's column alone against it
+make bench-record-o3                                    # warmc at -O3 beside -O2, for the -O3 columns
 ```
 
 ---
@@ -1070,6 +1128,9 @@ Most of the suite is **differential**. warmc's output is compared with:
 - wabt's `wasm-interp` again, for random modules in Go's shape whose stack
   pointer `go-sp` passes as an argument (`test/gen_gosp.py`), and for small
   ones with one thing each that rules the rewrite out (`test/run_gosp.py`)
+- the module itself, for the custom sections each linked image carries, read
+  back from Mach-O, ELF and PE (`test/check_macho.py`, `check_elf.py`,
+  `check_pe.py`) and asked for by name from a library (`test/run_customs.py`)
 
 `test/run_shared.sh` builds a shared library and calls it from C, C++,
 Python's `ctypes` and Java's foreign function API. The Java part needs Java 22

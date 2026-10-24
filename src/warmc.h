@@ -319,6 +319,13 @@ typedef struct {
   uint32_t sym;
 } IcTable;
 
+/* A custom section: its name and payload, in the binary the module was
+   read from */
+typedef struct {
+  const uint8_t *name, *data;
+  uint32_t name_len, len;
+} CustomSec;
+
 typedef struct {
   const uint8_t *bin;
   size_t bin_len;
@@ -344,6 +351,8 @@ typedef struct {
      (arguments above the callee's stack pointer, frames re-entered after
      the wasm stack unwinds) */
   bool go_stack;
+  /* every custom section, in the binary's order */
+  CustomSec *customs; uint32_t ncustoms;
   /* bodies a module transform wrote (tramp.c), which funcs[] point into in
      place of the binary */
   uint8_t **owned_bodies;
@@ -574,6 +583,10 @@ typedef struct {
   Buf text;
   Buf rodata;
   Buf data;
+  /* section 3: the module's custom sections (module_data.c), read-only and
+     in a section of their own, so that a tool can find them in what is
+     linked; written only when there are any */
+  Buf custom;
   Reloc *relocs; uint32_t nrelocs, cap_relocs;
 } ObjBuilder;
 
@@ -606,6 +619,9 @@ void obj_add_reloc(ObjBuilder *o, RelKind kind, int section, uint64_t off, uint3
 void codegen_prepare_module(Module *m, ObjBuilder *o);
 
 void codegen_set_symbol_prefix(const char *prefix);
+/* which custom sections a module's output carries (module_data.c) */
+typedef enum { CUSTOM_DEFAULT, CUSTOM_ALL, CUSTOM_NONE } CustomMode;
+void codegen_set_custom_sections(CustomMode mode);
 
 void codegen_set_load_barrier(bool on);
 extern bool warmc_load_barrier;

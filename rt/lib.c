@@ -202,6 +202,11 @@ int warmc_lib_bind_import(const char *module, const char *name, void *fn,
   return rc;
 }
 
+usz warmc_lib_custom_section(const char *name, usz index, const u8 **data,
+                             usz *size) {
+  return warmc_custom_section(&warmc_module, name, index, data, size);
+}
+
 u8 *warmc_lib_memory(usz *size) {
   u8 *base = 0;
   usz n = 0;

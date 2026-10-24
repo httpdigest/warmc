@@ -6,7 +6,9 @@
 /* The static linker's object model, shared between link.c (readers, symbol
    resolution, relocation) and pe.c (Windows layout and the PE32+ writer). */
 
-typedef enum { K_TEXT, K_RODATA, K_DATA, K_BSS, K_DROP } SecKind;
+/* K_CUSTOM: the module's custom sections (module_data.c), read-only and
+   kept in a section of their own */
+typedef enum { K_TEXT, K_RODATA, K_DATA, K_BSS, K_CUSTOM, K_DROP } SecKind;
 
 typedef struct {
   char *name;
@@ -63,6 +65,7 @@ typedef struct {
 
   uint64_t text_addr, text_size;
   uint64_t rodata_addr, rodata_size;
+  uint64_t custom_addr, custom_size;
   uint64_t data_addr, data_size;
   uint64_t bss_addr, bss_size;
 

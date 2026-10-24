@@ -8,7 +8,10 @@ land inside __text.  That exercises the ABS64/addend path end to end.
 import struct
 import sys
 
-path, expected_names = sys.argv[1], sys.argv[2:]
+args = sys.argv[1:]
+wasm = next((a[7:] for a in args if a.startswith("--wasm=")), None)
+args = [a for a in args if not a.startswith("--wasm=")]
+path, expected_names = args[0], args[1:]
 buf = open(path, "rb").read()
 
 magic, cputype, cpusub, filetype, ncmds, sizeofcmds, flags, _ = \
@@ -132,6 +135,17 @@ for i in range(nfuncrefs):
 
 if expected_names and sorted(seen) != sorted(expected_names):
     problems.append("export names %r != expected %r" % (sorted(seen), sorted(expected_names)))
+
+# The custom sections: __TEXT,__wasm_custom, which the descriptor points at,
+# holding what the module given by --wasm carries (test/custom_check.py).
+if wasm:
+    sys.path.insert(0, __import__("os").path.dirname(__file__))
+    import custom_check
+    cs = sections.get("__TEXT,__wasm_custom")
+    custom_check.check(problems, read(cs[0], cs[1]) if cs else None, cs[0] if cs else 0,
+                       u64(md + custom_check.DESC_CUSTOM),
+                       custom_check.wasm_customs(open(wasm, "rb").read()),
+                       __import__("os").environ.get("CUSTOM_SECTIONS", "default"))
 
 if problems:
     for p in problems:

@@ -197,7 +197,8 @@ uint32_t codegen_tail_out_bytes(Module *m) { return module_tail_outgoing(m); }
 
 static char g_module_sym[128] = "warmc_module";
 
-static char g_anchor[3][160] = { "__warmc_text", "__warmc_rodata", "__warmc_data" };
+static char g_anchor[4][160] = { "__warmc_text", "__warmc_rodata", "__warmc_data",
+                                 "__warmc_custom" };
 
 bool warmc_load_barrier = true;
 void codegen_set_load_barrier(bool on) { warmc_load_barrier = on; }
@@ -207,6 +208,64 @@ void codegen_set_symbol_prefix(const char *prefix) {
   snprintf(g_anchor[0], sizeof g_anchor[0], "__warmc_%s_text", prefix);
   snprintf(g_anchor[1], sizeof g_anchor[1], "__warmc_%s_rodata", prefix);
   snprintf(g_anchor[2], sizeof g_anchor[2], "__warmc_%s_data", prefix);
+  snprintf(g_anchor[3], sizeof g_anchor[3], "__warmc_%s_custom", prefix);
+}
+
+/* ---- custom sections -----------------------------------------------------
+   The module's custom sections, for the runtime to hand out by name as
+   WebAssembly.Module.customSections does (warmc_custom_section) and for a
+   tool to find in what is linked: a table in section 3, which the object
+   writers put in a read-only section of its own -- .wasm.custom (ELF),
+   __TEXT,__wasm_custom (Mach-O), .wcustom (COFF and PE) -- one table per
+   module, each 8-aligned, in this form, little-endian:
+     "wcustom\0"
+     u32 size, of the table, this header included
+     u32 count
+     count x { u32 name_off, name_len, data_off, data_len }, from the table
+     the names and the payloads
+   By default the name section, whose names warmc's symbols already carry,
+   and DWARF's .debug_* sections are left out: --custom-sections=all keeps
+   them, =none every section out. */
+static CustomMode g_custom_mode = CUSTOM_DEFAULT;
+void codegen_set_custom_sections(CustomMode mode) { g_custom_mode = mode; }
+
+static bool custom_kept(const CustomSec *c) {
+  if (g_custom_mode != CUSTOM_DEFAULT) return g_custom_mode == CUSTOM_ALL;
+  if (c->name_len == 4 && !memcmp(c->name, "name", 4)) return false;
+  return !(c->name_len >= 7 && !memcmp(c->name, ".debug_", 7));
+}
+
+static void patch_u32(Buf *b, uint64_t at, uint32_t v) {
+  for (int k = 0; k < 4; k++) b->data[at + k] = (uint8_t)(v >> (8 * k));
+}
+
+/* the table's offset in section 3, or UINT64_MAX when it would be empty */
+static uint64_t emit_custom_table(const Module *m, ObjBuilder *o) {
+  uint32_t n = 0;
+  for (uint32_t i = 0; i < m->ncustoms; i++) n += custom_kept(&m->customs[i]);
+  if (!n) return UINT64_MAX;
+  Buf *b = &o->custom;
+  buf_align(b, 8);
+  uint64_t at = b->len;
+  buf_bytes(b, "wcustom", 8);
+  buf_u32(b, 0);
+  buf_u32(b, n);
+  uint64_t ent = b->len;
+  buf_zero(b, 16 * (size_t)n);
+  for (uint32_t i = 0; i < m->ncustoms; i++) {
+    const CustomSec *c = &m->customs[i];
+    if (!custom_kept(c)) continue;
+    patch_u32(b, ent, (uint32_t)(b->len - at));
+    patch_u32(b, ent + 4, c->name_len);
+    buf_bytes(b, c->name, c->name_len);
+    patch_u32(b, ent + 8, (uint32_t)(b->len - at));
+    patch_u32(b, ent + 12, c->len);
+    buf_bytes(b, c->data, c->len);
+    ent += 16;
+  }
+  if (b->len - at > UINT32_MAX) warmc_fatal("the custom sections take more than 4 GiB");
+  patch_u32(b, at + 8, (uint32_t)(b->len - at));
+  return at;
 }
 
 static const char *module_sym(void) { return g_module_sym; }
@@ -1487,6 +1546,10 @@ void codegen_emit_module_data(Module *m, ObjBuilder *o) {
   buf_u64(&o->data, 0);
 
   if (pool_have) data_ptr(o, 1, pool_off);
+  else buf_u64(&o->data, 0);
+
+  uint64_t custom_off = emit_custom_table(m, o);
+  if (custom_off != UINT64_MAX) data_ptr(o, 3, custom_off);
   else buf_u64(&o->data, 0);
 
   uint64_t ictab_off = o->data.len;

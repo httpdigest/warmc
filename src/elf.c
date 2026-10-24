@@ -67,7 +67,8 @@ void write_elf64(ObjBuilder *o, const char *path) {
   Buf symtab; memset(&symtab, 0, sizeof symtab);
   buf_zero(&symtab, 24);
 
-  static const int sec_of[3] = { 1, 3, 5 };
+  /* section 3, the custom sections, comes last when there are any */
+  static const int sec_of[4] = { 1, 3, 5, 10 };
   for (uint32_t j = 0; j < n; j++) {
     Sym *s = &o->syms[order[j]];
     uint32_t nameoff = str_add(&strtab, s->name);
@@ -105,9 +106,11 @@ void write_elf64(ObjBuilder *o, const char *path) {
   uint32_t n_symtab = str_add(&shstr, ".symtab");
   uint32_t n_strtab = str_add(&shstr, ".strtab");
   uint32_t n_shstrtab = str_add(&shstr, ".shstrtab");
+  uint32_t n_custom = o->custom.len ? str_add(&shstr, ".wasm.custom") : 0;
+  int nsh = o->custom.len ? 11 : 10;
 
   struct { uint32_t name, type; uint64_t flags; const Buf *data;
-           uint32_t link, info; uint64_t align, entsize; } sh[10] = {
+           uint32_t link, info; uint64_t align, entsize; } sh[11] = {
     { 0, 0, 0, NULL, 0, 0, 0, 0 },
     { n_text,     SHT_PROGBITS, SHF_ALLOC | SHF_EXECINSTR, &o->text,   0, 0, 64, 0 },
     { n_rtext,    SHT_RELA,     SHF_INFO_LINK,             &rela[0],   7, 1, 8, 24 },
@@ -118,13 +121,14 @@ void write_elf64(ObjBuilder *o, const char *path) {
     { n_symtab,   SHT_SYMTAB,   0,                         &symtab,    8, first_global, 8, 24 },
     { n_strtab,   SHT_STRTAB,   0,                         &strtab,    0, 0, 1, 0 },
     { n_shstrtab, SHT_STRTAB,   0,                         &shstr,     0, 0, 1, 0 },
+    { n_custom,   SHT_PROGBITS, SHF_ALLOC,                 &o->custom, 0, 0, 8, 0 },
   };
 
   Buf out; memset(&out, 0, sizeof out);
   buf_zero(&out, 64);
 
-  uint64_t offsets[10] = { 0 };
-  for (int i = 1; i < 10; i++) {
+  uint64_t offsets[11] = { 0 };
+  for (int i = 1; i < nsh; i++) {
     uint64_t align = sh[i].align ? sh[i].align : 1;
     while (out.len % align) buf_u8(&out, 0);
     offsets[i] = out.len;
@@ -132,7 +136,7 @@ void write_elf64(ObjBuilder *o, const char *path) {
   }
   while (out.len % 8) buf_u8(&out, 0);
   uint64_t shoff = out.len;
-  for (int i = 0; i < 10; i++) {
+  for (int i = 0; i < nsh; i++) {
     buf_u32(&out, sh[i].name);
     buf_u32(&out, sh[i].type);
     buf_u64(&out, sh[i].flags);
@@ -158,7 +162,7 @@ void write_elf64(ObjBuilder *o, const char *path) {
   uint32_t one = 1;
   memcpy(h + 20, &one, 4);
   memcpy(h + 40, &shoff, 8);
-  uint16_t ehsize = 64, shentsize = 64, shnum = 10, shstrndx = 9;
+  uint16_t ehsize = 64, shentsize = 64, shnum = (uint16_t)nsh, shstrndx = 9;
   memcpy(h + 52, &ehsize, 2);
   memcpy(h + 58, &shentsize, 2);
   memcpy(h + 60, &shnum, 2);

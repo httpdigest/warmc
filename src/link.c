@@ -218,7 +218,7 @@ static SecKind elf_kind(const char *name, uint32_t type, uint64_t flags) {
   if (type == SHT_NOBITS) return K_BSS;
   if (flags & SHF_EXECINSTR) return K_TEXT;
   if (flags & SHF_WRITE) return K_DATA;
-  (void)name;
+  if (!strcmp(name, ".wasm.custom")) return K_CUSTOM;
   return K_RODATA;
 }
 
@@ -335,6 +335,7 @@ static SecKind macho_kind(const char *seg, const char *sect, uint32_t flags) {
   if ((flags & SECTION_TYPE) == S_ZEROFILL && !strcmp(seg, "__DATA")) return K_BSS;
   if (!strcmp(seg, "__TEXT")) {
     if (flags & (S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS)) return K_TEXT;
+    if (!strcmp(sect, "__wasm_custom")) return K_CUSTOM;
     return K_RODATA;
   }
   if (!strcmp(seg, "__DATA")) {
@@ -640,6 +641,7 @@ static SecKind coff_kind(const char *name, uint32_t ch) {
   if (ch & IMAGE_SCN_CNT_UNINITIALIZED_DATA) return K_BSS;
   if (ch & (IMAGE_SCN_CNT_CODE_L | IMAGE_SCN_MEM_EXECUTE_L)) return K_TEXT;
   if (ch & IMAGE_SCN_MEM_WRITE_L) return K_DATA;
+  if (!strcmp(name, ".wcustom")) return K_CUSTOM;
   return K_RODATA;
 }
 
@@ -1435,6 +1437,12 @@ static void resolve_addrs(Linker *L) {
 /* A program has two program headers; a library five (write_elf_shared). */
 #define ELF_SHARED_PHDRS 5
 
+/* where the read-only part after the code ends: rodata, then the custom
+   sections when there are any */
+static uint64_t ro_end_addr(const Linker *L) {
+  return L->custom_size ? L->custom_addr + L->custom_size : L->rodata_addr + L->rodata_size;
+}
+
 void emit_secs(Buf *b, Linker *L, SecKind k, uint64_t seg_addr, uint64_t seg_off) {
   for (uint32_t i = 0; i < L->nobjs; i++) {
     InObj *o = &L->objs[i];
@@ -1537,7 +1545,7 @@ static void elf_append_symbols(Linker *L, Buf *out) {
     }
   xfree(v);
 
-  static const char shstr[] = "\0.text\0.symtab\0.strtab\0.shstrtab";
+  static const char shstr[] = "\0.text\0.symtab\0.strtab\0.shstrtab\0.wasm.custom";
   while (out->len & 7) buf_u8(out, 0);
   uint64_t sym_off = out->len;
   buf_bytes(out, sym.data, sym.len);
@@ -1549,15 +1557,20 @@ static void elf_append_symbols(Linker *L, Buf *out) {
   uint64_t sh_off = out->len;
 
   struct { uint32_t name, type; uint64_t flags, addr, off, size;
-           uint32_t link, info; uint64_t align, entsize; } sh[5] = {
+           uint32_t link, info; uint64_t align, entsize; } sh[6] = {
     { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
     { 1, SHT_PROGBITS_E, SHF_ALLOC_E | SHF_EXEC_E, L->text_addr,
       64 + 2 * 56, L->text_size, 0, 0, 16, 0 },
     { 7, SHT_SYMTAB_E, 0, 0, sym_off, sym.len, 3, nlocal, 8, 24 },
     { 15, SHT_STRTAB_E, 0, 0, str_off, str.len, 0, 0, 1, 0 },
     { 23, SHT_STRTAB_E, 0, 0, shstr_off, sizeof shstr, 0, 0, 1, 0 },
+    /* the custom sections, when there are any */
+    { (uint32_t)(sizeof shstr - sizeof ".wasm.custom"), SHT_PROGBITS_E, SHF_ALLOC_E,
+      L->custom_addr, 64 + 2 * 56 + (L->custom_addr - L->text_addr), L->custom_size,
+      0, 0, 8, 0 },
   };
-  for (int i = 0; i < 5; i++) {
+  int nsh = L->custom_size ? 6 : 5;
+  for (int i = 0; i < nsh; i++) {
     buf_u32(out, sh[i].name); buf_u32(out, sh[i].type);
     buf_u64(out, sh[i].flags); buf_u64(out, sh[i].addr);
     buf_u64(out, sh[i].off); buf_u64(out, sh[i].size);
@@ -1565,7 +1578,7 @@ static void elf_append_symbols(Linker *L, Buf *out) {
     buf_u64(out, sh[i].align); buf_u64(out, sh[i].entsize);
   }
   wr64(out->data + 0x28, sh_off);
-  wr16(out->data + 0x3c, 5);
+  wr16(out->data + 0x3c, (uint16_t)nsh);
   wr16(out->data + 0x3e, 4);
   xfree(sym.data); xfree(str.data);
 }
@@ -1577,7 +1590,7 @@ static void write_elf_exec(Linker *L, const char *path, uint64_t entry) {
   uint64_t text_off = hdr;
 
   uint64_t ro_off  = text_off + (L->rodata_addr - L->text_addr);
-  uint64_t ro_end  = ro_off + L->rodata_size;
+  uint64_t ro_end  = text_off + (ro_end_addr(L) - L->text_addr);
 
   uint64_t rw_off  = align_up(ro_end, ELF_PAGE) + (L->got_addr & (ELF_PAGE - 1));
 
@@ -1607,6 +1620,7 @@ static void write_elf_exec(Linker *L, const char *path, uint64_t entry) {
 
   emit_secs(&out, L, K_TEXT, L->text_addr, text_off);
   emit_secs(&out, L, K_RODATA, L->rodata_addr, ro_off);
+  emit_secs(&out, L, K_CUSTOM, L->custom_addr, text_off + (L->custom_addr - L->text_addr));
   while (out.len < rw_off) buf_u8(&out, 0);
   for (uint32_t i = 0; i < L->ngot; i++) buf_u64(&out, L->gsyms[L->got[i]].addr);
   emit_secs(&out, L, K_DATA, L->data_addr, data_off);
@@ -1653,7 +1667,7 @@ typedef struct { uint32_t name, type; uint64_t flags, addr, off, size;
 static void write_elf_shared(Linker *L, const char *path) {
   const uint64_t hdr = 64 + ELF_SHARED_PHDRS * 56;
   const char *soname = strrchr(path, '/') ? strrchr(path, '/') + 1 : path;
-  uint64_t ro_end = L->rodata_addr + L->rodata_size;
+  uint64_t ro_end = ro_end_addr(L);
   uint64_t rw_off = L->got_addr;
   uint64_t rw_file = (L->data_addr + L->data_size) - L->got_addr;
   uint64_t rw_mem = (L->bss_addr + L->bss_size) - L->got_addr;
@@ -1768,6 +1782,7 @@ static void write_elf_shared(Linker *L, const char *path) {
 
   emit_secs(&out, L, K_TEXT, L->text_addr, L->text_addr);
   emit_secs(&out, L, K_RODATA, L->rodata_addr, L->rodata_addr);
+  emit_secs(&out, L, K_CUSTOM, L->custom_addr, L->custom_addr);
   while (out.len < rw_off) buf_u8(&out, 0);
   for (uint32_t i = 0; i < L->ngot; i++) buf_u64(&out, L->gsyms[L->got[i]].addr);
   emit_secs(&out, L, K_DATA, L->data_addr, L->data_addr - L->got_addr + rw_off);
@@ -1803,7 +1818,7 @@ static void write_elf_shared(Linker *L, const char *path) {
   xfree(v);
 
   static const char shstr[] = "\0.text\0.dynamic\0.dynsym\0.dynstr\0.hash\0"
-                              ".rela.dyn\0.symtab\0.strtab\0.shstrtab";
+                              ".rela.dyn\0.symtab\0.strtab\0.shstrtab\0.wasm.custom";
   while (out.len & 7) buf_u8(&out, 0);
   uint64_t sym_off = out.len;
   buf_bytes(&out, sym.data, sym.len);
@@ -1814,7 +1829,7 @@ static void write_elf_shared(Linker *L, const char *path) {
   while (out.len & 7) buf_u8(&out, 0);
   uint64_t sh_off = out.len;
   uint64_t dpos = dyn_off;
-  ElfShdr sh[10] = {
+  ElfShdr sh[11] = {
     { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
     { 1, SHT_PROGBITS_E, SHF_ALLOC_E | SHF_EXEC_E, L->text_addr, L->text_addr,
       L->text_size, 0, 0, 16, 0 },
@@ -1830,8 +1845,12 @@ static void write_elf_shared(Linker *L, const char *path) {
     { 48, SHT_SYMTAB_E, 0, 0, sym_off, sym.len, 8, nlocal, 8, 24 },
     { 56, SHT_STRTAB_E, 0, 0, str_off, str.len, 0, 0, 1, 0 },
     { 64, SHT_STRTAB_E, 0, 0, shstr_off, sizeof shstr, 0, 0, 1, 0 },
+    /* the custom sections, when there are any */
+    { (uint32_t)(sizeof shstr - sizeof ".wasm.custom"), SHT_PROGBITS_E, SHF_ALLOC_E,
+      L->custom_addr, L->custom_addr, L->custom_size, 0, 0, 8, 0 },
   };
-  for (int i = 0; i < 10; i++) {
+  int nsh = L->custom_size ? 11 : 10;
+  for (int i = 0; i < nsh; i++) {
     buf_u32(&out, sh[i].name); buf_u32(&out, sh[i].type);
     buf_u64(&out, sh[i].flags); buf_u64(&out, sh[i].addr);
     buf_u64(&out, sh[i].off); buf_u64(&out, sh[i].size);
@@ -1839,7 +1858,7 @@ static void write_elf_shared(Linker *L, const char *path) {
     buf_u64(&out, sh[i].align); buf_u64(&out, sh[i].entsize);
   }
   wr64(out.data + 0x28, sh_off);
-  wr16(out.data + 0x3c, 10);
+  wr16(out.data + 0x3c, (uint16_t)nsh);
   wr16(out.data + 0x3e, 9);
 
   FILE *f = fopen(path, "wb");
@@ -1874,6 +1893,10 @@ static void layout_linux(Linker *L) {
   L->rodata_addr = at;
   at = place(L, K_RODATA, at);
   L->rodata_size = at - L->rodata_addr;
+  at = align_up(at, 8);
+  L->custom_addr = at;
+  at = place(L, K_CUSTOM, at);
+  L->custom_size = at - L->custom_addr;
 
   at = align_up(at, ELF_PAGE);
   L->got_addr = at;
@@ -2137,10 +2160,18 @@ static void sha_final(Sha256 *s, uint8_t out[32]) {
 #define MACHO_DYLIB "/usr/lib/libSystem.B.dylib"
 #define MACHO_DYLD  "/usr/lib/dyld"
 
+/* whether an input section of kind k is in what is linked */
+static bool has_kind(const Linker *L, SecKind k) {
+  for (uint32_t i = 0; i < L->nobjs; i++)
+    for (uint32_t s = 0; s < L->objs[i].nsecs; s++)
+      if (L->objs[i].secs[s].kind == k && L->objs[i].secs[s].size) return true;
+  return false;
+}
+
 static uint64_t macho_hdr_size(const Linker *L) {
   uint64_t n = 32;
   n += 4 * 72;
-  n += 6 * 80;
+  n += (has_kind(L, K_CUSTOM) ? 7 : 6) * 80;
   n += 48 + 24 + 80 + 24 + 24 + 24 + 16;
 
   n += align_up(12 + strlen(MACHO_DYLD) + 1, 8);
@@ -2163,6 +2194,10 @@ static void layout_macos(Linker *L) {
   L->rodata_addr = at;
   at = place(L, K_RODATA, at);
   L->rodata_size = at - L->rodata_addr;
+  at = align_up(at, 8);
+  L->custom_addr = at;
+  at = place(L, K_CUSTOM, at);
+  L->custom_size = at - L->custom_addr;
 
   at = align_up(at, MACHO_PAGE);
   L->got_addr = at;
@@ -2376,7 +2411,7 @@ static void write_macho(Linker *L, const char *path, uint64_t entry) {
   const char *dyld  = MACHO_DYLD;
   const char *ident = strrchr(path, '/') ? strrchr(path, '/') + 1 : path;
 
-  uint64_t text_end = align_up(L->rodata_addr + L->rodata_size, 16);
+  uint64_t text_end = align_up(ro_end_addr(L), 16);
   uint64_t text_fsz = text_end - base;
   uint64_t data_foff = L->got_addr - base;
   uint64_t data_fsz  = (L->data_addr + L->data_size) - L->got_addr;
@@ -2507,7 +2542,8 @@ static void write_macho(Linker *L, const char *path, uint64_t entry) {
   if (!L->shared) { seg_cmd(&lc, "__PAGEZERO", 0, base, 0, 0, 0, 0, 0); ncmds++; }
 
   seg_cmd(&lc, "__TEXT", base, align_up(text_fsz, MACHO_PAGE), 0, text_fsz,
-          VM_PROT_READ | VM_PROT_EXEC, VM_PROT_READ | VM_PROT_EXEC, 3); ncmds++;
+          VM_PROT_READ | VM_PROT_EXEC, VM_PROT_READ | VM_PROT_EXEC,
+          L->custom_size ? 4 : 3); ncmds++;
   sect_cmd(&lc, "__text", "__TEXT", L->text_addr, L->stub_addr - L->text_addr,
            (uint32_t)(L->text_addr - base), 2,
            S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS);
@@ -2516,6 +2552,9 @@ static void write_macho(Linker *L, const char *path, uint64_t entry) {
            S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS);
   sect_cmd(&lc, "__const", "__TEXT", L->rodata_addr, L->rodata_size,
            (uint32_t)(L->rodata_addr - base), 4, 0);
+  if (L->custom_size)
+    sect_cmd(&lc, "__wasm_custom", "__TEXT", L->custom_addr, L->custom_size,
+             (uint32_t)(L->custom_addr - base), 3, 0);
 
   seg_cmd(&lc, "__DATA", L->got_addr, align_up(data_vsz, MACHO_PAGE), data_foff, data_fsz,
           VM_PROT_READ | VM_PROT_WRITE, VM_PROT_READ | VM_PROT_WRITE, 3); ncmds++;
@@ -2634,6 +2673,7 @@ static void write_macho(Linker *L, const char *path, uint64_t entry) {
   }
   while (out.len < L->rodata_addr - base) buf_u8(&out, 0);
   emit_secs(&out, L, K_RODATA, L->rodata_addr, L->rodata_addr - base);
+  emit_secs(&out, L, K_CUSTOM, L->custom_addr, L->custom_addr - base);
 
   while (out.len < data_foff) buf_u8(&out, 0);
   for (uint32_t i = 0; i < L->ngot; i++) {

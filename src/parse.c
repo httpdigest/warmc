@@ -807,9 +807,13 @@ Module *wasm_parse(const uint8_t *bin, size_t len) {
     }
     switch (id) {
       case 0: {
-        char *nm = rd_name(&sec, NULL);
+        uint32_t nl;
+        char *nm = rd_name(&sec, &nl);
+        const uint8_t *at = sec.p - nl;
         if (!strcmp(nm, "go:buildid")) m->go_stack = true;
         xfree(nm);
+        m->customs = xrealloc(m->customs, (m->ncustoms + 1) * sizeof(CustomSec));
+        m->customs[m->ncustoms++] = (CustomSec){ at, sec.p, nl, (uint32_t)(sec.end - sec.p) };
         break;
       }
       case 1: parse_types(m, &sec); break;
@@ -886,6 +890,7 @@ void wasm_skip_core_rectype(Rd *r) {
 
 void module_free(Module *m) {
   if (!m) return;
+  xfree(m->customs);
   for (uint32_t i = 0; i < m->ntypes; i++) {
     xfree(m->types[i].params); xfree(m->types[i].results); xfree(m->types[i].display);
     xfree(m->types[i].fields);

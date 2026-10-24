@@ -36,6 +36,8 @@ static const struct { const char *name, *rt, *proto, *ret; } HELPERS[] = {
   { "memory", "warmc_lib_memory", "(size_t *size)", "uint8_t *" },
   { "bind_import", "warmc_lib_bind_import",
     "(const char *module, const char *name, void *fn, void *ctx)", "int" },
+  { "custom_section", "warmc_lib_custom_section",
+    "(const char *name, size_t index, const uint8_t **data, size_t *size)", "size_t" },
 };
 #define NHELPERS (sizeof HELPERS / sizeof HELPERS[0])
 
@@ -342,7 +344,14 @@ void shlib_write_header(Shlib *p, const char *path, const char *libname) {
   fputs("\n/* The library's own.  last_trap is the trap of the calling thread's\n"
         "   last call, 0 if it returned; memory is linear memory 0, which a call\n"
         "   that grows it may move; bind_import returns 0, 1 for an import the\n"
-        "   module does not have, 2 once the first call has been made. */\n", f);
+        "   module does not have, 2 once the first call has been made.\n"
+        "   custom_section returns how many of the module's custom sections are\n"
+        "   named name, as WebAssembly.Module.customSections does, and puts the\n"
+        "   index-th one's payload in *data and *size, NULL and 0 when there\n"
+        "   is none; it needs no instance, and the payload lives as long as the\n"
+        "   library.\n"
+        "   The name section and DWARF's .debug_* are there only if the library\n"
+        "   was built with --custom-sections=all. */\n", f);
   for (size_t h = 0; h < NHELPERS; h++)
     fprintf(f, "%s%s%s%s;\n", HELPERS[h].ret,
             HELPERS[h].ret[strlen(HELPERS[h].ret) - 1] == '*' ? "" : " ",
