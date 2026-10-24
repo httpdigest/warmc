@@ -628,7 +628,8 @@ int main(int argc, char **argv) {
             "             self_tail=%llu ldcomb=%llu spills=%llu insts=%llu\n"
             "             ldpairs=%llu stpairs=%llu cold_frames=%llu early_rets=%llu\n"
             "             reloads=%llu caller_saves=%llu csa_restores=%llu"
-            " v128_spills=%llu rb_trips=%llu split_cuts=%llu split_invs=%llu pieces=%llu\n"
+            " v128_spills=%llu rb_trips=%llu split_cuts=%llu split_invs=%llu pieces=%llu"
+            " loop_pieces=%llu recomputes=%llu\n"
             "             escape_removed=%llu escape_forwarded=%llu escape_made=%llu gloop=%llu\n"
             "             loop_closed=%llu reassoc=%llu cmp_reused=%llu csel_fused=%llu mul_wide=%llu fma=%llu gssa=%llu\n"
             "             bar_masks=%llu bar_elided=%llu\n"
@@ -669,6 +670,8 @@ int main(int argc, char **argv) {
             (unsigned long long)g_stats.split_cuts,
             (unsigned long long)g_stats.split_invs,
             (unsigned long long)g_stats.pieces,
+            (unsigned long long)g_stats.loop_pieces,
+            (unsigned long long)g_stats.recomputes,
             (unsigned long long)g_stats.escape_removed,
             (unsigned long long)g_stats.escape_forwarded,
             (unsigned long long)g_stats.escape_made,

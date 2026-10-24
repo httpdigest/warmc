@@ -33,6 +33,64 @@ static bool op_is_safepoint(uint16_t op) {
   }
 }
 
+#if RA_HAVE_RECOMP
+/* An add or sub immediate for k: the 12 bits, shifted by 12 or not, and
+   whether it is the negation that fits (sub for add, add for sub). */
+static bool recomp_addsub_imm(uint64_t k, bool w64, uint32_t *imm, int *lsl, bool *neg) {
+  uint64_t m = w64 ? ~0ull : 0xffffffffull;
+  for (int n = 0; n < 2; n++) {
+    uint64_t x = (n ? (uint64_t)0 - k : k) & m;
+    *neg = n != 0;
+    if (x < 4096) { *imm = (uint32_t)x; *lsl = 0; return true; }
+    if ((x & 0xfff) == 0 && x < (1ull << 24)) { *imm = (uint32_t)(x >> 12); *lsl = 1; return true; }
+  }
+  return false;
+}
+
+/* The shape of a value a read can recompute instead of reloading: one
+   integer operation of a register operand x and either another, y, or an
+   immediate c the instruction encodes.  Its op, or I_NOP. */
+static IrOp recomp_shape(IrFunc *f, Ref v, Ref *x, Ref *y, uint64_t *c) {
+  const Inst *in = &f->insts[v];
+  ValType t = (ValType)in->type;
+  if (in->nargs != 2 || (t != VT_I32 && t != VT_I64)) return I_NOP;
+  IrOp op = (IrOp)in->op;
+  const Ref *a = ir_args(f, v);
+  bool k0 = f->insts[a[0]].op == I_CONST, k1 = f->insts[a[1]].op == I_CONST;
+  bool w64 = t == VT_I64;
+  switch (op) {
+    case I_ADD: case I_SUB: case I_AND: case I_OR: case I_XOR:
+    case I_SHL: case I_SHRU: case I_SHRS:
+      break;
+    default:
+      return I_NOP;
+  }
+  if (k0 && k1) return I_NOP;
+  bool comm = op == I_ADD || op == I_AND || op == I_OR || op == I_XOR;
+  if (k0 && !comm) return I_NOP;
+  *x = k0 ? a[1] : a[0];
+  *y = REF_NONE;
+  if (!k0 && !k1) {
+    if (op == I_SHL || op == I_SHRU || op == I_SHRS) return I_NOP;
+    *y = a[1];
+    return op;
+  }
+  *c = f->insts[k0 ? a[0] : a[1]].imm & (w64 ? ~0ull : 0xffffffffull);
+  uint32_t imm, enc;
+  int lsl;
+  bool neg;
+  switch (op) {
+    case I_ADD: case I_SUB:
+      return recomp_addsub_imm(*c, w64, &imm, &lsl, &neg) ? op : I_NOP;
+    case I_AND: case I_OR: case I_XOR:
+      return a64_logical_imm(*c, w64 ? SF64 : SF32, &enc) ? op : I_NOP;
+    default:
+      return op;
+  }
+}
+
+#endif
+
 static bool value_needs_location(IrFunc *f, Ref v) {
   Inst *in = &f->insts[v];
   return in->type != 0;
@@ -891,6 +949,352 @@ static int piece_cmp(const void *a, const void *b) {
   if (x->lo != y->lo) return x->lo < y->lo ? -1 : 1;
   return x->v < y->v ? -1 : x->v > y->v;
 }
+
+#define U64_LESS(x, y) (*(x) < *(y))
+WARMC_SORT(sort_u64, uint64_t, U64_LESS)
+
+typedef struct { Ref v; uint32_t hdr; double gain; } LoopPieceCand;
+
+static int lpc_cmp(const void *a, const void *b) {
+  const LoopPieceCand *x = a, *y = b;
+  if (x->gain != y->gain) return x->gain > y->gain ? -1 : 1;
+  if (x->hdr != y->hdr) return x->hdr < y->hdr ? -1 : 1;
+  return x->v < y->v ? -1 : x->v > y->v;
+}
+
+/* Loop pieces.  A value with no register that a loop reads and that is made
+   before it -- a bound, a base, a constant hoisted out of it -- is the same
+   on every trip, but a use-cluster piece needs its reads close together in
+   one block, and a loop reads it once a block an iteration: each read
+   reloads.  A register free across the whole loop holds it instead, filled
+   once at the end of each block that enters the loop: rsbench/utf8scan's
+   decode loop reloaded its end from the stack every character, the bound
+   being live across an outer loop whose other inner loop needed every
+   register.  Only in a loop that makes no call and has no landing pad, and
+   only a register the range lists show free over each of its blocks and at
+   each fill: nothing writes it there, so it holds the value until the loop
+   is left, through the blocks' terminators too, whose compares read it.
+   Candidates go heaviest first, an enclosing loop's before an inner one's,
+   which it covers.  Appends to *pcs: one PC_LOOP piece per block of the
+   loop, one PC_FILL piece per block entering it. */
+static void place_loop_pieces(Isel *s, IrFunc *f, RList rl[2][32],
+                              const int32_t *blk_start, const int32_t *blk_end,
+                              const uint32_t *lin_off, const Ref *lin,
+                              const uint32_t *web, const Interval *iv,
+                              const int32_t *num, const int *gpool, int ngpool,
+                              Ref *eu, uint32_t eucap, uint32_t n,
+                              struct Piece **pcs, uint32_t *npcs,
+                              uint32_t *cap_pcs) {
+  uint32_t nb = f->nblocks;
+  /* most functions spill nothing a loop could read, and remake nothing
+     that costs more than a move */
+  bool any = false;
+  for (uint32_t v = 0; v < n && !any; v++) {
+    int l = s->loc[v];
+    if (num[v] < 0) continue;
+    if (l != LOC_NONE) { any = IS_SLOT(l); continue; }
+    const Inst *vi = &f->insts[v];
+    any = vi->op == I_GLOBAL_GET ||
+          (vi->op == I_CONST && ((vt_is_float((ValType)vi->type) || (ValType)vi->type == VT_V128) ||
+                                 ir_const_cost(vi->imm, vt_is_64((ValType)vi->type)) > 1));
+  }
+  if (!any) return;
+  uint8_t *member = xcalloc(nb ? nb : 1, 1);
+  uint32_t *mstack = xmalloc((nb ? nb : 1) * sizeof(uint32_t));
+  /* each loop's blocks, by header: lfirst[h]..lfirst[h] + lcount[h] in lblk */
+  uint32_t *lfirst = xmalloc((nb ? nb : 1) * sizeof(uint32_t));
+  uint32_t *lcount = xcalloc(nb ? nb : 1, sizeof(uint32_t));
+  uint32_t *lblk = NULL, nlblk = 0, cap_lblk = 0;
+  double *rw = xcalloc(n ? n : 1, sizeof(double));
+  uint32_t *rstamp = xcalloc(n ? n : 1, sizeof(uint32_t));
+  Ref *rvals = xmalloc((n ? n : 1) * sizeof(Ref));
+  LoopPieceCand *cand = NULL;
+  uint32_t ncand = 0, cap_cand = 0, stamp = 0;
+  uint64_t work = 0;
+
+  for (uint32_t oi = 0; oi < f->norder && work <= SPLIT_BUDGET; oi++) {
+    uint32_t hb = f->order[oi];
+    Block *hd = &f->blocks[hb];
+    if (!hd->reachable || hd->is_pad || hb == f->entry) continue;
+    bool is_hdr = false;
+    for (uint32_t p = 0; p < hd->npreds && !is_hdr; p++) {
+      uint32_t pb = hd->preds[p];
+      is_hdr = f->blocks[pb].reachable && f->blocks[pb].rpo >= hd->rpo;
+    }
+    if (!is_hdr) continue;
+    uint32_t first = nlblk, spx = 0;
+    member[hb] = 1;
+#define LP_ADD(x) do {                                                  \
+      if (nlblk == cap_lblk) {                                            \
+        cap_lblk = cap_lblk ? cap_lblk * 2 : 64;                          \
+        lblk = xrealloc(lblk, cap_lblk * sizeof(uint32_t));               \
+      }                                                                   \
+      lblk[nlblk++] = (x);                                                \
+    } while (0)
+    LP_ADD(hb);
+    for (uint32_t p = 0; p < hd->npreds; p++) {
+      uint32_t pb = hd->preds[p];
+      if (!f->blocks[pb].reachable || f->blocks[pb].rpo < hd->rpo || member[pb]) continue;
+      member[pb] = 1; LP_ADD(pb); mstack[spx++] = pb;
+    }
+    while (spx) {
+      Block *c = &f->blocks[mstack[--spx]];
+      for (uint32_t p = 0; p < c->npreds; p++) {
+        uint32_t pb = c->preds[p];
+        if (member[pb] || !f->blocks[pb].reachable) continue;
+        member[pb] = 1; LP_ADD(pb); mstack[spx++] = pb;
+      }
+    }
+#undef LP_ADD
+    work += nlblk - first;
+    /* irreducible, or one that calls or catches: none */
+    bool bad = false;
+    for (uint32_t k = first; k < nlblk && !bad; k++) {
+      uint32_t bi = lblk[k];
+      const Block *b = &f->blocks[bi];
+      bad = b->rpo < hd->rpo || bi == f->entry || b->is_pad ||
+            ir_block_has_eh(f, bi) || b->term == T_RETURN || b->term == T_TRAP;
+      for (uint32_t i = 0; i < b->ninsts && !bad; i++) {
+        uint16_t op = f->insts[b->insts[i]].op;
+        bad = op_clobbers_caller_saved(op) || op == I_RETURN_CALL ||
+              op == I_RETURN_CALL_INDIRECT || op == I_RETURN_CALL_REF;
+      }
+      work += b->ninsts;
+    }
+    for (uint32_t k = first; k < nlblk; k++) member[lblk[k]] = 0;
+    if (warmc_getenv("WARMC_LP_DEBUG"))
+      fprintf(stderr, "lp[%u] hdr b%u blocks=%u bad=%d\n", f->func_index, hb,
+              nlblk - first, bad);
+    if (bad) { nlblk = first; continue; }
+    lfirst[hb] = first;
+    lcount[hb] = nlblk - first;
+
+    /* what the loop reads that has no register and is live into it */
+    uint32_t cur = ++stamp, nr = 0;
+    for (uint32_t k = lin_off[hb]; k < lin_off[hb + 1]; k++) {
+      Ref v = lin[k];
+      if (v >= n || num[v] < 0 || iv[web[v]].end < 0) continue;
+      if (!value_needs_location(f, v) || skip_location(s, v) || s->pinned[v]) continue;
+      int l = s->loc[web[v]];
+      if (l != LOC_NONE && !IS_SLOT(l)) continue;
+      const Inst *vi = &f->insts[v];
+      if (l == LOC_NONE && vi->op == I_CONST &&
+          !vt_is_float((ValType)vi->type) && (ValType)vi->type != VT_V128 &&
+          ir_const_cost(vi->imm, vt_is_64((ValType)vi->type)) <= 1)
+        continue;
+      if (l == LOC_NONE && vi->op != I_CONST && vi->op != I_GLOBAL_GET) continue;
+      rstamp[v] = cur;
+      rw[v] = 0;
+    }
+    for (uint32_t k = first; k < nlblk; k++) {
+      const Block *b = &f->blocks[lblk[k]];
+      double w = 1.0;
+      for (uint32_t d = 0; d < b->loop_depth && d < 8; d++) w *= 10.0;
+      if (b->cold) w = 0.01;
+      for (uint32_t i = 0; i < b->ninsts; i++) {
+        uint32_t ne = eff_uses(s, f, b->insts[i], eu, eucap);
+        for (uint32_t j = 0; j < ne; j++)
+          if (eu[j] < n && rstamp[eu[j]] == cur) {
+            if (rw[eu[j]] == 0) rvals[nr++] = eu[j];
+            rw[eu[j]] += w;
+          }
+      }
+      if (b->term == T_BRIF && s->fused && s->fused[b->term_arg]) {
+        uint32_t ne = eff_uses(s, f, b->term_arg, eu, eucap);
+        for (uint32_t j = 0; j < ne; j++) {
+          Ref u = eff_arg(s, f, eu[j]);
+          if (u < n && rstamp[u] == cur) {
+            if (rw[u] == 0) rvals[nr++] = u;
+            rw[u] += w;
+          }
+        }
+      } else if ((b->term == T_BRIF || b->term == T_BRTABLE) &&
+                 b->term_arg < n && rstamp[b->term_arg] == cur) {
+        if (rw[b->term_arg] == 0) rvals[nr++] = b->term_arg;
+        rw[b->term_arg] += w;
+      }
+    }
+    if (!nr) continue;
+    /* a fill at the end of each block that enters the loop */
+    double fw = 0;
+    for (uint32_t p = 0; p < hd->npreds; p++) {
+      const Block *pb = &f->blocks[hd->preds[p]];
+      if (!pb->reachable || pb->rpo >= hd->rpo) continue;
+      double w = 1.0;
+      for (uint32_t d = 0; d < pb->loop_depth && d < 8; d++) w *= 10.0;
+      if (pb->cold) w = 0.01;
+      fw += w;
+    }
+    for (uint32_t k = 0; k < nr; k++) {
+      Ref v = rvals[k];
+      if (rw[v] <= fw) continue;
+      if (ncand == cap_cand) {
+        cap_cand = cap_cand ? cap_cand * 2 : 32;
+        cand = xrealloc(cand, cap_cand * sizeof(LoopPieceCand));
+      }
+      cand[ncand++] = (LoopPieceCand){ v, hb, rw[v] - fw };
+    }
+  }
+  if (ncand > 1) qsort(cand, ncand, sizeof(LoopPieceCand), lpc_cmp);
+
+  for (uint32_t x = 0; x < ncand; x++) {
+    Ref v = cand[x].v;
+    uint32_t hb = cand[x].hdr;
+    const Block *hd = &f->blocks[hb];
+    /* covered by an enclosing loop's piece already */
+    bool covered = false;
+    for (uint32_t k = 0; k < *npcs && !covered; k++)
+      covered = (*pcs)[k].v == v && (*pcs)[k].block == hb && (*pcs)[k].kind == PC_LOOP;
+    if (covered) continue;
+    int cl = s->cls[v];
+    const int *pool = cl ? FPR_ALLOC : gpool;
+    int npool = cl ? NFPR_ALLOC : ngpool;
+    int got = -1;
+    for (int k = 0; k < npool && got < 0; k++) {
+      int rr = pool[k];
+      if (cl ? (fpr_is_callee_saved(rr) && !(s->used_fpr_cs & (1u << rr)))
+             : ((gpr_is_callee_saved(rr) && !(s->used_gpr_cs & (1u << rr))) ||
+                rr == RA_ALLOC_RES_REG))
+        continue;
+      const RList *L = &rl[cl ? 1 : 0][rr];
+      bool ok = true;
+      for (uint32_t j = 0; j < lcount[hb] && ok; j++) {
+        uint32_t bi = lblk[lfirst[hb] + j];
+        ok = rl_free(L, blk_start[bi], blk_end[bi]);
+      }
+      for (uint32_t p = 0; p < hd->npreds && ok; p++) {
+        uint32_t pb = hd->preds[p];
+        if (!f->blocks[pb].reachable || f->blocks[pb].rpo >= hd->rpo) continue;
+        ok = rl_free(L, blk_end[pb], blk_end[pb]);
+      }
+      if (ok) got = rr;
+    }
+    if (warmc_getenv("WARMC_LP_DEBUG"))
+      fprintf(stderr, "lp[%u] v%u hdr b%u gain=%.0f reg=%d\n", f->func_index, v, hb,
+              cand[x].gain, got);
+    if (got < 0) continue;
+    RList *L = &rl[cl ? 1 : 0][got];
+    uint32_t need = lcount[hb] + hd->npreds;
+    if (*npcs + need > *cap_pcs) {
+      *cap_pcs = (*npcs + need) * 2;
+      *pcs = xrealloc(*pcs, *cap_pcs * sizeof(struct Piece));
+    }
+    for (uint32_t j = 0; j < lcount[hb]; j++) {
+      uint32_t bi = lblk[lfirst[hb] + j];
+      rl_add(L, blk_start[bi], blk_end[bi], true);
+      (*pcs)[(*npcs)++] = (struct Piece){ v, bi, 0, UINT32_MAX, got, PC_LOOP };
+    }
+    for (uint32_t p = 0; p < hd->npreds; p++) {
+      uint32_t pb = hd->preds[p];
+      if (!f->blocks[pb].reachable || f->blocks[pb].rpo >= hd->rpo) continue;
+      rl_add(L, blk_end[pb], blk_end[pb], true);
+      (*pcs)[(*npcs)++] = (struct Piece){ v, pb, f->blocks[pb].ninsts,
+                                          f->blocks[pb].ninsts, got, PC_FILL };
+    }
+    g_stats.loop_pieces++;
+  }
+  xfree(member); xfree(mstack); xfree(lfirst); xfree(lcount); xfree(lblk);
+  xfree(rw); xfree(rstamp); xfree(rvals); xfree(cand);
+}
+
+#if RA_HAVE_RECOMP
+/* Recompute on read.  A value that is one cheap operation of registers
+   and an immediate (recomp_shape) -- a frame address, sp plus an offset,
+   most often -- costs a load at each read once spilled, where an add from
+   the frame pointer, which has a register there anyway, costs less.  So a
+   spilled one is recomputed at every read where each register operand
+   holds it -- live there and alone in its web, past the read so no result
+   can have taken its register yet, or up to it for a terminator's -- and
+   reloaded nowhere.  Its definition still stores it, for the moves on
+   edges, which read the slot.  A call marshals its arguments into
+   registers an operand could be in, so at one the operands must be
+   callee-saved; a return's epilogue restores those, so a read there rules
+   it out. */
+static void mark_recompute(Isel *s, IrFunc *f, const Interval *iv, const Range *R,
+                           const uint32_t *web, const int32_t *num,
+                           const int32_t *blk_end, Ref *eu, uint32_t eucap,
+                           uint32_t n) {
+  uint32_t *wcnt = xcalloc(n ? n : 1, sizeof(uint32_t));
+  uint8_t *ok = xcalloc(n ? n : 1, 1);
+  uint32_t ncand = 0;
+  for (uint32_t i = 0; i < n; i++)
+    if (iv[i].end >= 0 || (web[i] != i && iv[web[i]].end >= 0)) wcnt[web[i]]++;
+  for (uint32_t v = 0; v < n; v++) {
+    if (num[v] < 0 || !value_needs_location(f, v) || skip_location(s, v)) continue;
+    int l = s->loc[v];
+    if (l == LOC_NONE || !IS_SLOT(l)) continue;
+    Ref x, y;
+    uint64_t c;
+    if (recomp_shape(f, v, &x, &y, &c) == I_NOP) continue;
+    bool regs = true;
+    for (int k = 0; k < 2 && regs; k++) {
+      Ref o = k ? y : x;
+      if (o == REF_NONE) continue;
+      int lo = s->loc[o];
+      regs = o < n && num[o] >= 0 && lo != LOC_NONE && !IS_SLOT(lo) && lo < 32 &&
+             wcnt[web[o]] == 1;
+    }
+    if (regs) { ok[v] = 1; ncand++; }
+  }
+#define RC_COVERS(o, p, strict) ({                                              \
+    const Interval *I_ = &iv[web[o]];                                           \
+    bool c_ = false;                                                            \
+    if (I_->rcount) {                                                           \
+      for (uint32_t y_ = 0; y_ < I_->rcount && !c_; y_++) {                     \
+        const Range *G_ = &R[I_->rfirst + y_];                                  \
+        c_ = G_->lo <= (p) && ((strict) ? (p) < G_->hi : (p) <= G_->hi);        \
+      }                                                                         \
+    } else {                                                                    \
+      c_ = I_->start <= (p) && ((strict) ? (p) < I_->end : (p) <= I_->end);     \
+    }                                                                           \
+    c_; })
+/* where a call marshals into the argument registers, an operand must be in
+   a register no marshalling writes */
+#define RC_SAFE(o) gpr_is_callee_saved(s->loc[o])
+#define RC_READ(w, p, strict, marsh) do {                                       \
+    Ref w_ = (w);                                                               \
+    if (w_ < n && ok[w_]) {                                                     \
+      Ref x_, y_;                                                               \
+      uint64_t c_;                                                              \
+      recomp_shape(f, w_, &x_, &y_, &c_);                                       \
+      if (!RC_COVERS(x_, (p), strict) ||                                        \
+          (y_ != REF_NONE && !RC_COVERS(y_, (p), strict)) ||                    \
+          ((marsh) && (!RC_SAFE(x_) || (y_ != REF_NONE && !RC_SAFE(y_)))))      \
+        ok[w_] = 0;                                                             \
+    }                                                                           \
+  } while (0)
+  for (uint32_t oi = 0; oi < f->norder && ncand; oi++) {
+    uint32_t bi = f->order[oi];
+    const Block *b = &f->blocks[bi];
+    if (!b->reachable) continue;
+    for (uint32_t i = 0; i < b->ninsts; i++) {
+      Ref r = b->insts[i];
+      uint16_t op = f->insts[r].op;
+      bool marshals = op_clobbers_caller_saved(op) || op == I_RETURN_CALL ||
+                      op == I_RETURN_CALL_INDIRECT || op == I_RETURN_CALL_REF;
+      uint32_t ne = eff_uses(s, f, r, eu, eucap);
+      for (uint32_t j = 0; j < ne; j++) RC_READ(eu[j], num[r], true, marshals);
+    }
+    if (b->term == T_BRIF && s->fused && s->fused[b->term_arg]) {
+      uint32_t ne = eff_uses(s, f, b->term_arg, eu, eucap);
+      for (uint32_t j = 0; j < ne; j++) RC_READ(eff_arg(s, f, eu[j]), blk_end[bi], false, false);
+    } else if (b->term == T_BRIF || b->term == T_BRTABLE) {
+      RC_READ(b->term_arg, blk_end[bi], false, false);
+    }
+    for (uint32_t j = 0; j < b->nret; j++)
+      if (b->ret_args[j] < n) ok[b->ret_args[j]] = 0;
+  }
+#undef RC_READ
+#undef RC_SAFE
+#undef RC_COVERS
+  xfree(wcnt);
+  bool any = false;
+  for (uint32_t v = 0; v < n && !any; v++) any = ok[v];
+  if (any) s->recomp = ok;
+  else xfree(ok);
+}
+
+#endif
 
 /* WARMC_VERIFY_RA: at every instruction, no two slots the scan handed out
    that were merged into one hold values live across it -- by location, or as
@@ -2263,6 +2667,13 @@ static void regalloc_linear(Isel *s) {
     xfree(next);
   }
 
+  xfree(s->recomp);
+  s->recomp = NULL;
+#if RA_HAVE_RECOMP
+  if (!warmc_getenv("WARMC_NO_RECOMP"))
+    mark_recompute(s, f, iv, R, web, num, blk_end, eu, eucap, n);
+#endif
+
   /* ---- use-cluster pieces ----
      A value left without a register of its own reloads, or is rebuilt, at
      every read the reload cache misses.  Where it is read several times in
@@ -2298,6 +2709,16 @@ static void regalloc_linear(Isel *s) {
       for (int r = 0; r < 32; r++)
         if (rl[c][r].n > 1)
           sort_ranges_lo(rl[c][r].v, rl[c][r].n);
+    struct Piece *lps = NULL;
+    uint32_t nlps = 0, cap_lps = 0;
+    if (!warmc_getenv("WARMC_NO_LOOP_PIECES"))
+      place_loop_pieces(s, f, rl, blk_start, blk_end, lin_off, lin, web, iv, num,
+                        gpool, ngpool, eu, eucap, n, &lps, &nlps, &cap_lps);
+    /* (value, block) of each, sorted: a block's own pieces leave them out */
+    uint64_t *lpkey = xmalloc((nlps ? nlps : 1) * sizeof(uint64_t));
+    for (uint32_t k = 0; k < nlps; k++)
+      lpkey[k] = (uint64_t)lps[k].v << 32 | lps[k].block;
+    sort_u64(lpkey, nlps);
     PieceUse *pu = NULL; uint32_t npu = 0, cap_pu = 0;
     PieceCand *pcd = NULL; uint32_t npcd = 0, cap_pcd = 0;
     uint32_t *clob = NULL; uint32_t cap_clob = 0;
@@ -2329,6 +2750,15 @@ static void regalloc_linear(Isel *s) {
             continue;
           int l = s->loc[web[u]];
           if (l != LOC_NONE && !IS_SLOT(l)) continue;
+          if (nlps) {
+            uint64_t key = (uint64_t)u << 32 | bi;
+            uint32_t a = 0, z = nlps;
+            while (a < z) {
+              uint32_t m = (a + z) / 2;
+              if (lpkey[m] < key) a = m + 1; else z = m;
+            }
+            if (a < nlps && lpkey[a] == key) continue;
+          }
           if (npu == cap_pu) {
             cap_pu = cap_pu ? cap_pu * 2 : 64;
             pu = xrealloc(pu, cap_pu * sizeof(PieceUse));
@@ -2360,8 +2790,11 @@ static void regalloc_linear(Isel *s) {
       }
     }
     if (npcd > 1) qsort(pcd, npcd, sizeof(PieceCand), piece_cand_cmp);
-    struct Piece *pcs = xmalloc((npcd ? npcd : 1) * sizeof(struct Piece));
-    uint32_t npcs = 0;
+    struct Piece *pcs = xmalloc((npcd + nlps ? npcd + nlps : 1) * sizeof(struct Piece));
+    uint32_t npcs = nlps;
+    if (nlps) memcpy(pcs, lps, nlps * sizeof(struct Piece));
+    xfree(lps);
+    xfree(lpkey);
     for (uint32_t x = 0; x < npcd; x++) {
       PieceCand *c = &pcd[x];
       int cl = s->cls[c->v];
@@ -2382,7 +2815,7 @@ static void regalloc_linear(Isel *s) {
       }
       if (got < 0) continue;
       rl_add(&rl[cl ? 1 : 0][got], plo, phi, true);
-      pcs[npcs++] = (struct Piece){ c->v, c->block, c->lo, c->hi, got };
+      pcs[npcs++] = (struct Piece){ c->v, c->block, c->lo, c->hi, got, PC_CLUSTER };
     }
     if (npcs) {
       qsort(pcs, npcs, sizeof(struct Piece), piece_cmp);

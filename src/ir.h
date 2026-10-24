@@ -505,7 +505,7 @@ typedef struct {
 
   uint64_t bar_masks, bar_elided;
   uint64_t caller_saves, csa_restores, spills_v128_xcall, range_budget_trips;
-  uint64_t split_cuts, split_invs, pieces;
+  uint64_t split_cuts, split_invs, pieces, loop_pieces, recomputes;
   uint64_t devirt_ref, devirt_indirect, devirt_null_kept;
   uint64_t const_reads, throw_jumps, inl_more;
   uint64_t inl_flat, inl_spliced, inl_once_forced, inl_retcall_sites;

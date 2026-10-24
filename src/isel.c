@@ -143,6 +143,10 @@ static bool isel_fp_remat_ok(Isel *s, const Inst *in) {
 #define RA_RETAREA_REG R8
 #define RA_ALLOC_RES_REG R0
 #define RA_HAVE_PIECES 1
+#define RA_HAVE_RECOMP 1
+
+static bool recomp_addsub_imm(uint64_t k, bool w64, uint32_t *imm, int *lsl, bool *neg);
+static IrOp recomp_shape(IrFunc *f, Ref v, Ref *x, Ref *y, uint64_t *c);
 #define RA_FMA_TIED 0
 /* a constant zero is read as wzr/xzr where it has no register (rd_zr) */
 #define RA_ZERO_REG 1
@@ -164,17 +168,66 @@ static void pool_load(Isel *s, int ft, int fr, uint64_t bits);
 static int vmctx_at(Isel *s, uint32_t off, int size, uint32_t *disp,
                     int scratch);
 
-/* The register a use-cluster piece holds v in at the current instruction, or
-   -1.  Pieces are live only while the instruction loop of emit_block runs:
-   a terminator reads after the last piece has ended. */
+/* The register a piece holds v in at the current instruction, or -1.  A
+   use-cluster piece is live only while the instruction loop of emit_block
+   runs, as a terminator reads after its last read; a loop piece through
+   the terminator's condition as well. */
 static int piece_reg(Isel *s, Ref v) {
-  if (!s->pc_live || !s->pc_head) return -1;
+  if ((!s->pc_live && !s->pc_term) || !s->pc_head) return -1;
   for (int32_t k = s->pc_head[v]; k >= 0; k = s->pc_next[k]) {
     const struct Piece *p = &s->pc[k];
-    if (p->block == s->cur_block && p->lo <= s->cur_pos && s->cur_pos <= p->hi)
+    if (p->block != s->cur_block) continue;
+    if (p->kind == PC_LOOP) return p->reg;
+    if (p->kind == PC_CLUSTER && s->pc_live && p->lo <= s->cur_pos &&
+        s->cur_pos <= p->hi)
       return p->reg;
   }
   return -1;
+}
+
+/* A spilled value mark_recompute found its register operands hold at
+   every read: computed again into scratch instead of reloaded. */
+static int recomp_read(Isel *s, Ref v, int scratch) {
+  Ref x, y;
+  uint64_t c = 0;
+  IrOp op = recomp_shape(s->f, v, &x, &y, &c);
+  int sf = is64(s->f, v) ? SF64 : SF32;
+  int xr = s->loc[x], yr = y == REF_NONE ? -1 : s->loc[y];
+  uint32_t imm = 0, enc = 0;
+  int lsl = 0;
+  bool neg = false;
+  if (yr < 0 && (op == I_ADD || op == I_SUB))
+    recomp_addsub_imm(op == I_SUB ? (uint64_t)0 - c : c, sf == SF64, &imm, &lsl, &neg);
+  if (yr < 0 && (op == I_AND || op == I_OR || op == I_XOR))
+    a64_logical_imm(c, sf, &enc);
+  int sh = (int)(c & (sf == SF64 ? 63u : 31u));
+  switch (op) {
+    case I_ADD: case I_SUB:
+      if (yr >= 0) {
+        if (op == I_ADD) a64_add_reg(B, sf, scratch, xr, yr);
+        else a64_sub_reg(B, sf, scratch, xr, yr);
+      } else if (neg) {
+        a64_sub_imm(B, sf, scratch, xr, imm, lsl);
+      } else {
+        a64_add_imm(B, sf, scratch, xr, imm, lsl);
+      }
+      break;
+    case I_AND:
+      if (yr >= 0) a64_and_reg(B, sf, scratch, xr, yr); else a64_and_imm(B, sf, scratch, xr, enc);
+      break;
+    case I_OR:
+      if (yr >= 0) a64_orr_reg(B, sf, scratch, xr, yr); else a64_orr_imm(B, sf, scratch, xr, enc);
+      break;
+    case I_XOR:
+      if (yr >= 0) a64_eor_reg(B, sf, scratch, xr, yr); else a64_eor_imm(B, sf, scratch, xr, enc);
+      break;
+    case I_SHL: a64_lsl_imm(B, sf, scratch, xr, sh); break;
+    case I_SHRU: a64_lsr_imm(B, sf, scratch, xr, sh); break;
+    case I_SHRS: a64_asr_imm(B, sf, scratch, xr, sh); break;
+    default: warmc_fatal("internal: v%u is no value to recompute", v);
+  }
+  g_stats.recomputes++;
+  return scratch;
 }
 
 static int rd(Isel *s, Ref v, int scratch) {
@@ -251,6 +304,7 @@ static int rd(Isel *s, Ref v, int scratch) {
      needed when that register is this scratch, as it often is.  Where the
      reload cache takes the value, the move fills the cache instead. */
   bool fwd = s->st_v == v && s->st_end == B->len;
+  if (!fwd && s->recomp && s->recomp[v]) return recomp_read(s, v, scratch);
   if (s->rc_reg[0] && !is_fp_value(s->f, v) && !is_vec_value(s->f, v)) {
     for (int i = 0; i < 2; i++)
       if (s->rc_reg[i] && s->rc_slot[i] == sl + 1) {
@@ -2204,6 +2258,7 @@ typedef struct {
   uint32_t npc;
   uint32_t *pc_bfirst, *pc_bn;
   int32_t *pc_head, *pc_next;
+  uint8_t *recomp;
   uint32_t *sp_first, *sp_n;
   Ref *sp_vals;
   uint32_t nsp_vals, cap_sp_vals;
@@ -2217,7 +2272,7 @@ static void ra_keep_drop(void *p) {
   xfree(k->loc); xfree(k->csa_slot); xfree(k->csa_on); xfree(k->no_remat);
   xfree(k->csa_first); xfree(k->csa_n); xfree(k->csa_vals);
   xfree(k->pc); xfree(k->pc_bfirst); xfree(k->pc_bn); xfree(k->pc_head);
-  xfree(k->pc_next);
+  xfree(k->pc_next); xfree(k->recomp);
   xfree(k->sp_first); xfree(k->sp_n); xfree(k->sp_vals);
   xfree(k->lv_in_off); xfree(k->lv_out_off); xfree(k->lv_in); xfree(k->lv_out);
   xfree(k);
@@ -2236,6 +2291,7 @@ static void ra_keep_save(Isel *s, const OptStats *added) {
   MOVE(loc); MOVE(csa_slot); MOVE(csa_on); MOVE(no_remat);
   MOVE(csa_first); MOVE(csa_n); MOVE(csa_vals);
   MOVE(pc); MOVE(pc_bfirst); MOVE(pc_bn); MOVE(pc_head); MOVE(pc_next);
+  MOVE(recomp);
   MOVE(sp_first); MOVE(sp_n); MOVE(sp_vals);
   MOVE(lv_in_off); MOVE(lv_out_off); MOVE(lv_in); MOVE(lv_out);
 #undef MOVE
@@ -2259,6 +2315,7 @@ static void ra_keep_take(Isel *s) {
   MOVE(loc); MOVE(csa_slot); MOVE(csa_on); MOVE(no_remat);
   MOVE(csa_first); MOVE(csa_n); MOVE(csa_vals);
   MOVE(pc); MOVE(pc_bfirst); MOVE(pc_bn); MOVE(pc_head); MOVE(pc_next);
+  MOVE(recomp);
   MOVE(sp_first); MOVE(sp_n); MOVE(sp_vals);
   MOVE(lv_in_off); MOVE(lv_out_off); MOVE(lv_in); MOVE(lv_out);
 #undef MOVE
@@ -3132,6 +3189,7 @@ give_up:
   xfree(s->vrot); xfree(s->vadal);
   xfree(s->extr);
   xfree(s->pc); xfree(s->pc_bfirst); xfree(s->pc_bn); xfree(s->pc_head);
+  xfree(s->recomp);
   xfree(s->pc_next);
   xfree(s->lowonly);
   xfree(s->sites); xfree(s->clauses);

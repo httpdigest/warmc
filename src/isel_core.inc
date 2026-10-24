@@ -139,12 +139,20 @@ typedef struct {
      rematerialisation) held in a register that is free across a run of its
      uses in one block, filled once before the first of them.  pc is sorted
      by (block, first instruction); pc_bfirst/pc_bn index it per block, and
-     pc_head/pc_next chain each value's pieces. */
-  struct Piece { Ref v; uint32_t block, lo, hi; int reg; } *pc;
+     pc_head/pc_next chain each value's pieces.  A loop piece (see
+     place_loop_pieces) is a PC_LOOP piece in each block of a loop, read
+     there up to the terminator's condition (pc_term), and a PC_FILL piece
+     at the end of each block entering it. */
+  struct Piece { Ref v; uint32_t block, lo, hi; int reg; uint8_t kind; } *pc;
+#define PC_CLUSTER 0
+#define PC_LOOP 1
+#define PC_FILL 2
   uint32_t npc;
   uint32_t *pc_bfirst, *pc_bn;
   int32_t *pc_head, *pc_next;
-  bool pc_live;
+  bool pc_live, pc_term;
+  /* spilled values read by recomputing them (see mark_recompute) */
+  uint8_t *recomp;
   /* a wrap all of whose readers read only the low half of a register */
   uint8_t *lowonly;
   uint8_t *no_remat;
@@ -631,6 +639,9 @@ static int edge_moves(Isel *s, Edge *e, Move *mv) {
   IrFunc *f = s->f;
   Block *t = &f->blocks[e->target];
   int n = 0;
+  /* A loop piece's register can be a param's outside the loop, written on
+     the way out: moves read nothing from pieces. */
+  s->pc_term = false;
   for (uint32_t i = 0; i < t->nparams; i++) {
     Ref dstv = t->params[i], srcv = e->args[i];
     if (s->loc[dstv] == LOC_NONE) continue;
