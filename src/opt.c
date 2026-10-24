@@ -5979,6 +5979,9 @@ typedef struct {
   int64_t lo, hi;
   uint32_t callees[FX_MAX_CALLEES];
   uint32_t ncallees;
+  /* its body as built: how many instructions, and whether any is a call */
+  uint32_t built_insts;
+  bool makes_calls;
   VtStore *vtst;
   uint32_t nvtst, capvtst;
 } DirectFx;
@@ -6000,14 +6003,19 @@ typedef struct {
      less than that value, as a frame is taken */
   uint64_t above, uncertain, push;
   bool indirect, capped;
-  /* resolved: neither it nor anything it calls reads its callers' frames */
-  bool safe;
+  /* per global below 64 it writes: back at its entry value at every
+     return whatever the calls do, or provided they put it back too */
+  uint64_t setg, bal_alone, bal_calls;
+  bool has_calls;
+  /* resolved: neither it nor anything it calls reads its callers' frames;
+     it returns with the stack pointer where it found it */
+  bool safe, balanced;
   DfArg *args;
   uint32_t nargs, cap;
 } DfFunc;
 static DfFunc *df_func;
 static uint32_t df_sp = UINT32_MAX;
-static bool df_scanfree;
+static bool df_scanfree, df_imports_bal;
 static void df_scan(Module *m, IrFunc *g, uint32_t fi);
 static void df_resolve(Module *m);
 
@@ -6304,6 +6312,12 @@ static void fx_scan_direct(Module *m, const OptOpts *o, uint32_t fi) {
     }
   }
   if (df_func) df_scan(m, g, fi);
+  d->built_insts = g->ninsts;
+  for (uint32_t bi = 0; bi < g->nblocks && !d->makes_calls; bi++) {
+    Block *b = &g->blocks[bi];
+    for (uint32_t i = 0; i < b->ninsts; i++)
+      if (is_call_op(g->insts[b->insts[i]].op)) { d->makes_calls = true; break; }
+  }
   ir_free(g);
 
   d->writes_globals = writes_globals;
@@ -6473,6 +6487,52 @@ static void df_scan_write(DfFunc *d, uint8_t k, uint8_t id, int64_t at, int64_t 
   if (k == DF_ENTRY && df_known(at) && at + w > 0) d->above |= 1ull << id;
 }
 
+/* Whether global gi holds the value it was entered with at every return:
+   each write of it puts back that value or another, and a call keeps it --
+   or, `lose`, may leave anything.  An exception's edge leaves anything. */
+static bool df_balanced(IrFunc *g, const DfVals *dv, uint32_t gi, bool lose) {
+  uint32_t nb = g->nblocks, n = g->ninsts;
+  uint8_t *in = xcalloc(nb ? nb : 1, 1);
+  uint8_t *inq = xcalloc(nb ? nb : 1, 1);
+  uint32_t *wl = xmalloc((nb ? nb : 1) * sizeof(uint32_t));
+  uint32_t nw = 0;
+  in[g->entry] = 1;
+  wl[nw++] = g->entry;
+  inq[g->entry] = 1;
+  bool ok = true;
+  while (nw && ok) {
+    uint32_t bi = wl[--nw];
+    inq[bi] = 0;
+    Block *b = &g->blocks[bi];
+    uint8_t st = in[bi];
+    for (uint32_t i = 0; i < b->ninsts && ok; i++) {
+      Ref v = b->insts[i];
+      Inst *x = &g->insts[v];
+      if (x->op == I_GLOBAL_SET && x->imm == gi) {
+        Ref a0 = ir_args(g, v)[0];
+        st = a0 < n && dv->kind[a0] == DF_ENTRY && dv->id[a0] == gi && dv->off[a0] == 0 ? 1 : 2;
+      } else if (x->op == I_RETURN_CALL || x->op == I_RETURN_CALL_INDIRECT ||
+                 x->op == I_RETURN_CALL_REF) {
+        if (st != 1 || lose) ok = false;
+      } else if (lose && is_call_op(x->op)) {
+        st = 2;
+      }
+    }
+    if (b->term == T_RETURN && st != 1) ok = false;
+    for (uint32_t s = 0; s < b->nsuccs && ok; s++) {
+      uint32_t t = b->succs[s].target;
+      uint8_t es = b->succs[s].eh ? 2 : st;
+      uint8_t ns = in[t] == 0 ? es : in[t] == es ? es : 2;
+      if (ns != in[t]) {
+        in[t] = ns;
+        if (!inq[t]) { inq[t] = 1; wl[nw++] = t; }
+      }
+    }
+  }
+  xfree(in); xfree(inq); xfree(wl);
+  return ok;
+}
+
 static void df_scan(Module *m, IrFunc *g, uint32_t fi) {
   DfFunc *d = &df_func[fi];
   for (int j = 0; j < DF_MAXP; j++) { d->lo[j] = INT64_MAX; d->hi[j] = INT64_MIN; }
@@ -6518,6 +6578,19 @@ static void df_scan(Module *m, IrFunc *g, uint32_t fi) {
     }
     if (!dv.changed) break;
     if (round == 15) { d->esc = 0xff; d->uncertain = ~0ull; }
+  }
+  for (uint32_t bi = 0; bi < g->nblocks; bi++) {
+    Block *b = &g->blocks[bi];
+    for (uint32_t i = 0; i < b->ninsts; i++) {
+      Inst *in = &g->insts[b->insts[i]];
+      if (in->op == I_GLOBAL_SET && df_stackish(m, in->imm)) d->setg |= 1ull << in->imm;
+      if (is_call_op(in->op)) d->has_calls = true;
+    }
+  }
+  for (uint64_t gm = d->setg; gm; gm &= gm - 1) {
+    uint32_t gi = (uint32_t)__builtin_ctzll(gm);
+    if (df_balanced(g, &dv, gi, false)) d->bal_calls |= 1ull << gi;
+    if (df_balanced(g, &dv, gi, true)) d->bal_alone |= 1ull << gi;
   }
 
   for (uint32_t bi = 0; bi < g->nblocks; bi++) {
@@ -6684,248 +6757,352 @@ static void df_resolve(Module *m) {
       if (!safe) { d->safe = false; changed = true; }
     }
   }
+
+  /* which calls return with the stack pointer where they found it: an
+     import, when the host cannot see it, and a function that puts it back
+     itself or whose calls all do */
+  df_imports_bal = !m->globals[sp].imported;
+  for (uint32_t e = 0; e < m->nexports; e++)
+    if (m->exports[e].kind == EK_GLOBAL && m->exports[e].index == sp) df_imports_bal = false;
+  for (uint32_t fi = 0; fi < m->nfuncs; fi++) {
+    DfFunc *d = &df_func[fi];
+    if (!fx_direct[fi].has_body) { d->balanced = df_imports_bal; continue; }
+    bool written = (d->setg & spb) != 0;
+    d->balanced = written ? (d->bal_calls & spb) != 0 : true;
+  }
+  for (changed = true; changed;) {
+    changed = false;
+    for (uint32_t fi = 0; fi < m->nfuncs; fi++) {
+      DfFunc *d = &df_func[fi];
+      const DirectFx *x = &fx_direct[fi];
+      if (!d->balanced || !x->has_body) continue;
+      bool alone = (d->setg & spb) ? (d->bal_alone & spb) != 0 : !d->has_calls;
+      if (alone) continue;
+      bool bal = !d->indirect && !x->callees_capped;
+      for (uint32_t k = 0; k < x->ncallees && bal; k++) {
+        uint32_t c = x->callees[k];
+        if (c < m->nfuncs && !df_func[c].balanced) bal = false;
+      }
+      if (!bal) { d->balanced = false; changed = true; }
+    }
+  }
   df_sp = sp;
 }
 
-typedef struct { uint32_t at; int64_t lo, hi; } DfRead;
+/* What the pass sees of a block, in order: a read of the frame -- bytes
+   [lo, hi) from the entry stack pointer, or all of it -- and a pop, a
+   stack pointer put back to lo, below which nothing is read again. */
+enum { DF_EV_READ, DF_EV_ALL, DF_EV_POP };
+typedef struct { uint32_t at; uint8_t kind; int64_t lo, hi; } DfEvent;
 typedef struct { uint32_t block, at; Ref v; int64_t lo, hi; } DfCand;
 
-static bool df_overlap(const DfRead *r, int64_t lo, int64_t hi) {
-  return r->lo == DF_ALL || (r->lo < hi && lo < r->hi);
+/* Whether a store of [lo, hi) is read, starting at event k of block b:
+   1 read, 0 not on this path (a pop leaves it below the stack pointer), -1
+   on to the block's successors. */
+static int df_scan_block(const DfEvent *ev, uint32_t k, uint32_t end, int64_t lo,
+                         int64_t hi) {
+  for (; k < end; k++) {
+    const DfEvent *e = &ev[k];
+    if (e->kind == DF_EV_POP) { if (hi <= e->lo) return 0; }
+    else if (e->kind == DF_EV_ALL || (e->lo < hi && lo < e->hi)) return 1;
+  }
+  return -1;
 }
 
 static bool pass_dead_frames(IrFunc *f) {
   Module *m = f->m;
   if (!df_func || df_sp == UINT32_MAX || fx_mod != m || !fx_resolved) return false;
-  Block *eb = &f->blocks[f->entry];
-  uint32_t n = f->ninsts;
+  uint32_t n = f->ninsts, nb = f->nblocks;
   bool any = false;
-  for (uint32_t i = 0; i < eb->ninsts && !any; i++) {
-    Inst *in = &f->insts[eb->insts[i]];
-    if (in->op == I_GLOBAL_GET && in->imm == df_sp) any = true;
-    else if ((in->op == I_GLOBAL_SET && in->imm == df_sp) || is_call_op(in->op)) break;
+  for (uint32_t oi = 0; oi < f->norder && !any; oi++) {
+    Block *b = &f->blocks[f->order[oi]];
+    for (uint32_t i = 0; i < b->ninsts && !any; i++) {
+      Inst *in = &f->insts[b->insts[i]];
+      if (in->op == I_GLOBAL_GET && in->imm == df_sp) any = true;
+    }
   }
   if (!any) return false;
   DfVals dv = { xcalloc(n ? n : 1, 1), xcalloc(n ? n : 1, 1),
                 xcalloc(n ? n : 1, sizeof(int64_t)), false, NULL };
-  bool cut = false;
-  for (uint32_t i = 0; i < eb->ninsts; i++) {
-    Ref v = eb->insts[i];
-    Inst *in = &f->insts[v];
-    if (in->op == I_GLOBAL_GET && in->imm == df_sp && !cut) dv.kind[v] = DF_ENTRY;
-    if ((in->op == I_GLOBAL_SET && in->imm == df_sp) || is_call_op(in->op)) cut = true;
-  }
-  for (uint32_t oi = 0; oi < f->norder; oi++) {
-    Block *b = &f->blocks[f->order[oi]];
-    for (uint32_t i = 0; i < b->ninsts; i++) {
-      Ref v = b->insts[i];
-      Inst *in = &f->insts[v];
-      if (in->op == I_GLOBAL_GET && in->imm == df_sp && dv.kind[v] == DF_NONE) {
-        dv.kind[v] = DF_LATER; dv.off[v] = DF_UNK;
-      }
-    }
-  }
+  /* What the stack pointer holds at each block's start, flowed forward: the
+     entry value, then what each write puts there; a call to a function that
+     puts it back as it found it keeps it, any other call or an exception's
+     edge loses it, and so does a meeting of two values.  Each read is the
+     value it finds -- after inlining, a callee's prologue reads what its
+     caller's left. */
+  uint8_t *spk = xcalloc(nb ? nb : 1, 1);
+  int64_t *spo = xcalloc(nb ? nb : 1, sizeof(int64_t));
+  spk[f->entry] = DF_ENTRY;
   bool bail = true;
   for (int round = 0; round < 16; round++) {
     dv.changed = false;
     for (uint32_t oi = 0; oi < f->norder; oi++) {
       uint32_t bi = f->order[oi];
       Block *b = &f->blocks[bi];
-      for (uint32_t i = 0; i < b->ninsts; i++) df_derive(f, &dv, b->insts[i]);
+      uint8_t sk = spk[bi] ? spk[bi] : DF_LATER;
+      int64_t so = spk[bi] ? spo[bi] : DF_UNK;
+      for (uint32_t i = 0; i < b->ninsts; i++) {
+        Ref v = b->insts[i];
+        Inst *in = &f->insts[v];
+        if (in->op == I_GLOBAL_GET && in->imm == df_sp) df_set(&dv, v, sk, 0, so);
+        df_derive(f, &dv, v);
+        if (in->op == I_GLOBAL_SET && in->imm == df_sp && in->nargs == 1) {
+          Ref x = ir_args(f, v)[0];
+          if (x < n && dv.kind[x] != DF_NONE) { sk = dv.kind[x]; so = dv.off[x]; }
+          else { sk = DF_LATER; so = DF_UNK; }
+        } else if (is_call_op(in->op) &&
+                   !(in->op == I_CALL && in->imm < m->nfuncs && df_func[in->imm].balanced)) {
+          sk = DF_LATER; so = DF_UNK;
+        }
+      }
       df_edges(f, &dv, bi);
+      for (uint32_t s = 0; s < b->nsuccs; s++) {
+        uint32_t t = b->succs[s].target;
+        uint8_t ik = b->succs[s].eh ? DF_LATER : sk;
+        int64_t io = b->succs[s].eh ? DF_UNK : so;
+        if (!spk[t]) { spk[t] = ik; spo[t] = io; dv.changed = true; }
+        else if ((spk[t] != ik || spo[t] != io) && !(spk[t] == DF_LATER && spo[t] == DF_UNK)) {
+          spk[t] = DF_LATER; spo[t] = DF_UNK; dv.changed = true;
+        }
+      }
     }
     if (!dv.changed) { bail = false; break; }
   }
-
-  uint32_t nb = f->nblocks;
-  uint32_t *rstart = xcalloc(nb ? nb : 1, sizeof(uint32_t));
-  uint32_t *rcount = xcalloc(nb ? nb : 1, sizeof(uint32_t));
-  int64_t *hlo = xmalloc((nb ? nb : 1) * sizeof(int64_t));
-  int64_t *hhi = xmalloc((nb ? nb : 1) * sizeof(int64_t));
-  for (uint32_t bi = 0; bi < nb; bi++) { hlo[bi] = INT64_MAX; hhi[bi] = INT64_MIN; }
-  DfRead *rd = NULL;
-  DfCand *cd = NULL;
-  uint32_t nr = 0, cr = 0, nc = 0, cc = 0;
-#define DF_READ(i, l, h) do { \
-    if (nr == cr) { cr = cr ? cr * 2 : 64; rd = xrealloc(rd, cr * sizeof(DfRead)); } \
-    rd[nr++] = (DfRead){ (i), (l), (h) }; \
-    if ((l) == DF_ALL) { hlo[bi] = DF_ALL; hhi[bi] = INT64_MAX; } \
-    else if (hlo[bi] != DF_ALL) { \
-      if ((l) < hlo[bi]) hlo[bi] = (l); \
-      if ((h) > hhi[bi]) hhi[bi] = (h); \
-    } \
-  } while (0)
-#define DF_CAND(i, v, l, h) do { \
-    if (nc == cc) { cc = cc ? cc * 2 : 64; cd = xrealloc(cd, cc * sizeof(DfCand)); } \
-    cd[nc++] = (DfCand){ bi, (i), (v), (l), (h) }; \
-  } while (0)
-
+  xfree(spk); xfree(spo);
+  /* the stack pointer set to what the pass cannot follow is a stack it
+     does not know */
   for (uint32_t oi = 0; oi < f->norder && !bail; oi++) {
-    uint32_t bi = f->order[oi];
-    Block *b = &f->blocks[bi];
-    rstart[bi] = nr;
+    Block *b = &f->blocks[f->order[oi]];
     for (uint32_t i = 0; i < b->ninsts && !bail; i++) {
       Ref v = b->insts[i];
       Inst *in = &f->insts[v];
-      Ref *a = ir_args(f, v);
-      /* a call that may reach a function reading its callers' frames reads
-         this one whole */
-      if (is_call_op(in->op)) {
-        bool all;
-        if (in->op == I_CALL || in->op == I_RETURN_CALL) {
-          uint32_t c = (uint32_t)in->imm;
-          all = c < m->nfuncs && fx_direct[c].has_body && !df_func[c].safe;
-        } else {
-          all = !df_scanfree;
-        }
-        if (all) DF_READ(i, DF_ALL, 0);
-      }
-      for (uint32_t j = 0; j < in->nargs && !bail; j++) {
-        Ref x = a[j];
-        if (x >= n || dv.kind[x] == DF_NONE) continue;
-        bool ent = dv.kind[x] == DF_ENTRY && df_known(dv.off[x]);
-        int64_t at = ent ? dv.off[x] + (int64_t)in->imm : DF_UNK;
-        switch (in->op) {
-          case I_LOAD: {
-            int64_t w = (int64_t)1 << MEMF_SIZE(in->imm2);
-            if (MEMF_MEM(in->imm2) != 0 || (ent && at + w > 0)) { bail = true; break; }
-            if (ent) DF_READ(i, at, at + w); else DF_READ(i, DF_ALL, 0);
-            break;
-          }
-          case I_VLOAD: case I_VLDN:
-            DF_READ(i, DF_ALL, 0);
-            break;
-          case I_STORE: {
-            int64_t w = (int64_t)1 << MEMF_SIZE(in->imm2);
-            if (j != 0 || MEMF_MEM(in->imm2) != 0 || (ent && at + w > 0)) { bail = true; break; }
-            Ref y = a[1];
-            if (ent && at >= -FRAME_SPAN && !(y < n && dv.kind[y] != DF_NONE))
-              DF_CAND(i, v, at, at + w);
-            break;
-          }
-          case I_VSTORE:
-            if (j != 0) bail = true;
-            break;
-          case I_MEM_COPY: case I_MEM_FILL: {
-            Ref ln = a[2];
-            bool lc = ln < n && f->insts[ln].op == I_CONST;
-            int64_t len = lc ? (int64_t)(uint32_t)f->insts[ln].imm : 0;
-            int64_t o = ent ? dv.off[x] : DF_UNK;
-            if (in->imm != 0 || (in->op == I_MEM_COPY && in->imm2 != 0) || j == 2 ||
-                (j == 1 && in->op == I_MEM_FILL) || (ent && lc && o + len > 0)) {
-              bail = true;
-              break;
-            }
-            if (j == 1) {
-              if (ent && lc) DF_READ(i, o, o + len); else DF_READ(i, DF_ALL, 0);
-            } else if (ent && lc && len > 0 && o >= -FRAME_SPAN) {
-              DF_CAND(i, v, o, o + len);
-            }
-            break;
-          }
-          case I_MEM_INIT:
-            if (j != 0) bail = true;
-            break;
-          case I_CALL: {
-            uint32_t c = (uint32_t)in->imm;
-            if (c >= m->nfuncs || !fx_direct[c].has_body || j >= DF_MAXP ||
-                (df_func[c].esc >> j & 1)) {
-              bail = true;
-              break;
-            }
-            int64_t lo = df_func[c].lo[j], hi = df_func[c].hi[j];
-            if (df_func[c].unk >> j & 1) {
-              DF_READ(i, DF_ALL, 0);
-            } else if (lo < hi) {
-              if (ent) DF_READ(i, dv.off[x] + lo, dv.off[x] + hi);
-              else DF_READ(i, DF_ALL, 0);
-            }
-            break;
-          }
-          case I_GLOBAL_SET:
-            if (in->imm != df_sp) bail = true;
-            break;
-          case I_BOUNDS_CHECK: case I_TRAP_IF: case I_SELECT:
-            break;
-          default:
-            if (df_is_cmp(in->op)) break;
-            if (!ir_is_pure(in) || is_call_op(in->op)) bail = true;
-            break;
-        }
-      }
+      if (in->op == I_GLOBAL_SET && in->imm == df_sp &&
+          (in->nargs != 1 || ir_args(f, v)[0] >= n || dv.kind[ir_args(f, v)[0]] == DF_NONE))
+        bail = true;
     }
-    for (uint32_t r = 0; r < b->nret && !bail; r++) {
-      Ref x = b->ret_args[r];
-      if (x < n && dv.kind[x] != DF_NONE) bail = true;
-    }
-    rcount[bi] = nr - rstart[bi];
   }
-#undef DF_READ
-#undef DF_CAND
 
-  /* a store is dead when no read it reaches before the function returns
-     overlaps it: its own block's later ones, and every one in a block it
-     can reach */
+  /* Where a frame pointer escapes -- stored, returned, handed to what the
+     scan cannot follow -- anything may read the frame from then on: the
+     escape reads all of it, and so does every load and call after it, and
+     no store after it goes.  Found first, the code after each is known when
+     the reads are gathered. */
+  uint32_t *esc_at = xmalloc((nb ? nb : 1) * sizeof(uint32_t));
+  uint8_t *esc_all = xcalloc(nb ? nb : 1, 1);
+  for (uint32_t bi = 0; bi < nb; bi++) esc_at[bi] = UINT32_MAX;
+  uint32_t *estart = xcalloc(nb ? nb : 1, sizeof(uint32_t));
+  uint32_t *ecount = xcalloc(nb ? nb : 1, sizeof(uint32_t));
+  DfEvent *ev = NULL;
+  DfCand *cd = NULL;
+  uint32_t ne = 0, ce = 0, nc = 0, cc = 0;
+  bool escaped = false;
+#define DF_EVENT(i, k, l, h) do { \
+    if (ne == ce) { ce = ce ? ce * 2 : 64; ev = xrealloc(ev, ce * sizeof(DfEvent)); } \
+    ev[ne++] = (DfEvent){ (i), (k), (l), (h) }; \
+  } while (0)
+#define DF_READ(i, l, h) DF_EVENT(i, DF_EV_READ, l, h)
+#define DF_ALLR(i) DF_EVENT(i, DF_EV_ALL, 0, 0)
+#define DF_ESCAPE(i) do { \
+    if (phase == 0) { if (esc_at[bi] == UINT32_MAX) esc_at[bi] = (i); escaped = true; } \
+    else DF_ALLR(i); \
+  } while (0)
+
+  for (int phase = 0; phase < 2 && !bail; phase++) {
+    if (phase == 1 && escaped) {
+      uint32_t *stk = xmalloc((nb ? nb : 1) * sizeof(uint32_t));
+      uint32_t sp = 0;
+      for (uint32_t bi = 0; bi < nb; bi++)
+        if (esc_at[bi] != UINT32_MAX)
+          for (uint32_t s = 0; s < f->blocks[bi].nsuccs; s++) {
+            uint32_t t = f->blocks[bi].succs[s].target;
+            if (!esc_all[t]) { esc_all[t] = 1; stk[sp++] = t; }
+          }
+      while (sp) {
+        Block *xb = &f->blocks[stk[--sp]];
+        for (uint32_t s = 0; s < xb->nsuccs; s++) {
+          uint32_t t = xb->succs[s].target;
+          if (!esc_all[t]) { esc_all[t] = 1; stk[sp++] = t; }
+        }
+      }
+      xfree(stk);
+    }
+    for (uint32_t oi = 0; oi < f->norder && !bail; oi++) {
+      uint32_t bi = f->order[oi];
+      Block *b = &f->blocks[bi];
+      estart[bi] = ne;
+      for (uint32_t i = 0; i < b->ninsts && !bail; i++) {
+        Ref v = b->insts[i];
+        Inst *in = &f->insts[v];
+        Ref *a = ir_args(f, v);
+        bool after = esc_all[bi] || (esc_at[bi] != UINT32_MAX && i > esc_at[bi]);
+        if (phase == 1) {
+          bool reads = is_call_op(in->op) || in->op == I_LOAD || in->op == I_VLOAD ||
+                       in->op == I_VLDN || in->op == I_MEM_COPY;
+          if (after && reads) {
+            DF_ALLR(i);
+          } else if (is_call_op(in->op)) {
+            /* a call that may reach a function reading its callers' frames
+               reads this one whole */
+            bool all;
+            if (in->op == I_CALL || in->op == I_RETURN_CALL) {
+              uint32_t c = (uint32_t)in->imm;
+              all = c < m->nfuncs && fx_direct[c].has_body && !df_func[c].safe;
+            } else {
+              all = !df_scanfree;
+            }
+            if (all) DF_ALLR(i);
+          }
+          if (in->op == I_GLOBAL_SET && in->imm == df_sp && in->nargs == 1) {
+            Ref x = a[0];
+            if (x < n && dv.kind[x] == DF_ENTRY && df_known(dv.off[x]))
+              DF_EVENT(i, DF_EV_POP, dv.off[x], 0);
+          }
+        }
+        for (uint32_t j = 0; j < in->nargs && !bail; j++) {
+          Ref x = a[j];
+          if (x >= n || dv.kind[x] == DF_NONE) continue;
+          bool ent = dv.kind[x] == DF_ENTRY && df_known(dv.off[x]);
+          int64_t at = ent ? dv.off[x] + (int64_t)in->imm : DF_UNK;
+          switch (in->op) {
+            case I_LOAD: {
+              int64_t w = (int64_t)1 << MEMF_SIZE(in->imm2);
+              if (MEMF_MEM(in->imm2) != 0 || (ent && at + w > 0)) { bail = true; break; }
+              if (phase == 1 && !after) { if (ent) DF_READ(i, at, at + w); else DF_ALLR(i); }
+              break;
+            }
+            case I_VLOAD: case I_VLDN:
+              if (phase == 1 && !after) DF_ALLR(i);
+              break;
+            case I_STORE: {
+              int64_t w = (int64_t)1 << MEMF_SIZE(in->imm2);
+              if (MEMF_MEM(in->imm2) != 0 || (ent && at + w > 0)) { bail = true; break; }
+              if (j != 0) { DF_ESCAPE(i); break; }
+              Ref y = a[1];
+              if (phase == 1 && !after && ent && at >= -FRAME_SPAN &&
+                  !(y < n && dv.kind[y] != DF_NONE)) {
+                if (nc == cc) { cc = cc ? cc * 2 : 64; cd = xrealloc(cd, cc * sizeof(DfCand)); }
+                cd[nc++] = (DfCand){ bi, i, v, at, at + w };
+              }
+              break;
+            }
+            case I_VSTORE:
+              if (j != 0) DF_ESCAPE(i);
+              break;
+            case I_MEM_COPY: case I_MEM_FILL: {
+              Ref ln = a[2];
+              bool lc = ln < n && f->insts[ln].op == I_CONST;
+              int64_t len = lc ? (int64_t)(uint32_t)f->insts[ln].imm : 0;
+              int64_t o = ent ? dv.off[x] : DF_UNK;
+              if (in->imm != 0 || (in->op == I_MEM_COPY && in->imm2 != 0) ||
+                  (ent && lc && o + len > 0)) {
+                bail = true;
+                break;
+              }
+              if (j == 2 || (j == 1 && in->op == I_MEM_FILL)) { DF_ESCAPE(i); break; }
+              if (phase == 0 || after) break;
+              if (j == 1) {
+                if (ent && lc) DF_READ(i, o, o + len); else DF_ALLR(i);
+              } else if (ent && lc && len > 0 && o >= -FRAME_SPAN) {
+                if (nc == cc) { cc = cc ? cc * 2 : 64; cd = xrealloc(cd, cc * sizeof(DfCand)); }
+                cd[nc++] = (DfCand){ bi, i, v, o, o + len };
+              }
+              break;
+            }
+            case I_MEM_INIT:
+              if (j != 0) DF_ESCAPE(i);
+              break;
+            case I_CALL: {
+              uint32_t c = (uint32_t)in->imm;
+              if (c >= m->nfuncs || !fx_direct[c].has_body || j >= DF_MAXP ||
+                  (df_func[c].esc >> j & 1)) {
+                DF_ESCAPE(i);
+                break;
+              }
+              if (phase == 0 || after) break;
+              int64_t lo = df_func[c].lo[j], hi = df_func[c].hi[j];
+              if (df_func[c].unk >> j & 1) DF_ALLR(i);
+              else if (lo < hi) {
+                if (ent) DF_READ(i, dv.off[x] + lo, dv.off[x] + hi);
+                else DF_ALLR(i);
+              }
+              break;
+            }
+            case I_GLOBAL_SET:
+              if (in->imm != df_sp) DF_ESCAPE(i);
+              break;
+            case I_BOUNDS_CHECK: case I_TRAP_IF: case I_SELECT:
+              break;
+            default:
+              if (df_is_cmp(in->op)) break;
+              if (!ir_is_pure(in) || is_call_op(in->op)) DF_ESCAPE(i);
+              break;
+          }
+        }
+      }
+      for (uint32_t r = 0; r < b->nret && !bail; r++) {
+        Ref x = b->ret_args[r];
+        if (x < n && dv.kind[x] != DF_NONE) {
+          uint32_t i = b->ninsts;
+          DF_ESCAPE(i);
+        }
+      }
+      ecount[bi] = ne - estart[bi];
+    }
+  }
+#undef DF_EVENT
+#undef DF_READ
+#undef DF_ALLR
+#undef DF_ESCAPE
+
+  /* A store is dead when no read it reaches overlaps it before a pop puts
+     it below the stack pointer or the function returns. */
   uint32_t removed = 0;
   if (!bail && nc) {
     uint32_t *seen = xcalloc(nb ? nb : 1, sizeof(uint32_t));
     uint32_t *stk = xmalloc((nb ? nb : 1) * sizeof(uint32_t));
-    uint32_t *reach = xmalloc((nb ? nb : 1) * sizeof(uint32_t));
     uint64_t budget = (uint64_t)1 << 22;
     uint32_t epoch = 0;
-    for (uint32_t c0 = 0; c0 < nc && budget;) {
-      uint32_t bi = cd[c0].block, c1 = c0;
-      while (c1 < nc && cd[c1].block == bi) c1++;
-      epoch++;
-      uint32_t sp = 0, nreach = 0;
-      int64_t rlo = INT64_MAX, rhi = INT64_MIN;
-      Block *b = &f->blocks[bi];
-      for (uint32_t s = 0; s < b->nsuccs; s++) {
-        uint32_t t = b->succs[s].target;
-        if (seen[t] != epoch) { seen[t] = epoch; stk[sp++] = t; }
-      }
-      while (sp) {
-        uint32_t x = stk[--sp];
-        reach[nreach++] = x;
-        if (hlo[x] == DF_ALL) rlo = DF_ALL;
-        else if (rlo != DF_ALL && hlo[x] < hhi[x]) {
-          if (hlo[x] < rlo) rlo = hlo[x];
-          if (hhi[x] > rhi) rhi = hhi[x];
-        }
-        Block *xb = &f->blocks[x];
-        for (uint32_t s = 0; s < xb->nsuccs; s++) {
-          uint32_t t = xb->succs[s].target;
+    for (uint32_t k = 0; k < nc && budget; k++) {
+      DfCand *c = &cd[k];
+      uint32_t bi = c->block, from = estart[bi], end = estart[bi] + ecount[bi];
+      while (from < end && ev[from].at <= c->at) from++;
+      int r = df_scan_block(ev, from, end, c->lo, c->hi);
+      if (r < 0) {
+        epoch++;
+        uint32_t sp = 0;
+        Block *b = &f->blocks[bi];
+        for (uint32_t s = 0; s < b->nsuccs; s++) {
+          uint32_t t = b->succs[s].target;
           if (seen[t] != epoch) { seen[t] = epoch; stk[sp++] = t; }
         }
-      }
-      budget = budget > nreach + 1 ? budget - nreach - 1 : 0;
-      for (uint32_t k = c0; k < c1; k++) {
-        DfCand *c = &cd[k];
-        bool dead = true;
-        for (uint32_t r = rstart[bi]; r < rstart[bi] + rcount[bi] && dead; r++)
-          if (rd[r].at > c->at && df_overlap(&rd[r], c->lo, c->hi)) dead = false;
-        if (dead && (rlo == DF_ALL || (rlo < c->hi && c->lo < rhi))) {
-          for (uint32_t q = 0; q < nreach && dead; q++) {
-            uint32_t x = reach[q];
-            if (hlo[x] != DF_ALL && !(hlo[x] < c->hi && c->lo < hhi[x])) continue;
-            for (uint32_t r = rstart[x]; r < rstart[x] + rcount[x] && dead; r++)
-              if (df_overlap(&rd[r], c->lo, c->hi)) dead = false;
+        r = 0;
+        while (sp && !r) {
+          uint32_t x = stk[--sp];
+          budget = budget > ecount[x] + 1 ? budget - ecount[x] - 1 : 0;
+          int rx = df_scan_block(ev, estart[x], estart[x] + ecount[x], c->lo, c->hi);
+          if (rx > 0) r = 1;
+          else if (rx < 0) {
+            Block *xb = &f->blocks[x];
+            for (uint32_t s = 0; s < xb->nsuccs; s++) {
+              uint32_t t = xb->succs[s].target;
+              if (seen[t] != epoch) { seen[t] = epoch; stk[sp++] = t; }
+            }
           }
         }
-        if (dead) {
-          Inst *in = &f->insts[c->v];
-          in->op = I_NOP;
-          in->nargs = 0;
-          removed++;
-        }
+        if (!budget) r = 1;
       }
-      c0 = c1;
+      if (r == 0) {
+        Inst *in = &f->insts[c->v];
+        in->op = I_NOP;
+        in->nargs = 0;
+        removed++;
+      }
     }
-    xfree(seen); xfree(stk); xfree(reach);
+    xfree(seen); xfree(stk);
   }
   g_stats.dead_frame_stores += removed;
-  xfree(rd); xfree(cd);
-  xfree(rstart); xfree(rcount); xfree(hlo); xfree(hhi);
+  xfree(ev); xfree(cd);
+  xfree(estart); xfree(ecount); xfree(esc_at); xfree(esc_all);
   xfree(dv.kind); xfree(dv.id); xfree(dv.off);
   return removed > 0;
 }
@@ -7312,6 +7489,16 @@ uint32_t opt_direct_callsite_count(const Module *m, uint32_t fi) {
 bool opt_call_frame_only(const Module *m, uint32_t fi) {
   if (fx_mod != m || !fx_resolved || fi >= m->nfuncs) return false;
   return fx_func[fi].state == 2 && fx_func[fi].frame_only;
+}
+
+/* Whether function fi has a body that makes no call, and how many
+   instructions it holds as built. */
+bool opt_func_leaf(const Module *m, uint32_t fi, uint32_t *ninsts) {
+  if (fx_mod != m || !fx_resolved || fi >= m->nfuncs || !fx_direct[fi].has_body ||
+      fx_direct[fi].makes_calls)
+    return false;
+  *ninsts = fx_direct[fi].built_insts;
+  return true;
 }
 
 /* ---- constant objects ---------------------------------------------------
@@ -18551,6 +18738,10 @@ void ir_optimize(IrFunc *f, const OptOpts *o) {
     ir_order(f);
   }
 
+  /* before the stack pointer's writes move: global_ssa leaves only the ones
+     a call needs, and a frame's pop is where its bytes die */
+  if (o->dead_frames && TP("dead_frames", pass_dead_frames(f)) && o->dce) pass_dce(f);
+
   if (o->gloop && TP("global_loop", pass_global_loop(f, o))) {
     if (o->fold) pass_fold(f, o);
     if (o->cse) pass_cse(f, o);
@@ -18571,7 +18762,6 @@ void ir_optimize(IrFunc *f, const OptOpts *o) {
      tipped stdgo/recurse's fib into leaving its stack pointer in memory,
      25% slower. */
   if (o->memopt && TP("global_dse", global_dse(f)) && o->dce) pass_dce(f);
-  if (o->dead_frames && TP("dead_frames", pass_dead_frames(f)) && o->dce) pass_dce(f);
 
   for (int shape = 0; shape < 6; shape++) {
     bool moved = false;
