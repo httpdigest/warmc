@@ -4319,4 +4319,10 @@ write("conv", gen_conv())
 write("bits", gen_bits())
 write("brtable", gen_brtable())
 write("vmctx", gen_vmctx())
+
+# a module in Go's shape whose stack pointer gosp.c passes to its functions:
+# test/gen_gosp.py's, from seed 1
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import gen_gosp
+write("gospgen", gen_gosp.body(1))
 print("generated arithmetic cases in", OUT)

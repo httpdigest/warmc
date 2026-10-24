@@ -590,6 +590,7 @@ void compile_module(Module *m, ObjBuilder *o, const OptOpts *opts) {
   g_profile = opts->profile;
   /* before anything reads a function's signature: it changes some */
   if (opts->trampoline) g_stats.tramp_funcs += module_untrampoline(m);
+  if (opts->go_sp) g_stats.gosp_funcs += module_go_sp_args(m);
   codegen_prepare_module(m, o);
 
   if (opts->reach && !m->reached) {

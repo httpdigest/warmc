@@ -66,7 +66,12 @@ def flag_tag():
     env = ["%s_%s" % (k, os.environ[k]) for k in sorted(os.environ)
            if k.startswith("WARMC_") and k not in TAG_IGNORED_ENV]
     parts = WARMC_FLAGS + env
-    return "".join(c if c.isalnum() else "_" for c in "_".join(parts)) or "default"
+    tag = "".join(c if c.isalnum() else "_" for c in "_".join(parts)) or "default"
+    # a file name holds 255 bytes: a long configuration, such as one of
+    # test/run_combos.py's, is named by its start and a hash of the whole
+    if len(tag) > 80:
+        tag = tag[:40] + "_" + hashlib.sha1(tag.encode()).hexdigest()[:12]
+    return tag
 
 def tool_version(tool):
     r = subprocess.run([tool, "--version"], capture_output=True, text=True)

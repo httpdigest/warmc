@@ -8,7 +8,7 @@ export PATH="$PATH:$HOME/.npm-global/bin"
 WORK="$BUILD/testrun"
 mkdir -p "$WORK"
 
-for t in traps ictraps tramptraps; do
+for t in traps ictraps tramptraps gosptraps; do
   if [ ! -s "$WORK/$t.wasm" ] || [ test/cases_traps/$t.wat -nt "$WORK/$t.wasm" ]; then
     wat2wasm $WABT_FLAGS test/cases_traps/$t.wat -o "$WORK/$t.wasm.$$" || exit 1
     mv -f "$WORK/$t.wasm.$$" "$WORK/$t.wasm"
@@ -231,6 +231,23 @@ expect tramp_x_null          "uninitialized element"
 expect tramp_x_oob           "undefined element"
 expect tramp_x_far           "undefined element"
 expect tramp_c_on_stg        "indirect call type mismatch"
+
+# a module in Go's shape, whose stack pointer gosp.c passes to its functions:
+# each call through Go's type traps as it did, from an export or from a Go
+# function, so does one through the type its functions now have the shape
+# of, and a Go function's own trap is the one reported
+BIN="$WORK/gosptraps$FTAG"
+wtimeout ./$BUILD/warmc ${WARMC_FLAGS:-} $WARMC_TARGET_FLAGS -o "$BIN" "$WORK/gosptraps.wasm" || exit 1
+expect gosp_ok               "OK"
+expect gosp_x_type           "indirect call type mismatch"
+expect gosp_x_null           "uninitialized element"
+expect gosp_x_oob            "undefined element"
+expect gosp_go_x_type        "indirect call type mismatch"
+expect gosp_go_x_null        "uninitialized element"
+expect gosp_go_x_oob         "undefined element"
+expect gosp_c2_on_go         "indirect call type mismatch"
+expect gosp_c2_ok            "OK"
+expect gosp_trap             "unreachable"
 
 echo "traps: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

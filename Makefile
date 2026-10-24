@@ -55,7 +55,7 @@ WARMC_SRC := src/main.c src/util.c src/a64.c src/x64.c src/parse.c src/opcodes.c
              src/validate.c src/component.c src/wit.c src/wat.c \
              src/module_data.c src/elf.c src/macho.c src/coff.c src/pe.c src/ir.c src/ir_build.c \
              src/opt.c src/isel.c src/isel_x64.c src/codegen.c src/inline.c src/compile.c src/link.c src/canon.c src/witgen.c \
-             src/clink.c src/shlib.c src/tramp.c
+             src/clink.c src/shlib.c src/tramp.c src/gosp.c
 RT_OBJS   := $(BUILD)/rt/rt.o $(BUILD)/rt/start.o $(BUILD)/rt/hook.o \
              $(BUILD)/rt/gcthook.o \
              $(BUILD)/rt/modules.o $(BUILD)/rt/component.o $(BUILD)/rt/lib.o
@@ -410,6 +410,12 @@ bench-record-warmc: all
 	  python3 test/gobench.py --corpus $$c --record --reuse-baseline | tail -1; \
 	done
 
+# every triple of passes off and on over the cases, traps and collector, and
+# every pair over the language test corpora (test/run_combos.py)
+check-combos: all
+	@python3 test/run_combos.py --strength 3 --suites cases,traps,gc && \
+	  python3 test/run_combos.py --suites corpora
+
 FUZZ_SEED  ?= 1
 FUZZ_COUNT ?= 300
 
@@ -433,6 +439,6 @@ clean:
 	rm -rf $(BUILD)
 
 .PHONY: all asan tsan check smoke check-tools check-linux check-encoder check-spec conformance testsuite wasm-tools \
-        kotlin-stdlib wasi-sdk fuzz clean bench-compare bench-record bench-record-warmc gc-jitter gc-jitter-full
+        kotlin-stdlib wasi-sdk fuzz check-combos clean bench-compare bench-record bench-record-warmc gc-jitter gc-jitter-full
 
 -include $(WARMC_DEPS)

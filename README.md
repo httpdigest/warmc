@@ -74,8 +74,8 @@ Hello world!
   Functions compile in parallel and are laid out in a deterministic order.
 - **Fast code.** Across 335 benchmark kernels compiled from Go, TinyGo, Rust,
   Zig, AssemblyScript, Kotlin, C, C++ and Haskell, warmc's steady-state code
-  takes 0.46× wasmtime's time (geometric mean), with much lower peak memory.
-  Against the same programs compiled natively at `-O2` it takes 1.04× the
+  takes 0.45× wasmtime's time (geometric mean), with much lower peak memory.
+  Against the same programs compiled natively at `-O2` it takes 1.02× the
   time. See [Performance](#performance).
 - **Runtime for modern languages:**
   - a concurrent, compacting, ZGC-style collector with coloured pointers,
@@ -677,12 +677,14 @@ are parsed but not enforced.
 
 | Level | What it does |
 |---|---|
+| `-O3` | everything `-O2` does, and the passes that change what a program can see: `fma` and `dead-frames` (below). Every optimisation warmc has, for code that does not depend on wasm's exact float rounding or on reading stack memory it never wrote |
 | `-O2` (default) | the full pipeline: inlining, devirtualisation, unrolling, GC-aware passes, and guard-page memory (which also enables the vectoriser and native-pointer caching) |
 | `-O1` | the optimising pipeline without guard pages, inlining, devirtualisation, unrolling or the GC-purity passes |
 | `-O0` | skips the IR optimiser. Register allocation and module-level reachability still run. |
 
 You can switch individual passes with `-fPASS` / `-fno-PASS`. Flags apply in
-command-line order, so put them **after** `-O`.
+command-line order, so put them **after** `-O`; each `-O` sets everything a
+level decides, so the last one given is the level.
 
 | Pass | What it does |
 |---|---|
@@ -715,6 +717,7 @@ command-line order, so put them **after** `-O`.
 | `partial-escape` | allocate a GC object that escapes on some paths only where it escapes |
 | `devirt`, `closed-world` | turn `call_ref` and `call_indirect` into direct calls, also through vtables in immutable globals; with a closed world, use vtable slots too |
 | `trampoline` | a module whose functions each return the table index of the next to run, to one loop that calls through the table until one returns 0, as GHC's code returns to its runtime's `StgRun`, has them tail-call the next themselves, directly when the index is a constant, with the three globals they alone use most passed as arguments and written back when the loop ends; made only where nothing else can tell: the loop's is the module's one call of that type, nothing calls or takes a reference to those functions any other way, and a call through another type that reached one still traps |
+| `go-sp` | a module Go's compiler made (a `go:buildid` section) has each function of Go's one type take the stack pointer as an argument and return it beside its result, in place of reading and writing global 0 at every call; arguments, results and frames stay in Go's stack memory for its collector and stack growth, the global is stored before a call into a function of another type that can reach it -- the write barrier, the resume loop, an import an export could be called back through -- and loaded after, and a goroutine's switch to another stack goes through the resume loop as before; made only where nothing else can tell: no function of Go's type exported, taken by `ref.func` or imported into a table, no table or stack pointer imported or exported, and no tail call, `call_ref`, `table.get`, subtype or exception handling in the module |
 | `ictab` | a `call_indirect` through a table nothing writes loads its target from a code table per type, whose slots that fail the call's checks hold trap stubs, so the call needs no signature, null or instance check |
 | `reinline` | after the cleanup passes, inline again what devirtualisation made direct and the calls an allocation leaves by |
 | `throw-jump` | a `throw` caught in its own function, without the exnref, becomes a jump to the catch |
@@ -758,7 +761,7 @@ as `call stack exhausted` rather than crashing.
 | `--target linux\|macos\|windows` | output format and ISA (default `linux`; `darwin` means `macos`) |
 | `--rt PATH` | runtime archive to link (default `$WARMC_RT`) |
 | `--wasi[=PATH]` | link a WASI host and run `_start` (core module) or `wasi:cli/run` (component) |
-| `-O0` `-O1` `-O2` | optimisation level (default `-O2`) |
+| `-O0` `-O1` `-O2` `-O3` | optimisation level (default `-O2`) |
 | `-fPASS`, `-fno-PASS` | toggle one pass (see [Optimisation](#optimisation)) |
 | `-j N`, `-jN` | maximum number of compile threads |
 | `--profile=full\|deterministic` | the WebAssembly profile. `deterministic` makes relaxed-SIMD and NaN results platform-independent. |
@@ -833,9 +836,11 @@ variables, `WARMC_GC_*` among them, at its first call.
 **Front end** (`src/parse.c`, `validate.c`, `wat.c`, `component.c`, `wit.c`).
 These decode, assemble and validate core modules, components and WIT. The text
 assembler handles both flat and folded syntax, names in every index space,
-inline imports, exports and segments, and GC type definitions.
+inline imports, exports and segments, GC type definitions, and the custom
+sections `(@custom ...)`, `(@producers ...)` and `(@dylink.0 ...)` write, at
+the place each names.
 
-**Middle end** (`src/ir*.c`, `opt.c`, `inline.c`, `tramp.c`). Functions become SSA with
+**Middle end** (`src/ir*.c`, `opt.c`, `inline.c`, `tramp.c`, `gosp.c`). Functions become SSA with
 block parameters instead of phi nodes. SSA is built directly from wasm locals,
 and exception edges lead to landing-pad blocks. The optimiser runs the pass
 pipeline described above, using module-wide effect summaries, reachability and
@@ -898,7 +903,8 @@ faster. Each program's empty-program time is subtracted first, so the ratios
 compare steady-state code rather than start-up or compile time. All three
 are timed interleaved, round by round, each kernel's figure the best of five
 rounds (`make bench-record`); `make bench-record-warmc` re-times warmc's
-column alone against the recorded wasmtime and native times.
+column alone against the recorded wasmtime and native times, as the `stdgo`
+row is.
 
 The wasm comes from each language's usual producer: TinyGo 0.43 at
 `-opt=2`, Go 1.27.3, rustc nightly 1.101 at `opt-level=3` with LTO, Zig 0.17
@@ -913,7 +919,7 @@ AssemblyScript and Kotlin/Wasm have no native compiler to compare with.
 | Corpus | Source language | Kernels | warmc / wasmtime | Range | warmc / native | Range | Median peak RSS, MiB (warmc / wasmtime / native) |
 |---|---|---:|---:|---|---:|---|---|
 | `gobench` | TinyGo | 39 | 0.59 | 0.06 – 1.01 | 0.88 | 0.13 – 3.09 | 2.0 / 8.9 / 1.9 |
-| `stdgo` | Go | 49 | 0.58 | 0.03 – 1.06 | 1.59 | 0.08 – 9.48 | 7.4 / 27.4 / 4.7 |
+| `stdgo` | Go | 49 | 0.53 | 0.03 – 1.12 | 1.44 | 0.08 – 9.45 | 7.3 / 27.4 / 4.7 |
 | `vecbench` | TinyGo (vectorisable loops) | 43 | 0.18 | 0.03 – 0.96 | 0.72 | 0.11 – 1.19 | 2.0 / 8.9 / 1.9 |
 | `asbench` | AssemblyScript | 37 | 0.59 | 0.16 – 0.98 | – | – | 1.9 / 8.7 / – |
 | `rsbench` | Rust | 39 | 0.63 | 0.13 – 1.00 | 1.04 | 0.63 – 2.64 | 2.0 / 9.1 / 1.9 |
@@ -925,7 +931,7 @@ AssemblyScript and Kotlin/Wasm have no native compiler to compare with.
 
 ### Against wasmtime
 
-Over all 335 kernels, warmc's code takes **0.46×** wasmtime's time, and
+Over all 335 kernels, warmc's code takes **0.45×** wasmtime's time, and
 0.44× without `stdgo`. Six kernels are slower than wasmtime. Four of them
 are within 1.5%, inside the spread between runs: `gobench/strswitch` (1.01),
 `cbench/malloc` (1.01), `cppbench/bitset` (1.004) and `zigbench/optional`
@@ -933,7 +939,7 @@ are within 1.5%, inside the spread between runs: `gobench/strswitch` (1.01),
 
 | Kernel | warmc / wasmtime | What is known |
 |---|---:|---|
-| `stdgo/memcpy` | 1.06 | the platform's memmove under both engines, whose ratio spreads by more than 10% between runs |
+| `stdgo/memcpy` | 1.12 | the platform's memmove under both engines, whose ratio spreads by more than 10% between runs |
 | `cppbench/algorithms` | 1.04 | code placement: the same instructions laid out with no loop header aligned run 6% faster, below wasmtime |
 
 TinyGo's `-opt=2` unrolls loops that its size-first default leaves alone,
@@ -954,17 +960,19 @@ function where it left off, and it sends each jump inside the function -- a
 loop's back edge among them -- through that dispatch with a constant index.
 warmc threads those jumps to their targets (`thread`), gives the dispatch a
 cold copy of the loops it can enter in the middle so that the originals have
-one way in again (`nodesplit`), and keeps Go's stack pointer in a register
-between calls (`gssa`). With the loops back, the vectoriser takes Go's
+one way in again (`nodesplit`), and passes Go's stack pointer to each
+function and back in registers instead of through its global, a store and a
+load on the path of every call (`go-sp`), which takes 11% off `stdgo`'s
+cycles. With the loops back, the vectoriser takes Go's
 64-bit address arithmetic too: `stdgo/strsum` runs at 0.03× and `stdgo/sum`
 at 0.04×.
 
 ### Against native code
 
-Over the 271 kernels with a native build, warmc's code takes **1.04×** the
-native time (median 1.06), and 1.01× without Haskell. wasmtime's code takes
+Over the 271 kernels with a native build, warmc's code takes **1.02×** the
+native time (median 1.06), and 0.99× without Haskell. wasmtime's code takes
 2.04× the native time on the same kernels. 104 kernels run faster under warmc
-than natively, and another 45 are within 10% of the native build.
+than natively, and another 47 are within 10% of the native build.
 
 The native builds start ahead of the wasm in a few ways that have nothing to
 do with warmc's compiler:
@@ -1033,13 +1041,16 @@ make check-encoder  # the AArch64 encoder against GNU as, llvm-mc or clang; the 
 make check-spec     # the official WebAssembly testsuite, at three optimisation settings
 make conformance    # write CONFORMANCE.md: spec results grouped by proposal
 make fuzz           # random modules vs wasm-interp (FUZZ_SEED, FUZZ_COUNT)
+make check-combos   # the cases, traps and GC tests with every triple of passes turned off and on in all combinations, the language corpora with every pair
 make gc-jitter      # GC schedule sweep with randomised collector delays
 make check-linux    # run the GC tests, and on a macOS host with tinygo the TinyGo WASI corpus, as real Linux binaries (podman/docker arm64)
 ```
 
 Most of the suite is **differential**. warmc's output is compared with:
 - wabt's `wasm-interp`, for the hand-written cases in `test/cases` (at every
-  `-O` level and with individual passes turned off). `test/cases_gc`,
+  `-O` level, with individual passes turned off, and at nine settings that
+  turn every pair of passes off and on in all four combinations,
+  `test/run_combos.py`). `test/cases_gc`,
   `cases_traps` and `cases_relaxed` are checked against the results written
   in their scripts.
 - wasmtime, for WASI preview 1 and 0.2 programs (stdout, stderr, exit code and
@@ -1056,6 +1067,9 @@ Most of the suite is **differential**. warmc's output is compared with:
   exactly; for example, it prints no arithmetic NaN bits.
 - `wasm-tools`, for component, WIT and WAT handling
 - the Component Model's reference `definitions.py`, for canonical-ABI layout
+- wabt's `wasm-interp` again, for random modules in Go's shape whose stack
+  pointer `go-sp` passes as an argument (`test/gen_gosp.py`), and for small
+  ones with one thing each that rules the rewrite out (`test/run_gosp.py`)
 
 `test/run_shared.sh` builds a shared library and calls it from C, C++,
 Python's `ctypes` and Java's foreign function API. The Java part needs Java 22
@@ -1091,6 +1105,7 @@ src/            the compiler
   component.c canon.c clink.c wit.c witgen.c   Component Model and WIT
   ir.c ir_build.c opt.c inline.c          SSA IR and optimiser
   tramp.c                                 a GHC-style trampoline rewritten as tail calls
+  gosp.c                                  Go's stack pointer passed as an argument
   isel*.c isel_*.inc regalloc.inc         instruction selection and register allocation
   a64.c x64.c                             machine-code encoders
   codegen.c compile.c module_data.c       per-function emission, parallel driver, module descriptor

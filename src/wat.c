@@ -295,12 +295,30 @@ static void lex_string(Lex *l) {
   xfree(s.p);
 }
 
+static bool tok_is_word(const Tok *t, const char *w) {
+  size_t n = strlen(w);
+  return t->kind == TK_WORD && t->n == n && !memcmp(t->s, w, n);
+}
+
+/* the annotations that make a custom section, which are module fields */
+static bool custom_annotation(const Tok *t) {
+  return tok_is_word(t, "@custom") || tok_is_word(t, "@producers") || tok_is_word(t, "@dylink.0");
+}
+
+/* Annotations are white space, but for the ones that make a custom section:
+   those stay for take_customs, and only where a module field can be. */
 static void strip_annotations(Lex *l) {
-  uint32_t out = 0;
+  uint32_t fields = l->ntoks > 1 && l->toks[0].kind == TK_LPAR && tok_is_word(&l->toks[1], "module");
+  uint32_t out = 0, level = 0;
   for (uint32_t i = 0; i < l->ntoks;) {
     if (l->toks[i].kind == TK_LPAR && i + 1 < l->ntoks &&
         l->toks[i + 1].kind == TK_WORD && l->toks[i + 1].n &&
-        l->toks[i + 1].s[0] == '@') {
+        l->toks[i + 1].s[0] == '@' && custom_annotation(&l->toks[i + 1]) && level != fields)
+      pos_err(l->path, l->toks[i].line, l->toks[i].col, "misplaced %.*s annotation",
+              (int)l->toks[i + 1].n, l->toks[i + 1].s);
+    if (l->toks[i].kind == TK_LPAR && i + 1 < l->ntoks &&
+        l->toks[i + 1].kind == TK_WORD && l->toks[i + 1].n &&
+        l->toks[i + 1].s[0] == '@' && !custom_annotation(&l->toks[i + 1])) {
       uint32_t depth = 0;
       do {
         if (l->toks[i].kind == TK_EOF)
@@ -312,6 +330,8 @@ static void strip_annotations(Lex *l) {
       } while (depth);
       continue;
     }
+    if (l->toks[i].kind == TK_LPAR) level++;
+    else if (l->toks[i].kind == TK_RPAR && level) level--;
     l->toks[out++] = l->toks[i++];
   }
   l->ntoks = out;
@@ -510,6 +530,15 @@ typedef struct {
 
 #define VEC(T) struct { T *v; uint32_t n, cap; }
 
+/* A custom section, of (@custom ...), (@producers ...) or (@dylink.0 ...):
+   before the module's first section, before or after the place of the one
+   whose id is anchor -- written there or not --, or after its last. */
+enum { CU_FIRST, CU_BEFORE, CU_AFTER, CU_LAST };
+typedef struct {
+  uint8_t place, anchor;
+  Bytes name, data;
+} WCustom;
+
 typedef struct {
   Arena *a;
   const char *path;
@@ -532,6 +561,7 @@ typedef struct {
   VEC(WElem) el;
   VEC(WData) da;
   VEC(Job) jobs;
+  VEC(WCustom) cu;
 
   bool code_uses_data;
 
@@ -588,10 +618,6 @@ static void perr(P *p, const char *fmt, ...) {
 static bool at_lpar(P *p) { return tk(p)->kind == TK_LPAR; }
 static bool at_rpar(P *p) { return tk(p)->kind == TK_RPAR; }
 
-static bool tok_is_word(const Tok *t, const char *w) {
-  size_t n = strlen(w);
-  return t->kind == TK_WORD && t->n == n && !memcmp(t->s, w, n);
-}
 
 static bool at_word(P *p, const char *w) { return tok_is_word(tk(p), w); }
 
@@ -2504,10 +2530,209 @@ static uint32_t count_imported(P *p, uint8_t kind) {
   return n;
 }
 
+static Bytes cu_name(P *p, const char *what) {
+  Bytes b = take_string(p, what);
+  wasm_check_utf8(b.p, b.n);
+  return b;
+}
+
+/* a dylink.0 subsection: its id, then its payload's size and the payload */
+static void cu_sub(WBuf *d, uint8_t id, WBuf *pay) {
+  wb_byte(d, id);
+  wb_u32(d, (uint32_t)pay->n);
+  wb_raw(d, pay->p, pay->n);
+  pay->n = 0;
+}
+
+/* a dylink.0 symbol's flags: numbers or their names, or'd */
+static uint32_t cu_flags(P *p) {
+  static const char *const names[] = {
+    "binding-weak", "binding-local", "visibility-hidden", NULL, "undefined", "exported",
+    "explicit-name", "no-strip", "tls", "absolute",
+  };
+  uint32_t f = 0;
+  while (!at_rpar(p)) {
+    if (tk(p)->kind == TK_WORD && tk(p)->n && tk(p)->s[0] >= '0' && tk(p)->s[0] <= '9') {
+      f |= (uint32_t)take_nat(p, "a symbol's flags", UINT32_MAX);
+      continue;
+    }
+    uint32_t k = 0;
+    while (k < sizeof names / sizeof *names && !(names[k] && at_word(p, names[k]))) k++;
+    if (k == sizeof names / sizeof *names) perr(p, "expected a symbol's flag");
+    f |= 1u << k;
+    p->i++;
+  }
+  return f;
+}
+
+/* One custom-section annotation, at p->i, into p->cu: wasm-tools' grammar
+   and encoding, which the annotations proposal leaves to the producer for
+   all but @custom. */
+static void take_custom(P *p) {
+  p->i++;
+  const Tok *kw = tk(p);
+  p->i++;
+  WCustom *c = VEC_PUSH(p, p->cu, WCustom);
+  WBuf d = {0}, pay = {0};
+  if (tok_is_word(kw, "@custom")) {
+    c->name = cu_name(p, "a custom section's name");
+    c->place = CU_LAST;
+    if (at_lpar(p)) {
+      static const struct { const char *w; uint8_t id; } anchors[] = {
+        { "type", 1 }, { "import", 2 }, { "func", 3 }, { "table", 4 }, { "memory", 5 },
+        { "global", 6 }, { "export", 7 }, { "start", 8 }, { "elem", 9 }, { "code", 10 },
+        { "data", 11 }, { "tag", 13 },
+      };
+      p->i++;
+      bool before = eat_word(p, "before");
+      if (!before && !eat_word(p, "after")) perr(p, "expected before or after");
+      if (before && eat_word(p, "first")) c->place = CU_FIRST;
+      else if (!before && eat_word(p, "last")) c->place = CU_LAST;
+      else {
+        uint32_t k = 0;
+        while (k < sizeof anchors / sizeof *anchors && !at_word(p, anchors[k].w)) k++;
+        if (k == sizeof anchors / sizeof *anchors) perr(p, "expected a section's name");
+        p->i++;
+        c->place = before ? CU_BEFORE : CU_AFTER;
+        c->anchor = anchors[k].id;
+      }
+      expect_rpar(p);
+    }
+    while (tk(p)->kind == TK_STRING) wb_bytes(&d, take_string(p, "data"));
+  } else if (tok_is_word(kw, "@producers")) {
+    /* its fields in this order, whatever the text's */
+    static const char *const fields[] = { "language", "sdk", "processed-by" };
+    WBuf f[3] = { { 0 }, { 0 }, { 0 } };
+    uint32_t nv[3] = { 0, 0, 0 }, nf = 0;
+    c->name = (Bytes){ (const uint8_t *)"producers", 9 };
+    c->place = CU_LAST;
+    while (at_lpar(p)) {
+      p->i++;
+      uint32_t k = 0;
+      while (k < 3 && !at_word(p, fields[k])) k++;
+      if (k == 3) perr(p, "expected language, sdk or processed-by");
+      p->i++;
+      wb_name(&f[k], cu_name(p, "a producer's name"));
+      wb_name(&f[k], cu_name(p, "a producer's version"));
+      nv[k]++;
+      expect_rpar(p);
+    }
+    for (uint32_t k = 0; k < 3; k++) nf += nv[k] != 0;
+    wb_u32(&d, nf);
+    for (uint32_t k = 0; k < 3; k++) {
+      if (!nv[k]) continue;
+      wb_name(&d, (Bytes){ (const uint8_t *)fields[k], (uint32_t)strlen(fields[k]) });
+      wb_u32(&d, nv[k]);
+      wb_raw(&d, f[k].p, f[k].n);
+      xfree(f[k].p);
+    }
+  } else {
+    /* dylink.0: export-info and import-info entries in a row make one
+       subsection, as each of the others is one */
+    c->name = (Bytes){ (const uint8_t *)"dylink.0", 8 };
+    c->place = CU_FIRST;
+    WBuf list = {0};
+    uint8_t list_id = 0;
+    uint32_t nlist = 0;
+    while (at_lpar(p)) {
+      p->i++;
+      uint8_t id = eat_word(p, "mem-info") ? 1 : eat_word(p, "needed") ? 2
+                 : eat_word(p, "export-info") ? 3 : eat_word(p, "import-info") ? 4
+                 : eat_word(p, "runtime-path") ? 5 : eat_word(p, "target-arch") ? 6 : 0;
+      if (!id) perr(p, "expected a dylink.0 subsection");
+      if (list_id && id != list_id) {
+        wb_u32(&pay, nlist);
+        wb_raw(&pay, list.p, list.n);
+        cu_sub(&d, list_id, &pay);
+        list.n = 0;
+        nlist = 0;
+        list_id = 0;
+      }
+      if (id == 1) {
+        uint64_t v[4] = { 0, 0, 0, 0 };
+        for (uint32_t k = 0; k < 2; k++) {
+          if (!at_group(p, k ? "table" : "memory")) continue;
+          p->i += 2;
+          v[2 * k] = take_nat(p, "a size", UINT32_MAX);
+          v[2 * k + 1] = take_nat(p, "an alignment", UINT32_MAX);
+          expect_rpar(p);
+        }
+        for (uint32_t k = 0; k < 4; k++) wb_u32(&pay, (uint32_t)v[k]);
+        cu_sub(&d, id, &pay);
+      } else if (id == 2 || id == 5) {
+        WBuf names = {0};
+        uint32_t n = 0;
+        while (tk(p)->kind == TK_STRING) { wb_name(&names, cu_name(p, "a name")); n++; }
+        wb_u32(&pay, n);
+        wb_raw(&pay, names.p, names.n);
+        xfree(names.p);
+        cu_sub(&d, id, &pay);
+      } else if (id == 6) {
+        wb_name(&pay, cu_name(p, "an architecture"));
+        cu_sub(&d, id, &pay);
+      } else {
+        if (id == 4) wb_name(&list, cu_name(p, "a module's name"));
+        wb_name(&list, cu_name(p, "a symbol's name"));
+        wb_u32(&list, cu_flags(p));
+        list_id = id;
+        nlist++;
+      }
+      expect_rpar(p);
+    }
+    if (list_id) {
+      wb_u32(&pay, nlist);
+      wb_raw(&pay, list.p, list.n);
+      cu_sub(&d, list_id, &pay);
+    }
+    xfree(list.p);
+  }
+  expect_rpar(p);
+  c->data = arena_bytes(p->a, d.p, d.n);
+  xfree(d.p);
+  xfree(pay.p);
+}
+
+/* The custom-section annotations among the module's fields, taken out of
+   the tokens before anything walks the fields. */
+static void take_customs(P *p) {
+  uint32_t fields = at_group(p, "module") ? 1 : 0, level = 0, out = 0;
+  for (uint32_t i = 0; i < p->ntoks;) {
+    if (level == fields && p->t[i].kind == TK_LPAR && i + 1 < p->ntoks &&
+        custom_annotation(&p->t[i + 1])) {
+      p->i = i;
+      take_custom(p);
+      i = p->i;
+      continue;
+    }
+    if (p->t[i].kind == TK_LPAR) level++;
+    else if (p->t[i].kind == TK_RPAR && level) level--;
+    p->t[out++] = p->t[i++];
+  }
+  p->ntoks = out;
+  p->i = 0;
+}
+
+static void emit_customs(WBuf *out, P *p, uint8_t place, uint8_t anchor) {
+  for (uint32_t i = 0; i < p->cu.n; i++) {
+    const WCustom *c = &p->cu.v[i];
+    if (c->place != place || ((place == CU_BEFORE || place == CU_AFTER) && c->anchor != anchor))
+      continue;
+    WBuf body = {0};
+    wb_name(&body, c->name);
+    wb_bytes(&body, c->data);
+    wb_byte(out, 0);
+    wb_u32(out, (uint32_t)body.n);
+    wb_raw(out, body.p, body.n);
+    xfree(body.p);
+  }
+}
+
 static uint8_t *assemble(P *p, size_t *len_out) {
   WBuf out = {0}, sec = {0};
   wb_raw(&out, "\0asm\1\0\0\0", 8);
+  emit_customs(&out, p, CU_FIRST, 0);
 
+  emit_customs(&out, p, CU_BEFORE, 1);
   if (p->recs.n) {
     wb_u32(&sec, p->recs.n);
     for (uint32_t i = 0; i < p->recs.n; i++) {
@@ -2520,7 +2745,9 @@ static uint8_t *assemble(P *p, size_t *len_out) {
     }
     emit_section(&out, 1, &sec);
   }
+  emit_customs(&out, p, CU_AFTER, 1);
 
+  emit_customs(&out, p, CU_BEFORE, 2);
   if (p->im.n) {
     /* a run of imports sharing a group id becomes one compact entry:
        module name, empty field name, 0x7f, then the members */
@@ -2575,6 +2802,7 @@ static uint8_t *assemble(P *p, size_t *len_out) {
     }
     emit_section(&out, 2, &sec);
   }
+  emit_customs(&out, p, CU_AFTER, 2);
 
   uint32_t nifuncs = count_imported(p, EK_FUNC);
   uint32_t nitables = count_imported(p, EK_TABLE);
@@ -2582,13 +2810,16 @@ static uint8_t *assemble(P *p, size_t *len_out) {
   uint32_t niglobals = count_imported(p, EK_GLOBAL);
   uint32_t nitags = count_imported(p, EK_TAG);
 
+  emit_customs(&out, p, CU_BEFORE, 3);
   if (p->fn.n > nifuncs) {
     wb_u32(&sec, p->fn.n - nifuncs);
     for (uint32_t i = 0; i < p->fn.n; i++)
       if (!p->fn.v[i].imported) wb_u32(&sec, p->fn.v[i].type);
     emit_section(&out, 3, &sec);
   }
+  emit_customs(&out, p, CU_AFTER, 3);
 
+  emit_customs(&out, p, CU_BEFORE, 4);
   if (p->tb.n > nitables) {
     wb_u32(&sec, p->tb.n - nitables);
     for (uint32_t i = 0; i < p->tb.n; i++) {
@@ -2605,7 +2836,9 @@ static uint8_t *assemble(P *p, size_t *len_out) {
     }
     emit_section(&out, 4, &sec);
   }
+  emit_customs(&out, p, CU_AFTER, 4);
 
+  emit_customs(&out, p, CU_BEFORE, 5);
   if (p->mem.n > nimems) {
     wb_u32(&sec, p->mem.n - nimems);
     for (uint32_t i = 0; i < p->mem.n; i++) {
@@ -2615,7 +2848,9 @@ static uint8_t *assemble(P *p, size_t *len_out) {
     }
     emit_section(&out, 5, &sec);
   }
+  emit_customs(&out, p, CU_AFTER, 5);
 
+  emit_customs(&out, p, CU_BEFORE, 13);
   if (p->tg.n > nitags) {
     wb_u32(&sec, p->tg.n - nitags);
     for (uint32_t i = 0; i < p->tg.n; i++) {
@@ -2625,7 +2860,9 @@ static uint8_t *assemble(P *p, size_t *len_out) {
     }
     emit_section(&out, 13, &sec);
   }
+  emit_customs(&out, p, CU_AFTER, 13);
 
+  emit_customs(&out, p, CU_BEFORE, 6);
   if (p->gl.n > niglobals) {
     wb_u32(&sec, p->gl.n - niglobals);
     for (uint32_t i = 0; i < p->gl.n; i++) {
@@ -2637,7 +2874,9 @@ static uint8_t *assemble(P *p, size_t *len_out) {
     }
     emit_section(&out, 6, &sec);
   }
+  emit_customs(&out, p, CU_AFTER, 6);
 
+  emit_customs(&out, p, CU_BEFORE, 7);
   if (p->ex.n) {
     wb_u32(&sec, p->ex.n);
     for (uint32_t i = 0; i < p->ex.n; i++) {
@@ -2652,12 +2891,16 @@ static uint8_t *assemble(P *p, size_t *len_out) {
     }
     emit_section(&out, 7, &sec);
   }
+  emit_customs(&out, p, CU_AFTER, 7);
 
+  emit_customs(&out, p, CU_BEFORE, 8);
   if (p->has_start) {
     wb_u32(&sec, resolve(p, &p->funcs, &p->start, "function"));
     emit_section(&out, 8, &sec);
   }
+  emit_customs(&out, p, CU_AFTER, 8);
 
+  emit_customs(&out, p, CU_BEFORE, 9);
   if (p->el.n) {
     wb_u32(&sec, p->el.n);
     for (uint32_t i = 0; i < p->el.n; i++) {
@@ -2687,12 +2930,14 @@ static uint8_t *assemble(P *p, size_t *len_out) {
     }
     emit_section(&out, 9, &sec);
   }
+  emit_customs(&out, p, CU_AFTER, 9);
 
   if (p->code_uses_data) {
     wb_u32(&sec, p->da.n);
     emit_section(&out, 12, &sec);
   }
 
+  emit_customs(&out, p, CU_BEFORE, 10);
   if (p->fn.n > nifuncs) {
     wb_u32(&sec, p->fn.n - nifuncs);
     for (uint32_t i = 0; i < p->fn.n; i++) {
@@ -2722,7 +2967,9 @@ static uint8_t *assemble(P *p, size_t *len_out) {
     }
     emit_section(&out, 10, &sec);
   }
+  emit_customs(&out, p, CU_AFTER, 10);
 
+  emit_customs(&out, p, CU_BEFORE, 11);
   if (p->da.n) {
     wb_u32(&sec, p->da.n);
     for (uint32_t i = 0; i < p->da.n; i++) {
@@ -2740,7 +2987,9 @@ static uint8_t *assemble(P *p, size_t *len_out) {
     }
     emit_section(&out, 11, &sec);
   }
+  emit_customs(&out, p, CU_AFTER, 11);
 
+  emit_customs(&out, p, CU_LAST, 0);
   xfree(sec.p);
   *len_out = out.n;
   return out.p;
@@ -2766,6 +3015,7 @@ uint8_t *wat_assemble(const char *src, size_t len, const char *path,
   p.path = path;
   p.t = l.toks;
   p.ntoks = l.ntoks;
+  take_customs(&p);
 
   uint32_t end = p.ntoks - 1;
   if (at_group(&p, "module")) {
