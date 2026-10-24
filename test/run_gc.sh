@@ -211,6 +211,8 @@ expect arr_init_data_oob_seg "out of bounds memory access"
 expect arr_init_data_oob_arr "out of bounds array access"
 expect arr_init_elem_oob_seg "out of bounds table access"
 expect arr_new_data_oob      "out of bounds memory access"
+expect arr_new_size_overflow  "allocation failed"
+expect arr_new_size_overflow2 "allocation failed"
 
 expect live_across_size        "OK"
 expect ea_fwd                  "OK"

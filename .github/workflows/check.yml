@@ -15,9 +15,9 @@ name: Check
 #   build/ci/{wasmtime,wabt,ccache}, build/ci/{kotlinc,asc}
 #                               the pinned release binaries
 #   ~/.rustup, ~/.cargo/bin     the pinned Rust toolchain
-#   build/tools                 what the Makefile fetches: wasm-tools (a
+#   build/tools, build/testsuite  what the Makefile fetches: wasm-tools (a
 #                               release binary here, never built), wasi-sdk,
-#                               the Kotlin stdlib
+#                               the Kotlin stdlib, the official testsuite
 #   build/ci-cache              ccache, the ThinLTO cache, Go's build cache:
 #                               saved anew by every run, the latest restored
 #   build/testrun/*.{wasm,ref}  the test modules and the interpreter's answers
@@ -111,7 +111,9 @@ jobs:
         id: make-tools
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: build/tools
+          path: |
+            build/tools
+            build/testsuite
           key: make-tools-macos-arm64-${{ inputs.full && 'full' || 'smoke' }}-${{ steps.pins.outputs.makefile }}-${{ steps.pins.outputs.languages }}
           restore-keys: |
             make-tools-macos-arm64-${{ inputs.full && 'full' || 'smoke' }}-${{ steps.pins.outputs.makefile }}-
@@ -264,7 +266,9 @@ jobs:
         if: steps.make-tools.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: build/tools
+          path: |
+            build/tools
+            build/testsuite
           key: ${{ steps.make-tools.outputs.cache-primary-key }}
 
       # A module found here newer than its source is not built again, so
@@ -406,7 +410,9 @@ jobs:
         id: make-tools
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: build/tools
+          path: |
+            build/tools
+            build/testsuite
           key: make-tools-linux-arm64-${{ inputs.full && 'full' || 'smoke' }}-${{ steps.pins.outputs.makefile }}-${{ steps.pins.outputs.languages }}
           restore-keys: |
             make-tools-linux-arm64-${{ inputs.full && 'full' || 'smoke' }}-${{ steps.pins.outputs.makefile }}-
@@ -507,7 +513,9 @@ jobs:
         if: steps.make-tools.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: build/tools
+          path: |
+            build/tools
+            build/testsuite
           key: ${{ steps.make-tools.outputs.cache-primary-key }}
 
       - name: Restore the built corpora
@@ -626,7 +634,9 @@ jobs:
         id: make-tools
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: build/tools
+          path: |
+            build/tools
+            build/testsuite
           key: make-tools-windows-x64-${{ inputs.full && 'full' || 'smoke' }}-${{ steps.pins.outputs.makefile }}
           restore-keys: |
             make-tools-windows-x64-${{ inputs.full && 'full' || 'smoke' }}-${{ steps.pins.outputs.makefile }}-
@@ -739,7 +749,9 @@ jobs:
         if: steps.make-tools.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: build/tools
+          path: |
+            build/tools
+            build/testsuite
           key: ${{ steps.make-tools.outputs.cache-primary-key }}
 
       - name: Restore the built corpora
