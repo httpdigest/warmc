@@ -104,5 +104,10 @@ wftag() {
     case "$WFTAG_IGNORE" in *" $n "*) continue ;; esac
     parts="${parts:+$parts }${n}_${!n}"
   done
-  printf '%s' "${parts:-default}" | tr -c 'A-Za-z0-9' '_'
+  local tag
+  tag=$(printf '%s' "${parts:-default}" | tr -c 'A-Za-z0-9' '_')
+  # a file name holds 255 bytes: a long configuration, such as one of
+  # test/run_combos.py's, is named by its start and a checksum of the whole
+  [ ${#tag} -gt 80 ] && tag="${tag:0:40}_$(printf '%s' "$tag" | cksum | cut -d' ' -f1)"
+  printf '%s' "$tag"
 }

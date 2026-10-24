@@ -7,10 +7,9 @@
 ;; carried entirely by code with no test, which is the shape that lets a rule
 ;; be wrong for as long as nobody writes one by hand.
 ;;
-;; Every annotation here is one *both* assemblers ignore.  `(@custom ...)` is
-;; deliberately not among them: wabt with --enable-annotations turns that one
-;; into a custom section and warmc drops it, so including it would make this
-;; file differ for a reason that is not a bug.
+;; Every annotation here is one both assemblers ignore.  The ones that make a
+;; custom section -- `(@custom ...)`, `(@producers ...)`, `(@dylink.0 ...)` --
+;; are test/wat/customs.wat's.
 
 (module (@module-note "ignored")
   (; A block comment holding a ;; line comment marker, and

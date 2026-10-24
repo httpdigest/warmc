@@ -175,6 +175,12 @@ start gc-modes ./test/run_gc_modes.sh
 
 start gcthread env GCTHREAD_ROUNDS=50000 ./test/run_gcthread.sh
 
+# -O3, in the rows whose answers do not depend on how a float rounds: fma
+# fuses a multiply into the add that reads it, which every row comparing
+# float results with another engine would see
+start traps-O3 env WARMC_FLAGS=-O3 ./test/run_traps.sh
+start gc-O3    env WARMC_FLAGS=-O3 ./test/run_gc.sh
+
 for lv in -O0 -O1 -O2; do
   start "traps$lv" env WARMC_FLAGS=$lv ./test/run_traps.sh
   start "gc$lv" env WARMC_FLAGS=$lv ./test/run_gc.sh
@@ -239,6 +245,7 @@ start canon     python3 test/run_canon.py
 start adapter   python3 test/run_adapter.py
 
 start clink     python3 test/run_clink.py
+start levels    ./test/run_levels.sh
 
 start wat       python3 test/run_wat.py
 
@@ -288,6 +295,20 @@ wait
 # of a machine no row is loading any more.
 if [ -z "${CHECK_SMOKE:-}" ]; then
   start gc-pause env GC_PAUSE_CHECK=only WARMC_FLAGS=-O2 ./test/run_gc.sh
+  wait
+  # gosp.c: the modules in Go's shape that rule its rewrite out, and random
+  # ones it makes, against wasm-interp.  Also after the others: it links and
+  # runs some four hundred fresh binaries, and macOS checks a fresh binary's
+  # signature on its first run one at a time across the machine
+  # (test/run_cases.py), which beside the other rows starves their runs.
+  start gosp python3 test/run_gosp.py
+  wait
+  # Every pair of passes, off and on in all four combinations, over the
+  # cases, traps and the collector: nine settings (make check-combos does
+  # triples).  Last and alone, since each setting runs those suites on
+  # every core, which beside the other rows pushes their compiles past
+  # their timeouts.
+  start combos python3 test/run_combos.py
   wait
 fi
 

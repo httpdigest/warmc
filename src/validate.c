@@ -1242,6 +1242,7 @@ static void validate_func(Module *m, uint32_t i) {
    functions are not started once one has failed */
 typedef struct {
   Module *m;
+  const uint32_t *fns;         /* the k-th body is fns[k], or every one when NULL */
   _Atomic uint32_t bad;
   pthread_mutex_t lock;
   DiagCatch bad_diag;
@@ -1268,8 +1269,21 @@ static void validate_par(void *ctx, uint32_t k, uint32_t w) {
     return;
   }
   warmc_diag_catch(&c);
-  validate_func(vp->m, vp->m->nimported_funcs + k);
+  validate_func(vp->m, vp->fns ? vp->fns[k] : vp->m->nimported_funcs + k);
   warmc_diag_catch(NULL);
+}
+
+/* the bodies fns names, or all of them, on the compiler's threads; the first
+   one's diagnostic is the one reported, as walking them in order would */
+static void validate_bodies(Module *m, const uint32_t *fns, uint32_t nb) {
+  uint32_t nt = compile_want_threads(m, nb);
+  if (nt <= 1) {
+    for (uint32_t k = 0; k < nb; k++) validate_func(m, fns ? fns[k] : m->nimported_funcs + k);
+  } else {
+    VPar vp = { m, fns, UINT32_MAX, PTHREAD_MUTEX_INITIALIZER, { 0 } };
+    warmc_par_for(nb, nt, validate_par, &vp);
+    if (vp.bad != UINT32_MAX) warmc_diag_rethrow(&vp.bad_diag);
+  }
 }
 
 void wasm_validate(Module *m) {
@@ -1389,25 +1403,18 @@ void wasm_validate(Module *m) {
      largest serial step was validating stdgo's: 19 ms of webtext's 350.
      Each thread catches its own diagnostic, and the first function's is the
      one reported, as walking them in order would. */
-  uint32_t nb = m->nfuncs - m->nimported_funcs;
-  uint32_t nt = compile_want_threads(m, nb);
-  if (nt <= 1) {
-    for (uint32_t i = m->nimported_funcs; i < m->nfuncs; i++) validate_func(m, i);
-  } else {
-    VPar vp = { m, UINT32_MAX, PTHREAD_MUTEX_INITIALIZER, { 0 } };
-    warmc_par_for(nb, nt, validate_par, &vp);
-    if (vp.bad != UINT32_MAX) warmc_diag_rethrow(&vp.bad_diag);
-  }
+  validate_bodies(m, NULL, m->nfuncs - m->nimported_funcs);
 
   xfree(g_declared);
   g_declared = NULL;
 }
 
 /* Bodies a module transform rewrote, validated as wasm_validate validates
-   every body (tramp.c): what it writes must be wasm a validator accepts. */
+   every body (tramp.c, gosp.c): what it writes must be wasm a validator
+   accepts. */
 void wasm_validate_funcs(Module *m, const uint32_t *fns, uint32_t n) {
   collect_declared(m);
-  for (uint32_t k = 0; k < n; k++) validate_func(m, fns[k]);
+  validate_bodies(m, fns, n);
   xfree(g_declared);
   g_declared = NULL;
 }

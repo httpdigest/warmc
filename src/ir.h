@@ -414,6 +414,9 @@ typedef struct {
   /* a GHC-style trampoline whose functions return the next to run becomes
      tail calls, its hottest registers passed as arguments (tramp.c) */
   bool trampoline;
+  /* Go's stack pointer passed to its functions and returned by them in
+     place of its global (gosp.c) */
+  bool go_sp;
   bool gssa;
 
   bool labcache;
@@ -515,7 +518,7 @@ typedef struct {
   uint64_t bar_masks, bar_elided;
   uint64_t caller_saves, csa_restores, spills_v128_xcall, range_budget_trips;
   uint64_t split_cuts, split_invs, pieces, loop_pieces, recomputes,
-           dead_frame_stores, tramp_funcs;
+           dead_frame_stores, tramp_funcs, gosp_funcs;
   uint64_t devirt_ref, devirt_indirect, devirt_null_kept;
   uint64_t const_reads, throw_jumps, inl_more;
   uint64_t inl_flat, inl_spliced, inl_once_forced, inl_retcall_sites;

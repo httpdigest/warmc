@@ -52,6 +52,34 @@ elif ! "$WORK/host"; then
   fail=1
 fi
 
+# A library in Go's shape, whose stack pointer gosp.c passes in place of its
+# global, and whose import calls back into it: what the export reads and
+# moves there is what the Go function inside the import holds.
+GLIB="$WORK/libgosp.$EXT"
+[ "$EXT" = dll ] && GLIB="$WORK/gosp.dll"
+if ! ./$BUILD/warmc "${TARGET[@]}" --shared --stats -o "$GLIB" test/shared/gosp.wat \
+       2>"$WORK/gosp.err"; then
+  echo "FAIL[shared]: test/shared/gosp.wat does not build"
+  sed 's/^/    /' "$WORK/gosp.err"
+  fail=1
+elif ! grep -q '\bgosp_funcs=1\b' "$WORK/gosp.err"; then
+  echo "FAIL[shared]: gosp.c did not rewrite test/shared/gosp.wat's Go function"
+  fail=1
+elif [ "$EXT" = dll ] &&
+     ! llvm-dlltool -m i386:x86-64 -d "$WORK/gosp.def" -l "$WORK/libgosp.dll.a" \
+         2>"$WORK/dlltool.err"; then
+  echo "FAIL[shared]: no import library from gosp's .def"
+  sed 's/^/    /' "$WORK/dlltool.err"
+  fail=1
+elif ! cc -O2 -Wall -Werror -I "$WORK" -o "$WORK/gosphost" test/shared/gosphost.c \
+         -L "$WORK" -lgosp -Wl,-rpath,"$WORK" 2>"$WORK/gosphost.err"; then
+  echo "FAIL[shared]: the gosp host does not build against the header"
+  sed 's/^/    /' "$WORK/gosphost.err"
+  fail=1
+elif ! "$WORK/gosphost"; then
+  fail=1
+fi
+
 # The runtime's options reach a library through the environment as they do
 # a program: a heap of 4 MB cannot hold a million live nodes.
 cat > "$WORK/heap.c" <<'EOF'
@@ -128,5 +156,5 @@ refuse "a --wasi library" "no wasi host" '(module)' --wasi
 refuse "a library without export names" "export names" '(module)' \
   --no-export-names
 
-[ "$fail" = 0 ] && echo "shared: a library called from C, C++, Python and Java, its options from the environment, and four refusals"
+[ "$fail" = 0 ] && echo "shared: a library called from C, C++, Python and Java, one in Go's shape called back from its import, its options from the environment, and four refusals"
 exit $fail

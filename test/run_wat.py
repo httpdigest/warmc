@@ -112,20 +112,23 @@ def oracles():
     return out
 
 def strip_custom(b):
-    """A module without its custom sections, or None if it is not one.
+    """A module without its name sections, or None if it is not one.
 
-    Applied to both sides of every comparison.  A custom section is the one
+    Applied to both sides of every comparison.  The name section is the one
     thing here that two correct assemblers may legitimately disagree about:
-    warmc implements none, in the text format or the binary one, while
-    `wasm-tools parse` writes a name section for the `$names` in the text and
-    `wat2wasm` turns `(@custom ...)` back into a section.  Removing them from
-    the bytes keeps the criterion plain identity rather than an "equal apart
-    from" that would have to be trusted -- and it removes exactly one section
-    id, which is checkable by reading this function.
+    `wasm-tools parse` writes one for the `$names` in the text, and warmc,
+    whose names come from the binary it compiles, writes none.  Every other
+    custom section is compared where it stands, since `(@custom ...)`,
+    `(@producers ...)` and `(@dylink.0 ...)` say exactly what to write and
+    where.  Removing the name sections from the bytes keeps the criterion
+    plain identity rather than an "equal apart from" that would have to be
+    trusted -- and it removes exactly one kind of section, which is checkable
+    by reading this function.
 
     A module's shape is enough: an eight-byte header, then id, size, payload
-    for each section.  Anything that does not walk cleanly is not a module and
-    is left to the tools to reject.
+    for each section, and a custom section's payload starts with its name.
+    Anything that does not walk cleanly is not a module and is left to the
+    tools to reject.
     """
     if len(b) < 8 or b[:4] != b"\0asm":
         return None
@@ -147,7 +150,7 @@ def strip_custom(b):
                 break
         if j + size > len(b):
             return None
-        if sec != 0:
+        if sec != 0 or b[j:j + 5] != b"\x04name":
             out += b[i:j + size]
         i = j + size
     return bytes(out)
@@ -367,12 +370,31 @@ def main():
     # field carry an inline import, and an import may not follow a definition
     # of the same sort -- a rule the front end has and nothing asserted, so
     # deleting the check broke no test.
+    # A custom-section annotation is a module field, and its grammar is
+    # wasm-tools': one anywhere else, a place no section has, a producers
+    # field or dylink.0 subsection no one defined, or a name that is not
+    # UTF-8 is refused rather than dropped.
     for src, want in (
             ('(module (func) (func (import "m" "f")))',
              "must come before every"),
             ('(module (global i32 (i32.const 0)) '
              '(global (import "m" "g") i32))',
-             "must come before every")):
+             "must come before every"),
+            ('(module (func (@custom "a" "b")))', "misplaced @custom annotation"),
+            ('(module (@custom "a" (@custom "b" "c") "d"))', "misplaced @custom annotation"),
+            ('(module (func (@producers (language "a" "1"))))', "misplaced @producers annotation"),
+            ('(module (memory 1 (@dylink.0)))', "misplaced @dylink.0 annotation"),
+            ('(module (@custom "a" (after nothing) "b"))', "expected a section's name"),
+            ('(module (@custom "a" (within code) "b"))', "expected before or after"),
+            ('(module (@custom "a" (before last) "b"))', "expected a section's name"),
+            ('(module (@custom "a" (after first) "b"))', "expected a section's name"),
+            ('(module (@custom "a" 1))', "expected ')'"),
+            ('(module (@custom "\\ff" "b"))', "UTF-8"),
+            ('(module (@producers (author "a" "1")))', "expected language, sdk or processed-by"),
+            ('(module (@producers (language "a")))', "a producer's version"),
+            ('(module (@dylink.0 (needs "a")))', "expected a dylink.0 subsection"),
+            ('(module (@dylink.0 (export-info "f" sideways)))', "expected a symbol's flag"),
+            ('(module (@dylink.0 (mem-info (memory 1 0x100000000))))', "out of range")):
         with tempfile.TemporaryDirectory() as tmp:
             wat = os.path.join(tmp, "order.wat")
             with open(wat, "w") as f:
@@ -381,10 +403,10 @@ def main():
                                  os.path.join(tmp, "o.wasm"), wat],
                                 capture_output=True, text=True, timeout=limit(30))
             if p_.returncode == 0:
-                failures.append("an import after a definition was accepted")
+                failures.append("accepted: %s" % src)
             elif want not in p_.stderr:
-                failures.append("an import after a definition was refused for "
-                                "the wrong reason: %s" % p_.stderr.strip())
+                failures.append("%s was refused for the wrong reason: %s"
+                                % (src, p_.stderr.strip()))
             else:
                 counts["exact"] += 1
 

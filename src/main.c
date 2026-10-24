@@ -40,11 +40,14 @@ static const char *usage_text =
   "                is the one value that is always exact -- which is what\n"
   "                makes it the flag to reach for when output differs\n"
   "                between runs\n"
-  "  -O0 -O1 -O2   optimisation level (default -O2)\n"
+  "  -O0 -O1 -O2 -O3  optimisation level (default -O2)\n"
   "                O0 skips the IR optimiser (register allocation, module\n"
   "                reachability and merging identical bodies still run),\n"
   "                O1 the optimising pipeline, O2 adds guard pages,\n"
   "                inlining, devirtualisation, unrolling and gcpure.\n"
+  "                O3 adds the passes that change what a program can see,\n"
+  "                fma and dead-frames, described below: every optimisation\n"
+  "                warmc has, where O2 keeps wasm's semantics.\n"
   "                -fno-inline turns inlining off, and src/inline.c has the\n"
   "                measurements that decided both.  Options apply in order,\n"
   "                so a -f flag goes after the -O it amends\n"
@@ -55,7 +58,7 @@ static const char *usage_text =
   "                partial-escape, gloop, gssa, loopclose, cpool, ictab, reach,\n"
   "                prune, merge, devirt, reinline, throw-jump, closed-world,\n"
   "                gcpure, split, labcache, ifconv, mulwide, barelide,\n"
-  "                small-loop-align, trampoline, fma, dead-frames\n"
+  "                small-loop-align, trampoline, go-sp, fma, dead-frames\n"
   "                fma is off unless asked for: it fuses a float multiply\n"
   "                into the add that reads it, rounded once, which is not\n"
   "                wasm's arithmetic and can change a result's last bit\n"
@@ -253,6 +256,17 @@ static uint8_t *read_file(const char *path, size_t *len_out) {
   return buf;
 }
 
+/* What an -O level decides; every other pass is on at every level but -O0,
+   which skips the IR optimiser, and is the -f flags' to change.  Each -O
+   sets all of these, so the last one given is the level. */
+static void set_level(OptOpts *o, int level) {
+  o->level = level;
+  o->align = o->split = o->trampoline = o->go_sp = level >= 1;
+  o->guard_pages = o->inl = o->devirt = o->unroll = o->gcpure = level >= 2;
+  /* -O3: also the passes that change what a program can see */
+  o->fma = o->dead_frames = level >= 3;
+}
+
 int main(int argc, char **argv) {
 #ifdef _WIN32
   /* Dumps are byte-compared against golden files; keep the streams free
@@ -277,21 +291,17 @@ int main(int argc, char **argv) {
 
   OptOpts opt;
   memset(&opt, 0, sizeof opt);
-  opt.level = 2;
+  set_level(&opt, 2);
   opt.fold = opt.dce = opt.cse = opt.licm = opt.branch = true;
   opt.thread = opt.nodesplit = true;
   opt.gssa = true;
   opt.small_loop_align = true;
   opt.memopt = opt.bce = opt.strength = true;
 
-  opt.inl = true;
   opt.rotate = true;
   opt.addroff = true;
   opt.memptr = true;
-  opt.align = true;
-  opt.guard_pages = true;
   opt.regalloc = true;
-  opt.split = true;
   opt.vectorize = true;
   opt.edgetests = true;
   opt.selftail = true;
@@ -302,19 +312,15 @@ int main(int argc, char **argv) {
   opt.loopclose = true;
   opt.cpool = true;
   opt.ictab = true;
-  opt.trampoline = true;
   opt.reassoc = true;
   opt.labcache = true;
   opt.barelide = true;
   opt.reach = true;
   opt.prune = true;
-  opt.devirt = true;
   opt.reinline = true;
   opt.throwjump = true;
-  opt.unroll = true;
   opt.ifconv = true;
   opt.mulwide = true;
-  opt.gcpure = true;
   opt.closed_world = true;
 
   for (int i = 1; i < argc; i++) {
@@ -359,33 +365,8 @@ int main(int argc, char **argv) {
       printf("%llu %d %d\n", (unsigned long long)mg.m, mg.add, mg.sh);
       return 0;
     }
-    else if (!strcmp(a, "-O0")) {
-
-      opt.level = 0;
-      opt.guard_pages = false;
-      opt.trampoline = false;
-      opt.align = false;
-      opt.split = false;
-      opt.inl = false;
-      opt.devirt = false;
-      opt.unroll = false;
-      opt.gcpure = false;
-    }
-    else if (!strcmp(a, "-O1")) {
-
-      opt.level = 1;
-      opt.guard_pages = false;
-      opt.inl = false;
-      opt.devirt = false;
-      opt.unroll = false;
-      opt.gcpure = false;
-    }
-    else if (!strcmp(a, "-O2")) {
-      /* back to the defaults an earlier -O0 or -O1 turned off */
-      opt.level = 2;
-      opt.guard_pages = opt.align = opt.split = true;
-      opt.inl = opt.devirt = opt.unroll = opt.gcpure = true;
-    }
+    else if (a[0] == '-' && a[1] == 'O' && a[2] >= '0' && a[2] <= '3' && !a[3])
+      set_level(&opt, a[2] - '0');
     else if (!strcmp(a, "--validate-only")) validate_only = true;
     else if (!strcmp(a, "--dump-component")) dump_component = true;
     else if (!strcmp(a, "--dump-canon")) dump_canon = true;
@@ -444,6 +425,7 @@ int main(int argc, char **argv) {
       else if (!strcmp(name, "cpool")) opt.cpool = on;
       else if (!strcmp(name, "ictab")) opt.ictab = on;
       else if (!strcmp(name, "trampoline")) opt.trampoline = on;
+      else if (!strcmp(name, "go-sp")) opt.go_sp = on;
       else if (!strcmp(name, "gssa")) opt.gssa = on;
       else if (!strcmp(name, "gssa-all")) opt.gssa = opt.gssa_all = on;
       else if (!strcmp(name, "small-loop-align")) opt.small_loop_align = on;
@@ -638,7 +620,7 @@ int main(int argc, char **argv) {
             "             ldpairs=%llu stpairs=%llu cold_frames=%llu early_rets=%llu\n"
             "             reloads=%llu caller_saves=%llu csa_restores=%llu"
             " v128_spills=%llu rb_trips=%llu split_cuts=%llu split_invs=%llu pieces=%llu"
-            " loop_pieces=%llu recomputes=%llu dead_frame_stores=%llu tramp_funcs=%llu\n"
+            " loop_pieces=%llu recomputes=%llu dead_frame_stores=%llu tramp_funcs=%llu gosp_funcs=%llu\n"
             "             escape_removed=%llu escape_forwarded=%llu escape_made=%llu gloop=%llu\n"
             "             loop_closed=%llu reassoc=%llu cmp_reused=%llu csel_fused=%llu mul_wide=%llu fma=%llu gssa=%llu\n"
             "             bar_masks=%llu bar_elided=%llu\n"
@@ -683,6 +665,7 @@ int main(int argc, char **argv) {
             (unsigned long long)g_stats.recomputes,
             (unsigned long long)g_stats.dead_frame_stores,
             (unsigned long long)g_stats.tramp_funcs,
+            (unsigned long long)g_stats.gosp_funcs,
             (unsigned long long)g_stats.escape_removed,
             (unsigned long long)g_stats.escape_forwarded,
             (unsigned long long)g_stats.escape_made,

@@ -403,6 +403,7 @@ uint32_t module_add_func_type(Module *m, const ValType *params, uint32_t nparams
                               const ValType *results, uint32_t nresults, bool final_);
 void wasm_validate_funcs(Module *m, const uint32_t *fns, uint32_t n);
 uint32_t module_untrampoline(Module *m);
+uint32_t module_go_sp_args(Module *m);
 
 bool vt_subtype(const Module *m, ValType a, ValType b);
 
