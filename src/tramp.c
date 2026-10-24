@@ -402,10 +402,10 @@ uint32_t module_untrampoline(Module *m) {
 
   ValType params[TR_NREG], res = VT_I32;
   for (uint32_t k = 0; k < t.nreg; k++) params[k] = VT_I32;
-  /* not final: a call through a type the module wrote by the same structure
-     -- C's (i32, i32, i32) -> i32 function pointers -- still traps on these
-     functions, as it did on their type before */
-  t.nt = module_add_func_type(m, params, t.nreg, &res, 1, false);
+  /* a type of its own: a call through one the module wrote by the same
+     structure -- C's (i32, i32, i32) -> i32 function pointers -- still traps
+     on these functions, as it did on their type before */
+  t.nt = module_add_distinct_func_type(m, params, t.nreg, &res, 1);
 
   uint32_t *done = xmalloc((ns + 1) * sizeof(uint32_t));
   uint32_t nd = 0;

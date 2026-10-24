@@ -923,28 +923,39 @@ void module_free(Module *m) {
   xfree(m);
 }
 
-/* A function type of its own rec group, appended as the parser appends
-   one: for a transform that gives functions a signature the module did not
-   have (tramp.c).  One not final has an identity of its own, which no type
-   the module wrote by the same structure shares. */
-uint32_t module_add_func_type(Module *m, const ValType *params, uint32_t nparams,
-                              const ValType *results, uint32_t nresults, bool final_) {
+/* A final function type with an identity of its own, appended as the
+   parser appends one: for a transform that gives functions a signature the
+   module did not have (tramp.c, gosp.c).  It shares a rec group with an
+   empty function type, so no type the module wrote by the same structure
+   is the same type -- a call through one of those still traps on these
+   functions -- while a call through it checks the type by its identity
+   alone, as a final type's is checked. */
+uint32_t module_add_distinct_func_type(Module *m, const ValType *params, uint32_t nparams,
+                                       const ValType *results, uint32_t nresults) {
   uint32_t i = m->ntypes;
-  m->types = xrealloc(m->types, (i + 1) * sizeof(CompType));
+  m->types = xrealloc(m->types, (i + 2) * sizeof(CompType));
+  memset(&m->types[i], 0, 2 * sizeof(CompType));
+  for (uint32_t k = 0; k < 2; k++) {
+    CompType *t = &m->types[i + k];
+    t->kind = CT_FUNC;
+    t->final_ = true;
+    t->rec_first = i;
+    t->rec_n = 2;
+    t->params = xmalloc((k ? 1 : nparams ? nparams : 1) * sizeof(ValType));
+    t->results = xmalloc((k ? 1 : nresults ? nresults : 1) * sizeof(ValType));
+  }
   CompType *t = &m->types[i];
-  memset(t, 0, sizeof *t);
-  t->kind = CT_FUNC;
-  t->final_ = final_;
-  t->rec_first = i;
-  t->rec_n = 1;
-  t->params = xmalloc((nparams ? nparams : 1) * sizeof(ValType));
   memcpy(t->params, params, nparams * sizeof(ValType));
   t->nparams = nparams;
-  t->results = xmalloc((nresults ? nresults : 1) * sizeof(ValType));
   memcpy(t->results, results, nresults * sizeof(ValType));
   t->nresults = nresults;
-  m->ntypes = i + 1;
-  identify_group(m, i, 1);
+  m->ntypes = i + 2;
+  identify_group(m, i, 2);
   build_display(m, i);
+  build_display(m, i + 1);
+  /* the identity is a hash of the structure (check_type_ids) */
+  for (uint32_t u = 0; u < i; u++)
+    if (m->types[u].id == m->types[i].id || m->types[u].id == m->types[i + 1].id)
+      warmc_fatal("internal: a transform's new type has the identity of type %u", u);
   return i;
 }

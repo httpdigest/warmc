@@ -417,20 +417,10 @@ uint32_t module_go_sp_args(Module *m) {
   for (uint32_t fi = 0; fi < nf; fi++) g.in_r[fi] = reach[fi] && !g.in_s[fi];
   xfree(reach);
 
-  /* Final, so that a call through it checks the type by its identity
-     alone -- unless the module wrote a final type of that structure, which
-     would then be the same type and a call through it reach these
-     functions: not final, it stays apart, at the cost of a subtype check
-     on each call through the table. */
+  /* a type of its own: a call through one the module wrote by the same
+     structure still traps on these functions, as it did on their type */
   ValType params[2] = { VT_I32, VT_I32 }, res = VT_I64;
-  bool clash = false;
-  for (uint32_t ti = 0; ti < nty && !clash; ti++) {
-    const CompType *c = &m->types[ti];
-    clash = c->kind == CT_FUNC && c->final_ && !c->has_super && c->rec_n == 1 &&
-            c->nparams == 2 && c->params[0] == VT_I32 && c->params[1] == VT_I32 &&
-            c->nresults == 1 && c->results[0] == VT_I64;
-  }
-  g.nt = module_add_func_type(m, params, 2, &res, 1, !clash);
+  g.nt = module_add_distinct_func_type(m, params, 2, &res, 1);
 
   /* the Go functions and those of the others that call one, rewritten on
      the compiler's threads, each its own body */

@@ -18,7 +18,11 @@ one() {
   local name outbin
   name=$(basename "$wasm" .wasm)
   outbin="$WORK/$name"
-  if ! WARMC_MACOS_LIBDIR="$PWD/test/sdk" wtimeout ./$BUILD/warmc --target=macos \
+  # -j1: the row runs a build per CPU, and a build that also took every core
+  # for its own threads, beside the rest of make check starting, could miss
+  # its timeout on a module it compiles in milliseconds (test/run_jobs.sh
+  # shows the thread count never reaches the output)
+  if ! WARMC_MACOS_LIBDIR="$PWD/test/sdk" wtimeout ./$BUILD/warmc --target=macos -j1 \
         --rt "$BUILD/warmrt-macos.a" --ld ld64.lld -o "$outbin" "$wasm" \
         2>"$WORK/$name.err"; then
     echo "FAIL[macho] $name: $(head -3 "$WORK/$name.err")" >"$WORK/$name.fail"
