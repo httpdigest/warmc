@@ -141,8 +141,13 @@ def compile_case(idx, name, wasm, outdir):
     obj = os.path.join(outdir, name + ".o")
     target = ["--target=macos"] if hostbuild.DARWIN \
         else ["--target=windows"] if hostbuild.WINDOWS else []
+    # -j1, before the flags so that a row can still ask for threads: the
+    # cases compile on a worker per CPU, and a compile that also took every
+    # core for its own threads, beside the rest of make check starting,
+    # could miss its timeout on a module it compiles in milliseconds
+    # (test/run_jobs.sh shows the thread count never reaches the output)
     try:
-        r = sh([os.path.join(BUILD, "warmc")] + WARMC_FLAGS + target +
+        r = sh([os.path.join(BUILD, "warmc"), "-j1"] + WARMC_FLAGS + target +
                ["--symbol-prefix=c%d" % idx, "-c", "-o", obj, wasm],
                timeout=TIMEOUT)
     except subprocess.TimeoutExpired:
