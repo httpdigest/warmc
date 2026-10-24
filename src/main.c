@@ -59,18 +59,19 @@ static const char *usage_text =
   "                prune, merge, devirt, reinline, throw-jump, closed-world,\n"
   "                gcpure, split, labcache, ifconv, mulwide, barelide,\n"
   "                small-loop-align, trampoline, go-sp, fma, dead-frames\n"
-  "                fma is off unless asked for: it fuses a float multiply\n"
+  "                fma is off below -O3: it fuses a float multiply\n"
   "                into the add that reads it, rounded once, which is not\n"
   "                wasm's arithmetic and can change a result's last bit\n"
-  "                dead-frames is off unless asked for: it assumes C's\n"
+  "                dead-frames is off below -O3: it assumes C's\n"
   "                stack, where nothing reads a function's frame once it\n"
   "                returns, and removes the stores into it nothing reads\n"
   "                before then; wasm keeps them, so a program that reads\n"
   "                stack memory it never wrote can see other bytes\n"
-  "                The last two are the passes built on a loop containing\n"
-  "                no safepoint, which is the only assumption the compiler\n"
-  "                makes about the collector: turning them off says whether\n"
-  "                a collection bug that needs -O2 is one of theirs\n"
+  "                labcache and barelide build on what the collector\n"
+  "                allows -- the allocation buffer kept open over a loop of\n"
+  "                small allocations, the load-barrier mask kept over a loop\n"
+  "                with no safepoint: turning them off says whether a\n"
+  "                collection bug the optimiser brings out is one of theirs\n"
   "  -fno-loadbar  emit no GC load barriers.  Unsound for a module with GC\n"
   "                references, which relocation heals through the barrier;\n"
   "                test/run_nobar.sh uses it to show that a module without\n"
@@ -96,7 +97,7 @@ static const char *usage_text =
   "                harness that invokes an export by name.  Which host is\n"
   "                decided by the input: a core module gets the\n"
   "                wasi_snapshot_preview1 one and runs _start, a component\n"
-  "                gets the WASI 0.2 one and runs wasi:cli/run@0.2.0#run,\n"
+  "                gets the WASI 0.2 one and runs wasi:cli/run@0.2.x#run,\n"
   "                whose result is its exit status -- 0 or 1 -- unless it\n"
   "                calls wasi:cli/exit's exit-with-code for another.\n"
   "                A wasi:* function this host does not implement traps when\n"
@@ -115,9 +116,9 @@ static const char *usage_text =
   "                sections the output carries, in a read-only section of its\n"
   "                own (.wasm.custom, __TEXT,__wasm_custom, .wcustom) that a\n"
   "                --shared library also hands out by name:\n"
-  "                PREFIX_custom_section.  default leaves out the name\n"
-  "                section, whose names the symbols carry, and DWARF's\n"
-  "                .debug_* sections\n"
+  "                PREFIX_custom_section.  default leaves out the debug\n"
+  "                information: the name section, which warmc does not\n"
+  "                read, and DWARF's .debug_* sections\n"
   "  --no-export-names  emit only the exports a name can still be needed\n"
   "                for -- _start and main -- and drop the rest of the export\n"
   "                table.  The program can then no longer be asked for an\n"
@@ -176,6 +177,9 @@ static const char *wasi_archive(const char *rt, const char *wasi, bool p2,
     snprintf(buf, bufn, "%.*s%s%s", (int)(base - rt), rt,
              p2 ? "warmwasip2" : "warmwasi", base + 6);
     wasi = buf;
+    /* make builds no WASI 0.2 host for Windows */
+    if (p2 && strstr(base, "windows"))
+      warmc_fatal("--wasi: there is no WASI 0.2 host for Windows");
   }
   FILE *probe = fopen(wasi, "rb");
   if (!probe)

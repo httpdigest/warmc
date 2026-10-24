@@ -63,6 +63,14 @@ static void err(const char *s) {
   warmc_rt_write(2, s, (usz)(p - s));
 }
 
+static void err_u64(unsigned long long v) {
+  char b[24];
+  int i = 24;
+  if (!v) { warmc_rt_write(2, "0", 1); return; }
+  while (v) { b[--i] = (char)('0' + (v % 10)); v /= 10; }
+  warmc_rt_write(2, b + i, (usz)(24 - i));
+}
+
 static int str_eq(const char *a, const char *b) {
   while (*a && *a == *b) { a++; b++; }
   return *a == *b;
@@ -1237,7 +1245,15 @@ static int drive(int argc, char **argv) {
   g_argv = argv;
 
   warmc_host_lookup = p2_lookup;
-  warmc_component_instantiate();
+  /* as the preview1 host: a core instance that fails to link or to
+     instantiate, a trap in its start function included, is 71 */
+  u32 e = warmc_component_instantiate_catching();
+  if (e) {
+    err("warmc-wasip2: the component failed to instantiate or link: ");
+    err(warmc_trap_name(e));
+    err(" ("); err_u64(e); err(")\n");
+    return 71;
+  }
 
   const ExportDesc *ex = 0;
   WarmInstance *v = 0;
@@ -1246,7 +1262,7 @@ static int drive(int argc, char **argv) {
                             warmc_component->exports[i].name))
       v = warmc_component_export(warmc_component->exports[i].name, &ex);
   if (!v) {
-    err("warmc-wasip2: the component does not export wasi:cli/run@0.2.0;"
+    err("warmc-wasip2: the component does not export wasi:cli/run@0.2.x;"
         " it is not a command\n");
     return 72;
   }
@@ -1259,8 +1275,7 @@ static int drive(int argc, char **argv) {
   if (trap) {
     err("warmc-wasip2: trap: ");
     err(warmc_trap_name(trap));
-    err("\n  (an unimplemented wasi:* call traps like this;\n"
-        "   rt/wasip2.c lists what this host implements)\n");
+    err("\n");
     return 73;
   }
 
