@@ -355,8 +355,15 @@ Sandbox behaviour:
 - Symlinks are followed by hand: at most 8, and never to an absolute target.
 - A path that ends in a slash names a directory, as under wasmtime: making a
   directory or renaming by it acts on the entry itself, which must be one;
-  creating a file by it is refused; anything else acts on what the name
+  creating a file by it is refused, with the host's errno (`EISDIR` on Linux
+  and Windows, `EINVAL` on macOS); anything else acts on what the name
   leads into.
+- A name is taken as it is spelled: on Windows too, `x.` and `x ` are names of
+  their own and not `x`, and paths of any length up to 4096 bytes reach
+  Win32 whole (by its `\\?\` prefix).
+- On Windows the host gives Linux's answers, where wasmtime's Windows host has
+  rules of its own for a path that ends in a slash (`EACCES` for a directory
+  removed by one, a symlink to nothing refused).
 - Rights are enforced per descriptor.
 
 The exit status is the guest's `proc_exit` code. A code of 126 or more, which

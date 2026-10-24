@@ -86,10 +86,8 @@ extern int HeapFree(void *heap, u32 flags, void *p);
 #define SHARE_ALL       0x00000007u        /* READ | WRITE | DELETE */
 
 #define CREATE_NEW        1u
-#define CREATE_ALWAYS     2u
 #define OPEN_EXISTING     3u
 #define OPEN_ALWAYS       4u
-#define TRUNCATE_EXISTING 5u
 
 #define FLAG_BACKUP_SEMANTICS   0x02000000u
 #define FLAG_OPEN_REPARSE_POINT 0x00200000u
@@ -448,14 +446,37 @@ static int wjoin(const u16 *dir, const char *leaf, u16 *out) {
   return 0;
 }
 
-/* The absolute Win32 path a (dirfd, name) pair names. */
+/* The absolute Win32 path a (dirfd, name) pair names.  One from the current
+   directory is made absolute and given the \\?\ prefix, and every descriptor's
+   path is joined from such a one, so each path handed to Win32 has it: without
+   it Win32 refuses a path past MAX_PATH's 260 characters, where a preopen 200
+   directories deep is still 400 bytes, and strips a name's trailing dots and
+   spaces, which makes `x.` the file `x`.  The prefix also turns off the
+   parsing of "." and "..", which wjoin and rt/wasifs.c's walk never pass. */
 static int resolve(int dirfd, const char *name, u16 *out) {
   if (dirfd == H_AT_FDCWD) {
-    u16 rel[WPATH];
+    u16 rel[WPATH], full[WPATH];
     if (wide_of(name, rel, WPATH)) return -1;
-    u32 n = GetFullPathNameW(rel, WPATH, out, 0);
+    u32 n = GetFullPathNameW(rel, WPATH, full, 0);
     if (!n) return fail_last();
     if (n >= WPATH) return fail(E_NAMETOOLONG);
+    /* \\?\C:\x, and \\?\UNC\server\share for \\server\share; one that has a
+       \\?\ or \\.\ prefix already keeps it */
+    static const u16 pre[] = { '\\', '\\', '?', '\\' };
+    static const u16 unc[] = { 'U', 'N', 'C' };
+    usz o = 0, from = 0;
+    if (n >= 4 && full[0] == '\\' && full[1] == '\\' &&
+        (full[2] == '?' || full[2] == '.') && full[3] == '\\') {
+      o = 0;
+    } else if (n >= 2 && full[0] == '\\' && full[1] == '\\') {
+      for (usz i = 0; i < 4; i++) out[o++] = pre[i];
+      for (usz i = 0; i < 3; i++) out[o++] = unc[i];
+      from = 1;
+    } else {
+      for (usz i = 0; i < 4; i++) out[o++] = pre[i];
+    }
+    if (o + (n - from) >= WPATH) return fail(E_NAMETOOLONG);
+    for (usz i = from; i <= n; i++) out[o++] = full[i];
     return 0;
   }
   WFd *d = fd_at(dirfd);
@@ -578,14 +599,17 @@ static void *win_open_handle(const u16 *wp, int flags, int link_is_target) {
     case H_RDWR:   access = GENERIC_READ | GENERIC_WRITE; break;
     default:       access = GENERIC_READ; break;
   }
+  /* O_TRUNC truncates on Linux whatever the access, which takes writing here */
+  if (flags & H_TRUNC) access |= GENERIC_WRITE;
   if (link_is_target) access = FILE_READ_ATTRS;
 
+  /* No disposition that changes what it opens: with O_NOFOLLOW that is the
+     link itself, and CREATE_ALWAYS replaced a link by an empty file before
+     win_open could answer ELOOP for it.  win_open truncates instead, once
+     what it opened is known to be no link and no directory. */
   u32 disp;
-  if (flags & H_CREAT)
-    disp = (flags & H_EXCL) ? CREATE_NEW
-         : (flags & H_TRUNC) ? CREATE_ALWAYS : OPEN_ALWAYS;
-  else
-    disp = (flags & H_TRUNC) ? TRUNCATE_EXISTING : OPEN_EXISTING;
+  if (flags & H_CREAT) disp = (flags & H_EXCL) ? CREATE_NEW : OPEN_ALWAYS;
+  else disp = OPEN_EXISTING;
 
   u32 extra = FLAG_BACKUP_SEMANTICS;
   if ((flags & H_NOFOLLOW) || link_is_target) extra |= FLAG_OPEN_REPARSE_POINT;
@@ -620,6 +644,20 @@ static int win_open(const u16 *wp, int flags) {
   if ((flags & H_DIRECTORY) && !(attr & ATTR_DIRECTORY)) {
     CloseHandle(h);
     return fail(E_NOTDIR);
+  }
+  /* A directory opened for writing, or by a create, is EISDIR on POSIX
+     whatever the access granted: Win32 grants writing to a directory opened
+     with backup semantics by a process that holds the backup privilege, as an
+     administrator's does. */
+  if ((attr & ATTR_DIRECTORY) &&
+      ((flags & 3) != H_RDONLY || (flags & (H_CREAT | H_TRUNC)))) {
+    CloseHandle(h);
+    return fail(E_ISDIR);
+  }
+  if ((flags & H_TRUNC) && (!SetFilePointerEx(h, 0, 0, 0) || !SetEndOfFile(h))) {
+    u32 e = GetLastError();
+    CloseHandle(h);
+    return fail(win_errno(e));
   }
   int fd = fd_new(h, wp);
   if (fd >= 0 && (flags & H_APPEND)) g_fd[fd].append = 1;
@@ -781,6 +819,9 @@ int mkdirat(int dirfd, const char *name, unsigned int mode) {
 
 int unlinkat(int dirfd, const char *name, int flags) {
   u16 wp[WPATH];
+  /* "." is the directory itself, which wjoin's path names: POSIX removes no
+     directory by it, where RemoveDirectoryW would remove an empty one */
+  if ((flags & H_AT_REMOVEDIR) && name[0] == '.' && !name[1]) return fail(E_INVAL);
   if (resolve(dirfd, name, wp)) return -1;
   u32 attr = GetFileAttributesW(wp);
   if (attr == ATTR_INVALID) return fail_last();

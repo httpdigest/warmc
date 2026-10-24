@@ -96,7 +96,9 @@ for lv in -O0 -O1 -O2; do
   wtimeout ./$BUILD/warmc $lv $WARMC_TARGET_FLAGS --symbol-prefix=t \
       -c -o "$WORK/t.o" "$WORK/t.wasm" \
     || { echo "FAIL[link]: compiling trap.wat at $lv"; exit 1; }
-  link_prog trapprog test/link/trapdriver.c "$WORK/t.o" || exit 1
+  # a program of its own per level: Windows refuses to write over the image
+  # of one that has only just exited
+  link_prog "trapprog$lv" test/link/trapdriver.c "$WORK/t.o" || exit 1
   got=$(wruntimeout $WARMC_RUN "$LINKED" 2>&1)
   if [ "$got" = "$trapwant" ]; then continue; fi
   echo "FAIL[link/trap]: $lv output differs"
