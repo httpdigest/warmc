@@ -111,6 +111,13 @@ static const char *usage_text =
   "                guest reaches no network at all\n"
   "  --symbol-prefix=P  name the module descriptor P_module, so several\n"
   "                modules can be linked into one program\n"
+  "  --custom-sections=default|all|none  which of the module's custom\n"
+  "                sections the output carries, in a read-only section of its\n"
+  "                own (.wasm.custom, __TEXT,__wasm_custom, .wcustom) that a\n"
+  "                --shared library also hands out by name:\n"
+  "                PREFIX_custom_section.  default leaves out the name\n"
+  "                section, whose names the symbols carry, and DWARF's\n"
+  "                .debug_* sections\n"
   "  --no-export-names  emit only the exports a name can still be needed\n"
   "                for -- _start and main -- and drop the rest of the export\n"
   "                table.  The program can then no longer be asked for an\n"
@@ -341,6 +348,13 @@ int main(int argc, char **argv) {
     else if (!strcmp(a, "--keep-obj")) keep_obj = true;
     else if (!strcmp(a, "--no-dead-strip")) dead_strip = false;
     else if (!strcmp(a, "--no-export-names")) g_no_export_names = true;
+    else if (!strncmp(a, "--custom-sections=", 18)) {
+      const char *v = a + 18;
+      if (!strcmp(v, "default")) codegen_set_custom_sections(CUSTOM_DEFAULT);
+      else if (!strcmp(v, "all")) codegen_set_custom_sections(CUSTOM_ALL);
+      else if (!strcmp(v, "none")) codegen_set_custom_sections(CUSTOM_NONE);
+      else warmc_fatal("--custom-sections takes default, all or none, not %s", v);
+    }
     else if (!strcmp(a, "-fno-loadbar")) codegen_set_load_barrier(false);
     else if (!strncmp(a, "--symbol-prefix=", 16)) sym_prefix = a + 16;
     else if (!strcmp(a, "--shared")) shared = true;

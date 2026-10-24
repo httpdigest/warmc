@@ -602,6 +602,33 @@ __attribute__((noreturn)) void warmc_trap(u32 code) {
 
 const char *warmc_trap_name(u32 code) { return trap_name(code); }
 
+static u32 rd_le32(const u8 *p) {
+  return (u32)p[0] | (u32)p[1] << 8 | (u32)p[2] << 16 | (u32)p[3] << 24;
+}
+
+usz warmc_custom_section(const ModuleDesc *md, const char *name, usz index,
+                         const u8 **data, usz *size) {
+  const u8 *t = md->custom;
+  usz found = 0;
+  u32 n = t ? rd_le32(t + 12) : 0;
+  for (u32 i = 0; i < n; i++) {
+    const u8 *e = t + 16 + 16 * (usz)i;
+    const u8 *nm = t + rd_le32(e);
+    u32 nl = rd_le32(e + 4), k = 0;
+    while (k < nl && name[k] && (u8)name[k] == nm[k]) k++;
+    if (k != nl || name[k]) continue;
+    if (found++ == index) {
+      if (data) *data = t + rd_le32(e + 8);
+      if (size) *size = rd_le32(e + 12);
+    }
+  }
+  if (found <= index) {
+    if (data) *data = 0;
+    if (size) *size = 0;
+  }
+  return found;
+}
+
 static void catch_save(u64 *buf, int *was) {
   *was = g_catching;
   for (u32 i = 0; i < sizeof g_catch_buf / sizeof g_catch_buf[0]; i++)

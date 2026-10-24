@@ -27,7 +27,8 @@ warmc, module, rtlib = sys.argv[1], sys.argv[2], sys.argv[3]
 expected_exports = sys.argv[4:]
 
 out = module + ".pechk"
-r = subprocess.run([warmc, "-O2", "--target=windows", "--rt", rtlib, "-o", out, module],
+r = subprocess.run([warmc, "-O2", "--target=windows", "--rt", rtlib, "-o", out, module,
+                    "--custom-sections=" + __import__("os").environ.get("CUSTOM_SECTIONS", "default")],
                    capture_output=True, text=True,
                    env={"WARMC_LINK_MAP": "1", "PATH": "/usr/bin:/bin"})
 if r.returncode != 0:
@@ -211,6 +212,20 @@ for i in range(nfuncrefs):
     code = u64(funcrefs + i * 24)
     assert text_lo <= code < text_hi, \
         "funcref %d points at %#x, which is not in .text" % (i, code)
+
+# The custom sections: .wcustom, which the descriptor points at, holding what
+# the module carries (test/custom_check.py).
+sys.path.insert(0, __import__("os").path.dirname(__file__))
+import custom_check
+problems = []
+cs = by_name.get(".wcustom")
+if cs:
+    assert not cs[5] & 0x80000000, ".wcustom is writable"
+custom_check.check(problems, read_rva(cs[1], cs[2]) if cs else None,
+                   image_base + cs[1] if cs else 0, u64(md + custom_check.DESC_CUSTOM),
+                   custom_check.module_customs(warmc, module),
+                   __import__("os").environ.get("CUSTOM_SECTIONS", "default"))
+assert not problems, "; ".join(problems)
 
 print("check_pe: %s ok (%d export%s: %s; %d funcref%s; %d DLL%s: %s)"
       % (module, nexport, "" if nexport == 1 else "s", ", ".join(names) or "-",

@@ -797,6 +797,38 @@ def baseline_record(corpus, rows, host, variant, lang, with_native=False,
           % (corpus, len(rows), os.path.relpath(BASELINE, ROOT)))
     return 0
 
+def baseline_record_variant(corpus, names, variants, best, name):
+    """--record-variant NAME: a second warmc flag string's figures beside the
+    recorded ones, as the recorded ratios times its time over the control's
+    in this run -- the two timed interleaved, warmc alone -- so that the
+    two columns differ by what the flags change and not by how either run
+    was timed.  Each kernel gets ratio_NAME, native_ratio_NAME (where it has
+    a native ratio) and over_NAME, the corpus variant_NAME; nothing else in
+    the baseline moves."""
+    data = baseline_load()
+    old = data.get(corpus, {}).get("kernels", {})
+    a, b = variants
+    n = 0
+    for k in names:
+        if k not in old:
+            continue
+        ta = best[a][k] - best[a]["empty"]
+        tb = best[b][k] - best[b]["empty"]
+        f = tb / max(ta, 1e-9)
+        row = old[k]
+        row["over_" + name] = round(f, 4)
+        for key in ("ratio", "native_ratio"):
+            if key in row:
+                row["%s_%s" % (key, name)] = round(row[key] * f, 4)
+        n += 1
+    data[corpus]["variant_" + name] = "%s, over %s" % (b, a)
+    with open(BASELINE, "w") as fh:
+        json.dump(data, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+    print("%s: recorded %s for %d kernel(s) into %s"
+          % (corpus, name, n, os.path.relpath(BASELINE, ROOT)))
+    return 0
+
 def baseline_compare(corpus, rows, host, variant, threshold):
     """This run against the recorded one, kernel by kernel.
 
@@ -933,6 +965,12 @@ usage: python3 test/gobench.py [options]
                      when warmc does, and re-running them is most of a record.
                      With --record, the ratios are the new warmc time over the
                      recorded ones.
+  --record-variant NAME
+                     with two --variants, the control first, and
+                     --reuse-baseline: time the two interleaved, warmc alone,
+                     and record beside each kernel's figures the second's
+                     ratios -- the recorded ones times its time over the
+                     control's -- as ratio_NAME and native_ratio_NAME.
   --compare          time as usual and report every kernel whose ratio has moved
                      more than --threshold, exiting non-zero if any got worse.
   --threshold P      the move --compare reports, in percent (default %.0f).
@@ -998,6 +1036,11 @@ def main():
         i = args.index("--rounds")
         rounds = int(args[i + 1])
         del args[i:i + 2]
+    record_variant = None
+    if "--record-variant" in args:
+        i = args.index("--record-variant")
+        record_variant = args[i + 1]
+        del args[i:i + 2]
 
     only = []
     while "--only" in args:
@@ -1011,6 +1054,10 @@ def main():
         del args[i:i + 2]
     if not variants:
         variants = ["-O2"]
+    if record_variant and (len(variants) != 2 or not reuse):
+        print("--record-variant times two --variants, the control first, with "
+              "--reuse-baseline", file=sys.stderr)
+        return 1
 
     if not os.path.exists(WARMC):
         print("%s: %s not built" % (CORPUS, WARMC), file=sys.stderr)
@@ -1156,6 +1203,9 @@ def main():
     if want_rss:
         print()
         rss_report(names, cols, rss)
+
+    if record_variant:
+        return baseline_record_variant(CORPUS, names, variants, best, record_variant)
 
     if record or compare:
         host = subprocess.run(". test/hostenv.sh; echo $WARMC_HOST", shell=True,

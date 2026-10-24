@@ -57,8 +57,11 @@ void write_macho64(ObjBuilder *o, const char *path) {
   uint64_t text_addr = 0;
   uint64_t const_addr = align_up(text_addr + o->text.len, 16);
   uint64_t data_addr = align_up(const_addr + o->rodata.len, 16);
-  uint64_t vmsize = align_up(data_addr + o->data.len, 16);
-  const uint64_t sec_addr[3] = { text_addr, const_addr, data_addr };
+  /* the custom sections, when there are any, as a fourth section */
+  int ns = o->custom.len ? 4 : 3;
+  uint64_t custom_addr = align_up(data_addr + o->data.len, 16);
+  uint64_t vmsize = align_up(ns == 4 ? custom_addr + o->custom.len : data_addr + o->data.len, 16);
+  const uint64_t sec_addr[4] = { text_addr, const_addr, data_addr, custom_addr };
 
   for (uint32_t i = 0; i < o->nrelocs; i++) {
     Reloc *r = &o->relocs[i];
@@ -69,8 +72,8 @@ void write_macho64(ObjBuilder *o, const char *path) {
     for (int b = 0; b < 8; b++) sec->data[r->offset + b] = (uint8_t)(v >> (8 * b));
   }
 
-  Buf reloc[3];
-  for (int i = 0; i < 3; i++) memset(&reloc[i], 0, sizeof reloc[i]);
+  Buf reloc[4];
+  for (int i = 0; i < 4; i++) memset(&reloc[i], 0, sizeof reloc[i]);
   for (uint32_t i = 0; i < o->nrelocs; i++) {
     Reloc *r = &o->relocs[i];
     uint32_t type, pcrel, length;
@@ -112,16 +115,18 @@ void write_macho64(ObjBuilder *o, const char *path) {
   while (strtab.len % 8) buf_u8(&strtab, 0);
 
   uint32_t ncmds = 4;
-  uint32_t sizeofcmds = (72 + 80 * 3) + 24 + 24 + 80;
+  uint32_t sizeofcmds = (72 + 80 * (uint32_t)ns) + 24 + 24 + 80;
   uint64_t hdr_end = 32 + sizeofcmds;
 
   uint64_t off_text = align_up(hdr_end, 16);
   uint64_t off_const = align_up(off_text + o->text.len, 16);
   uint64_t off_data = align_up(off_const + o->rodata.len, 16);
-  uint64_t sec_off[3] = { off_text, off_const, off_data };
-  uint64_t cur = align_up(off_data + o->data.len, 8);
-  uint64_t rel_off[3];
-  for (int i = 0; i < 3; i++) { rel_off[i] = cur; cur += reloc[i].len; }
+  uint64_t off_custom = align_up(off_data + o->data.len, 16);
+  uint64_t sec_off[4] = { off_text, off_const, off_data, off_custom };
+  uint64_t sec_end = ns == 4 ? off_custom + o->custom.len : off_data + o->data.len;
+  uint64_t cur = align_up(sec_end, 8);
+  uint64_t rel_off[4];
+  for (int i = 0; i < 4; i++) { rel_off[i] = cur; cur += reloc[i].len; }
   uint64_t symoff = align_up(cur, 8);
   uint64_t stroff = symoff + symtab.len;
   uint64_t total = stroff + strtab.len;
@@ -138,25 +143,26 @@ void write_macho64(ObjBuilder *o, const char *path) {
   buf_u32(&out, 0);
 
   buf_u32(&out, LC_SEGMENT_64);
-  buf_u32(&out, 72 + 80 * 3);
+  buf_u32(&out, 72 + 80 * (uint32_t)ns);
   buf_zero(&out, 16);
   buf_u64(&out, 0);
   buf_u64(&out, vmsize);
   buf_u64(&out, off_text);
-  buf_u64(&out, align_up(off_data + o->data.len, 16) - off_text);
+  buf_u64(&out, align_up(sec_end, 16) - off_text);
   buf_u32(&out, 7);
   buf_u32(&out, 7);
-  buf_u32(&out, 3);
+  buf_u32(&out, (uint32_t)ns);
   buf_u32(&out, 0);
 
   struct { const char *sect, *seg; const Buf *data; uint64_t addr, off;
-           uint32_t align, flags; const Buf *rel; uint64_t reloff; } S[3] = {
+           uint32_t align, flags; const Buf *rel; uint64_t reloff; } S[4] = {
     { "__text",  "__TEXT", &o->text,   text_addr,  off_text,
       6, S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS, &reloc[0], rel_off[0] },
     { "__const", "__TEXT", &o->rodata, const_addr, off_const, 4, 0, &reloc[1], rel_off[1] },
     { "__data",  "__DATA", &o->data,   data_addr,  off_data,  4, 0, &reloc[2], rel_off[2] },
+    { "__wasm_custom", "__TEXT", &o->custom, custom_addr, off_custom, 3, 0, &reloc[3], rel_off[3] },
   };
-  for (int i = 0; i < 3; i++) {
+  for (int i = 0; i < ns; i++) {
     char nm[16] = { 0 }, sg[16] = { 0 };
     memcpy(nm, S[i].sect, strlen(S[i].sect));
     memcpy(sg, S[i].seg, strlen(S[i].seg));
@@ -195,11 +201,11 @@ void write_macho64(ObjBuilder *o, const char *path) {
   buf_u32(&out, nlocal + nextdef); buf_u32(&out, nundef);
   for (int i = 0; i < 12; i++) buf_u32(&out, 0);
 
-  for (int i = 0; i < 3; i++) {
+  for (int i = 0; i < ns; i++) {
     while (out.len < sec_off[i]) buf_u8(&out, 0);
     buf_bytes(&out, S[i].data->data, S[i].data->len);
   }
-  for (int i = 0; i < 3; i++) {
+  for (int i = 0; i < ns; i++) {
     while (out.len < rel_off[i]) buf_u8(&out, 0);
     buf_bytes(&out, reloc[i].data, reloc[i].len);
   }
@@ -216,6 +222,6 @@ void write_macho64(ObjBuilder *o, const char *path) {
   if (fclose(f)) warmc_fatal("cannot write %s", path);
 
   buf_free(&out); buf_free(&symtab); buf_free(&strtab);
-  for (int i = 0; i < 3; i++) buf_free(&reloc[i]);
+  for (int i = 0; i < 4; i++) buf_free(&reloc[i]);
   xfree(order); xfree(newidx);
 }

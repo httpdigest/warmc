@@ -24,7 +24,7 @@ one() {
     echo "FAIL[macho] $name: $(head -3 "$WORK/$name.err")" >"$WORK/$name.fail"
     return 1
   fi
-  if ! python3 test/check_macho.py "$outbin" >"$WORK/$name.chk" 2>&1; then
+  if ! python3 test/check_macho.py --wasm="$wasm" "$outbin" >"$WORK/$name.chk" 2>&1; then
     cp "$WORK/$name.chk" "$WORK/$name.fail"
     return 1
   fi

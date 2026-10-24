@@ -370,6 +370,10 @@ typedef struct {
   void (*report)(WarmInstance *inst);
 
   const u8 *gcroots;
+
+  /* the module's custom sections, as module_data.c's emit_custom_table
+     lays them out; NULL when it carries none */
+  const u8 *custom;
 } ModuleDesc;
 
 #define WARMC_ASSERT_OFF(type, field, n) \
@@ -381,6 +385,7 @@ WARMC_ASSERT_OFF(ModuleDesc, exports, 88);
 WARMC_ASSERT_OFF(ModuleDesc, nfuncrefs, 108);
 WARMC_ASSERT_OFF(ModuleDesc, funcrefs, 112);
 WARMC_ASSERT_OFF(ModuleDesc, nimported_funcs, 124);
+WARMC_ASSERT_OFF(ModuleDesc, custom, 240);
 WARMC_ASSERT_OFF(ExportDesc, name, 0);
 WARMC_ASSERT_OFF(ExportDesc, name_len, 8);
 WARMC_ASSERT_OFF(ExportDesc, kind, 12);
@@ -514,6 +519,11 @@ WarmInstance *warmc_instantiate_catching(const ModuleDesc *md, u32 *err);
 u32 warmc_invoke_catching(void *fn, WarmInstance *vm, const u64 *iargs,
                           const u64 *fargs, u64 *retbuf);
 const char *warmc_trap_name(u32 code);
+/* A module's custom sections named name: how many it carries, and the
+   index-th one's payload into *data and *size -- NULL and 0 when there is
+   no index-th. */
+usz warmc_custom_section(const ModuleDesc *md, const char *name, usz index,
+                         const u8 **data, usz *size);
 long warmc_rt_write(int fd, const void *buf, usz n);
 long warmc_rt_read(int fd, void *buf, usz n);
 

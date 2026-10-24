@@ -218,7 +218,12 @@ void layout_windows(Linker *L) {
   at = place(L, K_RODATA, at);
   L->rodata_size = at - L->rodata_addr;
 
+  /* the custom sections, when there are any: .wcustom, a section of its own */
   at = pe_align(at, PE_SECT_ALIGN);
+  L->custom_addr = at;
+  at = place(L, K_CUSTOM, at);
+  L->custom_size = at - L->custom_addr;
+  if (L->custom_size) at = pe_align(at, PE_SECT_ALIGN);
   L->data_addr = at;
   at = place(L, K_DATA, at);
   L->data_size = at - L->data_addr;
@@ -310,12 +315,14 @@ void write_pe_exec(Linker *L, const char *path, uint64_t entry) {
   uint64_t text_raw = pe_align(L->text_size, PE_FILE_ALIGN);
   uint64_t rdata_raw = pe_align(L->rodata_size, PE_FILE_ALIGN);
   uint64_t data_raw = pe_align(L->data_size, PE_FILE_ALIGN);
-  uint32_t nsec = L->shared ? 5 : 3;
+  uint64_t custom_raw = pe_align(L->custom_size, PE_FILE_ALIGN);
+  uint32_t nsec = (L->shared ? 5 : 3) + (L->custom_size ? 1 : 0);
   uint64_t hdr_end = 0x40 + 4 + 20 + 0xf0 + nsec * 40;
   uint64_t hdr_raw = pe_align(hdr_end, PE_FILE_ALIGN);
   uint64_t text_foff = hdr_raw;
   uint64_t rdata_foff = text_foff + text_raw;
-  uint64_t data_foff = rdata_foff + rdata_raw;
+  uint64_t custom_foff = rdata_foff + rdata_raw;
+  uint64_t data_foff = custom_foff + custom_raw;
   uint64_t image_size = pe_align(data_rva + data_vsz, PE_SECT_ALIGN);
 
   Buf edata, reloc;
@@ -400,6 +407,9 @@ void write_pe_exec(Linker *L, const char *path, uint64_t entry) {
 
   pe_sechdr(&out, ".text", L->text_size, text_rva, text_raw, text_foff, 0x60000020u);
   pe_sechdr(&out, ".rdata", L->rodata_size, rdata_rva, rdata_raw, rdata_foff, 0x40000040u);
+  if (L->custom_size)
+    pe_sechdr(&out, ".wcustom", L->custom_size, L->custom_addr - base, custom_raw,
+              custom_foff, 0x40000040u);
   pe_sechdr(&out, ".data", data_vsz, data_rva, data_raw, data_foff, 0xc0000040u);
   if (L->shared) {
     pe_sechdr(&out, ".edata", edata.len, edata_rva, edata_raw, edata_foff, 0x40000040u);
@@ -417,6 +427,8 @@ void write_pe_exec(Linker *L, const char *path, uint64_t entry) {
   while (out.len < rdata_foff) buf_u8(&out, 0);
   buf_bytes(&out, L->pe_imp.data, L->pe_imp.len);
   emit_secs(&out, L, K_RODATA, L->rodata_addr, rdata_foff);
+  while (out.len < custom_foff) buf_u8(&out, 0);
+  emit_secs(&out, L, K_CUSTOM, L->custom_addr, custom_foff);
   while (out.len < data_foff) buf_u8(&out, 0);
   emit_secs(&out, L, K_DATA, L->data_addr, data_foff);
   while (out.len < data_foff + data_raw) buf_u8(&out, 0);

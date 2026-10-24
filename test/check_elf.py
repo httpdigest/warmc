@@ -29,7 +29,8 @@ warmc, module, rtlib = sys.argv[1], sys.argv[2], sys.argv[3]
 expected_exports = sys.argv[4:]
 
 out = module + ".elfchk"
-r = subprocess.run([warmc, "-O2", "--rt", rtlib, "-o", out, module],
+r = subprocess.run([warmc, "-O2", "--rt", rtlib, "-o", out, module,
+                    "--custom-sections=" + __import__("os").environ.get("CUSTOM_SECTIONS", "default")],
                    capture_output=True, text=True,
                    env={"WARMC_LINK_MAP": "1", "PATH": "/usr/bin:/bin"})
 if r.returncode != 0:
@@ -135,6 +136,21 @@ for i in range(1, symsize // 24):
 assert "warmc_trap" in funcs, "the runtime's functions have no names"
 if nfuncrefs or nexport:
     assert any(n.startswith("wasm_func_") for n in funcs), "the module's functions have no names"
+
+# The custom sections: .wasm.custom, which the descriptor points at, holding
+# what the module carries (test/custom_check.py).
+sys.path.insert(0, __import__("os").path.dirname(__file__))
+import custom_check
+shstrndx, = struct.unpack_from("<H", buf, 0x3e)
+shstr = shs[shstrndx][4]
+custom = [s for s in shs if buf[shstr + s[0]:buf.index(b"\0", shstr + s[0])] == b".wasm.custom"]
+assert len(custom) <= 1, "%d .wasm.custom sections" % len(custom)
+problems = []
+custom_check.check(problems, read(custom[0][3], custom[0][5]) if custom else None,
+                   custom[0][3] if custom else 0, u64(md + custom_check.DESC_CUSTOM),
+                   custom_check.module_customs(warmc, module),
+                   __import__("os").environ.get("CUSTOM_SECTIONS", "default"))
+assert not problems, "; ".join(problems)
 
 print("check_elf: %s ok (%d export%s: %s; %d funcref%s)"
       % (module, nexport, "" if nexport == 1 else "s", ", ".join(names) or "-",
