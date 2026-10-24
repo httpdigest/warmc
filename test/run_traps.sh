@@ -8,7 +8,7 @@ export PATH="$PATH:$HOME/.npm-global/bin"
 WORK="$BUILD/testrun"
 mkdir -p "$WORK"
 
-for t in traps ictraps; do
+for t in traps ictraps tramptraps; do
   if [ ! -s "$WORK/$t.wasm" ] || [ test/cases_traps/$t.wat -nt "$WORK/$t.wasm" ]; then
     wat2wasm $WABT_FLAGS test/cases_traps/$t.wat -o "$WORK/$t.wasm.$$" || exit 1
     mv -f "$WORK/$t.wasm.$$" "$WORK/$t.wasm"
@@ -219,6 +219,18 @@ expect ict_z_type            "indirect call type mismatch"
 expect ict_z_null            "uninitialized element"
 expect ict_z_oob             "undefined element"
 expect ict_loop_type         "indirect call type mismatch"
+
+# a trampoline in GHC's shape, which tramp.c turns into tail calls: each call
+# its loop would have made traps as it did, and so does one through the
+# type its functions now have the shape of
+BIN="$WORK/tramptraps$FTAG"
+wtimeout ./$BUILD/warmc ${WARMC_FLAGS:-} $WARMC_TARGET_FLAGS -o "$BIN" "$WORK/tramptraps.wasm" || exit 1
+expect tramp_ok              "OK"
+expect tramp_x_type          "indirect call type mismatch"
+expect tramp_x_null          "uninitialized element"
+expect tramp_x_oob           "undefined element"
+expect tramp_x_far           "undefined element"
+expect tramp_c_on_stg        "indirect call type mismatch"
 
 echo "traps: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

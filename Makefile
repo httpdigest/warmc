@@ -55,7 +55,7 @@ WARMC_SRC := src/main.c src/util.c src/a64.c src/x64.c src/parse.c src/opcodes.c
              src/validate.c src/component.c src/wit.c src/wat.c \
              src/module_data.c src/elf.c src/macho.c src/coff.c src/pe.c src/ir.c src/ir_build.c \
              src/opt.c src/isel.c src/isel_x64.c src/codegen.c src/inline.c src/compile.c src/link.c src/canon.c src/witgen.c \
-             src/clink.c src/shlib.c
+             src/clink.c src/shlib.c src/tramp.c
 RT_OBJS   := $(BUILD)/rt/rt.o $(BUILD)/rt/start.o $(BUILD)/rt/hook.o \
              $(BUILD)/rt/gcthook.o \
              $(BUILD)/rt/modules.o $(BUILD)/rt/component.o $(BUILD)/rt/lib.o

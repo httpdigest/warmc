@@ -74,8 +74,8 @@ Hello world!
   Functions compile in parallel and are laid out in a deterministic order.
 - **Fast code.** Across 335 benchmark kernels compiled from Go, TinyGo, Rust,
   Zig, AssemblyScript, Kotlin, C, C++ and Haskell, warmc's steady-state code
-  takes 0.45× wasmtime's time (geometric mean), with much lower peak memory.
-  Against the same programs compiled natively at `-O2` it takes 1.03× the
+  takes 0.46× wasmtime's time (geometric mean), with much lower peak memory.
+  Against the same programs compiled natively at `-O2` it takes 1.04× the
   time. See [Performance](#performance).
 - **Runtime for modern languages:**
   - a concurrent, compacting, ZGC-style collector with coloured pointers,
@@ -714,6 +714,7 @@ command-line order, so put them **after** `-O`.
 | `escape` | remove GC objects that never escape and forward their fields |
 | `partial-escape` | allocate a GC object that escapes on some paths only where it escapes |
 | `devirt`, `closed-world` | turn `call_ref` and `call_indirect` into direct calls, also through vtables in immutable globals; with a closed world, use vtable slots too |
+| `trampoline` | a module whose functions each return the table index of the next to run, to one loop that calls through the table until one returns 0, as GHC's code returns to its runtime's `StgRun`, has them tail-call the next themselves, directly when the index is a constant, with the three globals they alone use most passed as arguments and written back when the loop ends; made only where nothing else can tell: the loop's is the module's one call of that type, nothing calls or takes a reference to those functions any other way, and a call through another type that reached one still traps |
 | `ictab` | a `call_indirect` through a table nothing writes loads its target from a code table per type, whose slots that fail the call's checks hold trap stubs, so the call needs no signature, null or instance check |
 | `reinline` | after the cleanup passes, inline again what devirtualisation made direct and the calls an allocation leaves by |
 | `throw-jump` | a `throw` caught in its own function, without the exnref, becomes a jump to the catch |
@@ -834,7 +835,7 @@ These decode, assemble and validate core modules, components and WIT. The text
 assembler handles both flat and folded syntax, names in every index space,
 inline imports, exports and segments, and GC type definitions.
 
-**Middle end** (`src/ir*.c`, `opt.c`, `inline.c`). Functions become SSA with
+**Middle end** (`src/ir*.c`, `opt.c`, `inline.c`, `tramp.c`). Functions become SSA with
 block parameters instead of phi nodes. SSA is built directly from wasm locals,
 and exception edges lead to landing-pad blocks. The optimiser runs the pass
 pipeline described above, using module-wide effect summaries, reachability and
@@ -894,11 +895,10 @@ Apple silicon machine: wasmtime 50.0.0 running the same wasm, and the same
 source compiled natively. warmc runs at `-O2`. Each figure is the geometric
 mean of warmc's time divided by the reference's, so below 1 means warmc is
 faster. Each program's empty-program time is subtracted first, so the ratios
-compare steady-state code rather than start-up or compile time. The
-wasmtime and native times are timed interleaved with warmc's, round by
-round (`make bench-record`); warmc's column is re-timed on its own against
-them on the same machine (`make bench-record-warmc`), each kernel's figure
-the best of two runs of seven rounds.
+compare steady-state code rather than start-up or compile time. All three
+are timed interleaved, round by round, each kernel's figure the best of five
+rounds (`make bench-record`); `make bench-record-warmc` re-times warmc's
+column alone against the recorded wasmtime and native times.
 
 The wasm comes from each language's usual producer: TinyGo 0.43 at
 `-opt=2`, Go 1.27.3, rustc nightly 1.101 at `opt-level=3` with LTO, Zig 0.17
@@ -912,38 +912,40 @@ AssemblyScript and Kotlin/Wasm have no native compiler to compare with.
 
 | Corpus | Source language | Kernels | warmc / wasmtime | Range | warmc / native | Range | Median peak RSS, MiB (warmc / wasmtime / native) |
 |---|---|---:|---:|---|---:|---|---|
-| `gobench` | TinyGo | 39 | 0.57 | 0.06 – 1.04 | 0.84 | 0.13 – 2.97 | 2.0 / 8.9 / 1.9 |
-| `stdgo` | Go | 49 | 0.56 | 0.03 – 1.07 | 1.52 | 0.08 – 8.78 | 7.4 / 27.4 / 4.7 |
-| `vecbench` | TinyGo (vectorisable loops) | 43 | 0.17 | 0.03 – 0.96 | 0.68 | 0.10 – 1.18 | 2.0 / 8.9 / 1.9 |
-| `asbench` | AssemblyScript | 37 | 0.57 | 0.16 – 0.97 | – | – | 1.9 / 8.7 / – |
-| `rsbench` | Rust | 39 | 0.61 | 0.12 – 0.95 | 1.01 | 0.60 – 2.63 | 2.0 / 9.1 / 1.9 |
-| `zigbench` | Zig | 22 | 0.70 | 0.17 – 1.00 | 0.94 | 0.21 – 1.71 | 2.0 / 8.9 / 1.9 |
-| `ktbench` | Kotlin (Wasm GC) | 25 | 0.10 | 0.003 – 0.68 | – | – | 3.5 / 22.7 / – |
-| `cbench` | C | 27 | 0.73 | 0.27 – 0.98 | 1.01 | 0.008 – 4.44 | 2.0 / 9.0 / 1.8 |
-| `cppbench` | C++ | 26 | 0.66 | 0.21 – 1.03 | 0.86 | 0.02 – 1.50 | 2.4 / 9.5 / 2.1 |
-| `hsbench` | Haskell | 28 | 0.59 | 0.35 – 0.87 | 1.77 | 0.58 – 6.06 | 10.0 / 32.4 / 12.8 |
+| `gobench` | TinyGo | 39 | 0.59 | 0.06 – 1.01 | 0.88 | 0.13 – 3.09 | 2.0 / 8.9 / 1.9 |
+| `stdgo` | Go | 49 | 0.58 | 0.03 – 1.06 | 1.59 | 0.08 – 9.48 | 7.4 / 27.4 / 4.7 |
+| `vecbench` | TinyGo (vectorisable loops) | 43 | 0.18 | 0.03 – 0.96 | 0.72 | 0.11 – 1.19 | 2.0 / 8.9 / 1.9 |
+| `asbench` | AssemblyScript | 37 | 0.59 | 0.16 – 0.98 | – | – | 1.9 / 8.7 / – |
+| `rsbench` | Rust | 39 | 0.63 | 0.13 – 1.00 | 1.04 | 0.63 – 2.64 | 2.0 / 9.1 / 1.9 |
+| `zigbench` | Zig | 22 | 0.72 | 0.17 – 1.00 | 0.97 | 0.21 – 1.77 | 2.0 / 8.8 / 1.9 |
+| `ktbench` | Kotlin (Wasm GC) | 25 | 0.10 | 0.004 – 0.72 | – | – | 3.5 / 21.0 / – |
+| `cbench` | C | 27 | 0.75 | 0.26 – 1.01 | 1.03 | 0.008 – 4.29 | 2.0 / 9.0 / 1.8 |
+| `cppbench` | C++ | 26 | 0.69 | 0.22 – 1.04 | 0.90 | 0.03 – 1.58 | 2.4 / 9.5 / 2.1 |
+| `hsbench` | Haskell | 28 | 0.44 | 0.20 – 0.97 | 1.32 | 0.61 – 6.42 | 10.1 / 32.4 / 12.8 |
 
 ### Against wasmtime
 
-Over all 335 kernels, warmc's code takes **0.45×** wasmtime's time, and
-0.44× without `stdgo`. Three kernels are slower than wasmtime:
+Over all 335 kernels, warmc's code takes **0.46×** wasmtime's time, and
+0.44× without `stdgo`. Six kernels are slower than wasmtime. Four of them
+are within 1.5%, inside the spread between runs: `gobench/strswitch` (1.01),
+`cbench/malloc` (1.01), `cppbench/bitset` (1.004) and `zigbench/optional`
+(1.001). The other two:
 
 | Kernel | warmc / wasmtime | What is known |
 |---|---:|---|
-| `stdgo/memcpy` | 1.07 | the platform's memmove under both engines, whose ratio spreads by more than 10% between runs |
-| `gobench/strswitch` | 1.04 | code placement: the same instructions laid out with no loop header aligned run 5% faster, below wasmtime |
-| `cppbench/algorithms` | 1.03 | code placement, as for `strswitch`: 3% faster with no loop header aligned |
+| `stdgo/memcpy` | 1.06 | the platform's memmove under both engines, whose ratio spreads by more than 10% between runs |
+| `cppbench/algorithms` | 1.04 | code placement: the same instructions laid out with no loop header aligned run 6% faster, below wasmtime |
 
 TinyGo's `-opt=2` unrolls loops that its size-first default leaves alone,
 which hides them from some of warmc's loop passes. LLVM's unrolled byte search
-is vectorised as the rolled one is (`vecbench/search`, 0.29×), and a
+is vectorised as the rolled one is (`vecbench/search`, 0.40×), and a
 callee whose loop LLVM unrolled into several calls through a closure is
 inlined where the closure is a constant, so the calls inline too
 (`gobench/closures`, 0.15×). A loop LLVM unrolled by three, whose stride
 neither divides a vector nor is a whole number of them, is unrolled again
 until it spans three vectors and vectorised: `vecbench/neighbour` runs at
-0.20×, and `cbench/matmul`, whose inner loop is the same shape in `f64`, at
-0.41×.
+0.21×, and `cbench/matmul`, whose inner loop is the same shape in `f64`, at
+0.42×.
 
 `stdgo` is Go built by Go's own compiler, which is not LLVM. It compiles
 every function to a loop around a `br_table` over the function's resume
@@ -959,10 +961,10 @@ at 0.04×.
 
 ### Against native code
 
-Over the 272 kernels with a native build, warmc's code takes **1.03×** the
-native time (median 1.04), and 0.97× without Haskell. wasmtime's code takes
-2.05× the native time on the same kernels. 118 kernels run faster under warmc
-than natively, and another 39 are within 10% of the native build.
+Over the 271 kernels with a native build, warmc's code takes **1.04×** the
+native time (median 1.06), and 1.01× without Haskell. wasmtime's code takes
+2.04× the native time on the same kernels. 104 kernels run faster under warmc
+than natively, and another 45 are within 10% of the native build.
 
 The native builds start ahead of the wasm in a few ways that have nothing to
 do with warmc's compiler:
@@ -971,24 +973,27 @@ do with warmc's compiler:
   what warmc's own vectoriser makes of scalar loops. It takes saturating
   arithmetic, high-half multiplies, byte reversals and int/float conversions,
   and runs several copies of a loop's body per iteration with an accumulator
-  each: `satadd`, `mulhi16` and `bswap` run at 0.59×, 0.67× and 0.85×
-  native, and `vecbench/neighbour`, a loop LLVM unrolled by three, at 0.88×.
+  each: `satadd`, `mulhi16` and `bswap` run at 0.66×, 0.75× and 0.92×
+  native, and `vecbench/neighbour`, a loop LLVM unrolled by three, at 0.98×.
   `vecbench/rgbgrey` reads pixels three bytes apart, loads them with one
-  `ld3` and computes in 16-bit lanes as the native build does, at 0.92×.
+  `ld3` and computes in 16-bit lanes as the native build does, at 1.00×.
 - **Hand-written assembly.** `stdgo/sha256` is 9× because native Go computes
   SHA-256 with the ARMv8 SHA-256 instructions, where the wasm build runs the
   portable Go code.
 - **The producer's wasm back end.** Go's wasm port keeps nearly everything
   64-bit and dispatches through resume points (see above). GHC's wasm backend
-  returns every function to a trampoline in the runtime, where its native code
-  generator jumps directly; that is most of `hsbench`'s 1.77×.
+  returns every function to a trampoline in the runtime and keeps its virtual
+  registers in globals, where its native code generator jumps directly with
+  them in machine registers. warmc turns those returns into tail calls and
+  passes the three registers the functions use most as arguments
+  (`trampoline`), which takes 29% off `hsbench`'s cycles.
 
 The native build is slower where the platform's own mechanism costs more
 than wasm's:
 - `cbench/setjmp` runs at 0.01× native: macOS's `setjmp` and `longjmp` save
   and restore the signal mask, a system call each, and warmc lowers them onto
   wasm exceptions.
-- `cppbench/exceptions` runs at 0.02×: a native C++ throw goes through the
+- `cppbench/exceptions` runs at 0.03×: a native C++ throw goes through the
   platform's two-phase unwinder, and warmc unwinds through its own compact
   tables.
 - `stdgo/atomics` runs at 0.08×: native Go's atomics are real atomic
@@ -1000,12 +1005,12 @@ Go's `int`, Rust's `usize`, C's `long` and Haskell's `Int` are 32 bits on
 wasm32 and 64 natively. Native floating-point code is also not always rounded
 as wasm's is: clang fuses multiply-adds natively, for one, which warmc does
 only when asked to with `-ffma`. Without those 45
-kernels the geometric mean is 1.05×. The Haskell natives are built with
+kernels the geometric mean is 1.06×. The Haskell natives are built with
 `-with-rtsopts=-V0`: without it the runtime's exit waits out its 10 ms ticker,
 which made the empty program's time mostly that wait and credited every
-kernel with time it never spent. One native time is too short to time
-reliably, under 5 ms: `vecbench/rowsum`, which is left out of the native
-figures.
+kernel with time it never spent. Two native times are too short to time
+reliably, under 5 ms: `vecbench/rowsum` and `hsbench/fib`, which are left
+out of the native figures.
 
 Re-run the comparison on your own machine before relying on these numbers:
 
@@ -1085,6 +1090,7 @@ src/            the compiler
   parse.c validate.c wat.c opcodes.c      front end
   component.c canon.c clink.c wit.c witgen.c   Component Model and WIT
   ir.c ir_build.c opt.c inline.c          SSA IR and optimiser
+  tramp.c                                 a GHC-style trampoline rewritten as tail calls
   isel*.c isel_*.inc regalloc.inc         instruction selection and register allocation
   a64.c x64.c                             machine-code encoders
   codegen.c compile.c module_data.c       per-function emission, parallel driver, module descriptor

@@ -344,6 +344,10 @@ typedef struct {
      (arguments above the callee's stack pointer, frames re-entered after
      the wasm stack unwinds) */
   bool go_stack;
+  /* bodies a module transform wrote (tramp.c), which funcs[] point into in
+     place of the binary */
+  uint8_t **owned_bodies;
+  uint32_t nowned_bodies;
 
   bool *reached;
 
@@ -395,6 +399,10 @@ Module *wasm_parse(const uint8_t *bin, size_t len);
 void wasm_check_utf8(const uint8_t *p, uint32_t n);
 void wasm_validate(Module *m);
 void module_free(Module *m);
+uint32_t module_add_func_type(Module *m, const ValType *params, uint32_t nparams,
+                              const ValType *results, uint32_t nresults, bool final_);
+void wasm_validate_funcs(Module *m, const uint32_t *fns, uint32_t n);
+uint32_t module_untrampoline(Module *m);
 
 bool vt_subtype(const Module *m, ValType a, ValType b);
 
