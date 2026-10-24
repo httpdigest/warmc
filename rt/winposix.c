@@ -895,6 +895,9 @@ long readlinkat(int dirfd, const char *name, char *buf, usz cap) {
   } else {
     return fail(E_INVAL);
   }
+  /* the name the buffer says it holds must lie in what came back of it */
+  usz base = (usz)((const u8 *)path - raw);
+  if (base > got || (usz)off + len > got - base) return fail(E_INVAL);
   const u16 *s = path + off / 2;
   usz n = len / 2;
   /* A substitute name carries the \??\ device prefix; the guest wants the

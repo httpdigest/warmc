@@ -361,7 +361,7 @@ void write_pe_exec(Linker *L, const char *path, uint64_t entry) {
   buf_u16(&out, 0x20b);    /* PE32+ */
   buf_u8(&out, 14); buf_u8(&out, 0);
   buf_u32(&out, (uint32_t)text_raw);
-  buf_u32(&out, (uint32_t)(rdata_raw + data_raw + edata_raw + reloc_raw));
+  buf_u32(&out, (uint32_t)(rdata_raw + custom_raw + data_raw + edata_raw + reloc_raw));
   buf_u32(&out, (uint32_t)pe_align(L->bss_size, PE_FILE_ALIGN));
   buf_u32(&out, L->shared ? 0u : (uint32_t)(entry - base));
   buf_u32(&out, (uint32_t)text_rva);

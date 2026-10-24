@@ -1,0 +1,14 @@
+module 0: cm0, 2 funcs, 0 imports, 3 exports
+module 1: cm1, 1 funcs, 0 imports, 2 exports
+module 2: cm2, 2 funcs, 1 imports, 1 exports
+instance 0: module 0, 0 imports
+instance 1: module 1, 0 imports
+instance 2: module 2, 1 imports
+  bind "" "len" <- canon 1 [func]
+canon 0: lift instance 0 "mem" [func], core () -> (), memory=no
+canon 1: lower func 0, core (i32 i32) -> (i32), memory=yes
+canon 2: lift instance 2 "run" [func], core () -> (i32), memory=no
+func 0: canon 2
+export "run": func 0
+blocked: a canonical definition names a 64-bit memory, and the canonical ABI here is 32-bit
+blocked: a lowered function the component imports has nothing to lift

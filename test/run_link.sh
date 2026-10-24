@@ -105,6 +105,77 @@ for lv in -O0 -O1 -O2; do
 done
 [ "$fail" = 0 ] && echo "link: a trap seen from an embedder, 3 optimisation levels"
 
+# A trampoline tramp.c rewrites beside a global imported from another
+# module, which must stay out of the registers it passes: the other module
+# reads it while a trampolined function is inside a call to it.
+trampwant='peek_saw=5
+register=1
+global_after=5'
+for m in a b; do
+  wat2wasm $WABT_FLAGS "test/link/tramp_$m.wat" -o "$WORK/tr$m.wasm" || exit 1
+  wtimeout ./$BUILD/warmc ${WARMC_FLAGS:--O2} $WARMC_TARGET_FLAGS --symbol-prefix=tr$m --stats \
+      -c -o "$WORK/tr$m.o" "$WORK/tr$m.wasm" 2>"$WORK/tr$m.err" \
+    || { echo "FAIL[link]: compiling tramp_$m.wat"; exit 1; }
+done
+case "${WARMC_FLAGS:--O2}" in
+  *-O0*|*-fno-trampoline*) ;;
+  *) grep -q '\btramp_funcs=2\b' "$WORK/trb.err" ||
+       { echo "FAIL[link/tramp]: tramp.c did not rewrite tramp_b.wat's two functions"; fail=1; } ;;
+esac
+link_prog trampprog test/link/trampdriver.c "$WORK/tra.o" "$WORK/trb.o" || exit 1
+got=$(wruntimeout $WARMC_RUN "$LINKED" 2>&1)
+if [ "$got" = "$trampwant" ]; then
+  echo "link: a trampoline beside an imported global"
+else
+  echo "FAIL[link/tramp]: output differs"
+  diff <(echo "$trampwant") <(echo "$got") | head -10
+  fail=1
+fi
+
+# A module in Go's shape whose Go function hands an import a reference to a
+# function that reads the stack pointer gosp.c passes, and the import calls
+# it: the function sees the Go function's frame.
+gospwant='peek_saw=8160'
+WTG="$BUILD/tools/bin/wasm-tools"
+if [ -x "$WTG" ]; then
+  for m in a b; do
+    "$WTG" parse "test/link/gosp_$m.wat" -o "$WORK/gs$m.wasm" || exit 1
+    wtimeout ./$BUILD/warmc ${WARMC_FLAGS:--O2} $WARMC_TARGET_FLAGS --symbol-prefix=gs$m --stats \
+        -c -o "$WORK/gs$m.o" "$WORK/gs$m.wasm" 2>"$WORK/gs$m.err" \
+      || { echo "FAIL[link]: compiling gosp_$m.wat"; exit 1; }
+  done
+  case "${WARMC_FLAGS:--O2}" in
+    *-O0*|*-fno-go-sp*) ;;
+    *) grep -q '\bgosp_funcs=1\b' "$WORK/gsb.err" ||
+         { echo "FAIL[link/gosp]: gosp.c did not rewrite gosp_b.wat's Go function"; fail=1; } ;;
+  esac
+  link_prog gospprog test/link/gospdriver.c "$WORK/gsa.o" "$WORK/gsb.o" || exit 1
+  got=$(wruntimeout $WARMC_RUN "$LINKED" 2>&1)
+  if [ "$got" = "$gospwant" ]; then
+    echo "link: a Go-shaped module's callback through a reference sees its stack pointer"
+  else
+    echo "FAIL[link/gosp]: output differs"
+    diff <(echo "$gospwant") <(echo "$got") | head -10
+    fail=1
+  fi
+fi
+
+# An import of a memory is checked against the maximum its module declared,
+# not the one the runtime lets it grow to.
+for m in a b c; do
+  wat2wasm $WABT_FLAGS "test/link/memmax_$m.wat" -o "$WORK/mm$m.wasm" || exit 1
+  wtimeout ./$BUILD/warmc ${WARMC_FLAGS:--O2} $WARMC_TARGET_FLAGS --symbol-prefix=mm$m \
+      -c -o "$WORK/mm$m.o" "$WORK/mm$m.wasm" || { echo "FAIL[link]: compiling memmax_$m.wat"; exit 1; }
+done
+link_prog mmprog test/link/memmaxdriver.c "$WORK/mma.o" "$WORK/mmb.o" "$WORK/mmc.o" || exit 1
+got=$(wruntimeout $WARMC_RUN "$LINKED" 2>&1)
+if [ "$got" = "$(printf 'b=refused\nc=linked')" ]; then
+  echo "link: a memory import checked against the maximum its module declared"
+else
+  echo "FAIL[link/memmax]: [$got], not b=refused and c=linked"
+  fail=1
+fi
+
 WT="$BUILD/tools/bin/wasm-tools"
 if [ ! -x "$WT" ]; then
   echo "link: $WT not found, skipping the collection pair (run \`make wasm-tools\`)"
@@ -156,6 +227,37 @@ done
 [ "$fail" = 0 ] && echo "link: a round handler that fails does not wedge the collector"
 
 [ "$fail" = 0 ] && echo "link: a collection across the module boundary, 2 configurations"
+
+# A reference the host makes is no object and no i31 to the module, whatever
+# it points at, and comes back as it went; a struct the module made comes
+# back a struct (101: eq and struct).
+"$WT" parse test/link/extern.wat -o "$WORK/ext.wasm" || { echo "FAIL[link]: assembling extern.wat"; exit 1; }
+wtimeout ./$BUILD/warmc ${WARMC_FLAGS:--O2} $WARMC_TARGET_FLAGS --symbol-prefix=ext \
+    -c -o "$WORK/ext.o" "$WORK/ext.wasm" || { echo "FAIL[link]: compiling extern.wat"; exit 1; }
+link_prog extprog test/link/externdriver.c "$WORK/ext.o" || exit 1
+got=$(wruntimeout $WARMC_RUN "$LINKED" 2>&1)
+if [ "$got" = "$(printf 'host=0\nhost_back=same\nnull_back=null\nstruct=101')" ]; then
+  echo "link: a host's reference is no object to the module and comes back as it went"
+else
+  echo "FAIL[link/extern]: [$got]"
+  fail=1
+fi
+
+# A reference the embedder holds across a call that traps is still a root
+# after it: the collector moves the struct and heals the embedder's slot.
+"$WT" parse test/link/gchold.wat -o "$WORK/gch.wasm" || { echo "FAIL[link]: assembling gchold.wat"; exit 1; }
+wtimeout ./$BUILD/warmc ${WARMC_FLAGS:--O2} $WARMC_TARGET_FLAGS --symbol-prefix=gch \
+    -c -o "$WORK/gch.o" "$WORK/gch.wasm" || { echo "FAIL[link]: compiling gchold"; exit 1; }
+link_prog gchprog test/link/gcholddriver.c "$WORK/gch.o" || exit 1
+got=$( export WARMC_GC_STRESS=1 WARMC_GC_RELOCATE_ALL=1 WARMC_GC_VERIFY=1
+       wruntimeout $WARMC_RUN "$LINKED" 2>&1 )
+if [ "$got" = "$(printf 'trapped\nhold=42')" ]; then
+  echo "link: a reference held across a trap stays a root"
+else
+  echo "FAIL[link/gchold]: [$got], not trapped and hold=42"
+  fail=1
+fi
+
 
 # A System V archive stores any member name of sixteen characters or more as
 # `/<offset>` into a `//` string table, and warmc's reader skipped every one of

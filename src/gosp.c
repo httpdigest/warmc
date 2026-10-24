@@ -28,7 +28,9 @@
    into one of them from a rewritten function stores the pointer into the
    global first and loads it again after, and their calls into rewritten
    functions pass the global and store what comes back to it.  An import
-   counts as one when the host could call back into one through an export.
+   counts as one when the host could call back into one, through an export
+   or a reference it could be handed -- one some body, segment, global or
+   table takes by ref.func.
 
    It changes the signature of every function of Go's type, so it is made
    only where nothing else can tell:
@@ -38,10 +40,11 @@
    - global 0 is a mutable i32, neither imported nor exported;
    - Go's type is final, and each function of it is defined in the module,
      neither exported nor the start function nor taken by ref.func outside
-     an active or passive segment; no import of it is in a segment;
+     an active or passive segment; no import of it is in a segment or a
+     table's initial value or taken by ref.func;
    - no table is imported or exported, and nothing reads a reference out of
-     one, calls through a reference, makes a tail call or handles an
-     exception.
+     one or a segment (table.get, array.new_elem, array.init_elem), calls
+     through a reference, makes a tail call or handles an exception.
    The bodies written are validated as the module's were. */
 
 #include "warmc.h"
@@ -240,6 +243,7 @@ static void gs_rewrite_one(void *ctx, uint32_t k, uint32_t w) {
 typedef struct {
   const Gs *g;
   uint8_t *touch, *calls_s, *refs_s, *bad;
+  _Atomic uint8_t *refd;       /* per function: some body takes it by ref.func */
   uint32_t **out, *nout;
 } GsScan;
 
@@ -285,18 +289,31 @@ static void gs_scan_one(void *ctx, uint32_t i, uint32_t w) {
       }
       case 0xd2: {
         uint32_t c = rd_u32(&r);
-        if (c < m->nfuncs && g->in_s[c]) sc->refs_s[fi] = 1;
+        if (c >= m->nfuncs) continue;
+        /* a reference of Go's type: one of the rewritten functions, or an
+           import the table could be given and called through as one */
+        if (g->in_s[c] || (m->funcs[c].imported && gs_is_go_type(g, m->funcs[c].type_index)))
+          sc->refs_s[fi] = 1;
+        atomic_store_explicit(&sc->refd[c], 1, memory_order_relaxed);
         continue;
       }
-      /* tail calls, calls through a reference, table.get, exceptions */
+      /* tail calls, calls through a reference, table.get, exceptions, and
+         references out of a segment, which a passive one of Go's functions
+         would hand out for ref.test to find of their new type */
       case 0x12: case 0x13: case 0x14: case 0x15: case 0x25:
       case 0x06: case 0x07: case 0x08: case 0x09: case 0x0a: case 0x18: case 0x19: case 0x1f:
+      case OP_PREFIXED(0xfb, 10): case OP_PREFIXED(0xfb, 19):
         sc->bad[fi] = 1;
         return;
       default: break;
     }
     if (!wasm_skip_imm(&r, op)) { sc->bad[fi] = 1; return; }
   }
+}
+
+static void gs_mark_refs(const InitExpr *e, uint8_t *mark, uint32_t nf) {
+  for (uint32_t k = 0; k < e->n; k++)
+    if (e->ins[k].op == IOP_REF_FUNC && e->ins[k].lo < nf) mark[e->ins[k].lo] = 1;
 }
 
 /* whether a constant expression names a function of Go's type */
@@ -342,17 +359,12 @@ uint32_t module_go_sp_args(Module *m) {
 
   uint32_t nf = m->nfuncs, nty = m->ntypes;
   g.nty = nty;
-  g.canon = xmalloc((nty ? nty : 1) * sizeof(uint32_t));
-  for (uint32_t ti = 0; ti < nty; ti++) {
-    g.canon[ti] = ti;
-    for (uint32_t u = 0; u < ti; u++)
-      if (m->types[u].id == m->types[ti].id) { g.canon[ti] = u; break; }
-  }
+  g.canon = module_type_canon(m);
   g.in_s = xcalloc(nf, 1);
   g.in_r = xcalloc(nf, 1);
   g.rtype = xcalloc(nty ? nty : 1, 1);
   GsScan sc = { &g, xcalloc(nf, 1), xcalloc(nf, 1), xcalloc(nf, 1), xcalloc(nf, 1),
-                xcalloc(nf, sizeof(uint32_t *)), xcalloc(nf, sizeof(uint32_t)) };
+                xcalloc(nf, 1), xcalloc(nf, sizeof(uint32_t *)), xcalloc(nf, sizeof(uint32_t)) };
   uint32_t ns = 0, applied = 0, nb = nf - m->nimported_funcs;
   bool ok = true;
 
@@ -375,11 +387,24 @@ uint32_t module_go_sp_args(Module *m) {
   }
   for (uint32_t gi = 0; gi < m->nglobals && ok; gi++)
     if (gs_init_refs(&g, &m->globals[gi].init, false)) ok = false;
+  /* a table's own initial value fills it as an active segment does */
+  for (uint32_t t = 0; t < m->ntables && ok; t++)
+    if (m->tables[t].has_init && gs_init_refs(&g, &m->tables[t].init, true)) ok = false;
   if (!ok || !ns) goto out;
 
   warmc_par_for(nb, compile_want_threads(m, nb), gs_scan_one, &sc);
   for (uint32_t fi = 0; fi < nf; fi++)
     if (sc.bad[fi] || sc.refs_s[fi]) goto out;
+
+  /* what the host could be handed a reference to and call: what a body,
+     a segment, a global or a table takes by ref.func */
+  uint8_t *esc = xmalloc(nf ? nf : 1);
+  for (uint32_t fi = 0; fi < nf; fi++) esc[fi] = atomic_load_explicit(&sc.refd[fi], memory_order_relaxed);
+  for (uint32_t s = 0; s < m->nelems; s++)
+    for (uint32_t j = 0; j < m->elems[s].n; j++) gs_mark_refs(&m->elems[s].items[j], esc, nf);
+  for (uint32_t gi = 0; gi < m->nglobals; gi++) gs_mark_refs(&m->globals[gi].init, esc, nf);
+  for (uint32_t t = 0; t < m->ntables; t++)
+    if (m->tables[t].has_init) gs_mark_refs(&m->tables[t].init, esc, nf);
 
   /* reach: what can read or write the global, itself or through a call */
   uint8_t *reach = xcalloc(nf, 1);
@@ -402,20 +427,23 @@ uint32_t module_go_sp_args(Module *m) {
         break;
       }
     }
-    if (!imports)
-      for (uint32_t e = 0; e < m->nexports; e++)
-        if (m->exports[e].kind == EK_FUNC && m->exports[e].index < nf && reach[m->exports[e].index]) {
-          imports = true;
-          for (uint32_t fi = 0; fi < m->nimported_funcs; fi++) {
-            reach[fi] = 1;
-            g.rtype[g.canon[m->funcs[fi].type_index]] = 1;
-          }
-          ch = true;
-          break;
-        }
+    bool host = false;
+    for (uint32_t e = 0; e < m->nexports && !imports && !host; e++)
+      if (m->exports[e].kind == EK_FUNC && m->exports[e].index < nf && reach[m->exports[e].index])
+        host = true;
+    for (uint32_t fi = 0; fi < nf && !imports && !host; fi++)
+      if (esc[fi] && reach[fi]) host = true;
+    if (host) {
+      imports = true;
+      for (uint32_t fi = 0; fi < m->nimported_funcs; fi++) {
+        reach[fi] = 1;
+        g.rtype[g.canon[m->funcs[fi].type_index]] = 1;
+      }
+      ch = true;
+    }
   }
   for (uint32_t fi = 0; fi < nf; fi++) g.in_r[fi] = reach[fi] && !g.in_s[fi];
-  xfree(reach);
+  xfree(reach); xfree(esc);
 
   /* a type of its own: a call through one the module wrote by the same
      structure still traps on these functions, as it did on their type */
@@ -446,6 +474,6 @@ out:
   for (uint32_t fi = 0; fi < nf; fi++) xfree(sc.out[fi]);
   xfree(sc.out); xfree(sc.nout);
   xfree(g.canon); xfree(g.in_s); xfree(g.in_r); xfree(g.rtype);
-  xfree(sc.touch); xfree(sc.calls_s); xfree(sc.refs_s); xfree(sc.bad);
+  xfree(sc.touch); xfree(sc.calls_s); xfree(sc.refs_s); xfree(sc.bad); xfree((void *)sc.refd);
   return applied;
 }

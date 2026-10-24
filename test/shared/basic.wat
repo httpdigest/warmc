@@ -9,6 +9,15 @@
   (global $calls (mut i32) (i32.const 0))
   (global $list (mut (ref null $node)) (ref.null $node))
 
+  ;; the import as a reference, kept where no pass can see what it holds,
+  ;; and tested against its type: a function the host binds is of the type
+  ;; the module imports it at
+  (type $tw (func (param i64) (result i64)))
+  (global $ref (mut funcref) (ref.null func))
+  (elem declare func $twice)
+  (func (export "take_twice") (global.set $ref (ref.func $twice)))
+  (func (export "twice_is_tw") (result i32) (ref.test (ref $tw) (global.get $ref)))
+
   (func (export "add") (param i32 i32) (result i32)
     (global.set $calls (i32.add (global.get $calls) (i32.const 1)))
     (i32.add (local.get 0) (local.get 1)))
@@ -45,6 +54,34 @@
             (i64.add (i64.mul (local.get 4) (i64.const 10000))
               (i64.add (i64.mul (local.get 5) (i64.const 100000))
                        (i64.mul (local.get 6) (i64.const 1000000)))))))))
+
+  ;; more parameters than any target's registers: on x86-64 the rest ride the
+  ;; callee's stack slots, which the library's C entry builds (rt/lib.c); arm64
+  ;; gives it no C symbol, as it gives none past 7 integer or 8 float ones
+  (func (export "wide") (param i64 i64 i64 i64 i64 i64 i64 i64 i64 i64 i64 i64
+                         f64 f64 f64 f64 f64 f64 f64 f64 f64 f64) (result f64)
+    (f64.add (f64.add (f64.add (f64.add (f64.add (f64.add (f64.add (f64.add (f64.add (f64.add (f64.add (f64.add (f64.add (f64.add (f64.add (f64.add (f64.add (f64.add (f64.add (f64.add (f64.add (f64.mul (f64.convert_i64_s (local.get 0)) (f64.const 1))
+      (f64.mul (f64.convert_i64_s (local.get 1)) (f64.const 2)))
+      (f64.mul (f64.convert_i64_s (local.get 2)) (f64.const 3)))
+      (f64.mul (f64.convert_i64_s (local.get 3)) (f64.const 4)))
+      (f64.mul (f64.convert_i64_s (local.get 4)) (f64.const 5)))
+      (f64.mul (f64.convert_i64_s (local.get 5)) (f64.const 6)))
+      (f64.mul (f64.convert_i64_s (local.get 6)) (f64.const 7)))
+      (f64.mul (f64.convert_i64_s (local.get 7)) (f64.const 8)))
+      (f64.mul (f64.convert_i64_s (local.get 8)) (f64.const 9)))
+      (f64.mul (f64.convert_i64_s (local.get 9)) (f64.const 10)))
+      (f64.mul (f64.convert_i64_s (local.get 10)) (f64.const 11)))
+      (f64.mul (f64.convert_i64_s (local.get 11)) (f64.const 12)))
+      (f64.mul (local.get 12) (f64.const 13)))
+      (f64.mul (local.get 13) (f64.const 14)))
+      (f64.mul (local.get 14) (f64.const 15)))
+      (f64.mul (local.get 15) (f64.const 16)))
+      (f64.mul (local.get 16) (f64.const 17)))
+      (f64.mul (local.get 17) (f64.const 18)))
+      (f64.mul (local.get 18) (f64.const 19)))
+      (f64.mul (local.get 19) (f64.const 20)))
+      (f64.mul (local.get 20) (f64.const 21)))
+      (f64.mul (local.get 21) (f64.const 22))))
 
   (func (export "twice_plus_one") (param i64) (result i64)
     (i64.add (call $twice (local.get 0)) (i64.const 1)))

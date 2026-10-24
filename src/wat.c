@@ -248,6 +248,11 @@ static void lex_string(Lex *l) {
         uint64_t cp = 0;
         bool any = false;
         while (l->p < l->end && *l->p != '}') {
+          /* a '_' between two of the digits */
+          if (*l->p == '_' && any && l->p + 1 < l->end && l->p[1] != '_' && l->p[1] != '}') {
+            lex_advance(l);
+            continue;
+          }
           cp = cp * 16 + hex_digit(l->path, l->line, l->col, *l->p);
           if (cp > 0x10ffff)
             pos_err(l->path, l->line, l->col, "escape is not a code point");
@@ -305,29 +310,44 @@ static bool custom_annotation(const Tok *t) {
   return tok_is_word(t, "@custom") || tok_is_word(t, "@producers") || tok_is_word(t, "@dylink.0");
 }
 
+static bool annotation_at(const Lex *l, uint32_t i) {
+  return l->toks[i].kind == TK_LPAR && i + 1 < l->ntoks && l->toks[i + 1].kind == TK_WORD &&
+         l->toks[i + 1].n && l->toks[i + 1].s[0] == '@';
+}
+
+/* the index past the annotation at i */
+static uint32_t skip_annotation(const Lex *l, uint32_t i) {
+  uint32_t depth = 0;
+  do {
+    if (l->toks[i].kind == TK_EOF)
+      pos_err(l->path, l->toks[i].line, l->toks[i].col, "unterminated annotation");
+    if (l->toks[i].kind == TK_LPAR) depth++;
+    else if (l->toks[i].kind == TK_RPAR) depth--;
+    i++;
+  } while (depth);
+  return i;
+}
+
 /* Annotations are white space, but for the ones that make a custom section:
-   those stay for take_customs, and only where a module field can be. */
+   those stay for take_customs, and only where a module field can be --
+   inside (module ...), past any annotations in front of it, or at the top
+   of a file of fields alone. */
 static void strip_annotations(Lex *l) {
-  uint32_t fields = l->ntoks > 1 && l->toks[0].kind == TK_LPAR && tok_is_word(&l->toks[1], "module");
+  uint32_t k = 0;
+  while (annotation_at(l, k)) k = skip_annotation(l, k);
+  uint32_t fields = k + 1 < l->ntoks && l->toks[k].kind == TK_LPAR &&
+                    tok_is_word(&l->toks[k + 1], "module");
   uint32_t out = 0, level = 0;
   for (uint32_t i = 0; i < l->ntoks;) {
+    if (annotation_at(l, i) && l->toks[i + 1].n == 1)
+      pos_err(l->path, l->toks[i + 1].line, l->toks[i + 1].col, "empty annotation id");
     if (l->toks[i].kind == TK_LPAR && i + 1 < l->ntoks &&
         l->toks[i + 1].kind == TK_WORD && l->toks[i + 1].n &&
         l->toks[i + 1].s[0] == '@' && custom_annotation(&l->toks[i + 1]) && level != fields)
       pos_err(l->path, l->toks[i].line, l->toks[i].col, "misplaced %.*s annotation",
               (int)l->toks[i + 1].n, l->toks[i + 1].s);
-    if (l->toks[i].kind == TK_LPAR && i + 1 < l->ntoks &&
-        l->toks[i + 1].kind == TK_WORD && l->toks[i + 1].n &&
-        l->toks[i + 1].s[0] == '@' && !custom_annotation(&l->toks[i + 1])) {
-      uint32_t depth = 0;
-      do {
-        if (l->toks[i].kind == TK_EOF)
-          pos_err(l->path, l->toks[i].line, l->toks[i].col,
-                  "unterminated annotation");
-        if (l->toks[i].kind == TK_LPAR) depth++;
-        else if (l->toks[i].kind == TK_RPAR) depth--;
-        i++;
-      } while (depth);
+    if (annotation_at(l, i) && !custom_annotation(&l->toks[i + 1])) {
+      i = skip_annotation(l, i);
       continue;
     }
     if (l->toks[i].kind == TK_LPAR) level++;
@@ -356,6 +376,28 @@ static void tokenize(Lex *l) {
     while (l->p < l->end && idchar(*l->p)) lex_advance(l);
     size_t n = (size_t)(l->p - begin);
     Tok *t;
+    /* $"..." and @"...": an identifier or an annotation's id as a string,
+       the same one as the name it spells written plain */
+    if (n == 1 && (c == '$' || c == '@') && l->p < l->end && *l->p == '"') {
+      lex_string(l);
+      t = &l->toks[l->ntoks - 1];
+      if (!t->n) pos_err(l->path, line, col, c == '$' ? "empty identifier" : "empty annotation id");
+      t->line = line;
+      t->col = col;
+      if (c == '$') {
+        t->kind = TK_ID;
+      } else {
+        WBuf w = {0};
+        wb_byte(&w, '@');
+        wb_raw(&w, t->s, t->n);
+        Bytes b = arena_bytes(l->a, w.p, w.n);
+        xfree(w.p);
+        t->kind = TK_WORD;
+        t->s = (const char *)b.p;
+        t->n = b.n;
+      }
+      continue;
+    }
     if (c == '$') {
       if (n == 1) pos_err(l->path, line, col, "empty identifier");
       t = lex_push(l, TK_ID, line, col);
@@ -667,11 +709,22 @@ static void skip_group(P *p) {
   } while (depth);
 }
 
+static bool num_digit(char c, bool hex) {
+  return (c >= '0' && c <= '9') ||
+         (hex && ((c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')));
+}
+
+/* A number without its '_'s, each of which must stand between two digits
+   of one part: hex ones from a 0x to a p, decimal ones elsewhere. */
 static size_t strip_seps(P *p, const Tok *t, char *out, size_t cap) {
   size_t j = 0;
+  bool hex = false;
   for (size_t i = 0; i < t->n; i++) {
-    if (t->s[i] == '_') {
-      if (i == 0 || i + 1 == t->n || t->s[i - 1] == '_')
+    char c = t->s[i];
+    if ((c == 'x' || c == 'X') && i && t->s[i - 1] == '0') hex = true;
+    else if (hex && (c == 'p' || c == 'P')) hex = false;
+    if (c == '_') {
+      if (i == 0 || i + 1 == t->n || !num_digit(t->s[i - 1], hex) || !num_digit(t->s[i + 1], hex))
         pos_err(p->path, t->line, t->col, "misplaced '_' in a number");
       continue;
     }
@@ -3024,6 +3077,8 @@ uint8_t *wat_assemble(const char *src, size_t len, const char *path,
     size_t nl;
     take_id(&p, &nm, &nl);
     if (at_word(&p, "binary")) {
+      /* a custom section is in the bytes or nowhere */
+      if (p.cu.n) perr(&p, "a custom annotation in a binary module");
       p.i++;
       WBuf bin = {0};
       while (tk(&p)->kind == TK_STRING) {
@@ -3031,6 +3086,7 @@ uint8_t *wat_assemble(const char *src, size_t len, const char *path,
         p.i++;
       }
       expect_rpar(&p);
+      if (tk(&p)->kind != TK_EOF) perr(&p, "more after the module");
       xfree(l.toks);
       arena_free(&arena);
       *len_out = bin.n;
@@ -3040,6 +3096,7 @@ uint8_t *wat_assemble(const char *src, size_t len, const char *path,
     uint32_t save = p.i;
     p.i = 0;
     skip_group(&p);
+    if (tk(&p)->kind != TK_EOF) perr(&p, "more after the module");
     end = p.i - 1;
     p.i = save;
   }

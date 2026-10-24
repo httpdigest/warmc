@@ -28,6 +28,11 @@ What the comparison has to know:
   * smith's constant expressions build arrays of a few gigabytes, which
     wasmtime's GC heap holds and warmc's default 1 GiB reservation does not,
     so warmc's programs run with a 16 GiB reservation (WARMC_GC_HEAP_KB).
+    What one engine can allocate and the other cannot is each engine's own
+    limit, which the spec leaves to it -- wasmtime refuses an object over
+    its largest size or past its GC heap, warmc one past its reservation --
+    so a call where only one side runs out (RESOURCE_LIMITS) is not counted
+    either.
   * No compile may take more than a second, link included.  One that does is
     timed again, since the other jobs share the machine, and a module whose
     faster compile is still over the limit is reported as bad.
@@ -52,6 +57,10 @@ import random
 import shutil
 import struct
 import subprocess
+
+# the traps that are an engine running out of what it may allocate
+RESOURCE_LIMITS = ("GC heap out of memory", "allocation size too large",
+                   "allocation failed")
 import sys
 import tempfile
 import time
@@ -318,7 +327,8 @@ def one_seed(seed, levels, profile, calls, out_dir, flags):
                         if w_trap and g_trap:
                             continue
                         so = ("stack" in w_err.lower() or "stack" in g_err.lower())
-                        if so:
+                        oom = any(m in w_err + g_err for m in RESOURCE_LIMITS)
+                        if so or oom:
                             continue
                         nbad += 1
                         notes.append("%s %s(%s): wasmtime %s, warmc %s" % (

@@ -66,11 +66,15 @@ static const char *c_type_name(ValType t) {
 
 /* The parameters warmc_invoke can carry on arm64: seven integers after the
    instance and eight floats.  x64 passes the rest on the stack. */
+/* arm64 passes 7 integer and 8 float parameters in registers and the C
+   entry no more; x64 passes 3 and 4 and the rest in stack slots, as many as
+   rt/lib.c's image of them holds (480 bytes, WARMC_X64_STACK_BYTES) */
 static bool fits_registers(const CompType *t) {
-  if (g_target == &warmc_target_x64) return true;
   uint32_t ni = 0, nf = 0;
   for (uint32_t i = 0; i < t->nparams; i++)
     if (vt_is_float(t->params[i])) nf++; else ni++;
+  if (g_target == &warmc_target_x64)
+    return (ni > 3 ? ni - 3 : 0) + (nf > 4 ? nf - 4 : 0) <= 60;
   return ni <= 7 && nf <= 8;
 }
 
@@ -82,7 +86,9 @@ static const char *c_callable(const CompType *t) {
     if (!c_scalar(t->results[i])) return "a result is not i32, i64, f32 or f64";
   if (t->nresults > 16) return "it has more than 16 results";
   if (!fits_registers(t))
-    return "it takes more than 7 integer or 8 float parameters";
+    return g_target == &warmc_target_x64
+      ? "it takes more than 60 parameters past the 3 integer and 4 float registers"
+      : "it takes more than 7 integer or 8 float parameters";
   return NULL;
 }
 

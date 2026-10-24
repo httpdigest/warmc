@@ -49,6 +49,7 @@ typedef struct {
   u8 seekable;
   u8 append;
   u64 pos;
+  u32 children;   /* pollables subscribed to it and not yet dropped */
 } Stream;
 
 static int g_argc;
@@ -200,6 +201,14 @@ static u64 p2_get_stderr(WarmInstance *vm) { return stdio_handle(2, 0); }
 
 static u64 p2_stream_drop(WarmInstance *vm, u64 h, u32 rt) {
   u32 owned = 0;
+  /* a pollable of it polls its descriptor: a stream outlives its children,
+     as a resource does in the component model */
+  Stream *live = (Stream *)(uptr)warmc_res_lift_borrow(rt, (u32)h);
+  warmc_res_release(rt, (u32)h);
+  if (live && live->children) {
+    err("warmc-wasi: a stream dropped while a pollable of it is alive\n");
+    warmc_trap(TRAP_UNREACHABLE);
+  }
   Stream *s = (Stream *)(uptr)warmc_res_drop(rt, (u32)h, &owned);
   if (s && !s->no_close) close(s->fd);
   free(s);
@@ -353,16 +362,19 @@ typedef struct {
   u8 kind;
   int fd;
   u64 deadline;
+  Stream *parent;   /* the stream whose descriptor it polls, or none */
 } Pollable;
 
 typedef struct { int fd; short ev; short rev; } HPollFd;
 
-static u64 pollable_new(u8 kind, int fd, u64 deadline) {
+static u64 pollable_new(u8 kind, int fd, u64 deadline, Stream *parent) {
   Pollable *p = malloc(sizeof *p);
   if (!p) warmc_trap(TRAP_HEAP_OOM);
   p->kind = kind;
   p->fd = fd;
   p->deadline = deadline;
+  p->parent = parent;
+  if (parent) parent->children++;
   return warmc_res_lower_own(RT_POLLABLE, (u64)(uptr)p);
 }
 
@@ -375,12 +387,19 @@ static int pollable_ready(const Pollable *p) {
   return poll(&f, 1, 0) > 0;
 }
 
+/* In slices of at most a day, whose seconds fit a long where it is 32 bits
+   (Windows): a deadline years away sleeps rather than spinning. */
 static void sleep_ns(u64 ns) {
-  long ts[2];
-  ts[0] = (long)(ns / 1000000000ull);
-  ts[1] = (long)(ns % 1000000000ull);
-  long rem[2];
-  while (nanosleep(ts, rem) < 0 && h_errno == 4) { ts[0] = rem[0]; ts[1] = rem[1]; }
+  const u64 day = 86400ull * 1000000000ull;
+  while (ns) {
+    u64 part = ns < day ? ns : day;
+    long ts[2];
+    ts[0] = (long)(part / 1000000000ull);
+    ts[1] = (long)(part % 1000000000ull);
+    long rem[2];
+    while (nanosleep(ts, rem) < 0 && h_errno == 4) { ts[0] = rem[0]; ts[1] = rem[1]; }
+    ns -= part;
+  }
 }
 
 static void pollable_block(const Pollable *p) {
@@ -396,17 +415,19 @@ static void pollable_block(const Pollable *p) {
   while (poll(&f, 1, -1) < 0 && h_errno == 4) f.rev = 0;
 }
 
+/* a duration past the end of the clock's range is at its end */
 static u64 p2_subscribe_duration(WarmInstance *vm, u64 ns) {
-  return pollable_new(POLL_TIMER, -1, warmc_rt_nanos(0) + ns);
+  u64 now = warmc_rt_nanos(0);
+  return pollable_new(POLL_TIMER, -1, ns > ~(u64)0 - now ? ~(u64)0 : now + ns, 0);
 }
 
 static u64 p2_subscribe_instant(WarmInstance *vm, u64 when) {
-  return pollable_new(POLL_TIMER, -1, when);
+  return pollable_new(POLL_TIMER, -1, when, 0);
 }
 
 static u64 p2_stream_subscribe(WarmInstance *vm, u64 self, u32 rt) {
   Stream *s = stream_of(rt, self);
-  return pollable_new(rt == RT_INPUT_STREAM ? POLL_READ : POLL_WRITE, s->fd, 0);
+  return pollable_new(rt == RT_INPUT_STREAM ? POLL_READ : POLL_WRITE, s->fd, 0, s);
 }
 
 static u64 p2_input_subscribe(WarmInstance *vm, u64 self) {
@@ -434,22 +455,33 @@ static u64 p2_pollable_block(WarmInstance *vm, u64 self) {
 
 static u64 p2_drop_pollable(WarmInstance *vm, u64 h) {
   u32 owned = 0;
-  free((void *)(uptr)warmc_res_drop(RT_POLLABLE, (u32)h, &owned));
+  Pollable *p = (Pollable *)(uptr)warmc_res_drop(RT_POLLABLE, (u32)h, &owned);
+  if (p && p->parent) p->parent->children--;
+  free(p);
   return 0;
 }
 
+/* What is ready of a list of pollables, waiting for one to be: each
+   descriptor polled at once and the soonest timer the wait's bound, every
+   round from the clock as it is then.  An empty list is a trap, as
+   wasi:io/poll says, there being nothing it could wait for. */
 static u64 p2_poll(WarmInstance *vm, u64 ptr, u64 len, u64 ret) {
   ptr &= 0xffffffffu;
   len &= 0xffffffffu;
-  if (!len || !ok(vm, ptr, len * 4)) {
-    put32(vm, ret, 0);
-    put32(vm, ret + 4, 0);
-    return 0;
+  if (!len) {
+    err("warmc-wasi: poll of an empty list\n");
+    warmc_trap(TRAP_UNREACHABLE);
   }
+  if (!ok(vm, ptr, len * 4)) warmc_trap(TRAP_MEM_OOB);
 
   Pollable **ps = malloc(sizeof(Pollable *) * (usz)len);
   u32 *hit = malloc(sizeof(u32) * (usz)len);
-  if (!ps || !hit) { free(ps); free(hit); warmc_trap(TRAP_HEAP_OOM); }
+  HPollFd *fds = malloc(sizeof(HPollFd) * (usz)len);
+  u32 *idx = malloc(sizeof(u32) * (usz)len);
+  if (!ps || !hit || !fds || !idx) {
+    free(ps); free(hit); free(fds); free(idx);
+    warmc_trap(TRAP_HEAP_OOM);
+  }
   for (u64 i = 0; i < len; i++) {
     u32 h = 0;
     __builtin_memcpy(&h, vm->mem_base + ptr + i * 4, 4);
@@ -459,11 +491,11 @@ static u64 p2_poll(WarmInstance *vm, u64 ptr, u64 len, u64 ret) {
 
   u32 n = 0;
   for (;;) {
+    n = 0;
     u64 now = warmc_rt_nanos(0);
     u64 soonest = 0;
     int have_timer = 0;
-    HPollFd fds[64];
-    u32 nfd = 0, idx[64];
+    u32 nfd = 0;
     for (u64 i = 0; i < len; i++) {
       if (ps[i]->kind == POLL_TIMER) {
         if (now >= ps[i]->deadline) hit[n++] = (u32)i;
@@ -471,7 +503,7 @@ static u64 p2_poll(WarmInstance *vm, u64 ptr, u64 len, u64 ret) {
           soonest = ps[i]->deadline;
           have_timer = 1;
         }
-      } else if (nfd < 64) {
+      } else {
         fds[nfd].fd = ps[i]->fd;
         fds[nfd].ev = ps[i]->kind == POLL_READ ? 1 : 4;
         fds[nfd].rev = 0;
@@ -480,17 +512,24 @@ static u64 p2_poll(WarmInstance *vm, u64 ptr, u64 len, u64 ret) {
       }
     }
     if (nfd) {
-      int ms = n ? 0 : (have_timer ? (int)((soonest - now + 999999ull) / 1000000ull)
-                                   : -1);
+      /* the wait ends at the soonest timer, at most a day on: poll's
+         milliseconds are an int */
+      u64 wait_ms = have_timer ? (soonest - now + 999999ull) / 1000000ull : 0;
+      if (wait_ms > 86400000ull) wait_ms = 86400000ull;
+      int ms = n ? 0 : have_timer ? (int)wait_ms : -1;
       int r = poll(fds, nfd, ms);
       if (r < 0 && h_errno == 4) continue;
       for (u32 k = 0; k < nfd && r > 0; k++)
         if (fds[k].rev) hit[n++] = idx[k];
+      /* a timer the wait ran out on is found ready next round */
+      if (!n && have_timer) continue;
     }
     if (n) break;
     if (!have_timer) break;
     sleep_ns(soonest - now);
   }
+  free(fds);
+  free(idx);
 
   u64 out = guest_alloc(vm, 4, n * 4);
   for (u32 i = 0; i < n; i++) put32(vm, out + (u64)i * 4, hit[i]);
@@ -587,7 +626,7 @@ static u32 ec_of_p1(u32 e) {
     case 54: return EC_NOTDIR;
     case 55: return EC_NOTEMPTY;
     case 56: return 26;
-    case 58: return EC_UNSUPPORTED;
+    case 52: case 58: return EC_UNSUPPORTED;
     case 59: return 28;
     case 60: return 29;
     case 61: return EC_OVERFLOW;
@@ -639,11 +678,14 @@ static u32 read_path(WarmInstance *vm, u64 p, u64 n, char *out) {
   return 0;
 }
 
+/* trailed, when not NULL, takes the path's last slashes off and says
+   whether there were any (wasifs_trim_slash) */
 static u32 at_leaf(Desc *d, WarmInstance *vm, u64 p, u64 n, int follow,
-                   int *dir, char *leaf) {
+                   int *dir, char *leaf, int *trailed) {
   char path[PATHMAX];
   u32 ec = read_path(vm, p, n, path);
   if (ec) return ec;
+  if (trailed) *trailed = wasifs_trim_slash(path);
   u32 rc = wasifs_walk_leaf(d->fd, path, dir, leaf, follow);
   if (rc) return ec_of_p1(rc);
   if (!leaf[0]) leaf[0] = '.', leaf[1] = 0;
@@ -691,11 +733,13 @@ static u64 p2_stat_at(WarmInstance *vm, u64 self, u64 flags, u64 p, u64 n,
   Desc *d = desc_of(self);
   int dir = -1;
   char leaf[PATHMAX];
-  u32 ec = at_leaf(d, vm, p, n, (int)(flags & 1), &dir, leaf);
+  u32 ec = at_leaf(d, vm, p, n, (int)(flags & 1), &dir, leaf, 0);
   if (ec) { res_err(vm, ret, 8, ec); return 0; }
 
   u8 st[ST_SIZE];
-  int r = fstatat(dir, leaf, st, (flags & 1) ? 0 : H_AT_NOFOLLOW);
+  /* at_leaf followed what was to be followed: the leaf it hands back is
+     looked at as it stands, so a link put there since is not gone through */
+  int r = fstatat(dir, leaf, st, H_AT_NOFOLLOW);
   int e = h_errno;
   wasifs_walk_done(d->fd, dir);
   if (r < 0) { res_err(vm, ret, 8, ec_of_host(e)); return 0; }
@@ -709,7 +753,13 @@ static u64 p2_open_at(WarmInstance *vm, u64 self, u64 pflags, u64 p, u64 n,
   Desc *d = desc_of(self);
   int dir = -1;
   char leaf[PATHMAX];
-  u32 ec = at_leaf(d, vm, p, n, (int)(pflags & 1), &dir, leaf);
+  /* a file is not made by a name that says it is a directory */
+  if ((oflags & 1) && (n & 0xffffffffu) && ok(vm, p, n & 0xffffffffu) &&
+      vm->mem_base[p + (n & 0xffffffffu) - 1] == '/') {
+    res_err(vm, ret, 4, EC_INVALID);
+    return 0;
+  }
+  u32 ec = at_leaf(d, vm, p, n, (int)(pflags & 1), &dir, leaf, 0);
   if (ec) { res_err(vm, ret, 4, ec); return 0; }
 
   int hf = 0;
@@ -721,7 +771,9 @@ static u64 p2_open_at(WarmInstance *vm, u64 self, u64 pflags, u64 p, u64 n,
   if (oflags & 2) hf |= H_DIRECTORY;
   if (oflags & 4) hf |= H_EXCL;
   if (oflags & 8) hf |= H_TRUNC;
-  if (!(pflags & 1)) hf |= H_NOFOLLOW;
+  /* at_leaf followed what was to be followed; a link put at the leaf
+     since is not opened through */
+  hf |= H_NOFOLLOW;
 
   int fd = openat(dir, leaf, hf, 0666);
   int e = h_errno;
@@ -883,10 +935,12 @@ static u64 p2_metadata_hash_at(WarmInstance *vm, u64 self, u64 flags, u64 p,
   Desc *d = desc_of(self);
   int dir = -1;
   char leaf[PATHMAX];
-  u32 ec = at_leaf(d, vm, p, n, (int)(flags & 1), &dir, leaf);
+  u32 ec = at_leaf(d, vm, p, n, (int)(flags & 1), &dir, leaf, 0);
   if (ec) { res_err(vm, ret, 8, ec); return 0; }
   u8 st[ST_SIZE];
-  int r = fstatat(dir, leaf, st, (flags & 1) ? 0 : H_AT_NOFOLLOW);
+  /* at_leaf followed what was to be followed: the leaf it hands back is
+     looked at as it stands, so a link put there since is not gone through */
+  int r = fstatat(dir, leaf, st, H_AT_NOFOLLOW);
   int e = h_errno;
   wasifs_walk_done(d->fd, dir);
   if (r < 0) { res_err(vm, ret, 8, ec_of_host(e)); return 0; }
@@ -933,7 +987,9 @@ static u64 path_op(WarmInstance *vm, u64 self, u64 p, u64 n, u64 ret, int op) {
   Desc *d = desc_of(self);
   int dir = -1;
   char leaf[PATHMAX];
-  u32 ec = at_leaf(d, vm, p, n, 0, &dir, leaf);
+  /* a directory is made by a name that ends in a slash as by the name */
+  int trailed;
+  u32 ec = at_leaf(d, vm, p, n, 0, &dir, leaf, op == 0 ? &trailed : 0);
   if (ec) { res_err(vm, ret, 1, ec); return 0; }
 
   int r;
@@ -961,7 +1017,7 @@ static u64 p2_readlink_at(WarmInstance *vm, u64 self, u64 p, u64 n, u64 ret) {
   Desc *d = desc_of(self);
   int dir = -1;
   char leaf[PATHMAX];
-  u32 ec = at_leaf(d, vm, p, n, 0, &dir, leaf);
+  u32 ec = at_leaf(d, vm, p, n, 0, &dir, leaf, 0);
   if (ec) { res_err(vm, ret, 4, ec); return 0; }
 
   char link[PATHMAX];
@@ -982,7 +1038,7 @@ static u64 p2_symlink_at(WarmInstance *vm, u64 self, u64 op, u64 on, u64 np,
   if (ec) { res_err(vm, ret, 1, ec); return 0; }
   int dir = -1;
   char leaf[PATHMAX];
-  ec = at_leaf(d, vm, np, nn, 0, &dir, leaf);
+  ec = at_leaf(d, vm, np, nn, 0, &dir, leaf, 0);
   if (ec) { res_err(vm, ret, 1, ec); return 0; }
 
   int r = symlinkat(old, dir, leaf);
@@ -999,10 +1055,25 @@ static u64 two_place(WarmInstance *vm, u64 self, u64 p1, u64 n1, u64 other,
   Desc *b = desc_of(other);
   int da = -1, db = -1;
   char la[PATHMAX], lb[PATHMAX];
-  u32 ec = at_leaf(a, vm, p1, n1, link ? (int)(flags & 1) : 0, &da, la);
+  /* a rename by a name that ends in a slash moves the entry itself, which
+     must be a directory */
+  int ta = 0, tb = 0;
+  u32 ec = at_leaf(a, vm, p1, n1, link ? (int)(flags & 1) : 0, &da, la, link ? 0 : &ta);
   if (ec) { res_err(vm, ret, 1, ec); return 0; }
-  ec = at_leaf(b, vm, p2, n2, 0, &db, lb);
+  ec = at_leaf(b, vm, p2, n2, 0, &db, lb, link ? 0 : &tb);
   if (ec) { wasifs_walk_done(a->fd, da); res_err(vm, ret, 1, ec); return 0; }
+  if (ta || tb) {
+    u8 st[ST_SIZE];
+    ec = 0;
+    if (fstatat(da, la, st, H_AT_NOFOLLOW) < 0) ec = ec_of_host(h_errno);
+    else if (wasifs_filetype(st) != FT_DIR) ec = EC_NOTDIR;
+    if (ec) {
+      wasifs_walk_done(a->fd, da);
+      wasifs_walk_done(b->fd, db);
+      res_err(vm, ret, 1, ec);
+      return 0;
+    }
+  }
 
   int r = link ? linkat(da, la, db, lb, (flags & 1) ? H_AT_SYMLINK_FOLLOW : 0)
                : renameat(da, la, db, lb);
@@ -1188,8 +1259,16 @@ static int add_preopen(const char *spec) {
     host[i] = spec[i];
   }
   host[i] = 0;
-  guest = spec[i] ? spec + i + 2 : host;
-  if (!guest[0]) guest = host;
+  /* the guest name outlives this frame: the argument itself when it is all
+     a host path, else what follows `::`, or a copy of the host path when
+     that is empty */
+  guest = spec[i] ? spec + i + 2 : spec;
+  if (!guest[0]) {
+    char *g = malloc(i + 1);
+    if (!g) return 0;
+    for (usz k = 0; k <= i; k++) g[k] = host[k];
+    guest = g;
+  }
 
   int fd = openat(H_AT_FDCWD, host, H_RDONLY | H_DIRECTORY);
   if (fd < 0) return 0;

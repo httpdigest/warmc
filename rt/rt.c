@@ -265,8 +265,11 @@ static void put_hex_raw(u64 v, int digits) {
 #define MAX_INSTANCES 4096
 #define ARENA_WORDS (1u << 21)
 
+/* max_pages is what it may grow to here; decl_max what the module said,
+   which an import's type is checked against */
 typedef struct {
   u8 *base; u64 size; u64 pages; u64 max_pages; u32 has_max; u32 index64;
+  u64 decl_max;
 } WarmMemory;
 
 typedef struct {
@@ -550,7 +553,6 @@ static const char *trap_name(u32 code) {
     case TRAP_INDIRECT_NULL: return "uninitialized element";
     case TRAP_INDIRECT_TYPE: return "indirect call type mismatch";
     case TRAP_BAD_CONVERSION: return "invalid conversion to integer";
-    case TRAP_UNINIT_ELEM: return "uninitialized element";
     case TRAP_TABLE_OOB: return "out of bounds table access";
     case TRAP_STACK_OVERFLOW: return "call stack exhausted";
     case TRAP_NULL_REF: return "null reference";
@@ -576,7 +578,12 @@ static u64 g_catch_buf[24];
 static int g_catching;
 static u32 g_trap_code;
 
-static void gc_after_trap(void);
+/* What a catching call finds of the collector's state when it starts, and
+   puts back when a trap ends it: the roots the frames it unwound held go,
+   its caller's stay. */
+typedef struct { void *roots; u32 from_wasm, no_collect; } GcCatch;
+static void gc_catch_save(GcCatch *c);
+static void gc_after_trap(const GcCatch *c);
 static void gc_trap_round_arm(void);
 extern u64 warmc_gc_invoke_depth;
 
@@ -650,10 +657,12 @@ WarmInstance *warmc_instantiate_bound_catching(const ModuleDesc *md,
   u64 outer[sizeof g_catch_buf / sizeof g_catch_buf[0]];
   int was;
   catch_save(outer, &was);
+  GcCatch gcs;
+  gc_catch_save(&gcs);
   if (warmc_setjmp(g_catch_buf)) {
     catch_restore(outer, was);
     warmc_gc_invoke_depth = depth;
-    gc_after_trap();
+    gc_after_trap(&gcs);
     *err = g_trap_code;
     return 0;
   }
@@ -670,10 +679,12 @@ u32 warmc_invoke_catching(void *fn, WarmInstance *v, const u64 *iargs,
   u64 outer[sizeof g_catch_buf / sizeof g_catch_buf[0]];
   int was;
   catch_save(outer, &was);
+  GcCatch gcs;
+  gc_catch_save(&gcs);
   if (warmc_setjmp(g_catch_buf)) {
     catch_restore(outer, was);
     warmc_gc_invoke_depth = depth;
-    gc_after_trap();
+    gc_after_trap(&gcs);
     return g_trap_code;
   }
   g_catching = 1;
@@ -690,10 +701,12 @@ u32 warmc_invoke_catching_s(void *fn, WarmInstance *v, const u64 *iargs,
   u64 outer[sizeof g_catch_buf / sizeof g_catch_buf[0]];
   int was;
   catch_save(outer, &was);
+  GcCatch gcs;
+  gc_catch_save(&gcs);
   if (warmc_setjmp(g_catch_buf)) {
     catch_restore(outer, was);
     warmc_gc_invoke_depth = depth;
-    gc_after_trap();
+    gc_after_trap(&gcs);
     return g_trap_code;
   }
   g_catching = 1;
@@ -1806,6 +1819,22 @@ static u32 gc_in_heap(u64 v) {
   if (off >= gc_heap_bytes) return 0;
   return __atomic_load_n(&gc_pages[off >> GC_GRAN_SHIFT].kind,
                          __ATOMIC_ACQUIRE) != GCP_FREE;
+}
+
+/* any.convert_extern: a reference the host made -- not null, not an i31
+   and not an object of the heap, which come back from extern.convert_any --
+   takes the host tag, so that no type test takes it for an object or an
+   i31; extern.convert_any takes it off.  So a host's reference has its low
+   two bits clear, as a pointer to a C object does. */
+u64 warmc_any_of_extern(WarmInstance *vm, u64 e) {
+  (void)vm;
+  if (!e || GC_IS_I31(e) || (gc_base && gc_in_heap(e))) return e;
+  return e | GC_HOST_TAG;
+}
+
+u64 warmc_extern_of_any(WarmInstance *vm, u64 a) {
+  (void)vm;
+  return GC_IS_HOST(a) ? a & ~(u64)3 : a;
 }
 
 static void gc_check_tbi(void);
@@ -3395,11 +3424,16 @@ void warmc_gc_hold(u64 *base, const u32 *n, void *slot) {
 }
 void warmc_gc_release(void *slot) { gc_rootlist = ((GcRoots *)slot)->next; }
 
-static void gc_after_trap(void) {
-  gc_rootlist = 0;
-  gc_from_wasm = 0;
+static void gc_catch_save(GcCatch *c) {
+  c->roots = gc_rootlist;
+  c->from_wasm = gc_from_wasm;
+  c->no_collect = gc_no_collect;
+}
 
-  gc_no_collect = 0;
+static void gc_after_trap(const GcCatch *c) {
+  gc_rootlist = (GcRoots *)c->roots;
+  gc_from_wasm = c->from_wasm;
+  gc_no_collect = c->no_collect;
   if (gc_claim_slot) {
     __atomic_store_n(&gc_fwd[(gc_claim_slot - 1) * 2 + 1], gc_claim_from,
                      __ATOMIC_RELEASE);
@@ -3626,17 +3660,28 @@ u32 warmc_ref_test(WarmInstance *vm, u64 v, u32 kind, u64 id, u32 depth) {
   return 0;
 }
 
+/* An instance past a limit of this runtime's own: it fails to instantiate,
+   as one that does not link does, saying why. */
+__attribute__((noreturn)) static void refuse_instance(const char *why) {
+  eputs("warmc-rt: cannot instantiate: ");
+  eputs(why);
+  eputs("\n");
+  if (g_catching) { g_catching = 0; g_trap_code = TRAP_LINK; warmc_longjmp(g_catch_buf, 1); }
+  sys_exit(4);
+}
+
+/* A memory may be 65536 pages here, a 32-bit one 65535: an address of a
+   32-bit memory past 2^32 - 2^16 is past any memory, which the compiler's
+   address folds count on (opt.c addr_ran). */
 static WarmMemory *make_memory(u64 min_pages, u64 max_pages, u32 has_max,
                                u32 index64, u32 needs_guard) {
   WarmMemory *M = arena_alloc(sizeof(WarmMemory));
-
-  if (max_pages > 65536) max_pages = 65536;
-  if (min_pages > 65536) warmc_trap(TRAP_MEM_OOB);
-
-  if (!index64) {
-    if (max_pages > 65535) max_pages = 65535;
-    if (min_pages > 65535) warmc_trap(TRAP_MEM_OOB);
-  }
+  u64 limit = index64 ? 65536 : 65535;
+  M->decl_max = max_pages;
+  if (min_pages > limit)
+    refuse_instance(index64 ? "a memory of more than 65536 pages"
+                            : "a 32-bit memory of more than 65535 pages");
+  if (max_pages > limit) max_pages = limit;
   M->has_max = has_max;
   M->index64 = index64;
 
@@ -3678,16 +3723,20 @@ static WarmMemory *make_memory(u64 min_pages, u64 max_pages, u32 has_max,
   return M;
 }
 
+/* A table is mapped at what it may grow to, its maximum or the runtime's
+   2^20 entries, and never moves: compiled code holds where it is.  Pages
+   no entry has reached cost nothing until touched (sys_mmap_lazy). */
 static WarmTable *make_table(u64 min, u64 max, u32 has_max, u32 index64) {
   WarmTable *T = arena_alloc(sizeof(WarmTable));
-  if (min > MAX_TABLE_ENTRIES) warmc_trap(TRAP_TABLE_OOB);
-  u64 cap = has_max ? max : min + 1024;
+  if (min > MAX_TABLE_ENTRIES) refuse_instance("a table of more than 2^20 entries");
+  u64 cap = has_max ? max : MAX_TABLE_ENTRIES;
   if (cap > MAX_TABLE_ENTRIES) cap = MAX_TABLE_ENTRIES;
   if (cap < min) cap = min;
   usz bytes = ((usz)cap * sizeof(TableEntry) + 4095) & ~4095UL;
   if (bytes == 0) bytes = 4096;
-  T->entries = (TableEntry *)sys_mmap(0, bytes, PROT_READ | PROT_WRITE,
-                                      MAP_PRIVATE | MAP_ANONYMOUS);
+  T->entries = (TableEntry *)(bytes > (64u << 10)
+      ? sys_mmap_lazy(bytes)
+      : sys_mmap(0, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS));
   if (!T->entries) die("cannot allocate table");
   T->cap = cap;
   T->len = min;
@@ -3781,21 +3830,24 @@ WarmInstance *warmc_instantiate_bound(const ModuleDesc *md,
     if (binds && binds[i].code) {
       if (im->kind != 0) link_error("host binding is not a function",
                                     im->module, im->name);
+      WarmInstance *ctx = binds[i].self ? v : binds[i].inst;
       imports[2 * fi] = (u64)(uptr)binds[i].code;
-      imports[2 * fi + 1] = (u64)(uptr)binds[i].inst;
+      imports[2 * fi + 1] = (u64)(uptr)ctx;
       funcrefs[fi].code = binds[i].code;
-      funcrefs[fi].instance = binds[i].inst;
+      funcrefs[fi].instance = ctx;
       funcrefs[fi].type_id = im->type_id;
-      funcrefs[fi].rtt = 0;
+      /* a host function is of the type the module imports it at */
+      funcrefs[fi].rtt = md->funcrefs[fi].rtt;
       fi++;
       continue;
     }
 
-    WarmInstance *src = binds ? binds[i].inst
+    int named = binds && binds[i].inst;
+    WarmInstance *src = named ? binds[i].inst
                               : lookup_module(im->module, im->module_len);
     if (!src) link_error("unknown module", im->module, im->name);
 
-    const ExportDesc *e = binds
+    const ExportDesc *e = named
         ? warmc_find_export(src, binds[i].name)
         : warmc_find_export_n(src, im->name, im->name_len);
     if (!e) link_error("unknown import", im->module, im->name);
@@ -3826,7 +3878,7 @@ WarmInstance *warmc_instantiate_bound(const ModuleDesc *md,
       case 2: {
 
         WarmMemory *M = from->mems ? from->mems[e->index] : 0;
-        if (!M || !limits_match(M->pages, M->max_pages, M->has_max, M->index64,
+        if (!M || !limits_match(M->pages, M->decl_max, M->has_max, M->index64,
                                 im->min, im->max, im->has_max, im->index64))
           link_error("incompatible import type", im->module, im->name);
         in->mems[mi++] = M;
@@ -4796,8 +4848,22 @@ __attribute__((noreturn)) static void warmc_run(int argc, char **argv) {
 
   if (warmc_gcth_tests) warmc_gcth_tests();
 
+  /* Six megabytes below main's frame for the program -- or as far as the
+     thread's own stack goes, short of what the runtime and a signal frame
+     need below it, where that is less: a deep recursion traps as call
+     stack exhausted rather than running into the guard page under a stack
+     an RLIMIT_STACK made small. */
   u64 here = (u64)(uptr)&argv;
-  g_stack_limit = here > (6u << 20) ? here - (6u << 20) : 0;
+  u64 limit = here > (6u << 20) ? here - (6u << 20) : 0;
+  u64 lo = 0, hi = 0;
+  warmc_rt_stack_bounds(&lo, &hi);
+  if (lo && here > lo && here <= hi) {
+    u64 margin = (hi - lo) / 8;
+    if (margin < (64u << 10)) margin = 64u << 10;
+    if (margin > (256u << 10)) margin = 256u << 10;
+    if (limit < lo + margin) limit = lo + margin;
+  }
+  g_stack_limit = limit;
 
   sys_exit(warmc_driver_hook(argc, argv));
 }

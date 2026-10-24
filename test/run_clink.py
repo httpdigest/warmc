@@ -89,6 +89,8 @@ CASES = {
     "composed": [("len", ["5"]), ("len", ["1"]), ("len", ["0"])],
     "fused": [("run", []), ("wide", [])],
     "outer2": [("outer", []), ("local", [])],
+    "xreffunc": [("run", ["21"])],
+    "xreffunc2": [("t1", []), ("t3", []), ("tt", []), ("selftest", [])],
     "linkable": [
         ("test:link/ops#split", []),
         ("test:link/ops#through-mem", ["5"]),

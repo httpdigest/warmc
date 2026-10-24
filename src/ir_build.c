@@ -1174,7 +1174,7 @@ static void gc_build(Bld *b, uint32_t sub, const char *sym) {
       Ref x = pop(b);
       ValType t = (ValType)f->insts[x].type;
       bool nul = !vt_is_ref(t) || vt_nullable(t);
-      push(b, ir_emit(f, b->cur, I_REF_CONVERT,
+      push(b, ir_emit(f, b->cur, sub == 26 ? I_ANY_OF_EXTERN : I_EXTERN_OF_ANY,
                       vt_ref(nul, sub == 26 ? HT_ANY : HT_EXTERN), &x, 1, 0, 0));
       break;
     }

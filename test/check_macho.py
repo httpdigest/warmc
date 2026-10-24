@@ -21,7 +21,9 @@ assert cputype == 0x0100000C, "not arm64: %#x" % cputype
 
 segments = []
 sections = {}
+sect_order = []
 symbols = {}
+defined = []
 local_text = []
 uuid = None
 off = 32
@@ -37,6 +39,7 @@ for _ in range(ncmds):
             sn = buf[so:so + 16].rstrip(b"\0").decode()
             addr, size = struct.unpack_from("<QQ", buf, so + 32)
             sections["%s,%s" % (segname, sn)] = (addr, size)
+            sect_order.append(("%s,%s" % (segname, sn), addr, size))
             so += 80
     elif cmd == 0x2:
         symoff, nsyms, stroff, strsize = struct.unpack_from("<IIII", buf, off + 8)
@@ -46,6 +49,8 @@ for _ in range(ncmds):
             end = buf.index(b"\0", stroff + strx)
             name = buf[stroff + strx:end].decode()
             symbols[name] = value
+            if ntype & 0x0E == 0x0E:
+                defined.append((name, nsect, value))
             if ntype == 0x0E and nsect == 1:
                 local_text.append(name)
     elif cmd == 0x1B:
@@ -101,6 +106,27 @@ def in_text(a):
 
 problems = []
 seen = []
+
+# Each symbol defined in a section names the one its address is in, by its
+# ordinal among the image's sections: a profiler or debugger finds what a
+# symbol is by that.  One at a section's end belongs to it when no other
+# starts there.  A symbol whose code the link dropped is not there at all.
+base = min(v for v, _, _, fsz in segments if fsz) if segments else 0
+for name, nsect, value in defined:
+    # the image's header, which ld64 too gives the first section
+    if name in ("__mh_execute_header", "__mh_dylib_header") and nsect == 1 and value == base:
+        continue
+    inside = [k for k, (_, a, n) in enumerate(sect_order) if a <= value < a + n]
+    ends = [k for k, (_, a, n) in enumerate(sect_order) if value == a + n]
+    want = (inside or ends or [None])[0]
+    if want is None or nsect != want + 1:
+        problems.append("symbol %s at %#x is in section %d (%s), which is %s"
+                        % (name, value, nsect,
+                           sect_order[nsect - 1][0] if 0 < nsect <= len(sect_order) else "none",
+                           "%d (%s)" % (want + 1, sect_order[want][0]) if want is not None
+                           else "in no section"))
+        if len(problems) > 8:
+            break
 
 for i in range(nexport):
     e = exports_ptr + EXPORT_SIZE * i

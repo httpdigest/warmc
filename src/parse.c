@@ -1,6 +1,7 @@
 #include "warmc.h"
 #include "reader.h"
 #include "opcodes.h"
+#include "sort.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -810,7 +811,7 @@ Module *wasm_parse(const uint8_t *bin, size_t len) {
         uint32_t nl;
         char *nm = rd_name(&sec, &nl);
         const uint8_t *at = sec.p - nl;
-        if (!strcmp(nm, "go:buildid")) m->go_stack = true;
+        if (nl == 10 && !memcmp(nm, "go:buildid", 10)) m->go_stack = true;
         xfree(nm);
         m->customs = xrealloc(m->customs, (m->ncustoms + 1) * sizeof(CustomSec));
         m->customs[m->ncustoms++] = (CustomSec){ at, sec.p, nl, (uint32_t)(sec.end - sec.p) };
@@ -923,39 +924,67 @@ void module_free(Module *m) {
   xfree(m);
 }
 
+typedef struct { uint64_t id; uint32_t i; } TypeById;
+#define TYPE_BY_ID_LESS(x, y) ((x)->id < (y)->id || ((x)->id == (y)->id && (x)->i < (y)->i))
+WARMC_SORT(sort_types_by_id, TypeById, TYPE_BY_ID_LESS)
+
+/* Per type index, the first type index of the same identity: a call
+   through either reaches the same functions. */
+uint32_t *module_type_canon(const Module *m) {
+  uint32_t n = m->ntypes;
+  uint32_t *canon = xmalloc((n ? n : 1) * sizeof(uint32_t));
+  TypeById *by = xmalloc((n ? n : 1) * sizeof(TypeById));
+  for (uint32_t i = 0; i < n; i++) by[i] = (TypeById){ m->types[i].id, i };
+  sort_types_by_id(by, n);
+  for (uint32_t k = 0; k < n; k++)
+    canon[by[k].i] = k && by[k - 1].id == by[k].id ? canon[by[k - 1].i] : by[k].i;
+  xfree(by);
+  return canon;
+}
+
 /* A final function type with an identity of its own, appended as the
    parser appends one: for a transform that gives functions a signature the
-   module did not have (tramp.c, gosp.c).  It shares a rec group with an
-   empty function type, so no type the module wrote by the same structure
-   is the same type -- a call through one of those still traps on these
-   functions -- while a call through it checks the type by its identity
-   alone, as a final type's is checked. */
+   module did not have (tramp.c, gosp.c).  It shares a rec group with empty
+   function types, so no type the module wrote by the same structure is the
+   same type -- a call through one of those still traps on these functions
+   -- while a call through it checks the type by its identity alone, as a
+   final type's is checked.  One empty type does unless the module wrote
+   that very group, and then the group takes another until it is new. */
 uint32_t module_add_distinct_func_type(Module *m, const ValType *params, uint32_t nparams,
                                        const ValType *results, uint32_t nresults) {
   uint32_t i = m->ntypes;
-  m->types = xrealloc(m->types, (i + 2) * sizeof(CompType));
-  memset(&m->types[i], 0, 2 * sizeof(CompType));
-  for (uint32_t k = 0; k < 2; k++) {
-    CompType *t = &m->types[i + k];
-    t->kind = CT_FUNC;
-    t->final_ = true;
-    t->rec_first = i;
-    t->rec_n = 2;
-    t->params = xmalloc((k ? 1 : nparams ? nparams : 1) * sizeof(ValType));
-    t->results = xmalloc((k ? 1 : nresults ? nresults : 1) * sizeof(ValType));
+  for (uint32_t n = 2;; n++) {
+    m->types = xrealloc(m->types, (i + n) * sizeof(CompType));
+    memset(&m->types[i], 0, n * sizeof(CompType));
+    for (uint32_t k = 0; k < n; k++) {
+      CompType *t = &m->types[i + k];
+      t->kind = CT_FUNC;
+      t->final_ = true;
+      t->rec_first = i;
+      t->rec_n = n;
+      t->params = xmalloc((k ? 1 : nparams ? nparams : 1) * sizeof(ValType));
+      t->results = xmalloc((k ? 1 : nresults ? nresults : 1) * sizeof(ValType));
+    }
+    CompType *t = &m->types[i];
+    memcpy(t->params, params, nparams * sizeof(ValType));
+    t->nparams = nparams;
+    memcpy(t->results, results, nresults * sizeof(ValType));
+    t->nresults = nresults;
+    m->ntypes = i + n;
+    identify_group(m, i, n);
+    for (uint32_t k = 0; k < n; k++) build_display(m, i + k);
+    /* the identity is a hash of the structure (check_type_ids): a type of
+       the module with one of the group's is a group the module wrote */
+    bool taken = false;
+    for (uint32_t u = 0; u < i && !taken; u++)
+      for (uint32_t k = 0; k < n && !taken; k++)
+        if (m->types[u].id == m->types[i + k].id) taken = true;
+    if (!taken) return i;
+    for (uint32_t k = 0; k < n; k++) {
+      xfree(m->types[i + k].params);
+      xfree(m->types[i + k].results);
+      xfree(m->types[i + k].display);
+    }
+    m->ntypes = i;
   }
-  CompType *t = &m->types[i];
-  memcpy(t->params, params, nparams * sizeof(ValType));
-  t->nparams = nparams;
-  memcpy(t->results, results, nresults * sizeof(ValType));
-  t->nresults = nresults;
-  m->ntypes = i + 2;
-  identify_group(m, i, 2);
-  build_display(m, i);
-  build_display(m, i + 1);
-  /* the identity is a hash of the structure (check_type_ids) */
-  for (uint32_t u = 0; u < i; u++)
-    if (m->types[u].id == m->types[i].id || m->types[u].id == m->types[i + 1].id)
-      warmc_fatal("internal: a transform's new type has the identity of type %u", u);
-  return i;
 }

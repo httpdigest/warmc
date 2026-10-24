@@ -19,7 +19,10 @@
    It changes the signature of every function the loop reaches, so it is
    made only where nothing else can tell:
    - one call_indirect in the module has the loop's type, () -> i32, through
-     table 0, and nothing calls through a reference of that type;
+     table 0, and nothing calls through a reference of that type.  It is
+     StgRun's, alone in a loop that calls again with what it returns until
+     that is 0 -- loop, local.get N, the call, local.tee N, br_if 0, end --
+     so a function's result is only ever the next index to call;
    - table 0 is frozen (module_table0_facts) and nothing reads a reference
      out of it, and each of its entries of that type is defined in the
      module, neither exported nor called directly nor taken by ref.func nor
@@ -28,6 +31,14 @@
    - a register is a mutable i32 global, neither imported nor exported, that
      only those functions touch: the loop sees the values a function wrote
      when it returns 0, and nothing else ever reads them.
+   A call out of one of those functions into what can run the loop again --
+   the loop's function itself, what calls it, an import other than WASI's
+   when the host can call back into it, a call through a type one of those
+   has -- stores the
+   registers to their globals before and loads them after, so that a
+   trampoline run inside another starts from and leaves the values the
+   original would have; in a module that catches exceptions every call out
+   stores them before, for a handler that runs the loop again.
    The bodies written are validated as the module's were. */
 
 #include "warmc.h"
@@ -65,6 +76,12 @@ typedef struct {
   const Table0Facts *t0;
   uint8_t *in_s;
   uint32_t reg[TR_NREG], nreg;
+  /* per function, then per canonical type index, then the host: whether a
+     call to it can run the loop (TrScan's reach) */
+  const uint8_t *reach;
+  const uint32_t *canon;
+  uint32_t host;
+  bool catches;
 } Tr;
 
 static int tr_reg(const Tr *t, uint32_t g) {
@@ -117,6 +134,22 @@ static void tr_go(const Tr *t, Buf *b, uint32_t tmp) {
   buf_u8(b, 0x13); tr_uleb(b, t->nt); tr_uleb(b, 0);
 }
 
+/* the registers to their globals, before a call that can run the loop;
+   and back, after it */
+static void tr_store(const Tr *t, Buf *b) {
+  for (uint32_t k = 0; k < t->nreg; k++) {
+    buf_u8(b, 0x20); tr_uleb(b, k);
+    buf_u8(b, 0x24); tr_uleb(b, t->reg[k]);
+  }
+}
+
+static void tr_load(const Tr *t, Buf *b) {
+  for (uint32_t k = 0; k < t->nreg; k++) {
+    buf_u8(b, 0x23); tr_uleb(b, t->reg[k]);
+    buf_u8(b, 0x21); tr_uleb(b, k);
+  }
+}
+
 static uint8_t *tr_own(Module *m, Buf *b) {
   m->owned_bodies = xrealloc(m->owned_bodies, (m->nowned_bodies + 1) * sizeof(uint8_t *));
   m->owned_bodies[m->nowned_bodies++] = b->data;
@@ -165,6 +198,16 @@ static bool tr_rewrite_s(Tr *t, uint32_t fi) {
         const_at = here;
         const_k = k;
         continue;
+      }
+      case 0x10: case 0x11: case 0x14: {
+        uint32_t x = rd_u32(&r);
+        if (op == 0x11) rd_u32(&r);
+        bool runs = op == 0x10 ? t->reach[x]
+                  : t->reach[m->nfuncs + t->canon[x]] || (op == 0x14 && t->reach[t->host]);
+        if (runs || t->catches) tr_store(t, &b);
+        buf_bytes(&b, at, (size_t)(r.p - at));
+        if (runs) tr_load(t, &b);
+        break;
       }
       case 0x0f:
         if (const_at != (size_t)-1) {
@@ -240,15 +283,32 @@ static bool tr_rewrite_loop(Tr *t, uint32_t fi) {
 
 /* What the module's bodies do that the rewrite must know: who is called
    directly or taken by ref.func, where the loop's type is called through,
-   which globals each function touches. */
+   whether anything catches an exception, and every call as an edge from
+   the caller to what it calls -- a function, nf plus the canonical index
+   of a type called through, or the host (nf + ntypes) for a call through
+   a reference, which may be one the host handed in. */
+typedef struct { uint32_t to, from; } TrEdge;
+
 typedef struct {
   uint8_t *direct, *refd;
   uint32_t loop_fn, nloop;
-  bool bad;
+  bool bad, catches;
+  const uint32_t *canon;
+  TrEdge *edge;
+  uint32_t nedge, capedge;
 } TrScan;
 
+static void tr_edge(TrScan *sc, uint32_t from, uint32_t to) {
+  if (sc->nedge == sc->capedge) {
+    sc->capedge = sc->capedge ? sc->capedge * 2 : 1024;
+    sc->edge = xrealloc(sc->edge, sc->capedge * sizeof(TrEdge));
+  }
+  sc->edge[sc->nedge++] = (TrEdge){ to, from };
+}
+
 static void tr_scan(const Module *m, uint64_t tid, TrScan *sc) {
-  for (uint32_t fi = m->nimported_funcs; fi < m->nfuncs && !sc->bad; fi++) {
+  uint32_t nf = m->nfuncs, host = nf + m->ntypes;
+  for (uint32_t fi = m->nimported_funcs; fi < nf && !sc->bad; fi++) {
     const Func *f = &m->funcs[fi];
     if (!f->body) continue;
     Rd r = rd_make(f->body, f->body_end, f->body);
@@ -257,12 +317,12 @@ static void tr_scan(const Module *m, uint64_t tid, TrScan *sc) {
       switch (op) {
         case 0x10: case 0x12: {
           uint32_t c = rd_u32(&r);
-          if (c < m->nfuncs) sc->direct[c] = 1;
+          if (c < nf) { sc->direct[c] = 1; tr_edge(sc, fi, c); }
           continue;
         }
         case 0xd2: {
           uint32_t c = rd_u32(&r);
-          if (c < m->nfuncs) sc->refd[c] = 1;
+          if (c < nf) sc->refd[c] = 1;
           continue;
         }
         case 0x25:
@@ -271,23 +331,115 @@ static void tr_scan(const Module *m, uint64_t tid, TrScan *sc) {
           continue;
         case 0x11: case 0x13: {
           uint32_t ti = rd_u32(&r), tab = rd_u32(&r);
+          (void)tab;
           if (tr_is_loop_type(m, ti, tid)) {
-            if (op != 0x11 || tab != 0) sc->bad = true;
+            /* the one, StgRun's shape asks, is a call_indirect */
             sc->loop_fn = fi;
             sc->nloop++;
+          } else if (ti < m->ntypes) {
+            tr_edge(sc, fi, nf + sc->canon[ti]);
           }
           continue;
         }
         case 0x14: case 0x15: {
           uint32_t ti = rd_u32(&r);
           if (tr_is_loop_type(m, ti, tid)) sc->bad = true;
+          else if (ti < m->ntypes) { tr_edge(sc, fi, nf + sc->canon[ti]); tr_edge(sc, fi, host); }
           continue;
         }
+        case 0x06: case 0x1f:
+          sc->catches = true;
+          break;
         default: break;
       }
       if (!wasm_skip_imm(&r, op)) sc->bad = true;
     }
   }
+}
+
+/* Whether the loop's call is StgRun's:
+     loop  local.get N  call_indirect  local.tee N  br_if 0  end
+   or local.set N, local.get N in place of the local.tee. */
+static bool tr_loop_shape(const Module *m, const Func *f, uint64_t tid) {
+  Rd r = rd_make(f->body, f->body_end, f->body);
+  uint32_t op1 = 0, imm1 = 0, op2 = 0, imm2 = 0;
+  while (!rd_eof(&r)) {
+    uint32_t op = wasm_read_op(&r), imm = 0;
+    if (op == 0x11) {
+      uint32_t ti = rd_u32(&r);
+      rd_u32(&r);
+      if (tr_is_loop_type(m, ti, tid)) {
+        if (op2 != 0x03 || imm2 != 0x40 || op1 != 0x20) return false;
+        uint32_t n = imm1, a = wasm_read_op(&r);
+        if (a == 0x21) {
+          if (rd_u32(&r) != n || wasm_read_op(&r) != 0x20) return false;
+        } else if (a != 0x22) {
+          return false;
+        }
+        if (rd_u32(&r) != n || wasm_read_op(&r) != 0x0d || rd_u32(&r) != 0) return false;
+        return wasm_read_op(&r) == 0x0b;
+      }
+    } else if (op == 0x20) {
+      imm = rd_u32(&r);
+    } else {
+      if (op == 0x02 || op == 0x03 || op == 0x04) imm = rd_eof(&r) ? 0 : *r.p;
+      if (!wasm_skip_imm(&r, op)) return false;
+    }
+    op2 = op1; imm2 = imm1;
+    op1 = op; imm1 = imm;
+  }
+  return false;
+}
+
+/* Whether an import is one of WASI's, none of which calls into the module. */
+static bool tr_wasi(const Module *m, uint32_t fi) {
+  const Func *f = &m->funcs[fi];
+  if (!f->imported || f->import_index >= m->nimports) return false;
+  const Import *im = &m->imports[f->import_index];
+  return (im->module_len == 22 && !memcmp(im->module, "wasi_snapshot_preview1", 22)) ||
+         (im->module_len == 13 && !memcmp(im->module, "wasi_unstable", 13));
+}
+
+/* What can run the loop again, found back from it along the calls: per
+   node of TrScan's edges, 1 when a call to it can.  A function anything
+   can call through a type -- in the table or taken by ref.func -- makes
+   its type and each above it reach the loop; one of those, or an export,
+   makes the host, and so every import but WASI's. */
+static uint8_t *tr_reach(const Module *m, const TrScan *sc, const uint8_t *addr,
+                         const uint8_t *exported) {
+  uint32_t nf = m->nfuncs, host = nf + m->ntypes, nn = host + 1;
+  uint32_t *start = xcalloc(nn + 1, sizeof(uint32_t));
+  uint32_t *from = xmalloc((sc->nedge ? sc->nedge : 1) * sizeof(uint32_t));
+  for (uint32_t e = 0; e < sc->nedge; e++) start[sc->edge[e].to + 1]++;
+  for (uint32_t k = 0; k < nn; k++) start[k + 1] += start[k];
+  uint32_t *fill = xmalloc(nn * sizeof(uint32_t));
+  memcpy(fill, start, nn * sizeof(uint32_t));
+  for (uint32_t e = 0; e < sc->nedge; e++) from[fill[sc->edge[e].to]++] = sc->edge[e].from;
+  xfree(fill);
+
+  uint8_t *reach = xcalloc(nn, 1);
+  uint32_t *work = xmalloc(nn * sizeof(uint32_t)), nw = 0;
+#define TR_REACH(x) do { if (!reach[x]) { reach[x] = 1; work[nw++] = (x); } } while (0)
+  TR_REACH(sc->loop_fn);
+  while (nw) {
+    uint32_t x = work[--nw];
+    for (uint32_t k = start[x]; k < start[x + 1]; k++) TR_REACH(from[k]);
+    if (x == host) {
+      for (uint32_t fi = 0; fi < m->nimported_funcs; fi++)
+        if (!tr_wasi(m, fi)) TR_REACH(fi);
+    } else if (x < nf) {
+      if (addr[x])
+        for (uint32_t ti = m->funcs[x].type_index; ti < m->ntypes;) {
+          TR_REACH(nf + sc->canon[ti]);
+          if (!m->types[ti].has_super) break;
+          ti = m->types[ti].super;
+        }
+      if (addr[x] || exported[x]) TR_REACH(host);
+    }
+  }
+#undef TR_REACH
+  xfree(work); xfree(start); xfree(from);
+  return reach;
 }
 
 /* Of a body: whether it tail-calls or handles exceptions, and the counts of
@@ -325,28 +477,32 @@ uint32_t module_untrampoline(Module *m) {
       have = true;
     }
   }
-  if (!have || m->ntables != 1 || !m->nglobals) return 0;
+  if (!have || !m->nglobals) return 0;
+  /* frozen, which asks that it be the module's one table, with each
+     slot known */
   const Table0Facts *t0 = module_table0_facts(m);
-  if (!t0->frozen || !t0->entry) {
+  if (!t0->entry) {
     xfree(m->t0->entry); xfree(m->t0->sites); xfree(m->t0);
     m->t0 = NULL;
     return 0;
   }
 
   uint32_t nf = m->nfuncs, ng = m->nglobals;
-  TrScan sc = { xcalloc(nf, 1), xcalloc(nf, 1), UINT32_MAX, 0, false };
+  TrScan sc = { xcalloc(nf, 1), xcalloc(nf, 1), UINT32_MAX, 0, false, false,
+                module_type_canon(m), NULL, 0, 0 };
   tr_scan(m, tid, &sc);
-  uint8_t *in_s = xcalloc(nf, 1);
+  uint8_t *in_s = xcalloc(nf, 1), *reach = NULL;
   uint32_t *cnt = xcalloc(ng, sizeof(uint32_t));
   uint8_t *outside = xcalloc(ng, 1);
   uint32_t ns = 0, applied = 0;
-  bool ok = !sc.bad && sc.nloop == 1 && sc.loop_fn != UINT32_MAX;
+  bool ok = !sc.bad && sc.nloop == 1 && sc.loop_fn != UINT32_MAX &&
+            tr_loop_shape(m, &m->funcs[sc.loop_fn], tid);
 
   for (uint32_t k = 0; k < t0->n && ok; k++) {
     uint32_t fi = t0->entry[k];
     if (fi == TABLE0_NULL || fi >= nf || in_s[fi]) continue;
     if (!tr_is_loop_type(m, m->funcs[fi].type_index, tid)) continue;
-    if (m->funcs[fi].imported || !m->funcs[fi].body || sc.direct[fi] || sc.refd[fi] ||
+    if (!m->funcs[fi].body || sc.direct[fi] || sc.refd[fi] ||
         fi == sc.loop_fn || (m->has_start && m->start_func == fi))
       ok = false;
     in_s[fi] = 1;
@@ -381,12 +537,36 @@ uint32_t module_untrampoline(Module *m) {
   for (uint32_t e = 0; e < m->nexports; e++)
     if (m->exports[e].kind == EK_GLOBAL && m->exports[e].index < ng) outside[m->exports[e].index] = 1;
 
+  /* what anything can call through a type, and what the host can call */
+  uint8_t *addr = xcalloc(nf, 1), *exported = xcalloc(nf, 1);
+  for (uint32_t k = 0; k < t0->n; k++)
+    if (t0->entry[k] != TABLE0_NULL && t0->entry[k] < nf) addr[t0->entry[k]] = 1;
+  for (uint32_t fi = 0; fi < nf; fi++) addr[fi] |= sc.refd[fi];
+  for (uint32_t s = 0; s < m->nelems; s++)
+    for (uint32_t j = 0; j < m->elems[s].n; j++)
+      for (uint32_t k = 0; k < m->elems[s].items[j].n; k++) {
+        const InitInsn *in = &m->elems[s].items[j].ins[k];
+        if (in->op == IOP_REF_FUNC && in->lo < nf) addr[in->lo] = 1;
+      }
+  for (uint32_t g = 0; g < ng; g++)
+    for (uint32_t k = 0; k < m->globals[g].init.n; k++)
+      if (m->globals[g].init.ins[k].op == IOP_REF_FUNC && m->globals[g].init.ins[k].lo < nf)
+        addr[m->globals[g].init.ins[k].lo] = 1;
+  for (uint32_t e = 0; e < m->nexports; e++)
+    if (m->exports[e].kind == EK_FUNC && m->exports[e].index < nf) exported[m->exports[e].index] = 1;
+  reach = tr_reach(m, &sc, addr, exported);
+  xfree(addr); xfree(exported);
+
   Tr t;
   memset(&t, 0, sizeof t);
   t.m = m;
   t.tid = tid;
   t.t0 = t0;
   t.in_s = in_s;
+  t.reach = reach;
+  t.canon = sc.canon;
+  t.host = nf + m->ntypes;
+  t.catches = sc.catches;
   for (uint32_t k = 0; k < TR_NREG; k++) {
     uint32_t best = UINT32_MAX;
     for (uint32_t g = 0; g < ng; g++) {
@@ -428,7 +608,7 @@ out:
      again when asked for. */
   xfree(m->t0->entry); xfree(m->t0->sites); xfree(m->t0);
   m->t0 = NULL;
-  xfree(sc.direct); xfree(sc.refd);
-  xfree(in_s); xfree(cnt); xfree(outside);
+  xfree(sc.direct); xfree(sc.refd); xfree((uint32_t *)sc.canon); xfree(sc.edge);
+  xfree(in_s); xfree(reach); xfree(cnt); xfree(outside);
   return applied;
 }

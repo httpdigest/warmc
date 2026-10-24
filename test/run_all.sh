@@ -284,6 +284,7 @@ for c in cbench cppbench rsbench zigbench; do
 done
 
 start magic    python3 test/magic.py
+start optcases python3 test/run_optcases.py
 start reject   ./test/run_reject.sh
 start asan     ./test/run_asan.sh
 start tsan     ./test/run_tsan.sh
@@ -298,11 +299,14 @@ if [ -z "${CHECK_SMOKE:-}" ]; then
   start gc-pause env GC_PAUSE_CHECK=only WARMC_FLAGS=-O2 ./test/run_gc.sh
   wait
   # gosp.c: the modules in Go's shape that rule its rewrite out, and random
-  # ones it makes, against wasm-interp.  Also after the others: it links and
-  # runs some four hundred fresh binaries, and macOS checks a fresh binary's
-  # signature on its first run one at a time across the machine
-  # (test/run_cases.py), which beside the other rows starves their runs.
+  # ones it makes, against wasm-interp; tramp.c: the modules in GHC's shape
+  # that rule its rewrite out or need more of it, at -O0 and -O2.  Also
+  # after the others: they link and run some five hundred fresh binaries,
+  # and macOS checks a fresh binary's signature on its first run one at a
+  # time across the machine (test/run_cases.py), which beside the other
+  # rows starves their runs.
   start gosp python3 test/run_gosp.py
+  start tramp python3 test/run_tramp.py
   wait
   # Every pair of passes, off and on in all four combinations, over the
   # cases, traps and the collector: nine settings (make check-combos does

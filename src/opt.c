@@ -3143,7 +3143,7 @@ static bool pass_dce(IrFunc *f) {
            f->insts[v].op == I_ARRAY_GET || f->insts[v].op == I_I31_GET) &&
           !gc_op_traps(&f->insts[v]))
         continue;
-      if (!ir_is_pure(&f->insts[v])) MARK(v);
+      if (!ir_has_no_effect(&f->insts[v])) MARK(v);
     }
     if (b->term == T_BRIF || b->term == T_BRTABLE) MARK(b->term_arg);
     for (uint32_t i = 0; i < b->nret; i++) MARK(b->ret_args[i]);
@@ -4649,10 +4649,6 @@ static bool cse_candidate(IrFunc *f, Ref v, bool gcpure) {
   }
   if (!ir_is_pure(in)) return false;
   if (in->op == I_PARAM || in->op == I_NOP) return false;
-
-  if (in->op == I_LOAD || in->op == I_GLOBAL_GET) return false;
-
-  if (in->op == I_EXN_OBJ) return false;
   return in->type != 0;
 }
 
@@ -5984,6 +5980,9 @@ typedef struct {
   bool makes_calls;
   VtStore *vtst;
   uint32_t nvtst, capvtst;
+  /* the functions it takes by ref.func, each once (ref_effects) */
+  uint32_t *refs;
+  uint32_t nrefs, caprefs;
 } DirectFx;
 
 /* -fdead-frames's facts about each function, from its body as built (see
@@ -6027,6 +6026,8 @@ static bool fx_resolved;
 static bool fx_warming;
 static int fx_indirect_done;
 static CallFx fx_indirect;
+static int fx_ref_done;
+static CallFx fx_ref;
 
 typedef struct {
   bool computed;
@@ -6099,12 +6100,13 @@ static void fx_scan_direct(Module *m, const OptOpts *o, uint32_t fi);
 static const CallFx *call_effects(Module *m, const OptOpts *o, uint32_t fi,
                                   int depth);
 static const CallFx *indirect_effects(Module *m, const OptOpts *o);
+static const CallFx *ref_effects(Module *m, const OptOpts *o);
 
 void opt_effects_begin(Module *m, const OptOpts *o) {
   if (fx_mod == m && fx_opts == o) return;
   xfree(fx_func);
   if (fx_direct)
-    for (uint32_t i = 0; i < fx_nfuncs; i++) xfree(fx_direct[i].vtst);
+    for (uint32_t i = 0; i < fx_nfuncs; i++) { xfree(fx_direct[i].vtst); xfree(fx_direct[i].refs); }
   xfree(fx_direct);
   memset(&fx_table0, 0, sizeof(fx_table0));
   xfree(fx_vt); fx_vt = NULL;
@@ -6127,6 +6129,7 @@ void opt_effects_begin(Module *m, const OptOpts *o) {
   fx_func = xcalloc(m->nfuncs ? m->nfuncs : 1, sizeof(CallFx));
   fx_direct = xcalloc(m->nfuncs ? m->nfuncs : 1, sizeof(DirectFx));
   fx_indirect_done = 0;
+  fx_ref_done = 0;
   fx_resolved = false;
 }
 
@@ -6142,6 +6145,7 @@ void opt_effects_end(Module *m, const OptOpts *o) {
   fx_warming = true;
   for (uint32_t fi = 0; fi < m->nfuncs; fi++) call_effects(m, o, fi, 0);
   indirect_effects(m, o);
+  ref_effects(m, o);
   fx_facts_build(m);
   if (df_func) df_resolve(m);
   fx_warming = false;
@@ -6230,6 +6234,18 @@ static void fx_scan_direct(Module *m, const OptOpts *o, uint32_t fi) {
             gc_arrays = true;
           }
           break;
+        case I_REF_FUNC: {
+          uint32_t c = (uint32_t)in->imm;
+          bool have = false;
+          for (uint32_t k = 0; k < d->nrefs && !have; k++) have = d->refs[k] == c;
+          if (have) break;
+          if (d->nrefs == d->caprefs) {
+            d->caprefs = d->caprefs ? d->caprefs * 2 : 4;
+            d->refs = xrealloc(d->refs, d->caprefs * sizeof(uint32_t));
+          }
+          d->refs[d->nrefs++] = c;
+          break;
+        }
         case I_FIELD_SET:
           /* an initialising store writes an object younger than anything
              a caller could be tracking */
@@ -6426,8 +6442,7 @@ static void df_set(DfVals *dv, Ref v, uint8_t k, uint8_t id, int64_t off) {
 /* What v is an address from, given its operands. */
 static void df_derive(IrFunc *f, DfVals *dv, Ref v) {
   Inst *in = &f->insts[v];
-  if (in->op == I_LOAD || in->op == I_VLOAD || in->op == I_VLDN ||
-      df_is_cmp(in->op) || !ir_is_pure(in))
+  if (df_is_cmp(in->op) || !ir_is_pure(in))
     return;
   Ref *a = ir_args(f, v);
   uint32_t n = f->ninsts;
@@ -6649,7 +6664,7 @@ static void df_scan(Module *m, IrFunc *g, uint32_t fi) {
           case I_BOUNDS_CHECK: case I_TRAP_IF: case I_SELECT:
             break;
           default:
-            if (!df_is_cmp(in->op) && !ir_is_pure(in)) df_poison(d, k, id);
+            if (!df_is_cmp(in->op) && !ir_has_no_effect(in)) df_poison(d, k, id);
             break;
         }
       }
@@ -7034,7 +7049,7 @@ static bool pass_dead_frames(IrFunc *f) {
               break;
             default:
               if (df_is_cmp(in->op)) break;
-              if (!ir_is_pure(in) || is_call_op(in->op)) DF_ESCAPE(i);
+              if (!ir_has_no_effect(in) || is_call_op(in->op)) DF_ESCAPE(i);
               break;
           }
         }
@@ -7989,13 +8004,102 @@ static const CallFx *indirect_effects(Module *m, const OptOpts *o) {
   return &fx_indirect;
 }
 
+/* Whether a reference to a function can come into the module from outside,
+   where it could be one of anything: a reference other than an extern one
+   that crosses the boundary inward -- an import's parameter or result
+   handed back, an export's parameter, an imported or exported table, a
+   global the host can set, an imported tag's payload. */
+static bool fx_ref_inward(ValType t) {
+  if (!vt_is_ref(t)) return false;
+  if (vt_concrete(t)) return true;
+  HeapType h = vt_heap(t);
+  return h != HT_EXTERN && h != HT_NOEXTERN;
+}
+
+static bool fx_refs_cross(const Module *m) {
+  for (uint32_t g = 0; g < m->nglobals; g++)
+    if (m->globals[g].imported && fx_ref_inward(m->globals[g].type)) return true;
+  for (uint32_t i = 0; i < m->nimports; i++) {
+    const Import *im = &m->imports[i];
+    if (im->kind == EK_TABLE) return true;
+    if ((im->kind == EK_FUNC || im->kind == EK_TAG) && im->type_index < m->ntypes) {
+      const CompType *t = &m->types[im->type_index];
+      for (uint32_t k = 0; k < t->nparams; k++)
+        if (fx_ref_inward(t->params[k])) return true;
+      for (uint32_t k = 0; k < t->nresults; k++)
+        if (fx_ref_inward(t->results[k])) return true;
+    }
+  }
+  for (uint32_t e = 0; e < m->nexports; e++) {
+    const Export *x = &m->exports[e];
+    if (x->kind == EK_TABLE) return true;
+    if (x->kind == EK_GLOBAL && x->index < m->nglobals && m->globals[x->index].mutable_ &&
+        fx_ref_inward(m->globals[x->index].type))
+      return true;
+    if (x->kind == EK_FUNC && x->index < m->nfuncs) {
+      const CompType *t = &m->types[m->funcs[x->index].type_index];
+      for (uint32_t k = 0; k < t->nparams; k++)
+        if (fx_ref_inward(t->params[k])) return true;
+    }
+  }
+  return false;
+}
+
+static void fx_meet_init(Module *m, const OptOpts *o, const InitExpr *e, CallFx *meet,
+                         uint8_t *seen) {
+  for (uint32_t k = 0; k < e->n; k++) {
+    if (e->ins[k].op != IOP_REF_FUNC || e->ins[k].lo >= m->nfuncs) continue;
+    uint32_t c = (uint32_t)e->ins[k].lo;
+    if (seen[c]) continue;
+    seen[c] = 1;
+    fx_meet(meet, call_effects(m, o, c, 0));
+  }
+}
+
+/* What a call through a function reference can do: what any function a
+   reference is taken of can -- by ref.func in a body, a global, a segment
+   or a table's initial value -- when no reference can come in from
+   outside (fx_refs_cross); anything otherwise.  Not table 0's entries
+   alone, as for a call_indirect through it: a reference may be to any of
+   these. */
+static const CallFx *ref_effects(Module *m, const OptOpts *o) {
+  fx_need(m, o);
+  if (fx_ref_done) return &fx_ref;
+  fx_ref_done = 1;
+  fx_ref = fx_unknown;
+  if (fx_refs_cross(m)) return &fx_ref;
+
+  CallFx meet = { .state = 2, .frame_only = true,
+                  .frame_global = 0xffffffffu, .lo = 0, .hi = -FRAME_SPAN };
+  uint8_t *seen = xcalloc(m->nfuncs ? m->nfuncs : 1, 1);
+  for (uint32_t fi = 0; fi < m->nfuncs; fi++)
+    for (uint32_t k = 0; k < fx_direct[fi].nrefs; k++) {
+      uint32_t c = fx_direct[fi].refs[k];
+      if (c >= m->nfuncs || seen[c]) continue;
+      seen[c] = 1;
+      fx_meet(&meet, call_effects(m, o, c, 0));
+    }
+  for (uint32_t s = 0; s < m->nelems; s++)
+    for (uint32_t k = 0; k < m->elems[s].n; k++) fx_meet_init(m, o, &m->elems[s].items[k], &meet, seen);
+  for (uint32_t g = 0; g < m->nglobals; g++) fx_meet_init(m, o, &m->globals[g].init, &meet, seen);
+  for (uint32_t t = 0; t < m->ntables; t++)
+    if (m->tables[t].has_init) fx_meet_init(m, o, &m->tables[t].init, &meet, seen);
+  xfree(seen);
+  if (meet.frame_global == 0xffffffffu) meet.frame_global = 0;
+  if (!meet.writes_mem) { meet.lo = 0; meet.hi = 0; }
+  meet.frame_only = meet.frame_only && !meet.writes_globals;
+  fx_ref = meet;
+  return &fx_ref;
+}
+
 static const CallFx *site_effects(IrFunc *f, const OptOpts *o, Ref v) {
   Inst *in = &f->insts[v];
   if (in->op == I_CALL || in->op == I_RETURN_CALL)
     return call_effects(f->m, o, (uint32_t)in->imm, 0);
-  if (in->op == I_CALL_INDIRECT || in->op == I_RETURN_CALL_INDIRECT ||
-      in->op == I_CALL_REF || in->op == I_RETURN_CALL_REF)
+  if (in->op == I_CALL_INDIRECT || in->op == I_RETURN_CALL_INDIRECT)
     return indirect_effects(f->m, o);
+  if (in->op == I_CALL_REF || in->op == I_RETURN_CALL_REF)
+    return ref_effects(f->m, o);
   return &fx_unknown;
 }
 
@@ -8810,12 +8914,17 @@ static bool pass_memopt(IrFunc *f, const OptOpts *o) {
       } else if (in->op == I_GLOBAL_SET) {
         uint32_t g = (uint32_t)in->imm;
         if (g < MAX_TRACKED_GLOBALS) { gval[g] = a[0]; gok |= (uint64_t)1 << g; }
-      } else if (is_call_op(in->op) ||
+      } else if (in->op == I_VLOAD || in->op == I_VLDN) {
+        /* it reads what a pending store wrote, which is then no longer
+           dead whatever writes over it later */
+        npend = 0;
+      } else if (is_call_op(in->op) || in->op == I_VSTORE ||
                  in->op == I_MEM_GROW || in->op == I_MEM_COPY ||
                  in->op == I_MEM_FILL || in->op == I_MEM_INIT) {
 
         /* GC field entries and tracked globals survive what cannot write
-           them: the bulk memory ops touch linear memory only, and a call
+           them: the bulk memory ops and a vector store touch linear memory
+           only, and a call
            clobbers only what its summary says it can reach -- gany means
            unknown, so everything.  The collector itself never changes a
            field's or a global's value, just its address. */
@@ -8958,17 +9067,43 @@ static bool gc_inbounds_cond(IrFunc *f, Ref cond, bool taken,
   return false;
 }
 
+/* Whether block from leaves the loop of header hb for good: no path from
+   it reaches latch but back through hb. */
+static bool gc_leaves_loop(IrFunc *f, uint32_t hb, uint32_t latch, uint32_t from) {
+  if (from == latch || from == hb) return false;
+  uint8_t *seen = xcalloc(f->nblocks, 1);
+  uint32_t *stack = xmalloc(f->nblocks * sizeof(uint32_t)), sp = 0, budget = 4096;
+  bool out = true;
+  seen[from] = seen[hb] = 1;
+  stack[sp++] = from;
+  while (sp && out) {
+    Block *b = &f->blocks[stack[--sp]];
+    if (!budget--) { out = false; break; }
+    for (uint32_t k = 0; k < b->nsuccs; k++) {
+      uint32_t t = b->succs[k].target;
+      if (t == latch) { out = false; break; }
+      if (!seen[t]) { seen[t] = 1; stack[sp++] = t; }
+    }
+  }
+  xfree(seen);
+  xfree(stack);
+  return out;
+}
+
 /* The counted-loop form: the header tests its own param x against a
-   bound B fixed above the loop, and x walks 0, 1, 2, ... -- it cannot
-   skip B, so wherever x has been tested unequal it is also below.  On
-   the continue side of x != B that gives x <u B. */
-static bool gc_counted_cond(IrFunc *f, uint32_t hb, Ref cond, bool taken,
+   bound B fixed above the loop, x walks 0, 1, 2, ..., and the side where
+   x == B leaves the loop -- so x cannot pass B, and wherever x has been
+   tested unequal it is also below.  On the continue side of x != B that
+   gives x <u B. */
+static bool gc_counted_cond(IrFunc *f, uint32_t hb, uint32_t bi, Ref cond, bool taken,
                             Ref *idx, Ref *len) {
   Inst *c = &f->insts[cond];
   if (c->nargs != 2) return false;
   if (!((c->op == I_NE && taken) || (c->op == I_EQ && !taken))) return false;
   Block *h = &f->blocks[hb];
-  if (h->npreds != 2) return false;
+  if (h->npreds != 2 || h->nsuccs != 2) return false;
+  /* bi is the unequal side; the other arm is the equal one */
+  uint32_t eq_side = h->succs[0].target == bi ? h->succs[1].target : h->succs[0].target;
   Ref a0 = ir_resolve(f, ir_args(f, cond)[0]);
   Ref a1 = ir_resolve(f, ir_args(f, cond)[1]);
   for (int side = 0; side < 2; side++) {
@@ -8996,6 +9131,12 @@ static bool gc_counted_cond(IrFunc *f, uint32_t hb, Ref cond, bool taken,
       return false;
     }
     if (!from_zero || !by_one) continue;
+    uint32_t latch = UINT32_MAX;
+    for (uint32_t p = 0; p < h->npreds; p++) {
+      Edge *e = iv_edge(f, h->preds[p], hb);
+      if (f->insts[ir_resolve(f, e->args[pi])].op == I_ADD) latch = h->preds[p];
+    }
+    if (latch == UINT32_MAX || !gc_leaves_loop(f, hb, latch, eq_side)) continue;
     *idx = x;
     *len = B;
     return true;
@@ -9391,7 +9532,7 @@ static bool pass_gc_nullchk(IrFunc *f) {
         Ref bidx, blen;
         if (bcounts[bi] < CAP &&
             (gc_inbounds_cond(f, cond, taken, &bidx, &blen) ||
-             gc_counted_cond(f, b->preds[0], cond, taken, &bidx, &blen))) {
+             gc_counted_cond(f, b->preds[0], bi, cond, taken, &bidx, &blen))) {
           bsets[bi][bcounts[bi]].idx = bidx;
           bsets[bi][bcounts[bi]].len = blen;
           bcounts[bi]++;
@@ -9605,6 +9746,10 @@ static void loop_effects(IrFunc *f, const OptOpts *o, const uint32_t *lblk,
         case I_STORE:
           lf->writes_mem = true;
           break;
+        /* a vector store's sixteen bytes are not among the stores a load
+           is checked against, so it writes, as far as a load knows,
+           anywhere */
+        case I_VSTORE:
         case I_MEM_COPY: case I_MEM_FILL: case I_MEM_INIT:
           lf->writes_mem = lf->writes_anywhere = true;
           break;
@@ -9694,6 +9839,11 @@ static void const_reg_uses(IrFunc *f, const uint32_t *lblk, uint32_t nlbl,
 #undef CRU_BUMP
 }
 
+/* What a trap may not be moved above, ending the stretch of a loop's
+   header that every entry reaches: what can trap itself, which would then
+   fire in the other order, and what has an effect -- a store, a global
+   set, a grow or a drop -- which a trap moved above it would leave undone
+   for whoever looks at the instance after the trap. */
 static bool stops_block(const Inst *in) {
   switch (in->op) {
     case I_CALL: case I_CALL_INDIRECT: case I_CALL_REF:
@@ -9703,10 +9853,13 @@ static bool stops_block(const Inst *in) {
     case I_TRAP: case I_TRAP_IF:
     case I_DIVS: case I_DIVU: case I_REMS: case I_REMU:
     case I_TRUNCS: case I_TRUNCU:
-    case I_LOAD: case I_STORE: case I_BOUNDS_CHECK:
+    case I_LOAD: case I_STORE: case I_VSTORE: case I_BOUNDS_CHECK:
     case I_MEM_COPY: case I_MEM_FILL: case I_MEM_INIT:
+    case I_MEM_GROW: case I_DATA_DROP:
+    case I_GLOBAL_SET:
     case I_TABLE_GET: case I_TABLE_SET: case I_TABLE_FILL:
-    case I_TABLE_COPY: case I_TABLE_INIT:
+    case I_TABLE_COPY: case I_TABLE_INIT: case I_TABLE_GROW: case I_ELEM_DROP:
+    case I_FIELD_SET: case I_ARRAY_SET: case I_ARRAY_OP:
       return true;
     default:
       /* A GC access can trap on null or bounds and an allocation on heap
@@ -9808,8 +9961,68 @@ static bool access_dominates(IrFunc *f, AccList *acc, Ref addr, uint64_t imm,
    proved it not null, and for an element, read at the same index, in
    bounds.  A field or a length also takes pass_gc_nullchk's branch facts:
    the non-null arm of a null test or a ref.test above target. */
+/* Whether the type a conversion narrows to holds at the end of block
+   target.  A cast is its test, a trap_if on it or a branch on it, and then
+   a conversion that is pure and moves on its own: a GC read of its result
+   takes the layout of the narrower type, so it moves to target only where
+   a test of the conversion's operand against that type passed first --
+   asserted by a trap_if or the arm of a branch dominating target -- or
+   where the operand's own type was that narrow already. */
+static bool gc_ref_test_of(IrFunc *f, Ref t, Ref x, HeapType ht) {
+  t = ir_resolve(f, t);
+  Inst *ti = &f->insts[t];
+  return ti->op == I_REF_TEST && ti->nargs == 1 && RTEST_HEAP(ti->imm) == ht &&
+         gc_ref_root(f, ir_args(f, t)[0]) == gc_ref_root(f, x);
+}
+
+static bool gc_convert_holds_at(IrFunc *f, Ref c, uint32_t target) {
+  Inst *ci = &f->insts[c];
+  Ref x = ir_resolve(f, ir_args(f, c)[0]);
+  ValType to = (ValType)ci->type, from = (ValType)f->insts[x].type;
+  if (!vt_is_ref(to)) return true;
+  HeapType ht = vt_heap(to);
+  if (vt_is_ref(from) && heap_subtype(f->m, vt_heap(from), ht)) return true;
+  uint32_t budget = 4096;
+  for (uint32_t bi = target; bi != REF_NONE; bi = f->blocks[bi].idom) {
+    Block *b = &f->blocks[bi];
+    Block *p = b->npreds == 1 ? &f->blocks[b->preds[0]] : NULL;
+    if (p && p->term == T_BRIF && p->nsuccs >= 2 && p->succs[0].target != p->succs[1].target) {
+      bool taken = p->succs[0].target == bi;
+      Ref cond = ir_resolve(f, p->term_arg);
+      while (f->insts[cond].op == I_EQZ && f->insts[cond].nargs == 1) {
+        cond = ir_resolve(f, ir_args(f, cond)[0]);
+        taken = !taken;
+      }
+      if (taken && gc_ref_test_of(f, cond, x, ht)) return true;
+    }
+    for (uint32_t i = 0; i < b->ninsts; i++) {
+      if (!budget--) return false;
+      Ref u = b->insts[i];
+      if (f->insts[u].op == I_TRAP_IF && f->insts[u].nargs == 1 &&
+          gc_ref_test_of(f, ir_args(f, u)[0], x, ht))
+        return true;
+    }
+    if (bi == f->entry) break;
+  }
+  return false;
+}
+
+/* Every narrowing conversion between a GC access's operand and its root
+   holds at target (gc_convert_holds_at). */
+static bool gc_types_hold_at(IrFunc *f, Ref v, uint32_t target) {
+  Ref r = ir_resolve(f, ir_args(f, v)[0]);
+  for (int hop = 0; hop < 8; hop++) {
+    Inst *in = &f->insts[r];
+    if (in->op != I_REF_CONVERT || in->nargs != 1) return true;
+    if (!gc_convert_holds_at(f, r, target)) return false;
+    r = ir_resolve(f, ir_args(f, r)[0]);
+  }
+  return false;
+}
+
 static bool gc_checks_hold_at(IrFunc *f, Ref v, uint32_t target) {
   Inst *in = &f->insts[v];
+  if (!gc_types_hold_at(f, v, target)) return false;
   Ref r = gc_ref_root(f, ir_args(f, v)[0]);
   Ref idx = in->op == I_ARRAY_GET ? ir_resolve(f, ir_args(f, v)[1]) : REF_NONE;
   ValType rt = (ValType)f->insts[r].type;
@@ -9914,6 +10127,10 @@ static bool inst_hoistable(IrFunc *f, Ref v, bool reach_mem, bool reach_any,
     }
     return true;
   }
+  /* a vector load reads memory as a load does: out of a loop that writes
+     none, and only from where the loop always reaches it, since it can
+     trap where a guard inside the loop kept it from running */
+  if (in->op == I_VLOAD || in->op == I_VLDN) return reach_mem && !lf->writes_mem;
   if (in->op == I_GLOBAL_GET)
     return !lf->glob_any &&
            (in->imm >= FX_GBITS ||
@@ -11155,6 +11372,10 @@ static bool gl_promote_one(IrFunc *f, uint32_t hb, uint32_t pre,
         fprintf(stderr, "gl %s b%u g%u: no round trip%s\n",
                 f->m->funcs[f->func_index].sym, hb, gidx,
                 may_carry ? " and the walk declined" : " and carrying is off");
+      /* the read made for the promotion goes with it */
+      Block *pb = &f->blocks[pre];
+      if (pb->ninsts && pb->insts[pb->ninsts - 1] == entry) pb->ninsts--;
+      f->insts[entry].op = I_NOP;
       xfree(cur); xfree(subst); return false;
     }
 
@@ -11220,6 +11441,9 @@ static bool pass_global_loop(IrFunc *f, const OptOpts *o) {
       else { nfwd++; pre = h->preds[p]; }
     }
     if (!nback || nfwd != 1) continue;
+    /* the global is read at the preheader's end, which one that ends in a
+       call that can raise has none of: a raising call ends its block */
+    if (ir_block_has_eh(f, pre)) continue;
 
     memset(inloop, 0, f->nblocks);
     inloop[hb] = 1;
@@ -11601,23 +11825,24 @@ static uint32_t lh_preheader(IrFunc *f, uint32_t hb, uint32_t pre) {
 }
 
 /* The chain of pure instructions in the loop that v is computed by, all of
-   which can run before the loop instead.  Pure is not invariant for what
-   reads state: a mutable global's value is the loop's own when the loop sets
-   it, or calls anything that may (gset is null then, or marks the globals the
-   loop sets) -- wasm-smith's fuel counter is read, tested and decremented on
-   every way round, and hoisting its test made the loop run forever -- and a
-   vector load reads memory the loop may store. */
+   which can run before the loop instead -- and a global's read, where the
+   loop does not set it: a mutable global's value is the loop's own when the
+   loop sets it, or calls anything that may (gset is null then, or marks the
+   globals the loop sets) -- wasm-smith's fuel counter is read, tested and
+   decremented on every way round, and hoisting its test made the loop run
+   forever. */
 static bool lh_collect(IrFunc *f, Ref v, const uint8_t *inloop, uint8_t *moved,
                        uint32_t *out, uint32_t *nout, uint32_t cap, int depth,
                        const uint8_t *gset) {
   if (!inloop[f->insts[v].block]) return true;
   if (depth > 16) return false;
   Inst *in = &f->insts[v];
-  if (in->op == I_PARAM || !ir_is_pure(in) || in->op == I_VLOAD || in->op == I_VLDN)
+  if (in->op == I_GLOBAL_GET) {
+    if (in->imm < f->m->nglobals && f->m->globals[in->imm].mutable_ && (!gset || gset[in->imm]))
+      return false;
+  } else if (in->op == I_PARAM || !ir_is_pure(in)) {
     return false;
-  if (in->op == I_GLOBAL_GET && in->imm < f->m->nglobals &&
-      f->m->globals[in->imm].mutable_ && (!gset || gset[in->imm]))
-    return false;
+  }
   if (moved[v]) return true;
   Ref *a = ir_args(f, v);
   for (uint32_t i = 0; i < in->nargs; i++)
@@ -11654,14 +11879,12 @@ static bool lh_can_trap(IrFunc *f, Ref v) {
   }
 }
 
+/* Two accesses of one place: same_access, whose sums wrap as the i32 adds
+   in the addresses do -- x + -1 then offset 1 is x only where x is not 0,
+   and where it is the access is at 2^32 and traps. */
 static bool lh_same_place(IrFunc *f, Ref aa, uint64_t ia, uint32_t sa, uint32_t ma,
                           Ref ab, uint64_t ib, uint32_t sb, uint32_t mb) {
-  if (sa != sb || ma != mb) return false;
-  Ref ra, rb;
-  int64_t oa, ob;
-  access_root(f, aa, &ra, &oa);
-  access_root(f, ab, &rb, &ob);
-  return ra == rb && oa + (int64_t)ia == ob + (int64_t)ib;
+  return same_access(f, aa, ia, sa, ma, ab, ib, sb, mb);
 }
 
 #define LH_MAX_PROLOGUE 8
@@ -12004,11 +12227,17 @@ static bool pass_loop_hoist(IrFunc *f) {
     h = &f->blocks[hb];
     uint32_t gsave = nchain;
 
+    /* The guard goes before the loop, so before all of the header: what
+       stays there and can trap would trap after it, and what stays and
+       has an effect -- a global set, a call -- would not have happened
+       when it traps, for its trap block to see (a return_call there is a
+       call and then a trap) or whoever looks at the instance after. */
     bool guard_clear = true;
     for (uint32_t i = 0; i < h->ninsts; i++) {
-      if (!lh_can_trap(f, h->insts[i])) continue;
+      Ref u = h->insts[i];
+      if (!lh_can_trap(f, u) && ir_has_no_effect(&f->insts[u])) continue;
       bool ours = false;
-      for (uint32_t k = 0; k < nmv; k++) if (mv[k] == h->insts[i]) ours = true;
+      for (uint32_t k = 0; k < nmv; k++) if (mv[k] == u) ours = true;
       if (!ours) { guard_clear = false; break; }
     }
     if (guard_clear && h->term == T_BRIF && h->nsuccs == 2 &&
@@ -12212,7 +12441,7 @@ static bool rotate_one(IrFunc *f, uint32_t hb) {
 
   for (uint32_t i = 0; i < h->ninsts; i++) {
     Inst *in = &f->insts[h->insts[i]];
-    if (!ir_is_pure(in) || in->nargs > 3) RJ_OP("impure/wide", in->op);
+    if (!ir_has_no_effect(in) || in->nargs > 3) RJ_OP("impure/wide", in->op);
   }
 
   uint32_t nb = f->nblocks;

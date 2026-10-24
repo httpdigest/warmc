@@ -2396,13 +2396,25 @@ static void export_trie(Linker *L, Buf *out) {
   xfree(addrs);
 }
 
+/* The ordinal of the section an address is in, as write_macho orders them:
+   __text, __stubs, __const, __wasm_custom when there is one, __got,
+   __data, __bss. */
 static uint32_t macho_sect_of(Linker *L, uint64_t a) {
+  uint32_t c = L->custom_size ? 1 : 0;
   if (a < L->stub_addr) return 1;
   if (a < L->rodata_addr) return 2;
-  if (a < L->got_addr) return 3;
-  if (a < L->data_addr) return 4;
-  if (a < L->bss_addr) return 5;
-  return 6;
+  if (a < (c ? L->custom_addr : L->got_addr)) return 3;
+  if (a < L->got_addr) return 4;
+  if (a < L->data_addr) return 4 + c;
+  if (a < L->bss_addr) return 5 + c;
+  return 6 + c;
+}
+
+/* A global whose section the link dropped as unreachable: no address. */
+static bool gs_dropped(const Linker *L, const GSym *g) {
+  if (g->obj < 0) return false;
+  const InSym *s = &L->objs[g->obj].syms[g->sym];
+  return !s->common && s->sec >= 0 && L->objs[g->obj].secs[s->sec].kind == K_DROP;
 }
 
 static void write_macho(Linker *L, const char *path, uint64_t entry) {
@@ -2494,7 +2506,7 @@ static void write_macho(Linker *L, const char *path, uint64_t entry) {
   if (L->shared)
     for (uint32_t i = 0; i < L->ngsyms; i++) {
       GSym *g = &L->gsyms[i];
-      if (!g->defined || g->imported || g->exported) continue;
+      if (!g->defined || g->imported || g->exported || gs_dropped(L, g)) continue;
       buf_u32(&symt, (uint32_t)strt.len);
       buf_bytes(&strt, g->name, strlen(g->name) + 1);
       buf_u8(&symt, N_SECT);
@@ -2505,7 +2517,7 @@ static void write_macho(Linker *L, const char *path, uint64_t entry) {
     }
   for (uint32_t i = 0; i < L->ngsyms; i++) {
     GSym *g = &L->gsyms[i];
-    if (!g->defined || g->imported || (L->shared && !g->exported)) continue;
+    if (!g->defined || g->imported || (L->shared && !g->exported) || gs_dropped(L, g)) continue;
     uint32_t sx = (uint32_t)strt.len;
     buf_bytes(&strt, g->name, strlen(g->name) + 1);
     buf_u32(&symt, sx);

@@ -72,10 +72,11 @@ static const char *usage_text =
   "                small allocations, the load-barrier mask kept over a loop\n"
   "                with no safepoint: turning them off says whether a\n"
   "                collection bug the optimiser brings out is one of theirs\n"
-  "  -fno-loadbar  emit no GC load barriers.  Unsound for a module with GC\n"
-  "                references, which relocation heals through the barrier;\n"
-  "                test/run_nobar.sh uses it to show that a module without\n"
-  "                them compiles to the same bytes either way\n"
+  "  -fno-loadbar  emit no GC load barriers (-floadbar, the default, emits\n"
+  "                them).  Unsound for a module with GC references, which\n"
+  "                relocation heals through the barrier; test/run_nobar.sh\n"
+  "                uses it to show that a module without them compiles to\n"
+  "                the same bytes either way\n"
   "  -fgssa        turn a global a function uses as a variable into SSA\n"
   "                values, with a parameter at each merge, where that does\n"
   "                fewer memory operations on it, counted by loop depth, or\n"
@@ -177,9 +178,6 @@ static const char *wasi_archive(const char *rt, const char *wasi, bool p2,
     snprintf(buf, bufn, "%.*s%s%s", (int)(base - rt), rt,
              p2 ? "warmwasip2" : "warmwasi", base + 6);
     wasi = buf;
-    /* make builds no WASI 0.2 host for Windows */
-    if (p2 && strstr(base, "windows"))
-      warmc_fatal("--wasi: there is no WASI 0.2 host for Windows");
   }
   FILE *probe = fopen(wasi, "rb");
   if (!probe)
@@ -360,6 +358,7 @@ int main(int argc, char **argv) {
       else warmc_fatal("--custom-sections takes default, all or none, not %s", v);
     }
     else if (!strcmp(a, "-fno-loadbar")) codegen_set_load_barrier(false);
+    else if (!strcmp(a, "-floadbar")) codegen_set_load_barrier(true);
     else if (!strncmp(a, "--symbol-prefix=", 16)) sym_prefix = a + 16;
     else if (!strcmp(a, "--shared")) shared = true;
     else if (!strncmp(a, "--header=", 9)) header = a + 9;
@@ -445,7 +444,7 @@ int main(int argc, char **argv) {
       else if (!strcmp(name, "trampoline")) opt.trampoline = on;
       else if (!strcmp(name, "go-sp")) opt.go_sp = on;
       else if (!strcmp(name, "gssa")) opt.gssa = on;
-      else if (!strcmp(name, "gssa-all")) opt.gssa = opt.gssa_all = on;
+      else if (!strcmp(name, "gssa-all")) { opt.gssa_all = on; if (on) opt.gssa = true; }
       else if (!strcmp(name, "small-loop-align")) opt.small_loop_align = on;
       else if (!strcmp(name, "labcache")) opt.labcache = on;
       else if (!strcmp(name, "barelide")) opt.barelide = on;
@@ -554,6 +553,10 @@ int main(int argc, char **argv) {
         warmc_fatal("--wasi: %s is a component that does not export %s, so "
                     "there is nothing for the host to run", input,
                     CLINK_COMMAND_EXPORT);
+      /* make builds no WASI 0.2 host for Windows */
+      if (want_wasi && !wasi && fmt == TGT_PE)
+        warmc_fatal("--wasi: there is no WASI 0.2 host for Windows");
+      if (!obj_only && !rt) warmc_fatal("no runtime specified; pass --rt or set WARMC_RT");
       ObjBuilder co;
       memset(&co, 0, sizeof co);
       clink_compile(lp, &co, &opt);
@@ -564,13 +567,13 @@ int main(int argc, char **argv) {
       else if (fmt == TGT_PE) write_coff64(&co, cobj);
       else write_elf64(&co, cobj);
       if (!obj_only) {
-        if (!rt) warmc_fatal("no runtime specified; pass --rt or set WARMC_RT");
+        if (!keep_obj) warmc_temp_output(cobj);
         char cwasi[4096];
         warmc_link_exec(fmt, output ? output : outdef, cobj,
                         want_wasi ? wasi_archive(rt, wasi, true, cwasi,
                                                  sizeof cwasi) : NULL,
                         rt, entry_sym, dead_strip);
-        if (!keep_obj) remove(cobj);
+        if (!keep_obj) { remove(cobj); warmc_temp_output(NULL); }
       }
       clink_free(lp);
       comp_free(c);
@@ -736,6 +739,7 @@ int main(int argc, char **argv) {
   if (macho) write_macho64(&o, objpath);
   else if (fmt == TGT_PE) write_coff64(&o, objpath);
   else write_elf64(&o, objpath);
+  if (!obj_only && !keep_obj) warmc_temp_output(objpath);
 
   if (lib) {
     char hdr[4096];
@@ -761,7 +765,7 @@ int main(int argc, char **argv) {
       char **syms = shlib_symbols(lib, &nsyms);
       warmc_link_shared(fmt, output, objpath, rt, syms, nsyms, dead_strip);
       xfree(syms);
-      if (!keep_obj) remove(objpath);
+      if (!keep_obj) { remove(objpath); warmc_temp_output(NULL); }
     }
     shlib_free(lib);
     module_free(m);
@@ -790,7 +794,7 @@ int main(int argc, char **argv) {
     warmc_link_exec(fmt, output ? output : outdef, objpath,
                     want_wasi ? wasi : NULL, rt, entry_sym,
                     dead_strip);
-    if (!keep_obj) remove(objpath);
+    if (!keep_obj) { remove(objpath); warmc_temp_output(NULL); }
     module_free(m);
     xfree(bin);
     return 0;
@@ -820,7 +824,7 @@ int main(int argc, char **argv) {
   if (verbose) fprintf(stderr, "warmc: %s\n", cmd);
   int rc = system(cmd);
   if (rc != 0) warmc_fatal("link failed (%d)", rc);
-  if (!keep_obj) remove(objpath);
+  if (!keep_obj) { remove(objpath); warmc_temp_output(NULL); }
 
   module_free(m);
   xfree(bin);

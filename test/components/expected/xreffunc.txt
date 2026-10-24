@@ -1,0 +1,8 @@
+core module 0: 2 funcs, 1 exports
+core module 1: 3 funcs, 1 exports
+core instance 0: instantiate module 0, 0 args
+core instance 1: instantiate module 1, 1 args
+type 0: func
+alias 0: core export 1 "run" (core func)
+canon 0: lift, 0 options
+export 0: "run" (func 0)

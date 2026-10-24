@@ -1135,6 +1135,46 @@ _DEPTH = 5001
 case("text_deep_nesting", "malformed", "instruction nesting too deep",
      "(module (func " + "(block " * _DEPTH + "(nop)" + ")" * _DEPTH + "))")
 
+# Text only.  A custom annotation is a module field: before (module ...) it is
+# outside the module and refused -- while any other annotation there is white
+# space and leaves the custom one inside the module where it belongs -- and in
+# a binary module the bytes are the whole module, so it would go nowhere.
+case("text_custom_before_module", "malformed", "misplaced @custom annotation",
+     '(@custom "a" "x")\n(module (func))')
+case("text_custom_after_other_annotation", "accept", "",
+     '(@foo bar)\n(module (@custom "a" "x") (func))')
+case("text_custom_in_binary_module", "malformed", "a custom annotation in a binary module",
+     '(module binary (@custom "a" "x") "\\00asm\\01\\00\\00\\00")')
+# An annotation's id and an identifier may be strings, but not empty ones.
+case("text_empty_annotation_id", "malformed", "empty annotation id", '(module (@) (func))')
+case("text_empty_annotation_id_spaced", "malformed", "empty annotation id",
+     '(module (@ custom "a" "x") (func))')
+case("text_empty_quoted_annotation_id", "malformed", "empty annotation id",
+     '(module (@"") (func))')
+case("text_empty_quoted_identifier", "malformed", "empty identifier", '(module (func $""))')
+# A file is one module: what follows it is refused, not ignored.
+case("text_more_after_module", "malformed", "more after the module",
+     '(module (func))\n(func)')
+case("text_more_after_binary_module", "malformed", "more after the module",
+     '(module binary "\\00asm\\01\\00\\00\\00") (func)')
+# A '_' in a number stands between two digits of one part: not after the 0x,
+# not beside an exponent's e or p or the point, not leading a NaN's payload;
+# in a \u{...} escape, between two hex digits too.
+for _n, _t in [("hex_after_x", "(i32.const 0x_20)"),
+               ("before_exponent", "(f64.const 1_e5)"),
+               ("after_exponent", "(f64.const 1e_5)"),
+               ("after_point", "(f64.const 1._5)"),
+               ("before_hex_exponent", "(f64.const 0x1_p4)"),
+               ("nan_payload", "(f32.const nan:0x_1)")]:
+    case("text_underscore_" + _n, "malformed", "misplaced '_' in a number",
+         "(module (func (drop %s)))" % _t)
+case("text_unicode_escape_leading_underscore", "malformed", "expected a hex digit",
+     '(module (memory 1) (data (i32.const 0) "\\u{_41}"))')
+case("text_underscores_between_digits", "accept", "",
+     '(module (memory 1) (data (i32.const 0) "\\u{1_F600}")'
+     ' (func (drop (i32.const 0x1_0)) (drop (i64.const -1_000))'
+     ' (drop (f64.const 1_0.2_5e1_0)) (drop (f64.const 0x1_f.8p1_0)) (drop (f32.const nan:0x1_0))))')
+
 def main():
     out = sys.argv[1] if len(sys.argv) > 1 else "."
     os.makedirs(out, exist_ok=True)

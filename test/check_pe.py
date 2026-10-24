@@ -91,6 +91,17 @@ for i in range(nsec):
     assert rawoff + rawsz <= len(buf), "%s runs past the end of the file" % name
     assert va + vsz <= size_of_image, "%s runs past SizeOfImage" % name
 
+# The optional header's totals: the code and the initialized data, each the
+# file size of the sections that say they hold it.
+size_of_code, size_of_idata = struct.unpack_from("<II", buf, opt + 4)
+want_code = sum(s[4] for s in secs if s[5] & 0x20)
+want_idata = sum(s[4] for s in secs if s[5] & 0x40)
+assert size_of_code == want_code, "SizeOfCode %#x, the code sections hold %#x" % (
+    size_of_code, want_code)
+assert size_of_idata == want_idata, \
+    "SizeOfInitializedData %#x, the initialized-data sections hold %#x (%s)" % (
+        size_of_idata, want_idata, ", ".join(s[0] for s in secs if s[5] & 0x40))
+
 by_name = {s[0]: s for s in secs}
 for want in (".text", ".rdata", ".data"):
     assert want in by_name, "no %s section" % want

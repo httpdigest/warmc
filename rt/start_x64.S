@@ -188,7 +188,7 @@ warmc_invoke:
    into the cushion here, eight bytes at a time because the image's length is
    only a multiple of eight.
    Args: fn(rcx), vm(rdx), iargs(r8), fargs(r9), then on the stack:
-   retbuf, stk, stk_bytes.  stk_bytes caps at 480 (the cushion). */
+   retbuf, stk, stk_bytes.  No more than 480 bytes (the cushion) are copied. */
     .globl warmc_invoke_s
 warmc_invoke_s:
     pushq  %rbx
@@ -205,6 +205,10 @@ warmc_invoke_s:
     movups %xmm15, 656(%rsp)
     movq   728(%rsp), %rax
     movq   736(%rsp), %r10
+    /* no more than the cushion holds: past it are the saved xmm6-15 */
+    movq   $480, %r11
+    cmpq   %r11, %r10
+    cmova  %r11, %r10
     leaq   32(%rsp), %r11
     testq  %r10, %r10
     jz     2f

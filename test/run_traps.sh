@@ -150,6 +150,34 @@ expect hoist_past_div    "integer divide by zero"
 
 expect guard_past_fault  "out of bounds memory access"
 expect stack_overflow    "call stack exhausted"
+# A memory past the runtime's limit of 65535 pages for a 32-bit one is
+# refused at instantiation, saying so, not trapped as an access.
+printf '(module (memory 65536) (func (export "f")))\n' > "$WORK/bigmem.wat"
+if wtimeout ./$BUILD/warmc $WARMC_TARGET_FLAGS -o "$WORK/bigmem" "$WORK/bigmem.wat" 2>"$WORK/bigmem.err"; then
+  out=$(wruntimeout $WARMC_RUN "$WORK/bigmem" f 2>&1); rc=$?
+  if [ "$rc" -ne 4 ] || [[ "$out" != *"cannot instantiate: a 32-bit memory of more than 65535 pages"* ]]; then
+    echo "FAIL[traps] a memory of 65536 pages: expected the refusal, exit 4, got rc=$rc: $out"
+    fail=$((fail+1))
+  else
+    pass=$((pass+1))
+  fi
+else
+  echo "FAIL[traps] a memory of 65536 pages does not compile: $(head -1 "$WORK/bigmem.err")"
+  fail=$((fail+1))
+fi
+
+# A stack smaller than the 6 MB the program may otherwise take: the limit is
+# where the thread's own stack ends, short of the runtime's margin, so the
+# recursion still traps rather than dying on the guard page (SIGSEGV).
+# Windows has no RLIMIT_STACK for ulimit to set, so there this repeats the
+# case above.
+out=$( (ulimit -s 2048 2>/dev/null; wruntimeout $WARMC_RUN "$BIN" stack_overflow) 2>&1 ); rc=$?
+if [ "$rc" -ne 1 ] || [[ "$out" != *"call stack exhausted"* ]]; then
+  echo "FAIL[traps] stack_overflow under a 2 MB stack: expected 'call stack exhausted', got rc=$rc: $out"
+  fail=$((fail+1))
+else
+  pass=$((pass+1))
+fi
 
 expect mem_far_offset      "out of bounds memory access"
 expect mem_far_offset_v128 "out of bounds memory access"
