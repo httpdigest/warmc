@@ -2882,7 +2882,8 @@ static void emit_block(Isel *s, uint32_t bi, uint32_t next_bi) {
   for (uint32_t i = 0; i < b->ninsts; i++) {
     s->cur_pos = i;
     s->pc_live = true;
-    for (; pck < pce && s->pc[pck].lo == i; pck++) piece_fill(s, &s->pc[pck]);
+    for (; pck < pce && s->pc[pck].lo == i; pck++)
+      if (s->pc[pck].kind == PC_CLUSTER) piece_fill(s, &s->pc[pck]);
     s->at_eh_site = eh && i + 1 == b->ninsts;
     if (s->at_eh_site) emit_eh_stores(s, bi);
     if (s->paired[b->insts[i]]) continue;
@@ -2896,10 +2897,14 @@ static void emit_block(Isel *s, uint32_t bi, uint32_t next_bi) {
     if (op_clobbers_caller_saved(f->insts[b->insts[i]].op))
       rc_kill_reg(s, R30);
   }
+  /* the loop pieces of the loops this block enters */
+  for (; pck < pce; pck++)
+    if (s->pc[pck].kind == PC_FILL) piece_fill(s, &s->pc[pck]);
   s->pc_live = false;
+  s->pc_term = s->pc_head != NULL;
   s->at_eh_site = false;
 
-  if (s->tail_done) { s->tail_done = false; return; }
+  if (s->tail_done) { s->tail_done = false; s->pc_term = false; return; }
 
   switch (b->term) {
     case T_JUMP: {
@@ -3117,4 +3122,5 @@ static void emit_block(Isel *s, uint32_t bi, uint32_t next_bi) {
     case T_TRAP: emit_trap(s, (int)b->term_imm); break;
     default: warmc_fatal("isel: block b%u has no terminator", bi);
   }
+  s->pc_term = false;
 }

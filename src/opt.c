@@ -8934,7 +8934,12 @@ static bool inst_hoistable(IrFunc *f, Ref v, bool reach_mem, bool reach_any,
     return ir_const_cost(in->imm, vt_is_64((ValType)in->type)) > 1;
   }
 
-  if (in->op == I_MEM_ADDR) return true;
+  /* A native address stays by the access it serves, which folds it -- the
+     memory base plus a 32-bit index is one of arm64's addressing modes, and
+     x64's carries the offset too -- where taken out of the loop it holds a
+     64-bit register through the whole of it, and zigbench/wordfreq's token
+     loop has dozens. */
+  if (in->op == I_MEM_ADDR) return false;
   if (in->op == I_LOAD) {
 
     uint32_t lsz = (uint32_t)MEMF_SIZE(in->imm2);
@@ -9893,6 +9898,31 @@ static bool pass_licm(IrFunc *f, const OptOpts *o) {
   uint32_t *const_reg_use = xcalloc(f->ninsts ? f->ninsts : 1, sizeof(uint32_t));
   uint32_t *cru_touched = xmalloc((f->ninsts ? f->ninsts : 1) * sizeof(uint32_t));
   AccList *acc = xcalloc(f->nblocks ? f->nblocks : 1, sizeof(AccList));
+  /* Each value's shallowest read, by loop depth: one read only inside loops
+     nested in this one stays where it is, outside the innermost of them.
+     Taken further it would save a run per trip of this loop and hold a
+     register through the whole of it, the inner loops' neighbours
+     included: zigbench/wordfreq's main, its whole program inlined, had its
+     frame addresses, and the constants they are made from, taken out of
+     every loop to the entry, and spilled three times what it did without
+     LICM. */
+  uint8_t *udepth = xmalloc(f->ninsts ? f->ninsts : 1);
+  memset(udepth, 0xff, f->ninsts ? f->ninsts : 1);
+#define LICM_USE(x, d) do { Ref x_ = (x); uint8_t d_ = (uint8_t)((d) < 254 ? (d) : 254); \
+    if (x_ < f->ninsts && d_ < udepth[x_]) udepth[x_] = d_; } while (0)
+  for (uint32_t oi = 0; oi < f->norder; oi++) {
+    const Block *b = &f->blocks[f->order[oi]];
+    for (uint32_t i = 0; i < b->ninsts; i++) {
+      const Inst *in = &f->insts[b->insts[i]];
+      const Ref *a = ir_args(f, b->insts[i]);
+      for (uint32_t j = 0; j < in->nargs; j++) LICM_USE(a[j], b->loop_depth);
+    }
+    if (b->term == T_BRIF || b->term == T_BRTABLE) LICM_USE(b->term_arg, b->loop_depth);
+    for (uint32_t j = 0; j < b->nret; j++) LICM_USE(b->ret_args[j], b->loop_depth);
+    for (uint32_t s = 0; s < b->nsuccs; s++)
+      for (uint32_t j = 0; j < b->succs[s].nargs; j++)
+        LICM_USE(b->succs[s].args[j], b->loop_depth);
+  }
   SpInfo spi;
   sp_reset(&spi, f, reach, rstack);
 
@@ -9980,6 +10010,7 @@ static bool pass_licm(IrFunc *f, const OptOpts *o) {
         Ref *a = ir_args(f, v);
         for (uint32_t j = 0; hoist && j < in->nargs; j++)
           if (inloop[f->insts[a[j]].block]) hoist = false;
+        if (hoist && udepth[v] != 0xff && udepth[v] > h->loop_depth) hoist = false;
         if (!hoist) {
           if (stops_block(in)) reach_any = false;
           if (stops_with_other_code(in)) reach_mem = false;
@@ -9994,6 +10025,7 @@ static bool pass_licm(IrFunc *f, const OptOpts *o) {
                                (size_t)pre->cap_insts * sizeof(uint32_t));
         }
         pre->insts[pre->ninsts++] = v;
+        for (uint32_t j = 0; j < in->nargs; j++) LICM_USE(a[j], pre->loop_depth);
         in->block = preheader;
         if (acc[preheader].built && (in->op == I_LOAD || in->op == I_STORE))
           acc_push(&acc[preheader], acc_key_of(f, v));
@@ -10012,6 +10044,8 @@ static bool pass_licm(IrFunc *f, const OptOpts *o) {
   xfree(acc);
   xfree(inloop); xfree(reach); xfree(stack); xfree(rstack);
   xfree(lblk); xfree(lord); xfree(const_reg_use); xfree(cru_touched);
+  xfree(udepth);
+#undef LICM_USE
   return changed;
 }
 

@@ -4194,6 +4194,106 @@ write("vecloops_i32", gen_vecloops("i32"))
 write("vecloops_i64", gen_vecloops("i64"))
 write("vecloops_f32", gen_vecloops("f32"))
 write("vecloops_f64", gen_vecloops("f64"))
+# ---- loops under register pressure -----------------------------------------
+#
+# Many values live across an outer loop -- with a call in it or without --
+# and an inner loop that reads some of them, a bound, constants and
+# frame-relative addresses made before both loops: the values the register
+# allocator cannot keep everywhere, and the ones it reloads, holds in a
+# register for a loop (a loop piece), or recomputes from the frame pointer.
+# Every export folds every value into its result, so one held in the wrong
+# register, or filled before it was made, shows.
+
+def gen_pressloops():
+    out = ["  (memory 1)\n  (global $sp (mut i32) (i32.const 60000))\n",
+           "  (type $t (func (param i32) (result i32)))\n",
+           "  (table 1 funcref)\n  (elem (i32.const 0) $tick)\n",
+           "  (func $tick (param $x i32) (result i32)\n"
+           "    (i32.add (i32.mul (local.get $x) (i32.const 3)) (i32.const 1)))\n",
+           "  (func $init (local $k i32)\n    (loop $l\n"
+           "      (i64.store (i32.add (i32.const 1024) (i32.shl (local.get $k) (i32.const 3)))\n"
+           "        (i64.add (i64.mul (i64.extend_i32_u (local.get $k)) (i64.const 0x9E3779B97F4A7C15)) (i64.const 77)))\n"
+           "      (br_if $l (i32.lt_u (local.tee $k (i32.add (local.get $k) (i32.const 1))) (i32.const 64)))))\n"]
+    for ty in ("i64", "i32", "f64"):
+        for nhot in (6, 14, 22, 30):
+            for call in (False, True):
+                for shape in ("sum", "addr"):
+                    name = "press_%s_%d_%s%s" % (ty, nhot, shape, "_call" if call else "")
+                    loc = " ".join("(local $t%d %s)" % (j, ty) for j in range(nhot))
+                    b = []
+                    b.append("    (local $fp i32) (local $o i32) (local $i i32) (local $n i32) (local $acc %s) (local $k1 %s) (local $k2 %s) (local $c i32) %s\n" % (ty, ty, ty, loc))
+                    b.append("    (call $init)\n")
+                    b.append("    (local.set $fp (i32.sub (global.get $sp) (i32.const 512)))\n")
+                    b.append("    (global.set $sp (local.get $fp))\n")
+                    b.append("    (local.set $i (i32.const 0))\n    (loop $f\n"
+                             "      (i32.store (i32.add (local.get $fp) (i32.shl (local.get $i) (i32.const 2)))\n"
+                             "        (i32.add (i32.mul (local.get $i) (i32.const 7)) (i32.const 3)))\n"
+                             "      (br_if $f (i32.lt_u (local.tee $i (i32.add (local.get $i) (i32.const 1))) (i32.const 128))))\n")
+                    # made before both loops, read in the light inner loop: a bound, two values
+                    b.append("    (local.set $n (i32.add (i32.and (i32.load (i32.const 1024)) (i32.const 15)) (i32.const 23)))\n")
+                    if ty == "f64":
+                        b.append("    (local.set $k1 (f64.convert_i32_u (i32.load (i32.const 1032))))\n")
+                        b.append("    (local.set $k2 (f64.const 0.375))\n")
+                    else:
+                        b.append("    (local.set $k1 (%s.load (i32.const 1032)))\n" % ty)
+                        b.append("    (local.set $k2 (%s.load (i32.const 1040)))\n" % ty)
+                    b.append("    (local.set $acc (%s.const 1))\n    (local.set $o (i32.const 0))\n    (loop $outer\n" % ty)
+                    if call:
+                        b.append("      (local.set $c (call_indirect (type $t) (local.get $o) (i32.const 0)))\n")
+                    else:
+                        b.append("      (local.set $c (i32.add (local.get $o) (i32.const 1)))\n")
+                    # the heavy part: nhot values made from memory, all live together
+                    for j in range(nhot):
+                        if ty == "f64":
+                            v = "(f64.convert_i64_s (i64.shr_s (i64.load offset=%d (i32.const 1024)) (i64.const 40)))" % (8 * j)
+                        elif ty == "i64":
+                            v = "(i64.add (i64.load offset=%d (i32.const 1024)) (i64.extend_i32_u (local.get $o)))" % (8 * j)
+                        else:
+                            v = "(i32.add (i32.load offset=%d (i32.const 1024)) (local.get $o))" % (8 * j)
+                        b.append("      (local.set $t%d %s)\n" % (j, v))
+                    b.append("      (local.set $i (i32.const 0))\n      (loop $heavy\n")
+                    for j in range(nhot):
+                        nx = (j + 1) % nhot
+                        if ty == "f64":
+                            b.append("        (local.set $t%d (f64.add (f64.mul (local.get $t%d) (f64.const 0.5)) (local.get $t%d)))\n" % (j, j, nx))
+                        else:
+                            b.append("        (local.set $t%d (%s.add (%s.rotl (local.get $t%d) (%s.const 3)) (local.get $t%d)))\n" % (j, ty, ty, j, ty, nx))
+                    if shape == "addr":
+                        # the light loop's frame address read here too, so it lives across this loop
+                        b.append("        (i32.store (i32.add (i32.add (local.get $fp) (i32.const 192)) (i32.shl (local.get $i) (i32.const 2))) (i32.add (local.get $i) (local.get $o)))\n")
+                    b.append("        (br_if $heavy (i32.lt_u (local.tee $i (i32.add (local.get $i) (i32.const 1))) (i32.const 3))))\n")
+                    for j in range(nhot):
+                        b.append("      (local.set $acc (%s.add (local.get $acc) (local.get $t%d)))\n" % (ty, j))
+                    # the light part: reads the bound, k1, k2 and frame addresses
+                    b.append("      (local.set $i (i32.const 0))\n      (loop $light\n")
+                    if shape == "sum":
+                        idx = "(i32.add (local.get $fp) (i32.shl (i32.and (i32.add (local.get $i) (local.get $c)) (i32.const 31)) (i32.const 2)))"
+                    else:
+                        idx = "(i32.add (i32.add (local.get $fp) (i32.const 192)) (i32.shl (i32.and (local.get $i) (i32.const 15)) (i32.const 2)))"
+                    x = "(i32.load %s)" % idx
+                    if ty == "i64":
+                        e = "(i64.add (i64.add (local.get $acc) (i64.mul (i64.extend_i32_u %s) (local.get $k1))) (i64.xor (local.get $k2) (i64.const 0x123456789)))" % x
+                    elif ty == "i32":
+                        e = "(i32.add (i32.add (local.get $acc) (i32.mul %s (local.get $k1))) (i32.xor (local.get $k2) (i32.const 0x12345)))" % x
+                    else:
+                        e = "(f64.add (f64.add (local.get $acc) (f64.mul (f64.convert_i32_u %s) (local.get $k1))) (f64.mul (local.get $k2) (f64.const 0.25)))" % x
+                    b.append("        (local.set $acc %s)\n" % e)
+                    if shape == "addr":
+                        b.append("        (i32.store offset=320 (local.get $fp) (i32.add (i32.load offset=320 (local.get $fp)) (local.get $i)))\n")
+                    b.append("        (br_if $light (i32.lt_u (local.tee $i (i32.add (local.get $i) (i32.const 1))) (local.get $n))))\n")
+                    b.append("      (br_if $outer (i32.lt_u (local.tee $o (i32.add (local.get $o) (i32.const 1))) (i32.const 9))))\n")
+                    b.append("    (global.set $sp (i32.add (local.get $fp) (i32.const 512)))\n")
+                    if ty == "i64":
+                        r = "(i64.add (local.get $acc) (i64.extend_i32_u (i32.load offset=320 (local.get $fp))))"
+                    elif ty == "i32":
+                        r = "(i64.extend_i32_u (i32.add (local.get $acc) (i32.load offset=320 (local.get $fp))))"
+                    else:
+                        r = "(i64.add (i64.reinterpret_f64 (local.get $acc)) (i64.extend_i32_u (i32.load offset=320 (local.get $fp))))"
+                    b.append("    %s)\n" % r)
+                    out.append('  (func (export "%s") (result i64)\n%s' % (name, "".join(b)))
+    return "".join(out)
+
+write("pressloops", gen_pressloops())
 write("downloop", gen_downloop())
 write("bulkcopy", gen_bulkcopy())
 write("magicdiv", gen_magicdiv())
