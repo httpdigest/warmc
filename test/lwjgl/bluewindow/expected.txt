@@ -1,0 +1,11 @@
+no callback before: true
+GLFW 3.4.0
+errors 1: 0x10003 Invalid window hint 0x7FFFFFFF
+thrown after the call: GLFW error [0x10003]: Invalid window hint 0x7FFFFFFF
+window 200x150
+a video mode: true
+OpenGL 1.1: true, 2.1: true
+renderer: true, vendor: true
+viewport matches the framebuffer: true
+frames 30, pixel 0 0 255 255, GL error 0
+done

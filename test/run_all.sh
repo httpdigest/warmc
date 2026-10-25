@@ -209,6 +209,8 @@ start names    python3 test/run_names.py
 start teavm    python3 test/run_teavm.py
 # --native-module: imports called as C functions, on the host's own target
 start native   python3 test/run_native.py
+# lwjgl/: LWJGL 3 programs through TeaVM and warmc, a window and its pixels
+start lwjgl    python3 test/run_lwjgl.py
 start shared   ./test/run_shared.sh
 
 start elf      ./test/run_elf.sh
