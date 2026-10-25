@@ -403,13 +403,23 @@ static const RtAlloc *const_alloc(const Instance *in) {
 }
 
 #define CONST_STACK 32
+/* The deepest stack a constant expression is evaluated on in this frame;
+   one deeper -- an array.new_fixed of thousands of elements, as TeaVM writes
+   for its class tables -- gets a mapping of its own for the evaluation. */
+#define CONST_ON_STACK 256
 static void const_eval(Instance *in, u32 at, u64 *out) {
 
   u32 depth = in->md->const_depth ? in->md->const_depth : CONST_STACK;
-  if (depth > 1024) die("constant expression too deep");
-  u64 lo[depth], hi[depth];
-
-  u64 roots[depth];
+  u64 near[3 * CONST_ON_STACK];
+  u64 *lo = near;
+  usz mapped = 0;
+  if (depth > CONST_ON_STACK) {
+    mapped = (usz)depth * 3 * sizeof(u64);
+    lo = (u64 *)sys_mmap(0, mapped, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS);
+    if (!lo) die("no memory to evaluate a constant expression on");
+  }
+  u64 *hi = lo + depth, *roots = hi + depth;
   u32 sp = 0;
   GcRoots hold;
   warmc_gc_hold(roots, &sp, &hold);
@@ -539,6 +549,7 @@ static void const_eval(Instance *in, u32 at, u64 *out) {
   warmc_gc_release(&hold);
   out[0] = lo[0];
   out[1] = hi[0];
+  if (mapped) sys_munmap(lo, mapped);
 }
 
 static WarmInstance *vm;

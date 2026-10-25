@@ -109,10 +109,13 @@ case("result_count_over_limit", "malformed", "above the limit",
 # The bit was decoded and dropped, so the module compiled as though it had
 # asked for an ordinary memory.
 # The stack a constant expression is evaluated on used to be a fixed 32
-# entries and is now sized from the module, with a limit of its own; nothing
-# in the tree had a constant expression deeper than 32, so neither the new
-# capability nor the new limit was exercised.  array.new_fixed is the only
-# constant instruction that takes an unbounded number of operands.
+# entries and is now sized from the module; nothing in the tree had a
+# constant expression deeper than 32, so the sizing was not exercised.
+# array.new_fixed is the only constant instruction that takes an unbounded
+# number of operands.  No depth is refused: the runtime evaluates up to 256
+# values in its frame and maps the stack for a deeper one, and TeaVM writes an
+# array.new_fixed of 3,716 for its class table (test/gen_gc_cases.py runs
+# such initialisers; these only validate them).
 A_MUT_I32_T = b"\x5e" + bytes([I32]) + b"\x01"
 def deep_const(n):
     return module([section(1, vec([A_MUT_I32_T])),
@@ -120,8 +123,9 @@ def deep_const(n):
                                    b"\x41\x00" * n +
                                    b"\xfb\x08" + leb(0) + leb(n) + END]))])
 case("const_stack_deeper_than_32_ok", "accept", "", deep_const(64))
-case("const_stack_over_limit", "invalid", "more than the",
-     deep_const(1025))
+case("const_stack_past_the_frame_ok", "accept", "", deep_const(257))
+case("const_stack_past_1024_ok", "accept", "", deep_const(1025))
+case("const_stack_10000_ok", "accept", "", deep_const(10000))
 
 case("shared_memory", "invalid", "shared memory",
      module([section(5, vec([b"\x03" + leb(1) + leb(1)]))]))

@@ -468,8 +468,6 @@ ValType vt_join(const Module *m, ValType a, ValType b);
 
 #define INVOKE_MAX_RESULTS 16u
 
-#define MAX_CONST_DEPTH 1024u
-
 #define MAX_ARRAY_NEW_FIXED 10000u
 
 #define WASM_PAGE_SIZE 65536

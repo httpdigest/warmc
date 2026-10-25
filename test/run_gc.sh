@@ -31,6 +31,7 @@ assemble test/cases_gc/ictab_sub.wat ictab_sub
 assemble test/cases_gc/escape.wat escape
 assemble test/cases_gc/castfacts.wat castfacts
 assemble test/cases_gc/castfacts.wat castfacts_nt
+assemble test/cases_gc/brcast.wat brcast
 assemble "$WORK/gcgen.wat" gcgen
 
 [ "${1:-}" = --prepare ] && exit 0
@@ -278,12 +279,35 @@ H=${GC_H:-$(( N < 4000 ? N : 4000 ))}
 
 build_one gcgen
 expect manytypes          "OK" $M
+expect deepconst          "OK"
 
 build_one constroot
 expect struct_chain       "OK"
 expect array_elems        "OK"
 expect global_get_identity "OK"
 expect global_get_shared  "OK"
+
+build_one brcast
+expect loop_field   "OK" 0 1000 1000
+expect loop_field   "OK" 1 1000 0
+expect loop_field   "OK" 2 1000 0
+expect loop_field   "OK" 3 1000 0
+expect restart      "OK" 0 0
+expect restart      "OK" 3 1
+expect restart      "OK" 2 2
+expect restart      "OK" 1 3
+expect to_return    "OK" 0 1 1
+expect to_return    "OK" 3 1 2
+expect to_return    "OK" 1 0 0
+expect to_return    "OK" 4 0 0
+expect to_loop      "OK" 0 2
+expect to_loop      "OK" 3 1
+expect to_loop      "OK" 1 0
+expect to_loop      "OK" 4 0
+expect fail_branch  "OK" 0 10 20
+expect fail_branch  "OK" 1 10 30
+expect fail_branch  "OK" 3 10 20
+expect fail_branch  "OK" 2 10 40
 
 build_one exnpayload
 expect payload_survives   "OK"

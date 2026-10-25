@@ -1218,7 +1218,40 @@ static void gc_build(Bld *b, uint32_t sub, const char *sym) {
       Ref cond = t;
       if (!taken_is_cast)
         cond = ir_emit(f, b->cur, I_EQZ, VT_I32, &t, 1, 0, 0);
-      branch_if(b, d, cond, REF_NONE);
+      if (taken_is_cast) {
+        /* The branch takes the cast's result, converted on an edge of its
+           own, where the test has passed: a read past the target takes
+           the cast type's layout, and passing x itself left nothing to
+           say which test made that layout true, so LICM moved such reads
+           out of a loop, above the cast (test/cases_gc/brcast.wat). */
+        uint32_t edge = new_block(b, NULL, 0), next = new_block(b, NULL, 0);
+        set_term(b, b->cur, T_BRIF);
+        f->blocks[b->cur].term_arg = cond;
+        ir_add_edge(f, b->cur, edge, NULL, 0);
+        ir_add_edge(f, b->cur, next, NULL, 0);
+        f->blocks[edge].sealed = f->blocks[next].sealed = true;
+        b->cur = edge;
+        ValType src = (ValType)f->insts[x].type;
+        bool out_nul = vt_nullable(t2) && (!vt_is_ref(src) || vt_nullable(src));
+        b->stack[b->sp - 1] = ir_emit(f, edge, I_REF_CONVERT, vt_ref(out_nul, h2),
+                                      &x, 1, 0, 0);
+        Ctl *tc = &b->ctl[b->nctl - 1 - d];
+        uint32_t arity = tc->kind == C_LOOP ? tc->nparams : tc->nresults;
+        if (tc->kind == C_FUNC) {
+          Block *blk = &f->blocks[edge];
+          set_term(b, edge, T_RETURN);
+          blk->nret = arity;
+          blk->ret_args = xmalloc((arity ? arity : 1) * sizeof(Ref));
+          memcpy(blk->ret_args, &b->stack[b->sp - arity], arity * sizeof(Ref));
+        } else {
+          jump_to(b, edge, tc->target, &b->stack[b->sp - arity], arity);
+          if (tc->kind != C_LOOP) tc->after_reached = true;
+        }
+        b->stack[b->sp - 1] = x;
+        b->cur = next;
+      } else {
+        branch_if(b, d, cond, REF_NONE);
+      }
 
       ValType diff = vt_nullable(t2) ? vt_as_non_null(t1) : t1;
       ValType left = taken_is_cast ? diff : t2;
