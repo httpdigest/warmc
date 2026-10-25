@@ -67,7 +67,7 @@ def assemble(wat, out):
 # name: (main class, exit status, stderr wanted in full or as a prefix (...))
 RUNS = {
     "host": ("Main", 0, "E\n"),
-    "unsupported": ("Main", 69, "teavm-wasi: teavmJso.callMethod1 has no meaning outside JavaScript\n"),
+    "unsupported": ("Main", 69, "teavm-wasi: teavmJso.callMethod2 has no meaning outside JavaScript\n"),
     "jsoname": ("Main", 69, "teavm-wasi: JavaScript's window has no meaning outside JavaScript\n"),
     "funcsrc": ("Main", 69, "teavm-wasi: a function made from JavaScript source has no meaning outside JavaScript\n"),
     "uncaught": ("Main", 1, "Uncaught Java exception: böom❗\n"),
@@ -136,6 +136,84 @@ FUNCSRC_WAT = '''(module
       (call $createFunction1 (call $mk (i32.const 1) (i32.const %d)) (call $mk (i32.const %d) (i32.const %d)))
       (call $mk (i32.const 0) (i32.const 1))) (i32.const 0)))
     (call $putchar (i32.const 10))))'''
+
+# What TeaVM's ByteBuffer.allocateDirect asks JavaScript for on the wasm-gc
+# target, the adapter's FinalizationRegistry that never calls back:
+# JSObjects.create's `{}`s for the key and the token, the registry made with
+# the cleanup, a Java object's method as a function, and register and, on
+# release(), unregister.  Each case changes one of them from what TeaVM asks
+# and is stopped there (the call it stops at, stderr's message); the first
+# asks nothing else, prints "ok", and checks that a Java object as JavaScript
+# sees it is the object.
+REGISTRY_OK = dict(body="{return {};}", cls="FinalizationRegistry", reg="register", unreg="unregister",
+                   on_reg="$reg", on_unreg="$reg")
+REGISTRY = [
+    ({}, None),
+    ({"body": "{return [];}"}, "a function made from JavaScript source"),
+    ({"body": "return {};"}, "a function made from JavaScript source"),
+    ({"cls": "performance"}, "a JavaScript class's constructor"),
+    ({"reg": "registe"}, "JavaScript's registe"),
+    ({"unreg": "register"}, "JavaScript's register"),
+    ({"on_reg": "$key"}, "JavaScript's register"),
+    ({"on_unreg": "$token"}, "JavaScript's unregister"),
+]
+
+REGISTRY_WAT = '''(module
+  (type $chars (array (mut i16)))
+  (type $Object (sub (struct (field (mut i32)))))
+  (import "env" "memory" (memory 1))
+  (import "teavmConsole" "putcharStdout" (func $putchar (param i32)))
+  (import "wasm:js-string" "fromCharCodeArray" (func $fromArray (param (ref null $chars) i32 i32) (result (ref extern))))
+  (import "teavmJso" "createFunction0" (func $createFunction0 (param externref) (result (ref extern))))
+  (import "teavmJso" "callFunction0" (func $callFunction0 (param externref) (result externref)))
+  (import "teavmJso" "global" (func $global (param externref) (result externref)))
+  (import "teavmJso" "javaObjectToJS" (func $javaObjectToJS (param (ref null $Object) externref) (result externref)))
+  (import "teavmJso" "asFunction" (func $asFunction (param externref externref) (result externref)))
+  (import "teavmJso" "construct1" (func $construct1 (param externref externref) (result externref)))
+  (import "teavmJso" "wrapInt" (func $wrapInt (param i32) (result externref)))
+  (import "teavmJso" "callMethod3" (func $callMethod3 (param externref externref externref externref externref) (result externref)))
+  (import "teavmJso" "callMethod1" (func $callMethod1 (param externref externref externref) (result externref)))
+  (tag $exn (export "teavm.javaException") (param (ref null $Object)))
+  (data (i32.const 0) "%(data)s")
+  (@custom "teavm.memoryRequirements" "{\\"min\\":1, \\"dataSize\\":128, \\"shared\\": false}")
+  (func $mk (param $p i32) (param $n i32) (result (ref extern))
+    (local $a (ref $chars)) (local $i i32)
+    (local.set $a (array.new_default $chars (local.get $n)))
+    (block $done
+      (loop $next
+        (br_if $done (i32.ge_u (local.get $i) (local.get $n)))
+        (array.set $chars (local.get $a) (local.get $i)
+          (i32.load8_u (i32.add (local.get $p) (local.get $i))))
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br $next)))
+    (call $fromArray (local.get $a) (i32.const 0) (local.get $n)))
+  (func $Main::main_$caller$exported$0 (param $args externref)
+    (local $create externref) (local $key externref) (local $token externref) (local $reg externref)
+    (local $cleanup (ref null $Object)) (local $js externref)
+    (local.set $cleanup (struct.new $Object (i32.const 7)))
+    (local.set $js (call $javaObjectToJS (local.get $cleanup) (ref.null extern)))
+    (if (ref.eq (ref.cast (ref null eq) (any.convert_extern (local.get $js))) (local.get $cleanup))
+      (then (call $putchar (i32.const 111))))
+    (local.set $create (call $createFunction0 %(body)s))
+    (local.set $key (call $callFunction0 (local.get $create)))
+    (local.set $token (call $callFunction0 (local.get $create)))
+    (local.set $reg (call $construct1 (call $global %(cls)s)
+                                      (call $asFunction (local.get $js) %(accept)s)))
+    (drop (call $callMethod3 (local.get %(on_reg)s) %(reg)s (local.get $key) (call $wrapInt (i32.const 4096))
+                             (local.get $token)))
+    (drop (call $callMethod1 (local.get %(on_unreg)s) %(unreg)s (local.get $token)))
+    (call $putchar (i32.const 107))
+    (call $putchar (i32.const 10))))'''
+
+def registry_wat(change):
+    c = dict(REGISTRY_OK, **change)
+    data, at = "", {}
+    for k in ("body", "cls", "reg", "unreg"):
+        at[k] = "(call $mk (i32.const %d) (i32.const %d))" % (len(data), len(c[k]))
+        data += c[k]
+    at["accept"] = "(call $mk (i32.const %d) (i32.const 6))" % len(data)
+    data += "accept"
+    return REGISTRY_WAT % dict(at, data=data, on_reg=c["on_reg"], on_unreg=c["on_unreg"])
 
 # A string builtin's misuse traps, as the JS String Builtins proposal says:
 # each of these is the body of a main that must not get past it.
@@ -245,6 +323,30 @@ def run_funcsrc(work, flags):
             if (r.returncode, r.stdout) != want:
                 fail("new Function(%r, %r) under %s: exit %d stdout %r, wanted %s"
                      % (arg, body, who, r.returncode, r.stdout, want))
+
+def run_registry(work, flags):
+    for i, (change, stops) in enumerate(REGISTRY):
+        src = os.path.join(work, "registry_%d.wasm" % i)
+        assemble(registry_wat(change), src)
+        adapted = os.path.join(work, "registry_%d.w.wasm" % i)
+        with open(src, "rb") as f:
+            err = wasi.write(f.read(), adapted)
+        if err:
+            fail("registry %r: the adapter refused it: %s" % (change, err))
+            continue
+        exe = os.path.join(work, "registry_%d" % i)
+        r = subprocess.run([WARMC] + flags + ["-O2", "--wasi", "-o", exe, adapted],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            fail("registry %r: warmc: %s" % (change, r.stderr.strip()[:300]))
+            continue
+        want = (0, b"ok\n", b"") if stops is None else \
+            (69, b"o", ("teavm-wasi: %s has no meaning outside JavaScript\n" % stops).encode())
+        for who, cmd in (("wasmtime", ["wasmtime", adapted]), ("warmc", [exe])):
+            r = subprocess.run(cmd, capture_output=True)
+            if (r.returncode, r.stdout, r.stderr) != want:
+                fail("registry %r under %s: exit %d stdout %r stderr %r, wanted %s"
+                     % (change, who, r.returncode, r.stdout, r.stderr, want))
 
 def run_cases(work, flags):
     for name, (main_class, want_rc, want_err) in RUNS.items():
@@ -404,6 +506,7 @@ PATCHED = [
     ("arrayname", ("wasm", "strict")),
     ("flush", ("wasm", "strict")),
     ("byteorder", ("wasm",)),
+    ("directbuffer", ("wasm",)),
 ]
 
 def run_patched(work, flags):
@@ -517,6 +620,7 @@ def main():
         flags = host_flags()
         run_cases(work, flags)
         run_funcsrc(work, flags)
+        run_registry(work, flags)
         run_traps(work, flags)
         run_random(work)
         run_refusals(work)
@@ -528,9 +632,10 @@ def main():
         print("teavm: %d failure(s)" % len(fails))
         return 1
     print("teavm: %d adapted modules agree under wasmtime and warmc -O0/-O2, %d functions from "
-          "source told apart, %d misused string builtins trap, %d modules refused as they "
-          "should be, %d runs of the patched TeaVM's programs as the JVM runs them"
-          % (len(RUNS), len(FUNCSRC), len(TRAPS), len(REFUSE) + 1, patched))
+          "source told apart, %d uses of the direct buffers' registry, %d misused string builtins "
+          "trap, %d modules refused as they should be, %d runs of the patched TeaVM's programs as "
+          "the JVM runs them"
+          % (len(RUNS), len(FUNCSRC), len(REGISTRY), len(TRAPS), len(REFUSE) + 1, patched))
     return 0
 
 if __name__ == "__main__":

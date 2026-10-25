@@ -37,7 +37,12 @@ What each host call becomes:
     -- make placeholder objects, and the few JSO calls TeaVM's class library
     makes on its own (performance.now, the length of main's argument array)
     answer as JavaScript would;
-  * weak references stay strong, which the Java memory model allows.
+  * weak references stay strong, which the Java memory model allows;
+  * a direct ByteBuffer's memory, which TeaVM allocates in the linear memory
+    and has JavaScript's FinalizationRegistry release once the buffer is
+    garbage, stays the buffer's: the registry the class library makes is one
+    that never calls back, as no weak reference clears, and the `{}` keys it
+    registers buffers by are placeholder objects.
 
 Of TeaVM's exports the module keeps the program's own: those for the loader
 alone (loader_export) go, and with them every reference that crossed the
@@ -268,8 +273,11 @@ def obj(kind):
     return ext("(struct.new $__w.obj (i32.const %d))" % kind)
 
 # The JS objects the host makes, by kind: one it knows nothing more of,
-# `performance`, main's argument array, and a function returning its argument.
-OBJ_OTHER, OBJ_PERFORMANCE, OBJ_ARGS, OBJ_IDENTITY = 0, 1, 2, 3
+# `performance`, main's argument array, a function returning its argument, a
+# function returning a new `{}`, the FinalizationRegistry class, and one of
+# its registries.
+(OBJ_OTHER, OBJ_PERFORMANCE, OBJ_ARGS, OBJ_IDENTITY, OBJ_NEW_EMPTY, OBJ_REGISTRY_CLASS,
+ OBJ_REGISTRY) = range(7)
 
 def is_name(lay, s, text):
     p, n = lay.string(text)
@@ -290,8 +298,10 @@ def h_deref(sig, lay):
     return "(ref.cast %s (any.convert_extern (local.get 0)))" % r
 
 def h_global(sig, lay):
-    return ("(if (result externref) %s (then %s) (else (call $__w.unsupported_jso (local.get 0)) (unreachable)))"
-            % (is_name(lay, "(local.get 0)", "performance"), obj(OBJ_PERFORMANCE)))
+    return ("(if (result externref) %s (then %s) (else (if (result externref) %s (then %s)"
+            " (else (call $__w.unsupported_jso (local.get 0)) (unreachable)))))"
+            % (is_name(lay, "(local.get 0)", "performance"), obj(OBJ_PERFORMANCE),
+               is_name(lay, "(local.get 0)", "FinalizationRegistry"), obj(OBJ_REGISTRY_CLASS)))
 
 def h_call_method0(sig, lay):
     # performance.now(): the one method TeaVM's class library calls by itself
@@ -323,6 +333,34 @@ def h_unwrap_bool(sig, lay):
 
 def h_new_obj(sig, lay):
     return obj(OBJ_OTHER) if sig.results else ""
+
+def h_create_function0(sig, lay):
+    # new Function(body): JSObjects.create's is `{return {};}`, which the class
+    # library's direct buffers call for their registry keys
+    return ("(if (result (ref extern)) %s (then %s) (else %s))"
+            % (is_name(lay, "(local.get 0)", "{return {};}"), obj(OBJ_NEW_EMPTY), obj(OBJ_OTHER)))
+
+def h_call_function0(sig, lay):
+    p, n = lay.string("a function made from JavaScript source")
+    return ("(if (result externref) (call $__w.is_obj (local.get 0) (i32.const %d))"
+            " (then %s) (else (call $__w.unsupported (i32.const %d) (i32.const %d)) (unreachable)))"
+            % (OBJ_NEW_EMPTY, obj(OBJ_OTHER), p, n))
+
+def h_construct1(sig, lay):
+    # new FinalizationRegistry(cleanup): one that never calls cleanup back
+    p, n = lay.string("a JavaScript class's constructor")
+    return ("(if (result externref) (call $__w.is_obj (local.get 0) (i32.const %d))"
+            " (then %s) (else (call $__w.unsupported (i32.const %d) (i32.const %d)) (unreachable)))"
+            % (OBJ_REGISTRY_CLASS, obj(OBJ_REGISTRY), p, n))
+
+def h_registry_method(method):
+    # registry.register(key, value, token) and registry.unregister(token):
+    # nothing to keep, as the registry never calls back
+    def h(sig, lay):
+        return ("(if (result externref) (i32.and (call $__w.is_obj (local.get 0) (i32.const %d)) %s)"
+                " (then (ref.null extern)) (else (call $__w.unsupported_jso (local.get 1)) (unreachable)))"
+                % (OBJ_REGISTRY, is_name(lay, "(local.get 1)", method)))
+    return h
 
 def h_create_function1(sig, lay):
     # new Function(arg, body): JSString's valueOf and stringValue are
@@ -390,6 +428,14 @@ HOST = {
     ("teavmJso", "callMethod0"): h_call_method0,
     ("teavmJso", "getProperty"): h_get_property,
     ("teavmJso", "callFunction1"): h_call_function1,
+    ("teavmJso", "callFunction0"): h_call_function0,
+    ("teavmJso", "construct1"): h_construct1,
+    ("teavmJso", "callMethod1"): h_registry_method("unregister"),
+    ("teavmJso", "callMethod3"): h_registry_method("register"),
+    # a Java object as JavaScript sees it, and its method as a function: the
+    # registry's cleanup, which it never calls
+    ("teavmJso", "javaObjectToJS"): lambda sig, lay: ext("(local.get 0)"),
+    ("teavmJso", "asFunction"): lambda sig, lay: obj(OBJ_OTHER),
     ("teavmJso", "wrapInt"): h_wrap,
     ("teavmJso", "wrapDouble"): h_wrap,
     ("teavmJso", "wrapFloat"): h_wrap,
@@ -412,6 +458,8 @@ def host_body(module, name, sig, lay, fdlibm):
         return h(sig, lay) if h else None
     if module == "teavmJso" and name == "createFunction1":
         return h_create_function1(sig, lay)
+    if module == "teavmJso" and name == "createFunction0":
+        return h_create_function0(sig, lay)
     if module == "teavmJso" and name.startswith("createFunction"):
         return h_new_obj(sig, lay)
     if module == "teavmMath" and name in fdlibm:
