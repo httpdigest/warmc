@@ -2282,6 +2282,10 @@ static void emit_inst(Isel *s, Ref v) {
     }
 
     case I_TRAP_IF: {
+      if (s->folded && s->folded[a[0]] && f->insts[a[0]].op == I_REF_SLOT) {
+        emit_slot_test(s, &f->insts[a[0]], rd(s, ir_args(f, a[0])[0], S0), (int)in->imm, NULL);
+        break;
+      }
       int x = rd(s, a[0], S0);
       trap_if_zero(s, is64(f, a[0]), x, (int)in->imm);
       break;
@@ -2640,7 +2644,7 @@ static void emit_inst(Isel *s, Ref v) {
 
     case I_REF_TEST: {
       /* Same slot fast path as the a64 backend: this module's objects
-         answer inline from their slot (rtest_slots), another module's ask
+         answer inline from their slot (codegen_rtest_slots), another module's ask
          warmc_ref_test. */
       size_t to_end[3];
       int nend = 0;
@@ -2649,7 +2653,7 @@ static void emit_inst(Isel *s, Ref v) {
       bool exact;
       if ((RTEST_KIND(in->imm) & ~RTK_NULLABLE) == RTK_CONCRETE_ANY &&
           !warmc_getenv("WARMC_NO_RTEST_FAST") &&
-          rtest_slots(f->m, in->imm, in->imm2, &lo, &hi, &exact, &nslots)) {
+          codegen_rtest_slots(f->m, in->imm, in->imm2, &lo, &hi, &exact, &nslots)) {
         int x = rd(s, a[0], S0);
         bool nullable = (RTEST_KIND(in->imm) & RTK_NULLABLE) != 0;
         uint32_t tmask = (1u << (30 - GC_TYPE_SHIFT)) - 1u;
@@ -2709,6 +2713,21 @@ static void emit_inst(Isel *s, Ref v) {
       if (d != X_RAX) x64_mov_rr(B, 0, d, X_RAX);
       csa_restore(s, v);
       for (int e = 0; e < nend; e++) br_patch(s, to_end[e], B->len);
+      commit(s, v, d);
+      break;
+    }
+
+    case I_REF_SLOT: {
+      int x = rd(s, a[0], S0);
+      size_t fail[3];
+      int nf = emit_slot_test(s, in, x, -1, fail);
+      int d = wr(s, v, S1);
+      x64_mov_ri(B, 0, d, 1);
+      x64_jmp_rel32(B);
+      size_t to_end = B->len;
+      for (int k = 0; k < nf; k++) br_patch(s, fail[k], B->len);
+      x64_mov_ri(B, 0, d, 0);
+      br_patch(s, to_end, B->len);
       commit(s, v, d);
       break;
     }

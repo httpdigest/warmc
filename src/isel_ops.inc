@@ -1909,6 +1909,12 @@ static void emit_inst(Isel *s, Ref v) {
 
     case I_TRAP_IF: {
 
+      /* a cast: its slot test branches to the trap itself */
+      if (s->folded && s->folded[a[0]] && f->insts[a[0]].op == I_REF_SLOT) {
+        const Inst *t = &f->insts[a[0]];
+        emit_slot_test(s, t, rd(s, ir_args(f, a[0])[0], S0), (int)in->imm, NULL);
+        break;
+      }
       int x = rd(s, a[0], S0);
       trap_if_zero(s, is64(f, a[0]) ? SF64 : SF32, x, (int)in->imm);
       break;
@@ -2307,7 +2313,7 @@ static void emit_inst(Isel *s, Ref v) {
 
       /* The run-time id answers for this module's own objects: the header id
          less the instance's base is the object's slot when it is below the
-         module's count, and rtest_slots says which slots pass, so a slot in
+         module's count, and codegen_rtest_slots says which slots pass, so a slot in
          the passing run answers yes and -- when the run is every slot that
          passes -- any other slot of the module's answers no.  An id outside
          the range is another module's object: gc_register_types hands each
@@ -2325,7 +2331,7 @@ static void emit_inst(Isel *s, Ref v) {
       bool exact;
       if ((RTEST_KIND(in->imm) & ~RTK_NULLABLE) == RTK_CONCRETE_ANY &&
           !warmc_getenv("WARMC_NO_RTEST_FAST") &&
-          rtest_slots(f->m, in->imm, in->imm2, &lo, &hi, &exact, &nslots)) {
+          codegen_rtest_slots(f->m, in->imm, in->imm2, &lo, &hi, &exact, &nslots)) {
         int x = rd(s, a[0], S0);
         bool nullable = (RTEST_KIND(in->imm) & RTK_NULLABLE) != 0;
         size_t to_i31, to_slow[2];
@@ -2396,6 +2402,21 @@ static void emit_inst(Isel *s, Ref v) {
       if (d != R0) a64_mov_reg(B, SF32, d, R0);
       csa_restore(s, v);
       for (int e = 0; e < nend; e++) patch_b26_checked(s, to_end[e], B->len);
+      commit(s, v, d);
+      break;
+    }
+
+    case I_REF_SLOT: {
+      int x = rd(s, a[0], S0);
+      size_t fail[3];
+      int nf = emit_slot_test(s, in, x, -1, fail);
+      int d = wr(s, v, S1);
+      a64_load_imm(B, SF32, d, 1);
+      size_t to_end = B->len;
+      a64_b(B, 0);
+      for (int k = 0; k < nf; k++) a64_patch_b19(B, fail[k], B->len);
+      a64_load_imm(B, SF32, d, 0);
+      a64_patch_b26(B, to_end, B->len);
       commit(s, v, d);
       break;
     }

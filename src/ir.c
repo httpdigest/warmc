@@ -1227,9 +1227,14 @@ bool ir_has_no_effect(const Inst *in) {
 
     case I_REF_I31:
 
-    case I_REF_TEST: case I_REF_CONVERT: case I_ANY_OF_EXTERN: case I_EXTERN_OF_ANY:
+    case I_REF_TEST: case I_REF_CONVERT: case I_ANY_OF_EXTERN:
+    case I_EXTERN_OF_ANY:
     case I_NOP:
       return true;
+
+    /* one that traps on null in place of an access after it does not */
+    case I_REF_SLOT:
+      return !(RTEST_KIND(in->imm) & RTK_NULLTRAP);
 
     case I_STRUCT_NEW: case I_ARRAY_NEW: case I_ARRAY_NEW_SEG:
       return false;
@@ -1379,7 +1384,7 @@ const char *ir_op_name(uint16_t op) {
     N(I_ARRAY_LEN, "array.len"),
     N(I_GC_LAB_OPEN, "gc.lab_open"), N(I_GC_LAB_FLUSH, "gc.lab_flush"),
     N(I_GC_BADMASK, "gc.badmask"),
-    N(I_REF_TEST, "ref.test"), N(I_REF_CONVERT, "ref.convert"), N(I_REF_I31, "ref.i31"), N(I_I31_GET, "i31.get"),
+    N(I_REF_TEST, "ref.test"), N(I_REF_SLOT, "ref.test.slot"), N(I_REF_CONVERT, "ref.convert"), N(I_REF_I31, "ref.i31"), N(I_I31_GET, "i31.get"),
     N(I_ANY_OF_EXTERN, "any.convert_extern"), N(I_EXTERN_OF_ANY, "extern.convert_any"),
     N(I_NOP, "nop"),
   };

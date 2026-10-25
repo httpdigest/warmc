@@ -708,6 +708,72 @@ static void emit_gc_canon(Isel *s, int into, int x) {
   x64_shr_ri(B, 1, into, 8);
 }
 
+/* An I_REF_SLOT's test of the reference in x, as the a64 backend's
+   emit_slot_test makes it: falls through when it passes, traps with the
+   given code when it fails, or given -1 jumps instead, through the rel32
+   sites it returns in fail[] (at most three). */
+static int emit_slot_test(Isel *s, const Inst *in, int x, int trap, size_t *fail) {
+  uint32_t lo, hi, nslots;
+  bool exact;
+  if (!codegen_rtest_slots(s->f->m, in->imm, in->imm2, &lo, &hi, &exact, &nslots) ||
+      !exact)
+    warmc_fatal("internal: a slot test of a type no run of slots decides");
+  int nf = 0;
+  bool nullable = (RTEST_KIND(in->imm) & RTK_NULLABLE) != 0;
+  size_t to_pass = 0;
+  if (RTEST_KIND(in->imm) & RTK_NULLTRAP) {
+    trap_if_zero(s, 1, x, TRAP_NULL_REF);
+  } else if (nullable) {
+    x64_test_rr(B, 1, x, x);
+    x64_jcc_rel32(B, XCC_E);
+    to_pass = B->len;
+  } else if (trap >= 0) {
+    trap_if_zero(s, 1, x, trap);
+  } else {
+    x64_test_rr(B, 1, x, x);
+    x64_jcc_rel32(B, XCC_E);
+    fail[nf++] = B->len;
+  }
+  if (lo > hi) {
+    if (trap >= 0) {
+      emit_trap(s, trap);
+    } else {
+      x64_jmp_rel32(B);
+      fail[nf++] = B->len;
+    }
+  } else {
+    if (!s->f->m->gc_no_i31) {
+      x64_test_ri(B, 1, x, 3);
+      if (trap >= 0) {
+        trap_if_cc(s, XCC_NE, trap);
+      } else {
+        x64_jcc_rel32(B, XCC_NE);
+        fail[nf++] = B->len;
+      }
+    }
+    emit_gc_canon(s, TMP0, x);
+    x64_load32(B, TMP0, TMP0, X64_NOIDX, 0, GC_HDR_WORD_OFF);
+    x64_load32(B, TMP1, REG_VMCTX, X64_NOIDX, 0, VMCTX_GC_HDR);
+    x64_sub_rr(B, 0, TMP0, TMP1);
+    int cc = XCC_NE;
+    if (lo != hi) {
+      if (lo) x64_sub_ri(B, 0, TMP0, (int32_t)lo);
+      x64_cmp_ri(B, 0, TMP0, (int32_t)(hi - lo));
+      cc = XCC_A;
+    } else {
+      x64_cmp_ri(B, 0, TMP0, (int32_t)lo);
+    }
+    if (trap >= 0) {
+      trap_if_cc(s, cc, trap);
+    } else {
+      x64_jcc_rel32(B, cc);
+      fail[nf++] = B->len;
+    }
+  }
+  if (to_pass) br_patch(s, to_pass, B->len);
+  return nf;
+}
+
 /* ---- the GC allocation fast path ------------------------------------- */
 
 #define GC_FASTNEW_MAX 256u
@@ -1059,6 +1125,20 @@ static void analyse_immediates(Isel *s) {
     uint16_t op = f->insts[c].op;
     bool cmpish = (op >= I_EQ && op <= I_EQZ) || (op >= I_FEQ && op <= I_FGE);
     if (cmpish && !warmc_getenv("WARMC_NO_FUSE")) s->fused[c] = 1;
+  }
+
+  /* A cast's slot test, which only its trap reads, jumps to the trap itself
+     (I_TRAP_IF). */
+  for (uint32_t oi = 0; oi < f->norder; oi++) {
+    Block *b = &f->blocks[f->order[oi]];
+    for (uint32_t i = 0; i < b->ninsts; i++) {
+      Ref u = b->insts[i];
+      if (f->insts[u].op != I_TRAP_IF || f->insts[u].nargs != 1) continue;
+      Ref c = ir_args(f, u)[0];
+      if (f->insts[c].op != I_REF_SLOT || uses[c] != 1 || blocked[c]) continue;
+      if (f->insts[c].block != f->order[oi] || s->folded[c]) continue;
+      s->folded[c] = 1;
+    }
   }
 
   /* AND feeding only a zero-test becomes TEST. */

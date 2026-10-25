@@ -493,6 +493,87 @@ static void rtest_cmp_imm(Isel *s, int reg, uint32_t imm) {
   }
 }
 
+/* An I_REF_SLOT's test of the reference in x.  Every object its module's
+   code meets is its own (Module.gc_sealed), whose header holds the
+   instance's type base plus the object's slot, so the slot decides: the
+   test passes for a slot in the run codegen_rtest_slots gives, fails for an
+   i31 and for any other slot, and passes for null when the test takes null
+   -- or traps as a null dereference does, RTK_NULLTRAP's.
+   The code falls through when the test passes.  When it fails it traps with
+   the given code, a cast's; given -1 it branches instead, through the b19
+   sites it returns in fail[] (at most three), for its caller to place. */
+static int emit_slot_test(Isel *s, const Inst *in, int x, int trap, size_t *fail) {
+  uint32_t lo, hi, nslots;
+  bool exact;
+  if (!codegen_rtest_slots(s->f->m, in->imm, in->imm2, &lo, &hi, &exact, &nslots) ||
+      !exact)
+    warmc_fatal("internal: a slot test of a type no run of slots decides");
+  int nf = 0;
+  bool nullable = (RTEST_KIND(in->imm) & RTK_NULLABLE) != 0;
+  size_t to_pass = 0;
+  if (RTEST_KIND(in->imm) & RTK_NULLTRAP) {
+    trap_if_zero(s, SF64, x, TRAP_NULL_REF);
+  } else if (nullable) {
+    to_pass = B->len;
+    a64_cbz(B, SF64, x, 0);
+  } else if (trap >= 0) {
+    trap_if_zero(s, SF64, x, trap);
+  } else {
+    fail[nf++] = B->len;
+    a64_cbz(B, SF64, x, 0);
+  }
+  if (lo > hi) {
+    /* no slot passes: nothing but a null does */
+    if (trap >= 0) {
+      emit_trap(s, trap);
+    } else {
+      /* b.al, a b19 site as the others are */
+      fail[nf++] = B->len;
+      a64_bcond(B, CC_AL, 0);
+    }
+  } else {
+    /* an i31 is the one reference besides an object and null, and a module
+       that makes none has none */
+    if (!s->f->m->gc_no_i31) {
+      uint32_t tst3;
+      if (!a64_logical_imm(3, SF64, &tst3))
+        warmc_fatal("internal: 3 is not a logical immediate");
+      a64_tst_imm(B, SF64, x, tst3);
+      if (trap >= 0) {
+        trap_if_cc(s, CC_NE, trap);
+      } else {
+        fail[nf++] = B->len;
+        a64_bcond(B, CC_NE, 0);
+      }
+    }
+    a64_ldr_imm(B, 2, S2, x, GC_HDR_WORD_OFF);
+    a64_ldr_imm(B, 2, S3, REG_VMCTX, VMCTX_GC_HDR);
+    a64_sub_reg(B, SF32, S2, S2, S3);
+    int cc = CC_NE;
+    if (lo != hi) {
+      /* lo <= slot <= hi as slot - lo <= hi - lo, unsigned */
+      if (lo <= 0xfffu) {
+        a64_sub_imm(B, SF32, S2, S2, lo, 0);
+      } else {
+        a64_load_imm(B, SF32, TMP0, lo);
+        a64_sub_reg(B, SF32, S2, S2, TMP0);
+      }
+      rtest_cmp_imm(s, S2, hi - lo);
+      cc = CC_HI;
+    } else {
+      rtest_cmp_imm(s, S2, lo);
+    }
+    if (trap >= 0) {
+      trap_if_cc(s, cc, trap);
+    } else {
+      fail[nf++] = B->len;
+      a64_bcond(B, cc, 0);
+    }
+  }
+  if (nullable) a64_patch_b19(B, to_pass, B->len);
+  return nf;
+}
+
 static int emit_gc_load_barrier_pre(Isel *s, int dst, int base) {
   if (dst != base) return base;
   a64_mov_reg(B, SF64, S3, base);
@@ -2016,6 +2097,20 @@ static void analyse_immediates(Isel *s) {
     uint16_t op = f->insts[c].op;
     bool cmpish = (op >= I_EQ && op <= I_EQZ) || (op >= I_FEQ && op <= I_FGE);
     if (cmpish && !warmc_getenv("WARMC_NO_FUSE")) s->fused[c] = 1;
+  }
+
+  /* A cast's slot test, which only its trap reads, branches to the trap
+     itself (I_TRAP_IF) instead of making a 0 or 1 to test again. */
+  for (uint32_t oi = 0; oi < f->norder; oi++) {
+    Block *b = &f->blocks[f->order[oi]];
+    for (uint32_t i = 0; i < b->ninsts; i++) {
+      Ref u = b->insts[i];
+      if (f->insts[u].op != I_TRAP_IF || f->insts[u].nargs != 1) continue;
+      Ref c = ir_args(f, u)[0];
+      if (f->insts[c].op != I_REF_SLOT || uses[c] != 1 || blocked[c]) continue;
+      if (f->insts[c].block != f->order[oi] || s->folded[c]) continue;
+      s->folded[c] = 1;
+    }
   }
 
   if (!warmc_getenv("WARMC_NO_TSTFUSE"))

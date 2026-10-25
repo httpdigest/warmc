@@ -169,6 +169,9 @@ enum {
   RTK_CONCRETE_ANY, RTK_CONCRETE_FUNC
 };
 #define RTK_NULLABLE 0x80u
+/* an I_REF_SLOT that traps on null as a null dereference does, in place of
+   the access after it that would have (codegen.c seal_tests) */
+#define RTK_NULLTRAP 0x40u
 
 #define GC_HDR_BYTES 8u
 #define GC_HDR_WIDE  16u
@@ -376,6 +379,15 @@ typedef struct {
      (arguments above the callee's stack pointer, frames re-entered after
      the wasm stack unwinds) */
   bool go_stack;
+  /* No reference crosses the module's boundary (compile.c module_gc_sealed),
+     so every GC object its code meets is one it allocated: a cast to one of
+     its types is decided by the object's type slot alone, with no runtime
+     to ask about another module's objects. */
+  bool gc_sealed;
+  /* No ref.i31 in the code reach found live or in an initialiser it runs,
+     so that in a sealed module every non-null reference of the any
+     hierarchy is an object (false when reach has not run) */
+  bool gc_no_i31;
   /* every custom section, in the binary's order */
   CustomSec *customs; uint32_t ncustoms;
   /* bodies a module transform wrote (tramp.c), which funcs[] point into in
@@ -664,6 +676,11 @@ extern bool warmc_load_barrier;
 /* whether a C call's arguments on the stack are packed, as Apple's AArch64
    convention has them, rather than given 8 bytes each */
 void codegen_set_darwin_abi(bool on);
+/* The slots of a module's numbering that pass a ref.test of a concrete type
+   in the any hierarchy (codegen.c) */
+bool codegen_rtest_slots(const Module *m, uint64_t imm, uint64_t id,
+                         uint32_t *lo, uint32_t *hi, bool *exact,
+                         uint32_t *nslots);
 extern bool warmc_darwin_abi;
 /* ImportDesc.flags: rt/warm_rt.h's WARMC_IMPORT_NATIVE */
 #define IMPORT_NATIVE 1u

@@ -180,6 +180,8 @@ typedef struct {
 
   bool *fld;   uint32_t *fldbase;
   const Module *m;
+  /* a ref.i31 in reached code or an initialiser that runs */
+  bool i31;
 } Reach;
 
 static bool field_read(const Reach *R, uint32_t ti, uint32_t k) {
@@ -233,7 +235,8 @@ static void reach_init(Reach *R, const InitExpr *e) {
       case IOP_REF_FUNC: break;
       case IOP_I32_ADD: case IOP_I32_SUB: case IOP_I32_MUL:
       case IOP_I64_ADD: case IOP_I64_SUB: case IOP_I64_MUL: pops = 2; break;
-      case IOP_REF_I31: case IOP_REF_CONVERT: pops = 1; break;
+      case IOP_REF_I31: R->i31 = true; pops = 1; break;
+      case IOP_REF_CONVERT: pops = 1; break;
       case IOP_ARRAY_NEW: pops = 2; break;
       case IOP_ARRAY_NEW_DEFAULT: pops = 1; break;
       case IOP_STRUCT_NEW: case IOP_ARRAY_NEW_FIXED: pops = UINT32_MAX; break;
@@ -293,6 +296,7 @@ static bool reach_body(const Module *m, uint32_t fi, Reach *R) {
   Rd r = rd_make(f->body, f->body_end, m->bin);
   while (!rd_eof(&r)) {
     uint32_t op = wasm_read_op(&r);
+    if (op == OP_PREFIXED(0xfb, 0x1c)) R->i31 = true;
     if (op == 0x10 || op == 0x12) {
       reach_fn(R, rd_u32(&r));
     } else if (op == 0xd2) {
@@ -330,7 +334,7 @@ static bool *module_reach(Module *m, bool closed) {
     xcalloc(m->ntypes ? m->ntypes : 1, sizeof(bool)), m->ntypes,
     xcalloc(m->ntypes ? m->ntypes : 1, sizeof(bool)),
     xcalloc(m->ndatas ? m->ndatas : 1, sizeof(bool)), m->ndatas,
-    NULL, NULL, m,
+    NULL, NULL, m, false,
   };
 
   for (uint32_t i = 0; i < m->ndatas; i++)
@@ -428,6 +432,7 @@ static bool *module_reach(Module *m, bool closed) {
                     "%u/%u globals, %u/%u data segments\n",
             nf, m->nfuncs, nt, m->ntypes, ne, ng, m->nglobals, nd, m->ndatas);
   }
+  m->gc_no_i31 = !R.i31;
   m->type_live = R.ty;
   m->type_entry = R.tyent;
   m->glob_read = R.glob;
@@ -584,6 +589,56 @@ static bool compile_parallel(Module *m, ObjBuilder *o, const OptOpts *opts,
   return true;
 }
 
+static bool sig_has_ref(const Module *m, uint32_t ti) {
+  const CompType *t = &m->types[ti];
+  for (uint32_t j = 0; j < t->nparams; j++)
+    if (vt_is_ref(t->params[j])) return true;
+  for (uint32_t j = 0; j < t->nresults; j++)
+    if (vt_is_ref(t->results[j])) return true;
+  return false;
+}
+
+/* Whether no object of another module's can reach this module's code.  One
+   comes in as a reference across its boundary -- an imported function's
+   result, an imported global, table or tag, an export's argument, what is
+   stored into an exported table or global or thrown with an exported tag --
+   and any reference going out -- an import's argument, an export's result,
+   an exported global -- can carry one of the module's own functions, which
+   another module may then call with its objects.  So none may cross either
+   way, a funcref no more than any other.  What the code then meets are its
+   own objects, whose header holds the instance's type base plus a slot of
+   the module's numbering (codegen_rtest_slots).  An answer wrong here could
+   not confuse a type: another module's ids lie outside this instance's
+   range, so its objects fail every slot test -- those of a structurally
+   equal type too, which ref.test must pass. */
+static bool module_gc_sealed(const Module *m) {
+  for (uint32_t i = 0; i < m->nfuncs; i++)
+    if (m->funcs[i].imported && sig_has_ref(m, m->funcs[i].type_index)) return false;
+  for (uint32_t i = 0; i < m->nglobals; i++)
+    if (m->globals[i].imported && vt_is_ref(m->globals[i].type)) return false;
+  for (uint32_t i = 0; i < m->ntables; i++)
+    if (m->tables[i].imported) return false;
+  for (uint32_t i = 0; i < m->ntags; i++)
+    if (m->tags[i].imported && sig_has_ref(m, m->tags[i].type_index)) return false;
+  for (uint32_t i = 0; i < m->nexports; i++) {
+    const Export *e = &m->exports[i];
+    switch (e->kind) {
+      case EK_FUNC:
+        if (sig_has_ref(m, m->funcs[e->index].type_index)) return false;
+        break;
+      case EK_TABLE: return false;
+      case EK_GLOBAL:
+        if (vt_is_ref(m->globals[e->index].type)) return false;
+        break;
+      case EK_TAG:
+        if (sig_has_ref(m, m->tags[e->index].type_index)) return false;
+        break;
+      case EK_MEM: break;
+    }
+  }
+  return true;
+}
+
 void compile_module(Module *m, ObjBuilder *o, const OptOpts *opts) {
   g_guard_pages = opts->guard_pages;
   g_det_profile = opts->det_profile;
@@ -605,6 +660,7 @@ void compile_module(Module *m, ObjBuilder *o, const OptOpts *opts) {
       else m->type_slot = slot;
     }
   }
+  m->gc_sealed = opts->sealed && module_gc_sealed(m);
   uint32_t out_bytes = codegen_tail_out_bytes(m);
 
   bool tm = warmc_getenv("WARMC_TIME") != NULL;

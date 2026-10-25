@@ -57,9 +57,9 @@ static const char *usage_text =
   "                vectorize, edge-tests, unroll, selftail, ldcomb, escape,\n"
   "                partial-escape, gloop, gssa, loopclose, cpool, ictab, reach,\n"
   "                prune, merge, devirt, reinline, throw-jump, closed-world,\n"
-  "                gcpure, split, labcache, ifconv, mulwide, barelide,\n"
-  "                small-loop-align, trampoline, go-sp, fma, dead-frames,\n"
-  "                exact-trap\n"
+  "                sealed, gcpure, split, labcache, ifconv, mulwide,\n"
+  "                barelide, small-loop-align, trampoline, go-sp, fma,\n"
+  "                dead-frames, exact-trap\n"
   "                fma is off below -O3: it fuses a float multiply\n"
   "                into the add that reads it, rounded once, which is not\n"
   "                wasm's arithmetic and can change a result's last bit\n"
@@ -426,6 +426,7 @@ int main(int argc, char **argv) {
   opt.ifconv = true;
   opt.mulwide = true;
   opt.closed_world = true;
+  opt.sealed = true;
 
   for (int i = 1; i < argc; i++) {
     const char *a = argv[i];
@@ -571,6 +572,7 @@ int main(int argc, char **argv) {
       else if (!strcmp(name, "exact-trap")) opt.exact_trap = on;
       else if (!strcmp(name, "gcpure")) opt.gcpure = on;
       else if (!strcmp(name, "closed-world")) opt.closed_world = on;
+      else if (!strcmp(name, "sealed")) opt.sealed = on;
       else warmc_fatal("unknown pass %s", name);
     }
     else if (a[0] == '-') warmc_fatal("unknown option %s (try --help)", a);
@@ -780,7 +782,8 @@ int main(int argc, char **argv) {
             " rej_score=%llu rej_depth=%llu rej_rec=%llu max_frame=%llu\n"
             "             unrolled=%llu unr_guarded=%llu unr_rej_shape=%llu"
             " unr_rej_body=%llu unr_rej_exit=%llu unr_rej_trip=%llu"
-            " unr_rej_escape=%llu unr_addr_folded=%llu gc_nullchk=%llu\n",
+            " unr_rej_escape=%llu unr_addr_folded=%llu gc_nullchk=%llu\n"
+            "             slot_tests=%llu slot_nullchks=%llu\n",
             (unsigned long long)g_stats.folded, (unsigned long long)g_stats.dce_removed,
             (unsigned long long)g_stats.cse_removed, (unsigned long long)g_stats.licm_hoisted,
             (unsigned long long)g_stats.branch_simplified,
@@ -857,7 +860,9 @@ int main(int argc, char **argv) {
             (unsigned long long)g_stats.unr_rej_trip,
             (unsigned long long)g_stats.unr_rej_escape,
             (unsigned long long)g_stats.unr_addr_folded,
-            (unsigned long long)g_stats.gc_nullchk_removed);
+            (unsigned long long)g_stats.gc_nullchk_removed,
+            (unsigned long long)g_stats.slot_tests,
+            (unsigned long long)g_stats.slot_nullchks);
   }
 
   char objpath[4096];
