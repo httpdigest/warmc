@@ -228,6 +228,9 @@ typedef struct {
 
 /* a direct call pass_devirt made, which a later inline round looks at */
 #define IRF_DEVIRT 1u
+/* a call through a class initializer's global in the copy of a loop that
+   runs only until the initializer has run, which pass_once leaves */
+#define IRF_ONCE_SLOW 2u
 
 typedef struct {
   uint32_t target;
@@ -471,6 +474,9 @@ typedef struct {
   bool gcpure;
 
   bool closed_world;
+  /* -fonce: drop the calls through a global of TeaVM's class-initializer
+     pattern that do nothing (opt.c pass_once) */
+  bool once;
   /* -fsealed: a module through whose boundary no reference passes
      (Module.gc_sealed) has its casts and type tests decided inline */
   bool sealed;
@@ -558,6 +564,12 @@ typedef struct {
   /* casts and type tests a sealed module's object slot decides inline, and
      the null checks of accesses after one that it makes instead */
   uint64_t slot_tests, slot_nullchks;
+  /* calls through a class initializer's global pass_once dropped: through a
+     dead one, and where the empty function was certain to be there */
+  uint64_t once_dead, once_dominated;
+  /* such calls left out of the copy of a loop run once the global holds its
+     empty function */
+  uint64_t once_looped;
   uint64_t ldpairs, stpairs;
   uint64_t cold_frames, early_rets;
   /* -fexact-trap: stores checked that guard pages would have left to the
@@ -572,6 +584,9 @@ void opt_init_tunables(void);
 
 void opt_passtime_report(void);
 
+/* Whether call v of g is a call_ref through a global of TeaVM's
+   class-initializer pattern, which pass_once removes where it does nothing */
+bool opt_once_call(IrFunc *g, Ref v);
 void opt_effects_begin(Module *m, const OptOpts *o);
 void opt_effects_scan(Module *m, const OptOpts *o, uint32_t fi);
 void opt_effects_end(Module *m, const OptOpts *o);
