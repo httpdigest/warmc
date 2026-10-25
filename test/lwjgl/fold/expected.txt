@@ -1,0 +1,2 @@
+absent false, flagged true, some true, shared false, impure false (asked 1), plain true
+looked up: glTextureView glClear glBufferStorage glEnable
