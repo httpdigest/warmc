@@ -399,6 +399,7 @@ PATCHED = [
     ("math", ("wasm",)),
     ("arrayname", ("wasm", "strict")),
     ("flush", ("wasm", "strict")),
+    ("byteorder", ("wasm",)),
 ]
 
 def run_patched(work, flags):

@@ -765,8 +765,10 @@ WASI = r"""
 class Unsupported(Exception):
     pass
 
-def adapt(wasm, main_class="Main", tools="wasm-tools"):
-    """The WASI module for TeaVM module `wasm` (bytes), as text."""
+def adapt(wasm, main_class="Main", tools="wasm-tools", native=()):
+    """The WASI module for TeaVM module `wasm` (bytes), as text.  The function
+    imports of a module in `native` stay imports: C functions that warmc's
+    --native-module calls (lwjgl/build.py's)."""
     req = custom(wasm, b"teavm.memoryRequirements")
     if req is None:
         raise Unsupported("no teavm.memoryRequirements section: not a module "
@@ -810,7 +812,7 @@ def adapt(wasm, main_class="Main", tools="wasm-tools"):
     fdlibm = {n[len("warmc.fdlibm."):]: f for n, f in exports.items()
               if n.startswith("warmc.fdlibm.")}
 
-    out, defs, arrays, missing = [], [], set(), []
+    out, defs, arrays, missing, kept = [], [], set(), [], []
     memory = heap = None
     for ln in lines[1:-2]:
         m = IMPORT.match(ln)
@@ -832,6 +834,8 @@ def adapt(wasm, main_class="Main", tools="wasm-tools"):
             if name == "heapOffset":
                 heap = (len(defs), ident, rest)
             defs.append("  (global %s%s (i32.const %d))" % (ident, rest, 0x7fffffff))
+        elif kind == "func" and module in native:
+            kept.append(ln)
         elif kind == "func":
             sig = Sig(rest)
             body = host_body(module, name, sig, lay, fdlibm)
@@ -916,7 +920,7 @@ def adapt(wasm, main_class="Main", tools="wasm-tools"):
         at, ident, rest = heap
         defs[at] = "  (global %s%s (i32.const %d))" % (ident, rest, lay.end())
 
-    text = "\n".join([lines[0], WASI.strip("\n")] + defs + out + [rt, data, ")", ""])
+    text = "\n".join([lines[0], WASI.strip("\n")] + kept + defs + out + [rt, data, ")", ""])
     return text, missing
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -927,13 +931,13 @@ def wasm_tools():
                           "wasm-tools.exe" if os.name == "nt" else "wasm-tools")
     return pinned if os.path.exists(pinned) else "wasm-tools"
 
-def write(wasm, dst, main_class="Main"):
+def write(wasm, dst, main_class="Main", native=()):
     """Write the WASI module for TeaVM module `wasm` (bytes) to dst, in one
     step, so a reader sees the old file or the new one.  None, or what went
     wrong."""
     tools = wasm_tools()
     try:
-        text, _ = adapt(wasm, main_class, tools)
+        text, _ = adapt(wasm, main_class, tools, native)
     except Unsupported as e:
         return str(e)
     except subprocess.CalledProcessError as e:
