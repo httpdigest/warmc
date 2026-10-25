@@ -71,7 +71,7 @@ jobs:
           s=.github/scripts
           sum() { cksum | cut -d' ' -f1; }
           {
-            echo "makefile=$(grep -E '^(WASM_TOOLS_VERSION|WASI_SDK_VERSION) *:=' Makefile | sum)"
+            echo "makefile=$(grep -E '^(WASM_TOOLS_VERSION|WASI_SDK_VERSION|TEAVM_VERSION|TEAVM_SOURCES) *:=' Makefile | sum)"
             echo "rust=$(sed -n 's/^RUST_VERSION=//p' $s/install-rust.sh)"
             echo "llvm=$(grep -E '^LLVM_VERSION=|lib/clang/' $s/install-llvm.sh | sum)"
             echo "tools=$(grep -E '^[A-Z_]+_VERSION=' $s/install-tools.sh | sum)"
@@ -289,6 +289,8 @@ jobs:
             build/gotests/*.wasm.flags
             build/hstests/*.wasm
             build/hstests/*.wasm.flags
+            build/javatests/*.wasm
+            build/javatests/*.wasm.flags
             build/kttests/*.wasm
             build/kttests/*.wasm.flags
             build/rstests/*.wasm
@@ -297,7 +299,7 @@ jobs:
             build/stdgotests/*.wasm.flags
             build/zigtests/*.wasm
             build/zigtests/*.wasm.flags
-          key: corpora-macos-arm64-${{ inputs.full }}-${{ steps.pins.outputs.makefile }}-${{ steps.pins.outputs.producers }}-${{ hashFiles('test/*tests/**', 'test/gobench.py') }}
+          key: corpora-macos-arm64-${{ inputs.full }}-${{ steps.pins.outputs.makefile }}-${{ steps.pins.outputs.producers }}-${{ hashFiles('test/*tests/**', 'test/teavm/**', 'test/gobench.py') }}
 
       # The test modules assembled from the cases and the interpreter's answers
       # for them, each beside a stamp of what it was made from, so that a
@@ -524,7 +526,7 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: *corpora
-          key: corpora-linux-arm64-${{ inputs.full }}-${{ steps.pins.outputs.makefile }}-${{ steps.pins.outputs.producers }}-${{ hashFiles('test/*tests/**', 'test/gobench.py') }}
+          key: corpora-linux-arm64-${{ inputs.full }}-${{ steps.pins.outputs.makefile }}-${{ steps.pins.outputs.producers }}-${{ hashFiles('test/*tests/**', 'test/teavm/**', 'test/gobench.py') }}
 
       - name: Restore the test references
         id: testrun
@@ -760,7 +762,7 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: *corpora
-          key: corpora-windows-x64-${{ inputs.full }}-${{ steps.pins.outputs.makefile }}-${{ steps.pins.outputs.producers }}-${{ hashFiles('test/*tests/**', 'test/gobench.py') }}
+          key: corpora-windows-x64-${{ inputs.full }}-${{ steps.pins.outputs.makefile }}-${{ steps.pins.outputs.producers }}-${{ hashFiles('test/*tests/**', 'test/teavm/**', 'test/gobench.py') }}
 
       - name: Restore the test references
         id: testrun

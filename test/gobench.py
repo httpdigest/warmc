@@ -23,6 +23,11 @@ producer emits rather than the wasm clang emits:
     monomorphised, and iterator chains inlined into the loop that drives them.
     What dominates a TinyGo module is its runtime; what dominates a Rust one is
     the code the program actually wrote.
+  * `test/javabench`                  Java through TeaVM's Wasm GC back end, a
+    producer that reads JVM bytecode rather than a source language: objects
+    are wasm GC structs, a virtual call goes through a vtable struct of
+    funcrefs, and TeaVM's own optimiser has inlined and devirtualised what it
+    could before warmc sees any of it.
 
 The name is historical: this drove only test/gobench first, and every note and
 memory of the Go performance work names it, so it keeps the name.
@@ -69,6 +74,7 @@ all for noticing that something drifted.
 import atexit
 import json
 import os
+import shlex
 import shutil
 import re
 import subprocess
@@ -83,7 +89,7 @@ WORK = os.path.join(ROOT, BUILD, "gobench")
 
 LANGS = {"main.go": "go", "main.ts": "as", "main.rs": "rs",
          "main.kt": "kt", "main.zig": "zig", "main.c": "c", "main.cpp": "cpp",
-         "Main.hs": "hs"}
+         "Main.hs": "hs", "Main.java": "java"}
 
 CORPUS_LANG = {"stdgo": "gostd", "stdgotests": "gostd"}
 KDIR = os.path.join(ROOT, "test", "gobench")
@@ -121,6 +127,25 @@ RUST_TARGET = "wasm32-wasip1"
 # kotlinc-wasm compiles to wasm by itself; -Xwasm is deprecated since 2.4.0.
 KOTLIN_FLAGS = ["-Xwasm-target=wasm-wasi", "-nowarn"]
 
+def _pinned(name):
+    """A version the Makefile pins, so the two cannot drift apart."""
+    with open(os.path.join(ROOT, "Makefile")) as f:
+        for line in f:
+            if line.startswith(name + " "):
+                return line.split(":=", 1)[1].strip()
+    raise SystemExit("gobench: no %s in the Makefile" % name)
+
+# TeaVM, which `make teavm` fetches and patches (test/teavm/patches): its
+# compiler, driven by test/teavm/TeaVMBuild.java, writes a module for a
+# JavaScript host, which test/teavm/wasi.py makes a WASI command of.
+TEAVM_VERSION = _pinned("TEAVM_VERSION")
+TEAVM_DIR = os.path.join(ROOT, "build", "tools", "teavm-" + TEAVM_VERSION)
+TEAVM_SRC = os.path.join(ROOT, "test", "teavm")
+# Built with TeaVM's --strict, where a null dereference or an index out of
+# bounds is Java's exception rather than a trap: what a test that catches one
+# needs.  The benchmarks are built as a project builds them by default.
+TEAVM_STRICT = {"javatests"}
+
 # TinyGo optimises for size (-opt=z) unless told otherwise; -opt=2 is its
 # setting for speed, and the one a benchmark of generated code should start
 # from.
@@ -128,12 +153,13 @@ FLAGS_FOR = {"go": ["-target=wasip1", "-scheduler=none", "-opt=2"],
              "as": ASC_FLAGS, "rs": RUSTC_FLAGS,
              "gostd": ["GOOS=wasip1", "GOARCH=wasm"],
              "kt": KOTLIN_FLAGS, "zig": ZIG_FLAGS,
-             "c": C_FLAGS, "cpp": CXX_FLAGS, "hs": GHC_FLAGS}
+             "c": C_FLAGS, "cpp": CXX_FLAGS, "hs": GHC_FLAGS,
+             "java": ["teavm-" + TEAVM_VERSION, "FULL"]}
 
 def set_corpus(name):
     """Point the harness at another directory of kernels.
 
-    Ten of them, and each is a different selection rather than more of the
+    Eleven of them, and each is a different selection rather than more of the
     same.  `test/gobench` is ordinary Go, chosen to be what programs actually
     look like.  `test/vecbench` is the opposite selection -- loops written to be
     vectorisable -- so a summary over the two mixed together would mean nothing.
@@ -156,6 +182,10 @@ def set_corpus(name):
     with the rest: GHC keeps its heap and its stack in linear memory, every
     function returns the next one to a trampoline in the RTS, and laziness makes
     most of a program closures entered through `call_indirect`.
+    `test/javabench` is Java through TeaVM, the second producer of GC structs
+    and the one that starts from bytecode: its classes are compiled whole-program,
+    with what TeaVM's optimiser could prove about them already folded in, and
+    their host calls are defined in the module by test/teavm/wasi.py.
 
     Separate corpora over one harness rather than one corpus, because what is
     worth averaging is what a corpus was selected for.
@@ -206,6 +236,10 @@ EMPTY = {
     "cpp": ("empty.cpp", "int main() { return 0; }\n"),
 
     "hs": ("empty.hs", "main :: IO ()\nmain = return ()\n"),
+
+    # in a directory of its own, as TeaVMBuild compiles a directory
+    "java": ("empty.java/Main.java",
+             "public class Main {\n    public static void main(String[] args) {\n    }\n}\n"),
 }
 
 TOOLCHAIN = {"go": ("tinygo", ["version"]), "as": ("asc", ["--version"]),
@@ -215,12 +249,14 @@ TOOLCHAIN = {"go": ("tinygo", ["version"]), "as": ("asc", ["--version"]),
              "zig": ("zig", ["version"]),
              "c": (os.path.join(WASI_SDK_BIN, "clang"), ["--version"]),
              "cpp": (os.path.join(WASI_SDK_BIN, "clang++"), ["--version"]),
-             "hs": (GHC_WASM, ["--version"])}
+             "hs": (GHC_WASM, ["--version"]),
+             "java": ("javac", ["-version"])}
 
 # What to run when a corpus's producer is missing, for the ones that are not
 # simply a package to install.
 TOOLCHAIN_HINT = {"c": "make wasi-sdk", "cpp": "make wasi-sdk",
-                  "hs": "ghc-wasm-meta's bootstrap.sh, see the README"}
+                  "hs": "ghc-wasm-meta's bootstrap.sh, see the README",
+                  "java": "a JDK, 21 or later"}
 
 KOTLIN_KLIB = os.path.join(ROOT, "build", "tools",
                            "kotlin-stdlib-wasm-wasi.klib")
@@ -253,6 +289,12 @@ def kotlinc_version():
         return None
     m = re.search(r"kotlinc-jvm ([0-9.]+)", r.stdout + r.stderr)
     return m.group(1) if m else None
+
+def javac_version():
+    """javac's major version, or None."""
+    r = subprocess.run(["javac", "-version"], capture_output=True, text=True)
+    m = re.match(r"javac (\d+)", (r.stdout + r.stderr).strip())
+    return int(m.group(1)) if m else None
 
 GO_WASI_ENV = {"GOOS": "wasip1", "GOARCH": "wasm"}
 
@@ -319,6 +361,8 @@ def build_wasm(name, lang):
         [e for e, l in LANGS.items() if l == lang][0]
     env = None
     deps = []
+    if lang == "java":
+        return build_java([name]).get(name)
     if name == "empty":
         fname, text = EMPTY[lang]
         src = os.path.join(WORK, fname)
@@ -457,11 +501,201 @@ def build_kotlin(name, src, wasm, stampf, stamp):
         f.write(stamp)
     return wasm
 
+def write_empty(lang):
+    """The empty program's source, written only when it differs: its mtime is
+    what the cache below is keyed on (see build_wasm)."""
+    fname, text = EMPTY[lang]
+    src = os.path.join(WORK, fname)
+    os.makedirs(os.path.dirname(src), exist_ok=True)
+    current = None
+    if os.path.exists(src):
+        with open(src) as f:
+            current = f.read()
+    if current != text:
+        with open(src, "w") as f:
+            f.write(text)
+    return src
+
+def java_dir(name):
+    """The directory a Java kernel's sources are in."""
+    if name == "empty":
+        return os.path.dirname(write_empty("java"))
+    return os.path.join(KDIR, name)
+
+TEAVM_PATCHED = os.path.join(TEAVM_DIR, "patched")
+
+def teavm_current():
+    """Whether `make teavm` fetched the release the Makefile pins and compiled
+    test/teavm/patches into it as they are now."""
+    stamp = os.path.join(TEAVM_PATCHED, ".complete")
+    patches = os.path.join(TEAVM_SRC, "patches")
+    made_from = [patches, os.path.join(TEAVM_SRC, "patch.py")] + [
+        os.path.join(patches, f) for f in os.listdir(patches)]
+    return (os.path.exists(stamp) and
+            os.path.getmtime(stamp) >= max(os.path.getmtime(p) for p in made_from))
+
+def teavm_flags():
+    return FLAGS_FOR["java"] + (["strict"] if CORPUS in TEAVM_STRICT else [])
+
+def teavm_newest(name):
+    """The newest of what a kernel's module is made from: its sources, the
+    driver, TeaVM's patches, the adapter and the math it calls."""
+    src = java_dir(name)
+    files = [os.path.join(src, f) for f in os.listdir(src)]
+    files += [os.path.join(TEAVM_SRC, f) for f in ("TeaVMBuild.java", "FdLibm.java", "wasi.py")]
+    files.append(os.path.join(TEAVM_PATCHED, ".complete"))
+    return max(os.path.getmtime(p) for p in files)
+
+def teavm_driver():
+    """test/teavm/TeaVMBuild.java, compiled against the fetched tooling into
+    this corpus's directory: a directory each, since two rows building two
+    corpora at once would otherwise compile into one."""
+    out = os.path.join(WORK, ".teavm-driver")
+    src = os.path.join(TEAVM_SRC, "TeaVMBuild.java")
+    cls = os.path.join(out, "warmc", "teavm", "TeaVMBuild.class")
+    if os.path.exists(cls) and os.path.getmtime(cls) > os.path.getmtime(src):
+        return out
+    part = os.path.join(staging(), "driver")
+    shutil.rmtree(part, ignore_errors=True)
+    r = sh(["javac", "--release", "17", "-nowarn", "-cp",
+            os.path.join(TEAVM_DIR, "*"), "-d", part, src])
+    if r.returncode != 0:
+        print("javac %s failed:\n%s" % (src, r.stderr[:400]), file=sys.stderr)
+        return None
+    shutil.rmtree(out, ignore_errors=True)
+    os.replace(part, out)
+    return out
+
+_wasi = None
+
+def teavm_adapter():
+    """test/teavm/wasi.py, loaded once for every kernel of the run."""
+    global _wasi
+    if _wasi is None:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "teavm_wasi", os.path.join(TEAVM_SRC, "wasi.py"))
+        _wasi = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(_wasi)
+    return _wasi
+
+def run_teavm(names):
+    """TeaVM over the given kernels, one JVM for all of them: each JVM start
+    is most of a small program's build.  The directory per kernel it wrote
+    into, for those it built."""
+    if not teavm_current():
+        print("%s needs TeaVM %s, patched as test/teavm/patches are: run `make teavm`"
+              % (CORPUS, TEAVM_VERSION),
+              file=sys.stderr)
+        return {}
+    driver = teavm_driver()
+    if driver is None:
+        return {}
+    part = staging()
+    outs, jobs = {}, []
+    for n in names:
+        outs[n] = os.path.join(part, n + ".teavm")
+        shutil.rmtree(outs[n], ignore_errors=True)
+        jobs.append("%s=%s" % (java_dir(n), outs[n]))
+    cmd = ["java", "-cp", os.pathsep.join([TEAVM_PATCHED, os.path.join(TEAVM_DIR, "*"), driver]),
+           "warmc.teavm.TeaVMBuild", "--teavm", TEAVM_DIR]
+    if CORPUS in TEAVM_STRICT:
+        cmd.append("--strict")
+    cmd += ["--support", os.path.join(TEAVM_SRC, "FdLibm.java")]
+    r = sh(cmd + jobs)
+    if r.returncode != 0:
+        print(r.stderr[:2000], file=sys.stderr, end="")
+    return {n: d for n, d in outs.items() if os.path.exists(os.path.join(d, "main.wasm"))}
+
+def build_java(names):
+    """Java kernels to WASI modules: TeaVM for every one that is stale, in one
+    JVM, then the adapter.  {name: .wasm path} for those that built."""
+    os.makedirs(WORK, exist_ok=True)
+    stamp = " ".join(teavm_flags())
+    out, stale = {}, []
+    for n in names:
+        wasm = os.path.join(WORK, n + ".wasm")
+        old = None
+        if os.path.exists(wasm + ".flags"):
+            with open(wasm + ".flags") as f:
+                old = f.read()
+        if (os.path.exists(wasm) and old == stamp
+                and os.path.getmtime(wasm) > teavm_newest(n)):
+            out[n] = wasm
+        else:
+            stale.append(n)
+    if not stale:
+        return out
+    built = run_teavm(stale)
+    for n in stale:
+        if n not in built:
+            print("teavm build %s failed" % n, file=sys.stderr)
+            continue
+        wasm = os.path.join(WORK, n + ".wasm")
+        with open(os.path.join(built[n], "main.wasm"), "rb") as f:
+            err = teavm_adapter().write(f.read(), wasm)
+        if err:
+            print("teavm-wasi %s: %s" % (n, err), file=sys.stderr)
+            continue
+        with open(wasm + ".flags", "w") as f:
+            f.write(stamp)
+        shutil.rmtree(built[n], ignore_errors=True)
+        out[n] = wasm
+    return out
+
+TEMURIN_VERSION = _pinned("TEMURIN_VERSION")
+TEMURIN_DIR = os.path.join(ROOT, "build", "tools", "temurin-" + TEMURIN_VERSION)
+
+def temurin_bin(tool):
+    """A tool of the Temurin `make temurin` fetched: macOS's JDK is a bundle."""
+    for home in (os.path.join(TEMURIN_DIR, "Contents", "Home"), TEMURIN_DIR):
+        p = os.path.join(home, "bin", tool + (".exe" if os.name == "nt" else ""))
+        if os.path.exists(p):
+            return p
+    return os.path.join(TEMURIN_DIR, "bin", tool)
+
+def build_java_native(name):
+    """A Java kernel's native build: its classes, compiled by Temurin's javac
+    at the release the kernels are written to, run by Temurin's JVM, through
+    a launcher script as an executable to time.  The empty program goes
+    through the same launcher, so the floor takes the JVM's start with the
+    script's out of every kernel's time."""
+    if not os.path.exists(os.path.join(TEMURIN_DIR, ".complete")):
+        print("%s: no Temurin %s for the native column: run `make temurin`"
+              % (CORPUS, TEMURIN_VERSION), file=sys.stderr)
+        return None
+    os.makedirs(WORK, exist_ok=True)
+    exe = os.path.join(WORK, name + ".native")
+    classes = os.path.join(WORK, name + ".classes")
+    src = java_dir(name)
+    sources = sorted(os.path.join(src, f) for f in os.listdir(src) if f.endswith(".java"))
+    stamp = " ".join(["temurin-" + TEMURIN_VERSION] + NATIVE_FLAGS["java"])
+    stampf = exe + ".flags"
+    old = open(stampf).read() if os.path.exists(stampf) else None
+    if (os.path.exists(exe) and old == stamp and
+            os.path.getmtime(exe) > max(os.path.getmtime(p) for p in sources)):
+        return exe
+    shutil.rmtree(classes, ignore_errors=True)
+    r = sh([temurin_bin("javac"), "--release", "21", "-nowarn", "-encoding", "UTF-8",
+            "-d", classes] + sources)
+    if r.returncode != 0:
+        print("javac native build %s failed:\n%s" % (name, r.stderr[:400]), file=sys.stderr)
+        return None
+    with open(exe, "w") as f:
+        f.write("#!/bin/sh\nexec %s\n" % " ".join(
+            shlex.quote(a) for a in [temurin_bin("java")] + NATIVE_FLAGS["java"] +
+            ["-cp", classes, "Main"]))
+    os.chmod(exe, 0o755)
+    with open(stampf, "w") as f:
+        f.write(stamp)
+    return exe
+
 # The same kernels compiled for the host by the language's own native
 # compiler, at -O2 or the nearest it has: what the detour through wasm costs
 # against the producer's native back end.  Zig has no -O2 (ReleaseFast is its
 # optimised build) and Go no levels at all.  AssemblyScript and Kotlin/Wasm
-# have no native compiler to compare with.
+# have no native compiler to compare with.  Java's is the JVM: the same
+# classes on Temurin (build_java_native).
 NATIVE_FLAGS = {"c": ["-O2"], "cpp": ["-O2", "-std=c++20"],
                 "rs": ["-C", "opt-level=2", "-C", "panic=abort", "-C", "lto=fat",
                        "-C", "codegen-units=1"],
@@ -471,13 +705,15 @@ NATIVE_FLAGS = {"c": ["-O2"], "cpp": ["-O2", "-std=c++20"],
                 # in its 10 ms sleep, the empty program's floor is mostly that
                 # wait, and every kernel, which waits only for the rest of its
                 # tick, came out about 10 ms faster than it ran.
-                "hs": ["-O2", "-with-rtsopts=-V0"]}
+                "hs": ["-O2", "-with-rtsopts=-V0"],
+                # the JVM as it comes: its JIT, its collector and heap sizing
+                "java": []}
 NATIVE_TOOL = {"c": "clang", "cpp": "clang++", "rs": "rustc", "zig": "zig",
-               "go": "tinygo", "gostd": "go", "hs": "ghc"}
+               "go": "tinygo", "gostd": "go", "hs": "ghc", "java": "java"}
 NATIVE_VERSION = {"c": ["clang", "--version"], "cpp": ["clang++", "--version"],
                   "rs": ["rustc", "--version"], "zig": ["zig", "version"],
                   "go": ["tinygo", "version"], "gostd": ["go", "version"],
-                  "hs": ["ghc", "--version"]}
+                  "hs": ["ghc", "--version"], "java": [temurin_bin("java"), "-version"]}
 
 def build_native(name, lang):
     """One kernel built natively, or None when its language has no native
@@ -487,6 +723,8 @@ def build_native(name, lang):
     over: Zig's print helper writes through WASI's fd_write, so the native
     build links test/zigbench/native.zig in its place, and std.heap's
     wasm_allocator exists only on wasm, so a native kernel gets libc's."""
+    if lang == "java":
+        return build_java_native(name)
     if lang not in NATIVE_FLAGS or not have(NATIVE_VERSION[lang]):
         return None
     os.makedirs(WORK, exist_ok=True)
@@ -780,6 +1018,9 @@ def baseline_record(corpus, rows, host, variant, lang, with_native=False,
     data[corpus] = {"host": host, "variant": variant, "kernels": rows,
                     "wasmtime": first_line(["wasmtime", "--version"]),
                     "producer": first_line(producer)}
+    if lang == "java":
+        data[corpus]["producer"] = "TeaVM %s %s, %s" % (
+            TEAVM_VERSION, " ".join(teavm_flags()[1:]), first_line(producer))
     if reuse:
         # the figures beside warmc's are the old run's, so are their tools
         for key in ("wasmtime", "native"):
@@ -790,6 +1031,9 @@ def baseline_record(corpus, rows, host, variant, lang, with_native=False,
     if with_native:
         data[corpus]["native"] = "%s %s" % (first_line(NATIVE_VERSION[lang]),
                                             " ".join(NATIVE_FLAGS[lang]))
+        if lang == "java":
+            data[corpus]["native"] = "Temurin %s, %s" % (TEMURIN_VERSION,
+                                                         first_line(NATIVE_VERSION[lang]))
     with open(BASELINE, "w") as f:
         json.dump(data, f, indent=2, sort_keys=True)
         f.write("\n")
@@ -1089,12 +1333,20 @@ def main():
             print("%s: kotlinc %s predates %s, skipping" % (CORPUS, v,
                   ".".join(map(str, KOTLIN_MIN))), file=sys.stderr)
             return 0
+    if lang == "java":
+        v = javac_version()
+        if v is not None and v < 21:
+            print("%s: javac %d predates 21, the release the kernels are "
+                  "written to, skipping" % (CORPUS, v), file=sys.stderr)
+            return 0
     if lang == "rs" and not rust_target_installed():
         print("%s: rustc has no %s std, skipping "
               "(rustup target add %s)" % (CORPUS, RUST_TARGET, RUST_TARGET),
               file=sys.stderr)
         return 0
     wasm = {}
+    if lang == "java":
+        build_java(["empty"] + names)    # the stale ones in one JVM
     for k in ["empty"] + names:
         w = build_wasm(k, lang)
         if w is None:

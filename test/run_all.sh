@@ -204,6 +204,9 @@ start link     ./test/run_link.sh
 # functions' symbols named as the name section names them, in each object
 # format, and nothing that refers to one by its name
 start names    python3 test/run_names.py
+# the WASI adapter for TeaVM's modules, on modules shaped as TeaVM writes
+# them, and the fdlibm it calls for Math against the JVM's StrictMath
+start teavm    python3 test/run_teavm.py
 start shared   ./test/run_shared.sh
 
 start elf      ./test/run_elf.sh
@@ -221,12 +224,13 @@ bench zigbench python3 test/gobench.py --corpus zigbench --check
 bench cbench   python3 test/gobench.py --corpus cbench --check
 bench cppbench python3 test/gobench.py --corpus cppbench --check
 bench hsbench  python3 test/gobench.py --corpus hsbench --check
+bench javabench python3 test/gobench.py --corpus javabench --check
 
 # The language test corpora: programs that print what they compute, line by
 # line, rather than a checksum, so a miscompile shows where it starts; each is
 # compared with wasmtime at every optimisation level, and with -fdead-frames.
 # Not benchmarks, so not in the Makefile's BENCH_CORPORA.
-for c in ctests cpptests rstests gotests stdgotests astests kttests zigtests hstests; do
+for c in ctests cpptests rstests gotests stdgotests astests kttests zigtests hstests javatests; do
   start "$c" python3 test/gobench.py --corpus "$c" --check \
     --variant -O0 --variant -O1 --variant -O2 --variant '-O2 -fdead-frames'
 done

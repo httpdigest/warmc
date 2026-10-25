@@ -1,0 +1,83 @@
+Math.rint, Math.round and Math.ulp(double) as Java defines them: the fixes
+TeaVM made after 0.16.0, in its commits 570a7eea4 and 11a50bc0b.
+
+rint was round's long as a double: half away from zero (rint(2.5) was 3.0),
+a zero without its sign (rint(-0.3) was 0.0), and Long.MAX_VALUE past 2^63
+(rint(1e300)); round added a half and truncated, which rounds
+0.49999999999999994 to 1 and odd integers past 2^52 up; ulp masked the
+exponent with 0xEFF0... for 0x7FF0..., so that ulp(1.0) was 2^-308, not 2^-52.
+
+test/teavm/fixes/math.
+
+--- a/teavm-classlib/org/teavm/classlib/java/lang/TMath.java
++++ b/teavm-classlib/org/teavm/classlib/java/lang/TMath.java
+@@ -115,8 +115,16 @@ public final class TMath extends TObject {
+     @Unmanaged
+     private static native double powImpl(double x, double y);
+ 
++    // From TeaVM's 570a7eea4 (classlib: fix Math.round and Math.rint), its
++    // JavaScript path, which needs no intrinsic: rint is round half to even.
+     public static double rint(double a) {
+-        return round(a);
++        double result = floor(a);
++        double diff = a - result;
++        if (diff > 0.5 || diff == 0.5 && result % 2 != 0) {
++            result += 1;
++        }
++        // preserve sign of zero, e.g. rint(-0.3) == -0.0
++        return result == 0 ? a * 0 : result;
+     }
+ 
+     @GeneratedBy(MathNativeGenerator.class)
+@@ -125,11 +133,25 @@ public final class TMath extends TObject {
+     public static native double atan2(double y, double x);
+ 
+     public static int round(float a) {
+-        return (int) (a + signum(a) * 0.5f);
++        // float to double conversion is exact, and so is the rest of computation in double
++        return (int) roundToDouble(a);
+     }
+ 
+     public static long round(double a) {
+-        return (long) (a + signum(a) * 0.5);
++        return (long) roundToDouble(a);
++    }
++
++    /**
++     * Computes floor(a + 0.5) without intermediate rounding of a + 0.5. a - floor(a) is either exact
++     * or, for a in (-0.5, 0), rounds to value that's still greater or equal than 0.5. NaN and infinities
++     * are preserved, so that subsequent conversion to integer type maps them properly.
++     */
++    private static double roundToDouble(double a) {
++        double result = floor(a);
++        if (a - result >= 0.5) {
++            result += 1;
++        }
++        return result;
+     }
+ 
+     public static int floorDiv(int a, int b) {
+@@ -513,6 +535,7 @@ public final class TMath extends TObject {
+         return n <= 0.0 ? 0.0 - n : n;
+     }
+ 
++    // From TeaVM's 11a50bc0b (classlib: fix exponent mask in Math.ulp(double))
+     public static double ulp(double d) {
+         if (TDouble.isNaN(d)) {
+             return d;
+@@ -520,14 +543,8 @@ public final class TMath extends TObject {
+             return TDouble.POSITIVE_INFINITY;
+         }
+ 
+-        if (TDouble.isNaN(d)) {
+-            return d;
+-        } else if (TDouble.isInfinite(d)) {
+-            return TDouble.POSITIVE_INFINITY;
+-        }
+-
+         long bits = TDouble.doubleToLongBits(d);
+-        bits &= 0xEFF0000000000000L;
++        bits &= 0x7FF0000000000000L;
+         if (bits >= 53L << 52L) {
+             bits -= 52L << 52L;
+         } else {

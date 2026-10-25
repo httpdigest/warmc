@@ -1,0 +1,42 @@
+getSimpleName and getName of an array class.
+
+An array's simple name is its item type's with [] after it, and its name is
+made from its item type's, so the item type needs the metadata that names it.
+TeaVM gave that only to the class the call was on: int[].class
+.getSimpleName() was a null dereference, and the simple name of an array of a
+local class, which its name cannot give, was "[]".
+
+test/teavm/fixes/arrayname.
+
+--- a/teavm-core/org/teavm/model/analysis/ClassMetadataRequirements.java
++++ b/teavm-core/org/teavm/model/analysis/ClassMetadataRequirements.java
+@@ -89,6 +89,10 @@ public class ClassMetadataRequirements {
+                 ClassInfo classInfo = requirements.computeIfAbsent(type, k -> new ClassInfo());
+                 classInfo.simpleName = true;
+                 classInfo.enclosingClass = true;
++                // an array's simple name is its item type's with [] after it
++                for (var t = itemType(type); t != null; t = itemType(t)) {
++                    requirements.computeIfAbsent(t, k -> new ClassInfo()).simpleName = true;
++                }
+             }
+         }
+ 
+@@ -336,10 +340,17 @@ public class ClassMetadataRequirements {
+ 
+     private void addClassesRequiringName(Map<ValueType, ClassInfo> target, ValueType[] source) {
+         for (var typeName : source) {
+-            target.computeIfAbsent(typeName, k -> new ClassInfo()).name = true;
++            // Class.getName makes an array's name from its item type's
++            for (var t = typeName; t != null; t = itemType(t)) {
++                target.computeIfAbsent(t, k -> new ClassInfo()).name = true;
++            }
+         }
+     }
+ 
++    private static ValueType itemType(ValueType type) {
++        return type instanceof ValueType.Array ? ((ValueType.Array) type).getItemType() : null;
++    }
++
+     static class ClassInfo implements Info {
+         boolean name;
+         boolean simpleName;

@@ -96,7 +96,7 @@ def nfuncs(path):
 
 cands = []
 for pat in ("testrun/*.wasm", "gobench/*.wasm", "ktbench/*.wasm",
-            "rsbench/*.wasm", "zigbench/*.wasm"):
+            "rsbench/*.wasm", "zigbench/*.wasm", "javabench/*.wasm"):
     for f in glob.glob(os.path.join(build, pat)):
         n = nfuncs(f)
         # Under nfuncs/8 the pool is one thread and the run says nothing.

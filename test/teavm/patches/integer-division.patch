@@ -1,0 +1,325 @@
+Integer division as Java has it, in the wasm-gc target.
+
+TeaVM divided with div_s, rem_s, div_u and rem_u, which trap where Java does
+not: Integer.MIN_VALUE / -1 (and Long's) is MIN_VALUE in Java, and a zero
+divisor throws ArithmeticException.  The quotient by -1 is now a negation,
+behind a test of the divisor where it is not a constant, and with --strict,
+which makes a null dereference and an index out of bounds Java's exceptions
+too, a zero divisor throws ArithmeticException("/ by zero"); without it a
+zero divisor still traps.  rem_s gives MIN_VALUE % -1 as 0, as Java does.
+
+TeaVM's dependency analysis is told a division can throw it -- as a cast can
+throw ClassCastException -- and so are divideUnsigned and remainderUnsigned,
+or a catch around one would not see the exception's class, and a call on what
+it caught (getMessage) would find no method in the class's table.
+
+test/teavm/fixes/division, division_nonzero and unsigned.
+
+--- a/teavm-core/org/teavm/backend/wasm/WasmGCTarget.java
++++ b/teavm-core/org/teavm/backend/wasm/WasmGCTarget.java
+@@ -448,6 +448,11 @@ public class WasmGCTarget implements TeaVMTarget, TeaVMWasmGCHost {
+                 return generator.exceptionTag();
+             }
+ 
++            @Override
++            public boolean isStrict() {
++                return strict;
++            }
++
+             @Override
+             public String entryPoint() {
+                 return controller.getEntryPoint();
+--- a/teavm-core/org/teavm/backend/wasm/dependencies/WasmGCDependencies.java
++++ b/teavm-core/org/teavm/backend/wasm/dependencies/WasmGCDependencies.java
+@@ -118,6 +118,16 @@ public class WasmGCDependencies {
+         analyzer.linkMethod(new MethodReference(WasmGCSupport.class, "aiiobe", ArrayIndexOutOfBoundsException.class))
+                 .use();
+         analyzer.linkMethod(new MethodReference(WasmGCSupport.class, "cce", ClassCastException.class)).use();
++        analyzer.linkMethod(new MethodReference(WasmGCSupport.class, "divisionByZero", ArithmeticException.class))
++                .use();
++        var arithmeticException = analyzer.getClassType(ArithmeticException.class.getName());
++        for (var type : Arrays.asList(int.class, long.class)) {
++            var cls = type == int.class ? Integer.class : Long.class;
++            for (var name : Arrays.asList("divideUnsigned", "remainderUnsigned")) {
++                analyzer.linkMethod(new MethodReference(cls, name, type, type, type)).getThrown()
++                        .propagate(arithmeticException);
++            }
++        }
+         analyzer.linkMethod(new MethodReference(WasmGCSupport.class, "throwCloneNotSupportedException",
+                 void.class)).use();
+         analyzer.linkMethod(new MethodReference(WasmGCSupport.class, "defaultClone", Object.class, Object.class)).use();
+--- a/teavm-core/org/teavm/backend/wasm/generate/methods/WasmGCGenerationContext.java
++++ b/teavm-core/org/teavm/backend/wasm/generate/methods/WasmGCGenerationContext.java
+@@ -65,6 +65,7 @@ public class WasmGCGenerationContext implements BaseWasmGenerationContext {
+     private WasmFunction npeMethod;
+     private WasmFunction aaiobeMethod;
+     private WasmFunction cceMethod;
++    private WasmFunction divisionByZeroMethod;
+     private WasmTag exceptionTag;
+     private Map<String, Set<String>> interfaceImplementors;
+     private WasmGCNameProvider names;
+@@ -206,6 +207,14 @@ public class WasmGCGenerationContext implements BaseWasmGenerationContext {
+         return cceMethod;
+     }
+ 
++    public WasmFunction divisionByZeroMethod() {
++        if (divisionByZeroMethod == null) {
++            divisionByZeroMethod = functions().forStaticMethod(new MethodReference(WasmGCSupport.class,
++                    "divisionByZero", ArithmeticException.class));
++        }
++        return divisionByZeroMethod;
++    }
++
+     public WasmModule module() {
+         return module;
+     }
+--- a/teavm-core/org/teavm/backend/wasm/generate/methods/WasmGCInstructionGenerationVisitor.java
++++ b/teavm-core/org/teavm/backend/wasm/generate/methods/WasmGCInstructionGenerationVisitor.java
+@@ -212,13 +212,17 @@ public class WasmGCInstructionGenerationVisitor implements StatementVisitor, Exp
+                 generateBinary(WasmIntBinaryOperation.MUL, WasmFloatBinaryOperation.MUL, expr);
+                 break;
+             case DIVIDE:
+-                generateBinary(WasmIntBinaryOperation.DIV_SIGNED, WasmFloatBinaryOperation.DIV, expr);
++                if (expr.getType() == OperationType.INT || expr.getType() == OperationType.LONG) {
++                    generateDivision(WasmIntBinaryOperation.DIV_SIGNED, expr);
++                } else {
++                    generateBinary(WasmIntBinaryOperation.DIV_SIGNED, WasmFloatBinaryOperation.DIV, expr);
++                }
+                 break;
+             case MODULO: {
+                 switch (expr.getType()) {
+                     case INT:
+                     case LONG:
+-                        generateBinary(WasmIntBinaryOperation.REM_SIGNED, expr);
++                        generateDivision(WasmIntBinaryOperation.REM_SIGNED, expr);
+                         break;
+                     default:
+                         builder.pushLocation(expr.getLocation());
+@@ -413,6 +417,71 @@ public class WasmGCInstructionGenerationVisitor implements StatementVisitor, Exp
+         builder.popLocation();
+     }
+ 
++    // div_s traps where Java's MIN_VALUE / -1 is MIN_VALUE, and in strict mode a zero divisor throws
++    // ArithmeticException, as rem_s and div_s would trap on it. rem_s gives MIN_VALUE % -1 as 0, as Java does.
++    private void generateDivision(WasmIntBinaryOperation op, BinaryExpr expr) {
++        var isLong = expr.getType() == OperationType.LONG;
++        var intType = isLong ? WasmIntType.INT64 : WasmIntType.INT32;
++        var type = isLong ? WasmType.INT64 : WasmType.INT32;
++        Long constant = expr.getSecondOperand() instanceof ConstantExpr cst && cst.getValue() instanceof Number n
++                ? n.longValue() : null;
++        var checkMinusOne = op == WasmIntBinaryOperation.DIV_SIGNED && (constant == null || constant == -1);
++        var checkZero = context.isStrict() && (constant == null || constant == 0);
++        if (!checkMinusOne && !checkZero) {
++            generateBinary(op, expr);
++            return;
++        }
++
++        builder.pushLocation(expr.getLocation());
++        if (checkMinusOne && constant != null) {
++            pushIntConst(builder, isLong, 0);
++            accept(expr.getFirstOperand());
++            builder.intBinary(intType, WasmIntBinaryOperation.SUB);
++            builder.popLocation();
++            return;
++        }
++
++        accept(expr.getFirstOperand());
++        var dividend = tempVars.acquire(type);
++        builder.setLocal(dividend);
++        accept(expr.getSecondOperand());
++        var divisor = tempVars.acquire(type);
++        builder.setLocal(divisor);
++        if (checkZero) {
++            var block = builder.block();
++            block.getLocal(divisor);
++            if (isLong) {
++                block.i64Const(0).intBinary(WasmIntType.INT64, WasmIntBinaryOperation.NE);
++            }
++            block.branch(block);
++            block.call(context.divisionByZeroMethod());
++            block.throw_(context.getExceptionTag());
++        }
++        if (checkMinusOne) {
++            builder.getLocal(divisor);
++            pushIntConst(builder, isLong, -1);
++            builder.intBinary(intType, WasmIntBinaryOperation.EQ);
++            var cond = builder.conditional(type);
++            var negation = cond.getThenBlock().builder();
++            pushIntConst(negation, isLong, 0);
++            negation.getLocal(dividend).intBinary(intType, WasmIntBinaryOperation.SUB);
++            cond.getElseBlock().builder().getLocal(dividend).getLocal(divisor).intBinary(intType, op);
++        } else {
++            builder.getLocal(dividend).getLocal(divisor).intBinary(intType, op);
++        }
++        tempVars.release(divisor);
++        tempVars.release(dividend);
++        builder.popLocation();
++    }
++
++    private static void pushIntConst(WasmInstructionBuilder target, boolean isLong, int value) {
++        if (isLong) {
++            target.i64Const(value);
++        } else {
++            target.i32Const(value);
++        }
++    }
++
+     private Class<?> convertType(OperationType type) {
+         switch (type) {
+             case INT:
+--- a/teavm-core/org/teavm/backend/wasm/intrinsics/IntNumIntrinsic.java
++++ b/teavm-core/org/teavm/backend/wasm/intrinsics/IntNumIntrinsic.java
+@@ -16,10 +16,13 @@
+ package org.teavm.backend.wasm.intrinsics;
+ 
+ import java.util.Set;
++import org.teavm.ast.ConstantExpr;
+ import org.teavm.ast.InvocationExpr;
+-import org.teavm.backend.wasm.BaseWasmFunctionRepository;
+ import org.teavm.backend.wasm.WasmRuntime;
++import org.teavm.backend.wasm.model.WasmFunction;
+ import org.teavm.backend.wasm.model.WasmNumType;
++import org.teavm.backend.wasm.model.WasmType;
++import org.teavm.backend.wasm.runtime.WasmGCSupport;
+ import org.teavm.backend.wasm.model.instruction.WasmInstructionBuilder;
+ import org.teavm.backend.wasm.model.instruction.WasmIntBinaryOperation;
+ import org.teavm.backend.wasm.model.instruction.WasmIntType;
+@@ -32,12 +35,13 @@ public class IntNumIntrinsic implements WasmGCInlineIntrinsic {
+ 
+     private final MethodReference compareUnsigned;
+     private final WasmIntType wasmType;
+-    private final BaseWasmFunctionRepository functions;
++    private final WasmGCCodeGenContext codeGenContext;
++    private WasmFunction divisionByZero;
+ 
+-    public IntNumIntrinsic(Class<?> javaType, WasmIntType wasmType, BaseWasmFunctionRepository functions) {
++    public IntNumIntrinsic(Class<?> javaType, WasmIntType wasmType, WasmGCCodeGenContext codeGenContext) {
+         compareUnsigned = new MethodReference(WasmRuntime.class, "compareUnsigned", javaType, javaType, int.class);
+         this.wasmType = wasmType;
+-        this.functions = functions;
++        this.codeGenContext = codeGenContext;
+     }
+ 
+     @Override
+@@ -45,19 +49,15 @@ public class IntNumIntrinsic implements WasmGCInlineIntrinsic {
+             WasmInstructionBuilder builder) {
+         switch (invocation.getMethod().getName()) {
+             case "divideUnsigned":
+-                context.generate(builder, invocation.getArguments().get(0));
+-                context.generate(builder, invocation.getArguments().get(1));
+-                builder.intBinary(wasmType, WasmIntBinaryOperation.DIV_UNSIGNED);
++                generateDivision(invocation, context, builder, WasmIntBinaryOperation.DIV_UNSIGNED);
+                 break;
+             case "remainderUnsigned":
+-                context.generate(builder, invocation.getArguments().get(0));
+-                context.generate(builder, invocation.getArguments().get(1));
+-                builder.intBinary(wasmType, WasmIntBinaryOperation.REM_UNSIGNED);
++                generateDivision(invocation, context, builder, WasmIntBinaryOperation.REM_UNSIGNED);
+                 break;
+             case "compareUnsigned":
+                 context.generate(builder, invocation.getArguments().get(0));
+                 context.generate(builder, invocation.getArguments().get(1));
+-                builder.call(functions.forStaticMethod(compareUnsigned));
++                builder.call(codeGenContext.functions().forStaticMethod(compareUnsigned));
+                 break;
+             case "numberOfLeadingZeros":
+                 context.generate(builder, invocation.getArguments().get(0));
+@@ -79,6 +79,35 @@ public class IntNumIntrinsic implements WasmGCInlineIntrinsic {
+         }
+     }
+ 
++    // In strict mode a zero divisor throws ArithmeticException, where div_u and rem_u would trap.
++    private void generateDivision(InvocationExpr invocation, WasmGCInlineIntrinsicContext context,
++            WasmInstructionBuilder builder, WasmIntBinaryOperation op) {
++        context.generate(builder, invocation.getArguments().get(0));
++        var divisorExpr = invocation.getArguments().get(1);
++        context.generate(builder, divisorExpr);
++        if (codeGenContext.isStrict() && !(divisorExpr instanceof ConstantExpr cst
++                && cst.getValue() instanceof Number n && n.longValue() != 0)) {
++            var isLong = wasmType == WasmIntType.INT64;
++            var divisor = context.tempVars().acquire(isLong ? WasmType.INT64 : WasmType.INT32);
++            builder.setLocal(divisor);
++            var block = builder.block();
++            block.getLocal(divisor);
++            if (isLong) {
++                block.i64Const(0).intBinary(WasmIntType.INT64, WasmIntBinaryOperation.NE);
++            }
++            block.branch(block);
++            if (divisionByZero == null) {
++                divisionByZero = codeGenContext.functions().forStaticMethod(new MethodReference(
++                        WasmGCSupport.class, "divisionByZero", ArithmeticException.class));
++            }
++            block.call(divisionByZero);
++            block.throw_(codeGenContext.exceptionTag());
++            builder.getLocal(divisor);
++            context.tempVars().release(divisor);
++        }
++        builder.intBinary(wasmType, op);
++    }
++
+     private void castToInt(WasmInstructionBuilder builder) {
+         if (wasmType == WasmIntType.INT64) {
+             builder.convert(WasmNumType.INT64, WasmNumType.INT32, false);
+--- a/teavm-core/org/teavm/backend/wasm/intrinsics/WasmGCCodeGenContext.java
++++ b/teavm-core/org/teavm/backend/wasm/intrinsics/WasmGCCodeGenContext.java
+@@ -46,5 +46,7 @@ public interface WasmGCCodeGenContext extends IntrinsicContributorContext {
+ 
+     WasmTag exceptionTag();
+ 
++    boolean isStrict();
++
+     WasmGCInitializerRegistry initializerRegistry();
+ }
+--- a/teavm-core/org/teavm/backend/wasm/intrinsics/WasmGCIntrinsics.java
++++ b/teavm-core/org/teavm/backend/wasm/intrinsics/WasmGCIntrinsics.java
+@@ -107,8 +107,8 @@ public class WasmGCIntrinsics {
+ 
+     private static void fillIntLong(IntrinsicRegistry<WasmGCInlineIntrinsic> reg,
+             WasmGCCodeGenContext ctx) {
+-        reg.registerIntrinsic(Integer.class, new IntNumIntrinsic(int.class, WasmIntType.INT32, ctx.functions()));
+-        reg.registerIntrinsic(Long.class, new IntNumIntrinsic(long.class, WasmIntType.INT64, ctx.functions()));
++        reg.registerIntrinsic(Integer.class, new IntNumIntrinsic(int.class, WasmIntType.INT32, ctx));
++        reg.registerIntrinsic(Long.class, new IntNumIntrinsic(long.class, WasmIntType.INT64, ctx));
+     }
+ 
+     private static void fillMath(IntrinsicRegistry<WasmGCInlineIntrinsic> reg) {
+--- a/teavm-core/org/teavm/backend/wasm/runtime/WasmGCSupport.java
++++ b/teavm-core/org/teavm/backend/wasm/runtime/WasmGCSupport.java
+@@ -36,6 +36,10 @@ public class WasmGCSupport {
+         return new ClassCastException();
+     }
+ 
++    public static ArithmeticException divisionByZero() {
++        return new ArithmeticException("/ by zero");
++    }
++
+     public static void throwCloneNotSupportedException() throws CloneNotSupportedException {
+         throw new CloneNotSupportedException();
+     }
+--- a/teavm-core/org/teavm/dependency/DependencyGraphBuilder.java
++++ b/teavm-core/org/teavm/dependency/DependencyGraphBuilder.java
+@@ -40,6 +40,8 @@ import org.teavm.model.TryCatchBlockReader;
+ import org.teavm.model.ValueType;
+ import org.teavm.model.VariableReader;
+ import org.teavm.model.instructions.ArrayElementType;
++import org.teavm.model.instructions.BinaryOperation;
++import org.teavm.model.instructions.NumericOperandType;
+ import org.teavm.model.text.ListingBuilder;
+ 
+ class DependencyGraphBuilder {
+@@ -221,6 +223,15 @@ class DependencyGraphBuilder {
+             }
+         }
+ 
++        @Override
++        public void binary(BinaryOperation op, VariableReader receiver, VariableReader first, VariableReader second,
++                NumericOperandType type) {
++            if ((op == BinaryOperation.DIVIDE || op == BinaryOperation.MODULO)
++                    && (type == NumericOperandType.INT || type == NumericOperandType.LONG)) {
++                currentExceptionConsumer.consume(dependencyAnalyzer.getClassType("java.lang.ArithmeticException"));
++            }
++        }
++
+         @Override
+         public void cast(VariableReader receiver, VariableReader value, ValueType targetType, boolean weak) {
+             super.cast(receiver, value, targetType, weak);

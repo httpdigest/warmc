@@ -1,0 +1,42 @@
+System.out.write and flush, TeaVM's console stream's bytes.
+
+The stream decodes the bytes write() gives it as UTF-8 and keeps what it has
+not printed until a flush.  flush() cleared its action before calling it, a
+null dereference; the decoder was told of the end of input at a flush and not
+reset, so the next write threw IllegalStateException; and a write of more
+bytes than its 32-byte buffer took every chunk from the start of them.
+
+test/teavm/fixes/flush.
+
+--- a/teavm-classlib/org/teavm/classlib/impl/console/JsConsolePrintStream.java
++++ b/teavm-classlib/org/teavm/classlib/impl/console/JsConsolePrintStream.java
+@@ -129,9 +129,10 @@ public abstract class JsConsolePrintStream extends PrintStream {
+ 
+     @Override
+     public void flush() {
+-        if (flushAction != null) {
++        var action = flushAction;
++        if (action != null) {
+             flushAction = null;
+-            flushAction.run();
++            action.run();
+         }
+     }
+ 
+@@ -167,6 +168,7 @@ public abstract class JsConsolePrintStream extends PrintStream {
+             while (len > 0) {
+                 var count = Math.min(len, buffer.remaining());
+                 buffer.put(b, off, count);
++                off += count;
+                 len -= count;
+                 output();
+             }
+@@ -181,6 +183,8 @@ public abstract class JsConsolePrintStream extends PrintStream {
+         private void flush() {
+             if (buffer.position() > 0) {
+                 output(true);
++                // the end of input it was told of ends its use, until a reset
++                decoder.reset();
+             }
+         }
+ 

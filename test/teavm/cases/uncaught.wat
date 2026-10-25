@@ -1,0 +1,23 @@
+;; An exception main lets out: stdout is written first, then the message
+;; through TeaVM's exceptionMessage and stringToJs exports, and exit status 1.
+(module
+  (type $Object (sub (struct (field (mut i32)))))
+  (type $String (sub $Object (struct (field (mut i32)) (field externref))))
+  (type $Throwable (sub $Object (struct (field (mut i32)) (field (ref null $String)))))
+  (type $chars (array (mut i16)))
+  (import "env" "memory" (memory 1))
+  (import "teavmConsole" "putcharStdout" (func $putchar (param i32)))
+  (import "wasm:js-string" "fromCharCodeArray" (func $fromArray (param (ref null $chars) i32 i32) (result (ref extern))))
+  (tag $exn (export "teavm.javaException") (param (ref null $Object)))
+  (@custom "teavm.memoryRequirements" "{\"min\":1, \"dataSize\":0, \"shared\": false}")
+  (func $exceptionMessage (export "teavm.exceptionMessage") (param (ref null $Throwable)) (result (ref null $String))
+    (struct.get $Throwable 1 (local.get 0)))
+  (func $stringToJs (export "teavm.stringToJs") (param (ref null $String)) (result externref)
+    (struct.get $String 1 (local.get 0)))
+  (func $Main::main_$caller$exported$0 (param $args externref)
+    (call $putchar (i32.const 112)) (call $putchar (i32.const 114)) (call $putchar (i32.const 101))
+    (throw $exn (struct.new $Throwable (i32.const 0)
+      (struct.new $String (i32.const 0)
+        (call $fromArray (array.new_fixed $chars 5 (i32.const 98) (i32.const 0xf6) (i32.const 111)
+                                                   (i32.const 109) (i32.const 0x2757))
+                         (i32.const 0) (i32.const 5)))))))
