@@ -1,7 +1,8 @@
 /*
- * What javac compiles org.lwjgl against, in java.base (--patch-module): the
- * signatures of lwjgl/src/org/teavm/classlib/java/nio/TLwjglBuffers.java, which
- * TeaVM substitutes for this class.  Never run.
+ * What javac compiles lwjgl/platform against, in java.base (--patch-module):
+ * the signatures of
+ * lwjgl/platform/org/teavm/classlib/java/nio/TLwjglBuffers.java, which TeaVM
+ * substitutes for this class.  Never run.
  */
 package java.nio;
 

@@ -1,7 +1,7 @@
 /*
- * Direct buffers over the module's linear memory, for org.lwjgl.system's
- * MemoryUtil and MemoryStack: TeaVM's own, whose constructors only this
- * package reaches.  It is java.nio.LwjglBuffers to the program: TeaVM
+ * Direct buffers over the module's linear memory, for warmc's backend of
+ * LWJGL's MemoryUtil (org.lwjgl.system.warmc.WarmcMemory): TeaVM's own, whose
+ * constructors only this package reaches.  It is java.nio.LwjglBuffers to the program: TeaVM
  * substitutes a class of its library for the java.* one a program names, its
  * T-classes renamed within it, and lwjgl/stub/java/nio/LwjglBuffers.java is
  * what javac compiles org.lwjgl against.

@@ -401,6 +401,25 @@ $(GLFW_STAMP):
 
 glfw: $(GLFW_STAMP)
 
+# LWJGL 3, for lwjgl/: the jars of its core, GLFW and OpenGL bindings, which
+# lwjgl/build.py compiles a program against and hands TeaVM.
+LWJGL_VERSION   := 3.4.3
+LWJGL_DIR       := $(BUILD)/tools/lwjgl-$(LWJGL_VERSION)
+LWJGL_STAMP     := $(LWJGL_DIR)/.complete
+LWJGL_ARTIFACTS := lwjgl lwjgl-glfw lwjgl-opengl
+
+$(LWJGL_STAMP):
+	@rm -rf $(BUILD)/tools/lwjgl-*
+	@mkdir -p $(LWJGL_DIR)
+	@for a in $(LWJGL_ARTIFACTS); do \
+	  j=org/lwjgl/$$a/$(LWJGL_VERSION)/$$a-$(LWJGL_VERSION).jar; \
+	  curl -sSLf -o $(LWJGL_DIR)/$$(basename $$j) "https://repo1.maven.org/maven2/$$j" || \
+	    { echo "make lwjgl: cannot fetch $$j"; exit 1; }; \
+	done
+	@touch $@
+
+lwjgl: $(LWJGL_STAMP)
+
 # clang, wasm-ld and a WASI sysroot for test/cbench and test/cppbench.  The
 # release, not a distribution's packages: its C++ library comes built both with
 # and without exceptions, and the kernels that throw need the former.
@@ -430,13 +449,13 @@ wasi-sdk: $(WASI_SDK_STAMP)
 # `make check` brings the pinned tools up to date first, and the official
 # testsuite its spec row runs; ktbench skips itself without a Kotlin
 # compiler, so the stdlib is only fetched when there is one, TeaVM only with
-# a JDK to run it, wasi-sdk only where it publishes a release, and GLFW, which
-# lwjgl/ links its programs against, on macOS.
+# a JDK to run it, wasi-sdk only where it publishes a release, and GLFW and
+# LWJGL, which lwjgl/ builds its programs with, on macOS.
 # hsbench's GHC is not fetched: ghc-wasm-meta installs it, and the corpus
 # skips itself without.
 CHECK_TOOLS := wasm-tools testsuite $(if $(KOTLIN_VERSION),kotlin-stdlib) \
                $(if $(JAVAC_VERSION),teavm) $(if $(WASI_SDK_HOST),wasi-sdk) \
-               $(if $(filter Darwin,$(UNAME_S)),glfw)
+               $(if $(filter Darwin,$(UNAME_S)),glfw lwjgl)
 
 SPEC_LEVELS ?= -O1,-O2,-O2 --profile=deterministic
 
@@ -549,6 +568,6 @@ clean:
 	rm -rf $(BUILD)
 
 .PHONY: all asan tsan check smoke check-tools check-linux check-encoder check-spec conformance testsuite wasm-tools \
-        kotlin-stdlib teavm temurin glfw wasi-sdk fuzz check-combos clean bench-compare bench-record bench-record-o3 bench-record-warmc gc-jitter gc-jitter-full
+        kotlin-stdlib teavm temurin glfw lwjgl wasi-sdk fuzz check-combos clean bench-compare bench-record bench-record-o3 bench-record-warmc gc-jitter gc-jitter-full
 
 -include $(WARMC_DEPS)
