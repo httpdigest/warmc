@@ -8,7 +8,7 @@ export PATH="$PATH:$HOME/.npm-global/bin"
 WORK="$BUILD/testrun"
 mkdir -p "$WORK"
 
-for t in traps ictraps tramptraps gosptraps; do
+for t in traps ictraps tramptraps gosptraps mem64big; do
   if [ ! -s "$WORK/$t.wasm" ] || [ test/cases_traps/$t.wat -nt "$WORK/$t.wasm" ]; then
     wat2wasm $WABT_FLAGS test/cases_traps/$t.wat -o "$WORK/$t.wasm.$$" || exit 1
     mv -f "$WORK/$t.wasm.$$" "$WORK/$t.wasm"
@@ -167,6 +167,20 @@ else
   echo "FAIL[traps] a memory of 65536 pages does not compile: $(head -1 "$BIG.err")"
   fail=$((fail+1))
 fi
+# and a 64-bit one past 2^26 pages, 4 TiB
+printf '(module (memory i64 67108865) (func (export "f")))\n' > "$BIG.wat"
+if wtimeout ./$BUILD/warmc $WARMC_TARGET_FLAGS -o "$BIG" "$BIG.wat" 2>"$BIG.err"; then
+  out=$(wruntimeout $WARMC_RUN "$BIG" f 2>&1); rc=$?
+  if [ "$rc" -ne 4 ] || [[ "$out" != *"cannot instantiate: a 64-bit memory of more than 2^26 pages (4 TiB)"* ]]; then
+    echo "FAIL[traps] a 64-bit memory of 2^26 + 1 pages: expected the refusal, exit 4, got rc=$rc: $out"
+    fail=$((fail+1))
+  else
+    pass=$((pass+1))
+  fi
+else
+  echo "FAIL[traps] a 64-bit memory of 2^26 + 1 pages does not compile: $(head -1 "$BIG.err")"
+  fail=$((fail+1))
+fi
 
 # A stack smaller than the 6 MB the program may otherwise take: the limit is
 # where the thread's own stack ends, short of the runtime's margin, so the
@@ -278,6 +292,31 @@ expect gosp_go_x_oob         "undefined element"
 expect gosp_c2_on_go         "indirect call type mismatch"
 expect gosp_c2_ok            "OK"
 expect gosp_trap             "unreachable"
+
+# a 64-bit memory past 4 GiB: each width, an offset past 2^32, a segment,
+# growth, bulk operations and a loop across the 4 GiB line check their own
+# answers, and an access a byte past the end traps, however it is reached.
+# Windows commits a memory's pages when it is made, 4 GiB of commit charge a
+# run, more than the rows running side by side have between them, so there
+# only the -O2 row runs it (test/gen_mem64.py runs every level, one at a time).
+mem64big=1
+case "$(uname -s)" in
+  MINGW*|CLANG*|MSYS*)
+    case "${WARMC_FLAGS:--O2}" in -O2) [ -z "${WARMC_FAR_BRANCH:-}" ] || mem64big=0 ;;
+                                  *) mem64big=0 ;; esac ;;
+esac
+if [ "$mem64big" = 1 ]; then
+  BIN="$WORK/mem64big$FTAG"
+  wtimeout ./$BUILD/warmc ${WARMC_FLAGS:-} $WARMC_TARGET_FLAGS -o "$BIN" "$WORK/mem64big.wasm" || exit 1
+  for e in big_size big_widths big_offset big_active big_last big_grow big_grow_cap \
+           big_fill big_copy big_init big_loop; do
+    expect "$e" "OK"
+  done
+  for e in big_past big_past_offset big_past_dyn big_fill_past big_copy_past \
+           big_loop_past; do
+    expect "$e" "out of bounds memory access"
+  done
+fi
 
 echo "traps: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]
