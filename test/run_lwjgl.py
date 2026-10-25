@@ -1,6 +1,7 @@
 """warmc's LWJGL (lwjgl/): LWJGL 3 programs through TeaVM and warmc, natively.
 
-  * lwjgl/demo/hello, LWJGL's HelloWorld, builds;
+  * lwjgl/demo/hello, LWJGL's HelloWorld, builds, and so does
+    test/lwjgl/plain, which calls no C function, and runs;
   * test/lwjgl/bluewindow runs: GLFW's version, an error GLFW reports through
     the error callback and one a callback throws coming out of the GLFW call
     that ran it, a window and what GLFW and OpenGL say about it, and the
@@ -49,6 +50,15 @@ def main():
     os.makedirs(OUT, exist_ok=True)
     bad = 0
     if not build(os.path.join(ROOT, "lwjgl", "demo", "hello"), "HelloWorld", os.path.join(OUT, "HelloWorld")):
+        bad += 1
+    # a program that calls none of GLFW or OpenGL builds and runs as well
+    plain = os.path.join(OUT, "plain")
+    if build(os.path.join(ROOT, "test", "lwjgl", "plain"), "Main", plain):
+        r = subprocess.run([plain], capture_output=True, text=True)
+        if r.returncode != 0 or r.stdout != "no C called\n":
+            print("FAIL[lwjgl] plain: exit %d, stdout %r" % (r.returncode, r.stdout))
+            bad += 1
+    else:
         bad += 1
     src = os.path.join(ROOT, "test", "lwjgl", "bluewindow")
     exe = os.path.join(OUT, "bluewindow")
