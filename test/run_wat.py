@@ -120,6 +120,7 @@ NONFINAL = ("wasm-tools gives an inline signature a (sub (func ...)) type, "
             "function type only (text/types.rst, Type Uses)")
 ORACLE_WRONG = {
     os.path.join("test", "cases_gc", "ictab_sub.wat"): NONFINAL,
+    os.path.join("test", "cases_opt", "once.wat"): NONFINAL,
 }
 
 def strip_custom(b):
