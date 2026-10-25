@@ -1,6 +1,7 @@
 """An LWJGL 3 program to a native macOS executable, through TeaVM and warmc.
 
-  python3 lwjgl/build.py [--main CLASS] [-O0|-O1|-O2|-O3] [--c FILE.c]... SRC_DIR -o OUT
+  python3 lwjgl/build.py [--main CLASS] [-O0|-O1|-O2|-O3] [--c FILE.c]...
+                         [--every-gl-function] SRC_DIR -o OUT
 
 SRC_DIR holds the program's .java files, written against LWJGL 3's API, and
 CLASS (default Main) is its main class.  --c's C files are the program's own,
@@ -23,7 +24,12 @@ JVM's memory:
     back (lwjgl/platform/org/lwjgl/system/Upcalls.java,
     lwjgl/native/lwjgl.c);
   * a library is the program itself, linked with GLFW (`make glfw`) and
-    against macOS's OpenGL framework, its functions found by dlsym.
+    against macOS's OpenGL framework, its functions found by dlsym;
+  * GLCapabilities looks up only the OpenGL functions the framework exports,
+    as the SDK's stub of it lists them, which are the only ones dlsym can
+    find: a check of a version or extension it has none of is false at
+    once.  --every-gl-function looks each up, as LWJGL does, which makes a
+    larger program with the same capabilities.
 
 The TeaVM adapter (test/teavm/wasi.py) makes the module a WASI command and
 warmc a native executable.
@@ -229,6 +235,25 @@ def write(path, text):
         f.write(text)
 
 
+def gl_exports():
+    """The OpenGL functions macOS's framework exports for arm64, one a line,
+    from the SDK's text stub of it (and the libraries it re-exports)."""
+    sdk = run(["xcrun", "--show-sdk-path"], "xcrun").stdout.strip()
+    tbd = os.path.join(sdk, "System", "Library", "Frameworks", "OpenGL.framework", "Versions", "A", "OpenGL.tbd")
+    out = os.path.join(WORK, "gl-exports.txt")
+    if stale(out, [tbd, __file__]):
+        with open(tbd) as f:
+            text = f.read()
+        names = set()
+        for targets, symbols in re.findall(r"targets:\s*\[(.*?)\]\s*symbols:\s*\[(.*?)\]", text, re.S):
+            if "arm64" in targets:
+                names.update(s.strip().strip("'")[1:] for s in symbols.split(",") if s.strip().strip("'").startswith("_gl"))
+        if not names:
+            raise SystemExit("lwjgl: no OpenGL function in %s" % tbd)
+        write(out, "".join(n + "\n" for n in sorted(names)))
+    return out
+
+
 def transformer():
     """lwjgl/teavm, compiled against TeaVM, for the driver's class path."""
     out = os.path.join(WORK, "transformer")
@@ -300,6 +325,8 @@ def main():
     ap.add_argument("--main", default="Main")
     ap.add_argument("-O", dest="level", default="2", choices="0123")
     ap.add_argument("--c", action="append", default=[], metavar="FILE.c", help="C of the program's own")
+    ap.add_argument("--every-gl-function", action="store_true",
+                    help="look up every OpenGL function LWJGL knows, not only those macOS exports")
     ap.add_argument("-v", action="store_true", help="print the link command")
     a = ap.parse_args()
 
@@ -325,7 +352,8 @@ def main():
     job = os.path.join(WORK, "job")
     shutil.rmtree(job, ignore_errors=True)
     cp = os.pathsep.join([os.path.join(TEAVM, "patched"), os.path.join(TEAVM, "*"), driver(), transformer()])
-    run(["java", "-cp", cp, "warmc.teavm.TeaVMBuild", "--teavm", TEAVM, "--main", ENTRY,
+    props = [] if a.every_gl_function else ["-Dwarmc.lwjgl.gl-exports=" + gl_exports()]
+    run(["java"] + props + ["-cp", cp, "warmc.teavm.TeaVMBuild", "--teavm", TEAVM, "--main", ENTRY,
          "--classpath", os.pathsep.join([classes] + JARS),
          "--transformer", "warmc.lwjgl.LwjglTransformer",
          "--support", os.path.join(TEAVM_SRC, "FdLibm.java"),
