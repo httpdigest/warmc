@@ -133,7 +133,8 @@ def main():
         link += ["-framework", fw]
     cmd = [os.path.join(BUILD, "warmc"), "--target", "macos",
            "--rt", os.path.join(BUILD, "warmrt-macos.a"), "--wasi", "-O" + a.level,
-           "--native-module", "lwjgl", "--link", " ".join(link), "-o", a.out, adapted]
+           # the system linker, for --link, even for a program that calls no C
+           "--system-ld", "--native-module", "lwjgl", "--link", " ".join(link), "-o", a.out, adapted]
     if a.v:
         cmd.append("-v")
     r = run(cmd, "warmc")
