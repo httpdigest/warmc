@@ -85,12 +85,12 @@ Hello world!
     frames that nothing reads again, which wasm's semantics do not allow
 
   Functions compile in parallel and are laid out in a deterministic order.
-- **Fast code.** Across 335 benchmark kernels compiled from Go, TinyGo, Rust,
-  Zig, AssemblyScript, Kotlin, C, C++ and Haskell, warmc's steady-state code
-  takes 0.45× wasmtime's time (geometric mean), with much lower peak memory.
-  Against the same programs compiled natively (at `-O2` or the nearest level
-  each toolchain has), over the 271 kernels with a native ratio, it takes
-  1.02× the time. See [Performance](#performance).
+- **Fast code.** Across 364 benchmark kernels compiled from Go, TinyGo, Rust,
+  Zig, AssemblyScript, Kotlin, Java, C, C++ and Haskell, warmc's steady-state
+  code takes 0.45× wasmtime's time (geometric mean), with much lower peak
+  memory. Against the same programs compiled natively (at `-O2` or the
+  nearest level each toolchain has), over the 300 kernels with a native
+  ratio, it takes 1.02× the time. See [Performance](#performance).
 - **Runtime for modern languages:**
   - a concurrent, compacting, ZGC-style collector with coloured pointers,
     precise stack maps and load barriers
@@ -169,8 +169,8 @@ This builds everything into `build/`:
 
 `BUILD=DIR` builds into another directory. `make clean` removes `build/`,
 including the pinned dependencies cached there (the spec testsuite,
-`wasm-tools`, wasi-sdk and the Kotlin stdlib), which the targets that need
-them fetch again. `make asan` and `make tsan` build sanitiser versions of the
+`wasm-tools`, wasi-sdk, TeaVM and the Kotlin stdlib), which the targets that
+need them fetch again. `make asan` and `make tsan` build sanitiser versions of the
 compiler, `build/warmc-asan` and `build/warmc-tsan`.
 
 ---
@@ -333,6 +333,7 @@ warmc compiles directly:
 | C | `clang -O3 main.c -o app.wasm` with [wasi-sdk](https://github.com/WebAssembly/wasi-sdk)'s clang (`make wasi-sdk` fetches the pinned release); add `-mllvm -wasm-enable-sjlj -mllvm -wasm-use-legacy-eh=false -lsetjmp` for `setjmp`/`longjmp` |
 | C++ | `clang++ -O3 -fwasm-exceptions -mllvm -wasm-use-legacy-eh=false main.cpp -lunwind -o app.wasm` (wasi-sdk), or without the exception flags for code that never throws |
 | Haskell | `wasm32-wasi-ghc -O2 Main.hs -o app.wasm`, with GHC's wasm backend from [ghc-wasm-meta](https://gitlab.haskell.org/haskell-wasm/ghc-wasm-meta) |
+| Java | [TeaVM](https://teavm.org)'s `wasm-gc` target, then `test/teavm/wasi.py` (see [Java through TeaVM](#java-through-teavm)) |
 
 Then compile it:
 
@@ -392,6 +393,70 @@ over raw system calls. It does so under names of its own (`warmc_lx_*`), so
 an embedder can still link the `-c` object into a C program that uses glibc:
 `gcc -nostartfiles -no-pie -u warmc_driver_hook app.o build/warmwasi.a
 build/warmrt.a`, as `test/run_gowasi_linux.sh` does.
+
+### Java through TeaVM
+
+TeaVM 0.16 compiles JVM bytecode to Wasm GC, but has no WASI target: its
+`wasm-gc` module is written for TeaVM's JavaScript loader, which supplies the
+module's memory, `System.out` a UTF-16 code unit at a time, the clock,
+`Math`'s transcendental functions, and the JS strings and objects its JSO
+layer makes at start-up to export `main`. `test/teavm/wasi.py` defines every
+one of those inside the module, over WASI, and adds a `_start` that runs
+`main` with no arguments. TeaVM's own code stays as TeaVM wrote it: the
+adapter replaces the module's import lines with functions of the same names
+and reassembles it, so every index keeps referring to what it did.
+`make teavm` fetches the pinned compiler and applies `test/teavm/patches`
+(below), and `test/teavm/TeaVMBuild.java` drives it, as TeaVM publishes no
+command-line jar for this release:
+
+```sh
+make teavm
+T=build/tools/teavm-0.16.0
+javac --release 17 -cp "$T/*" -d build/teavm-driver test/teavm/TeaVMBuild.java
+# src/ holds Main.java; TeaVM writes out/main.wasm
+java -cp "$T/patched:$T/*:build/teavm-driver" warmc.teavm.TeaVMBuild --teavm $T \
+  --support test/teavm/FdLibm.java src=out
+python3 test/teavm/wasi.py out/main.wasm app.wasm
+build/warmc --target macos --rt build/warmrt-macos.a --wasi -o app app.wasm
+```
+
+- `Math.sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2`, `exp`, `log` and
+  `pow` call `test/teavm/FdLibm.java`, a port of fdlibm (what `StrictMath`
+  computes) that `--support` has TeaVM compile into the module; `sqrt`,
+  `floor`, `ceil` and `abs` are single instructions.
+- Output is written a line at a time, as `console.log` writes it, in UTF-8,
+  with a lone surrogate as U+FFFD.
+- An exception `main` lets out prints `Uncaught Java exception: MESSAGE` and
+  exits 1. A host call with no meaning outside JavaScript (JSO, the DOM,
+  timers) prints its name and exits 69.
+- TeaVM's semantics are TeaVM's: without `--strict` (the driver's flag), a
+  null dereference, an index out of bounds or an integer division by zero is
+  a wasm trap rather than a Java exception; with it, the exception. A
+  negative array size, an `ArrayStoreException` and a stack overflow are
+  traps either way, and the class library has no `System.exit`.
+
+`test/teavm/patches` fix bugs of TeaVM 0.16.0, each a unified diff of the
+sources of the artifact it names. `test/teavm/patch.py` applies them, refusing
+a hunk whose context is not exactly where it says, and compiles the patched
+files into `$T/patched`, which goes ahead of the jars on the JVM's class path
+and on the one TeaVM reads a program's class library from (the driver checks
+both):
+- `name-section-order`: each map of the name section in index order, which
+  is not the order TeaVM keeps functions and globals in, as imported ones
+  come first. Out of order, a map is not one as the name section's appendix
+  has it: wasm-tools names nothing from its first entry out of order, and
+  warmc ignores the section.
+- `integer-division`: `MIN_VALUE / -1` is `MIN_VALUE`, where `div_s` traps,
+  and with `--strict` a zero divisor, of `/`, `%`, `divideUnsigned` or
+  `remainderUnsigned`, throws `ArithmeticException`, which TeaVM's
+  dependency analysis now knows a division can throw.
+- `math-rint-round-ulp`: `Math.rint` rounds half to even, `Math.round` is
+  `floor(x + 1/2)` without rounding the sum, and `Math.ulp(double)` masks
+  the exponent it means to; the fixes TeaVM made after 0.16.0.
+- `array-simple-name`: `getSimpleName` and `getName` of an array class, which
+  need the names of its item type.
+- `console-bytes`: `System.out.write` and `flush`, which threw: a null action
+  called, a decoder left at its end, and an offset never advanced.
 
 ### WASI 0.2 command components
 
@@ -1137,14 +1202,16 @@ best of five rounds (`make bench-record-o3`), so that they differ from the
 
 The wasm comes from each language's usual producer: TinyGo 0.43 at
 `-opt=2`, Go 1.27.3, rustc nightly 1.101 at `opt-level=3` with LTO, Zig 0.17
-`ReleaseFast`, AssemblyScript 0.28.20 at `-O3`, Kotlin 2.4.21, wasi-sdk 34
-(clang 23.1) at `-O3`, and GHC 9.14 at `-O2`. Only the Zig and AssemblyScript
+`ReleaseFast`, AssemblyScript 0.28.20 at `-O3`, Kotlin 2.4.21, TeaVM 0.16.0
+at its `FULL` level, wasi-sdk 34 (clang 23.1) at `-O3`, and GHC 9.14 at
+`-O2`. Only the Zig and AssemblyScript
 corpora are built with wasm SIMD; the Haskell modules carry some too, in the
 runtime system, libc and gmp that GHC's wasm toolchain ships prebuilt. The
 native builds use the same language's own
 compiler at `-O2`, or its nearest equivalent: clang 23.1 `-O2`, rustc
-`opt-level=2`, Zig `ReleaseFast`, TinyGo `-opt=2`, `go build` and GHC `-O2`
-(with `-with-rtsopts=-V0`, see below).
+`opt-level=2`, Zig `ReleaseFast`, TinyGo `-opt=2`, `go build`, GHC `-O2`
+(with `-with-rtsopts=-V0`, see below), and for Java the same classes run by
+Temurin 25.0.5's JVM (see below).
 AssemblyScript and Kotlin/Wasm have no native compiler to compare with, and
 the native columns cover 42 of `vecbench`'s kernels and 27 of `hsbench`'s
 (see below).
@@ -1161,14 +1228,15 @@ the native columns cover 42 of `vecbench`'s kernels and 27 of `hsbench`'s
 | `cbench` | C | 27 | 0.75 | 0.26 – 1.01 | 0.73 | 1.03 | 0.008 – 4.29 | 1.00 | 2.0 / 9.0 / 1.8 |
 | `cppbench` | C++ | 26 | 0.69 | 0.22 – 1.04 | 0.69 | 0.90 | 0.03 – 1.58 | 0.89 | 2.4 / 9.5 / 2.1 |
 | `hsbench` | Haskell | 28 | 0.44 | 0.20 – 0.97 | 0.44 | 1.32 | 0.61 – 6.42 | 1.32 | 10.1 / 32.4 / 12.8 |
+| `javabench` | Java (TeaVM, Wasm GC) | 29 | 0.42 | 0.02 – 1.01 | 0.42 | 1.01 | 0.26 – 9.40 | 1.01 | 8.3 / 10.2 / 58.8 |
 
 ### Against wasmtime
 
-Over all 335 kernels, warmc's code takes **0.45×** wasmtime's time, and
-0.44× without `stdgo`. Six kernels are slower than wasmtime. Four of them
+Over all 364 kernels, warmc's code takes **0.45×** wasmtime's time, and
+0.44× without `stdgo`. Seven kernels are slower than wasmtime. Five of them
 are within 1.5%, inside the spread between runs: `gobench/strswitch` (1.01),
-`cbench/malloc` (1.01), `cppbench/bitset` (1.004) and `zigbench/optional`
-(1.001). The other two:
+`cbench/malloc` (1.01), `javabench/alloc` (1.01), `cppbench/bitset` (1.004)
+and `zigbench/optional` (1.001). The other two:
 
 | Kernel | warmc / wasmtime | What is known |
 |---|---:|---|
@@ -1202,10 +1270,10 @@ at 0.04×.
 
 ### Against native code
 
-Over the 271 kernels with a native ratio, warmc's code takes **1.02×** the
-native time (median 1.06), and 0.99× without Haskell. wasmtime's code takes
-2.04× the native time on the same kernels. 104 kernels run faster under warmc
-than natively, and another 47 are within 10% of the native build.
+Over the 300 kernels with a native ratio, warmc's code takes **1.02×** the
+native time (median 1.05), and 0.99× without Haskell. wasmtime's code takes
+2.08× the native time on the same kernels. 119 kernels run faster under warmc
+than natively, and another 50 are within 10% of the native build.
 
 The native builds start ahead of the wasm in a few ways that have nothing to
 do with warmc's compiler:
@@ -1228,6 +1296,12 @@ do with warmc's compiler:
   them in machine registers. warmc turns those returns into tail calls and
   passes the three registers the functions use most as arguments
   (`trampoline`), which takes 29% off `hsbench`'s cycles.
+- **Java's class library.** The Java native is the JDK's: the same classes
+  run by the JVM against its own library, where the wasm carries TeaVM's.
+  `javabench/list` runs at 9.4× the JVM's time because TeaVM's `ArrayList`
+  has no `removeIf` of its own and takes `Collection`'s, whose
+  `iterator.remove()` shifts the rest of the array for each element it
+  removes, where the JDK's compacts the array in one pass.
 
 The native build is slower where the platform's own mechanism costs more
 than wasm's:
@@ -1247,30 +1321,39 @@ TinyGo's `int`, Rust's `usize`, C's `long` and Haskell's `Int` are 32 bits on
 wasm32 and 64 natively. Native floating-point code is also not always rounded
 as wasm's is: clang fuses multiply-adds natively, for one, which warmc does
 only with `-ffma` or at `-O3`. Without those 45 kernels the geometric mean
-is 1.04×. The Haskell natives are built with `-with-rtsopts=-V0`: without it
+is 1.03×. The Haskell natives are built with `-with-rtsopts=-V0`: without it
 the runtime's exit would wait out its 10 ms ticker, which would make the
 empty program's time mostly that wait and leave every kernel's native time
-10 ms short. 273 kernels have a native build, but two native times are too
-short to time reliably, under 5 ms: `vecbench/rowsum` and `hsbench/fib`,
-which have no native ratio (their memory figures still count).
+10 ms short. The Java natives are Temurin 25.0.5's JVM as it comes, running
+the classes javac compiled, and the floor subtracted from them is the JVM
+running an empty `main`. What remains of a kernel's time includes the
+interpreter and the JIT compiling it, which at the tens of milliseconds a
+kernel runs for is part of what the JVM costs. The three kernels where
+warmc's code is fastest against it are the three whose JVM peaks at
+520–650 MiB resident: `javabench/exn` at 0.26×, `complex` at 0.33× and
+`alloc` at 0.35×. 302 kernels have a native build, but two native times are
+too short to time reliably, under 5 ms: `vecbench/rowsum` and
+`hsbench/fib`, which have no native ratio (their memory figures still
+count).
 
 ### At `-O3`
 
-At `-O3` warmc's code takes **0.45×** wasmtime's time (0.446) and **1.01×**
-the native time, 0.991 of its time at `-O2`, over the same 335 and 271
+At `-O3` warmc's code takes **0.44×** wasmtime's time (0.443) and **1.01×**
+the native time, 0.991 of its time at `-O2`, over the same 364 and 300
 kernels. The gains are where the two passes `-O3` adds have something to do:
 - `dead-frames` removes the stores into C frames that nothing reads again:
   `cbench/structval` takes 0.54× its `-O2` time.
 - `fma` fuses float multiplies into the adds that read them:
   `vecbench/horner` takes 0.63×, `rsbench/f32ops` 0.66×, `asbench/mathfn`
-  0.77×, `asbench/stencil` 0.78× and `cbench/nbody` 0.84×.
+  0.77×, `asbench/stencil` 0.78×, `javabench/alloc` 0.80× and `cbench/nbody`
+  0.84×.
 
-142 of the 335 kernels compile to the same code at both levels, most of
-`gobench`, `vecbench`, `rsbench`, `zigbench` and `ktbench`. Their `-O3`
-figures differ from `-O2`'s only by the spread between runs: between 0.93
-and 1.11 for single kernels, 1.002 on average. That spread is all that moves
-`ktbench` from 0.10 to 0.11 (0.104 and 0.105 unrounded). The 193 kernels
-whose code changes take 0.983 of their `-O2` time. Three of them came out
+167 of the 364 kernels compile to the same code at both levels, most of
+`gobench`, `vecbench`, `rsbench`, `zigbench`, `ktbench` and `javabench`.
+Their `-O3` figures differ from `-O2`'s only by the spread between runs:
+between 0.93 and 1.11 for single kernels, 1.004 on average. That spread is
+all that moves `ktbench` from 0.10 to 0.11 (0.104 and 0.105 unrounded). The
+197 kernels whose code changes take 0.981 of their `-O2` time. Three of them came out
 more than 3% slower than at `-O2`: timed again, `stdgo/recurse` ran at 0.98
 of its `-O2` time and `asbench/utf8enc` at 1.00, and `hsbench/fib` is too
 short to time.
@@ -1324,17 +1407,26 @@ Most of the suite is **differential**. warmc's output is compared with:
 - wasmtime, for WASI preview 1 and 0.2 programs (stdout, stderr, exit code and
   the resulting directory tree), and for linked components (`test/run_clink.py`)
 - wasmtime, for the benchmark corpora in Go, Rust, Zig, AssemblyScript,
-  Kotlin, C, C++ and Haskell; four of them also with `-fdead-frames`, and
-  four with `-fexact-trap`
-- wasmtime, at `-O0`, `-O1`, `-O2` and `-O2 -fdead-frames`, for 310 test
+  Kotlin, Java, C, C++ and Haskell; four of them also with `-fdead-frames`,
+  and four with `-fexact-trap`
+- wasmtime, at `-O0`, `-O1`, `-O2` and `-O2 -fdead-frames`, for 332 test
   programs that are not benchmarks: `test/ctests` (C, 36), `cpptests` (C++,
   40), `rstests` (Rust, 34), `gotests` (TinyGo, 36), `stdgotests` (Go, 44),
-  `astests` (AssemblyScript, 40), `kttests` (Kotlin, 22), `zigtests` (Zig, 35)
-  and `hstests` (Haskell, 23). Each one covers a single language area:
+  `astests` (AssemblyScript, 40), `kttests` (Kotlin, 22), `javatests` (Java,
+  22, built with TeaVM's `--strict`), `zigtests` (Zig, 35) and `hstests`
+  (Haskell, 23). Each one covers a single language area:
   integer and float edge cases, strings, collections, closures, exceptions,
   generics, the GC and the runtime library. Each prints only results that
   wasm fixes exactly; for example, it prints no arithmetic NaN bits.
 - `wasm-tools`, for component, WIT and WAT handling
+- wasmtime again, for the TeaVM adapter (`test/run_teavm.py`): modules shaped
+  as TeaVM writes them, each host call the adapter defines called and printed,
+  the string builtins' traps, the calls it stops at and an exception `main`
+  lets out, against what each must print and its exit status; the JVM's
+  `StrictMath`, which `test/teavm/FdLibm.java` must match bit for bit; and
+  the JVM again for TeaVM's patches, a program for each in `test/teavm/fixes`
+  built with the patched TeaVM, with and without `--strict`, each run's
+  output the JVM's for the same classes
 - the Component Model's reference `definitions.py`, for canonical-ABI layout
   and for what the generated adapter code computes (`test/run_adapter.py`)
 - wabt's `wasm-interp` again, for random modules in Go's shape whose stack
@@ -1406,18 +1498,21 @@ against other wasm engines), `test/sizes.py` (output sizes) and
 Requirements:
 - `make check` needs `python3`, `perl` and wabt (`wat2wasm`, `wasm-interp`).
   It also needs clang's `wasm32` target with `wasm-ld`.
-- Three dependencies are pinned in the Makefile and cached under `build/`:
+- Four dependencies are pinned in the Makefile and cached under `build/`:
   `wasm-tools` (built with `cargo` by `make wasm-tools`), the spec testsuite
-  (`make testsuite`), and wasi-sdk, the clang and sysroot the C and C++
-  corpora are built with (`make wasi-sdk`). A fourth, the Kotlin/Wasm stdlib
-  (`make kotlin-stdlib`), is cached there too, in the version your `kotlinc`
-  reports. Each cached copy is stamped with its version, so bumping a pin or
-  upgrading `kotlinc` fetches it again.
-  `make check` brings all four up to date by itself, and `make check-spec`
-  the testsuite.
+  (`make testsuite`), wasi-sdk, the clang and sysroot the C and C++ corpora
+  are built with (`make wasi-sdk`), and TeaVM, the compiler and class library
+  the Java corpora are built with (`make teavm`, which needs a JDK, and
+  applies `test/teavm/patches`). A fifth,
+  the Kotlin/Wasm stdlib (`make kotlin-stdlib`), is cached there too, in the
+  version your `kotlinc` reports. Each cached copy is stamped with its
+  version, so bumping a pin or upgrading `kotlinc` fetches it again.
+  `make check` brings all five up to date by itself, and `make check-spec`
+  the testsuite. A sixth, Temurin, the JDK the Java corpus's native column
+  runs (`make temurin`), only `make bench-record` fetches.
 - Rows that need wasmtime, TinyGo, Go, Rust (`wasm32-wasip1` / `wasm32-wasip2`),
-  Zig, `asc`, `kotlinc-wasm` or `wasm32-wasi-ghc` skip themselves when the tool
-  is missing. GHC's wasm backend is not fetched by the Makefile: install it
+  Zig, `asc`, `kotlinc-wasm`, `wasm32-wasi-ghc` or a JDK (`javac` 21 or later,
+  for the Java corpora) skip themselves when the tool is missing. GHC's wasm backend is not fetched by the Makefile: install it
   with ghc-wasm-meta's `bootstrap.sh` (the `hsbench` corpus is recorded with
   `FLAVOUR=9.14`), which puts it in `~/.ghc-wasm`, where `test/gobench.py`
   finds it without `~/.ghc-wasm/env` being sourced.
@@ -1455,7 +1550,7 @@ rt/             the runtime linked into every program and shared library
   win.inc winposix.c                      Windows platform layer
   warm_rt.h                               the embedding API
   const_ops.inc                           the constant-expression opcodes, shared with the compiler
-test/           test drivers (run_all.sh is make check), cases, benchmark and test corpora, the spec harness (spec/)
+test/           test drivers (run_all.sh is make check), cases, benchmark and test corpora, the spec harness (spec/), TeaVM's driver and WASI adapter (teavm/)
 example/        TinyGo and Kotlin sample programs (source, .wasm and a macOS build)
 Makefile        the build, the pinned dependencies and the test targets
 .github/        CI: make smoke on pushes to main and on pull requests, make check nightly
