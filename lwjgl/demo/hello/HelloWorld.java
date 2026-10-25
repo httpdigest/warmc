@@ -1,5 +1,5 @@
 // LWJGL 3's HelloWorld, as lwjgl.org's guide has it, with a blue window:
-// written against LWJGL's API, built with warmc's (lwjgl/build.py).
+// built on LWJGL's jars through TeaVM and warmc (lwjgl/build.py).
 import static org.lwjgl.glfw.Callbacks.glfwFreeCallbacks;
 import static org.lwjgl.glfw.GLFW.*;
 import static org.lwjgl.opengl.GL11.*;

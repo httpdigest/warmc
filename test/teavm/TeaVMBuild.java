@@ -4,7 +4,7 @@
  *
  *   java -cp TEAVM_DIR/'*':DRIVER warmc.teavm.TeaVMBuild
  *        --teavm TEAVM_DIR [--strict] [--main CLASS] [--classpath PATH]
- *        [--support SRC.java]... JOB...
+ *        [--transformer CLASS]... [--support SRC.java]... JOB...
  *
  * TEAVM_DIR is where `make teavm` put TeaVM's jars: the compiler runs from all
  * of them, and the program's classes come from its class library and runtime
@@ -18,7 +18,9 @@
  * OUT_DIR/main.wasm of it.  The entry point is class Main, or --main's.
  * --classpath's directories and jars (separated as the platform separates
  * them) are classes the program is compiled against and TeaVM reads beside
- * its own: lwjgl/build.py's LWJGL.  --support files are
+ * its own: lwjgl/build.py's LWJGL.  --transformer names a TeaVM
+ * ClassHolderTransformer on this JVM's class path, which TeaVM runs on every
+ * class it reads: lwjgl/teavm/LwjglTransformer.java.  --support files are
  * compiled once and given to every job, and their classes are kept whether or
  * not the program reaches them: test/teavm/FdLibm.java, whose functions
  * test/teavm/wasi.py calls in place of JavaScript's Math.
@@ -142,6 +144,7 @@ public final class TeaVMBuild {
         boolean strict = false;
         String mainClass = "Main";
         var extra = new ArrayList<File>();
+        var transformers = new ArrayList<String>();
         for (int i = 0; i < args.length; i++) {
             switch (args[i]) {
                 case "--teavm": {
@@ -180,6 +183,9 @@ public final class TeaVMBuild {
                     break;
                 case "--strict":
                     strict = true;
+                    break;
+                case "--transformer":
+                    transformers.add(args[++i]);
                     break;
                 default:
                     jobs.add(args[i]);
@@ -244,6 +250,7 @@ public final class TeaVMBuild {
             }
             cp.addAll(teavm);
             tool.setClassPath(cp);
+            tool.getTransformers().addAll(transformers);
             try {
                 tool.generate();
             } catch (Exception e) {
