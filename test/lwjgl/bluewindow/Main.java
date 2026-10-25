@@ -63,7 +63,7 @@ public class Main {
         }
         int[] keys = new int[1];
         glfwSetKeyCallback(window, (w, key, scancode, action, mods) -> keys[0]++);
-        // an optional function, which GLFW 3.4 has not: LWJGL checks its address
+        // an optional function, which GLFW 3.5.1 has not: LWJGL checks its address
         try {
             glfwResetPreeditText(window);
             System.out.println("an optional function: called");

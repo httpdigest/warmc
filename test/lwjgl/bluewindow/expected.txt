@@ -1,5 +1,5 @@
 no callback before: true
-GLFW 3.4.0
+GLFW 3.5.1
 errors 1: 0x10003 Invalid window hint 0x7FFFFFFF
 thrown after the call: GLFW error [0x10003]: Invalid window hint 0x7FFFFFFF
 an optional function: not there
