@@ -179,7 +179,9 @@ static const char *usage_text =
   "                module NAME, by its name, with the platform's C calling\n"
   "                convention: i32, i64, f32 and f64 alone, a pointer an i64\n"
   "                native address, and the import only ever called.  Its\n"
-  "                warmc_memory_base, () -> i64, is memory 0's base, not C's.\n"
+  "                warmc_memory_base, () -> i64, is memory 0's base, not C's,\n"
+  "                and its warmc_call (or warmc_call.ANYTHING) calls the C\n"
+  "                function at the address its last argument, an i64, holds.\n"
   "                AArch64's, on linux and macos; implies --system-ld\n"
   "  --link ARGS   more for the system linker, in its shell syntax: objects,\n"
   "                archives, -l and -framework; repeatable\n"
@@ -256,6 +258,12 @@ static uint32_t mark_native_imports(Module *m, const char *const *mods, uint32_t
                     "module with a memory, and takes no arguments",
                     (int)im->module_len, im->module);
       fn->native_memory_base = true;
+    } else if (!strcmp(im->name, "warmc_call") || !strncmp(im->name, "warmc_call.", 11)) {
+      if (!t->nparams || t->params[t->nparams - 1] != VT_I64)
+        warmc_fatal("native import %.*s.%s: a call of the C function at the address its "
+                    "last argument, an i64, gives",
+                    (int)im->module_len, im->module, im->name);
+      fn->native_indirect = true;
     } else if (!im->name_len || strlen(im->name) != im->name_len) {
       warmc_fatal("native import %.*s: a C function's name, not empty and without a NUL",
                   (int)im->module_len, im->module);

@@ -1929,12 +1929,34 @@ static void emit_inst(Isel *s, Ref v) {
         /* the C function of the import's name, called as C calls it: no
            vmctx, the arguments where C's convention puts them, and the
            system linker to find it */
-        emit_call_args_c(s, a, in->nargs);
-        if (s->cold_frame) emit_cold_frame(s);
-        uint32_t sym = obj_intern_sym(s->o, f->m->imports[fn->import_index].name,
-                                      SYM_UNDEF_FUNC, -1, 0);
-        isel_reloc(s, REL_CALL26, B->len, sym, 0);
-        a64_bl(B, 0);
+        if (fn->native_indirect) {
+          /* The address is called where it is when no argument's move writes
+             that register -- one past the integer arguments, where it is
+             hinted -- and else taken ahead of them, as a call_ref's is, into
+             a scratch register their moves leave alone. */
+          uint32_t nint = 0;
+          for (uint32_t j = 0; j + 1 < in->nargs; j++) nint += !is_fp_value(f, a[j]);
+          int l = s->loc[a[in->nargs - 1]];
+          int p;
+          if (l != LOC_NONE && !IS_SLOT(l) && l >= (int)(nint < 8 ? nint : 8) && l <= R15 &&
+              l != TMP0 && l != TMP1) {
+            p = l;
+          } else {
+            p = rd(s, a[in->nargs - 1], S2);
+            if (p != S2) a64_mov_reg(B, SF64, S2, p);
+            p = S2;
+          }
+          emit_call_args_c(s, a, in->nargs - 1);
+          if (s->cold_frame) emit_cold_frame(s);
+          a64_blr(B, p);
+        } else {
+          emit_call_args_c(s, a, in->nargs);
+          if (s->cold_frame) emit_cold_frame(s);
+          uint32_t sym = obj_intern_sym(s->o, f->m->imports[fn->import_index].name,
+                                        SYM_UNDEF_FUNC, -1, 0);
+          isel_reloc(s, REL_CALL26, B->len, sym, 0);
+          a64_bl(B, 0);
+        }
         note_site(s);
         note_safepoint(s, v);
         if (s->cold_frame) { cold_call_done(s, v); break; }
