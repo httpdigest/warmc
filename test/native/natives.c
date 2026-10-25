@@ -65,6 +65,22 @@ int32_t nat_call_back(int32_t n) {
   return sum;
 }
 
+/* the addresses warmc_call imports call through */
+static int32_t bumps;
+void nat_bump(void) { bumps++; }
+int32_t nat_bumps(void) { return bumps; }
+int64_t nat_addr(int32_t which) {
+  switch (which) {
+    case 0: return (int64_t)(intptr_t)nat_i32;
+    case 1: return (int64_t)(intptr_t)nat_f64;
+    case 2: return (int64_t)(intptr_t)nat_mixed;
+    case 3: return (int64_t)(intptr_t)nat_bump;
+    case 4: return (int64_t)(intptr_t)nat_f32;
+    case 5: return (int64_t)(intptr_t)nat_i64;
+    default: return 0;
+  }
+}
+
 /* linear memory, through the native address warmc_memory_base gives it */
 int32_t nat_read(const int32_t *p) { return *p; }
 void nat_write(int32_t *p, int32_t v) { *p = v; }

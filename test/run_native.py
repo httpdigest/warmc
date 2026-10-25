@@ -5,13 +5,17 @@
     eight of a kind, on the stack (packed on Apple's convention, 8 bytes each
     on AAPCS64's), every result type, values kept across calls that write
     every caller-saved register, a tail call, C calling back into the module,
-    and C reading and writing linear memory at the native address
-    warmc_memory_base gives;
+    C reading and writing linear memory at the native address
+    warmc_memory_base gives, and warmc_call imports, calls of the C
+    function at the address their last argument holds -- an address the
+    call before made, in x0, where the first argument goes;
   * a C function's arguments are hinted into C's registers, so that none is
-    computed into wasm's and moved;
+    computed into wasm's and moved, and a warmc_call's address into the one
+    after them, where it is called;
   * what warmc refuses: a native import used as anything but a call, or of a
     type C cannot be called with, warmc_memory_base of the wrong type or
-    without a memory, and native imports where they cannot be linked.
+    without a memory, a warmc_call with no address last, and native imports
+    where they cannot be linked.
 
 It runs on the host's own target, macOS or Linux on AArch64, with clang.
 
@@ -74,6 +78,10 @@ REFUSE = {
     "warmc_memory_base without a memory": ('(module (import "c" "warmc_memory_base" (func (result i64))))',
                                            "memory 0's base"),
     "an empty name": ('(module (import "c" "" (func)))', "not empty"),
+    "warmc_call without an address": ('(module (import "c" "warmc_call" (func (result i32))))',
+                                      "its last argument, an i64"),
+    "warmc_call. with an i32 last": ('(module (import "c" "warmc_call.x" (func (param i64 i32))))',
+                                     "its last argument, an i64"),
 }
 
 
@@ -108,7 +116,8 @@ def run_refusals(work, target, rt):
     obj = os.path.join(work, "one.o")
     with open(src, "w") as f:
         f.write('(module (import "c" "native_f" (func)) (import "c" "warmc_memory_base" (func (result i64)))'
-                ' (memory 1) (func (export "g") (result i64) (call 0) (call 1)))')
+                ' (import "c" "warmc_call" (func (param i64)))'
+                ' (memory 1) (func (export "g") (result i64) (call 0) (call 2 (call 1)) (call 1)))')
     r = warmc(["--target", target, "--rt", rt, "--native-module", "c", "-c", "-o", obj, src])
     if r.returncode != 0:
         fail("-c: warmc: %s" % r.stderr.strip()[:300])
@@ -118,6 +127,8 @@ def run_refusals(work, target, rt):
         fail("-c: no undefined native_f in the object:\n%s" % syms[:400])
     if "warmc_memory_base" in syms:
         fail("-c: warmc_memory_base is a symbol of the object, not memory 0's base")
+    if "warmc_call" in syms:
+        fail("-c: warmc_call is a symbol of the object, not a call through an address")
 
 
 def run_calls(work, target, rt, cflags):
@@ -145,10 +156,14 @@ def run_calls(work, target, rt, cflags):
 
 SHAPE = '''(module
   (import "c" "nat_i32" (func $nat_i32 (param i32 i32) (result i32)))
+  (import "c" "warmc_call" (func $at (param i32 i32 i64) (result i32)))
   (memory 1)
   ;; both arguments loaded, the call's to make: each loaded into C's register
   (func $shape (export "shape") (result i32)
-    (call $nat_i32 (i32.load (i32.const 16)) (i32.load (i32.const 32)))))'''
+    (call $nat_i32 (i32.load (i32.const 16)) (i32.load (i32.const 32))))
+  ;; and so through an address, which is no argument of C's
+  (func $shape_at (export "shape_at") (result i32)
+    (call $at (i32.load (i32.const 16)) (i32.load (i32.const 32)) (i64.load (i32.const 48)))))'''
 
 
 def run_shape(work, target, rt):
@@ -165,10 +180,15 @@ def run_shape(work, target, rt):
         print("native: shape left out (no objdump)")
         return
     d = subprocess.run([objdump, "-d", "--no-show-raw-insn", obj], capture_output=True, text=True).stdout
-    body = d[d.find("shape"):]
+    body = d[d.find("shape"):]  # shape_at's too, which follows it
     moves = [l for l in body.split("\n") if re.search(r"\bmov\s+[wx]0, [wx][0-9]", l)]
     if moves:
         fail("shape: an argument computed elsewhere and moved into C's register:\n%s" % "\n".join(moves))
+    # a warmc_call's address, loaded into the register after the arguments,
+    # called there
+    moved = [l for l in body.split("\n") if re.search(r"\bmov\s+x14, x", l)]
+    if moved or not re.search(r"\bblr\s+x2\b", body):
+        fail("shape: shape_at's address not called in x2, where it was loaded:\n%s" % body[:600])
 
 
 def main():

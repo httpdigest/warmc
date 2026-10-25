@@ -18,6 +18,16 @@
   (import "c" "nat_write" (func $nat_write (param i64 i32)))
   ;; not C's: memory 0's base, the native address of offset 0
   (import "c" "warmc_memory_base" (func $base (result i64)))
+  ;; not C's either: a call of the C function at the address the last
+  ;; argument holds, which nat_addr gives
+  (import "c" "nat_addr" (func $addr (param i32) (result i64)))
+  (import "c" "nat_bumps" (func $bumps (result i32)))
+  (import "c" "warmc_call" (func $call_i32 (param i32 i32 i64) (result i32)))
+  (import "c" "warmc_call.f64" (func $call_f64 (param f64 f32 f64 i64) (result f64)))
+  (import "c" "warmc_call.f32" (func $call_f32 (param f32 f32 i64) (result f32)))
+  (import "c" "warmc_call.i64" (func $call_i64 (param i64 i32 i64 i64) (result i64)))
+  (import "c" "warmc_call.void" (func $call_void (param i64)))
+  (import "c" "warmc_call.mixed" (func $call_mixed (param i32 f32 i64 f64 i32 f32 i32 i32 i32 i32 i32 i64 f32 f64 f32 f64 f32 f64 f32 i32 i64) (result f64)))
   (memory (export "memory") 1)
   (data (i32.const 16) "native: ok\n")
 
@@ -27,6 +37,10 @@
   ;; a tail call of C is a call and a return
   (func $tail (param i32 i32) (result i32)
     (return_call $nat_i32 (local.get 0) (local.get 1)))
+
+  ;; a tail call through an address is a call and a return too
+  (func $tail_at (param i32 i32 i64) (result i32)
+    (return_call $call_i32 (local.get 0) (local.get 1) (local.get 2)))
 
   ;; what nat_call_back calls, itself calling C
   (func (export "back") (param $i i32) (result i32)
@@ -80,6 +94,30 @@
                  (i32.const 15))
     (call $nat_write (i64.add (call $base) (i64.const 72)) (i32.const -77))
     (call $check (i32.eq (i32.load (i32.const 72)) (i32.const -77)) (i32.const 16))
+    ;; calls through addresses: the address made by a call just before, in
+    ;; x0, where the first argument goes
+    (call $check (i32.eq (call $call_i32 (i32.const -3) (i32.const 7) (call $addr (i32.const 0)))
+                         (i32.const -23)) (i32.const 17))
+    (call $check (f64.eq (call $call_f64 (f64.const 2.5) (f32.const 4) (f64.const 0.25)
+                                         (call $addr (i32.const 1)))
+                         (f64.const 10.25)) (i32.const 18))
+    (call $check (f32.eq (call $call_f32 (f32.const 1.5) (f32.const 0.5) (call $addr (i32.const 4)))
+                         (f32.const 3)) (i32.const 19))
+    (call $check (i64.eq (call $call_i64 (i64.const 1000000000000) (i32.const -4) (i64.const 5)
+                                         (call $addr (i32.const 5)))
+                         (i64.const 1000000000020)) (i32.const 20))
+    (call $call_void (call $addr (i32.const 3)))
+    (call $call_void (call $addr (i32.const 3)))
+    (call $check (i32.eq (call $bumps) (i32.const 2)) (i32.const 21))
+    (call $check (f64.eq (call $call_mixed (i32.const 1) (f32.const 2) (i64.const 3) (f64.const 4)
+                                           (i32.const 5) (f32.const 6) (i32.const 7) (i32.const 8)
+                                           (i32.const 9) (i32.const 10) (i32.const 11) (i64.const 12)
+                                           (f32.const 13) (f64.const 14) (f32.const 15) (f64.const 16)
+                                           (f32.const 17) (f64.const 18) (f32.const 19) (i32.const 20)
+                                           (call $addr (i32.const 2)))
+                         (f64.const 20190)) (i32.const 22))
+    (call $check (i32.eq (call $tail_at (i32.const 4) (i32.const 5) (call $addr (i32.const 0)))
+                         (i32.const 45)) (i32.const 23))
     (i32.store (i32.const 0) (i32.const 16))
     (i32.store (i32.const 4) (i32.const 11))
     (drop (call $fd_write (i32.const 1) (i32.const 0) (i32.const 1) (i32.const 8)))))
