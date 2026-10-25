@@ -218,8 +218,20 @@ static int op_tied_arg(uint16_t op) {
 }
 
 static Ref tied_operand_of(IrFunc *f, Ref def) {
-  int ti = op_tied_arg(f->insts[def].op);
-  if (ti < 0 || (uint32_t)ti >= f->insts[def].nargs) return REF_NONE;
+  Inst *in = &f->insts[def];
+  /* A C function's result comes back in the register its first argument of
+     the same class went in, x0 or v0, which both are hinted to: one dying at
+     the call leaves the register to the result, rather than the result
+     taking another and moving back for its use. */
+  if (in->op == I_CALL && in->type != 0 && f->m->funcs[in->imm].native) {
+    bool fp = vt_is_float((ValType)in->type);
+    Ref *a = ir_args(f, def);
+    for (uint32_t j = 0; j < in->nargs; j++)
+      if ((bool)is_fp_value(f, a[j]) == fp) return a[j];
+    return REF_NONE;
+  }
+  int ti = op_tied_arg(in->op);
+  if (ti < 0 || (uint32_t)ti >= in->nargs) return REF_NONE;
   return ir_args(f, def)[ti];
 }
 
@@ -1695,7 +1707,8 @@ static void regalloc_linear(Isel *s) {
             in->op != I_CALL_REF) continue;
         uint32_t na = in->nargs - (in->op == I_CALL ? 0 : 1);
         Ref *a = ir_args(f, r2);
-        int ni = 1, nf = 0;
+        /* a C function's integer arguments start at x0, wasm's after vmctx */
+        int ni = in->op == I_CALL && f->m->funcs[in->imm].native ? 0 : 1, nf = 0;
         for (uint32_t j = 0; j < na; j++) {
           if (is_fp_value(f, a[j])) { if (nf < 8 && hint[a[j]] < 0) hint[a[j]] = nf; nf++; }
           else { if (ni <= 7 && hint[a[j]] < 0) hint[a[j]] = ni; ni++; }

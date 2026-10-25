@@ -193,6 +193,11 @@ void codegen_prewarm_symbols(Module *m, ObjBuilder *o) {
   for (size_t i = 0; i < sizeof helpers / sizeof helpers[0]; i++)
     obj_intern_sym(o, helpers[i], SYM_UNDEF_FUNC, -1, 0);
 
+  /* the C functions a --native-module's imports call */
+  for (uint32_t i = 0; i < m->nimported_funcs; i++)
+    if (m->funcs[i].native && !m->funcs[i].native_memory_base)
+      obj_intern_sym(o, m->imports[m->funcs[i].import_index].name, SYM_UNDEF_FUNC, -1, 0);
+
   /* A function goes by wasm_func_N, which every reference names; its
      symbol table entry, which only tools read, by its name section name. */
   for (uint32_t i = m->nimported_funcs; i < m->nfuncs; i++)
@@ -212,6 +217,9 @@ static char g_anchor[4][160] = { "__warmc_text", "__warmc_rodata", "__warmc_data
 
 bool warmc_load_barrier = true;
 void codegen_set_load_barrier(bool on) { warmc_load_barrier = on; }
+
+bool warmc_darwin_abi = false;
+void codegen_set_darwin_abi(bool on) { warmc_darwin_abi = on; }
 
 void codegen_set_symbol_prefix(const char *prefix) {
   snprintf(g_module_sym, sizeof g_module_sym, "%s_module", prefix);
@@ -1229,13 +1237,14 @@ void codegen_emit_module_data(Module *m, ObjBuilder *o) {
   for (uint32_t i = 0; i < m->nimports; i++) {
     Import *im = &m->imports[i];
     uint64_t type_id = 0, min = 0, max = 0, heap = 0;
-    uint32_t mut = 0, has_max = 0, index64 = 0, flags = 0;
+    uint32_t mut = 0, has_max = 0, index64 = 0, flags = 0, import_flags = 0;
     switch (im->kind) {
       case EK_FUNC: {
         type_id = type_hash(&m->types[im->type_index]);
         ValType t = vt_ref(false, (HeapType)im->type_index);
         flags = vt_flags_of(m, t);
         heap = heap_id_of(m, vt_heap(t));
+        if (m->funcs[nimported_funcs].native) import_flags |= IMPORT_NATIVE;
         nimported_funcs++;
         break;
       }
@@ -1283,7 +1292,7 @@ void codegen_emit_module_data(Module *m, ObjBuilder *o) {
     buf_u32(&o->data, im->name_len);
     buf_u64(&o->data, heap);
     buf_u32(&o->data, im->module_len);
-    buf_u32(&o->data, 0);
+    buf_u32(&o->data, import_flags);
   }
 
   uint64_t tables_off = o->data.len;
