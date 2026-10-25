@@ -226,7 +226,9 @@ static Ref tied_operand_of(IrFunc *f, Ref def) {
   if (in->op == I_CALL && in->type != 0 && f->m->funcs[in->imm].native) {
     bool fp = vt_is_float((ValType)in->type);
     Ref *a = ir_args(f, def);
-    for (uint32_t j = 0; j < in->nargs; j++)
+    /* not a warmc_call's address, which is no argument of C's */
+    uint32_t na = in->nargs - (f->m->funcs[in->imm].native_indirect ? 1u : 0u);
+    for (uint32_t j = 0; j < na; j++)
       if ((bool)is_fp_value(f, a[j]) == fp) return a[j];
     return REF_NONE;
   }
@@ -1707,7 +1709,9 @@ static void regalloc_linear(Isel *s) {
             in->op != I_CALL_REF) continue;
         uint32_t na = in->nargs - (in->op == I_CALL ? 0 : 1);
         Ref *a = ir_args(f, r2);
-        /* a C function's integer arguments start at x0, wasm's after vmctx */
+        /* a C function's integer arguments start at x0, wasm's after vmctx;
+           a warmc_call's address, last, takes the register after them, which
+           no argument's move writes */
         int ni = in->op == I_CALL && f->m->funcs[in->imm].native ? 0 : 1, nf = 0;
         for (uint32_t j = 0; j < na; j++) {
           if (is_fp_value(f, a[j])) { if (nf < 8 && hint[a[j]] < 0) hint[a[j]] = nf; nf++; }

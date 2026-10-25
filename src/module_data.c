@@ -195,7 +195,7 @@ void codegen_prewarm_symbols(Module *m, ObjBuilder *o) {
 
   /* the C functions a --native-module's imports call */
   for (uint32_t i = 0; i < m->nimported_funcs; i++)
-    if (m->funcs[i].native && !m->funcs[i].native_memory_base)
+    if (m->funcs[i].native && !m->funcs[i].native_memory_base && !m->funcs[i].native_indirect)
       obj_intern_sym(o, m->imports[m->funcs[i].import_index].name, SYM_UNDEF_FUNC, -1, 0);
 
   /* A function goes by wasm_func_N, which every reference names; its

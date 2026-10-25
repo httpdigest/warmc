@@ -247,6 +247,9 @@ typedef struct {
      linear memory's offsets are from */
   bool native;
   bool native_memory_base;
+  /* warmc_call (or warmc_call.ANYTHING): a call of the C function at the
+     address the last argument holds, with the others its arguments */
+  bool native_indirect;
   uint32_t import_index;
   char *sym;
   char *name;   /* the name section's name for it, or NULL */
