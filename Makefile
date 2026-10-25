@@ -385,7 +385,7 @@ temurin: $(TEMURIN_STAMP)
 
 # GLFW, for lwjgl/: the release's macOS binaries, its static library and
 # headers, which lwjgl/build.py links a program against.
-GLFW_VERSION := 3.4
+GLFW_VERSION := 3.5.1
 GLFW_DIR     := $(BUILD)/tools/glfw-$(GLFW_VERSION)
 GLFW_STAMP   := $(GLFW_DIR)/.complete
 

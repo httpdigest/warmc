@@ -486,7 +486,7 @@ cleared to blue. `lwjgl/build.py` compiles the program against LWJGL's jars
 (`make lwjgl` fetches them from Maven Central), has TeaVM make a module of it,
 LWJGL's classes and `lwjgl/platform`, the TeaVM adapter a WASI command of
 that, and warmc a native executable, linked with GLFW (`make glfw` fetches the
-3.4 release's static library), the system's libffi and the frameworks GLFW
+3.5.1 release's static library), the system's libffi and the frameworks GLFW
 and OpenGL need. `--c FILE.c` compiles and links C of the program's own.
 
 LWJGL's classes are its jars' own but for the few that `lwjgl/platform`
@@ -546,7 +546,7 @@ What differs from LWJGL on the JVM:
   (OpenGL 4.2 and later) is a link error, not a capability it checks for.
 - With `Configuration.DEBUG_FUNCTIONS` or `DEBUG`, LWJGL reports no OpenGL
   function the framework lacks as missing, as it never looks one up.
-- GLFW is the 3.4 release, which has none of the IME functions LWJGL binds
+- GLFW is the 3.5.1 release, which has none of the IME functions LWJGL binds
   as optional: calling one throws LWJGL's `NullPointerException`, as on the
   JVM with that GLFW.
 - A buffer over C's memory (`memByteBuffer` of an address C owns) is refused
