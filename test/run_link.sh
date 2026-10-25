@@ -230,6 +230,55 @@ done
 
 [ "$fail" = 0 ] && echo "link: a collection across the module boundary, 2 configurations"
 
+# A cast is decided inline from the object's type slot only in a module no
+# other module's object can reach.  Each of m1 to m11 lets references cross
+# its boundary one way, and casts a box of another module's that comes in
+# that way, which a module taken for sealed would trap on; m0 lets nothing
+# cross, and its casts ask the runtime nothing (test/gen_link_seal.py).
+python3 test/gen_link_seal.py "$WORK" || exit 1
+sealobjs=()
+for m in m0 P m1 m2 m3 m4 m5 m6 m7 m8 m9 m10 m11 R; do
+  "$WT" parse "$WORK/seal_$m.wat" -o "$WORK/seal_$m.wasm" \
+    || { echo "FAIL[link]: assembling seal_$m.wat"; exit 1; }
+  wtimeout ./$BUILD/warmc ${WARMC_FLAGS:--O2} $WARMC_TARGET_FLAGS --symbol-prefix=s$m --stats \
+      -c -o "$WORK/s$m.o" "$WORK/seal_$m.wasm" 2>"$WORK/s$m.err" \
+    || { echo "FAIL[link]: compiling seal_$m.wat"; exit 1; }
+  [ "$m" = m0 ] || sealobjs+=("$WORK/s$m.o")
+done
+case "${WARMC_FLAGS:-}" in
+  *-fno-sealed*) ;;
+  *) if ! grep -q '\bslot_tests=[1-9]' "$WORK/sm0.err" || ! grep -q '\bslot_tests=0\b' "$WORK/sm1.err"; then
+       echo "FAIL[link/seal]: m0, which lets no reference cross, has no cast decided from its slot, or m1 has"
+       fail=1
+     fi ;;
+esac
+wtimeout ./$BUILD/warmc ${WARMC_FLAGS:--O2} $WARMC_TARGET_FLAGS --symbol-prefix=sm0 --stats -fno-sealed \
+    -c -o "$WORK/sm0n.o" "$WORK/seal_m0.wasm" 2>"$WORK/sm0n.err" \
+  || { echo "FAIL[link]: compiling seal_m0.wat -fno-sealed"; exit 1; }
+grep -q '\bslot_tests=0\b' "$WORK/sm0n.err" \
+  || { echo "FAIL[link/seal]: -fno-sealed leaves a cast decided from its slot"; fail=1; }
+link_prog sealprog test/link/sealdriver.c "${sealobjs[@]}" || exit 1
+sealwant='import_result=101
+import_argument=102
+import_global=103
+import_table=104
+import_tag=105
+export_argument=106
+export_result=107
+export_global_mut=108
+export_global=109
+export_table=110
+arm=ok
+export_tag=111'
+got=$(wruntimeout $WARMC_RUN "$LINKED" 2>&1)
+if [ "$got" = "$sealwant" ]; then
+  echo "link: another module's object cast where it came in, each of 11 ways"
+else
+  echo "FAIL[link/seal]: output differs"
+  diff <(echo "$sealwant") <(echo "$got") | head -14
+  fail=1
+fi
+
 # A reference the host makes is no object and no i31 to the module, whatever
 # it points at, and comes back as it went; a struct the module made comes
 # back a struct (101: eq and struct).

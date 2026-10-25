@@ -151,7 +151,7 @@ for p in mem strength cse loopclose dce; do
   start "cases-no-$p" env WARMC_FLAGS="-O2 -fno-$p" ./test/run_tests.sh
 done
 
-for p in mem cse licm dce fold bce escape partial-escape reinline throw-jump loopclose barelide; do
+for p in mem cse licm dce fold bce escape partial-escape reinline throw-jump loopclose barelide sealed; do
   start "gc-no-$p" env WARMC_FLAGS="-O2 -fno-$p" ./test/run_gc.sh
 done
 
