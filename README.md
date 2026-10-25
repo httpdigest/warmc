@@ -528,6 +528,14 @@ changes them as TeaVM reads them:
   the callback returns, as JNI throws it.
 - A library is the program itself: LWJGL's `SharedLibrary` finds a function
   with `dlsym` among the program's symbols, all of GLFW's among them.
+- `GLCapabilities` looks up only the OpenGL functions macOS's framework
+  exports, as the SDK's stub of it lists them, which are all `dlsym` can
+  find there. The transformer folds a check of a version or extension the
+  framework has none of to `false` (OpenGL 4.2 and later, most extensions:
+  1037 of LWJGL's 2267 functions), and with it the check's arrays of names,
+  its flags and, when nothing else is left of it, the check itself, which
+  takes 0.7 MB off a program. The capabilities are the same, field for field;
+  `--every-gl-function` looks each function up as LWJGL does.
 - Of what TeaVM lacks, `MethodHandles.lookup()`, which a callback's
   descriptor keeps only for LWJGL's FFM backend, is null; `System::load` is
   not called; and `Runtime.addShutdownHook`'s hooks run when `main` returns.
@@ -536,6 +544,8 @@ What differs from LWJGL on the JVM:
 
 - An OpenGL function the program can reach that macOS's framework lacks
   (OpenGL 4.2 and later) is a link error, not a capability it checks for.
+- With `Configuration.DEBUG_FUNCTIONS` or `DEBUG`, LWJGL reports no OpenGL
+  function the framework lacks as missing, as it never looks one up.
 - GLFW is the 3.4 release, which has none of the IME functions LWJGL binds
   as optional: calling one throws LWJGL's `NullPointerException`, as on the
   JVM with that GLFW.
@@ -1568,8 +1578,11 @@ Most of the suite is **differential**. warmc's output is compared with:
   in the program's and in C's, printing what the JVM does; calls through
   `JNI` of C of the program's own, with results narrower than a register,
   arrays of each type, 23 arguments, floating point and callbacks, an
-  exception one throws coming out of the call that ran it; and a program
-  that makes a window, reports a GLFW error through the error callback, has
+  exception one throws coming out of the call that ran it; `GLCapabilities`
+  field for field the same, for a legacy and a 4.1 core context, whether it
+  looks up only what macOS's framework exports or everything, and checks of
+  each shape folded or left as they must be; and a program that makes a
+  window, reports a GLFW error through the error callback, has
   a callback's exception come out of the GLFW call that ran it, and reads
   back pixels cleared to blue, its module calling each GLFW and OpenGL
   function by an import of its own
