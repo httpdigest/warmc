@@ -1,0 +1,40 @@
+page 16384, cache line 128, pointer 8, C long 8
+mine: -2 true -12345 12345678 102030405060708 -1.5 3.141592653589793 1122334455667788 -3 cafebabe -81985529216486895
+mine: fe01c7cf7856341208070605040302010000c0bf00000000182d4454fb2109408877665544332211fdffffffffffffff00bebafeca1132547698badcfe
+C's: -2 true -12345 12345678 102030405060708 -1.5 3.141592653589793 1122334455667788 -3 cafebabe -81985529216486895
+C's: fe01c7cf7856341208070605040302010000c0bf00000000182d4454fb2109408877665544332211fdffffffffffffff00bebafeca1132547698badcfe
+copied to C's: 5a5a5a5a5a5a5a5a 5a5a5a5a5a5a5a5a00
+copied from C's: 5ac3c3c3c3c3c3c3c35a5a5a
+mine: [-9, 127, 0][0, 1, -2][a, é, ✓][-20, 30, 1515870915][1099511627776, -5, 7][0.5, -1.25, 3.0E9][2.718281828459045, -0.0, 1.0E300] ecffffff1e000000c35a5a5a
+mine: past the array's end refused, 0000000000000000
+C's: [-9, 127, 0][0, 1, -2][a, é, ✓][-20, 30, -1010580541][1099511627776, -5, 7][0.5, -1.25, 3.0E9][2.718281828459045, -0.0, 1.0E300] ecffffff1e000000c3c3c3c3
+C's: past the array's end refused, 0000000000000000
+mine: ascii asc 5
+mine: héllo ✓ 𝄞 héllo 15 68c3a96c6c6f20e29c9320f09d849e00
+mine: héllo ✓ 𝄞 hé 10
+mine: 15 hé
+mine: héllo ✓ 𝄞 16 15 0
+mine: a long string refused
+C's: ascii asc 5
+C's: héllo ✓ 𝄞 héllo 15 68c3a96c6c6f20e29c9320f09d849e00
+C's: héllo ✓ 𝄞 hé 10
+C's: 15 hé
+C's: héllo ✓ 𝄞 16 15 0
+C's: a long string refused
+a long from bytes: 908070605040302
+a null string: null null
+calloc: true 100 true
+realloc: 1000 1234 2 12
+realloc of NULL: true
+aligned: true100 true101 true102 true103 0 1 2 3
+many aligned blocks: true
+buffers: true 16909060 16909060 1020304 3 20 24
+a duplicate's order: LITTLE_ENDIAN
+big-endian slices: BIG_ENDIAN BIG_ENDIAN
+slices: 6 8 LITTLE_ENDIAN 60 BIG_ENDIAN 4 4
+a slice past the end refused
+array copies: [5, 6, 7] 6
+element sizes: 2 2 4 4 8 8 22488 42
+pointers: 42 -1 -1
+stack: 3 0 5 4 abc 3 true true true
+popped: true

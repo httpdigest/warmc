@@ -1,7 +1,9 @@
 // A blue OpenGL window through LWJGL's API (lwjgl/), checked rather than
 // looked at: what GLFW and OpenGL answer, an error GLFW reports through the
 // error callback, an exception a callback throws coming out of the GLFW call
-// that ran it, and the pixels a few frames cleared to blue read back.
+// that ran it, an optional function GLFW lacks, the addresses LWJGL's
+// capabilities hold and a call through one, and the pixels a few frames
+// cleared to blue read back.
 import static org.lwjgl.glfw.Callbacks.glfwFreeCallbacks;
 import static org.lwjgl.glfw.GLFW.*;
 import static org.lwjgl.opengl.GL11.*;
@@ -10,10 +12,12 @@ import static org.lwjgl.system.MemoryUtil.NULL;
 
 import java.nio.ByteBuffer;
 import java.nio.IntBuffer;
+import java.util.Arrays;
 import org.lwjgl.glfw.GLFWErrorCallback;
 import org.lwjgl.glfw.GLFWVidMode;
 import org.lwjgl.opengl.GL;
 import org.lwjgl.opengl.GLCapabilities;
+import org.lwjgl.system.JNI;
 import org.lwjgl.system.MemoryStack;
 
 public class Main {
@@ -59,6 +63,13 @@ public class Main {
         }
         int[] keys = new int[1];
         glfwSetKeyCallback(window, (w, key, scancode, action, mods) -> keys[0]++);
+        // an optional function, which GLFW 3.4 has not: LWJGL checks its address
+        try {
+            glfwResetPreeditText(window);
+            System.out.println("an optional function: called");
+        } catch (NullPointerException e) {
+            System.out.println("an optional function: not there");
+        }
 
         try (MemoryStack stack = stackPush()) {
             IntBuffer w = stack.mallocInt(1);
@@ -77,6 +88,14 @@ public class Main {
         System.out.println("OpenGL 1.1: " + caps.OpenGL11 + ", 2.1: " + caps.OpenGL21);
         System.out.println("renderer: " + (glGetString(GL_RENDERER) != null) + ", vendor: "
                 + (glGetString(GL_VENDOR) != null));
+        // what a program calls through: the functions dlsym finds
+        String[] names = {"glClear", "glViewport", "glGetIntegerv", "glReadPixels"};
+        long[] addresses = {caps.glClear, caps.glViewport, caps.glGetIntegerv, caps.glReadPixels};
+        boolean found = true;
+        for (int i = 0; i < names.length; i++) {
+            found &= addresses[i] != NULL && addresses[i] == GL.getFunctionProvider().getFunctionAddress(names[i]);
+        }
+        System.out.println("the capabilities' addresses are the functions': " + found);
 
         int[] fb = new int[1], fbh = new int[1];
         glfwGetFramebufferSize(window, fb, fbh);
@@ -84,6 +103,9 @@ public class Main {
         int[] viewport = new int[4];
         glGetIntegerv(GL_VIEWPORT, viewport);
         System.out.println("viewport matches the framebuffer: " + (viewport[2] == fb[0] && viewport[3] == fbh[0]));
+        int[] again = new int[4];
+        JNI.callPV(GL_VIEWPORT, again, caps.glGetIntegerv);
+        System.out.println("and through its address: " + Arrays.equals(viewport, again));
 
         glClearColor(0.0f, 0.0f, 1.0f, 1.0f);
         int frames = 0;
