@@ -107,9 +107,15 @@ static inline HeapType rd_heaptype(Rd *r) {
     warmc_malformed("malformed heap type 0x%02x at offset 0x%zx", b,
                     (size_t)(save - r->start));
 
-  if ((uint64_t)x > VT_HEAP_MAX)
-    warmc_malformed("type index %lld is beyond the %u a value type can name",
-                    (long long)x, VT_HEAP_MAX);
+  /* a non-negative s33 is a type index, however large, and well-formed; one
+     past what a value type can name is past every type a module may have
+     here too (parse_types refuses more), so it is unknown: invalid, and a
+     decoder holding that goes on with an abstract type in its place */
+  if ((uint64_t)x > VT_HEAP_MAX) {
+    warmc_invalid_held("unknown type %lld: a value type names at most %u",
+                       (long long)x, VT_HEAP_MAX);
+    return HT_NONE;
+  }
   return (HeapType)x;
 }
 

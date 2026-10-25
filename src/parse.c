@@ -113,22 +113,20 @@ static uint32_t rd_count(Rd *r) {
 
 static uint32_t g_type_limit;
 
-static void check_heap_indices(ValType t) {
-  if (vt_is_ref(t) && vt_concrete(t) && vt_type_index(t) >= g_type_limit)
-    warmc_invalid("unknown type %u", vt_type_index(t));
-}
-
-static ValType rd_valtype_checked(Rd *r) {
-  ValType t = rd_valtype(r);
-  check_heap_indices(t);
+/* t, or an abstract stand-in where it names a type the module does not
+   have yet: that is held invalid, and the stand-in leads nothing decoded
+   after it to a type that is not there */
+static ValType check_heap_indices(ValType t) {
+  if (vt_is_ref(t) && vt_concrete(t) && vt_type_index(t) >= g_type_limit) {
+    warmc_invalid_held("unknown type %u", vt_type_index(t));
+    return vt_ref(vt_nullable(t), HT_NONE);
+  }
   return t;
 }
 
-static ValType rd_reftype_checked(Rd *r) {
-  ValType t = rd_reftype(r);
-  check_heap_indices(t);
-  return t;
-}
+static ValType rd_valtype_checked(Rd *r) { return check_heap_indices(rd_valtype(r)); }
+
+static ValType rd_reftype_checked(Rd *r) { return check_heap_indices(rd_reftype(r)); }
 
 static bool rd_mutability(Rd *r) {
   uint8_t b = rd_u8(r);
@@ -142,8 +140,8 @@ static void rd_limits(Rd *r, uint64_t *min, uint64_t *max, bool *has_max,
   if (flags != 0 && flags != 1 && flags != 3 && flags != 4 && flags != 5)
     warmc_malformed("unsupported limits flags 0x%02x", flags);
   if (flags & 2)
-    warmc_invalid("a shared memory or table needs atomic operations, which "
-                  "this compiler does not implement");
+    warmc_invalid_held("a shared memory or table needs atomic operations, "
+                       "which this compiler does not implement");
   *index64 = (flags & 4) != 0;
   *min = rd_u64(r);
   *has_max = (flags & 1) != 0;
@@ -158,12 +156,50 @@ static void init_push(InitExpr *e, uint8_t op, uint64_t lo, uint64_t hi) {
   e->n++;
 }
 
+/* An instruction an expression may hold and a constant one may not: held
+   invalid and decoded past -- its immediates, and the blocks it opens
+   followed (open, nopen; 1 for an if before its else) so that their ends do
+   not end the expression. */
+static void rd_init_other(Rd *r, InitExpr *e, uint8_t **open, uint32_t *nopen,
+                          uint32_t *cap) {
+  uint32_t op = wasm_read_op(r);
+  if (!wasm_op_info(op)) {
+    xfree(e->ins); xfree(*open);
+    if (op > 0xff)
+      warmc_malformed("illegal opcode 0x%02x %u in a constant expression",
+                      op >> 16, op & 0xffff);
+    warmc_malformed("illegal opcode 0x%02x in a constant expression", op);
+  }
+  if (op == 0x05) {
+    if (!*nopen || !(*open)[*nopen - 1]) {
+      xfree(e->ins); xfree(*open);
+      warmc_malformed("else outside an if in a constant expression");
+    }
+    (*open)[*nopen - 1] = 0;
+  } else if (op == 0x02 || op == 0x03 || op == 0x04 || op == 0x1f) {
+    if (*nopen == *cap) {
+      *cap = *cap ? *cap * 2 : 8;
+      *open = xrealloc(*open, *cap);
+    }
+    (*open)[(*nopen)++] = op == 0x04;
+  }
+  warmc_invalid_held("constant expression required: %s", wasm_op_name(op));
+  wasm_skip_imm(r, op);
+}
+
 static InitExpr rd_init(Rd *r) {
   InitExpr e;
   memset(&e, 0, sizeof e);
+  uint8_t *open = NULL;
+  uint32_t nopen = 0, cap = 0;
   for (;;) {
+    const uint8_t *at = r->p;
     uint8_t op = rd_u8(r);
-    if (op == 0x0b) break;
+    if (op == 0x0b) {
+      if (!nopen) break;
+      nopen--;
+      continue;
+    }
     switch (op) {
       case 0x41: init_push(&e, IOP_I32_CONST, (uint64_t)(uint32_t)rd_i32(r), 0); break;
       case 0x42: init_push(&e, IOP_I64_CONST, (uint64_t)rd_i64(r), 0); break;
@@ -195,15 +231,7 @@ static InitExpr rd_init(Rd *r) {
           case 26: init_push(&e, IOP_REF_CONVERT, 0, 0); break;
           case 27: init_push(&e, IOP_REF_CONVERT, 1, 0); break;
           case 28: init_push(&e, IOP_REF_I31, 0, 0); break;
-          default: {
-            uint32_t full = OP_PREFIXED(0xfb, sub > 0xffffu ? OP_SUB_UNKNOWN : sub);
-            if (wasm_op_info(full)) {
-              xfree(e.ins);
-              warmc_invalid("constant expression required: %s", wasm_op_name(full));
-            }
-            xfree(e.ins);
-            warmc_malformed("illegal opcode 0xfb %u in a constant expression", sub);
-          }
+          default: r->p = at; rd_init_other(r, &e, &open, &nopen, &cap);
         }
         break;
       }
@@ -211,26 +239,19 @@ static InitExpr rd_init(Rd *r) {
       case 0xfd: {
         uint32_t sub = rd_u32(r);
         if (sub != 12) {
-
-          uint32_t full = OP_PREFIXED(0xfd, sub > 0xffffu ? OP_SUB_UNKNOWN : sub);
-          if (wasm_op_info(full)) {
-            xfree(e.ins);
-            warmc_invalid("constant expression required: %s", wasm_op_name(full));
-          }
-          xfree(e.ins);
-          warmc_malformed("illegal opcode 0xfd %u in a constant expression", sub);
+          r->p = at;
+          rd_init_other(r, &e, &open, &nopen, &cap);
+          break;
         }
         uint64_t lo = rd_u64le(r), hi = rd_u64le(r);
         init_push(&e, IOP_V128_CONST, lo, hi);
         break;
       }
 
-      default:
-        xfree(e.ins);
-        if (wasm_op_info(op)) warmc_invalid("constant expression required: %s", wasm_op_name(op));
-        warmc_malformed("illegal opcode 0x%02x in a constant expression", op);
+      default: r->p = at; rd_init_other(r, &e, &open, &nopen, &cap);
     }
   }
+  xfree(open);
   return e;
 }
 
@@ -339,9 +360,10 @@ static void check_type_ids(Module *m) {
     uint32_t a = ord[i - 1], b = ord[i];
     if (m->types[a].id != m->types[b].id) continue;
     if (id_types_alike(m, &m->types[a], &m->types[b])) continue;
-    xfree(ord);
-    warmc_invalid("types %u and %u are different and have the same identity, "
-                  "which this compiler derives by hashing their structure", a, b);
+    warmc_invalid_held("types %u and %u are different and have the same "
+                       "identity, which this compiler derives by hashing "
+                       "their structure", a, b);
+    break;
   }
   xfree(ord);
 }
@@ -355,10 +377,15 @@ static void check_type_ids(Module *m) {
 static void build_display(Module *m, uint32_t i) {
   CompType *t = &m->types[i];
   const CompType *s = t->has_super ? &m->types[t->super] : NULL;
+  if (s && s->depth + 1 > MAX_SUBTYPE_DEPTH) {
+    warmc_invalid_held("type %u: subtyping depth %u exceeds the %u limit", i,
+                       s->depth + 1, MAX_SUBTYPE_DEPTH);
+    /* held: the type goes on without its supertype, so that no display
+       grows past the limit */
+    t->has_super = false;
+    s = NULL;
+  }
   t->depth = s ? s->depth + 1 : 0;
-  if (t->depth > MAX_SUBTYPE_DEPTH)
-    warmc_invalid("type %u: subtyping depth %u exceeds the %u limit", i,
-                  t->depth, MAX_SUBTYPE_DEPTH);
   t->display = xcalloc(t->depth + 1, sizeof(uint64_t));
   if (s) memcpy(t->display, s->display, (t->depth) * sizeof(uint64_t));
   t->display[t->depth] = t->id;
@@ -518,11 +545,14 @@ static void parse_subtype(Module *m, Rd *r, uint32_t i) {
   if (b == 0x50 || b == 0x4f) {
     t->final_ = (b == 0x4f);
     uint32_t nsup = rd_count(r);
-    if (nsup > 1) warmc_invalid("type %u: at most one supertype", i);
-    if (nsup == 1) {
+    if (nsup > 1) warmc_invalid_held("type %u: at most one supertype", i);
+    for (uint32_t k = 0; k < nsup; k++) {
       uint32_t s = rd_u32(r);
-
-      if (s >= i) warmc_invalid("type %u: unknown supertype %u", i, s);
+      if (k) continue;
+      if (s >= i) {
+        warmc_invalid_held("type %u: unknown supertype %u", i, s);
+        continue;
+      }
       t->has_super = true;
       t->super = s;
     }
@@ -803,13 +833,18 @@ static void parse_code(Module *m, Rd *r) {
 
     Func *f = &m->funcs[fi];
 
+    /* held, the body is decoded as one of a function of no parameters */
+    CompType none;
+    memset(&none, 0, sizeof none);
+    none.kind = CT_FUNC;
+    CompType *ft = &none;
     if (f->type_index >= m->ntypes)
-      warmc_invalid("unknown type %u in function %u", f->type_index, fi);
-    CompType *ft = &m->types[f->type_index];
-
-    if (ft->kind != CT_FUNC)
-      warmc_invalid("function %u: type %u is not a function type", fi,
-                    f->type_index);
+      warmc_invalid_held("unknown type %u in function %u", f->type_index, fi);
+    else if (m->types[f->type_index].kind != CT_FUNC)
+      warmc_invalid_held("function %u: type %u is not a function type", fi,
+                         f->type_index);
+    else
+      ft = &m->types[f->type_index];
 
     uint32_t ngroups = rd_count(&br);
 
@@ -843,12 +878,71 @@ static void parse_code(Module *m, Rd *r) {
   }
 }
 
+/* the blocks open in a body being decoded, innermost last: 1 for an if
+   before its else */
+static void open_block(uint8_t **open, uint32_t *n, uint32_t *cap, bool is_if) {
+  if (*n == *cap) {
+    *cap = *cap ? *cap * 2 : 16;
+    *open = xrealloc(*open, *cap);
+  }
+  (*open)[(*n)++] = is_if;
+}
+
+void wasm_decode_bodies(const Module *m) {
+  DiagHold h;
+  warmc_hold_open(&h);
+  uint8_t *open = NULL;
+  uint32_t cap = 0;
+  for (uint32_t fi = m->nimported_funcs; fi < m->nfuncs; fi++) {
+    const Func *f = &m->funcs[fi];
+    if (!f->body) continue;
+    Rd r = rd_make(f->body, f->body_end, m->bin);
+    uint32_t n = 0;
+    open_block(&open, &n, &cap, false);
+    while (n) {
+      if (rd_eof(&r))
+        warmc_malformed("function %u: unexpected end of function body: missing "
+                        "end opcode (at offset 0x%zx)", fi, rd_pos(&r));
+      uint32_t op = wasm_read_op(&r);
+      if (!wasm_op_info(op)) {
+        if (op > 0xff)
+          warmc_malformed("function %u: illegal opcode 0x%02x 0x%02x", fi,
+                          op >> 16, op & 0xffff);
+        warmc_malformed("function %u: illegal opcode 0x%02x", fi, op);
+      }
+      switch (op) {
+        case 0x02: case 0x03: case 0x04: case 0x1f:
+          open_block(&open, &n, &cap, op == 0x04);
+          break;
+        case 0x05:
+          if (!open[n - 1])
+            warmc_malformed("function %u: else outside an if", fi);
+          open[n - 1] = 0;
+          break;
+        case 0x0b: n--; break;
+        case OP_PREFIXED(0xfc, 8): case OP_PREFIXED(0xfc, 9):
+        case OP_PREFIXED(0xfb, 9): case OP_PREFIXED(0xfb, 18):
+          if (!m->has_datacount) warmc_malformed("data count section required");
+          break;
+      }
+      wasm_skip_imm(&r, op);
+    }
+    if (!rd_eof(&r))
+      warmc_malformed("function %u: %zd bytes after the end of the function body",
+                      fi, r.end - r.p);
+  }
+  xfree(open);
+  xfree(warmc_hold_close(&h));
+}
+
 Module *wasm_parse(const uint8_t *bin, size_t len) {
   Module *m = xcalloc(1, sizeof(Module));
   m->bin = bin;
   m->bin_len = len;
 
   g_type_limit = 0;
+  DiagHold held;
+  warmc_hold_open(&held);
 
   Rd r = { bin, bin + len, bin };
   if (len < 8) warmc_malformed("file too short to be a wasm module");
@@ -902,17 +996,27 @@ Module *wasm_parse(const uint8_t *bin, size_t len) {
   }
 
   for (uint32_t i = 0; i < m->nfuncs; i++) {
+    if (!m->funcs[i].imported && !m->funcs[i].body)
+      warmc_malformed("function and code section have inconsistent lengths");
+  }
+  if (m->has_datacount && m->datacount != m->ndatas)
+    warmc_malformed("data count and data section have inconsistent lengths");
+  for (uint32_t i = 0; i < m->nfuncs; i++) {
     if (m->funcs[i].type_index >= m->ntypes)
-      warmc_invalid("unknown type %u in function %u", m->funcs[i].type_index, i);
+      warmc_invalid_held("unknown type %u in function %u", m->funcs[i].type_index, i);
     char name[64];
     snprintf(name, sizeof name, "wasm_func_%u", i);
     m->funcs[i].sym = xstrndup(name, strlen(name));
   }
-  read_func_names(m);
-  for (uint32_t i = 0; i < m->nfuncs; i++) {
-    if (!m->funcs[i].imported && !m->funcs[i].body)
-      warmc_malformed("function and code section have inconsistent lengths");
+
+  /* a verdict of invalid is given once the module is known to decode, the
+     bodies too, which the validator would decode only as it goes */
+  char *invalid = warmc_hold_close(&held);
+  if (invalid) {
+    wasm_decode_bodies(m);
+    warmc_invalid("%s", invalid);
   }
+  read_func_names(m);
   return m;
 }
 

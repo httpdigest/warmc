@@ -39,8 +39,8 @@ most of what this file does that a straight loop would not:
   * Every file's modules go into *one* executable per level, which is then
     invoked once per file.  The validation is paid once; the remaining
     invocations cost milliseconds.  Each file still gets its own process, so a
-    module that faults ends its own run and the other two hundred and
-    fifty-six still report, and its memory is returned in between.
+    module that faults ends its own run and every other file still reports,
+    and its memory is returned in between.
   * `--validate-only` does not take an optimisation level -- it parses and
     type-checks and stops.  Running the corpus at two levels therefore has
     exactly one validation half, not two, and the second was pure repetition.
@@ -100,15 +100,16 @@ DARWIN = platform.system() == "Darwin"
 
 WABT_FLAGS = hostbuild.wabt_flags()
 
-def _pinned_wasm_tools():
-    """The version the Makefile pins, so the two cannot drift apart."""
+def _pinned(name):
+    """A version the Makefile pins, so the two cannot drift apart."""
     with open(os.path.join(ROOT, "Makefile")) as f:
         for line in f:
-            if line.startswith("WASM_TOOLS_VERSION"):
+            if line.startswith(name):
                 return line.split(":=", 1)[1].strip()
-    raise SystemExit("spec: no WASM_TOOLS_VERSION in the Makefile")
+    raise SystemExit("spec: no %s in the Makefile" % name)
 
-WASM_TOOLS_VERSION = _pinned_wasm_tools()
+WASM_TOOLS_VERSION = _pinned("WASM_TOOLS_VERSION")
+TESTSUITE_COMMIT = _pinned("TESTSUITE_COMMIT")
 WASM_TOOLS = os.path.join(BUILD, "tools", "bin",
                           "wasm-tools.exe" if os.name == "nt" else "wasm-tools")
 
@@ -423,8 +424,8 @@ def _bisect_link(level, group, scratch):
 def execute_file(prog, wast_name):
     """Run one file out of the shared executable.
 
-    Its own process, so a module that faults ends its own run and the other
-    two hundred and fifty-six still report.  The image was validated by the
+    Its own process, so a module that faults ends its own run and every other
+    file still reports.  The image was validated by the
     first of these invocations, so the rest cost a few milliseconds.
     """
     r = sh([prog, wast_name], timeout=RUN_TIMEOUT)
@@ -486,6 +487,13 @@ def main():
 
     if not os.path.isdir(SUITE):
         print("spec: testsuite not found at %s (run `make testsuite`)" % SUITE)
+        return 2
+    # the checkout `make testsuite` leaves names its commit in a stamp; one of
+    # an older pin would be compared with counts recorded from this one
+    if "WASM_TESTSUITE" not in os.environ and not os.path.exists(
+            os.path.join(SUITE, ".commit-" + TESTSUITE_COMMIT)):
+        print("spec: the testsuite at %s is not the pinned %s (run `make testsuite`)"
+              % (SUITE, TESTSUITE_COMMIT[:7]))
         return 2
     if not os.path.exists(WASM_TOOLS):
         print("spec: %s not found (run `make wasm-tools`)" % WASM_TOOLS)

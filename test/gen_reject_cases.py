@@ -81,9 +81,15 @@ VT_HEAP_MAX = (1 << 22) - 1
 case("type_space_past_valtype_width", "malformed", "too many types",
      module([section(1, leb(1) + b"\x4e" + leb(VT_HEAP_MAX + 2) +
                      b"\x00" * (VT_HEAP_MAX + 2))]))
-case("heaptype_past_valtype_width", "malformed", "beyond the",
+# A heap type's index past what a value type names is well-formed -- any
+# non-negative s33 is an index -- and past every type a module may have, so
+# unknown: invalid, as binary.wast's (ref null 0x8000_0000) has it.
+case("heaptype_past_valtype_width", "invalid", "unknown type",
      module([section(1, vec([b"\x60\x01" + bytes([0x63]) +
                              sleb(VT_HEAP_MAX + 1) + b"\x00"]))]))
+case("heaptype_far_past_valtype_width", "invalid", "unknown type",
+     module([section(1, vec([b"\x60\x01" + bytes([0x63]) +
+                             sleb(0xffffffff) + b"\x00"]))]))
 # One type with a million parameters is bounded only by the size of the type
 # section, and every function naming that type pays for it again: parse_code
 # allocates nparams + nlocals entries whatever the local caps say, so N
@@ -213,7 +219,7 @@ _btif = (b"\x41\x01" +
          b"\x02" + bytes([I32]) + b"\x41\x01" + END +
          b"\x05" +
          b"\x42\x02" + END +
-         b"\x1a" + b"\x41\x00" + END)
+         b"\x1a" + b"\x41\x00")
 case("nested_blocktype_if", "invalid", "type mismatch",
      module([section(1, vec([b"\x60\x00\x01" + bytes([I32])])),
              section(3, vec([leb(0)])),
@@ -1374,6 +1380,185 @@ for _n, _s, _frag in [("empty", "(func (@name))", "a @name annotation holds one 
 case("text_name_annotations_elsewhere", "accept", "",
      '(module (@name "m") (memory (@name 1) 1) (func $f (@name "f") (param $p (@name "p") i32)'
      ' (local (@name "l") i32)) (func (export "g") (@name "not after func")))')
+
+# Decoding comes before validation: the spec decodes the whole module, the
+# bodies too, before it validates any of it, so a module invalid in one place
+# and malformed in a later one is malformed.  The decoder found some verdicts
+# of invalid as it went and raised them there, and the validator decoded each
+# body only as it validated it, so each of these was called invalid.  Every
+# place a verdict of invalid is held has a case followed by a part that does
+# not decode -- a section of an id there is none of -- and the shapes whose
+# class was wrong outright have cases of their own.
+BAD_SEC = bytes([0x7F]) + leb(0)
+ILLEGAL = b"\xc5"
+def _then_bad(name_, frag, sections):
+    case(name_, "invalid", frag, module(sections))
+    case(name_ + "_then_malformed", "malformed", "malformed section id",
+         module(sections + [BAD_SEC]))
+_then_bad("unknown_heap_type", "unknown type",
+          [section(1, vec([b"\x60\x01" + bytes([REF_NULL]) + sleb(5) + b"\x00"]))])
+_then_bad("heaptype_past_valtype_width_held", "unknown type",
+          [section(1, vec([b"\x60\x01" + bytes([REF_NULL]) + sleb(VT_HEAP_MAX + 1) + b"\x00"]))])
+_then_bad("shared_memory_held", "shared memory",
+          [section(5, vec([b"\x03" + leb(1) + leb(1)]))])
+_then_bad("global_init_nop", "constant expression required: nop",
+          [section(6, vec([bytes([I32, 0]) + b"\x01\x41\x00" + END]))])
+_then_bad("sub_two_supers_held", "supertype",
+          [section(1, vec([_sub(None, T_VOID), _sub(None, T_VOID),
+                           bytes([SUB]) + vec([leb(0), leb(1)]) + T_VOID]))])
+_then_bad("sub_forward_held", "supertype",
+          [section(1, vec([_sub(1, T_VOID), _sub(None, T_VOID)]))])
+_then_bad("subtype_depth_held", "subtyping depth", [section(1, vec(_chain))])
+_then_bad("import_unknown_func_type", "unknown type",
+          [section(1, vec([T_VOID])),
+           section(2, vec([name("m") + name("f") + b"\x00" + leb(5)]))])
+_then_bad("export_duplicate_held", "duplicate export",
+          [section(1, vec([T_VOID])), section(3, vec([leb(0)])),
+           section(7, vec([name("e") + b"\x00" + leb(0)] * 2)),
+           section(10, vec([fn(b"")]))])
+
+# of two held, the first found is the one given
+case("held_first_given", "invalid", "unknown type 5",
+     module([section(1, vec([b"\x60\x01" + bytes([REF_NULL]) + sleb(5) + b"\x00"])),
+             section(5, vec([b"\x03" + leb(1) + leb(1)]))]))
+
+# A constant expression is an expression: a non-constant instruction in one
+# is decoded with its immediates, and the blocks it opens end before the
+# expression does -- a second global after each shows its own start found.
+def _two_globals(t, init):
+    return module([section(1, vec([T_VOID])),
+                   section(6, vec([bytes([t, 0]) + init + END,
+                                   bytes([I32, 0]) + b"\x41\x00" + END]))])
+case("global_init_block_ends_inside", "invalid", "constant expression required: block",
+     _two_globals(I32, b"\x02" + bytes([I32]) + b"\x41\x00" + END))
+case("global_init_if_else_ends_inside", "invalid", "constant expression required: if",
+     _two_globals(I32, b"\x41\x01\x04" + bytes([I32]) + b"\x41\x02\x05\x41\x03" + END))
+case("global_init_loop_in_block", "invalid", "constant expression required",
+     _two_globals(I32, b"\x02" + bytes([I32]) + b"\x03\x40" + END + b"\x41\x00" + END))
+case("global_init_immediate_ends_nothing", "invalid", "constant expression required: local.get",
+     _two_globals(I32, b"\x20" + leb(11)))
+case("global_init_else_outside_if", "malformed", "else outside an if",
+     _two_globals(I32, b"\x41\x00\x05"))
+case("global_init_else_in_block", "malformed", "else outside an if",
+     _two_globals(I32, b"\x02" + bytes([I32]) + b"\x41\x00\x05" + END))
+case("global_init_else_twice", "malformed", "else outside an if",
+     _two_globals(I32, b"\x41\x01\x04" + bytes([I32]) + b"\x41\x02\x05\x41\x03\x05\x41\x04" + END))
+case("global_init_block_unended", "malformed", "unexpected end",
+     module([section(6, vec([bytes([I32, 0]) + b"\x02\x40" + END]))]))
+# an instruction of the 0xfc prefix was taken for an opcode of its own and
+# so for one there is none of
+case("global_init_trunc_sat", "invalid", "constant expression required: i32.trunc_sat_f32_s",
+     _two_globals(I32, b"\x43" + b"\x00" * 4 + b"\xfc" + leb(0)))
+case("global_init_memory_fill", "invalid", "constant expression required: memory.fill",
+     _two_globals(I32, b"\x41\x00" * 3 + b"\xfc" + leb(11) + leb(0) + b"\x41\x00"))
+case("global_init_fc_unknown", "malformed", "illegal opcode 0xfc 127",
+     _two_globals(I32, b"\xfc" + leb(127)))
+case("global_init_fd_not_constant", "invalid", "constant expression required: i8x16.splat",
+     _two_globals(V128, b"\x41\x00\xfd" + leb(15)))
+case("global_init_fb_not_constant", "invalid", "constant expression required: ref.test",
+     _two_globals(I32, b"\xd0" + sleb(-0x12) + b"\xfb" + leb(20) + sleb(-0x12)))
+case("global_init_fe_unknown", "malformed", "illegal opcode 0xfe",
+     _two_globals(I32, b"\xfe" + leb(0)))
+
+# The code section: a function of a type that is not there, or not one of a
+# function, is held, and its body is still decoded.
+case("code_unknown_type_illegal_body", "malformed", "illegal opcode",
+     module([section(1, vec([T_VOID])), section(3, vec([leb(5)])),
+             section(10, vec([fn(ILLEGAL)]))]))
+case("code_struct_type_illegal_body", "malformed", "illegal opcode",
+     module([section(1, vec([structty([(I32, True)])])), section(3, vec([leb(0)])),
+             section(10, vec([fn(ILLEGAL)]))]))
+case("code_unknown_type", "invalid", "unknown type 5",
+     module([section(1, vec([T_VOID])), section(3, vec([leb(5)])),
+             section(10, vec([fn(b"")]))]))
+# function and code sections of different lengths are malformed, the type of
+# the function without a body unknown or not
+case("func_unknown_type_without_code", "malformed", "inconsistent lengths",
+     module([section(1, vec([T_VOID])), section(3, vec([leb(5)]))]))
+case("datacount_mismatch_after_invalid", "malformed", "data count and data section",
+     module([section(1, vec([T_VOID])), section(3, vec([leb(0)])),
+             section(7, vec([name("e") + b"\x00" + leb(0)] * 2)),
+             section(12, leb(2)), section(10, vec([fn(b"")])), DATASEC]))
+case("datacount_mismatch_after_held", "malformed", "data count and data section",
+     module([section(5, vec([b"\x03" + leb(1) + leb(1)])),
+             section(12, leb(2)), DATASEC]))
+
+# The validator: what is wrong with one body, or with the module around it,
+# stands once every body decodes.
+def _bodies(*bodies, extra=()):
+    return module([section(1, vec([T_VOID])),
+                   section(3, vec([leb(0)] * len(bodies)))] + list(extra[:1]) +
+                  [section(10, vec(list(bodies)))] + list(extra[1:]))
+I32_ADD = b"\x6a"
+case("body_invalid_then_body_illegal", "malformed", "function 1: illegal opcode",
+     _bodies(fn(I32_ADD), fn(ILLEGAL)))
+case("body_invalid_then_illegal", "malformed", "function 0: illegal opcode",
+     _bodies(fn(I32_ADD + ILLEGAL)))
+case("body_invalid_then_else_in_block", "malformed", "else outside an if",
+     _bodies(fn(I32_ADD + b"\x02\x40\x05" + END)))
+case("body_invalid_then_else_twice", "malformed", "else outside an if",
+     _bodies(fn(I32_ADD), fn(b"\x41\x01\x04\x40\x05\x05" + END)))
+case("body_invalid_then_missing_end", "malformed", "missing end",
+     _bodies(fn(I32_ADD), leb(2) + b"\x00\x01"))
+case("body_invalid_then_memarg_flags", "malformed", "memop flags",
+     _bodies(fn(I32_ADD), fn(b"\x41\x00\x28" + leb(0x80) + leb(0) + b"\x1a"),
+             extra=(section(5, vec([b"\x00" + leb(1)])),)))
+case("body_invalid_then_br_on_cast_flags", "malformed", "br_on_cast flags",
+     _bodies(fn(I32_ADD), fn(b"\x02\x40\xd0" + sleb(-0x12) + b"\xfb" + leb(24) +
+                             b"\x04" + leb(0) + sleb(-0x12) + sleb(-0x12) +
+                             b"\x1a" + END)))
+case("body_invalid_then_catch_clause", "malformed", "unknown catch clause",
+     _bodies(fn(I32_ADD), fn(b"\x1f\x40" + vec([b"\x04" + leb(0)]) + END)))
+case("body_invalid_then_bytes_after_end", "malformed", "after the end of the function body",
+     _bodies(fn(I32_ADD), fn(END + b"\x01")))
+case("body_invalid_then_memory_init_no_datacount", "malformed", "data count section required",
+     _bodies(fn(I32_ADD), fn(b"\x41\x00" * 3 + b"\xfc" + leb(8) + leb(0) + leb(0)),
+             extra=(section(5, vec([b"\x00" + leb(1)])), DATASEC)))
+case("export_duplicate_then_body_illegal", "malformed", "illegal opcode",
+     module([section(1, vec([T_VOID])), section(3, vec([leb(0)])),
+             section(7, vec([name("e") + b"\x00" + leb(0)] * 2)),
+             section(10, vec([fn(ILLEGAL)]))]))
+case("body_invalid_alone", "invalid", "function 1:",
+     _bodies(fn(b""), fn(I32_ADD), fn(b"")))
+# the bodies decoded after a verdict of invalid nest as the validator's do
+case("body_invalid_then_blocks", "invalid", "function 0:",
+     _bodies(fn(I32_ADD), fn(b"\x02\x40\x03\x40\x1f\x40" + vec([]) +
+                             b"\x41\x01\x04\x40\x01\x05\x01" + END * 4)))
+# else belongs to an if alone, once, and nothing follows a body's last end
+case("else_in_block", "malformed", "else outside an if",
+     _bodies(fn(b"\x02\x40\x05" + END)))
+case("else_in_loop", "malformed", "else outside an if",
+     _bodies(fn(b"\x03\x40\x05" + END)))
+case("else_in_try_table", "malformed", "else outside an if",
+     _bodies(fn(b"\x1f\x40" + vec([]) + b"\x05" + END)))
+case("else_twice", "malformed", "else outside an if",
+     _bodies(fn(b"\x41\x01\x04\x40\x05\x05" + END)))
+case("else_at_function_level", "malformed", "else outside an if",
+     _bodies(fn(b"\x05")))
+case("if_else_ok", "accept", "",
+     _bodies(fn(b"\x41\x01\x04\x40\x05" + END)))
+case("bytes_after_body_end", "malformed", "1 bytes after the end of the function body",
+     _bodies(leb(3) + b"\x00" + END + b"\x01"))
+# the data count section is needed by a data index in code, whether or not
+# there are data segments to index
+case("memory_init_no_datacount_no_data", "malformed", "data count section required",
+     _bodies(fn(b"\x41\x00" * 3 + b"\xfc" + leb(8) + leb(0) + leb(0)),
+             extra=(section(5, vec([b"\x00" + leb(1)])),)))
+case("data_drop_no_datacount_no_data", "malformed", "data count section required",
+     _bodies(fn(b"\xfc" + leb(9) + leb(0))))
+case("data_drop_datacount_no_data", "invalid", "unknown data segment",
+     module([section(1, vec([T_VOID])), section(3, vec([leb(0)])),
+             section(12, leb(0)), section(10, vec([fn(b"\xfc" + leb(9) + leb(0))]))]))
+
+# Bodies enough to be validated on the compiler's threads, whose verdicts are
+# caught on each and raised again from the first: one invalid and a later
+# one malformed is malformed; two invalid give the first.
+_pad = b"\x01" * 200
+case("threads_body_invalid_then_illegal", "malformed", "function 30: illegal opcode",
+     _bodies(*[fn(_pad + (I32_ADD if i == 3 else ILLEGAL if i == 30 else b""))
+               for i in range(32)]))
+case("threads_two_invalid", "invalid", "function 3:",
+     _bodies(*[fn(_pad + (I32_ADD if i in (3, 20) else b"")) for i in range(32)]))
 
 def main():
     out = sys.argv[1] if len(sys.argv) > 1 else "."

@@ -26,9 +26,23 @@ static void remove_temp(void) {
   if (g_temp[0]) remove(g_temp);
 }
 
-void warmc_diag_catch(DiagCatch *c) { g_catch = c; }
+static _Thread_local DiagHold *g_hold;
+
+DiagCatch *warmc_diag_catch(DiagCatch *c) {
+  DiagCatch *was = g_catch;
+  g_catch = c;
+  return was;
+}
 
 void warmc_diag_rethrow(const DiagCatch *c) {
+  g_hold = NULL;
+  if (g_catch) {
+    DiagCatch *to = g_catch;
+    to->tag = c->tag;
+    to->code = c->code;
+    to->msg = c->msg;
+    longjmp(to->jb, 1);
+  }
   fprintf(stderr, "warmc: %s: %s\n", c->tag, c->msg);
   remove_temp();
   exit(c->code);
@@ -36,6 +50,7 @@ void warmc_diag_rethrow(const DiagCatch *c) {
 
 __attribute__((noreturn))
 static void diag(const char *tag, int code, const char *fmt, va_list ap) {
+  g_hold = NULL;
   if (g_catch) {
     DiagCatch *c = g_catch;
     va_list aq;
@@ -109,6 +124,33 @@ void warmc_invalid(const char *fmt, ...) {
   va_list ap;
   va_start(ap, fmt);
   diag("invalid", EXIT_INVALID, fmt, ap);
+  va_end(ap);
+}
+
+void warmc_hold_open(DiagHold *h) {
+  h->outer = g_hold;
+  h->msg = NULL;
+  g_hold = h;
+}
+
+char *warmc_hold_close(DiagHold *h) {
+  g_hold = h->outer;
+  return h->msg;
+}
+
+void warmc_invalid_held(const char *fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  if (!g_hold) diag("invalid", EXIT_INVALID, fmt, ap);
+  if (!g_hold->msg) {
+    va_list aq;
+    va_copy(aq, ap);
+    int n = vsnprintf(NULL, 0, fmt, aq);
+    va_end(aq);
+    g_hold->msg = xmalloc(n > 0 ? (size_t)n + 1 : 1);
+    g_hold->msg[0] = 0;
+    if (n > 0) vsnprintf(g_hold->msg, (size_t)n + 1, fmt, ap);
+  }
   va_end(ap);
 }
 

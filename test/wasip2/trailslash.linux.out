@@ -1,0 +1,35 @@
+setup dir: ok
+setup d: ok
+setup f: ok
+setup ld: symlink d /d/t/ld: errno 2
+setup lf: symlink f /d/t/lf: errno 2
+setup lx: symlink x /d/t/lx: errno 2
+mkdir n/: ok
+mkdir n2//: ok
+mkdir d/: mkdir /d/t/d/: file already exists
+mkdir f/: mkdir /d/t/f/: file already exists
+open f/: open /d/t/f/: errno 54
+open d/: ok
+open ld/: open /d/t/ld/: file does not exist
+open lf/: open /d/t/lf/: file does not exist
+create new/: open /d/t/new/: errno 31
+create d/: open /d/t/d/: errno 31
+lstat f/: lstat /d/t/f/: errno 54
+lstat d/: ok
+lstat ld/: lstat /d/t/ld/: file does not exist
+readlink ld/: readlink /d/t/ld/: errno 44
+rename n/ m: ok
+rename m k/: ok
+rename f/ g: rename /d/t/f/ /d/t/g: errno 54
+rename f g/: rename /d/t/f /d/t/g/: errno 54
+rename ld/ le: rename /d/t/ld/ /d/t/le: errno 44
+link f h/: link /d/t/f /d/t/h/: errno 44
+symlink f s/: symlink f /d/t/s/: errno 2
+remove f/: remove /d/t/f/: errno 54
+remove k/: remove /d/t/k/: errno 28
+remove n2//: remove /d/t/n2//: errno 28
+readdir: ok
+  d
+  f
+  k
+  n2
