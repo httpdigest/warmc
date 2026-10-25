@@ -49,7 +49,7 @@ static bool *g_declared;
 
 __attribute__((noreturn))
 static void invalid(V *v, const char *what) {
-  warmc_invalid("function %u: %s (at byte 0x%zx of the body)",
+  warmc_invalid("function %u: %s (at offset 0x%zx)",
                 v->func_index, what, rd_pos(&v->rd));
 }
 
@@ -269,9 +269,10 @@ static void check_lane(V *v, const OpInfo *oi, uint32_t lane) {
   if (lane >= (16u >> oi->align)) invalid(v, "invalid lane index");
 }
 
+/* a data index in code needs the data count section, data segments or
+   none */
 static void require_datacount(const Module *m) {
-  if (!m->has_datacount && m->ndatas > 0)
-    warmc_malformed("data count section required");
+  if (!m->has_datacount) warmc_malformed("data count section required");
 }
 
 static Table *table_at(V *v, uint32_t idx) {
@@ -328,7 +329,9 @@ static void validate_body(V *v) {
 
   bool ended = false;
   while (!rd_eof(&v->rd)) {
-    if (ended) invalid(v, "unexpected instruction after the function body ended");
+    if (ended)
+      warmc_malformed("function %u: %zd bytes after the end of the function body",
+                      v->func_index, v->rd.end - v->rd.p);
     uint32_t op = wasm_read_op(&v->rd);
     const OpInfo *oi = wasm_op_info(op);
 
@@ -356,8 +359,9 @@ static void validate_body(V *v) {
       }
 
       case 0x05: {
+        if (top(v)->op != 0x04)
+          warmc_malformed("function %u: else outside an if", v->func_index);
         Frame f = pop_ctrl(v);
-        if (f.op != 0x04) invalid(v, "else without a matching if");
         push_ctrl(v, 0x05, f.in, f.nin, f.out, f.nout);
         break;
       }
@@ -1005,7 +1009,7 @@ static void validate_body(V *v) {
 
   if (!ended)
     warmc_malformed("function %u: unexpected end of function body: missing end "
-                    "opcode (at byte 0x%zx of the body)",
+                    "opcode (at offset 0x%zx)",
                     v->func_index, rd_pos(&v->rd));
 }
 
@@ -1286,7 +1290,7 @@ static void validate_bodies(Module *m, const uint32_t *fns, uint32_t nb) {
   }
 }
 
-void wasm_validate(Module *m) {
+static void validate_module(Module *m) {
   check_declared_subtyping(m);
 
   for (uint32_t i = 0; i < m->nfuncs; i++) {
@@ -1393,9 +1397,6 @@ void wasm_validate(Module *m) {
     }
   }
 
-  if (m->has_datacount && m->datacount != m->ndatas)
-    warmc_malformed("data count and data section have inconsistent lengths");
-
   collect_declared(m);
 
   /* The bodies are independent of one another and read only what is above
@@ -1407,6 +1408,22 @@ void wasm_validate(Module *m) {
 
   xfree(g_declared);
   g_declared = NULL;
+}
+
+/* The validator decodes a body as it goes, while the spec decodes them all
+   before it validates any: a verdict of invalid stands once every body is
+   known to decode. */
+void wasm_validate(Module *m) {
+  DiagCatch c;
+  DiagCatch *outer = warmc_diag_catch(NULL);
+  if (setjmp(c.jb)) {
+    warmc_diag_catch(outer);
+    if (c.code == EXIT_INVALID) wasm_decode_bodies(m);
+    warmc_diag_rethrow(&c);
+  }
+  warmc_diag_catch(&c);
+  validate_module(m);
+  warmc_diag_catch(outer);
 }
 
 /* Bodies a module transform rewrote, validated as wasm_validate validates

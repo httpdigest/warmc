@@ -154,7 +154,7 @@
  },
  "binary.wast": {
   "fail": 0,
-  "pass": 127,
+  "pass": 129,
   "run": "ok",
   "run_fail": 0,
   "run_pass": 21,
@@ -304,6 +304,15 @@
   "run_pass": 32,
   "text_fail": 0,
   "text_pass": 8
+ },
+ "cast.wast": {
+  "fail": 0,
+  "pass": 1,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 6,
+  "text_fail": 0,
+  "text_pass": 1
  },
  "comments.wast": {
   "fail": 0,
@@ -1027,12 +1036,12 @@
  },
  "memory_grow64.wast": {
   "fail": 0,
-  "pass": 4,
+  "pass": 5,
   "run": "ok",
   "run_fail": 0,
-  "run_pass": 50,
+  "run_pass": 55,
   "text_fail": 0,
-  "text_pass": 4
+  "text_pass": 5
  },
  "memory_init.wast": {
   "fail": 0,
@@ -1291,7 +1300,7 @@
   "pass": 2,
   "run": "ok",
   "run_fail": 0,
-  "run_pass": 20,
+  "run_pass": 21,
   "text_fail": 0,
   "text_pass": 2
  },
@@ -2062,21 +2071,21 @@
  },
  "table_grow.wast": {
   "fail": 0,
-  "pass": 15,
+  "pass": 16,
   "run": "ok",
   "run_fail": 0,
-  "run_pass": 50,
+  "run_pass": 53,
   "text_fail": 0,
-  "text_pass": 15
+  "text_pass": 16
  },
  "table_grow64.wast": {
   "fail": 0,
-  "pass": 1,
+  "pass": 2,
   "run": "ok",
   "run_fail": 0,
-  "run_pass": 23,
+  "run_pass": 28,
   "text_fail": 0,
-  "text_pass": 1
+  "text_pass": 2
  },
  "table_init.wast": {
   "fail": 0,
@@ -2305,10 +2314,10 @@
  },
  "utf8-invalid-encoding.wast": {
   "fail": 0,
-  "pass": 176,
-  "run": "nothing to run",
+  "pass": 183,
+  "run": "ok",
   "run_fail": 0,
-  "run_pass": 0,
+  "run_pass": 4,
   "text_fail": 0,
   "text_pass": 0
  }

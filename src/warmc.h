@@ -21,8 +21,23 @@ void warmc_invalid(const char *fmt, ...)
    message, and the walk reports the one of the first item in order, as a
    walk in order would have (util.c). */
 typedef struct { jmp_buf jb; const char *tag; int code; char *msg; } DiagCatch;
-void warmc_diag_catch(DiagCatch *c);
+/* sets the thread's catch and returns the one it replaces */
+DiagCatch *warmc_diag_catch(DiagCatch *c);
+/* raises c's diagnostic again: to the thread's catch if it has one, else
+   it ends the process */
 void warmc_diag_rethrow(const DiagCatch *c) __attribute__((noreturn));
+/* While a decoder has a DiagHold open, warmc_invalid_held keeps the first
+   invalid verdict it is given rather than raise it, and the decoder goes on
+   past it with a stand-in: the spec decodes a whole module before it
+   validates any of it, so a malformed part after an invalid one makes the
+   module malformed.  With none open it is warmc_invalid.  Holds nest, and
+   a diagnostic raised while one is open drops them all. */
+typedef struct DiagHold { struct DiagHold *outer; char *msg; } DiagHold;
+void warmc_hold_open(DiagHold *h);
+/* closes h, the innermost hold, and returns the verdict it kept (the
+   caller frees it) or NULL */
+char *warmc_hold_close(DiagHold *h);
+void warmc_invalid_held(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 /* The intermediate object of a link, removed if an error ends warmc before
    the link does; NULL once it is removed or kept. */
 void warmc_temp_output(const char *path);
@@ -409,6 +424,10 @@ static inline bool vt_ref_collectable(const Module *m, ValType t) {
 }
 
 Module *wasm_parse(const uint8_t *bin, size_t len);
+/* Decodes every body of m, validating none, and raises the first that does
+   not decode as malformed: the spec decodes a whole module before it
+   validates any of it, so this runs before a verdict of invalid is given. */
+void wasm_decode_bodies(const Module *m);
 void wasm_check_utf8(const uint8_t *p, uint32_t n);
 /* the length of the longest prefix of p[0..n) that is well-formed UTF-8 */
 size_t wasm_utf8_prefix(const uint8_t *p, size_t n);

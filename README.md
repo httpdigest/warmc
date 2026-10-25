@@ -51,14 +51,14 @@ Hello world!
   calls**, **exception handling** (`try_table` / `exnref`), **memory64** and
   table64, **multi-memory**, and extended constant expressions. See
   [WebAssembly feature support](#webassembly-feature-support).
-- **Passes the official spec testsuite.** The 257 core `.wast` files of the
+- **Passes the official spec testsuite.** The 258 core `.wast` files of the
   pinned upstream testsuite (its top level; its `proposals/`, `legacy/` and
-  `custom/` directories are not run) pass with zero failures: 6,912
-  validation and 60,706 execution checks, counting each module that must
+  `custom/` directories are not run) pass with zero failures: 6,925
+  validation and 60,730 execution checks, counting each module that must
   compile and each instantiation as well as the assertions, at `-O1`, at
   `-O2`, and at `-O2 --profile=deterministic`. The text format is checked
   through warmc's own text front end: the quoted modules, malformed ones
-  among them, go to it directly, and the 5,114 modules the files write as
+  among them, go to it directly, and the 5,118 modules the files write as
   text are assembled by it to the bytes wasm-tools makes of them, except
   for two where wasm-tools gives a function a type that is not final and
   warmc follows the spec.
@@ -1046,14 +1046,17 @@ variables, `WARMC_GC_*` among them, at its first call.
 ```
 
 **Front end** (`src/parse.c`, `validate.c`, `wat.c`, `component.c`, `wit.c`).
-These decode, assemble and validate core modules, components and WIT. The text
-assembler handles both flat and folded syntax, names in every index space,
-inline imports, exports and segments, GC type definitions, and custom
-sections: `(@custom ...)` where it says, `(@producers ...)` last and
-`(@dylink.0 ...)` first. It writes a name section of the functions' names:
-each one's `(@name "...")` annotation, or else its `$id`. It reads the 3.0
-text grammar as written, down to its tokens: a run like `data"a"` is one
-reserved token and refused, and so is source that is not UTF-8.
+These decode, assemble and validate core modules, components and WIT. A core
+module is decoded whole, every body too, before a verdict of invalid is given,
+so one that is invalid in one place and malformed in a later one is malformed,
+as the spec has it. The text assembler handles both flat and folded syntax,
+names in every index space, inline imports, exports and segments, GC type
+definitions, and custom sections: `(@custom ...)` where it says,
+`(@producers ...)` last and `(@dylink.0 ...)` first. It writes a name section
+of the functions' names: each one's `(@name "...")` annotation, or else its
+`$id`. It reads the 3.0 text grammar as written, down to its tokens: a run like
+`data"a"` is one reserved token and refused, and so is source that is not
+UTF-8.
 
 **Middle end** (`src/ir*.c`, `opt.c`, `inline.c`, `tramp.c`, `gosp.c`). Functions become SSA with
 block parameters instead of phi nodes. SSA is built directly from wasm locals,

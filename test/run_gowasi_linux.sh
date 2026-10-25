@@ -3,7 +3,9 @@
 set -u
 BUILD=${BUILD:-build}
 WORK="$BUILD/gowasilinux"
-IMAGE=localhost/warmc-gowasi-linux
+# tagged with the Debian release it is built on, so that a new one builds anew
+# rather than finding the old image under the name
+IMAGE=localhost/warmc-gowasi-linux:trixie
 
 skip() { echo "gowasi-linux: SKIPPED ($1)"; exit 0; }
 
@@ -19,7 +21,7 @@ rm -rf "$WORK"; mkdir -p "$WORK"
 
 if ! "$PODMAN" image exists "$IMAGE" 2>/dev/null; then
   cat > "$WORK/Dockerfile" <<'EOF'
-FROM docker.io/library/debian:bookworm-slim
+FROM docker.io/library/debian:trixie-slim
 RUN apt-get -qq update && apt-get -qq install -y --no-install-recommends \
       gcc libc6-dev && rm -rf /var/lib/apt/lists/*
 EOF
@@ -34,7 +36,8 @@ cp "$BUILD/warmrt.a" "$BUILD/warmwasi.a" "$WORK/" || exit 1
 # over raw system calls -- what `warmc --wasi --target linux` gives a user.
 # `.lx` is the object linked by gcc against glibc, the way an embedder's driver
 # would be: the host must keep to its own warmc_lx_* names and leave that
-# libc's malloc and stdio alone.  Both have to match the macOS run.
+# libc's malloc and stdio alone.  Both have to match the macOS run, save
+# where the two hosts answer differently by design (below).
 
 printf 'alpha\nbeta\ngamma\n' > "$WORK/stdin.txt"
 printf 'secret\n' > "$WORK/escape.secret"
@@ -134,6 +137,23 @@ if ! "$PODMAN" run --rm -v "$PWD/$WORK:/w:Z" "$IMAGE" \
   exit 1
 fi
 
+# A create through a name that ends in a slash fails EISDIR on Linux and
+# EINVAL on macOS, each host's own answer, so a program whose
+# $src.linux.out is recorded beside its source -- what wasmtime prints on
+# Linux -- has its Linux builds held to that, and the exit status and the
+# rest still to the macOS run.
+for name in "${names[@]}"; do
+  case $name in
+    p2-*) rec="test/wasip2/${name#p2-}.linux.out" ;;
+    *)    rec="test/gowasi/$name.linux.out" ;;
+  esac
+  if [ -f "$rec" ]; then
+    { cat "$rec"; tail -n 1 "$WORK/$name.mac.out"; } > "$WORK/$name.ref.out"
+  else
+    cp "$WORK/$name.mac.out" "$WORK/$name.ref.out"
+  fi
+done
+
 fail=0
 pass=0
 for name in "${names[@]}"; do
@@ -143,14 +163,14 @@ for name in "${names[@]}"; do
     x="$WORK/$name.$v"
     bad=""
     [ -f "$x.out" ] || { echo "FAIL[gowasi-linux/$name.$v]: did not run"; fail=1; continue; }
-    cmp -s "$WORK/$name.mac.out"  "$x.out"  || bad="$bad stdout"
+    cmp -s "$WORK/$name.ref.out"  "$x.out"  || bad="$bad stdout"
     cmp -s "$WORK/$name.mac.err2" "$x.err2" || bad="$bad stderr"
     cmp -s "$WORK/$name.mac.tree" "$x.tree" || bad="$bad tree"
     if [ -n "$bad" ]; then
       echo "FAIL[gowasi-linux/$name.$v]: differs from the macOS run:$bad"
       for k in $bad; do
         case $k in
-          stdout) diff "$WORK/$name.mac.out"  "$x.out"  | head -8 ;;
+          stdout) diff "$WORK/$name.ref.out"  "$x.out"  | head -8 ;;
           stderr) diff "$WORK/$name.mac.err2" "$x.err2" | head -8 ;;
           tree)   diff "$WORK/$name.mac.tree" "$x.tree" | head -8 ;;
         esac

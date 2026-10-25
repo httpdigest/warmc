@@ -41,7 +41,7 @@ TYPED_REFS = {
     "br_on_null", "br_on_non_null", "local_init", "ref", "table-sub",
 }
 
-EXCEPTIONS = {"tag", "throw", "throw_ref", "try_table"}
+EXCEPTIONS = {"tag", "throw", "throw_ref", "try_table", "cast"}
 
 TAIL_CALLS = {"return_call", "return_call_indirect"}
 

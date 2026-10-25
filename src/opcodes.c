@@ -721,13 +721,15 @@ bool wasm_walk_imm(Rd *r, uint32_t op, WasmTypeFn on_type, void *ctx) {
     case IMM_MEMARG: case IMM_MEMARG_LANE: {
 
       uint32_t align = rd_u32(r);
+      if (align >= 0x80) warmc_malformed("malformed memop flags");
       if (align & 0x40) rd_u32(r);
       rd_u64(r);
       if (oi->imm == IMM_MEMARG_LANE) (void)rd_u8(r);
       break;
     }
     case IMM_BR_CAST: {
-      (void)rd_u8(r);
+      uint8_t flags = rd_u8(r);
+      if (flags > 3) warmc_malformed("malformed br_on_cast flags 0x%02x", flags);
       rd_u32(r);
       SAY_HT(rd_heaptype(r));
       SAY_HT(rd_heaptype(r));
