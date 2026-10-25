@@ -39,6 +39,11 @@ What each host call becomes:
     answer as JavaScript would;
   * weak references stay strong, which the Java memory model allows.
 
+Of TeaVM's exports the module keeps the program's own: those for the loader
+alone (loader_export) go, and with them every reference that crossed the
+module's boundary, so that warmc decides its casts from the object's type
+alone.
+
 Any other host call means the program uses JavaScript itself -- JSO, the DOM,
 threads on JS timers -- and has no WASI meaning: it stops the program with a
 message naming the call, exit status 69 (sysexits' EX_UNAVAILABLE; the WASI
@@ -820,8 +825,8 @@ def adapt(wasm, main_class="Main", tools="wasm-tools", native=()):
             if ln.startswith('  (@custom "teavm.imports"'):
                 continue            # what the loader was to supply, all defined here now
             m = EXPORT.match(ln)
-            if m and m.group(1).startswith("warmc.fdlibm."):
-                continue            # reached through teavmMath, if at all
+            if m and loader_export(m.group(1), m.group(2)):
+                continue
             out.append(ln)
             continue
         module, name, kind, ident, _, rest = m.groups()
@@ -901,7 +906,9 @@ def adapt(wasm, main_class="Main", tools="wasm-tools", native=()):
 
     # An export can be what declares a function for ref.func; one removed
     # above is declared instead, where anything takes a reference to it.
-    refd = [f for f in fdlibm.values() if ("ref.func " + f) in r.stdout.decode()]
+    printed = r.stdout.decode()
+    gone = {f for n, f in exports.items() if f in funcs and loader_export(n, "func")}
+    refd = sorted(f for f in gone if re.search(r"ref\.func %s(?![^\s)])" % re.escape(f), printed))
     rt = runtime(lay)
     if refd:
         rt += "  (elem declare func %s)\n" % " ".join(refd)
@@ -922,6 +929,17 @@ def adapt(wasm, main_class="Main", tools="wasm-tools", native=()):
 
     text = "\n".join([lines[0], WASI.strip("\n")] + kept + defs + out + [rt, data, ")", ""])
     return text, missing
+
+def loader_export(name, kind):
+    """Whether an export of TeaVM's is for its JavaScript loader alone: its
+    own (teavm.*, teavm_*), JSO's `main`, a JavaScript function, and the math
+    FdLibm.java exports, which the adapter reaches through teavmMath.  A WASI
+    host calls none of them; what is left is `_start`, `memory` and the
+    program's own exports.  Several take references -- strings, exceptions,
+    JS wrappers -- and an export a host could hand an object to would keep
+    warmc from deciding a cast from the object's type alone."""
+    return (name.startswith("teavm") or name.startswith("warmc.fdlibm.") or
+            (name == "main" and kind == "global"))
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 

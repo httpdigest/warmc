@@ -207,6 +207,119 @@ static void split_prune_plan(IrFunc *f, SplitCtl *sc) {
   sc->nfailed_new = 0;
 }
 
+/* A ref.test of a concrete type in the any hierarchy, as an object this
+   module allocated answers it.  Such an object's header holds the instance's
+   type base plus its type's slot; the slots are the types module_data gives a
+   descriptor, numbered in type order, and every module has its own range of
+   ids (gc_register_types), so an object of another module's -- even of a
+   structurally identical type -- never lands inside it.  For this module's
+   objects the slot alone decides the test, as warmc_ref_test would decide it
+   from the display the slot's type was emitted with.  *lo..*hi is the first
+   run of slots that pass (lo > hi when none does); *exact says no slot
+   outside the run passes, so a slot of this module outside it fails without
+   asking the runtime, which is left only another module's objects, whose
+   slot is not below *nslots.  False when the slots are not numbered as
+   module_data numbers them, which leaves the runtime every answer. */
+bool codegen_rtest_slots(const Module *m, uint64_t imm, uint64_t id,
+                         uint32_t *lo, uint32_t *hi, bool *exact,
+                         uint32_t *nslots) {
+  uint32_t depth = RTEST_DEPTH(imm);
+  uint32_t n = 0;
+  *lo = 1;
+  *hi = 0;
+  *exact = true;
+  for (uint32_t i = 0; i < m->ntypes; i++) {
+    if (m->type_entry && !m->type_entry[i]) continue;
+    if (gctype_slot(m, i) != n) return false;
+    const CompType *t = &m->types[i];
+    /* a type reach found unused is emitted with an empty display */
+    bool live = !m->type_live || m->type_live[i];
+    if (live && t->display && t->depth >= depth && t->display[depth] == id) {
+      if (*lo > *hi) *lo = *hi = n;
+      else if (*hi + 1 == n) *hi = n;
+      else *exact = false;
+    }
+    n++;
+  }
+  *nslots = n;
+  return true;
+}
+
+/* In a module no other module's object can reach (Module.gc_sealed) a slot
+   answers every ref.test of the module's own concrete types: each whose
+   passing slots are one run -- most are one type, a class without
+   subclasses -- becomes an I_REF_SLOT, which instruction selection decides
+   inline, and which, making no call, leaves a function that only tests and
+   casts a leaf.  A test whose passing slots have gaps, as structurally
+   equal types numbered apart give, keeps the runtime call for the slots
+   outside its first run. */
+static Ref unconverted(const IrFunc *f, Ref v) {
+  while (f->insts[v].op == I_REF_CONVERT) v = ir_args((IrFunc *)f, v)[0];
+  return v;
+}
+
+/* Whether u checks the object x, under whatever casts of it, for null: a
+   GC access of it, or a ref.as_non_null.  An access checks wherever the
+   object can be null; where it does not, x is not null there, nor so at a
+   test of it before with nothing between, which then never traps. */
+static bool null_checks(const IrFunc *f, Ref u, Ref x) {
+  switch (f->insts[u].op) {
+    case I_FIELD_GET: case I_FIELD_SET: case I_ARRAY_GET: case I_ARRAY_SET:
+    case I_ARRAY_LEN: case I_TRAP_IF:
+      return unconverted(f, ir_args((IrFunc *)f, u)[0]) == x;
+    default:
+      return false;
+  }
+}
+
+static void seal_tests(IrFunc *f) {
+  if (!f->m->gc_sealed) return;
+  for (Ref v = 0; v < f->ninsts; v++) {
+    Inst *in = &f->insts[v];
+    if (in->op != I_REF_TEST) continue;
+    if ((RTEST_KIND(in->imm) & ~RTK_NULLABLE) != RTK_CONCRETE_ANY) continue;
+    uint32_t lo, hi, nslots;
+    bool exact;
+    if (codegen_rtest_slots(f->m, in->imm, in->imm2, &lo, &hi, &exact, &nslots) && exact) {
+      in->op = I_REF_SLOT;
+      g_stats.slot_tests++;
+    }
+  }
+
+  /* A test that null passes, of an object that an access then checks for
+     null -- a nullable cast of an element of a Java array and a read of a
+     field of it -- traps on null as the access would have, and the access
+     checks nothing.  Between the two, in one block, runs nothing that has an
+     effect or can trap but a trap on the test's answer, which null passes;
+     so nothing sees the trap come earlier. */
+  for (uint32_t bi = 0; bi < f->nblocks; bi++) {
+    Block *b = &f->blocks[bi];
+    for (uint32_t i = 0; i < b->ninsts; i++) {
+      Ref v = b->insts[i];
+      Inst *in = &f->insts[v];
+      if (in->op != I_REF_SLOT || !(RTEST_KIND(in->imm) & RTK_NULLABLE)) continue;
+      Ref x = unconverted(f, ir_args(f, v)[0]);
+      for (uint32_t k = i + 1; k < b->ninsts; k++) {
+        Ref u = b->insts[k];
+        Inst *ui = &f->insts[u];
+        if (null_checks(f, u, x)) {
+          in->imm = (in->imm & ~(uint64_t)RTK_NULLABLE) | RTK_NULLTRAP;
+          g_stats.slot_nullchks++;
+          if (ui->op == I_TRAP_IF) {
+            ui->op = I_NOP;
+            ui->nargs = 0;
+          } else {
+            ui->imm2 &= ~(uint64_t)GCF_NULLCHK;
+          }
+          break;
+        }
+        bool on_test = ui->op == I_TRAP_IF && ir_args(f, u)[0] == v;
+        if (!on_test && !ir_has_no_effect(ui)) break;
+      }
+    }
+  }
+}
+
 /* One produce_body, run a second time when the first has measured the loops
    it aligns and wants to place them again knowing their sizes (4).  The
    sizes are for that code only, so they go once the second run has used
@@ -247,6 +360,7 @@ void ir_produce_function(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
      instructions: an insertion sort's previous index left a stack slot
      for a register and its loads now issue early. */
   if (opt->regalloc) ir_compact(f);
+  seal_tests(f);
   sc.full = warmc_getenv("WARMC_SPLIT") != NULL;
   bool collect = opt->regalloc && (opt->split || sc.full);
   int r = produce_once(f, obj, opt, out_bytes, fout, false, &sc, collect);

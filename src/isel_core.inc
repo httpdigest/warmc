@@ -495,44 +495,6 @@ static Ref load_barrier_mask(const IrFunc *f, Ref v) {
   return ir_args((IrFunc *)f, v)[in->nargs - 1];
 }
 
-/* A ref.test of a concrete type in the any hierarchy, as an object this
-   module allocated answers it.  Such an object's header holds the instance's
-   type base plus its type's slot; the slots are the types module_data gives a
-   descriptor, numbered in type order, and every module has its own range of
-   ids (gc_register_types), so an object of another module's -- even of a
-   structurally identical type -- never lands inside it.  For this module's
-   objects the slot alone decides the test, as warmc_ref_test would decide it
-   from the display the slot's type was emitted with.  *lo..*hi is the first
-   run of slots that pass (lo > hi when none does); *exact says no slot
-   outside the run passes, so a slot of this module outside it fails without
-   asking the runtime, which is left only another module's objects, whose
-   slot is not below *nslots.  False when the slots are not numbered as
-   module_data numbers them, which leaves the runtime every answer. */
-static bool rtest_slots(const Module *m, uint64_t imm, uint64_t id,
-                        uint32_t *lo, uint32_t *hi, bool *exact,
-                        uint32_t *nslots) {
-  uint32_t depth = RTEST_DEPTH(imm);
-  uint32_t n = 0;
-  *lo = 1;
-  *hi = 0;
-  *exact = true;
-  for (uint32_t i = 0; i < m->ntypes; i++) {
-    if (m->type_entry && !m->type_entry[i]) continue;
-    if (gctype_slot(m, i) != n) return false;
-    const CompType *t = &m->types[i];
-    /* a type reach found unused is emitted with an empty display */
-    bool live = !m->type_live || m->type_live[i];
-    if (live && t->display && t->depth >= depth && t->display[depth] == id) {
-      if (*lo > *hi) *lo = *hi = n;
-      else if (*hi + 1 == n) *hi = n;
-      else *exact = false;
-    }
-    n++;
-  }
-  *nslots = n;
-  return true;
-}
-
 static void emit_move_to(Isel *s, Buf *out, int dst, int src, int fp, int wide,
                          int vec) {
   if (dst == src) return;

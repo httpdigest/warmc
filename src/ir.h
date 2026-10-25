@@ -142,6 +142,11 @@ typedef enum {
   I_GC_BADMASK,
 
   I_REF_TEST,
+  /* ref.test of a concrete type in a module no other module's object can
+     reach (Module.gc_sealed), decided inline from the object's type slot
+     with no runtime call; codegen turns the I_REF_TESTs it can decide so
+     into these just before instruction selection (codegen_seal_tests) */
+  I_REF_SLOT,
 
   I_REF_CONVERT,
   I_REF_I31,
@@ -466,6 +471,9 @@ typedef struct {
   bool gcpure;
 
   bool closed_world;
+  /* -fsealed: a module through whose boundary no reference passes
+     (Module.gc_sealed) has its casts and type tests decided inline */
+  bool sealed;
   bool print_ir;
   bool stats;
   bool profile;
@@ -547,6 +555,9 @@ typedef struct {
   uint64_t unrolled, unr_guarded, unr_rej_shape, unr_rej_body, unr_rej_exit;
   uint64_t unr_rej_trip, unr_rej_escape, unr_addr_folded;
   uint64_t gc_nullchk_removed;
+  /* casts and type tests a sealed module's object slot decides inline, and
+     the null checks of accesses after one that it makes instead */
+  uint64_t slot_tests, slot_nullchks;
   uint64_t ldpairs, stpairs;
   uint64_t cold_frames, early_rets;
   /* -fexact-trap: stores checked that guard pages would have left to the
