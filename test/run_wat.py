@@ -127,8 +127,8 @@ def strip_custom(b):
 
     Applied to both sides of every comparison.  The name section is the one
     thing here that two correct assemblers may legitimately disagree about:
-    `wasm-tools parse` writes one for the `$names` in the text, and warmc,
-    whose names come from the binary it compiles, writes none.  Every other
+    `wasm-tools parse` writes one for every `$name` in the text, warmc one of
+    its functions' names alone, which its symbols take.  Every other
     custom section is compared where it stands, since `(@custom ...)`,
     `(@producers ...)` and `(@dylink.0 ...)` say exactly what to write and
     where.  Removing the name sections from the bytes keeps the criterion

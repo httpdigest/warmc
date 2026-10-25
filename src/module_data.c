@@ -154,6 +154,9 @@ void codegen_prepare_module(Module *m, ObjBuilder *o) {
 
 }
 
+static bool g_func_names = true;
+void codegen_set_function_names(bool on) { g_func_names = on; }
+
 void codegen_prewarm_symbols(Module *m, ObjBuilder *o) {
   static const char *const helpers[] = {
     "warmc_any_of_extern",
@@ -190,9 +193,14 @@ void codegen_prewarm_symbols(Module *m, ObjBuilder *o) {
   for (size_t i = 0; i < sizeof helpers / sizeof helpers[0]; i++)
     obj_intern_sym(o, helpers[i], SYM_UNDEF_FUNC, -1, 0);
 
+  /* A function goes by wasm_func_N, which every reference names; its
+     symbol table entry, which only tools read, by its name section name. */
   for (uint32_t i = m->nimported_funcs; i < m->nfuncs; i++)
-    if (!m->reached || m->reached[i])
-      obj_intern_sym(o, m->funcs[i].sym, SYM_LOCAL_FUNC, -1, 0);
+    if (!m->reached || m->reached[i]) {
+      uint32_t s = obj_intern_sym(o, m->funcs[i].sym, SYM_LOCAL_FUNC, -1, 0);
+      if (g_func_names && m->funcs[i].name && !o->syms[s].display)
+        o->syms[s].display = xstrndup(m->funcs[i].name, strlen(m->funcs[i].name));
+    }
 }
 
 uint32_t codegen_tail_out_bytes(Module *m) { return module_tail_outgoing(m); }
@@ -225,8 +233,8 @@ void codegen_set_symbol_prefix(const char *prefix) {
      u32 count
      count x { u32 name_off, name_len, data_off, data_len }, from the table
      the names and the payloads
-   By default the debug information is left out -- the name section, which
-   warmc does not read, and DWARF's .debug_* sections: --custom-sections=all
+   By default the debug information is left out -- the name section, whose
+   function names the symbols carry, and DWARF's .debug_* sections: --custom-sections=all
    keeps them, =none every section out. */
 static CustomMode g_custom_mode = CUSTOM_DEFAULT;
 void codegen_set_custom_sections(CustomMode mode) { g_custom_mode = mode; }

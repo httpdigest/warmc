@@ -1362,6 +1362,18 @@ case("text_elem_func_where_it_may_be_left_out", "accept", "",
      " (elem 0 (i32.const 0) $f) (elem 0 (offset (i32.const 0)) $f) (elem (i32.const 0))"
      " (elem (table 0) (i32.const 0) func $f) (elem func $f) (elem func)"
      " (elem declare func $f) (elem $e funcref (ref.func $f)))")
+# A function's (@name "...") annotation, right after `func` or its $id,
+# names it in the name section warmc writes, over its $id: one string, UTF-8,
+# one per function.  Elsewhere it names nothing warmc keeps, and is let go.
+for _n, _s, _frag in [("empty", "(func (@name))", "a @name annotation holds one string"),
+                      ("two_strings", '(func (@name "a" "b"))', "a @name annotation holds one string"),
+                      ("not_a_string", "(func $f (@name a))", "a @name annotation holds one string"),
+                      ("twice", '(func $f (@name "a") (@name "b"))', "a second @name annotation for one function"),
+                      ("not_utf8", '(func (@name "\\c3"))', "malformed UTF-8 encoding in a @name annotation")]:
+    case("text_name_annotation_" + _n, "malformed", _frag, "(module %s)" % _s)
+case("text_name_annotations_elsewhere", "accept", "",
+     '(module (@name "m") (memory (@name 1) 1) (func $f (@name "f") (param $p (@name "p") i32)'
+     ' (local (@name "l") i32)) (func (export "g") (@name "not after func")))')
 
 def main():
     out = sys.argv[1] if len(sys.argv) > 1 else "."

@@ -134,8 +134,21 @@ for i in range(1, symsize // 24):
         "%s is not in an executable section" % nm
     funcs.append(nm)
 assert "warmc_trap" in funcs, "the runtime's functions have no names"
+# The module's functions have names too: the name section's where it gives
+# one, and none of those goes by wasm_func_N, its index.
+sys.path.insert(0, __import__("os").path.dirname(__file__))
+import custom_check
+_bin = open(module, "rb").read() if not module.endswith(".wat") else None
+_names = custom_check.func_names(custom_check.module_customs(warmc, module),
+                                 custom_check.wasm_nfuncs(_bin) if _bin else None)
 if nfuncrefs or nexport:
-    assert any(n.startswith("wasm_func_") for n in funcs), "the module's functions have no names"
+    assert any(n.startswith("wasm_func_") or n in _names.values() for n in funcs), \
+        "the module's functions have no names"
+_misnamed = ["function %s has the name %r, and its symbol is %s"
+             % (n[10:], _names[int(n[10:])], n)
+             for n in funcs if n.startswith("wasm_func_") and n[10:].isdigit()
+             and int(n[10:]) in _names]
+assert not _misnamed, "; ".join(_misnamed)
 
 # The custom sections: .wasm.custom, which the descriptor points at, holding
 # what the module carries (test/custom_check.py).

@@ -201,6 +201,9 @@ done
 
 start pressure ./test/run_pressure.sh
 start link     ./test/run_link.sh
+# functions' symbols named as the name section names them, in each object
+# format, and nothing that refers to one by its name
+start names    python3 test/run_names.py
 start shared   ./test/run_shared.sh
 
 start elf      ./test/run_elf.sh

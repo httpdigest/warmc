@@ -32,6 +32,68 @@ static void check_utf8(const uint8_t *p, uint32_t n) {
   if (wasm_utf8_prefix(p, n) != n) warmc_malformed("malformed UTF-8 encoding");
 }
 
+/* A u32 of a custom section's, read without the binary's own checks: false
+   when it overruns the end or 32 bits. */
+static bool name_u32(const uint8_t **p, const uint8_t *end, uint32_t *out) {
+  uint64_t v = 0;
+  for (unsigned shift = 0; *p < end && shift < 35; shift += 7) {
+    uint8_t b = *(*p)++;
+    v |= (uint64_t)(b & 0x7f) << shift;
+    if (!(b & 0x80)) {
+      if (v > UINT32_MAX) return false;
+      *out = (uint32_t)v;
+      return true;
+    }
+  }
+  return false;
+}
+
+/* The function names of the name section, which the functions' symbols
+   take.  A custom section's errors must not invalidate the module, so one
+   that is not as the appendix has it -- a subsection out of order or twice,
+   a size past its end, an index out of range or not increasing, a name not
+   UTF-8 -- gives no names at all.  A name that is empty or holds a NUL,
+   which no symbol can, leaves only its function without one. */
+static void read_func_names(Module *m) {
+  const CustomSec *c = NULL;
+  for (uint32_t i = 0; i < m->ncustoms && !c; i++)
+    if (m->customs[i].name_len == 4 && !memcmp(m->customs[i].name, "name", 4))
+      c = &m->customs[i];
+  if (!c) return;
+  const uint8_t *p = c->data, *end = c->data + c->len;
+  int last_id = -1;
+  while (p < end) {
+    uint8_t id = *p++;
+    uint32_t size;
+    if (!name_u32(&p, end, &size) || size > (size_t)(end - p) || (int)id <= last_id)
+      goto bad;
+    last_id = id;
+    const uint8_t *q = p, *qend = p + size;
+    p = qend;
+    if (id != 1) continue;
+    uint32_t n;
+    if (!name_u32(&q, qend, &n)) goto bad;
+    int64_t prev = -1;
+    for (uint32_t k = 0; k < n; k++) {
+      uint32_t idx, len;
+      if (!name_u32(&q, qend, &idx) || !name_u32(&q, qend, &len) ||
+          len > (size_t)(qend - q) || (int64_t)idx <= prev || idx >= m->nfuncs ||
+          wasm_utf8_prefix(q, len) != len)
+        goto bad;
+      prev = idx;
+      if (len && !memchr(q, 0, len)) m->funcs[idx].name = xstrndup((const char *)q, len);
+      q += len;
+    }
+    if (q != qend) goto bad;
+  }
+  return;
+bad:
+  for (uint32_t i = 0; i < m->nfuncs; i++) {
+    xfree(m->funcs[i].name);
+    m->funcs[i].name = NULL;
+  }
+}
+
 static char *rd_name(Rd *r, uint32_t *len) {
   uint32_t n = rd_u32(r);
   rd_check(r, n);
@@ -846,6 +908,7 @@ Module *wasm_parse(const uint8_t *bin, size_t len) {
     snprintf(name, sizeof name, "wasm_func_%u", i);
     m->funcs[i].sym = xstrndup(name, strlen(name));
   }
+  read_func_names(m);
   for (uint32_t i = 0; i < m->nfuncs; i++) {
     if (!m->funcs[i].imported && !m->funcs[i].body)
       warmc_malformed("function and code section have inconsistent lengths");
@@ -902,7 +965,7 @@ void module_free(Module *m) {
   xfree(m->types);
   for (uint32_t i = 0; i < m->nimports; i++) { xfree(m->imports[i].module); xfree(m->imports[i].name); }
   xfree(m->imports);
-  for (uint32_t i = 0; i < m->nfuncs; i++) { xfree(m->funcs[i].local_types); xfree(m->funcs[i].sym); }
+  for (uint32_t i = 0; i < m->nfuncs; i++) { xfree(m->funcs[i].local_types); xfree(m->funcs[i].sym); xfree(m->funcs[i].name); }
   xfree(m->funcs);
   for (uint32_t i = 0; i < m->ntables; i++) xfree(m->tables[i].init.ins);
   xfree(m->tables);

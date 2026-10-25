@@ -90,15 +90,16 @@ void write_coff64(ObjBuilder *o, const char *path) {
   Buf symtab; memset(&symtab, 0, sizeof symtab);
   for (uint32_t i = 0; i < o->nsyms; i++) {
     Sym *s = &o->syms[i];
-    size_t len = strlen(s->name);
+    const char *nm = s->display ? s->display : s->name;
+    size_t len = strlen(nm);
     if (len <= 8) {
       char name[8] = { 0 };
-      memcpy(name, s->name, len);
+      memcpy(name, nm, len);
       buf_bytes(&symtab, name, 8);
     } else {
       buf_u32(&symtab, 0);
       buf_u32(&symtab, (uint32_t)strtab.len);
-      buf_bytes(&strtab, s->name, len + 1);
+      buf_bytes(&strtab, nm, len + 1);
     }
     bool undef = s->section < 0;
     buf_u32(&symtab, undef ? 0 : (uint32_t)s->value);

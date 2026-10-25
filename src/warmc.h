@@ -225,6 +225,7 @@ typedef struct {
   bool imported;
   uint32_t import_index;
   char *sym;
+  char *name;   /* the name section's name for it, or NULL */
 } Func;
 
 typedef enum {
@@ -574,6 +575,10 @@ typedef enum { SYM_LOCAL_FUNC, SYM_GLOBAL_FUNC, SYM_UNDEF_FUNC, SYM_LOCAL_DATA, 
 
 typedef struct {
   char *name;
+  /* the name the object's symbol table gives it, when that is not `name`:
+     a function's from the name section.  Only a local has one, which no
+     reference resolves by name, so it may be any name at all. */
+  char *display;
   SymKind kind;
   int section;
   uint64_t value;
@@ -628,6 +633,8 @@ void codegen_set_symbol_prefix(const char *prefix);
 /* which custom sections a module's output carries (module_data.c) */
 typedef enum { CUSTOM_DEFAULT, CUSTOM_ALL, CUSTOM_NONE } CustomMode;
 void codegen_set_custom_sections(CustomMode mode);
+/* whether a function's symbol takes its name from the name section */
+void codegen_set_function_names(bool on);
 
 void codegen_set_load_barrier(bool on);
 extern bool warmc_load_barrier;

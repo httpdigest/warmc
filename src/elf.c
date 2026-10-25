@@ -71,7 +71,7 @@ void write_elf64(ObjBuilder *o, const char *path) {
   static const int sec_of[4] = { 1, 3, 5, 10 };
   for (uint32_t j = 0; j < n; j++) {
     Sym *s = &o->syms[order[j]];
-    uint32_t nameoff = str_add(&strtab, s->name);
+    uint32_t nameoff = str_add(&strtab, s->display ? s->display : s->name);
     uint8_t bind = sym_is_local(s) ? STB_LOCAL : STB_GLOBAL;
     uint8_t type = STT_NOTYPE;
     if (s->section >= 0)

@@ -48,6 +48,89 @@ def wasm_customs(b):
     return out
 
 
+def wasm_nfuncs(b):
+    """the functions of a binary module, the imported ones included"""
+    n, i = 0, 8
+    while i < len(b):
+        sid = b[i]
+        size, i = uleb(b, i + 1)
+        end = i + size
+        if sid == 3:
+            n += uleb(b, i)[0]
+        elif sid == 2:
+            count, j = uleb(b, i)
+            for _ in range(count):
+                for _ in range(2):
+                    ln, j = uleb(b, j)
+                    j += ln
+                kind = b[j]
+                j += 1
+                if kind == 0:
+                    n += 1
+                    j = uleb(b, j)[1]
+                elif kind == 1:
+                    j = skip_limits(b, skip_reftype(b, j))
+                elif kind == 2:
+                    j = skip_limits(b, j)
+                elif kind == 3:
+                    j = skip_reftype(b, j) + 1
+                elif kind == 4:
+                    j = uleb(b, j + 1)[1]
+                else:
+                    return None
+        i = end
+    return n
+
+
+def skip_reftype(b, j):
+    """past a value type"""
+    if b[j] in (0x63, 0x64):
+        return uleb(b, j + 1)[1]
+    return j + 1
+
+
+def skip_limits(b, j):
+    flags = b[j]
+    j = uleb(b, j + 1)[1]
+    return uleb(b, j)[1] if flags & 1 else j
+
+
+def func_names(customs, nfuncs=None):
+    """{function index: name} from the name section, read as src/parse.c's
+    read_func_names reads it: nothing at all from a section that is not as
+    the appendix has it, and no name that is empty or holds a NUL"""
+    sec = next((d for n, d in customs if n == b"name"), None)
+    if sec is None:
+        return {}
+    out, i, last = {}, 0, -1
+    try:
+        while i < len(sec):
+            sid = sec[i]
+            size, i = uleb(sec, i + 1)
+            if sid <= last or i + size > len(sec):
+                return {}
+            last, sub, i = sid, sec[i:i + size], i + size
+            if sid != 1:
+                continue
+            n, j = uleb(sub, 0)
+            prev = -1
+            for _ in range(n):
+                idx, j = uleb(sub, j)
+                ln, j = uleb(sub, j)
+                if idx <= prev or j + ln > len(sub) or (nfuncs is not None and idx >= nfuncs):
+                    return {}
+                prev = idx
+                name = sub[j:j + ln].decode("utf-8")
+                j += ln
+                if name and "\0" not in name:
+                    out[idx] = name
+            if j != len(sub):
+                return {}
+    except (IndexError, UnicodeDecodeError):
+        return {}
+    return out
+
+
 def module_customs(warmc, module):
     """the custom sections of a .wasm, or of a .wat as warmc assembles it"""
     if not module.endswith(".wat"):

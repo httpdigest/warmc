@@ -101,7 +101,7 @@ ZIG_FLAGS = ["-target", "wasm32-wasi", "-O", "ReleaseFast",
 # --no-wasm-opt because clang otherwise runs whatever wasm-opt it finds on
 # PATH over its output: the corpus would be LLVM's code on one machine and
 # binaryen's rewrite of it on the next, and the pass also drops the name
-# section that maps a profile's wasm_func_N back to a C function.
+# section, which names a profile's functions after their C ones.
 WASI_SDK_BIN = os.path.join(ROOT, "build", "tools", "wasi-sdk", "bin")
 C_FLAGS = ["-O3", "--no-wasm-opt", "-mllvm", "-wasm-enable-sjlj", "-mllvm",
            "-wasm-use-legacy-eh=false", "-lsetjmp"]

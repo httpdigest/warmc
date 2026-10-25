@@ -4,8 +4,9 @@ Run by hand when deciding whether reordering instructions could pay:
 
     python3 test/tools/latency_model.py DIR FUNCINDEX
 
-where DIR holds `mathfn.o` (warmc, `-c`) and `mfg.cwasm` (`wasmtime compile`) for
-the same module.  It prints, per basic block and for both engines' orders, the
+where DIR holds `mathfn.o` (warmc, `-c --no-function-names`, so that its
+functions' symbols are `wasm_func_N` by index) and `mfg.cwasm` (`wasmtime
+compile`) for the same module.  It prints, per basic block and for both engines' orders, the
 instruction count, the dependence height in cycles, and the cycles the block would
 need if only issue width bound it.
 

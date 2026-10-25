@@ -98,7 +98,7 @@ void write_macho64(ObjBuilder *o, const char *path) {
   Buf symtab; memset(&symtab, 0, sizeof symtab);
   for (uint32_t j = 0; j < n; j++) {
     Sym *s = &o->syms[order[j]];
-    uint32_t nameoff = str_add(&strtab, s->name, 1);
+    uint32_t nameoff = str_add(&strtab, s->display ? s->display : s->name, 1);
     uint8_t n_type, n_sect;
     uint64_t n_value;
     if (sym_is_undef(s)) { n_type = N_UNDF | N_EXT; n_sect = 0; n_value = 0; }

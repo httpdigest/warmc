@@ -1388,8 +1388,9 @@ const char *ir_op_name(uint16_t op) {
 }
 
 void ir_print(IrFunc *f, const char *stage) {
+  const Func *fn = &f->m->funcs[f->func_index];
   fprintf(stderr, "; ---- %s: wasm_func_%u (%s) ----\n", stage, f->func_index,
-          f->m->funcs[f->func_index].sym);
+          fn->name ? fn->name : fn->sym);
   for (uint32_t oi = 0; oi < f->norder; oi++) {
     uint32_t bi = f->order[oi];
     Block *b = &f->blocks[bi];
