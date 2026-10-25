@@ -2339,12 +2339,14 @@ static void parse_tag(P *p, uint32_t index) {
 static void parse_elem(P *p, uint32_t index) {
   WElem *e = &p->el.v[index];
   e->mode = 0;
+  bool table_use = false;
   if (eat_word(p, "declare")) {
     e->mode = 2;
   } else if (at_group(p, "table")) {
     p->i += 2;
     e->table = take_ref(p, "table");
     e->explicit_table = true;
+    table_use = true;
     expect_rpar(p);
   } else if (at_index(p) && tk_at(p, p->i + 1)->kind == TK_LPAR) {
     /* the MVP's bare table index, (elem 0 (i32.const 0) $f ...), told from
@@ -2385,6 +2387,10 @@ static void parse_elem(P *p, uint32_t index) {
   } else if (at_valtype(p)) {
     e->elem = take_valtype(p);
   } else {
+    /* the list says func or its reference type, but for the abbreviation an
+       active segment on no named table has, as the MVP's had */
+    if (e->mode != 0 || table_use)
+      perr(p, "an element segment's items need func or a reference type before them");
     funcs_form = true;
   }
 

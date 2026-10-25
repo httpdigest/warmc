@@ -1344,6 +1344,24 @@ case("text_elem_folded_items", "accept", "",
      " (elem i31ref (ref.i31 (i32.const 5))))")
 case("text_inline_data_memory64", "accept", "",
      '(module (memory i64 (data "x")) (memory (data "y")))')
+# An element segment's list says func or a reference type before its items;
+# only an active segment that names no table -- the MVP's form, its bare
+# table index included -- may leave func out, its list empty or not.
+for _n, _s in [("table_use", "(elem (table 0) (i32.const 0) $f)"),
+               ("table_use_offset", "(elem (table 0) (offset (i32.const 0)) $f)"),
+               ("table_use_empty", "(elem (table 0) (i32.const 0))"),
+               ("passive", "(elem $e $f)"),
+               ("passive_empty", "(elem)"),
+               ("declarative", "(elem declare $f)"),
+               ("declarative_empty", "(elem declare)")]:
+    case("text_elem_without_func_" + _n, "malformed",
+         "need func or a reference type before them",
+         "(module (table 1 funcref) (func $f) %s)" % _s)
+case("text_elem_func_where_it_may_be_left_out", "accept", "",
+     "(module (table 1 funcref) (func $f) (elem (i32.const 0) $f) (elem (offset (i32.const 0)) $f)"
+     " (elem 0 (i32.const 0) $f) (elem 0 (offset (i32.const 0)) $f) (elem (i32.const 0))"
+     " (elem (table 0) (i32.const 0) func $f) (elem func $f) (elem func)"
+     " (elem declare func $f) (elem $e funcref (ref.func $f)))")
 
 def main():
     out = sys.argv[1] if len(sys.argv) > 1 else "."
