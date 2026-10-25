@@ -279,6 +279,20 @@ else
   fail=1
 fi
 
+# A global of TeaVM's class-initializer pattern the embedder sets: every
+# call through it runs what it was set to (test/link/once_x.wat).
+"$WT" parse test/link/once_x.wat -o "$WORK/ox.wasm" || { echo "FAIL[link]: assembling once_x.wat"; exit 1; }
+wtimeout ./$BUILD/warmc ${WARMC_FLAGS:--O2} $WARMC_TARGET_FLAGS --symbol-prefix=ox \
+    -c -o "$WORK/ox.o" "$WORK/ox.wasm" || { echo "FAIL[link]: compiling once_x.wat"; exit 1; }
+link_prog oxprog test/link/oncedriver.c "$WORK/ox.o" || exit 1
+got=$(wruntimeout $WARMC_RUN "$LINKED" 2>&1)
+if [ "$got" = "once_x=3" ]; then
+  echo "link: an exported global of the class-initializer pattern, set by the embedder"
+else
+  echo "FAIL[link/once]: [$got], not once_x=3"
+  fail=1
+fi
+
 # A reference the host makes is no object and no i31 to the module, whatever
 # it points at, and comes back as it went; a struct the module made comes
 # back a struct (101: eq and struct).
