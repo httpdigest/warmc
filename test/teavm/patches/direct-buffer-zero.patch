@@ -1,0 +1,22 @@
+ByteBuffer.allocateDirect on the wasm-gc target, its bytes zero.
+
+Java has every element of a new buffer zero.  TeaVM's wasm-gc target takes a
+direct buffer's bytes from its heap in linear memory as they are: what a
+released block held, or the free list's own bookkeeping that the block was
+carved from, so that a buffer of a few hundred bytes seldom starts out zero.
+LWJGL's GL.createCapabilities, among others, counts on it: it skips a
+function whose slot in its address buffer is not zero.
+
+test/teavm/fixes/directbuffer.
+
+--- a/teavm-classlib/org/teavm/classlib/java/nio/TByteBuffer.java
++++ b/teavm-classlib/org/teavm/classlib/java/nio/TByteBuffer.java
+@@ -54,6 +54,8 @@ public abstract class TByteBuffer extends TBuffer implements TComparable<TByteBu
+             if (addr == null) {
+                 throw new TOutOfMemoryError();
+             }
++            // the heap's blocks come as they were left
++            Address.fillZero(addr, capacity);
+             var result = new TByteBufferWasmGC(null, null, 0, null, addr, capacity, false);
+             result.regKey = JSObjects.create();
+             result.regToken = JSObjects.create();
