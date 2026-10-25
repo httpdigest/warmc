@@ -7,6 +7,18 @@ call:
     ;; run: EXPORT ARGS... => i32:42
     ;; run: EXPORT ARGS... => trap: out of bounds memory access
 
+and a module can say what warmc's --stats counts for it, at -O0, where no
+pass changes what there is to count, or at a level it names:
+
+    ;; stats: slot_tests=20 slot_nullchks=7
+    ;; stats -O2: once_dead=1
+
+and how many instructions of a function's AArch64 code at -O2 match a
+pattern, checked on an AArch64 host -- for what changes the code and not
+what it computes:
+
+    ;; shape: FUNCTION REGEX=N
+
 The answer is worked out by hand from the module, so it holds whichever
 level is wrong, -O0 included; the module is compiled at -O0, -O1, -O2 and
 -O3 and each call's output must be it.  A pass the module was written for
@@ -16,7 +28,9 @@ use garbage collection, which wabt does not read.
 import concurrent.futures
 import glob
 import os
+import platform
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -28,6 +42,10 @@ import hostbuild
 
 LEVELS = ["-O0", "-O1", "-O2", "-O3"]
 RUN_LINE = re.compile(r"^;; run: (\S+)((?: \S+)*) => (.*)$")
+STATS_LINE = re.compile(r"^;; stats(?: (-O[0-3]))?: (.*)$")
+SHAPE_LINE = re.compile(r"^;; shape: (\S+) (.*)=(\d+)$")
+OBJDUMP = shutil.which("llvm-objdump") or shutil.which("objdump")
+AARCH64 = platform.machine() in ("arm64", "aarch64")
 
 
 def calls(path):
@@ -37,6 +55,42 @@ def calls(path):
         if m:
             out.append((m.group(1), m.group(2).split(), m.group(3).strip()))
     return out
+
+
+def stats(path):
+    """{level: [name=value, ...]} of a module's stats lines"""
+    out = {}
+    for line in open(path):
+        m = STATS_LINE.match(line.rstrip("\n"))
+        if m:
+            out.setdefault(m.group(1) or "-O0", []).extend(m.group(2).split())
+    return out
+
+
+def shapes(path):
+    out = []
+    for line in open(path):
+        m = SHAPE_LINE.match(line.rstrip("\n"))
+        if m:
+            out.append((m.group(1), m.group(2), int(m.group(3))))
+    return out
+
+
+def shape_fails(name, exe, want):
+    """Each (function, pattern, count) of want against exe's code."""
+    d = subprocess.run([OBJDUMP, "-d", "--no-show-raw-insn", exe], capture_output=True,
+                       text=True).stdout
+    fails = []
+    for fn, pat, n in want:
+        body = re.search(r"<_?%s>:\n(.*?)(?:\n\n|\Z)" % re.escape(fn), d, re.S)
+        if not body:
+            fails.append("%s -O2: no function %s in the code" % (name, fn))
+            continue
+        got = len([l for l in body.group(1).split("\n") if re.search(pat, l)])
+        if got != n:
+            fails.append("%s -O2: %s has %d instructions matching %s, not %d"
+                         % (name, fn, got, pat, n))
+    return fails
 
 
 def check(path, build, warmc, target, run, tmp):
@@ -50,13 +104,25 @@ def check(path, build, warmc, target, run, tmp):
     if r.returncode:
         return ["%s: not assembled: %s" % (name, r.stderr.strip()[:200])]
     fails = []
+    counts = stats(path)
     for level in LEVELS:
         exe = hostbuild.exe(os.path.join(tmp, name + level))
-        r = subprocess.run([warmc, level] + target + ["-o", exe, wasm], capture_output=True,
-                           text=True, timeout=120)
+        r = subprocess.run([warmc, level] + target + ["-o", exe, wasm] +
+                           (["--stats"] if level in counts else []),
+                           capture_output=True, text=True, timeout=120)
         if r.returncode:
             fails.append("%s %s: warmc: %s" % (name, level, r.stderr.strip()[:300]))
             continue
+        want_shape = shapes(path)
+        if want_shape and level == "-O2" and AARCH64 and OBJDUMP:
+            fails += shape_fails(name, exe, want_shape)
+        if level in counts:
+            got = r.stderr.split()
+            for c in counts[level]:
+                if c not in got:
+                    have = [g for g in got if g.startswith(c.split("=")[0] + "=")]
+                    fails.append("%s %s: --stats has %s, not %s"
+                                 % (name, level, " ".join(have) or "nothing", c))
         for export, args, expect in want:
             p = subprocess.run(run + [exe, export] + args, capture_output=True, text=True,
                                timeout=30)

@@ -383,8 +383,12 @@ def run_names(work):
     for gone in ('"warmc.fdlibm.', '"teavm.imports"', '(import "teavm', '(import "env"'):
         if gone in r.stdout:
             fail("adapted module still has %s" % gone)
-    if '(export "memory"' not in r.stdout or '(export "_start"' not in r.stdout:
-        fail("adapted module exports no memory or no _start")
+    # of the exports, _start, memory and the program's own, none of the
+    # loader's (wasi.loader_export)
+    exports = sorted(re.findall(r'\(export "([^"]*)"', r.stdout))
+    if exports != ["_start", "app_answer", "memory"]:
+        fail("names: the adapted module exports %s, not _start, memory and the program's "
+             "app_answer" % exports)
 
 TEAVM = os.path.join(ROOT, "build", "tools", "teavm-" + pinned("TEAVM_VERSION"))
 FIXES = os.path.join(ROOT, "test", "teavm", "fixes")

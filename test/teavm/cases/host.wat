@@ -116,12 +116,23 @@
   (func $bracket (param $s externref)
     (call $putchar (i32.const 91)) (call $js (local.get $s)) (call $putchar (i32.const 93)))
 
+  ;; What the loader alone calls, which the adapter does not export: a
+  ;; function of TeaVM's own, the `main` JSO makes a JavaScript function of,
+  ;; and a function main takes a reference to, which the export declared.
+  ;; The program's own export stays.
+  (func $release (export "teavm.free") (param i32))
+  (global $mainfn (export "main") (mut externref) (ref.null extern))
+  (func $wrap (export "teavm.js.wrapException") (param (ref null $Object)) (result externref)
+    (ref.null extern))
+  (func (export "app_answer") (result i32) (i32.const 42))
+
   (func $Main::main_$caller$exported$0 (param $args externref)
     (local $abc externref) (local $def externref) (local $all externref)
     (local $a (ref null $chars)) (local $o (ref null $Object)) (local $i i32)
     (local $t f64) (local $u f64) (local $ok i32)
 
     ;; js-string
+    (drop (ref.func $wrap))
     (local.set $abc (call $mk (i32.const 0) (i32.const 3)))
     (local.set $def (call $mk (i32.const 3) (i32.const 3)))
     (local.set $all (call $concat (local.get $abc) (local.get $def)))
