@@ -7,26 +7,29 @@
 #include <stdlib.h>
 #include <string.h>
 
-static void check_utf8(const uint8_t *p, uint32_t n) {
-  for (uint32_t i = 0; i < n;) {
+size_t wasm_utf8_prefix(const uint8_t *p, size_t n) {
+  for (size_t i = 0; i < n;) {
     uint8_t b = p[i];
     uint32_t need, cp, lo;
     if (b < 0x80) { i++; continue; }
     else if ((b & 0xe0) == 0xc0) { need = 1; cp = b & 0x1f; lo = 0x80; }
     else if ((b & 0xf0) == 0xe0) { need = 2; cp = b & 0x0f; lo = 0x800; }
     else if ((b & 0xf8) == 0xf0) { need = 3; cp = b & 0x07; lo = 0x10000; }
-    else warmc_malformed("malformed UTF-8 encoding");
-    if (i + need >= n) warmc_malformed("malformed UTF-8 encoding");
+    else return i;
+    if (i + need >= n) return i;
     for (uint32_t k = 1; k <= need; k++) {
       uint8_t c = p[i + k];
-      if ((c & 0xc0) != 0x80) warmc_malformed("malformed UTF-8 encoding");
+      if ((c & 0xc0) != 0x80) return i;
       cp = (cp << 6) | (c & 0x3f);
     }
-    if (cp < lo) warmc_malformed("malformed UTF-8 encoding");
-    if (cp > 0x10ffff) warmc_malformed("malformed UTF-8 encoding");
-    if (cp >= 0xd800 && cp <= 0xdfff) warmc_malformed("malformed UTF-8 encoding");
+    if (cp < lo || cp > 0x10ffff || (cp >= 0xd800 && cp <= 0xdfff)) return i;
     i += need + 1;
   }
+  return n;
+}
+
+static void check_utf8(const uint8_t *p, uint32_t n) {
+  if (wasm_utf8_prefix(p, n) != n) warmc_malformed("malformed UTF-8 encoding");
 }
 
 static char *rd_name(Rd *r, uint32_t *len) {

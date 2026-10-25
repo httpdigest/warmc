@@ -111,6 +111,17 @@ def oracles():
         out.append(("wabt", ["wat2wasm"] + WABT_FLAGS, ["wasm2wat"] + WABT_FLAGS))
     return out
 
+# Where wasm-tools, the oracle, is wrong and warmc is not.  An entry is still
+# checked: warmc's module must validate and must still differ from
+# wasm-tools', so that an oracle that is fixed shows up as a stale entry.
+# test/spec/wasttext.py keeps the corpus's entries, for the same bug.
+NONFINAL = ("wasm-tools gives an inline signature a (sub (func ...)) type, "
+            "which is not final; the spec has it stand for a singular, final "
+            "function type only (text/types.rst, Type Uses)")
+ORACLE_WRONG = {
+    os.path.join("test", "cases_gc", "ictab_sub.wat"): NONFINAL,
+}
+
 def strip_custom(b):
     """A module without its name sections, or None if it is not one.
 
@@ -198,6 +209,15 @@ def check_fixture(wat):
             return ("no_oracle", label, "")
 
         agree = sorted(n for n, b in theirs.items() if b == mine)
+        wrong = ORACLE_WRONG.get(label)
+        if wrong is not None:
+            if "wasm-tools" in agree:
+                return ("fail", label, "listed in ORACLE_WRONG, but warmc and "
+                        "wasm-tools now agree")
+            if sh([WARMC, "--validate-only", mine_path]).returncode != 0:
+                return ("fail", label, "warmc's module, which differs from "
+                        "wasm-tools' as listed, does not validate")
+            return ("oracle_wrong", label, wrong)
         if len(agree) == len(theirs):
             return ("ok", label, "")
         if agree:
@@ -323,7 +343,8 @@ def main():
 
         corpus = corpus[::(total + cap - 1) // cap]
 
-    counts = {k: 0 for k in ("ok", "exact", "disagree", "consistent", "no_oracle")}
+    counts = {k: 0 for k in ("ok", "exact", "disagree", "consistent", "no_oracle",
+                             "oracle_wrong")}
     failures, notes = [], []
 
     def record(result):
@@ -332,8 +353,8 @@ def main():
             failures.append("%s: %s" % (label, why))
             return
         counts[status] += 1
-        if status == "disagree":
-            notes.append("%s: %s" % (label, why))
+        if status in ("disagree", "oracle_wrong"):
+            notes.append((status, "%s: %s" % (label, why)))
 
     with multiprocessing.Pool(jobs(), initializer=_init_worker,
                               initargs=(ORACLES,)) as pool:
@@ -344,9 +365,10 @@ def main():
 
     # Shapes whose *acceptance* is the property, not their bytes.  The three
     # assemblers expand a table's inline element list to different encodings,
-    # all of them legal -- warmc to the `func x*` form the abbreviation is
-    # defined as, wabt to the expression form -- so comparing bytes here would
-    # pin an encoder's taste rather than a defect.  What did need pinning is
+    # all of them legal -- warmc and wasm-tools name the table, as the
+    # abbreviation's expansion does, wabt leaves table 0 implied -- so
+    # comparing bytes here would pin an encoder's taste rather than a
+    # defect.  What did need pinning is
     # that warmc reads them at all: it used to give both inline-segment
     # abbreviations an empty offset expression and then refuse the result.
     for src in ('(module (func $f (result i32) (i32.const 7))\n'
@@ -368,7 +390,7 @@ def main():
 
     # And shapes whose *refusal* is the property.  The text format lets a
     # field carry an inline import, and an import may not follow a definition
-    # of the same sort -- a rule the front end has and nothing asserted, so
+    # of any sort -- a rule the front end has and nothing asserted, so
     # deleting the check broke no test.
     # A custom-section annotation is a module field, and its grammar is
     # wasm-tools': one anywhere else, a place no section has, a producers
@@ -376,10 +398,10 @@ def main():
     # UTF-8 is refused rather than dropped.
     for src, want in (
             ('(module (func) (func (import "m" "f")))',
-             "must come before every"),
+             "import after a function definition"),
             ('(module (global i32 (i32.const 0)) '
              '(global (import "m" "g") i32))',
-             "must come before every"),
+             "import after a global definition"),
             ('(module (func (@custom "a" "b")))', "misplaced @custom annotation"),
             ('(module (@custom "a" (@custom "b" "c") "d"))', "misplaced @custom annotation"),
             ('(module (func (@producers (language "a" "1"))))', "misplaced @producers annotation"),
@@ -412,22 +434,25 @@ def main():
 
     for why in sorted(failures):
         print("FAIL[wat]: %s" % why)
-    for why in sorted(notes):
-        print("wat: oracles disagree, warmc matches one -- %s" % why)
+    for status, why in sorted(notes):
+        if status == "disagree":
+            print("wat: oracles disagree, warmc matches one -- %s" % why)
+        else:
+            print("wat: wasm-tools is wrong, as listed -- %s" % why)
 
-    compared = counts["ok"] + counts["exact"] + counts["disagree"]
+    compared = counts["ok"] + counts["exact"] + counts["disagree"] + counts["oracle_wrong"]
     if not compared:
         print("FAIL[wat]: nothing was compared -- every file reported no oracle",
               file=sys.stderr)
         failures.append("no comparisons ran")
 
     print("wat: %d byte-identical to %s, %d round trips reproduced their input "
-          "module exactly, %d where the oracles disagreed, %d refused through "
-          "both front ends, %d with no oracle; %d fixtures and %d of the %d "
-          "modules in %s"
+          "module exactly, %d where the oracles disagreed, %d where wasm-tools "
+          "is wrong, %d refused through both front ends, %d with no oracle; %d "
+          "fixtures and %d of the %d modules in %s"
           % (counts["ok"], "+".join(n for n, _, _ in ORACLES), counts["exact"],
-             counts["disagree"], counts["consistent"], counts["no_oracle"],
-             len(wats), len(corpus), total, BUILD))
+             counts["disagree"], counts["oracle_wrong"], counts["consistent"],
+             counts["no_oracle"], len(wats), len(corpus), total, BUILD))
     return 1 if failures else 0
 
 if __name__ == "__main__":
