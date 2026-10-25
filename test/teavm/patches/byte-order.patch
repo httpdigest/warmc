@@ -1,0 +1,25 @@
+ByteOrder.nativeOrder() on the wasm-gc target, without JavaScript.
+
+TeaVM asks JavaScript for it there: a short written through an Int16Array
+over an ArrayBuffer and read back as bytes.  A host other than JavaScript
+has no ArrayBuffer (the WASI adapter stops the program at it), and the answer
+is not the host's to give: a direct buffer is in the module's linear memory,
+which wasm defines as little-endian.  ByteBuffer.order() asks for it.
+
+test/teavm/fixes/byteorder.
+
+--- a/teavm-classlib/org/teavm/classlib/java/nio/TByteOrder.java
++++ b/teavm-classlib/org/teavm/classlib/java/nio/TByteOrder.java
+@@ -33,7 +33,11 @@ public final class TByteOrder {
+ 
+     public static TByteOrder nativeOrder() {
+         if (nativeOrder == null) {
+-            if (PlatformDetector.isJavaScript() || PlatformDetector.isWebAssemblyGC()) {
++            if (PlatformDetector.isWebAssemblyGC()) {
++                // a direct buffer is in linear memory, which is little-endian, and
++                // a host need not be JavaScript to run the module
++                nativeOrder = LITTLE_ENDIAN;
++            } else if (PlatformDetector.isJavaScript()) {
+                 var buffer = new ArrayBuffer(2);
+                 var shortArray = new Int16Array(buffer);
+                 shortArray.set(0, (short) 1);

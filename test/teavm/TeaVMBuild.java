@@ -3,7 +3,8 @@
  * test/javatests), many programs in one JVM.
  *
  *   java -cp TEAVM_DIR/'*':DRIVER warmc.teavm.TeaVMBuild
- *        --teavm TEAVM_DIR [--strict] [--support SRC.java]... JOB...
+ *        --teavm TEAVM_DIR [--strict] [--main CLASS] [--classpath PATH]
+ *        [--support SRC.java]... JOB...
  *
  * TEAVM_DIR is where `make teavm` put TeaVM's jars: the compiler runs from all
  * of them, and the program's classes come from its class library and runtime
@@ -14,7 +15,10 @@
  *
  * A JOB is SRC_DIR=OUT_DIR: every .java file in SRC_DIR is compiled, with javac
  * in this JVM, into OUT_DIR/classes, and TeaVM's wasm-gc target makes
- * OUT_DIR/main.wasm of it.  The entry point is class Main.  --support files are
+ * OUT_DIR/main.wasm of it.  The entry point is class Main, or --main's.
+ * --classpath's directories and jars (separated as the platform separates
+ * them) are classes the program is compiled against and TeaVM reads beside
+ * its own: lwjgl/build.py's LWJGL.  --support files are
  * compiled once and given to every job, and their classes are kept whether or
  * not the program reaches them: test/teavm/FdLibm.java, whose functions
  * test/teavm/wasi.py calls in place of JavaScript's Math.
@@ -136,6 +140,8 @@ public final class TeaVMBuild {
         var support = new ArrayList<Path>();
         var jobs = new ArrayList<String>();
         boolean strict = false;
+        String mainClass = "Main";
+        var extra = new ArrayList<File>();
         for (int i = 0; i < args.length; i++) {
             switch (args[i]) {
                 case "--teavm": {
@@ -161,6 +167,16 @@ public final class TeaVMBuild {
                 }
                 case "--support":
                     support.add(Path.of(args[++i]));
+                    break;
+                case "--main":
+                    mainClass = args[++i];
+                    break;
+                case "--classpath":
+                    for (var entry : args[++i].split(File.pathSeparator)) {
+                        if (!entry.isEmpty()) {
+                            extra.add(new File(entry));
+                        }
+                    }
                     break;
                 case "--strict":
                     strict = true;
@@ -202,7 +218,8 @@ public final class TeaVMBuild {
                 sources = s.filter(p -> p.toString().endsWith(".java")).sorted().collect(Collectors.toList());
             }
             var err = new StringBuilder();
-            if (!javac(sources, classes, "", err)) {
+            var programCp = extra.stream().map(File::toString).collect(Collectors.joining(File.pathSeparator));
+            if (!javac(sources, classes, programCp, err)) {
                 System.err.print("javac " + src + " failed:\n" + err);
                 failed++;
                 continue;
@@ -215,11 +232,12 @@ public final class TeaVMBuild {
             tool.setOptimizationLevel(TeaVMOptimizationLevel.FULL);
             tool.setStrict(strict);
             tool.setObfuscated(false);
-            tool.setMainClass("Main");
+            tool.setMainClass(mainClass);
             tool.setTargetDirectory(out.toFile());
             tool.setTargetFileName("main.wasm");
             var cp = new ArrayList<File>();
             cp.add(classes.toFile());
+            cp.addAll(extra);
             if (supportClasses != null) {
                 cp.add(supportClasses.toFile());
                 tool.getClassesToPreserve().addAll(supportNames);
