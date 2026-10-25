@@ -294,17 +294,28 @@ void warmc_lib_call(u32 idx, const u64 *gpr, const u64 *fpr, const u8 *stk,
     u64 ret[WARMC_RETBUF_WORDS] = { 0 };
     CArgs a = { gpr, fpr, stk, 0, 0, 0, 0 };
     u32 ni = 0, nf = 0;
+    /* Parameters past the registers -- three integers and four floats on
+       x64, seven and eight on arm64 -- ride the callee's stack slots, in
+       parameter order, eight bytes each on x64 and sixteen on arm64;
+       shlib.c gives no C symbol to an export with more than 60 of them,
+       as many as the x64 image holds. */
 #if defined(__x86_64__)
-    /* Parameters past the three integer and four float registers ride the
-       callee's stack slots, eight bytes each in parameter order; shlib.c
-       gives no C symbol to an export with more than the image holds. */
-    u64 stkimg[WARMC_X64_STACK_BYTES / 8];
-    u32 w = 0;
+    enum { NREG_INT = 3, NREG_FLT = 4, SLOT_WORDS = 1 };
+#else
+    enum { NREG_INT = 7, NREG_FLT = 8, SLOT_WORDS = 2 };
+#endif
+    /* written slot by slot: an initialiser would be a call to memset */
+    u64 stkimg[60 * SLOT_WORDS];
+    u32 nstk = 0;
     for (u32 i = 0; i < e->nparams; i++) {
       u8 t = e->ptypes[i];
       u64 v = is_float(t) ? c_float(&a, width(t)) : c_int(&a, width(t));
-      if (is_float(t) ? nf >= 4 : ni >= 3) {
-        if (w < WARMC_X64_STACK_BYTES / 8) stkimg[w++] = v;
+      if (is_float(t) ? nf >= NREG_FLT : ni >= NREG_INT) {
+        if (nstk < 60) {
+          stkimg[SLOT_WORDS * nstk] = v;
+          if (SLOT_WORDS == 2) stkimg[SLOT_WORDS * nstk + 1] = 0;
+          nstk++;
+        }
       } else if (is_float(t)) {
         fargs[2 * nf] = v;
       } else {
@@ -312,13 +323,6 @@ void warmc_lib_call(u32 idx, const u64 *gpr, const u64 *fpr, const u8 *stk,
       }
       if (is_float(t)) nf++; else ni++;
     }
-#else
-    for (u32 i = 0; i < e->nparams; i++) {
-      u8 t = e->ptypes[i];
-      if (is_float(t)) fargs[2 * nf++] = c_float(&a, width(t));
-      else iargs[ni++] = c_int(&a, width(t));
-    }
-#endif
     u8 *outs[WARMC_RET_MAX_RESULTS];
     if (e->nresults > 1)
       for (u32 i = 0; i < e->nresults; i++) outs[i] = (u8 *)(uptr)c_int(&a, 8);
@@ -326,13 +330,8 @@ void warmc_lib_call(u32 idx, const u64 *gpr, const u64 *fpr, const u8 *stk,
     u64 limit = lib_vm->stack_limit;
     if (lib_depth == 1) lib_vm->stack_limit = thread_stack_limit();
     FuncRef fr = warmc_export_func(lib_vm, e);
-#if defined(__x86_64__)
     trap = warmc_invoke_catching_s(fr.code, (WarmInstance *)fr.instance, iargs,
-                                   fargs, ret, stkimg, 8ull * w);
-#else
-    trap = warmc_invoke_catching(fr.code, (WarmInstance *)fr.instance, iargs,
-                                 fargs, ret);
-#endif
+                                   fargs, ret, stkimg, 8ull * SLOT_WORDS * nstk);
     lib_vm->stack_limit = limit;
 
     if (!trap) {

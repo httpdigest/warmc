@@ -55,9 +55,50 @@
               (i64.add (i64.mul (local.get 5) (i64.const 100000))
                        (i64.mul (local.get 6) (i64.const 1000000)))))))))
 
-  ;; more parameters than any target's registers: on x86-64 the rest ride the
-  ;; callee's stack slots, which the library's C entry builds (rt/lib.c); arm64
-  ;; gives it no C symbol, as it gives none past 7 integer or 8 float ones
+  ;; more parameters than any target's registers: the rest ride the callee's
+  ;; stack slots, which the library's C entry builds (rt/lib.c) from the C
+  ;; caller's stack -- eight bytes each on arm64 Linux, packed at their own
+  ;; size on Apple's, which narrow's 4-byte ones show
+  (func (export "narrow") (param i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32
+                           f32 f32 f32 f32 f32 f32 f32 f32 f32 f32 f32) (result f32)
+    (local $s f32)
+    (local.set $s
+      (f32.convert_i32_s
+        (i32.add (i32.add (i32.add (i32.add (i32.add (i32.add (i32.add (i32.add (i32.add (i32.add
+          (local.get 0)
+          (i32.mul (local.get 1) (i32.const 2)))
+          (i32.mul (local.get 2) (i32.const 3)))
+          (i32.mul (local.get 3) (i32.const 4)))
+          (i32.mul (local.get 4) (i32.const 5)))
+          (i32.mul (local.get 5) (i32.const 6)))
+          (i32.mul (local.get 6) (i32.const 7)))
+          (i32.mul (local.get 7) (i32.const 8)))
+          (i32.mul (local.get 8) (i32.const 9)))
+          (i32.mul (local.get 9) (i32.const 10)))
+          (i32.mul (local.get 10) (i32.const 11)))))
+    (f32.add (f32.add (f32.add (f32.add (f32.add (f32.add (f32.add (f32.add (f32.add (f32.add (f32.add
+      (local.get $s)
+      (f32.mul (local.get 11) (f32.const 12)))
+      (f32.mul (local.get 12) (f32.const 13)))
+      (f32.mul (local.get 13) (f32.const 14)))
+      (f32.mul (local.get 14) (f32.const 15)))
+      (f32.mul (local.get 15) (f32.const 16)))
+      (f32.mul (local.get 16) (f32.const 17)))
+      (f32.mul (local.get 17) (f32.const 18)))
+      (f32.mul (local.get 18) (f32.const 19)))
+      (f32.mul (local.get 19) (f32.const 20)))
+      (f32.mul (local.get 20) (f32.const 21)))
+      (f32.mul (local.get 21) (f32.const 22))))
+
+  ;; nine parameters and two results, whose pointers come after them, past
+  ;; the C caller's registers too
+  (func (export "wide_pair") (param i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32 i64)
+    (i32.sub (local.get 8) (local.get 0))
+    (i64.extend_i32_s
+      (i32.add (i32.add (i32.add (i32.add (i32.add (i32.add (i32.add (i32.add
+        (local.get 0) (local.get 1)) (local.get 2)) (local.get 3)) (local.get 4))
+        (local.get 5)) (local.get 6)) (local.get 7)) (local.get 8))))
+
   (func (export "wide") (param i64 i64 i64 i64 i64 i64 i64 i64 i64 i64 i64 i64
                          f64 f64 f64 f64 f64 f64 f64 f64 f64 f64) (result f64)
     (f64.add (f64.add (f64.add (f64.add (f64.add (f64.add (f64.add (f64.add (f64.add (f64.add (f64.add (f64.add (f64.add (f64.add (f64.add (f64.add (f64.add (f64.add (f64.add (f64.add (f64.add (f64.mul (f64.convert_i64_s (local.get 0)) (f64.const 1))

@@ -29,6 +29,28 @@ VREG = {SV["f32"], SV["f64"], SV["v128"], SV["v128_nan"],
 NULL_ONLY = {"refnull", "nullref", "nullfuncref", "nullexternref",
              "nullexnref", "nullcontref"}
 
+# The words of driver.c's stack-argument image, and how many an invoke's
+# arguments take on the target that needs more: past 3 integers and 4 floats
+# on x64, one word a scalar and an aligned two a v128; past 7 and 8 on arm64,
+# two words each.
+SPEC_STK_WORDS = 48
+
+def stack_words(args):
+    def words(ireg, freg, scalar):
+        ni = nf = w = 0
+        for a in args:
+            if a[0] in VREG:
+                if nf >= freg:
+                    vec = a[0] in (SV["v128"], SV["v128_nan"])
+                    w = (w + (w & 1) + 2) if vec else w + scalar
+                nf += 1
+            else:
+                if ni >= ireg:
+                    w += scalar
+                ni += 1
+        return w
+    return max(words(3, 4, 1), words(7, 8, 2))
+
 REF_KINDS = {"funcref", "externref", "anyref", "eqref", "i31ref",
              "structref", "arrayref", "exnref"}
 
@@ -194,10 +216,8 @@ def generate(spec, module_files, stem, idx):
             op = CMD["invoke"]
             args = [value(a) for a in action.get("args", [])]
 
-            if sum(1 for a in args if a[0] in VREG) > 8:
-                raise Unsupported("more vector arguments than the trampoline passes")
-            if sum(1 for a in args if a[0] not in VREG) > 7:
-                raise Unsupported("more integer arguments than the trampoline passes")
+            if stack_words(args) > SPEC_STK_WORDS:
+                raise Unsupported("more stack arguments than the driver's image holds")
         elif action["type"] == "get":
             op = CMD["get"]
             args = []

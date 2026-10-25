@@ -693,7 +693,6 @@ u32 warmc_invoke_catching(void *fn, WarmInstance *v, const u64 *iargs,
   return 0;
 }
 
-#if defined(__x86_64__)
 u32 warmc_invoke_catching_s(void *fn, WarmInstance *v, const u64 *iargs,
                             const u64 *fargs, u64 *retbuf,
                             const u64 *stk, u64 stk_bytes) {
@@ -714,7 +713,6 @@ u32 warmc_invoke_catching_s(void *fn, WarmInstance *v, const u64 *iargs,
   catch_restore(outer, was);
   return 0;
 }
-#endif
 
 static void republish_memory(WarmMemory *M) {
   for (u32 i = 0; i < ninstances; i++) {
@@ -4129,72 +4127,53 @@ static int call_export(const ExportDesc *e, const char *name,
   u64 iargs[8] = { 0 };
   u64 fargs[WARMC_FARGS_WORDS] = { 0 };
   u64 ret[WARMC_RETBUF_WORDS] = { 0 };
-  int nint = 0, nflt = 0;
+  /* Parameters past the register ceilings ride the callee's incoming stack
+     slots; warmc_invoke_s copies this image into them, laid out as the
+     callee reads them: eight bytes per scalar on x64, a sixteen-byte slot
+     each on arm64, in parameter order.  At most 60 of them, as many as the
+     x64 image holds. */
+#if defined(__x86_64__)
+  enum { NREG_INT = 3, NREG_FLT = 4, SLOT_WORDS = 1 };
+#else
+  enum { NREG_INT = 7, NREG_FLT = 8, SLOT_WORDS = 2 };
+#endif
+#define RT_STK_PARAMS 60
+  /* written slot by slot: an initialiser would be a call to memset, which
+     the runtime does not have */
+  u64 stk[RT_STK_PARAMS * SLOT_WORDS];
+  u32 nint = 0, nflt = 0, nstk = 0;
 
   if ((u32)argc < e->nparams) { eputs("warmc-rt: not enough arguments\n"); return 2; }
   for (u32 i = 0; i < e->nparams; i++) {
     u64 bits = parse_u64(argv[i], 0);
-    switch (e->ptypes[i]) {
-
-      case VT_V128:
-        eputs("warmc-rt: a v128 argument cannot be given on the command line\n");
-        return 2;
-      case VT_F32: case VT_F64:
-        if (nflt >= 8) { eputs("warmc-rt: too many float arguments\n"); return 2; }
-        fargs[2 * nflt++] = bits;
-        break;
-      default:
-        if (nint >= 7) { eputs("warmc-rt: too many integer arguments\n"); return 2; }
-        iargs[nint++] = bits;
-        break;
+    u8 t = e->ptypes[i];
+    if (t == VT_V128) {
+      eputs("warmc-rt: a v128 argument cannot be given on the command line\n");
+      return 2;
     }
+    int flt = t == VT_F32 || t == VT_F64;
+    if (flt ? nflt < NREG_FLT : nint < NREG_INT) {
+      if (flt) fargs[2 * nflt] = bits;
+      else iargs[nint] = bits;
+    } else {
+      if (nstk == RT_STK_PARAMS) {
+        eputs("warmc-rt: more than 60 arguments past the registers\n");
+        return 2;
+      }
+      stk[SLOT_WORDS * nstk] = bits;
+      if (SLOT_WORDS == 2) stk[SLOT_WORDS * nstk + 1] = 0;
+      nstk++;
+    }
+    if (flt) nflt++; else nint++;
   }
+  u64 stk_bytes = 8ull * SLOT_WORDS * nstk;
 
   FuncRef fr = warmc_export_func(vm, e);
-
-#if defined(__x86_64__)
-  /* Parameters past the register ceilings (3 ints after vmctx, 4 floats)
-     ride the callee's incoming stack slots; warmc_invoke_s copies this
-     image into them.  The layout is the callee's: eight bytes per scalar in
-     parameter order, and a v128 in an aligned sixteen. */
-#define RT_STK_WORDS 24
-  u64 stk[RT_STK_WORDS];
-  u64 stk_bytes = 0;
-  {
-    u32 ni2 = 0, nf2 = 0, w = 0;
-    for (u32 i = 0; i < e->nparams; i++) {
-      switch (e->ptypes[i]) {
-        case VT_V128:
-          if (nf2 >= 4 && w + 2 < RT_STK_WORDS) {
-            if (w & 1) w++;
-            stk[w++] = fargs[2 * nf2];
-            stk[w++] = fargs[2 * nf2 + 1];
-          }
-          nf2++;
-          break;
-        case VT_F32: case VT_F64:
-          if (nf2 >= 4 && w < RT_STK_WORDS) stk[w++] = fargs[2 * nf2];
-          nf2++;
-          break;
-        default:
-          if (ni2 >= 3 && w < RT_STK_WORDS) stk[w++] = iargs[ni2];
-          ni2++;
-          break;
-      }
-    }
-    stk_bytes = 8ull * w;
-  }
 #define RT_INVOKE(ia, fa, rr) \
   warmc_invoke_s(fr.code, (WarmInstance *)fr.instance, ia, fa, rr, stk, stk_bytes)
 #define RT_INVOKE_CATCHING(ia, fa, rr) \
   warmc_invoke_catching_s(fr.code, (WarmInstance *)fr.instance, ia, fa, rr, \
                           stk, stk_bytes)
-#else
-#define RT_INVOKE(ia, fa, rr) \
-  warmc_invoke(fr.code, (WarmInstance *)fr.instance, ia, fa, rr)
-#define RT_INVOKE_CATCHING(ia, fa, rr) \
-  warmc_invoke_catching(fr.code, (WarmInstance *)fr.instance, ia, fa, rr)
-#endif
 
   if (reps > 0) {
     if (reps > BENCH_MAX) reps = BENCH_MAX;

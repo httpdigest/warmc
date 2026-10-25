@@ -65,6 +65,15 @@ check("divmod", (r0.value, r1.value), (3, 2))
 
 check("seven", fn("seven", C.c_int64, *[C.c_int64] * 7)(1, 2, 3, 4, 5, 6, 7),
       7654321)
+# past the registers, in eight-byte and in four-byte parameters
+check("wide", fn("wide", C.c_double, *[C.c_int64] * 12, *[C.c_double] * 10)(
+          *range(1, 13), *[0.5 * k for k in range(1, 11)]), 1172.5)
+check("narrow", fn("narrow", C.c_float, *[C.c_int32] * 11, *[C.c_float] * 11)(
+          *range(1, 12), *[0.5 * k for k in range(1, 12)]), 1122.0)
+r0, r1 = C.c_int32(), C.c_int64()
+fn("wide_pair", None, *[C.c_int32] * 9, C.POINTER(C.c_int32),
+   C.POINTER(C.c_int64))(*range(1, 10), C.byref(r0), C.byref(r1))
+check("wide_pair", (r0.value, r1.value), (8, 45))
 check("twice_plus_one", fn("twice_plus_one", C.c_int64, C.c_int64)(20), 41)
 check("the import's ctx", seen, [b"python"])
 

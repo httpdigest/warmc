@@ -36,15 +36,46 @@ _start:
     .size _start, . - _start
 #endif
 
+/* warmc_invoke(fn x0, vm x1, iargs x2, fargs x3, retbuf x4): warmc_invoke_s
+   with no stack arguments. */
     .globl SYM(warmc_invoke)
     FUNC_DIRECTIVES(SYM(warmc_invoke))
 SYM(warmc_invoke):
+    mov     x5, #0
+    mov     x6, #0
+    b       SYM(warmc_invoke_s)
+    SIZE_DIRECTIVE(SYM(warmc_invoke))
+
+/* warmc_invoke_s(fn x0, vm x1, iargs x2, fargs x3, retbuf x4, stk x5,
+   stk_bytes x6).  The internal convention carries 7 integers after the
+   instance and 8 floats in registers; a callee with more reads the rest
+   from sixteen-byte slots at its entry sp, one per parameter in parameter
+   order, a scalar in a slot's low eight bytes.  The caller builds an image
+   of exactly those slots, stk_bytes of it, a multiple of 16, and it is
+   copied to the bottom of the cushion, which grows to hold it.  The cushion
+   is 512 bytes at least, so a callee's reads of slots no image wrote stay
+   in memory that is ours. */
+    .globl SYM(warmc_invoke_s)
+    FUNC_DIRECTIVES(SYM(warmc_invoke_s))
+SYM(warmc_invoke_s):
     stp     x29, x30, [sp, #-16]!
     mov     x29, sp
     stp     x19, x20, [sp, #-16]!
 
-    sub     sp, sp, #512
-
+    add     x9, x6, #15
+    and     x9, x9, #-16
+    mov     x10, #512
+    cmp     x9, x10
+    csel    x9, x9, x10, hi
+    sub     sp, sp, x9
+    mov     x10, #0
+1:  cmp     x10, x6
+    b.hs    2f
+    ldr     x11, [x5, x10]
+    str     x11, [sp, x10]
+    add     x10, x10, #8
+    b       1b
+2:
     mov     x19, x4
     mov     x16, x0
     mov     x17, x1
@@ -83,11 +114,11 @@ SYM(warmc_invoke):
     str     x0, [x19, #0]
     str     q0, [x19, #16]
 
-    add     sp, sp, #512
+    sub     sp, x29, #16
     ldp     x19, x20, [sp], #16
     ldp     x29, x30, [sp], #16
     ret
-    SIZE_DIRECTIVE(SYM(warmc_invoke))
+    SIZE_DIRECTIVE(SYM(warmc_invoke_s))
 
     .globl SYM(warmc_setjmp)
     FUNC_DIRECTIVES(SYM(warmc_setjmp))
