@@ -308,7 +308,9 @@ PROG [--catch] [--bench N] EXPORT ARGS... [-- EXPORT ARGS...]...
   - `2` unknown export, too few arguments (extra ones are ignored), a `v128`
     parameter, or more than 60 parameters past the registers (3 integer
     and 4 float on x64, 7 and 8 on arm64)
-  - `4` unresolved import (the harness provides no imports)
+  - `4` unresolved import (the harness provides no imports), or an instance
+    the runtime refuses to make, such as one with a memory or table past its
+    limits, printed as `warmc-rt: cannot instantiate: …`
   - `139` a fault outside linear memory
 
 `--no-export-names` removes the export-name table from the binary, except for
@@ -509,10 +511,10 @@ turns it into an `anyref` (`any.convert_extern`) sees it as no object and no
 `i31` of its own, and gets it back unchanged from `extern.convert_any`.
 
 Limits: at most 4096 instances per process, and instances are never freed.
-Every memory that a module compiled with guard pages (`-O2` and `-O3`)
+Every 32-bit memory that a module compiled with guard pages (`-O2` and `-O3`)
 defines takes one of 1024 guarded address-space reservations, as does the
-process's first memory whatever the level, so at most 1024 such memories can
-be made.
+process's first 32-bit memory whatever the level, so at most 1024 such
+memories can be made. A 64-bit memory takes none.
 
 `test/link/driver.c` (multi-module linking) and `test/tinygo/driver.c`
 (hand-written WASI imports) are complete examples.
@@ -896,8 +898,8 @@ Without guard pages, and always for memory64, accesses are checked explicitly,
 and the `bce` pass removes the checks it can prove redundant. A 64-bit memory
 has no guard region and reserves what it may grow to: its declared maximum, up
 to 4 TiB, or 64 GiB when it declares none, and less, halving, where the
-address space runs short. The pages it grows into cost nothing until written,
-except on Windows, which commits them when the memory grows. Stack overflow
+address space runs short. Its pages cost nothing until written, except on
+Windows, which commits them when the memory is made or grows. Stack overflow
 is detected by a prologue check in every function that makes calls. It traps
 as `call stack exhausted` rather than crashing.
 
@@ -1025,6 +1027,8 @@ variables, `WARMC_GC_*` among them, at its first call.
 | Multi-memory | ✅ |
 | Extended constant expressions | ✅ |
 | Deterministic profile | ✅ `--profile=deterministic` |
+| Custom annotations: `(@custom ...)` | ✅ (and wasm-tools' `(@producers ...)` and `(@dylink.0 ...)`) |
+| Name section and name annotations | ✅ functions' names become their symbols' (see [How it works](#how-it-works)); the text assembler writes them from `$id`s and `(@name ...)` on functions. Module, local, type and field names are not used. |
 | Threads, shared memory, atomics | ❌ a shared memory is rejected when parsing, atomic instructions when validating |
 | Stack switching, stringref, wide arithmetic, custom page sizes, custom descriptors | ❌ |
 | Component Model | partial, see [Components and WIT](#components-and-wit) |
@@ -1047,9 +1051,9 @@ assembler handles both flat and folded syntax, names in every index space,
 inline imports, exports and segments, GC type definitions, and custom
 sections: `(@custom ...)` where it says, `(@producers ...)` last and
 `(@dylink.0 ...)` first. It writes a name section of the functions' names:
-each one's `(@name "...")` annotation, or else its `$id`. It reads the 3.0 text grammar as written, down to
-its tokens: a run like `data"a"` is one reserved token and refused, and so is
-source that is not UTF-8.
+each one's `(@name "...")` annotation, or else its `$id`. It reads the 3.0
+text grammar as written, down to its tokens: a run like `data"a"` is one
+reserved token and refused, and so is source that is not UTF-8.
 
 **Middle end** (`src/ir*.c`, `opt.c`, `inline.c`, `tramp.c`, `gosp.c`). Functions become SSA with
 block parameters instead of phi nodes. SSA is built directly from wasm locals,
@@ -1348,13 +1352,14 @@ Most of the suite is **differential**. warmc's output is compared with:
 - exact arithmetic, for every division's magic numbers (`test/magic.py`)
 - the module itself, for the custom sections each linked image carries, read
   back from Mach-O, ELF and PE (`test/check_macho.py`, `check_elf.py`,
-  `check_pe.py`) and asked for by name from a library (`test/run_customs.py`)
+  `check_pe.py`) and asked for by name from a library (`test/run_customs.py`),
+  and for the names its functions' symbols take in Mach-O and ELF
 
 The other rows check what has no second engine to compare with:
 - the trap tests (`test/cases_traps`), against the trap each export must
   raise, listed in `test/run_traps.sh`, at each level, at `-O3`, with
-  `-fexact-trap`, without the register allocator and with far branches
-  forced
+  `-fexact-trap`, without guard pages, without the register allocator and
+  with far branches forced
 - what a trap leaves in memory and globals with `-fexact-trap`, read by the
   calls after it on one instance (`test/run_trapstate.py`,
   `test/cases_trapstate`, with `test/link/statedriver.c`), at each level,
@@ -1378,12 +1383,11 @@ The other rows check what has no second engine to compare with:
   `run_tsan.sh`)
 
 Five phases run last, each alone, because they need a quiet machine or would
-load it for the others: the collector's pause check, the Go- and GHC-shaped
+load it for the others: the collector's pause check; the Go- and GHC-shaped
 rewrites' modules and random programs on a 64-bit memory past 4 GiB
-(`test/gen_mem64.py`, against `-O0` and wasmtime) with the Mach-O row, the
-corpora with `-fexact-trap`, the
-official testsuite at the levels `make check-spec` runs, and the pass
-combinations.
+(`test/gen_mem64.py`, against `-O0` and wasmtime), with the Mach-O row; the
+corpora with `-fexact-trap`; the official testsuite at the levels
+`make check-spec` runs; and the pass combinations.
 
 `test/run_shared.sh` builds a shared library and calls it from C, C++,
 Python's `ctypes` and Java's foreign function API. The Java part needs Java 22
@@ -1477,6 +1481,10 @@ Makefile        the build, the pinned dependencies and the test targets
 - **Memories:** a 32-bit one holds at most 65535 pages, one short of 4 GiB, a
   64-bit one 2^26 pages (4 TiB), or 2^20 (64 GiB) when it declares no maximum.
 - **A function's frame** is at most 1 MiB on AArch64 and 128 MiB on x86-64.
+- **Tail calls:** a module that makes one is refused if any of its function
+  types takes more than 512 bytes of stack arguments -- more than 32
+  parameters past the registers on AArch64, or 64 on x86-64 -- as a function
+  the host calls has room for no more.
 - **Guarded memories:** at most 1024 per process (see [Embedding compiled
   modules in C](#embedding-compiled-modules-in-c)).
 - **`--system-ld`** does not link Windows output.
