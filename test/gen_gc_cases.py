@@ -44,6 +44,18 @@ instead of keeping a register.  One stores into an array element, the other
 into a struct field past the reach of a scaled offset, whose address goes into
 x16 too.  Each function holds a single store: two would earn the constant a
 register of its own.
+
+And the *depth of a constant expression*.  The runtime evaluates a global's
+initialiser itself, on a stack of values (and of roots, for the collector) as
+deep as the deepest initialiser in the module.  It kept that stack in its frame
+and refused, as invalid, a module whose initialiser needed more than 1,024
+values -- which TeaVM's do, an `array.new_fixed` of 3,716 elements for its class
+table, where the spec sets no depth at all.  Past 256 values the stack is
+mapped for the evaluation instead, so `$deep` and `$past` sit on either side of
+that line and `$wide` is an `array.new_fixed` of 3,000 allocations, each held on
+the mapped stack while the next is made: under WARMC_GC_STRESS
+(test/run_gc_modes.sh) a collection fires between them, and an object only the
+stack held would be read back freed.
 """
 import os
 import sys
@@ -224,6 +236,25 @@ def gen():
         A("    (call $eq64 (i64.reinterpret_f64 %s) (i64.const 0xfff0000000000000))"
           % load)
         A("  )")
+
+    A("  (type $dk (struct (field i32)))")
+    A("  (type $darr (array (ref $dk)))")
+    for name, n in (("deep", 256), ("past", 257), ("wide", 3000)):
+        A("  (global $%s (ref $darr) (array.new_fixed $darr %d" % (name, n))
+        A("    " + " ".join("(struct.new $dk (i32.const %d))" % (k * 7 + 1) for k in range(n)))
+        A("  ))")
+    A('  (func (export "deepconst") (local $i i32) (local $s i32)')
+    for name, n in (("deep", 256), ("past", 257), ("wide", 3000)):
+        A("    (local.set $i (i32.const 0)) (local.set $s (i32.const 0))")
+        A("    (block $done (loop $next")
+        A("      (br_if $done (i32.ge_u (local.get $i) (array.len (global.get $%s))))" % name)
+        A("      (local.set $s (i32.add (local.get $s) (struct.get $dk 0"
+          " (array.get $darr (global.get $%s) (local.get $i)))))" % name)
+        A("      (local.set $i (i32.add (local.get $i) (i32.const 1)))")
+        A("      (br $next)))")
+        A("    (call $eq64 (i64.extend_i32_u (local.get $s)) (i64.const %d))"
+          % sum(k * 7 + 1 for k in range(n)))
+    A("  )")
 
     farpool("farpool_array",
             "(global.set $gdbl (array.new $adbl (f64.const 0) (i32.const 8)))",

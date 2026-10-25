@@ -1143,9 +1143,6 @@ static void expect_init(Module *m, const InitExpr *e, ValType want,
   if (!vt_subtype(m, st[0], want))
     warmc_invalid("type mismatch in %s: expected %s, found %s", what,
                   vt_name(want), vt_name(st[0]));
-  if (peak > MAX_CONST_DEPTH)
-    warmc_invalid("%s needs a stack of %u values, more than the %u the runtime "
-                  "evaluates one on", what, peak, MAX_CONST_DEPTH);
   if (peak > m->max_const_depth) m->max_const_depth = peak;
   xfree(st);
 }
