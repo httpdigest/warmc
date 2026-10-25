@@ -458,6 +458,44 @@ both):
 - `console-bytes`: `System.out.write` and `flush`, which threw: a null action
   called, a decoder left at its end, and an offset never advanced.
 
+### LWJGL 3 programs on macOS
+
+`lwjgl/` is LWJGL 3's Java API for programs TeaVM compiles and warmc builds,
+calling GLFW and macOS's OpenGL framework directly, with no LWJGL jar or JNI
+anywhere:
+
+```sh
+make all teavm glfw
+python3 lwjgl/build.py --main HelloWorld lwjgl/demo/hello -o hello
+./hello
+```
+
+`lwjgl/demo/hello/HelloWorld.java` is LWJGL's own HelloWorld, a window
+cleared to blue. `lwjgl/build.py` compiles the program against `lwjgl/src`,
+has TeaVM make a module of both, the TeaVM adapter a WASI command of that,
+and warmc a native executable, linked against GLFW (`make glfw` fetches the
+3.4 release) and the frameworks it needs.
+
+- Each GLFW and OpenGL function is an import of module `lwjgl`, which
+  `build.py` passes to warmc as a `--native-module` (see [Calling C
+  functions](#calling-c-functions)): a direct call of the C function, its
+  arguments where C's convention puts them.
+- An address is a native one, as in LWJGL, and C takes it as it is. What Java
+  allocates -- `MemoryStack`, `MemoryUtil.memAlloc`, `BufferUtils` -- is in
+  the module's linear memory, at `warmc_memory_base()` plus its offset there,
+  and Java reads and writes it with wasm's own loads and stores. Memory C
+  owns (a string GLFW hands back, a `GLFWvidmode`) is read through `memcpy`.
+- GLFW's callbacks reach Java through `lwjgl/native/lwjgl.c`, one C function
+  per kind of callback that calls the module's export for it. An exception a
+  callback throws comes out of the GLFW function whose call ran it, as with
+  LWJGL's own upcalls.
+- So far it has what `HelloWorld` and `test/lwjgl/bluewindow` use: `GLFW`
+  with its constants, the window, input and context functions, and eight
+  kinds of callback; `GL11`/`GL11C`'s clearing, viewport, state, queries,
+  `glReadPixels` and immediate mode; `GL.createCapabilities`;
+  `MemoryStack`, `MemoryUtil`, `BufferUtils` and `Version`. `BufferUtils`'s
+  buffers are never freed, as nothing collects linear memory.
+
 ### WASI 0.2 command components
 
 If the input is a component that exports `wasi:cli/run@0.2.x#run`, `--wasi`
@@ -583,6 +621,36 @@ memories can be made. A 64-bit memory takes none.
 
 `test/link/driver.c` (multi-module linking) and `test/tinygo/driver.c`
 (hand-written WASI imports) are complete examples.
+
+### Calling C functions
+
+`--native-module NAME` makes every function import of module `NAME` a call
+of the C function of the import's name: no host binding, no thunk, the
+arguments in the registers and stack slots the platform's C convention has
+them in (Apple's packed stack arguments on macOS), and the C function found
+by the system linker, which `--link` gives what it needs:
+
+```sh
+clang -O2 -c -o gl.o mygl.c
+build/warmc --target macos --rt build/warmrt-macos.a --wasi \
+  --native-module c --link "gl.o -framework OpenGL" -o app app.wasm
+```
+
+- A native import takes and returns `i32`, `i64`, `f32` and `f64` alone, at
+  most one result, and can only be called: one exported, in a table, taken
+  by `ref.func` or used as the start function is refused. A tail call of one
+  is a call and a return.
+- A pointer is an `i64` native address. `warmc_memory_base`, of type
+  `() -> i64` in a native module, is not a C function but memory 0's base,
+  the native address of offset 0, read from the register warmc keeps it in;
+  a 32-bit memory's base does not move, as warmc reserves all it can grow to.
+- C calls back into the program through `warmc_wasi_instance`, the instance
+  `--wasi`'s host made of it, with `warmc_find_export` and `warmc_invoke`. A
+  collection waits while such a call runs, as it does in every nested call.
+- Native imports leave the wasm sandbox: C reads and writes what it is
+  handed, wherever it points. They are AArch64's alone, on Linux and macOS,
+  link with the system linker, which they imply, and not into a `--shared`
+  library.
 
 ### Shared libraries
 
@@ -1042,6 +1110,8 @@ on each corpus (Apple M-series):
 | `--no-function-names` | name every function's symbol `wasm_func_N`, by its index, rather than as the name section does |
 | `--no-dead-strip` | keep unreferenced sections in the link |
 | `--system-ld`, `--ld PATH` | link with an external linker instead (Linux and macOS only, not with `--shared`) |
+| `--native-module NAME` | call the C function of each function import of module `NAME` (see [Calling C functions](#calling-c-functions)); implies `--system-ld` |
+| `--link ARGS` | more for the system linker: objects, archives, `-framework` and `-l` options, in its shell syntax; repeatable |
 | `--keep-obj` | keep the intermediate object |
 | `-v` | print the external link command |
 | `--validate-only`, `--emit-wasm`, `--dump-*`, `--print-ir`, `--stats`, `--profile`, `-fno-loadbar` | see above |
@@ -1427,6 +1497,17 @@ Most of the suite is **differential**. warmc's output is compared with:
   the JVM again for TeaVM's patches, a program for each in `test/teavm/fixes`
   built with the patched TeaVM, with and without `--strict`, each run's
   output the JVM's for the same classes
+- clang, for `--native-module` (`test/run_native.py`): C functions
+  (`test/native/natives.c`) that answer with where each argument arrived,
+  called at every level with up to twenty arguments of each kind, across
+  calls that write every caller-saved register, from a tail call, back into
+  the module from C, and on linear memory at `warmc_memory_base`'s address;
+  the arguments loaded into C's registers rather than moved there; and each
+  use of a native import warmc refuses
+- GLFW and macOS's OpenGL, for `lwjgl/` (`test/run_lwjgl.py`): LWJGL's
+  HelloWorld built, and a program that makes a window, reports a GLFW error
+  through the error callback, has a callback's exception come out of the
+  GLFW call that ran it, and reads back pixels cleared to blue
 - the Component Model's reference `definitions.py`, for canonical-ABI layout
   and for what the generated adapter code computes (`test/run_adapter.py`)
 - wabt's `wasm-interp` again, for random modules in Go's shape whose stack
@@ -1551,6 +1632,7 @@ rt/             the runtime linked into every program and shared library
   warm_rt.h                               the embedding API
   const_ops.inc                           the constant-expression opcodes, shared with the compiler
 test/           test drivers (run_all.sh is make check), cases, benchmark and test corpora, the spec harness (spec/), TeaVM's driver and WASI adapter (teavm/)
+lwjgl/          LWJGL 3's API for TeaVM and warmc (src/), its C glue (native/), the build driver and a demo
 example/        TinyGo and Kotlin sample programs (source, .wasm and a macOS build)
 Makefile        the build, the pinned dependencies and the test targets
 .github/        CI: make smoke on pushes to main and on pull requests, make check nightly
@@ -1561,6 +1643,8 @@ Makefile        the build, the pinned dependencies and the test targets
 ## Limitations
 
 - **x86-64 is supported for Windows only.** Linux and macOS output is AArch64.
+- **Native imports are AArch64's alone,** and `lwjgl/` is macOS's alone and
+  has only part of LWJGL's API.
 - **No wasm threads.** Shared memories and atomics are rejected. (The
   runtime itself has a collector thread, and a library takes calls from
   several threads.)
