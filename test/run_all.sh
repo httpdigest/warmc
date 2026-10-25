@@ -207,6 +207,8 @@ start names    python3 test/run_names.py
 # the WASI adapter for TeaVM's modules, on modules shaped as TeaVM writes
 # them, and the fdlibm it calls for Math against the JVM's StrictMath
 start teavm    python3 test/run_teavm.py
+# --native-module: imports called as C functions, on the host's own target
+start native   python3 test/run_native.py
 start shared   ./test/run_shared.sh
 
 start elf      ./test/run_elf.sh

@@ -1703,6 +1703,7 @@ static int drive(int argc, char **argv) {
   }
   WarmInstance *app = warmc_instantiate_bound_catching(md, binds, &e);
   free(binds);
+  warmc_wasi_instance = app;
   if (!app) {
 
     err("warmc-wasi: the module failed to instantiate or link: ");
@@ -1732,5 +1733,7 @@ static int drive(int argc, char **argv) {
   warmc_report_run(app);
   return 0;
 }
+
+WarmInstance *warmc_wasi_instance;
 
 int (*warmc_driver_hook)(int argc, char **argv) = drive;

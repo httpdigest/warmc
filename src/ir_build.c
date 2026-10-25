@@ -1556,6 +1556,10 @@ IrFunc *ir_build_unordered(Module *m, uint32_t fi, const OptOpts *opt) {
         uint32_t idx = fmap(m, rdu32(b));
         if (idx >= m->nfuncs) warmc_fatal("call to undefined function %u", idx);
         CompType *sig = &m->types[m->funcs[idx].type_index];
+        if (m->funcs[idx].native_memory_base) {
+          push(b, ir_emit(f, b->cur, I_MEM_BASE, VT_I64, NULL, 0, 0, 0));
+          break;
+        }
         uint32_t base = b->sp - sig->nparams;
         Ref call = ir_emit(f, b->cur, I_CALL,
                            sig->nresults == 1 ? sig->results[0] : 0,
@@ -1604,6 +1608,22 @@ IrFunc *ir_build_unordered(Module *m, uint32_t fi, const OptOpts *opt) {
           imm = fmap(m, rdu32(b));
           if (imm >= m->nfuncs) warmc_fatal("return_call to undefined function %u", (uint32_t)imm);
           sig = &m->types[m->funcs[imm].type_index];
+          if (m->funcs[imm].native) {
+            /* C has no tail call on wasm's terms: a call, then the return */
+            uint32_t base = b->sp - sig->nparams;
+            Ref call = m->funcs[imm].native_memory_base
+                ? ir_emit(f, b->cur, I_MEM_BASE, VT_I64, NULL, 0, 0, 0)
+                : ir_emit(f, b->cur, I_CALL, sig->nresults == 1 ? sig->results[0] : 0,
+                          &b->stack[base], sig->nparams, imm, 0);
+            b->sp = base;
+            Block *blk = &f->blocks[b->cur];
+            set_term(b, b->cur, T_RETURN);
+            blk->nret = sig->nresults;
+            blk->ret_args = xmalloc(sizeof(Ref));
+            blk->ret_args[0] = call;
+            b->dead = true;
+            break;
+          }
         } else if (op == 0x15) {
           imm = rdu32(b);
           if (imm >= m->ntypes) warmc_fatal("return_call_ref type %u out of range", (uint32_t)imm);

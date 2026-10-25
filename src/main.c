@@ -175,6 +175,14 @@ static const char *usage_text =
   "                ld.lld for linux; for macos ld on a macOS host and\n"
   "                ld64.lld elsewhere ($WARMC_LD overrides)\n"
   "  --ld PATH     which one, and implies --system-ld\n"
+  "  --native-module NAME  call the C function of each function import of\n"
+  "                module NAME, by its name, with the platform's C calling\n"
+  "                convention: i32, i64, f32 and f64 alone, a pointer an i64\n"
+  "                native address, and the import only ever called.  Its\n"
+  "                warmc_memory_base, () -> i64, is memory 0's base, not C's.\n"
+  "                AArch64's, on linux and macos; implies --system-ld\n"
+  "  --link ARGS   more for the system linker, in its shell syntax: objects,\n"
+  "                archives, -l and -framework; repeatable\n"
   "  --no-dead-strip  keep every section in the link, referenced or not\n"
   "  --keep-obj    do not delete the intermediate object\n"
   "  -v            print the link command\n"
@@ -213,6 +221,71 @@ static bool is_directory(const char *path) {
 static bool ends_with(const char *s, const char *suffix) {
   size_t n = strlen(s), m = strlen(suffix);
   return n >= m && !strcmp(s + n - m, suffix);
+}
+
+/* Every function import of a --native-module becomes a call of the C function
+   of its name: the module asks for it by name, and the system linker finds it
+   in what --link gives it.  Only calls: C has no wasm function to hand back
+   for ref.func, a table or an export, and only the values C passes in
+   registers as wasm has them.  How many there are. */
+static uint32_t mark_native_imports(Module *m, const char *const *mods, uint32_t nmods) {
+  uint32_t n = 0;
+  for (uint32_t fi = 0; fi < m->nfuncs; fi++) {
+    Func *fn = &m->funcs[fi];
+    if (!fn->imported) continue;
+    const Import *im = &m->imports[fn->import_index];
+    bool native = false;
+    for (uint32_t k = 0; k < nmods && !native; k++)
+      native = strlen(mods[k]) == im->module_len && !memcmp(mods[k], im->module, im->module_len);
+    if (!native) continue;
+    const CompType *t = &m->types[fn->type_index];
+    bool ok = t->nresults <= 1;
+    for (uint32_t k = 0; k < t->nparams && ok; k++)
+      ok = t->params[k] == VT_I32 || t->params[k] == VT_I64 ||
+           t->params[k] == VT_F32 || t->params[k] == VT_F64;
+    for (uint32_t k = 0; k < t->nresults && ok; k++)
+      ok = t->results[k] == VT_I32 || t->results[k] == VT_I64 ||
+           t->results[k] == VT_F32 || t->results[k] == VT_F64;
+    if (!ok)
+      warmc_fatal("native import %.*s.%.*s: a C function is called with i32, i64, f32 "
+                  "and f64 alone, and returns at most one of them",
+                  (int)im->module_len, im->module, (int)im->name_len, im->name);
+    if (!strcmp(im->name, "warmc_memory_base")) {
+      if (t->nparams || t->nresults != 1 || t->results[0] != VT_I64 || !m->nmemories)
+        warmc_fatal("native import %.*s.warmc_memory_base: memory 0's base, an i64 of a "
+                    "module with a memory, and takes no arguments",
+                    (int)im->module_len, im->module);
+      fn->native_memory_base = true;
+    } else if (!im->name_len || strlen(im->name) != im->name_len) {
+      warmc_fatal("native import %.*s: a C function's name, not empty and without a NUL",
+                  (int)im->module_len, im->module);
+    }
+    fn->native = true;
+    n++;
+  }
+  if (!n) return 0;
+  for (uint32_t e = 0; e < m->nexports; e++)
+    if (m->exports[e].kind == EK_FUNC && m->funcs[m->exports[e].index].native)
+      warmc_fatal("export %.*s is a native import: a native import can only be called",
+                  (int)m->exports[e].name_len, m->exports[e].name);
+  if (m->has_start && m->funcs[m->start_func].native)
+    warmc_fatal("the start function is a native import: a native import can only be called");
+  for (uint32_t g = 0; g < m->nglobals; g++)
+    for (uint32_t k = 0; k < m->globals[g].init.n; k++) {
+      const InitInsn *x = &m->globals[g].init.ins[k];
+      if (x->op == IOP_REF_FUNC && x->lo < m->nfuncs && m->funcs[x->lo].native)
+        warmc_fatal("global %u holds native import %u: a native import can only be called",
+                    g, (uint32_t)x->lo);
+    }
+  for (uint32_t e = 0; e < m->nelems; e++)
+    for (uint32_t i = 0; i < m->elems[e].n; i++)
+      for (uint32_t k = 0; k < m->elems[e].items[i].n; k++) {
+        const InitInsn *x = &m->elems[e].items[i].ins[k];
+        if (x->op == IOP_REF_FUNC && x->lo < m->nfuncs && m->funcs[x->lo].native)
+          warmc_fatal("element segment %u holds native import %u: a native import can only "
+                      "be called", e, (uint32_t)x->lo);
+      }
+  return n;
 }
 
 static const char *macos_libdir(void) {
@@ -313,6 +386,9 @@ int main(int argc, char **argv) {
   const char *header = NULL, *sym_prefix = NULL;
 
   bool system_ld = warmc_getenv("WARMC_SYSTEM_LD") != NULL;
+  const char *native_mods[64];
+  uint32_t nnative_mods = 0;
+  char link_extra[8192] = "";
   bool dump_component = false, dump_wit = false, emit_wasm = false;
   bool dump_canon = false;
   bool dump_adapter = false, dump_cwit = false, dump_link = false;
@@ -391,6 +467,19 @@ int main(int argc, char **argv) {
     else if (!strcmp(a, "--rt") && i + 1 < argc) rt = argv[++i];
     else if (!strcmp(a, "--ld") && i + 1 < argc) { ld = argv[++i]; system_ld = true; }
     else if (!strcmp(a, "--system-ld")) system_ld = true;
+    else if ((!strcmp(a, "--native-module") && i + 1 < argc) ||
+             !strncmp(a, "--native-module=", 16)) {
+      if (nnative_mods == sizeof native_mods / sizeof native_mods[0])
+        warmc_fatal("too many --native-module options");
+      native_mods[nnative_mods++] = a[15] == '=' ? a + 16 : argv[++i];
+    }
+    else if ((!strcmp(a, "--link") && i + 1 < argc) || !strncmp(a, "--link=", 7)) {
+      const char *v = a[6] == '=' ? a + 7 : argv[++i];
+      if (strlen(link_extra) + strlen(v) + 2 > sizeof link_extra)
+        warmc_fatal("--link: too long");
+      strcat(link_extra, " ");
+      strcat(link_extra, v);
+    }
 
     else if (!strncmp(a, "--magic=", 8)) {
       const char *arg = a + 8;
@@ -507,6 +596,7 @@ int main(int argc, char **argv) {
   else if (strcmp(target, "linux")) warmc_fatal("unknown target %s", target);
   if (fmt == TGT_PE) g_target = &warmc_target_x64;
   bool macho = fmt == TGT_MACHO;
+  codegen_set_darwin_abi(macho);
   const char *outdef = fmt == TGT_PE ? "a.exe" : "a.out";
   const char *entry_sym = fmt == TGT_PE ? "warmc_win_entry"
                         : macho ? "_main" : "_start";
@@ -618,6 +708,16 @@ int main(int argc, char **argv) {
   Module *m = wasm_parse(bin, len);
   STAMP(_t1);
   wasm_validate(m);
+  uint32_t nnative = mark_native_imports(m, native_mods, nnative_mods);
+  if (nnative && fmt == TGT_PE)
+    warmc_fatal("--native-module: native imports are AArch64's alone, for linux and macos");
+  if (nnative && shared)
+    warmc_fatal("--native-module: a --shared library's imports are bound by the program "
+                "that loads it");
+  /* the built-in linker resolves nothing outside warmc's own runtime */
+  if (nnative) system_ld = true;
+  if (*link_extra && !system_ld && !obj_only)
+    warmc_fatal("--link: for the system linker (--system-ld)");
   STAMP(_t2);
   if (wtm) fprintf(stderr, "front: parse %.1f validate %.1f (peak %.0f MB)\n",
                    _t1 - _t0, _t2 - _t1, peak_rss_mb());
@@ -828,7 +928,7 @@ int main(int argc, char **argv) {
     return 0;
   }
 
-  char cmd[8192];
+  char cmd[20000];
   if (fmt == TGT_PE)
     warmc_fatal("--system-ld --target windows: not wired up; the built-in "
                 "linker handles the PE link (an SDK-import-lib escape hatch "
@@ -839,15 +939,20 @@ int main(int argc, char **argv) {
       warmc_fatal("no macOS SDK found for -lSystem; install the command line "
                   "tools (xcode-select --install) or set WARMC_MACOS_LIBDIR "
                   "to the directory holding libSystem.tbd");
+    /* the SDK's frameworks, which a --link -framework names */
+    char fw[4200] = "";
+    snprintf(fw, sizeof fw, "%s/../../System/Library/Frameworks", libdir);
+    if (!is_directory(fw)) fw[0] = 0;
     snprintf(cmd, sizeof cmd,
              "%s -arch arm64 -platform_version macos 11.0 11.0 -o %s %s %s%s%s "
-             "-lSystem -L%s",
+             "-lSystem -L%s%s%s%s",
              ld, output ? output : outdef, objpath,
-             want_wasi ? wasi : "", want_wasi ? " " : "", rt, libdir);
+             want_wasi ? wasi : "", want_wasi ? " " : "", rt, libdir,
+             *fw ? " -F" : "", fw, link_extra);
   } else {
-    snprintf(cmd, sizeof cmd, "%s -static -e _start -o %s %s %s%s%s",
+    snprintf(cmd, sizeof cmd, "%s -static -e _start -o %s %s %s%s%s%s",
              ld, output ? output : outdef, objpath,
-             want_wasi ? wasi : "", want_wasi ? " " : "", rt);
+             want_wasi ? wasi : "", want_wasi ? " " : "", rt, link_extra);
   }
   if (verbose) fprintf(stderr, "warmc: %s\n", cmd);
   int rc = system(cmd);

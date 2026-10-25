@@ -238,6 +238,12 @@ typedef struct {
   ValType *local_types;
   uint32_t ntotal_locals;
   bool imported;
+  /* an import of a --native-module: a call to it is a call of the C
+     function of its name, made with the platform's C calling convention --
+     or, for warmc_memory_base, memory 0's base, the native address that
+     linear memory's offsets are from */
+  bool native;
+  bool native_memory_base;
   uint32_t import_index;
   char *sym;
   char *name;   /* the name section's name for it, or NULL */
@@ -655,6 +661,12 @@ void codegen_set_function_names(bool on);
 
 void codegen_set_load_barrier(bool on);
 extern bool warmc_load_barrier;
+/* whether a C call's arguments on the stack are packed, as Apple's AArch64
+   convention has them, rather than given 8 bytes each */
+void codegen_set_darwin_abi(bool on);
+extern bool warmc_darwin_abi;
+/* ImportDesc.flags: rt/warm_rt.h's WARMC_IMPORT_NATIVE */
+#define IMPORT_NATIVE 1u
 
 void codegen_rename_funcs(Module *m, const char *prefix);
 

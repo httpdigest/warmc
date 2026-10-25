@@ -151,8 +151,13 @@ typedef struct {
   u32 vt_flags;
   u32 name_len;
   u64 heap_id;
-  u32 module_len, pad3;
+  u32 module_len;
+  u32 flags;                    /* WARMC_IMPORT_* */
 } ImportDesc;
+
+/* An import of a --native-module: the module calls the C function of its
+   name, which the system linker resolved, and the import needs no binding. */
+#define WARMC_IMPORT_NATIVE 1u
 
 typedef struct {
   u64 min, max;
@@ -552,6 +557,11 @@ void warmc_rt_report(WarmInstance *inst);
 
 u32 warmc_bind_import(WarmInstance *v, const char *module, const char *name,
                       void *code, WarmInstance *self);
+
+/* The instance --wasi's host made of the program, once it has made it: what
+   C called from the program (a --native-module's functions) calls back into
+   the program through, with warmc_find_export and warmc_invoke. */
+extern WarmInstance *warmc_wasi_instance;
 
 enum {
   TRAP_UNREACHABLE = 1,

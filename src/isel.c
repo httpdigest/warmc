@@ -549,11 +549,15 @@ static void emit_gc_load_stubs(Isel *s) {
 
 __attribute__((unused))
 
+/* c_abi: the arguments of a C function, which takes no vmctx and has its
+   stack arguments where the platform's convention puts them, each in 8
+   bytes or, on Apple's, packed at its own size's alignment. */
 static void emit_call_args_core(Isel *s, const Ref *args, uint32_t nargs,
                                 int stack_base, int first_int,
-                                bool want_vmctx) {
+                                bool want_vmctx, bool c_abi) {
   IrFunc *f = s->f;
   int next_int = first_int, next_flt = 0, stack_slot = 0;
+  uint32_t c_at = 0;
   Move mv[24];
   int nmv = 0;
   Ref late[24];
@@ -568,6 +572,12 @@ static void emit_call_args_core(Isel *s, const Ref *args, uint32_t nargs,
     if (fp) flts++; else ints++;
     if (!on_stack) continue;
     uint32_t at = (uint32_t)stack_slot++ * ARG_STACK_SLOT;
+    if (c_abi) {
+      uint32_t size = warmc_darwin_abi ? (wide ? 8u : 4u) : 8u;
+      c_at = (c_at + size - 1) & ~(size - 1);
+      at = c_at;
+      c_at += size;
+    }
     /* a tail call's go where the function's own arrived, which a frameless
        one reaches from sp too */
     if (stack_base == RSP && !s->tail_args &&
@@ -618,21 +628,25 @@ static void emit_call_args_core(Isel *s, const Ref *args, uint32_t nargs,
 static void emit_call_args_to(Isel *s, const Ref *args, uint32_t nargs,
                               int stack_base) {
   s->tail_args = true;
-  emit_call_args_core(s, args, nargs, stack_base, 1, true);
+  emit_call_args_core(s, args, nargs, stack_base, 1, true, false);
   s->tail_args = false;
 }
 
 static void emit_call_args(Isel *s, const Ref *args, uint32_t nargs) {
-  emit_call_args_core(s, args, nargs, RSP, 1, true);
+  emit_call_args_core(s, args, nargs, RSP, 1, true, false);
 }
 
 static void emit_call_args_novmctx(Isel *s, const Ref *args, uint32_t nargs) {
-  emit_call_args_core(s, args, nargs, RSP, 1, false);
+  emit_call_args_core(s, args, nargs, RSP, 1, false, false);
+}
+
+static void emit_call_args_c(Isel *s, const Ref *args, uint32_t nargs) {
+  emit_call_args_core(s, args, nargs, RSP, 0, false, true);
 }
 
 static void emit_call_args_at(Isel *s, const Ref *args, uint32_t nargs,
                               int first_int) {
-  emit_call_args_core(s, args, nargs, RSP, first_int, true);
+  emit_call_args_core(s, args, nargs, RSP, first_int, true, false);
 }
 
 static void emit_call_ret(Isel *s, Ref call, CompType *sig) {

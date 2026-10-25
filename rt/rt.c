@@ -3847,6 +3847,13 @@ WarmInstance *warmc_instantiate_bound(const ModuleDesc *md,
   for (u32 i = 0; i < md->nimports; i++) {
     const ImportDesc *im = &md->imports[i];
 
+    if (im->kind == 0 && (im->flags & WARMC_IMPORT_NATIVE)) {
+      /* called straight, never through its slot: warmc refuses one used
+         as a value */
+      fi++;
+      continue;
+    }
+
     if (binds && binds[i].code) {
       if (im->kind != 0) link_error("host binding is not a function",
                                     im->module, im->name);

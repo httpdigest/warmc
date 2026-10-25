@@ -1918,8 +1918,25 @@ static void emit_inst(Isel *s, Ref v) {
     case I_CALL: {
       CompType *sig = call_sig(s, in);
       csa_save(s, v);
-      emit_ret_area(s, sig);
       Func *fn = &f->m->funcs[in->imm];
+      if (fn->native) {
+        /* the C function of the import's name, called as C calls it: no
+           vmctx, the arguments where C's convention puts them, and the
+           system linker to find it */
+        emit_call_args_c(s, a, in->nargs);
+        if (s->cold_frame) emit_cold_frame(s);
+        uint32_t sym = obj_intern_sym(s->o, f->m->imports[fn->import_index].name,
+                                      SYM_UNDEF_FUNC, -1, 0);
+        isel_reloc(s, REL_CALL26, B->len, sym, 0);
+        a64_bl(B, 0);
+        note_site(s);
+        note_safepoint(s, v);
+        if (s->cold_frame) { cold_call_done(s, v); break; }
+        emit_call_ret(s, v, sig);
+        csa_restore(s, v);
+        break;
+      }
+      emit_ret_area(s, sig);
       if (fn->imported) emit_call_args_novmctx(s, a, in->nargs);
       else emit_call_args(s, a, in->nargs);
       if (fn->imported) {
