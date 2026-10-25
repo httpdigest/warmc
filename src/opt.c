@@ -5986,7 +5986,22 @@ typedef struct {
   /* the functions it takes by ref.func, each once (ref_effects) */
   uint32_t *refs;
   uint32_t nrefs, caprefs;
+  /* For pass_once (once_scan): each store into a global of function
+     references, and the function stored or ONCE_UNK; the globals of
+     function references it reads for anything but to call what they hold;
+     the global its first effect stores into, when its first effect is such
+     a store; and whether it is inert -- one block that returns nothing,
+     whose only effects are such stores -- and empty, inert with no store. */
+  struct OnceStore *ost;
+  uint32_t nost, capost;
+  uint32_t *oobs;
+  uint32_t noobs, capoobs;
+  uint32_t first_g;
+  bool inert, empty;
 } DirectFx;
+
+typedef struct OnceStore { uint32_t gi, fi; } OnceStore;
+#define ONCE_UNK 0xffffffffu
 
 /* -fdead-frames's facts about each function, from its body as built (see
    df_scan): the bytes it reads through each pointer parameter -- a hull of
@@ -6073,6 +6088,12 @@ static uint32_t *fx_ncallers;
 static uint32_t *fx_cg_at, *fx_cg_first, *fx_cg_opnd;
 static bool fx_vt_poisoned;
 static uint32_t fx_nfuncs;
+/* once_resolve's facts: per global, the initializer it holds at first and
+   the empty function its every store writes, when it is such a global, and
+   whether calls through it do nothing whatever it holds; per function, the
+   global it initializes, if any */
+static uint32_t *ox_init, *ox_done, *ox_by_init;
+static uint8_t *ox_dead;
 
 static bool fx_field_is_funcref(const Module *m, ValType t) {
   if (!vt_is_ref(t)) return false;
@@ -6109,7 +6130,10 @@ void opt_effects_begin(Module *m, const OptOpts *o) {
   if (fx_mod == m && fx_opts == o) return;
   xfree(fx_func);
   if (fx_direct)
-    for (uint32_t i = 0; i < fx_nfuncs; i++) { xfree(fx_direct[i].vtst); xfree(fx_direct[i].refs); }
+    for (uint32_t i = 0; i < fx_nfuncs; i++) {
+      xfree(fx_direct[i].vtst); xfree(fx_direct[i].refs);
+      xfree(fx_direct[i].ost); xfree(fx_direct[i].oobs);
+    }
   xfree(fx_direct);
   memset(&fx_table0, 0, sizeof(fx_table0));
   xfree(fx_vt); fx_vt = NULL;
@@ -6120,6 +6144,10 @@ void opt_effects_begin(Module *m, const OptOpts *o) {
   xfree(fx_cg_first); fx_cg_first = NULL;
   xfree(fx_cg_opnd); fx_cg_opnd = NULL;
   fx_vt_poisoned = false;
+  xfree(ox_init); ox_init = NULL;
+  xfree(ox_done); ox_done = NULL;
+  xfree(ox_by_init); ox_by_init = NULL;
+  xfree(ox_dead); ox_dead = NULL;
   if (df_func)
     for (uint32_t i = 0; i < fx_nfuncs; i++) xfree(df_func[i].args);
   xfree(df_func);
@@ -6176,11 +6204,93 @@ static bool is_call_op(uint16_t op) {
          op == I_RETURN_CALL_REF;
 }
 
+/* ---- calls through a global a class initializer disarms (pass_once) ----
+
+   TeaVM initializes a class lazily: a global holds the class's initializer
+   until it runs, which first stores an empty function there, and every
+   static access calls whatever the global holds -- the initializer once,
+   the empty function ever after.  once_scan collects, per function, what
+   once_resolve needs to find such globals and pass_once to drop the calls
+   that do nothing. */
+
+static bool once_global(const Module *m, uint32_t gi) {
+  return gi < m->nglobals && fx_field_is_funcref(m, m->globals[gi].type);
+}
+
+static void once_push(uint32_t **v, uint32_t *n, uint32_t *cap, uint32_t x) {
+  for (uint32_t k = 0; k < *n; k++) if ((*v)[k] == x) return;
+  if (*n == *cap) {
+    *cap = *cap ? *cap * 2 : 4;
+    *v = xrealloc(*v, *cap * sizeof(uint32_t));
+  }
+  (*v)[(*n)++] = x;
+}
+
+static void once_scan(Module *m, IrFunc *g, DirectFx *d) {
+  /* the global of function references each value was read from */
+  uint32_t *src = xmalloc((g->ninsts ? g->ninsts : 1) * sizeof(uint32_t));
+  for (Ref v = 0; v < g->ninsts; v++) {
+    Inst *in = &g->insts[v];
+    src[v] = in->op == I_GLOBAL_GET && once_global(m, (uint32_t)in->imm) ? (uint32_t)in->imm
+                                                                         : ONCE_UNK;
+  }
+  for (bool moved = true; moved;) {
+    moved = false;
+    for (Ref v = 0; v < g->ninsts; v++)
+      if (g->insts[v].op == I_REF_CONVERT && src[v] == ONCE_UNK &&
+          src[ir_args(g, v)[0]] != ONCE_UNK) {
+        src[v] = src[ir_args(g, v)[0]];
+        moved = true;
+      }
+  }
+  bool only_stores = true, first_seen = false;
+  for (uint32_t bi = 0; bi < g->nblocks; bi++) {
+    Block *b = &g->blocks[bi];
+    for (uint32_t i = 0; i < b->ninsts; i++) {
+      Ref v = b->insts[i];
+      Inst *in = &g->insts[v];
+      Ref *a = ir_args(g, v);
+      if (in->op == I_GLOBAL_SET && once_global(m, (uint32_t)in->imm)) {
+        uint32_t fv = g->insts[a[0]].op == I_REF_FUNC ? (uint32_t)g->insts[a[0]].imm : ONCE_UNK;
+        if (d->nost == d->capost) {
+          d->capost = d->capost ? d->capost * 2 : 4;
+          d->ost = xrealloc(d->ost, d->capost * sizeof(OnceStore));
+        }
+        d->ost[d->nost++] = (OnceStore){ (uint32_t)in->imm, fv };
+        if (bi == g->entry && !first_seen) d->first_g = (uint32_t)in->imm;
+        if (bi == g->entry) first_seen = true;
+      } else if (!ir_has_no_effect(in)) {
+        only_stores = false;
+        if (bi == g->entry) first_seen = true;
+      }
+      for (uint32_t j = 0; j < in->nargs; j++) {
+        uint32_t gi = src[a[j]];
+        if (gi == ONCE_UNK) continue;
+        bool called = (in->op == I_CALL_REF || in->op == I_RETURN_CALL_REF) && j + 1 == in->nargs;
+        bool kept = in->op == I_REF_CONVERT || in->op == I_REF_IS_NULL || in->op == I_TRAP_IF;
+        if (!called && !kept) once_push(&d->oobs, &d->noobs, &d->capoobs, gi);
+      }
+    }
+    for (uint32_t k = 0; k < b->nret; k++)
+      if (src[b->ret_args[k]] != ONCE_UNK)
+        once_push(&d->oobs, &d->noobs, &d->capoobs, src[b->ret_args[k]]);
+    for (uint32_t s = 0; s < b->nsuccs; s++)
+      for (uint32_t k = 0; k < b->succs[s].nargs; k++)
+        if (src[b->succs[s].args[k]] != ONCE_UNK)
+          once_push(&d->oobs, &d->noobs, &d->capoobs, src[b->succs[s].args[k]]);
+  }
+  xfree(src);
+  d->inert = only_stores && g->nblocks == 1 && g->blocks[g->entry].term == T_RETURN &&
+             !g->sig->nresults;
+  d->empty = d->inert && !d->nost;
+}
+
 static void fx_scan_direct(Module *m, const OptOpts *o, uint32_t fi) {
   DirectFx *d = &fx_direct[fi];
   d->scanned = true;
   d->fg = 0xffffffffu;
   d->frame_only = true;
+  d->first_g = ONCE_UNK;
   if (m->funcs[fi].imported || !m->funcs[fi].body) return;
   d->has_body = true;
 
@@ -6331,6 +6441,7 @@ static void fx_scan_direct(Module *m, const OptOpts *o, uint32_t fi) {
     }
   }
   if (df_func) df_scan(m, g, fi);
+  once_scan(m, g, d);
   d->built_insts = g->ninsts;
   for (uint32_t bi = 0; bi < g->nblocks && !d->makes_calls; bi++) {
     Block *b = &g->blocks[bi];
@@ -7896,7 +8007,66 @@ static bool gc_fold_known(IrFunc *f, Ref v) {
   }
 }
 
+/* The globals of the class-initializer pattern.  Such a global is the
+   module's own and not exported, holds a function reference, and starts
+   out holding ref.func F; every store into it, anywhere, writes ref.func D
+   of one empty function D, and F's first effect is that store.  A call
+   through it that returns has then run F, whose first effect left D there,
+   or D: the global holds D after it for ever.  And a call through one that
+   only calls is dead when F is inert and every global F's stores write is
+   one of these, dead too, written its D: calling F changes nothing anything
+   reads but to call it again -- found by assuming every candidate dead and
+   taking back those that fail, until none does. */
+static void once_resolve(Module *m) {
+  uint32_t ng = m->nglobals;
+  ox_init = xmalloc((ng ? ng : 1) * sizeof(uint32_t));
+  ox_done = xmalloc((ng ? ng : 1) * sizeof(uint32_t));
+  ox_dead = xcalloc(ng ? ng : 1, 1);
+  ox_by_init = xmalloc((m->nfuncs ? m->nfuncs : 1) * sizeof(uint32_t));
+  for (uint32_t i = 0; i < m->nfuncs; i++) ox_by_init[i] = ONCE_UNK;
+  uint32_t *stored = xmalloc((ng ? ng : 1) * sizeof(uint32_t));
+  uint8_t *bad = xcalloc(ng ? ng : 1, 1), *seen = xcalloc(ng ? ng : 1, 1);
+  for (uint32_t gi = 0; gi < ng; gi++) { ox_init[gi] = ox_done[gi] = stored[gi] = ONCE_UNK; }
+  for (uint32_t i = 0; i < m->nexports; i++)
+    if (m->exports[i].kind == EK_GLOBAL && m->exports[i].index < ng) bad[m->exports[i].index] = 1;
+  for (uint32_t fi = 0; fi < m->nfuncs; fi++) {
+    const DirectFx *d = &fx_direct[fi];
+    for (uint32_t k = 0; k < d->nost; k++) {
+      uint32_t gi = d->ost[k].gi;
+      if (d->ost[k].fi == ONCE_UNK || (stored[gi] != ONCE_UNK && stored[gi] != d->ost[k].fi))
+        bad[gi] = 1;
+      stored[gi] = d->ost[k].fi;
+    }
+    for (uint32_t k = 0; k < d->noobs; k++) seen[d->oobs[k]] = 1;
+  }
+  for (uint32_t gi = 0; gi < ng; gi++) {
+    /* an initializer is ref.func of one of the module's functions, which
+       an imported global has not; a store makes the global mutable, and the
+       one function it stores, empty, is not the initializer, which stores */
+    const Global *g = &m->globals[gi];
+    if (bad[gi] || g->init.n != 1 || g->init.ins[0].op != IOP_REF_FUNC) continue;
+    uint32_t F = (uint32_t)g->init.ins[0].lo, D = stored[gi];
+    if (F >= m->nfuncs || D >= m->nfuncs || !fx_direct[D].empty || fx_direct[F].first_g != gi)
+      continue;
+    ox_init[gi] = F;
+    ox_done[gi] = D;
+    if (ox_by_init[F] == ONCE_UNK) ox_by_init[F] = gi;
+    ox_dead[gi] = !seen[gi] && fx_direct[F].inert;
+  }
+  for (bool moved = true; moved;) {
+    moved = false;
+    for (uint32_t gi = 0; gi < ng; gi++) {
+      if (!ox_dead[gi]) continue;
+      const DirectFx *d = &fx_direct[ox_init[gi]];
+      for (uint32_t k = 0; k < d->nost; k++)
+        if (!ox_dead[d->ost[k].gi]) { ox_dead[gi] = 0; moved = true; break; }
+    }
+  }
+  xfree(stored); xfree(bad); xfree(seen);
+}
+
 static void fx_facts_build(Module *m) {
+  once_resolve(m);
   fx_count_callers(m);
   fx_cg_build(m);
   fx_gfunc = xmalloc((m->nglobals ? m->nglobals : 1) * sizeof(uint32_t));
@@ -8107,14 +8277,21 @@ static const CallFx *ref_effects(Module *m, const OptOpts *o) {
   return &fx_ref;
 }
 
+static uint32_t once_callee(IrFunc *f, Ref callee);
+
 static const CallFx *site_effects(IrFunc *f, const OptOpts *o, Ref v) {
   Inst *in = &f->insts[v];
   if (in->op == I_CALL || in->op == I_RETURN_CALL)
     return call_effects(f->m, o, (uint32_t)in->imm, 0);
   if (in->op == I_CALL_INDIRECT || in->op == I_RETURN_CALL_INDIRECT)
     return indirect_effects(f->m, o);
-  if (in->op == I_CALL_REF || in->op == I_RETURN_CALL_REF)
+  if (in->op == I_CALL_REF || in->op == I_RETURN_CALL_REF) {
+    /* through a global of the class-initializer pattern: its initializer
+       or the empty function */
+    uint32_t gi = o->once && ox_init ? once_callee(f, ir_args(f, v)[in->nargs - 1]) : ONCE_UNK;
+    if (gi != ONCE_UNK) return call_effects(f->m, o, ox_init[gi], 0);
     return ref_effects(f->m, o);
+  }
   return &fx_unknown;
 }
 
@@ -8330,6 +8507,308 @@ static bool pass_devirt(IrFunc *f, const OptOpts *o) {
       }
     }
   }
+  return changed;
+}
+
+/* The global of the class-initializer pattern a call_ref's callee was read
+   from, or ONCE_UNK */
+static uint32_t once_callee(IrFunc *f, Ref callee) {
+  Ref r = ir_resolve(f, callee);
+  while (f->insts[r].op == I_REF_CONVERT) r = ir_resolve(f, ir_args(f, r)[0]);
+  if (f->insts[r].op != I_GLOBAL_GET) return ONCE_UNK;
+  uint32_t gi = (uint32_t)f->insts[r].imm;
+  return ox_init[gi] != ONCE_UNK ? gi : ONCE_UNK;
+}
+
+bool opt_once_call(IrFunc *g, Ref v) {
+  const Inst *in = &g->insts[v];
+  return fx_opts && fx_opts->once && ox_init && fx_mod == g->m && in->op == I_CALL_REF &&
+         once_callee(g, ir_args(g, v)[in->nargs - 1]) != ONCE_UNK;
+}
+
+/* Which global of the pattern v leaves holding its empty function, as a
+   call through it that returns does, a call of its initializer, or a store
+   of the empty function into it; ONCE_UNK if none */
+static uint32_t once_done_by(IrFunc *f, Ref v) {
+  Inst *in = &f->insts[v];
+  if (in->op == I_CALL_REF) return once_callee(f, ir_args(f, v)[in->nargs - 1]);
+  if (in->op == I_CALL) return ox_by_init[in->imm];
+  /* what such a global is ever stored is its empty function */
+  if (in->op == I_GLOBAL_SET && ox_init[in->imm] != ONCE_UNK) return (uint32_t)in->imm;
+  return ONCE_UNK;
+}
+
+/* Drop the call k of block bi, which does nothing; the call a block ends
+   in is the one thing in it that throws, so its way to a landing pad goes
+   too */
+static void once_drop(IrFunc *f, uint32_t bi, uint32_t k) {
+  Block *b = &f->blocks[bi];
+  Inst *in = &f->insts[b->insts[k]];
+  in->op = I_NOP;
+  in->nargs = 0;
+  if (k + 1 != b->ninsts) return;
+  uint32_t n = 0;
+  for (uint32_t s = 0; s < b->nsuccs; s++)
+    if (!b->succs[s].eh) b->succs[n++] = b->succs[s];
+  b->nsuccs = n;
+}
+
+static uint32_t loop_body(IrFunc *f, uint32_t hb, uint8_t *inloop, uint32_t *stack);
+
+/* A loop that calls through a global of the pattern -- the call not
+   dominated by another, so still there -- makes the call on every round,
+   though only a call before the initializer has run can do anything, and
+   a loop with a call in it is a loop the optimiser can move nothing out
+   of.  So the loop is copied, and every way into it tests whether each
+   such global it calls through holds its empty function, as it does for
+   ever once it does: the copy, entered then, makes none of those calls;
+   the original, entered until then, makes them, marked IRF_ONCE_SLOW so
+   that it is copied no more, and goes over to the copy at the end of the
+   round in which the last initializer ran.  The calls are those of the
+   innermost loop around them, a loop in it having its own.  A loop with a
+   landing pad, of more than ONCE_LOOP_MAX instructions, or with a value
+   read after it that is not a number, is left as it is. */
+#define ONCE_LOOP_MAX 800
+#define ONCE_LOOP_GLOBALS 4
+static bool once_split_loop(IrFunc *f, uint32_t hb, uint8_t *inloop, uint32_t *stack) {
+  uint32_t pre = loop_body(f, hb, inloop, stack);
+  if (pre == REF_NONE) return false;
+  uint32_t nb0 = f->nblocks, ni0 = f->ninsts, size = 0;
+  uint32_t gs[ONCE_LOOP_GLOBALS], ngs = 0;
+  for (uint32_t bi = 0; bi < nb0; bi++) {
+    if (!inloop[bi]) continue;
+    Block *b = &f->blocks[bi];
+    if (b->is_pad) return false;
+    size += b->ninsts + b->nparams;
+    /* the calls of a loop inside this one are its to test for */
+    if (b->loop_depth != f->blocks[hb].loop_depth) continue;
+    for (uint32_t k = 0; k < b->ninsts; k++) {
+      Ref v = b->insts[k];
+      Inst *in = &f->insts[v];
+      if (in->op != I_CALL_REF || (in->flags & IRF_ONCE_SLOW)) continue;
+      uint32_t gi = once_callee(f, ir_args(f, v)[in->nargs - 1]);
+      if (gi == ONCE_UNK) continue;
+      uint32_t j = 0;
+      while (j < ngs && gs[j] != gi) j++;
+      if (j == ngs) {
+        if (ngs == ONCE_LOOP_GLOBALS) return false;
+        gs[ngs++] = gi;
+      }
+    }
+  }
+  if (!ngs || size > ONCE_LOOP_MAX) return false;
+
+  uint8_t *esc = xcalloc(ni0 ? ni0 : 1, 1);
+  uint32_t *eslot = xmalloc((ni0 ? ni0 : 1) * sizeof(uint32_t));
+  TdVec *euse = NULL;
+  uint32_t nesc = escaping_values(f, inloop, nb0, ni0, esc, eslot, &euse);
+  bool ok = true;
+  for (uint32_t v = 0; v < ni0 && ok; v++)
+    if (esc[v] && !td_numeric((ValType)f->insts[v].type)) ok = false;
+  if (!ok) {
+    for (uint32_t i = 0; i < nesc; i++) xfree(euse[i].v);
+    xfree(esc); xfree(eslot); xfree(euse);
+    return false;
+  }
+
+  Ref *map = xmalloc(ni0 * sizeof(Ref));
+  uint32_t *bcopy = xmalloc(nb0 * sizeof(uint32_t));
+  clone_blocks(f, inloop, nb0, ni0, bcopy, map);
+  for (uint32_t bi = 0; bi < nb0; bi++) {
+    if (!inloop[bi]) continue;
+    f->blocks[bi].cold = true;
+    for (int copy = 0; copy < 2; copy++) {
+      uint32_t cb = copy ? bcopy[bi] : bi;
+      Block *b = &f->blocks[cb];
+      for (uint32_t k = 0; k < b->ninsts; k++) {
+        Ref v = b->insts[k];
+        Inst *in = &f->insts[v];
+        if (in->op != I_CALL_REF) continue;
+        uint32_t gi = once_callee(f, ir_args(f, v)[in->nargs - 1]);
+        bool guarded = false;
+        for (uint32_t j = 0; j < ngs; j++) guarded |= gs[j] == gi;
+        if (!guarded) continue;
+        if (copy) {
+          once_drop(f, cb, k);
+          g_stats.once_looped++;
+        } else {
+          in->flags |= IRF_ONCE_SLOW;
+        }
+      }
+    }
+  }
+
+  /* The copy is entered by a preheader of its own, taking the header's
+     arguments: from the loop's preheader, and from each way round the
+     original, which goes to the copy once every global holds its empty
+     function -- after the iteration that ran the last initializer, not the
+     whole of a loop entered once before it ran. */
+  Block *h = &f->blocks[hb];
+  uint32_t np = h->nparams;
+  ValType *pt = xmalloc((np ? np : 1) * sizeof(ValType));
+  for (uint32_t q = 0; q < np; q++) pt[q] = (ValType)f->insts[h->params[q]].type;
+  uint32_t fpre = ir_new_block(f);
+  Ref *pv = xmalloc((np ? np : 1) * sizeof(Ref));
+  for (uint32_t q = 0; q < np; q++) pv[q] = ir_add_param(f, fpre, pt[q]);
+  f->blocks[fpre].term = T_JUMP;
+  f->blocks[fpre].reachable = true;
+  ir_add_edge(f, fpre, bcopy[hb], pv, np);
+
+  /* each way in to the original, now through the test: the preheader's,
+     and every way round from inside it */
+  uint32_t nin = 0, capin = 8, (*ins)[2] = xmalloc(capin * sizeof *ins);
+  for (uint32_t bi = 0; bi < nb0; bi++) {
+    if (!inloop[bi] && bi != pre) continue;
+    for (uint32_t sx = 0; sx < f->blocks[bi].nsuccs; sx++) {
+      if (f->blocks[bi].succs[sx].target != hb) continue;
+      if (nin == capin) { capin *= 2; ins = xrealloc(ins, capin * sizeof *ins); }
+      ins[nin][0] = bi;
+      ins[nin][1] = sx;
+      nin++;
+    }
+  }
+  for (uint32_t k = 0; k < nin; k++) {
+    uint32_t from = ins[k][0], sx = ins[k][1];
+    uint32_t t = ir_new_block(f);
+    for (uint32_t q = 0; q < np; q++) pv[q] = ir_add_param(f, t, pt[q]);
+    Ref cond = REF_NONE;
+    for (uint32_t j = 0; j < ngs; j++) {
+      const Global *g = &f->m->globals[gs[j]];
+      Ref a[2] = { ir_emit(f, t, I_GLOBAL_GET, g->type, NULL, 0, gs[j], 0),
+                   ir_emit(f, t, I_REF_FUNC, g->type, NULL, 0, ox_done[gs[j]], 0) };
+      Ref eq = ir_emit(f, t, I_EQ, VT_I32, a, 2, 0, 0);
+      if (cond == REF_NONE) cond = eq;
+      else { Ref b2[2] = { cond, eq }; cond = ir_emit(f, t, I_AND, VT_I32, b2, 2, 0, 0); }
+    }
+    Block *tb = &f->blocks[t];
+    tb->term = T_BRIF;
+    tb->term_arg = cond;
+    tb->reachable = true;
+    tb->cold = from != pre;
+    ir_add_edge(f, t, fpre, pv, np);
+    ir_add_edge(f, t, hb, pv, np);
+    f->blocks[from].succs[sx].target = t;
+  }
+  xfree(ins); xfree(pv); xfree(pt);
+
+  ir_recompute_preds(f);
+  ir_order(f);
+  repair_copies(f, ni0, esc, eslot, euse, bcopy, map);
+  for (uint32_t i = 0; i < nesc; i++) xfree(euse[i].v);
+  xfree(esc); xfree(eslot); xfree(euse); xfree(map); xfree(bcopy);
+  prune_params(f);
+  ir_order(f);
+  return true;
+}
+
+#define ONCE_LOOPS 8
+static bool once_split_loops(IrFunc *f) {
+  bool changed = false;
+  for (int n = 0; n < ONCE_LOOPS; n++) {
+    uint8_t *inloop = xmalloc(f->nblocks);
+    uint32_t *stack = xmalloc(f->nblocks * sizeof(uint32_t));
+    bool split = false;
+    for (uint32_t oi = 0; oi < f->norder && !split; oi++)
+      split = once_split_loop(f, f->order[oi], inloop, stack);
+    xfree(inloop); xfree(stack);
+    if (!split) break;
+    changed = true;
+  }
+  return changed;
+}
+
+/* Calls through a global of the class-initializer pattern (once_resolve)
+   that do nothing: every call through a dead one, and a call where the
+   global holds its empty function on every path -- after a call through it
+   that returned, a call of its initializer, or a store of the empty
+   function, on each way there.  That is a forward problem over the blocks,
+   meeting at a join what holds on every way in.  The way to a landing pad
+   takes what holds at the block's end too: what throws ends its block, and
+   a call through such a global that throws has stored its empty function
+   first. */
+#define ONCE_BITS 64
+static bool pass_once(IrFunc *f, const OptOpts *o) {
+  (void)o;
+  Module *m = f->m;
+  if (fx_mod != m || !fx_resolved || !ox_init) return false;
+  bool changed = false;
+  uint32_t gl[ONCE_BITS], ngl = 0;
+  for (uint32_t oi = 0; oi < f->norder; oi++) {
+    Block *b = &f->blocks[f->order[oi]];
+    for (uint32_t k = 0; k < b->ninsts; k++) {
+      Ref v = b->insts[k];
+      Inst *in = &f->insts[v];
+      uint32_t gi = once_done_by(f, v);
+      if (gi == ONCE_UNK) continue;
+      if (in->op == I_CALL_REF && ox_dead[gi]) {
+        once_drop(f, f->order[oi], k);
+        g_stats.once_dead++;
+        changed = true;
+        continue;
+      }
+      uint32_t j = 0;
+      while (j < ngl && gl[j] != gi) j++;
+      if (j == ngl && ngl < ONCE_BITS) gl[ngl++] = gi;
+    }
+  }
+  if (!ngl) {
+    if (changed) {
+      ir_recompute_preds(f);
+      ir_order(f);
+    }
+    return changed;
+  }
+
+  uint64_t *in_set = xmalloc(f->nblocks * sizeof(uint64_t));
+  uint64_t *acc = xmalloc(f->nblocks * sizeof(uint64_t));
+  for (uint32_t bi = 0; bi < f->nblocks; bi++) in_set[bi] = ~(uint64_t)0;
+  in_set[f->entry] = 0;
+  for (bool moved = true; moved;) {
+    moved = false;
+    for (uint32_t bi = 0; bi < f->nblocks; bi++) acc[bi] = ~(uint64_t)0;
+    acc[f->entry] = 0;
+    for (uint32_t oi = 0; oi < f->norder; oi++) {
+      uint32_t bi = f->order[oi];
+      Block *b = &f->blocks[bi];
+      uint64_t cur = in_set[bi];
+      for (uint32_t k = 0; k < b->ninsts; k++) {
+        uint32_t gi = once_done_by(f, b->insts[k]);
+        for (uint32_t j = 0; j < ngl && gi != ONCE_UNK; j++)
+          if (gl[j] == gi) cur |= (uint64_t)1 << j;
+      }
+      for (uint32_t s = 0; s < b->nsuccs; s++) acc[b->succs[s].target] &= cur;
+    }
+    for (uint32_t bi = 0; bi < f->nblocks; bi++)
+      if (acc[bi] != in_set[bi]) { in_set[bi] = acc[bi]; moved = true; }
+  }
+
+  for (uint32_t oi = 0; oi < f->norder; oi++) {
+    uint32_t bi = f->order[oi];
+    Block *b = &f->blocks[bi];
+    uint64_t cur = in_set[bi];
+    for (uint32_t k = 0; k < b->ninsts; k++) {
+      Ref v = b->insts[k];
+      Inst *in = &f->insts[v];
+      uint32_t gi = once_done_by(f, v);
+      if (gi == ONCE_UNK) continue;
+      uint32_t j = 0;
+      while (j < ngl && gl[j] != gi) j++;
+      if (j == ngl) continue;
+      if (in->op == I_CALL_REF && (cur >> j & 1)) {
+        once_drop(f, bi, k);
+        g_stats.once_dominated++;
+        changed = true;
+      }
+      cur |= (uint64_t)1 << j;
+    }
+  }
+  xfree(in_set);
+  xfree(acc);
+  if (changed) {
+    ir_recompute_preds(f);
+    ir_order(f);
+  }
+  if (once_split_loops(f)) changed = true;
   return changed;
 }
 
@@ -19005,6 +19484,13 @@ static bool pass_fma(IrFunc *f) {
    at the calls an allocation leaves by. */
 #define OPT_INLINE_ROUNDS 4
 
+/* pass_devirt, then pass_once */
+static bool devirt_round(IrFunc *f, const OptOpts *o) {
+  bool changed = o->devirt && TP("devirt", pass_devirt(f, o));
+  if (o->once && TP("once", pass_once(f, o))) changed = true;
+  return changed;
+}
+
 void ir_optimize(IrFunc *f, const OptOpts *o) {
   pthread_once(&g_pt_once, pt_init);
   if (o->level == 0) return;
@@ -19012,7 +19498,7 @@ void ir_optimize(IrFunc *f, const OptOpts *o) {
   prune_params(f);
   ir_order(f);
 
-  if (o->devirt && TP("devirt", pass_devirt(f, o)))
+  if (devirt_round(f, o))
     ir_verify(f, "post-devirt");
 
   if (o->selftail) pass_self_tail(f);
@@ -19023,19 +19509,19 @@ void ir_optimize(IrFunc *f, const OptOpts *o) {
     ir_verify(f, "post-inline");
 
     /* inlined bodies arrive raw and can carry devirtualizable sites */
-    if (o->devirt && TP("devirt", pass_devirt(f, o)))
+    if (devirt_round(f, o))
       ir_verify(f, "post-devirt2");
   }
 
   opt_cleanup(f, o);
 
   for (int r = 0; o->inl && o->reinline && r < OPT_INLINE_ROUNDS; r++) {
-    if (o->devirt) TP("devirt", pass_devirt(f, o));
+    devirt_round(f, o);
     if (!pass_inline_more(f, o)) break;
     prune_params(f);
     ir_order(f);
     ir_verify(f, "post-inline-more");
-    if (o->devirt && TP("devirt", pass_devirt(f, o)))
+    if (devirt_round(f, o))
       ir_verify(f, "post-devirt-more");
     opt_cleanup(f, o);
   }
@@ -19044,7 +19530,7 @@ void ir_optimize(IrFunc *f, const OptOpts *o) {
     prune_params(f);
     ir_order(f);
     ir_verify(f, "post-inline2");
-    if (o->devirt && TP("devirt", pass_devirt(f, o)))
+    if (devirt_round(f, o))
       ir_verify(f, "post-devirt3");
     if (o->fold) pass_fold(f, o);
     if (o->cse) pass_cse(f, o);

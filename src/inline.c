@@ -274,7 +274,10 @@ static bool callee_calls_are_cold(IrFunc *g) {
 
 /* Returning calls the caller will actually cross: reachable, warm, not on a
    panic path. The old gate's trap-block exemption widens to diverging
-   blocks, the same cold-path discount CSA prices with. */
+   blocks, the same cold-path discount CSA prices with.  A call through a
+   class initializer's global is none: in the caller pass_once takes it out
+   where another went before it or of a loop's copy, and where it cannot,
+   the caller makes that call in place of the one to the callee. */
 static uint32_t warm_returning_calls(IrFunc *g, uint32_t *in_loop) {
   uint32_t n = 0;
   *in_loop = 0;
@@ -283,6 +286,7 @@ static uint32_t warm_returning_calls(IrFunc *g, uint32_t *in_loop) {
     if (!b->reachable || b->term == T_TRAP || b->diverges) continue;
     for (uint32_t i = 0; i < b->ninsts; i++) {
       uint16_t op = g->insts[b->insts[i]].op;
+      if (op == I_CALL_REF && opt_once_call(g, b->insts[i])) continue;
       if (op == I_CALL || op == I_CALL_INDIRECT || op == I_CALL_REF) n++;
       if ((op == I_CALL_INDIRECT || op == I_CALL_REF) && b->loop_depth)
         (*in_loop)++;

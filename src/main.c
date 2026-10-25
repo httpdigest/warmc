@@ -57,7 +57,7 @@ static const char *usage_text =
   "                vectorize, edge-tests, unroll, selftail, ldcomb, escape,\n"
   "                partial-escape, gloop, gssa, loopclose, cpool, ictab, reach,\n"
   "                prune, merge, devirt, reinline, throw-jump, closed-world,\n"
-  "                sealed, gcpure, split, labcache, ifconv, mulwide,\n"
+  "                sealed, once, gcpure, split, labcache, ifconv, mulwide,\n"
   "                barelide, small-loop-align, trampoline, go-sp, fma,\n"
   "                dead-frames, exact-trap\n"
   "                fma is off below -O3: it fuses a float multiply\n"
@@ -427,6 +427,7 @@ int main(int argc, char **argv) {
   opt.mulwide = true;
   opt.closed_world = true;
   opt.sealed = true;
+  opt.once = true;
 
   for (int i = 1; i < argc; i++) {
     const char *a = argv[i];
@@ -573,6 +574,7 @@ int main(int argc, char **argv) {
       else if (!strcmp(name, "gcpure")) opt.gcpure = on;
       else if (!strcmp(name, "closed-world")) opt.closed_world = on;
       else if (!strcmp(name, "sealed")) opt.sealed = on;
+      else if (!strcmp(name, "once")) opt.once = on;
       else warmc_fatal("unknown pass %s", name);
     }
     else if (a[0] == '-') warmc_fatal("unknown option %s (try --help)", a);
@@ -783,7 +785,7 @@ int main(int argc, char **argv) {
             "             unrolled=%llu unr_guarded=%llu unr_rej_shape=%llu"
             " unr_rej_body=%llu unr_rej_exit=%llu unr_rej_trip=%llu"
             " unr_rej_escape=%llu unr_addr_folded=%llu gc_nullchk=%llu\n"
-            "             slot_tests=%llu slot_nullchks=%llu\n",
+            "             slot_tests=%llu slot_nullchks=%llu once_dead=%llu once_dominated=%llu once_looped=%llu\n",
             (unsigned long long)g_stats.folded, (unsigned long long)g_stats.dce_removed,
             (unsigned long long)g_stats.cse_removed, (unsigned long long)g_stats.licm_hoisted,
             (unsigned long long)g_stats.branch_simplified,
@@ -862,7 +864,10 @@ int main(int argc, char **argv) {
             (unsigned long long)g_stats.unr_addr_folded,
             (unsigned long long)g_stats.gc_nullchk_removed,
             (unsigned long long)g_stats.slot_tests,
-            (unsigned long long)g_stats.slot_nullchks);
+            (unsigned long long)g_stats.slot_nullchks,
+            (unsigned long long)g_stats.once_dead,
+            (unsigned long long)g_stats.once_dominated,
+            (unsigned long long)g_stats.once_looped);
   }
 
   char objpath[4096];
