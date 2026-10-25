@@ -312,6 +312,9 @@ if [ -z "${CHECK_SMOKE:-}" ]; then
   # time across the machine (test/run_cases.py), which beside the other
   # rows starves their runs.
   start gosp python3 test/run_gosp.py
+  # Programs on a 64-bit memory past 4 GiB, at each level against -O0 and
+  # wasmtime: four hundred fresh binaries, so here too.
+  start mem64 python3 test/gen_mem64.py --seed 1 --count 100
   start tramp python3 test/run_tramp.py
   # The Mach-O row builds a module per CPU, each with a 6 s limit, which the
   # first half minute of the rows above, when all of them start at once,

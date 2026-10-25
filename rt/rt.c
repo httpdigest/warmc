@@ -3668,23 +3668,33 @@ __attribute__((noreturn)) static void refuse_instance(const char *why) {
   sys_exit(4);
 }
 
-/* A memory may be 65536 pages here, a 32-bit one 65535: an address of a
-   32-bit memory past 2^32 - 2^16 is past any memory, which the compiler's
-   address folds count on (opt.c addr_ran). */
+/* A 32-bit memory may be 65535 pages here: an address of one past
+   2^32 - 2^16 is past any memory, which the compiler's address folds count
+   on (opt.c addr_ran).  A 64-bit memory is bounds-checked at every access
+   and has no guard region, so it takes a reservation of its own: what it
+   declares it may grow to, up to 2^26 pages (4 TiB), or 2^20 (64 GiB) when
+   it declares no maximum -- and less, halving, where the address space
+   runs short. */
+#define MEM32_MAX_PAGES 65535ull
+#define MEM64_MAX_PAGES (1ull << 26)
+#define MEM64_DEFAULT_PAGES (1ull << 20)
+
 static WarmMemory *make_memory(u64 min_pages, u64 max_pages, u32 has_max,
                                u32 index64, u32 needs_guard) {
   WarmMemory *M = arena_alloc(sizeof(WarmMemory));
-  u64 limit = index64 ? 65536 : 65535;
+  u64 limit = index64 ? MEM64_MAX_PAGES : MEM32_MAX_PAGES;
   M->decl_max = max_pages;
   if (min_pages > limit)
-    refuse_instance(index64 ? "a memory of more than 65536 pages"
+    refuse_instance(index64 ? "a 64-bit memory of more than 2^26 pages (4 TiB)"
                             : "a 32-bit memory of more than 65535 pages");
+  if (!has_max) max_pages = index64 ? MEM64_DEFAULT_PAGES : 65536;
+  if (max_pages < min_pages) max_pages = min_pages;
   if (max_pages > limit) max_pages = limit;
   M->has_max = has_max;
   M->index64 = index64;
 
   usz reserve = (usz)GUARD_RESERVE;
-  u8 *base = needs_guard || !nguards
+  u8 *base = !index64 && (needs_guard || !nguards)
                ? (u8 *)sys_mmap(0, reserve, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS)
                : 0;
   if (base) {
@@ -3698,15 +3708,16 @@ static WarmMemory *make_memory(u64 min_pages, u64 max_pages, u32 has_max,
     usz adjust = (usz)(-(long)(usz)base) & (align - 1);
     base += adjust;
     reserve -= adjust;
-  } else if (needs_guard) {
+  } else if (needs_guard && !index64) {
     die("this module needs a guarded reservation and it is unavailable");
   } else {
+    /* what it may grow to, halving down to what it starts at */
+    usz floor = (usz)min_pages * WASM_PAGE_SIZE;
     reserve = (usz)max_pages * WASM_PAGE_SIZE;
-    while (reserve >= (usz)min_pages * WASM_PAGE_SIZE) {
+    for (;;) {
       base = (u8 *)sys_mmap(0, reserve ? reserve : 4096, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS);
-      if (base) break;
-      if (reserve <= 4096) break;
-      reserve /= 2;
+      if (base || reserve <= floor) break;
+      reserve = reserve / 2 > floor ? reserve / 2 : floor;
     }
   }
   if (!base) die("cannot reserve linear memory");
@@ -3902,9 +3913,7 @@ WarmInstance *warmc_instantiate_bound(const ModuleDesc *md,
 
   for (u32 i = 0; i < md->nmemories; i++)
     if (!md->memories[i].imported)
-      in->mems[i] = make_memory(md->memories[i].min,
-                                md->memories[i].has_max
-                                  ? md->memories[i].max : 65536,
+      in->mems[i] = make_memory(md->memories[i].min, md->memories[i].max,
                                 md->memories[i].has_max,
                                 md->memories[i].index64,
                                 md->needs_guard);

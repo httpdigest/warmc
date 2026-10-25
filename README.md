@@ -893,7 +893,11 @@ memory reserves 4 GiB plus a 32 MiB guard region of address space. An access
 whose static offset is within the guard needs no explicit check: a fault
 there becomes the `out of bounds memory access` trap.
 Without guard pages, and always for memory64, accesses are checked explicitly,
-and the `bce` pass removes the checks it can prove redundant. Stack overflow
+and the `bce` pass removes the checks it can prove redundant. A 64-bit memory
+has no guard region and reserves what it may grow to: its declared maximum, up
+to 4 TiB, or 64 GiB when it declares none, and less, halving, where the
+address space runs short. The pages it grows into cost nothing until written,
+except on Windows, which commits them when the memory grows. Stack overflow
 is detected by a prologue check in every function that makes calls. It traps
 as `call stack exhausted` rather than crashing.
 
@@ -1016,7 +1020,7 @@ variables, `WARMC_GC_*` among them, at its first call.
 | GC: struct, array, i31, recursive types and subtyping, casts | ✅ |
 | Exception handling: `try_table`, `throw`, `throw_ref`, `exnref` | ✅ |
 | Exception handling: legacy `try` / `catch` / `delegate` | ❌ |
-| memory64 and table64 | ✅ (memory capped at 65536 pages; a 32-bit memory at 65535) |
+| memory64 and table64 | ✅ (a 64-bit memory up to 2^26 pages, 4 TiB, or 2^20, 64 GiB, when it declares no maximum; a 32-bit memory up to 65535 pages) |
 | Multi-memory | ✅ |
 | Extended constant expressions | ✅ |
 | Deterministic profile | ✅ `--profile=deterministic` |
@@ -1364,7 +1368,9 @@ The other rows check what has no second engine to compare with:
 
 Five phases run last, each alone, because they need a quiet machine or would
 load it for the others: the collector's pause check, the Go- and GHC-shaped
-rewrites' modules with the Mach-O row, the corpora with `-fexact-trap`, the
+rewrites' modules and random programs on a 64-bit memory past 4 GiB
+(`test/gen_mem64.py`, against `-O0` and wasmtime) with the Mach-O row, the
+corpora with `-fexact-trap`, the
 official testsuite at the levels `make check-spec` runs, and the pass
 combinations.
 
@@ -1457,6 +1463,8 @@ Makefile        the build, the pinned dependencies and the test targets
   component cannot be built `--shared`, and component text must be assembled
   with `wasm-tools`.
 - **Tables** hold at most 2^20 entries, without a maximum as with one.
+- **Memories:** a 32-bit one holds at most 65535 pages, one short of 4 GiB, a
+  64-bit one 2^26 pages (4 TiB), or 2^20 (64 GiB) when it declares no maximum.
 - **A function's frame** is at most 1 MiB on AArch64 and 128 MiB on x86-64.
 - **Guarded memories:** at most 1024 per process (see [Embedding compiled
   modules in C](#embedding-compiled-modules-in-c)).

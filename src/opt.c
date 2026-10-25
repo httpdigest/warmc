@@ -2954,8 +2954,11 @@ static bool fold_block(IrFunc *f, uint32_t bi, const OptOpts *o, const uint32_t 
         }
         break;
       case I_MEM_ADDR:
+        /* a 32-bit memory's address is its i32 operand zero-extended, a
+           64-bit one's the whole i64 */
         if (is_const(f, a[0], &x)) {
-          replace_with_const(f, v, (uint64_t)(uint32_t)x + in->imm);
+          uint64_t ea = vt_is_64((ValType)f->insts[a[0]].type) ? x : (uint32_t)x;
+          replace_with_const(f, v, ea + in->imm);
           g_stats.folded++;
           changed = true;
         }
@@ -6481,6 +6484,18 @@ static void df_edges(IrFunc *f, DfVals *dv, uint32_t bi) {
   }
 }
 
+/* A bulk operation's length, when it is a constant: an i32 one's zero
+   extended, a 64-bit memory's i64 whole -- and not known when it is too
+   large for the offsets' arithmetic. */
+static bool df_const_len(IrFunc *f, Ref ln, int64_t *len) {
+  if (ln >= f->ninsts || f->insts[ln].op != I_CONST) return false;
+  uint64_t v = f->insts[ln].imm;
+  if (!vt_is_64((ValType)f->insts[ln].type)) v = (uint32_t)v;
+  if (v >= (1ull << 62)) return false;
+  *len = (int64_t)v;
+  return true;
+}
+
 /* A read of w bytes at offset `at` from what (k, id) names. */
 static void df_scan_read(DfFunc *d, uint8_t k, uint8_t id, int64_t at, int64_t w) {
   if (k == DF_PARAM) {
@@ -6636,8 +6651,8 @@ static void df_scan(Module *m, IrFunc *g, uint32_t fi) {
             break;
           case I_MEM_COPY: {
             Ref ln = a[2];
-            bool lc = ln < n && g->insts[ln].op == I_CONST;
-            int64_t len = lc ? (int64_t)(uint32_t)g->insts[ln].imm : 0;
+            int64_t len = 0;
+            bool lc = df_const_len(g, ln, &len);
             if (j == 0) df_scan_write(d, k, id, lc ? o : DF_UNK, len);
             else if (j == 1) df_scan_read(d, k, id, lc ? o : DF_UNK, len);
             else df_poison(d, k, id);
@@ -7005,8 +7020,8 @@ static bool pass_dead_frames(IrFunc *f) {
               break;
             case I_MEM_COPY: case I_MEM_FILL: {
               Ref ln = a[2];
-              bool lc = ln < n && f->insts[ln].op == I_CONST;
-              int64_t len = lc ? (int64_t)(uint32_t)f->insts[ln].imm : 0;
+              int64_t len = 0;
+              bool lc = df_const_len(f, ln, &len);
               int64_t o = ent ? dv.off[x] : DF_UNK;
               if (in->imm != 0 || (in->op == I_MEM_COPY && in->imm2 != 0) ||
                   (ent && lc && o + len > 0)) {
