@@ -404,7 +404,11 @@ layer makes at start-up to export `main`. `test/teavm/wasi.py` defines every
 one of those inside the module, over WASI, and adds a `_start` that runs
 `main` with no arguments. TeaVM's own code stays as TeaVM wrote it: the
 adapter replaces the module's import lines with functions of the same names
-and reassembles it, so every index keeps referring to what it did.
+and reassembles it, so every index keeps referring to what it did. Of the
+exports it keeps `_start`, `memory` and the program's own: TeaVM's exports
+for its loader -- strings and exceptions handed to JavaScript, the `main`
+function object -- take and return references, and with none crossing the
+module's boundary warmc decides its casts inline (`-fsealed`).
 `make teavm` fetches the pinned compiler and applies `test/teavm/patches`
 (below), and `test/teavm/TeaVMBuild.java` drives it, as TeaVM publishes no
 command-line jar for this release:
@@ -1004,6 +1008,8 @@ and `ldcomb` need `guard-pages`; `small-loop-align` needs `align`; and
 | `reinline` | after the cleanup passes, inline again what devirtualisation made direct and the calls an allocation leaves by |
 | `throw-jump` | a `throw` caught in its own function, without the exnref, becomes a jump to the catch |
 | `gcpure` | treat immutable GC fields and `array.len` as pure; drop redundant null and bounds checks, and casts and type tests that a dominating `ref.test` or cast already decides |
+| `sealed` | in a module no reference crosses the boundary of, either way, every object the code meets is the module's own, so a cast or type test of one of its types whose passing types are one run of its numbering -- a type and the subtypes numbered after it -- compares the object's type slot inline and never asks the runtime; a cast that lets null through, whose object an access then checks for null, traps on null itself, so the object is checked once. Another module's objects carry type ids outside the module's range, so a module wrongly taken for sealed could only fail a cast that should pass, never pass one that should fail (on at every level) |
+| `once` | TeaVM initializes a class lazily: a global holds the class's initializer until it runs, which first stores an empty function there, and every static access calls whatever the global holds. A call through such a global goes where the global holds the empty function on every way there -- after another call through it, a call of the initializer or a store of the empty function -- and wherever the initializer only disarms globals of the pattern nothing reads but to call them; a loop that makes such a call is copied, and the copy, without the call, entered once the global holds the empty function, also from the end of a round of the original; the call's effects are the initializer's; and the inliner takes a callee in a loop whose only call is one of these |
 | `labcache`, `barelide` | keep the GC allocation buffer open in a one-block loop of small allocations and calls that cannot let anything escape; hoist the load-barrier mask out of a safepoint-free loop, and drop a repeated barrier on the same slot between safepoints |
 | `reach`, `prune`, `merge` | module-wide reachability, whose unreachable bodies are not compiled; a body the optimised code no longer calls becomes a stub that traps; share byte-identical functions |
 | `split` | live-range splitting at loop boundaries in loops that make no call, so a value the loop carries keeps a register inside it although it is spilled outside |
@@ -1523,8 +1529,11 @@ Most of the suite is **differential**. warmc's output is compared with:
   and a trampoline beside a global imported from another module
   (`test/link/tramp_b.wat`) check the host's part
 - results worked out by hand, at `-O0`, `-O1`, `-O2` and `-O3`, for small
-  modules each of which some pass once compiled wrong (`test/run_optcases.py`,
-  `test/cases_opt`)
+  modules each of which some pass once compiled wrong or is to transform
+  (`test/run_optcases.py`, `test/cases_opt`); a module also says what
+  `--stats` counts for it at `-O0`, and how many of a function's AArch64
+  instructions at `-O2` match a pattern, for what changes the code and not
+  what it computes
 - exact arithmetic, for every division's magic numbers (`test/magic.py`)
 - the module itself, for the custom sections each linked image carries, read
   back from Mach-O, ELF and PE (`test/check_macho.py`, `check_elf.py`,
@@ -1551,7 +1560,11 @@ The other rows check what has no second engine to compare with:
   (`test/run_levels.sh`) and the thread count never reaches the output
   (`test/run_jobs.sh`)
 - linking, shared libraries, register pressure, rejected modules, binary
-  cases, function symbols named from the name section (`test/run_names.py`),
+  cases, another module's object cast in a module it reached each way a
+  reference can cross a boundary (`test/gen_link_seal.py`), which `sealed`
+  must not take the module for, a global of the class-initializer pattern
+  the embedder sets (`test/link/once_x.wat`), which `once` must not take
+  for one, function symbols named from the name section (`test/run_names.py`),
   the WAT assembler against other assemblers (`test/run_wat.py`), and
   a module without GC references compiling to the same bytes with and
   without load barriers (`test/run_nobar.sh`)
