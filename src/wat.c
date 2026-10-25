@@ -129,13 +129,16 @@ static Bytes arena_bytes(Arena *a, const void *p, size_t n) {
   return out;
 }
 
-typedef enum { TK_EOF, TK_LPAR, TK_RPAR, TK_ID, TK_STRING, TK_WORD } TokKind;
+/* TK_RESERVED is a token no production of the grammar takes, kept only so
+   that an annotation may hold one */
+typedef enum { TK_EOF, TK_LPAR, TK_RPAR, TK_ID, TK_STRING, TK_WORD, TK_RESERVED } TokKind;
 
 typedef struct {
   TokKind kind;
   const char *s;
   size_t n;
   uint32_t line, col;
+  bool annot;   /* a '(' with an '@' right after it, which opens an annotation */
 } Tok;
 
 typedef struct {
@@ -161,12 +164,17 @@ static void pos_err(const char *path, uint32_t line, uint32_t col,
 static bool idchar(char c) {
   if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'))
     return true;
-  return !!strchr("!#$%&'*+-./:<=>?@\\^_`|~", c);
+  return c && strchr("!#$%&'*+-./:<=>?@\\^_`|~", c);
 }
 
+/* a newline is U+0A, U+0D, or the two as a pair, which ends one line */
 static void lex_advance(Lex *l) {
-  if (*l->p == '\n') { l->line++; l->col = 1; }
-  else l->col++;
+  if (*l->p == '\n' || (*l->p == '\r' && (l->p + 1 >= l->end || l->p[1] != '\n'))) {
+    l->line++;
+    l->col = 1;
+  } else {
+    l->col++;
+  }
   l->p++;
 }
 
@@ -176,7 +184,7 @@ static void lex_trivia(Lex *l) {
     char c = *l->p;
     if (c == ' ' || c == '\t' || c == '\r' || c == '\n') { lex_advance(l); continue; }
     if (c == ';' && l->p + 1 < l->end && l->p[1] == ';') {
-      while (l->p < l->end && *l->p != '\n') lex_advance(l);
+      while (l->p < l->end && *l->p != '\n' && *l->p != '\r') lex_advance(l);
       continue;
     }
 
@@ -220,7 +228,9 @@ static uint32_t hex_digit(const char *path, uint32_t line, uint32_t col, char c)
   pos_err(path, line, col, "expected a hex digit, got '%c'", c);
 }
 
-static void lex_string(Lex *l) {
+/* A string's bytes with its escapes decoded; l->p is on the opening quote.
+   Characters below U+20, and U+7F, appear in one only as escapes. */
+static Bytes lex_string(Lex *l) {
   uint32_t line = l->line, col = l->col;
   lex_advance(l);
   WBuf s = {0};
@@ -229,6 +239,9 @@ static void lex_string(Lex *l) {
     char c = *l->p;
     if (c == '"') { lex_advance(l); break; }
     if (c == '\n') pos_err(l->path, line, col, "newline in string");
+    if ((uint8_t)c < 0x20 || c == 0x7f)
+      pos_err(l->path, l->line, l->col, "control character 0x%02x in a string",
+              (unsigned)(uint8_t)c);
     if (c != '\\') { wb_byte(&s, (uint8_t)c); lex_advance(l); continue; }
     lex_advance(l);
     if (l->p >= l->end) pos_err(l->path, line, col, "unterminated string");
@@ -293,11 +306,93 @@ static void lex_string(Lex *l) {
       }
     }
   }
-  Tok *t = lex_push(l, TK_STRING, line, col);
   Bytes b = arena_bytes(l->a, s.p, s.n);
-  t->s = (const char *)b.p;
-  t->n = b.n;
   xfree(s.p);
+  return b;
+}
+
+/* An id written as a string, $"..." or @"...", is the name it spells, which
+   must be one: not empty, and UTF-8 once its escapes are decoded. */
+static void check_quoted_name(const Lex *l, Bytes b, uint32_t line, uint32_t col,
+                              const char *what) {
+  if (!b.n) pos_err(l->path, line, col, "empty %s", what);
+  if (wasm_utf8_prefix(b.p, b.n) != b.n)
+    pos_err(l->path, line, col, "malformed UTF-8 encoding in an %s", what);
+}
+
+/* The id after "(@", read as the reference interpreter reads it: the
+   longest run of idchars, or one string, and nothing past it. */
+static void lex_annotation_id(Lex *l) {
+  uint32_t line = l->line, col = l->col;
+  const char *begin = l->p;
+  lex_advance(l);
+  Tok *t;
+  if (l->p < l->end && *l->p == '"') {
+    Bytes b = lex_string(l);
+    check_quoted_name(l, b, line, col, "annotation id");
+    WBuf w = {0};
+    wb_byte(&w, '@');
+    wb_raw(&w, b.p, b.n);
+    Bytes id = arena_bytes(l->a, w.p, w.n);
+    xfree(w.p);
+    t = lex_push(l, TK_WORD, line, col);
+    t->s = (const char *)id.p;
+    t->n = id.n;
+    return;
+  }
+  while (l->p < l->end && idchar(*l->p)) lex_advance(l);
+  t = lex_push(l, TK_WORD, line, col);
+  t->s = begin;
+  t->n = (size_t)(l->p - begin);
+}
+
+/* Idchars and strings with nothing between them are one token, and only
+   some such runs mean anything: idchars alone (a keyword, a number or a
+   $id), one string alone, and $ before one string (an id written as a
+   string).  Any other, like "a""b", data"a" or $"l"0, is reserved. */
+static void lex_run(Lex *l) {
+  uint32_t line = l->line, col = l->col;
+  const char *begin = l->p;
+  size_t chars = 0;
+  uint32_t strings = 0;
+  bool chars_after = false;
+  Bytes str = { NULL, 0 };
+  while (l->p < l->end) {
+    if (*l->p == '"') {
+      Bytes b = lex_string(l);
+      if (!strings++) str = b;
+    } else if (idchar(*l->p)) {
+      if (strings) chars_after = true;
+      else chars++;
+      lex_advance(l);
+    } else {
+      break;
+    }
+  }
+  Tok *t;
+  if (!strings && *begin == '$') {
+    if (chars == 1) pos_err(l->path, line, col, "empty identifier");
+    t = lex_push(l, TK_ID, line, col);
+    t->s = begin + 1;
+    t->n = chars - 1;
+  } else if (!strings) {
+    t = lex_push(l, TK_WORD, line, col);
+    t->s = begin;
+    t->n = chars;
+  } else if (strings == 1 && !chars_after && chars == 0) {
+    t = lex_push(l, TK_STRING, line, col);
+    t->s = (const char *)str.p;
+    t->n = str.n;
+  } else if (strings == 1 && !chars_after && chars == 1 && *begin == '$') {
+    check_quoted_name(l, str, line, col, "identifier");
+    t = lex_push(l, TK_ID, line, col);
+    t->s = (const char *)str.p;
+    t->n = str.n;
+  } else {
+    t = lex_push(l, TK_RESERVED, line, col);
+    t->s = begin;
+    t->n = (size_t)(l->p - begin);
+  }
 }
 
 static bool tok_is_word(const Tok *t, const char *w) {
@@ -311,8 +406,7 @@ static bool custom_annotation(const Tok *t) {
 }
 
 static bool annotation_at(const Lex *l, uint32_t i) {
-  return l->toks[i].kind == TK_LPAR && i + 1 < l->ntoks && l->toks[i + 1].kind == TK_WORD &&
-         l->toks[i + 1].n && l->toks[i + 1].s[0] == '@';
+  return l->toks[i].kind == TK_LPAR && l->toks[i].annot;
 }
 
 /* the index past the annotation at i */
@@ -341,15 +435,16 @@ static void strip_annotations(Lex *l) {
   for (uint32_t i = 0; i < l->ntoks;) {
     if (annotation_at(l, i) && l->toks[i + 1].n == 1)
       pos_err(l->path, l->toks[i + 1].line, l->toks[i + 1].col, "empty annotation id");
-    if (l->toks[i].kind == TK_LPAR && i + 1 < l->ntoks &&
-        l->toks[i + 1].kind == TK_WORD && l->toks[i + 1].n &&
-        l->toks[i + 1].s[0] == '@' && custom_annotation(&l->toks[i + 1]) && level != fields)
+    if (annotation_at(l, i) && custom_annotation(&l->toks[i + 1]) && level != fields)
       pos_err(l->path, l->toks[i].line, l->toks[i].col, "misplaced %.*s annotation",
               (int)l->toks[i + 1].n, l->toks[i + 1].s);
     if (annotation_at(l, i) && !custom_annotation(&l->toks[i + 1])) {
       i = skip_annotation(l, i);
       continue;
     }
+    if (l->toks[i].kind == TK_RESERVED)
+      pos_err(l->path, l->toks[i].line, l->toks[i].col, "unexpected token '%.*s'",
+              (int)l->toks[i].n, l->toks[i].s);
     if (l->toks[i].kind == TK_LPAR) level++;
     else if (l->toks[i].kind == TK_RPAR && level) level--;
     l->toks[out++] = l->toks[i++];
@@ -358,56 +453,44 @@ static void strip_annotations(Lex *l) {
 }
 
 static void tokenize(Lex *l) {
+  /* Source text is UTF-8 throughout, comments and strings included; outside
+     them only ASCII is a character of any token. */
+  size_t len = (size_t)(l->end - l->p);
+  size_t good = wasm_utf8_prefix((const uint8_t *)l->p, len);
+  if (good != len) {
+    const char *bad = l->p + good;
+    while (l->p < bad) lex_advance(l);
+    pos_err(l->path, l->line, l->col, "malformed UTF-8 encoding");
+  }
   for (;;) {
     lex_trivia(l);
     if (l->p >= l->end) { lex_push(l, TK_EOF, l->line, l->col); return; }
     uint32_t line = l->line, col = l->col;
     char c = *l->p;
-    if (c == '(') { lex_push(l, TK_LPAR, line, col); lex_advance(l); continue; }
+    if (c == '(') {
+      Tok *t = lex_push(l, TK_LPAR, line, col);
+      lex_advance(l);
+      if (l->p < l->end && *l->p == '@') {
+        t->annot = true;
+        lex_annotation_id(l);
+      }
+      continue;
+    }
     if (c == ')') { lex_push(l, TK_RPAR, line, col); lex_advance(l); continue; }
-    if (c == '"') { lex_string(l); continue; }
-    if (!idchar(c)) {
+    if (c && strchr(",;[]{}", c)) {
+      Tok *t = lex_push(l, TK_RESERVED, line, col);
+      t->s = l->p;
+      t->n = 1;
+      lex_advance(l);
+      continue;
+    }
+    if (c != '"' && !idchar(c)) {
 
       if (c >= 0x20 && c < 0x7f)
         pos_err(l->path, line, col, "unexpected character '%c'", c);
       pos_err(l->path, line, col, "unexpected byte 0x%02x", (unsigned)(uint8_t)c);
     }
-    const char *begin = l->p;
-    while (l->p < l->end && idchar(*l->p)) lex_advance(l);
-    size_t n = (size_t)(l->p - begin);
-    Tok *t;
-    /* $"..." and @"...": an identifier or an annotation's id as a string,
-       the same one as the name it spells written plain */
-    if (n == 1 && (c == '$' || c == '@') && l->p < l->end && *l->p == '"') {
-      lex_string(l);
-      t = &l->toks[l->ntoks - 1];
-      if (!t->n) pos_err(l->path, line, col, c == '$' ? "empty identifier" : "empty annotation id");
-      t->line = line;
-      t->col = col;
-      if (c == '$') {
-        t->kind = TK_ID;
-      } else {
-        WBuf w = {0};
-        wb_byte(&w, '@');
-        wb_raw(&w, t->s, t->n);
-        Bytes b = arena_bytes(l->a, w.p, w.n);
-        xfree(w.p);
-        t->kind = TK_WORD;
-        t->s = (const char *)b.p;
-        t->n = b.n;
-      }
-      continue;
-    }
-    if (c == '$') {
-      if (n == 1) pos_err(l->path, line, col, "empty identifier");
-      t = lex_push(l, TK_ID, line, col);
-      t->s = begin + 1;
-      t->n = n - 1;
-    } else {
-      t = lex_push(l, TK_WORD, line, col);
-      t->s = begin;
-      t->n = n;
-    }
+    lex_run(l);
   }
 }
 
@@ -417,8 +500,6 @@ typedef struct {
   uint32_t n, cap;
 
   uint32_t *tab, tab_cap;
-
-  bool saw_def;
 } Space;
 
 static uint32_t name_hash(const char *s, size_t n) {
@@ -503,6 +584,12 @@ typedef struct {
 
 typedef struct {
   bool is_func;
+  /* a type an inline signature may stand for: a func, final, with no
+     supertype, and in no (rec ...).  The last is wasm-tools' rule, which
+     appends a type where the reference interpreter would take one in a rec
+     group of one; the two modules are equivalent, and this one is the
+     oracle's byte for byte. */
+  bool implicit_ok;
   ValType *params; uint32_t nparams;
   ValType *results; uint32_t nresults;
   Space fields;
@@ -556,6 +643,7 @@ typedef struct {
   Bytes offset_enc;
   ValType elem;
   bool expr_items;
+  bool ref_func_items;   /* items are function indices, written as ref.func */
   TokRange *items; uint32_t nitems;
   Bytes *item_enc;
   bool implicit_offset;
@@ -611,6 +699,8 @@ typedef struct {
 
   bool has_start;
   Ref start;
+
+  const char *first_def;   /* the kind of the first thing defined, not imported */
 
   WBuf scratch;
 
@@ -739,7 +829,7 @@ static uint64_t parse_nat(P *p, const Tok *t, const char *s, size_t n) {
   if (!n) pos_err(p->path, t->line, t->col, "expected a number");
   uint64_t base = 10, v = 0;
   size_t i = 0;
-  if (n > 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) { base = 16; i = 2; }
+  if (n > 2 && s[0] == '0' && s[1] == 'x') { base = 16; i = 2; }
   if (i >= n) pos_err(p->path, t->line, t->col, "malformed number");
   for (; i < n; i++) {
     uint64_t d;
@@ -796,6 +886,30 @@ static uint64_t take_int(P *p, uint32_t bits) {
   return bits == 64 ? v : (v & umax);
 }
 
+/* Whether s is a float's magnitude as the grammar has it: digits, then a
+   '.' and maybe more digits, then maybe an exponent; or the same in hex
+   after a 0x, with a 'p' for the 'e' and the exponent still decimal.  So
+   no ".5", no "1e", no "infinity" -- all of which strtod takes. */
+static bool float_syntax(const char *s, size_t n) {
+  bool hex = n > 2 && s[0] == '0' && s[1] == 'x';
+  size_t i = hex ? 2 : 0;
+  size_t start = i;
+  while (i < n && num_digit(s[i], hex)) i++;
+  if (i == start) return false;
+  if (i < n && s[i] == '.') {
+    i++;
+    while (i < n && num_digit(s[i], hex)) i++;
+  }
+  if (i < n && (hex ? (s[i] == 'p' || s[i] == 'P') : (s[i] == 'e' || s[i] == 'E'))) {
+    i++;
+    if (i < n && (s[i] == '+' || s[i] == '-')) i++;
+    size_t e = i;
+    while (i < n && num_digit(s[i], false)) i++;
+    if (i == e) return false;
+  }
+  return i == n;
+}
+
 static uint64_t take_float(P *p, uint32_t bits) {
   const Tok *t = tk(p);
   if (t->kind != TK_WORD) perr(p, "expected a floating-point number");
@@ -816,13 +930,16 @@ static uint64_t take_float(P *p, uint32_t bits) {
   } else if (n == 3 && !memcmp(s, "nan", 3)) {
     out = expmask | ((uint64_t)1 << (mantbits - 1));
   } else if (n > 4 && !memcmp(s, "nan:", 4)) {
+    if (n < 7 || memcmp(s + 4, "0x", 2))
+      pos_err(p->path, t->line, t->col, "a NaN payload is written in hex, as nan:0x...");
     Tok sub = *t;
     uint64_t pay = parse_nat(p, &sub, s + 4, n - 4);
     if (pay == 0 || pay >= ((uint64_t)1 << mantbits))
       pos_err(p->path, t->line, t->col, "NaN payload is out of range");
     out = expmask | pay;
   } else {
-
+    if (!float_syntax(s, n))
+      pos_err(p->path, t->line, t->col, "malformed float '%.*s'", (int)t->n, t->s);
     char *endp = NULL;
     if (bits == 32) {
       float f = strtof(s, &endp);
@@ -835,6 +952,10 @@ static uint64_t take_float(P *p, uint32_t bits) {
     }
     if (!endp || *endp || endp == s)
       pos_err(p->path, t->line, t->col, "malformed float '%.*s'", (int)t->n, t->s);
+    /* rounding to infinity is out of range; to zero is not */
+    if ((out & expmask) == expmask)
+      pos_err(p->path, t->line, t->col, "float constant '%.*s' is out of range",
+              (int)t->n, t->s);
   }
   if (neg) out |= signbit;
   p->i++;
@@ -989,16 +1110,16 @@ static bool field_is_inline_import(P *p, uint32_t open, uint32_t end) {
   return got;
 }
 
-static void space_define(P *p, Space *sp, uint32_t open, uint32_t end,
-                         const char *what, uint32_t line, uint32_t col) {
+/* Every import comes before every function, table, memory, global and tag
+   the module defines, whatever the kinds of the two. */
+static void note_definition(P *p, uint32_t open, uint32_t end,
+                            const char *what, uint32_t line, uint32_t col) {
   if (field_is_inline_import(p, open, end)) {
-    if (sp->saw_def)
-      pos_err(p->path, line, col,
-              "an imported %s must come before every %s defined here", what,
-              what);
+    if (p->first_def)
+      pos_err(p->path, line, col, "import after a %s definition", p->first_def);
     return;
   }
-  sp->saw_def = true;
+  if (!p->first_def) p->first_def = what;
 }
 
 static void declare_field(P *p) {
@@ -1066,10 +1187,9 @@ static void declare_field(P *p) {
       else if (tok_is_word(dk, "global")) { sp = &p->globals; what = "global"; }
       else if (tok_is_word(dk, "tag")) { sp = &p->tags; what = "tag"; }
       else pos_err(p->path, dk->line, dk->col, "unknown import kind");
-      if (sp->saw_def)
-        pos_err(p->path, dk->line, dk->col,
-                "an imported %s must come before every %s defined here", what,
-                what);
+      if (p->first_def)
+        pos_err(p->path, dk->line, dk->col, "import after a %s definition",
+                p->first_def);
       space_add(sp, p->a, dnamed ? dn : NULL, dl, p->path, dk->line, dk->col, what);
       if (!grouped) break;
       p->i = item_open;
@@ -1077,21 +1197,21 @@ static void declare_field(P *p) {
     } while (p->i < end - 1);
   } else if (tok_is_word(kw, "func")) {
     space_add(&p->funcs, p->a, named ? name : NULL, nlen, p->path, line, col, "function");
-    space_define(p, &p->funcs, open, end, "function", line, col);
+    note_definition(p, open, end, "function", line, col);
   } else if (tok_is_word(kw, "table")) {
     space_add(&p->tables, p->a, named ? name : NULL, nlen, p->path, line, col, "table");
-    space_define(p, &p->tables, open, end, "table", line, col);
+    note_definition(p, open, end, "table", line, col);
     declare_inline_segments(p, end, "elem", &p->elems);
   } else if (tok_is_word(kw, "memory")) {
     space_add(&p->mems, p->a, named ? name : NULL, nlen, p->path, line, col, "memory");
-    space_define(p, &p->mems, open, end, "memory", line, col);
+    note_definition(p, open, end, "memory", line, col);
     declare_inline_segments(p, end, "data", &p->datas);
   } else if (tok_is_word(kw, "global")) {
     space_add(&p->globals, p->a, named ? name : NULL, nlen, p->path, line, col, "global");
-    space_define(p, &p->globals, open, end, "global", line, col);
+    note_definition(p, open, end, "global", line, col);
   } else if (tok_is_word(kw, "tag")) {
     space_add(&p->tags, p->a, named ? name : NULL, nlen, p->path, line, col, "tag");
-    space_define(p, &p->tags, open, end, "tag", line, col);
+    note_definition(p, open, end, "tag", line, col);
   } else if (tok_is_word(kw, "elem")) {
     space_add(&p->elems, p->a, named ? name : NULL, nlen, p->path, line, col, "elem segment");
   } else if (tok_is_word(kw, "data")) {
@@ -1103,14 +1223,16 @@ static void declare_field(P *p) {
   p->i = end;
 }
 
+/* named_ok: whether (param $x t) may name its parameter -- a function's
+   and a type definition's may, a block type's and call_indirect's not */
 static void take_params(P *p, ValType **out, uint32_t *n, uint32_t *cap,
-                        Space *names) {
+                        Space *names, bool named_ok) {
   while (at_group(p, "param")) {
     p->i += 2;
     const char *nm = NULL;
     size_t nl = 0;
     if (tk(p)->kind == TK_ID) {
-
+      if (!named_ok) perr(p, "a parameter here cannot be named");
       take_id(p, &nm, &nl);
       ValType v = take_valtype(p);
       if (*n == *cap) *out = vec_grow(p->a, *out, cap, *n, sizeof(ValType));
@@ -1150,13 +1272,16 @@ static bool sig_eq(const WType *t, const ValType *ps, uint32_t np,
   return true;
 }
 
+/* The type an inline signature stands for: the first that may, or a new one
+   at the end of the module. */
 static uint32_t intern_functype(P *p, const ValType *ps, uint32_t np,
                                 const ValType *rs, uint32_t nr) {
   for (uint32_t i = 0; i < p->ty.n; i++)
-    if (sig_eq(&p->ty.v[i], ps, np, rs, nr)) return i;
+    if (p->ty.v[i].implicit_ok && sig_eq(&p->ty.v[i], ps, np, rs, nr)) return i;
 
   WType *t = VEC_PUSH(p, p->ty, WType);
   t->is_func = true;
+  t->implicit_ok = true;
   t->nparams = np;
   t->nresults = nr;
   t->params = arena_alloc(p->a, (np ? np : 1) * sizeof(ValType));
@@ -1182,7 +1307,7 @@ static uint32_t intern_functype(P *p, const ValType *ps, uint32_t np,
   return idx;
 }
 
-static void read_typeuse(P *p, Space *names, Typeuse *tu) {
+static void read_typeuse(P *p, Space *names, Typeuse *tu, bool named_ok) {
   memset(tu, 0, sizeof *tu);
   if (at_group(p, "type")) {
     p->i += 2;
@@ -1191,7 +1316,7 @@ static void read_typeuse(P *p, Space *names, Typeuse *tu) {
     tu->has_type = true;
   }
   uint32_t before = p->i;
-  take_params(p, &tu->ps, &tu->np, &tu->cps, names);
+  take_params(p, &tu->ps, &tu->np, &tu->cps, names, named_ok);
   take_results(p, &tu->rs, &tu->nr, &tu->crs);
   tu->has_sig = p->i != before;
 
@@ -1209,16 +1334,22 @@ static uint32_t resolve_typeuse(P *p, const Typeuse *tu) {
   if (!tu->has_type) return intern_functype(p, tu->ps, tu->np, tu->rs, tu->nr);
 
   uint32_t idx = resolve(p, &p->types, &tu->tref, "type");
-  if (idx >= p->ty.n) return idx;
+  /* with no signature beside it, an unknown index is the validator's to
+     reject; with one, the text cannot be read, as there is nothing to
+     check the signature against */
+  if (idx >= p->ty.n && !tu->has_sig) return idx;
+  if (idx >= p->ty.n)
+    pos_err(p->path, tu->tref.line, tu->tref.col, "unknown type %u", idx);
   if (tu->has_sig && !sig_eq(&p->ty.v[idx], tu->ps, tu->np, tu->rs, tu->nr))
     pos_err(p->path, tu->tref.line, tu->tref.col,
             "the inline signature does not match type %u", idx);
   return idx;
 }
 
-static uint32_t take_typeuse(P *p, Space *names) {
+/* a type use in an instruction, whose parameters cannot be named */
+static uint32_t take_typeuse(P *p) {
   Typeuse tu;
-  read_typeuse(p, names, &tu);
+  read_typeuse(p, NULL, &tu, false);
   return resolve_typeuse(p, &tu);
 }
 
@@ -1260,7 +1391,6 @@ static void take_fields(P *p, WBuf *out, Space *names) {
 }
 
 static void parse_type(P *p, bool in_rec) {
-  (void)in_rec;
   expect_lpar(p);
   if (!eat_word(p, "type")) perr(p, "expected (type ...)");
   const char *nm = NULL;
@@ -1295,7 +1425,7 @@ static void parse_type(P *p, bool in_rec) {
   if (eat_word(p, "func")) {
     t->is_func = true;
     uint32_t cps = 0, crs = 0;
-    take_params(p, &t->params, &t->nparams, &cps, NULL);
+    take_params(p, &t->params, &t->nparams, &cps, NULL, true);
     take_results(p, &t->results, &t->nresults, &crs);
     wb_byte(s, 0x60);
     wb_u32(s, t->nparams);
@@ -1323,6 +1453,7 @@ static void parse_type(P *p, bool in_rec) {
   expect_rpar(p);
   if (sub) expect_rpar(p);
   expect_rpar(p);
+  t->implicit_ok = t->is_func && final_ && nsupers == 0 && !in_rec;
   t->enc = arena_bytes(p->a, s->p, s->n);
   xfree(s->p);
 }
@@ -1403,11 +1534,11 @@ static void write_blocktype(P *p, WBuf *b) {
   ValType *ps = NULL, *rs = NULL;
   uint32_t np = 0, cps = 0, nr = 0, crs = 0;
   if (has_type) {
-    uint32_t idx = take_typeuse(p, NULL);
+    uint32_t idx = take_typeuse(p);
     wb_s64(b, (int64_t)idx);
     return;
   }
-  take_params(p, &ps, &np, &cps, NULL);
+  take_params(p, &ps, &np, &cps, NULL, false);
   take_results(p, &rs, &nr, &crs);
   if (np == 0 && nr == 0) { wb_byte(b, 0x40); return; }
   if (np == 0 && nr == 1) { write_valtype(b, rs[0]); return; }
@@ -1595,7 +1726,7 @@ static void write_instr_imm(P *p, WBuf *b, uint32_t op, const OpInfo *oi) {
 
       uint32_t table = 0;
       if (at_index(p)) table = take_index(p, &p->tables, "table");
-      uint32_t type = take_typeuse(p, NULL);
+      uint32_t type = take_typeuse(p);
       wb_u32(b, type);
       wb_u32(b, table);
       break;
@@ -1992,6 +2123,15 @@ static TokRange record_folded(P *p) {
   return r;
 }
 
+/* One item of an element segment: (item instr*), or a single folded
+   instruction standing for (item (instr ...)). */
+static TokRange take_elem_expr(P *p) {
+  if (!at_group(p, "item")) return record_folded(p);
+  TokRange r = record_group(p);
+  r.first++;
+  return r;
+}
+
 static TokRange record_rest(P *p) {
   TokRange r;
   r.first = p->i;
@@ -2017,7 +2157,7 @@ static void parse_func(P *p, uint32_t index) {
     take_inline_exports(p, EK_FUNC, index);
   }
   f->imported = imported;
-  read_typeuse(p, &f->locals, &f->tu);
+  read_typeuse(p, &f->locals, &f->tu, true);
   add_job(p, JOB_FUNC, index);
   if (imported) {
     add_import(p, mod, nm, EK_FUNC, index);
@@ -2062,16 +2202,24 @@ static void parse_table(P *p, uint32_t index) {
     return;
   }
 
+  /* (table addrtype? reftype (elem ...)): a table exactly the size of the
+     segment, which is written with the table named, as wasm-tools writes
+     it, and of the table's element type -- function indices included,
+     which become ref.func expressions when that type is not funcref */
+  uint32_t save = p->i;
+  bool index64 = eat_word(p, "i64");
+  if (!index64) eat_word(p, "i32");
   if (at_valtype(p)) {
-    uint32_t save = p->i;
     ValType elem = take_valtype(p);
     if (at_group(p, "elem")) {
       t->elem = elem;
+      t->index64 = index64;
       p->i += 2;
       WElem *e = VEC_PUSH(p, p->el, WElem);
       e->mode = 0;
       e->table.present = true;
       e->table.num = index;
+      e->explicit_table = true;
       e->elem = elem;
       e->offset.first = e->offset.end = 0;
       e->implicit_offset = true;
@@ -2081,29 +2229,16 @@ static void parse_table(P *p, uint32_t index) {
       while (!at_rpar(p)) {
         if (e->nitems == cap)
           e->items = vec_grow(p->a, e->items, &cap, e->nitems, sizeof(TokRange));
-        if (at_lpar(p)) {
-          if (at_group(p, "item")) {
-            p->i++;
-            p->i++;
-            TokRange r;
-            r.first = p->i;
-            uint32_t depth = 0;
-            while (!(depth == 0 && at_rpar(p))) {
-              if (at_lpar(p)) depth++;
-              else if (at_rpar(p)) depth--;
-              p->i++;
-            }
-            r.end = p->i;
-            expect_rpar(p);
-            e->items[e->nitems++] = r;
-          } else {
-            e->items[e->nitems++] = record_group(p);
-          }
-        } else {
+        if (at_lpar(p)) e->items[e->nitems++] = take_elem_expr(p);
+        else {
           TokRange r = { p->i, p->i + 1 };
           p->i++;
           e->items[e->nitems++] = r;
         }
+      }
+      if (!e->expr_items && elem != VT_REF_ABS(true, HT_FUNC)) {
+        e->expr_items = true;
+        e->ref_func_items = true;
       }
       expect_rpar(p);
       add_job(p, JOB_ELEM, p->el.n - 1);
@@ -2111,8 +2246,8 @@ static void parse_table(P *p, uint32_t index) {
       t->has_max = true;
       return;
     }
-    p->i = save;
   }
+  p->i = save;
   take_limits(p, &t->min, &t->max, &t->has_max, &t->index64);
   t->elem = take_valtype(p);
 
@@ -2196,7 +2331,7 @@ static void parse_tag(P *p, uint32_t index) {
   bool imported = take_inline_import(p, &mod, &nm);
   if (imported) take_inline_exports(p, EK_TAG, index);
   t->imported = imported;
-  read_typeuse(p, NULL, &t->tu);
+  read_typeuse(p, NULL, &t->tu, true);
   add_job(p, JOB_TAG, index);
   if (imported) add_import(p, mod, nm, EK_TAG, index);
 }
@@ -2260,23 +2395,7 @@ static void parse_elem(P *p, uint32_t index) {
       e->items = vec_grow(p->a, e->items, &cap, e->nitems, sizeof(TokRange));
     if (at_lpar(p)) {
       e->expr_items = true;
-      if (at_group(p, "item")) {
-        p->i++;
-        p->i++;
-        TokRange r;
-        r.first = p->i;
-        uint32_t depth = 0;
-        while (!(depth == 0 && at_rpar(p))) {
-          if (at_lpar(p)) depth++;
-          else if (at_rpar(p)) depth--;
-          p->i++;
-        }
-        r.end = p->i;
-        expect_rpar(p);
-        e->items[e->nitems++] = r;
-      } else {
-        e->items[e->nitems++] = record_group(p);
-      }
+      e->items[e->nitems++] = take_elem_expr(p);
     } else {
       TokRange r = { p->i, p->i + 1 };
       p->i++;
@@ -2364,7 +2483,7 @@ static void parse_import_desc(P *p, Bytes mod, Bytes nm) {
     f->imported = true;
     uint32_t idx = p->fn.n - 1;
     take_inline_exports(p, EK_FUNC, idx);
-    read_typeuse(p, &f->locals, &f->tu);
+    read_typeuse(p, &f->locals, &f->tu, true);
     add_job(p, JOB_FUNC, idx);
     add_import(p, mod, nm, EK_FUNC, idx);
   } else if (tok_is_word(kw, "table")) {
@@ -2401,7 +2520,7 @@ static void parse_import_desc(P *p, Bytes mod, Bytes nm) {
     t->imported = true;
     uint32_t idx = p->tg.n - 1;
     take_inline_exports(p, EK_TAG, idx);
-    read_typeuse(p, NULL, &t->tu);
+    read_typeuse(p, NULL, &t->tu, true);
     add_job(p, JOB_TAG, idx);
     add_import(p, mod, nm, EK_TAG, idx);
   } else {
@@ -2460,6 +2579,7 @@ static void parse_field(P *p) {
     return;
   }
   if (tok_is_word(kw, "start")) {
+    if (p->has_start) perr(p, "a module has one start function at most");
     p->has_start = true;
     p->start = take_ref(p, "function");
     expect_rpar(p);
@@ -2515,7 +2635,7 @@ static void encode_expressions(P *p) {
           e->offset_enc = encode_range(p, e->offset, true);
         e->item_enc = arena_alloc(p->a, (e->nitems ? e->nitems : 1) * sizeof(Bytes));
         for (uint32_t j = 0; j < e->nitems; j++) {
-          if (e->expr_items) {
+          if (e->expr_items && !e->ref_func_items) {
             e->item_enc[j] = encode_range(p, e->items[j], true);
           } else {
 
@@ -2525,7 +2645,9 @@ static void encode_expressions(P *p) {
             p->i = save;
             WBuf *b = &p->scratch;
             b->n = 0;
+            if (e->ref_func_items) wb_byte(b, 0xd2);
             wb_u32(b, f);
+            if (e->ref_func_items) wb_byte(b, 0x0b);
             e->item_enc[j] = arena_take(p->a, b);
           }
         }
@@ -2560,10 +2682,11 @@ static void encode_expressions(P *p) {
   }
 }
 
-static Bytes zero_offset(P *p) {
+/* the offset of an inline segment: 0, of the address type of what it fills */
+static Bytes zero_offset(P *p, bool index64) {
   WBuf *b = &p->scratch;
   b->n = 0;
-  wb_byte(b, 0x41);
+  wb_byte(b, index64 ? 0x42 : 0x41);
   wb_byte(b, 0x00);
   wb_byte(b, 0x0b);
   return arena_take(p->a, b);
@@ -2974,7 +3097,7 @@ static uint8_t *assemble(P *p, size_t *len_out) {
       if (flags == 2 || flags == 6) wb_u32(&sec, table);
       if (e->mode == 0) {
         if (e->offset_enc.n) wb_bytes(&sec, e->offset_enc);
-        else wb_bytes(&sec, zero_offset(p));
+        else wb_bytes(&sec, zero_offset(p, table < p->tb.n && p->tb.v[table].index64));
       }
       if (flags == 1 || flags == 2 || flags == 3) wb_byte(&sec, 0x00);
       if (flags == 5 || flags == 6 || flags == 7) write_valtype(&sec, e->elem);
@@ -3033,7 +3156,7 @@ static uint8_t *assemble(P *p, size_t *len_out) {
       if (flags == 2) wb_u32(&sec, mem);
       if (d->active) {
         if (d->offset_enc.n) wb_bytes(&sec, d->offset_enc);
-        else wb_bytes(&sec, zero_offset(p));
+        else wb_bytes(&sec, zero_offset(p, mem < p->mem.n && p->mem.v[mem].index64));
       }
       wb_u32(&sec, d->data.n);
       wb_bytes(&sec, d->data);

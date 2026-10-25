@@ -8,17 +8,22 @@ modules.
 
 What runs:
 
-  assert_malformed   the binary must be rejected as malformed  (exit 2)
-  assert_invalid     the binary must be rejected as invalid    (exit 3)
+  assert_malformed   the module must be rejected as malformed  (exit 2)
+  assert_invalid     the module must be rejected as invalid    (exit 3)
   module             the module must compile
 
-and then, against the compiled modules linked into one driver (driver.c,
-with the tables test/spec/gen.py writes), the commands that execute:
-assert_return, assert_trap, assert_exhaustion, assert_exception,
-assert_uninstantiable, assert_unlinkable, register and action.  A command the
-generator cannot express -- one naming a module that did not compile -- is
-counted as `skipped` rather than dropped, so the totals do not silently
-shrink.
+each for a binary and for a quoted text module alike, the text going through
+warmc's own text front end; then every module the .wast writes as text is
+assembled by warmc and must come out as wasm-tools' binary of it does
+(test/spec/wasttext.py), so that the binaries the rest of this runs are the
+ones warmc's text front end would have made; and then, against the compiled
+modules linked into one driver (driver.c, with the tables test/spec/gen.py
+writes), the commands that execute: assert_return, assert_trap,
+assert_exhaustion, assert_exception, assert_uninstantiable, assert_unlinkable,
+register and action.  A quoted module that is valid runs as warmc assembles
+it, wasm-tools having made no binary of it.  A command the generator cannot
+express -- one naming a module that did not compile -- is counted as
+`skipped` rather than dropped, so the totals do not silently shrink.
 
 Every file's result is compared against test/spec/expected.json, which records
 what warmc fails today.  A file that starts passing is as much of a mismatch
@@ -73,6 +78,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import gen
 import hostbuild
 import proposals
+import wasttext
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 BUILD = os.environ.get("BUILD", os.path.join(ROOT, "build"))
@@ -201,22 +207,27 @@ def run_file(wast, idx, levels, verbose=False):
             continue
         if kind in ("module", "module_quote", "module_definition", "module_instance"):
 
-            if (kind != "module" or "filename" not in cmd
-                    or cmd.get("module_type", "binary") != "binary"):
+            if kind not in ("module", "module_definition") or "filename" not in cmd:
                 nskip += 1
                 continue
-            rc, msg = validate(os.path.join(outdir, cmd["filename"]))
+            path = os.path.join(outdir, cmd["filename"])
+            rc, msg = validate(path)
             if rc == 0:
                 npass += 1
             else:
                 nfail += 1
                 failures.append("line %s: module rejected: %s" % (cmd.get("line"), msg))
+            if rc == 0 and cmd.get("module_type") == "text":
+                # wasm-tools made no binary of a quoted module, so the one
+                # the execution half runs is warmc's
+                wasm = os.path.splitext(path)[0] + ".quote.wasm"
+                r = sh([WARMC, "--emit-wasm", "-o", wasm, path], timeout=WARMC_TIMEOUT)
+                if r.returncode == 0:
+                    cmd["filename"] = os.path.basename(wasm)
+                    cmd["module_type"] = "binary"
             continue
         if kind in ("assert_malformed", "assert_invalid"):
 
-            if cmd.get("module_type") != "binary":
-                nskip += 1
-                continue
             want = EXIT_MALFORMED if kind == "assert_malformed" else EXIT_INVALID
             rc, msg = validate(os.path.join(outdir, cmd["filename"]))
             if rc == want:
@@ -230,6 +241,10 @@ def run_file(wast, idx, levels, verbose=False):
             continue
         nskip += 1
 
+    tpass, tfail, tfailures = wasttext.check(wast, spec, outdir, WARMC, sh,
+                                             WARMC_TIMEOUT)
+    failures += tfailures
+
     if verbose:
         for f in failures[:20]:
             print("    " + f)
@@ -237,7 +252,7 @@ def run_file(wast, idx, levels, verbose=False):
     build = {lv_key(lv): build_file(stem, outdir, spec, lv, idx)
              for lv in levels}
     return {"pass": npass, "fail": nfail, "skip": nskip, "failures": failures,
-            "build": build}
+            "text_pass": tpass, "text_fail": tfail, "build": build}
 
 def cc_host(src, obj):
 
@@ -535,6 +550,7 @@ def main():
                 results[name]["run"][key] = execute_file(prog, name)
 
     tot_pass = tot_fail = tot_skip = 0
+    tot_tpass = tot_tfail = 0
     per_level = {level_tag(lv): {"pass": 0, "fail": 0, "runnable": 0} for lv in levels}
     mismatches = []
 
@@ -543,6 +559,8 @@ def main():
         tot_pass += r.get("pass", 0)
         tot_fail += r.get("fail", 0)
         tot_skip += r.get("skip", 0)
+        tot_tpass += r.get("text_pass", 0)
+        tot_tfail += r.get("text_fail", 0)
         want = expected.get(name, {})
         got_fail = r.get("fail", 0)
         for lv in levels:
@@ -556,13 +574,18 @@ def main():
             if not update and (got_fail != want.get("fail", 0) or
                                run.get("fail", 0) != want.get("run_fail", 0) or
                                r.get("pass", 0) != want.get("pass", 0) or
-                               run.get("pass", 0) != want.get("run_pass", 0)):
+                               run.get("pass", 0) != want.get("run_pass", 0) or
+                               r.get("text_pass", 0) != want.get("text_pass", 0) or
+                               r.get("text_fail", 0) != want.get("text_fail", 0)):
                 mismatches.append((name, " ".join(lv), want.get("fail", 0), got_fail,
                                    want.get("run_fail", 0), run.get("fail", 0),
-                                   ["validation %d -> %d, execution %d -> %d (%s)"
+                                   ["validation %d -> %d, execution %d -> %d (%s), "
+                                    "text %d/%d -> %d/%d"
                                     % (want.get("pass", 0), r.get("pass", 0),
                                        want.get("run_pass", 0), run.get("pass", 0),
-                                       run.get("status", "-"))] +
+                                       run.get("status", "-"),
+                                       want.get("text_pass", 0), want.get("text_fail", 0),
+                                       r.get("text_pass", 0), r.get("text_fail", 0))] +
                                    r.get("failures", []) + run.get("failures", [])))
         if verbose:
             first = r.get("run", {}).get(lv_key(levels[0]), {})
@@ -574,6 +597,8 @@ def main():
     if update:
         first = lv_key(levels[0])
         out = {n: {"fail": r.get("fail", 0), "pass": r.get("pass", 0),
+                   "text_fail": r.get("text_fail", 0),
+                   "text_pass": r.get("text_pass", 0),
                    "run_fail": r.get("run", {}).get(first, {}).get("fail", 0),
                    "run_pass": r.get("run", {}).get(first, {}).get("pass", 0),
                    "run": r.get("run", {}).get(first, {}).get("status", "-")}
@@ -588,6 +613,10 @@ def main():
         return 0
 
     print("spec: %d files; validation %d passed %d failed" % (len(files), tot_pass, tot_fail))
+    print("spec: text modules assembled by warmc %d as wasm-tools does (%d where "
+          "wasm-tools is wrong), %d not"
+          % (tot_tpass, sum(1 for n, _l in wasttext.ORACLE_WRONG if n in files),
+             tot_tfail))
     for lv in levels:
         acc = per_level[level_tag(lv)]
 
@@ -619,20 +648,22 @@ def write_proposal_table(files, results, levels):
     groups = proposals.classify_all(files)
     key = lv_key(levels[0])
 
-    print("| proposal | since | files | validation | execution | "
+    print("| proposal | since | files | validation | text | execution | "
           "validation-only | cannot compile |")
-    print("|---|---|---:|---:|---:|---:|---:|")
+    print("|---|---|---:|---:|---:|---:|---:|---:|")
     for label, ver, _m in proposals.ORDER:
         names = groups[label]
         if not names:
             continue
-        vp = vf = xp = xf = built = 0
+        vp = vf = tp = tf = xp = xf = built = 0
 
         vonly = badbuild = 0
         for n in names:
             r = results[n]
             vp += r.get("pass", 0)
             vf += r.get("fail", 0)
+            tp += r.get("text_pass", 0)
+            tf += r.get("text_fail", 0)
             run = r.get("run", {}).get(key) or {}
             xp += run.get("pass", 0)
             xf += run.get("fail", 0)
@@ -646,10 +677,15 @@ def write_proposal_table(files, results, levels):
 
         xp -= 2 * built
         v = "%d" % vp if not vf else "%d, **%d fail**" % (vp, vf)
+        t = "%d" % tp if not tf else "%d, **%d fail**" % (tp, tf)
         x = "%d" % xp if not xf else "%d, **%d fail**" % (xp, xf)
-        print("| %s | %s | %d | %s | %s | %d | %s |"
-              % (label, ver, len(names), v, x, vonly,
+        print("| %s | %s | %d | %s | %s | %s | %d | %s |"
+              % (label, ver, len(names), v, t, x, vonly,
                  "%d" % badbuild if not badbuild else "**%d**" % badbuild))
+    print()
+    print("`text` counts the modules a file writes as text that warmc assembles "
+          "as wasm-tools")
+    print("does, byte for byte (test/spec/wasttext.py).")
     print()
     print("`validation-only` files hold nothing but `assert_malformed` and "
           "`assert_invalid`,")

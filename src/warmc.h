@@ -409,6 +409,8 @@ static inline bool vt_ref_collectable(const Module *m, ValType t) {
 
 Module *wasm_parse(const uint8_t *bin, size_t len);
 void wasm_check_utf8(const uint8_t *p, uint32_t n);
+/* the length of the longest prefix of p[0..n) that is well-formed UTF-8 */
+size_t wasm_utf8_prefix(const uint8_t *p, size_t n);
 void wasm_validate(Module *m);
 void module_free(Module *m);
 uint32_t module_add_distinct_func_type(Module *m, const ValType *params, uint32_t nparams,

@@ -1175,6 +1175,176 @@ case("text_underscores_between_digits", "accept", "",
      ' (func (drop (i32.const 0x1_0)) (drop (i64.const -1_000))'
      ' (drop (f64.const 1_0.2_5e1_0)) (drop (f64.const 0x1_f.8p1_0)) (drop (f32.const nan:0x1_0))))')
 
+# Text only: the shapes of the text format the corpus's text half does not
+# reach.  A lone surrogate here, like "\udcff", is a raw byte that is not
+# UTF-8: main() writes it as the byte.
+#
+# Characters.  Source is UTF-8 throughout, comments and strings too; a string
+# holds no character below U+20 and no U+7F but as an escape; NUL is no
+# idchar, in an annotation either.
+case("text_nul_in_annotation", "malformed", "unexpected byte 0x00",
+     "(module (@a \x00) (func))")
+case("text_nul_between_tokens", "malformed", "unexpected byte 0x00",
+     "(module (func) \x00)")
+for _n, _c in [("tab", "\t"), ("cr", "\r"), ("del", "\x7f"), ("unit_sep", "\x1f")]:
+    case("text_raw_%s_in_string" % _n, "malformed", "control character 0x%02x in a string" % ord(_c),
+         '(module (memory 1) (data (i32.const 0) "a%sb"))' % _c)
+case("text_raw_tab_in_quoted_id", "malformed", "control character 0x09 in a string",
+     '(module (func $"a\tb"))')
+case("text_control_escapes_in_string", "accept", "",
+     '(module (memory 1) (data (i32.const 0) "\\t\\n\\r\\00\\7f\\u{1f}"))')
+case("text_bad_utf8_in_line_comment", "malformed", "malformed UTF-8 encoding",
+     "(module (func)) ;; \udcff\n")
+case("text_bad_utf8_in_block_comment", "malformed", "malformed UTF-8 encoding",
+     "(module (; \udcc3 ;) (func))")
+case("text_bad_utf8_raw_in_string", "malformed", "malformed UTF-8 encoding",
+     '(module (memory 1) (data (i32.const 0) "\udce2\udc82"))')
+case("text_overlong_utf8_in_string", "malformed", "malformed UTF-8 encoding",
+     '(module (memory 1) (data (i32.const 0) "\udcc0\udcaf"))')
+case("text_utf8_in_comments_and_strings", "accept", "",
+     '(module ;; Grüße\n (; ★ ;) (memory 1) (data (i32.const 0) "Heiße ★ 😀"))')
+case("text_bad_utf8_escape_in_quoted_id", "malformed",
+     "malformed UTF-8 encoding in an identifier", '(module (func $"\\ef\\bb"))')
+case("text_utf8_escapes_in_quoted_id", "accept", "",
+     '(module (func $"\\ef\\bb\\bf\\u{1F600}") (export "f" (func $"\\u{feff}😀")))')
+case("text_bad_utf8_escape_in_annotation_id", "malformed",
+     "malformed UTF-8 encoding in an annotation id", '(module (@"\\c3") (func))')
+# A line comment ends at a newline, which is U+0A, U+0D or the two: past a
+# lone CR the next line is code.  Had the comment run on, the module would
+# lack its closing parentheses.
+case("text_line_comment_ends_at_cr", "accept", "",
+     "(module (func ;; one\r(drop (i32.const 1))) ;; two\r\n(func))")
+# An error after lone CRs is placed on the line they make.
+case("text_cr_counts_lines", "malformed", ":3:18: malformed float",
+     "(module\r(func\r(drop (f32.const .5))))")
+# Tokens.  An annotation opens with "(@" and no space between; idchars and
+# strings with nothing between them are one token, which means something only
+# as idchars alone, one string alone, or $ before one string -- anything else
+# is reserved, and so are , ; [ ] { } -- and only an annotation may hold one.
+case("text_spaced_annotation_is_no_annotation", "malformed", "unknown module field '@a'",
+     "(module ( @a) (func))")
+case("text_annotation_holds_reserved_tokens", "accept", "",
+     '(module (@a , ; ] [ }} }x{ x"y" "a""b" $"l"0 ,{{};}] ;) (func))')
+case("text_reserved_comma", "malformed", "unexpected token ','", "(module (func) ,)")
+case("text_reserved_brace", "malformed", "unexpected token '{'", "(module (func {}))")
+case("text_keyword_then_string", "malformed", "unexpected token 'export\"f\"'",
+     '(module (func) (export"f" (func 0)))')
+case("text_two_strings_unseparated", "malformed", "unexpected token '\"a\"\"b\"'",
+     '(module (memory 1) (data (i32.const 0) "a""b"))')
+case("text_quoted_id_then_idchars", "malformed", "unexpected token '$\"f\"g'",
+     '(module (func $"f"g))')
+case("text_id_then_string", "malformed", "unexpected token '$f\"g\"'",
+     '(module (func $f"g"))')
+case("text_strings_separated", "accept", "",
+     '(module (memory 1) (data (i32.const 0) "a" "b"(;;)"c"))')
+# Numbers.  A float is digits, then maybe a point and more digits, then maybe
+# an exponent with digits of its own, or the same in hex after a lowercase
+# 0x; a NaN's payload is hex; a value that rounds to infinity is out of range
+# where one that rounds to zero is not.
+for _n, _t in [("leading_point", "f32.const .5"), ("leading_point_exp", "f64.const .5e1"),
+               ("empty_exponent", "f64.const 1e"), ("signed_empty_exponent", "f64.const 1e+"),
+               ("hex_empty_exponent", "f64.const 0x1p"), ("hex_leading_point", "f64.const 0x.8p1"),
+               ("infinity_spelled", "f32.const infinity"), ("inf_upper", "f64.const INF"),
+               ("upper_hex_prefix", "f64.const 0X1p3"), ("exponent_in_hex_digits", "f64.const 0x1e3p")]:
+    case("text_float_" + _n, "malformed", "malformed float", "(module (func (drop (%s))))" % _t)
+case("text_int_upper_hex_prefix", "malformed", "malformed number '0X10'",
+     "(module (func (drop (i32.const 0X10))))")
+for _n, _t in [("decimal", "nan:1"), ("upper_x", "nan:0X1")]:
+    case("text_nan_payload_" + _n, "malformed", "a NaN payload is written in hex",
+         "(module (func (drop (f32.const %s))))" % _t)
+for _n, _t in [("f32_hex", "f32.const 0x1p128"), ("f32_decimal", "f32.const 3.5e38"),
+               ("f32_halfway", "f32.const 0x1.ffffffp127"), ("f64_decimal", "f64.const -1e309"),
+               ("f64_hex", "f64.const 0x1p1024"), ("v128_lane", "v128.const f32x4 0 0 0 1e39")]:
+    case("text_float_out_of_range_" + _n, "malformed", "is out of range",
+         "(module (func (drop (%s))))" % _t)
+case("text_floats_at_the_edges", "accept", "",
+     "(module (func"
+     " (drop (f32.const 1.)) (drop (f64.const 1.e5)) (drop (f64.const 0x1.)) (drop (f64.const 0x1P3))"
+     " (drop (f64.const 1E3)) (drop (f32.const 0x1.fffffep127)) (drop (f32.const -0x1.fffffefffffffp127))"
+     " (drop (f32.const 3.4028234e38)) (drop (f64.const 0x1.fffffffffffffp1023))"
+     " (drop (f64.const 1.7976931348623157e308)) (drop (f32.const 1e-50)) (drop (f64.const 1e-400))"
+     " (drop (f32.const -inf)) (drop (f64.const +nan)) (drop (f64.const nan:0xf_ffff_ffff_ffff))))")
+# Type uses.  A function's, a type definition's, an import's and a tag's
+# parameters may be named; a block type's and call_indirect's not.  A type
+# use that has both an index and a signature must name a type, or there is
+# nothing to check the signature against.
+for _n, _b in [("block", "(block (param $x i32) (drop))"),
+               ("loop", "(loop (param $x i32) (drop))"),
+               ("if", "(if (param $x i32) (i32.const 1) (then (drop)) (else (drop)))"),
+               ("try_table", "(try_table (param $x i32) (drop))"),
+               ("flat_block", "block (param $x i32) drop end"),
+               ("block_with_type", "(block (type $t) (param $x i32) (drop))"),
+               ("call_indirect", "(call_indirect (param $x i32) (i32.const 0))"),
+               ("return_call_indirect", "(return_call_indirect (param $x i32) (i32.const 0))")]:
+    case("text_named_param_in_" + _n, "malformed", "a parameter here cannot be named",
+         "(module (type $t (func (param i32))) (table 1 funcref)"
+         " (func (i32.const 0) %s))" % _b)
+case("text_named_params_where_allowed", "accept", "",
+     '(module (type (func (param $a i32))) (import "m" "f" (func (param $b i32)))'
+     ' (import "m" "t" (tag (param $c i32))) (tag (param $d i32)) (func (param $e i32)))')
+case("text_typeuse_signature_unknown_type", "malformed", "unknown type 5",
+     "(module (func (type 5) (param i32)))")
+case("text_typeuse_signature_unknown_type_in_block", "malformed", "unknown type 7",
+     "(module (func (block (type 7) (result i32) (i32.const 0)) (drop)))")
+case("text_typeuse_unknown_type_alone", "invalid", "unknown type", "(module (func (type 5)))")
+# Imports come before every definition of a function, table, memory, global
+# or tag, whatever the kinds of the two -- an inline import included.  Types,
+# segments, exports and the start function are no definitions here.
+for _n, _d, _i in [("tag", "(tag)", '(import "m" "f" (func))'),
+                   ("func_then_tag", "(func)", '(import "m" "t" (tag))'),
+                   ("memory_inline_func", "(memory 1)", '(func (import "m" "f"))'),
+                   ("table_inline_global", "(table 1 funcref)", '(global (import "m" "g") i32)'),
+                   ("global_inline_tag", "(global i32 (i32.const 0))", '(tag (import "m" "t"))'),
+                   ("tag_inline_memory", "(tag)", '(memory (import "m" "mem") 1)')]:
+    case("text_import_after_" + _n, "malformed", "import after a", "(module %s %s)" % (_d, _i))
+case("text_import_after_non_definitions", "accept", "",
+     '(module (type (func)) (elem declare func) (data "") (export "f" (func 0))'
+     ' (start 0) (import "m" "f" (func)) (func (import "m" "g")))')
+case("text_two_start_functions", "malformed", "one start function at most",
+     "(module (func) (start 0) (func) (start 1))")
+# An inline signature stands for the first type that is a function type, in
+# no rec group of its own -- a group of one would do as well, and is
+# equivalent -- final and with no supertype; or for a new type at the end.
+# So $f's type below is never $t, and only a subtype of $t could be.
+for _n, _t in [("nonfinal", "(type $t (sub (func)))"),
+               ("in_rec_group", "(rec (type $t (func)) (type (struct)))")]:
+    case("text_implicit_type_is_not_" + _n, "invalid", "",
+         "(module %s (func $f) (global (ref $t) (ref.func $f)))" % _t)
+# $t is the first type with $f's signature, but it has a supertype, whose
+# signature is another
+case("text_implicit_type_is_not_with_supertype", "invalid", "",
+     "(module (type $s (sub (func (result anyref)))) (type $t (sub final $s (func (result eqref))))"
+     " (func $f (result eqref) (ref.null eq)) (global (ref $t) (ref.func $f)))")
+for _n, _t in [("plain", "(type $t (func))"), ("sub_final", "(type $t (sub final (func)))"),
+               ("rec_of_one", "(rec (type $t (func)))")]:
+    case("text_implicit_type_is_" + _n, "accept", "",
+         "(module %s (func $f) (global (ref $t) (ref.func $f)))" % _t)
+# Inline segments.  A table's inline (elem ...) takes an address type before
+# its element type, an offset of that address type, and the table's element
+# type for its items, function indices included; an item is (item ...) or a
+# folded instruction; a memory's inline (data ...) an offset of its address
+# type.  Every one of these was refused, as malformed or as invalid.
+case("text_inline_elem_table64", "accept", "",
+     "(module (table i64 funcref (elem $f)) (func $f))")
+case("text_inline_elem_table64_exprs", "accept", "",
+     "(module (table i64 funcref (elem (ref.func $f))) (func $f))")
+case("text_inline_elem_typed_indices", "accept", "",
+     "(module (type $t (func)) (table (ref null $t) (elem $f $f)) (func $f (type $t)))")
+# A (ref func) table has no default for its elements, so the abbreviation,
+# which gives the table none, is invalid -- after it is read.
+case("text_inline_elem_nonnull_indices", "invalid", "has no default value",
+     "(module (table (ref func) (elem $f)) (func $f))")
+case("text_inline_elem_folded_items", "accept", "",
+     "(module (type $a (array i8)) (table (ref null $a) (elem"
+     " (array.new $a (i32.const 7) (i32.const 3)) (item (array.new_fixed $a 1 (i32.const 1)))"
+     " (item i32.const 2 i32.const 4 array.new $a))))")
+case("text_elem_folded_items", "accept", "",
+     "(module (type $a (array i8)) (elem $e (ref $a)"
+     " (array.new $a (i32.const 7) (i32.const 3)) (array.new_default $a (i32.const 1)))"
+     " (elem i31ref (ref.i31 (i32.const 5))))")
+case("text_inline_data_memory64", "accept", "",
+     '(module (memory i64 (data "x")) (memory (data "y")))')
+
 def main():
     out = sys.argv[1] if len(sys.argv) > 1 else "."
     os.makedirs(out, exist_ok=True)
@@ -1182,7 +1352,10 @@ def main():
         text = isinstance(mod, str)
         path = os.path.join(out, name_ + (".wat" if text else ".wasm"))
         tmp = "%s.%d.tmp" % (path, os.getpid())
-        with open(tmp, "w" if text else "wb") as f:
+        # UTF-8 whatever the locale, a lone surrogate as the byte it stands
+        # for, and no newline translated
+        with (open(tmp, "w", encoding="utf-8", errors="surrogateescape", newline="")
+              if text else open(tmp, "wb")) as f:
             f.write(mod)
         os.replace(tmp, path)
         print("%s %s %s" % (name_, cls, frag))
