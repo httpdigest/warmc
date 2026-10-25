@@ -620,21 +620,24 @@ enum { VT_I32 = 0x7f, VT_I64 = 0x7e, VT_F32 = 0x7d, VT_F64 = 0x7c,
 void warmc_invoke(void *fn, WarmInstance *vm, const u64 *iargs,
                   const u64 *fargs, u64 *retbuf);
 
-#if defined(__x86_64__)
-/* x64 carries only 3 ints and 4 floats in argument registers; a callee
-   with more reads the rest from its incoming stack slots, which
+/* A callee with more parameters than its argument registers carry -- 3
+   ints and 4 floats on x64, 7 ints after the instance and 8 floats on
+   arm64 -- reads the rest from its incoming stack slots, which
    warmc_invoke cannot populate.  These variants also copy a caller-built
-   image of those slots: 8 bytes per scalar parameter past its class's
-   register ceiling and 16 per v128, in parameter order, at most
-   WARMC_X64_STACK_BYTES of it (the rest is not copied). */
+   image of those slots, in parameter order, of each parameter past its
+   class's register ceiling:
+     x64:   8 bytes per scalar and an aligned 16 per v128, at most
+            WARMC_X64_STACK_BYTES of it (the rest is not copied);
+     arm64: 16 bytes per parameter, a scalar in the low 8, any length, a
+            multiple of 16. */
 #define WARMC_X64_STACK_BYTES 480
+#define WARMC_A64_STACK_SLOT 16
 void warmc_invoke_s(void *fn, WarmInstance *vm, const u64 *iargs,
                     const u64 *fargs, u64 *retbuf,
                     const u64 *stk, u64 stk_bytes);
 u32 warmc_invoke_catching_s(void *fn, WarmInstance *vm, const u64 *iargs,
                             const u64 *fargs, u64 *retbuf,
                             const u64 *stk, u64 stk_bytes);
-#endif
 
 void warmc_trap(u32 code);
 void warmc_unreached(void);

@@ -110,15 +110,28 @@ int main(void) {
   CHECK(sum(65530, 10) == 0 && basic_last_trap() == 2,
         "a read past memory traps out of bounds: %u", basic_last_trap());
   CHECK(quot(9, 3) == 3 && basic_last_trap() == 0, "and the next call clears it");
-#if defined(__x86_64__)
-  /* 12 integer and 10 float parameters: 9 and 6 of them past the registers,
-     in the stack image the C entry builds */
+  /* 12 integer and 10 float parameters: 9 and 6 of them past the registers
+     on x64, 5 and 2 on arm64, in the stack image the C entry builds */
   {
     double w = wide(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12,
                     0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0);
     CHECK(w == 1172.5 && basic_last_trap() == 0, "wide(...) = %g, not 1172.5", w);
   }
-#endif
+  /* the same in 4-byte parameters, which Apple's arm64 convention packs on
+     the C caller's stack */
+  {
+    float w = narrow(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11,
+                     0.5f, 1.0f, 1.5f, 2.0f, 2.5f, 3.0f, 3.5f, 4.0f, 4.5f, 5.0f, 5.5f);
+    CHECK(w == 1122.0f && basic_last_trap() == 0, "narrow(...) = %g, not 1122", w);
+  }
+  /* results through pointers that follow nine parameters */
+  {
+    int32_t d = 0;
+    int64_t s = 0;
+    wide_pair(1, 2, 3, 4, 5, 6, 7, 8, 9, &d, &s);
+    CHECK(d == 8 && s == 45 && basic_last_trap() == 0,
+          "wide_pair(...) = %d, %lld, not 8, 45", d, (long long)s);
+  }
 
   /* Constant-length copies and fills: in bounds they move the bytes, an
      overlapping copy as memmove does; past the end by either range they

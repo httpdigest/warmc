@@ -54,7 +54,7 @@ Hello world!
 - **Passes the official spec testsuite.** The 257 core `.wast` files of the
   pinned upstream testsuite (its top level; its `proposals/`, `legacy/` and
   `custom/` directories are not run) pass with zero failures: 6,912
-  validation and 60,705 execution checks, counting each module that must
+  validation and 60,706 execution checks, counting each module that must
   compile and each instantiation as well as the assertions, at `-O1`, at
   `-O2`, and at `-O2 --profile=deterministic`. The text format is checked
   through warmc's own text front end: the quoted modules, malformed ones
@@ -306,7 +306,8 @@ PROG [--catch] [--bench N] EXPORT ARGS... [-- EXPORT ARGS...]...
   - `1` trap, printed to stderr as `trap: <spec message>`, or one of the
     runtime's own fatal errors, printed as `warmc-rt: …`
   - `2` unknown export, too few arguments (extra ones are ignored), a `v128`
-    parameter, or more than 7 integer or 8 float parameters
+    parameter, or more than 60 parameters past the registers (3 integer
+    and 4 float on x64, 7 and 8 on arm64)
   - `4` unresolved import (the harness provides no imports)
   - `139` a fault outside linear memory
 
@@ -492,7 +493,7 @@ The rest of the API, in [`rt/warm_rt.h`](rt/warm_rt.h):
 | `warmc_find_export(inst, name)`, `warmc_find_export_n(inst, name, len)`, `warmc_export_func(inst, e)` | look an export up, and get the function an export names |
 | `warmc_bind_import(inst, module, name, fn, self)` | rebind an already-linked function import to a host function, which then receives `self` first (`test/tinygo/driver.c` passes the guest, to reach its memory); returns how many imports it rebound |
 | `warmc_invoke(...)`, `warmc_invoke_catching(...)` | call an export. Integer and reference args go in `iargs`: up to 7 on arm64 and 3 on x64. Floats go in `fargs[2*i]`: up to 8 on arm64 and 4 on x64, a `v128` in `fargs[2*i]` and `fargs[2*i+1]`. Results come back in `ret[WARMC_RET_X0]` (integer), `ret[WARMC_RET_V0]` (float; a `v128` in it and the next word) or `ret[WARMC_RET_MULTI(i)]` (multi-value). |
-| `warmc_invoke_s`, `warmc_invoke_catching_s` | x64 only: for functions with more than 3 integer or 4 float parameters, which take the rest from an image of their stack slots, 8 bytes per scalar and 16 per `v128`. On arm64 a function with more than 7 integer or 8 float parameters cannot be called from C. |
+| `warmc_invoke_s`, `warmc_invoke_catching_s` | for functions with more parameters than the registers above carry, which take the rest from an image of their stack slots, in parameter order: on x64 8 bytes per scalar and an aligned 16 per `v128`, at most `WARMC_X64_STACK_BYTES`; on arm64 16 bytes per parameter (`WARMC_A64_STACK_SLOT`), a scalar in the low 8, any number of them. |
 | `warmc_global_cell(inst, idx)`, `inst->mem_base` / `mem_size` | access globals and linear memory 0 |
 | `warmc_gc_collect()`, `warmc_gc_hold()` / `warmc_gc_release()` | drive the collector; register C-side roots |
 | `warmc_custom_section(md, name, index, &data, &size)` | the module's custom sections named `name`: how many there are, and the `index`-th one's payload (see [Custom sections](#custom-sections)) |
@@ -640,8 +641,8 @@ Names:
 - Two exports that become the same C name, or an export named like one of
   the library's own functions, stop the build.
 - An export that C cannot call gets no symbol, and warmc warns about it. That
-  covers `v128` and reference types, more than 16 results, and, on arm64,
-  more than 7 integer or 8 float parameters.
+  covers `v128` and reference types, more than 16 results, and more than 60
+  parameters past the registers.
 
 warmc refuses to build a library that imports a memory, table, global or tag,
 or a function that C cannot stand in for: one returning more than one
@@ -1469,5 +1470,3 @@ Makefile        the build, the pinned dependencies and the test targets
   turns on it, and its imports cannot be rebound once it has been made. It
   imports only functions, each of which C must be able to stand in for; on
   Windows an imported function takes at most three parameters.
-- **From C**, on arm64, an export with more than 7 integer or 8 float
-  parameters cannot be called.
