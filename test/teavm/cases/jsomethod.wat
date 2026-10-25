@@ -1,0 +1,25 @@
+;; A method of `performance` other than now: the adapter names it and stops.
+(module
+  (type $chars (array (mut i16)))
+  (type $Object (sub (struct (field (mut i32)))))
+  (import "env" "memory" (memory 1))
+  (import "wasm:js-string" "fromCharCodeArray" (func $fromArray (param (ref null $chars) i32 i32) (result (ref extern))))
+  (import "teavmJso" "global" (func $global (param externref) (result externref)))
+  (import "teavmJso" "callMethod0" (func $callMethod0 (param externref externref) (result externref)))
+  (tag $exn (export "teavm.javaException") (param (ref null $Object)))
+  (data (i32.const 0) "performancemark")
+  (@custom "teavm.memoryRequirements" "{\"min\":1, \"dataSize\":15, \"shared\": false}")
+  (func $mk (param $p i32) (param $n i32) (result (ref extern))
+    (local $a (ref $chars)) (local $i i32)
+    (local.set $a (array.new_default $chars (local.get $n)))
+    (block $done
+      (loop $next
+        (br_if $done (i32.ge_u (local.get $i) (local.get $n)))
+        (array.set $chars (local.get $a) (local.get $i)
+          (i32.load8_u (i32.add (local.get $p) (local.get $i))))
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br $next)))
+    (call $fromArray (local.get $a) (i32.const 0) (local.get $n)))
+  (func $Main::main_$caller$exported$0 (param $args externref)
+    (drop (call $callMethod0 (call $global (call $mk (i32.const 0) (i32.const 11)))
+                             (call $mk (i32.const 11) (i32.const 4))))))

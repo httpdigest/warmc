@@ -1,0 +1,43 @@
+The name section's function and global maps in index order.
+
+A name map lists its entries by increasing index (the name section's
+appendix), and TeaVM writes each in the order of its collection, where an
+imported function or global may come after defined ones, though the index
+space numbers imports first.  Out of order, a map is not one the appendix
+allows: wasm-tools names nothing from its first entry out of order on, and
+warmc ignores the section.  The other maps list collections whose order is
+their index order already.
+
+test/teavm/fixes: every program's module, its maps checked in run_teavm.py.
+
+--- a/teavm-core/org/teavm/backend/wasm/render/WasmBinaryRenderer.java
++++ b/teavm-core/org/teavm/backend/wasm/render/WasmBinaryRenderer.java
+@@ -18,6 +18,7 @@ package org.teavm.backend.wasm.render;
+ import java.util.ArrayList;
+ import java.util.Collection;
+ import java.util.Collections;
++import java.util.Comparator;
+ import java.util.List;
+ import java.util.function.Supplier;
+ import java.util.stream.Collectors;
+@@ -543,8 +544,12 @@ public class WasmBinaryRenderer {
+         WasmBinaryWriter section = new WasmBinaryWriter();
+ 
+         WasmBinaryWriter functionsSubsection = new WasmBinaryWriter();
++        // A name map lists its entries in index order, which is not the order of
++        // the functions and globals: the imported ones come first.  Of the other
++        // maps, each lists what its collection has in index order already.
+         var functions = module.functions.stream()
+                 .filter(f -> f.getName() != null)
++                .sorted(Comparator.comparingInt(module.functions::indexOf))
+                 .collect(Collectors.toList());
+         functionsSubsection.writeLEB(functions.size());
+ 
+@@ -601,6 +606,7 @@ public class WasmBinaryRenderer {
+ 
+         var globals = module.globals.stream()
+                 .filter(g -> g.getName() != null)
++                .sorted(Comparator.comparingInt(module.globals::indexOf))
+                 .collect(Collectors.toList());
+         if (!globals.isEmpty()) {
+             var globalsSubsection = new WasmBinaryWriter();

@@ -49,7 +49,7 @@ SUITES = {
     "gc": ["./test/run_gc.sh"],
 }
 CORPORA = ["ctests", "cpptests", "rstests", "gotests", "stdgotests", "astests", "kttests",
-           "zigtests", "hstests"]
+           "zigtests", "hstests", "javatests"]
 
 def check_passes():
     src = open(os.path.join(ROOT, "src", "main.c")).read()

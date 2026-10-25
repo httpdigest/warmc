@@ -303,6 +303,86 @@ $(KOTLIN_STAMP):
 
 kotlin-stdlib: $(KOTLIN_STAMP)
 
+# TeaVM, Java to wasm GC, for test/javabench and test/javatests: its compiler
+# and class library, and what they load, from Maven Central.  TeaVM publishes
+# no command-line jar for this release, so test/teavm/TeaVMBuild.java drives
+# its tooling API.  The JDK is the machine's (javac 21 or later), and the
+# corpora skip themselves without one.  test/teavm/patches fix bugs of this
+# release in the sources of the artifacts they name, which are fetched too,
+# and are compiled into $(TEAVM_DIR)/patched, ahead of the jars.
+TEAVM_VERSION := 0.16.0
+TEAVM_DIR     := $(BUILD)/tools/teavm-$(TEAVM_VERSION)
+TEAVM_STAMP   := $(TEAVM_DIR)/.complete
+TEAVM_JARS := \
+  $(foreach a,tooling core classlib interop platform jso jso-apis jso-impl \
+      metaprogramming-api metaprogramming-impl extension-apis extension-spi \
+      extension-spi-util relocated-libs-asm relocated-libs-asm-analysis \
+      relocated-libs-asm-commons relocated-libs-asm-tree relocated-libs-asm-util \
+      relocated-libs-hppc relocated-libs-rhino,\
+    org/teavm/teavm-$(a)/$(TEAVM_VERSION)/teavm-$(a)-$(TEAVM_VERSION).jar) \
+  joda-time/joda-time/2.12.2/joda-time-2.12.2.jar \
+  com/jcraft/jzlib/1.1.3/jzlib-1.1.3.jar
+TEAVM_SOURCES := core classlib
+TEAVM_SOURCES_STAMP := $(TEAVM_DIR)/sources/.complete
+TEAVM_PATCHED := $(TEAVM_DIR)/patched/.complete
+JAVAC_VERSION := $(shell javac -version 2>&1 | sed -n 's/^javac \([0-9][0-9]*\).*/\1/p')
+
+$(TEAVM_STAMP):
+	@test -n "$(JAVAC_VERSION)" || { \
+	  echo "make teavm: javac not found (TeaVM runs on a JDK, 21 or later)"; exit 1; }
+	@rm -rf $(BUILD)/tools/teavm-*
+	@mkdir -p $(TEAVM_DIR)
+	@for j in $(TEAVM_JARS); do \
+	  curl -sSLf -o $(TEAVM_DIR)/$$(basename $$j) "https://repo1.maven.org/maven2/$$j" || \
+	    { echo "make teavm: cannot fetch $$j"; exit 1; }; \
+	done
+	@touch $@
+
+# A stamp of their own, so that a TeaVM fetched before they were is completed.
+$(TEAVM_SOURCES_STAMP): $(TEAVM_STAMP)
+	@rm -rf $(TEAVM_DIR)/sources
+	@mkdir -p $(TEAVM_DIR)/sources
+	@for a in $(TEAVM_SOURCES); do \
+	  j=org/teavm/teavm-$$a/$(TEAVM_VERSION)/teavm-$$a-$(TEAVM_VERSION)-sources.jar; \
+	  curl -sSLf -o $(TEAVM_DIR)/sources/$$(basename $$j) "https://repo1.maven.org/maven2/$$j" || \
+	    { echo "make teavm: cannot fetch $$j"; exit 1; }; \
+	done
+	@touch $@
+
+# The directory too, so that removing a patch rebuilds them.
+$(TEAVM_PATCHED): $(TEAVM_SOURCES_STAMP) test/teavm/patch.py test/teavm/patches \
+                  $(wildcard test/teavm/patches/*.patch)
+	@python3 test/teavm/patch.py $(TEAVM_DIR)
+
+teavm: $(TEAVM_PATCHED)
+
+# Temurin, the JDK the Java corpora's native column runs: the same classes
+# TeaVM compiles, on the JVM and its JIT.  Only a native record needs it
+# (`make bench-record`, `gobench.py --native`), so `make check` does not fetch
+# it.  Adoptium's release for this host, versioned like TeaVM's directory.
+TEMURIN_VERSION := 25.0.5+8
+TEMURIN_HOST    := $(strip \
+  $(if $(filter Darwin-arm64,$(UNAME_S)-$(UNAME_M)),aarch64_mac) \
+  $(if $(filter Darwin-x86_64,$(UNAME_S)-$(UNAME_M)),x64_mac) \
+  $(if $(filter Linux-aarch64 Linux-arm64,$(UNAME_S)-$(UNAME_M)),aarch64_linux) \
+  $(if $(filter Linux-x86_64,$(UNAME_S)-$(UNAME_M)),x64_linux))
+TEMURIN_DIR     := $(BUILD)/tools/temurin-$(TEMURIN_VERSION)
+TEMURIN_STAMP   := $(TEMURIN_DIR)/.complete
+TEMURIN_FEATURE := $(firstword $(subst ., ,$(TEMURIN_VERSION)))
+
+$(TEMURIN_STAMP):
+	@test -n "$(TEMURIN_HOST)" || { \
+	  echo "make temurin: Adoptium publishes no Temurin tarball for this host"; exit 1; }
+	@rm -rf $(BUILD)/tools/temurin-*
+	@mkdir -p $(TEMURIN_DIR)
+	curl -sSLf -o $(TEMURIN_DIR).tar.gz \
+	  "https://github.com/adoptium/temurin$(TEMURIN_FEATURE)-binaries/releases/download/jdk-$(subst +,%2B,$(TEMURIN_VERSION))/OpenJDK$(TEMURIN_FEATURE)U-jdk_$(TEMURIN_HOST)_hotspot_$(subst +,_,$(TEMURIN_VERSION)).tar.gz"
+	@tar xzf $(TEMURIN_DIR).tar.gz -C $(TEMURIN_DIR) --strip-components=1
+	@rm -f $(TEMURIN_DIR).tar.gz
+	@touch $@
+
+temurin: $(TEMURIN_STAMP)
+
 # clang, wasm-ld and a WASI sysroot for test/cbench and test/cppbench.  The
 # release, not a distribution's packages: its C++ library comes built both with
 # and without exceptions, and the kernels that throw need the former.
@@ -331,11 +411,12 @@ wasi-sdk: $(WASI_SDK_STAMP)
 
 # `make check` brings the pinned tools up to date first, and the official
 # testsuite its spec row runs; ktbench skips itself without a Kotlin
-# compiler, so the stdlib is only fetched when there is one, and wasi-sdk
-# only where it publishes a release.  hsbench's GHC is not fetched:
-# ghc-wasm-meta installs it, and the corpus skips itself without.
+# compiler, so the stdlib is only fetched when there is one, TeaVM only with
+# a JDK to run it, and wasi-sdk only where it publishes a release.
+# hsbench's GHC is not fetched: ghc-wasm-meta installs it, and the corpus
+# skips itself without.
 CHECK_TOOLS := wasm-tools testsuite $(if $(KOTLIN_VERSION),kotlin-stdlib) \
-               $(if $(WASI_SDK_HOST),wasi-sdk)
+               $(if $(JAVAC_VERSION),teavm) $(if $(WASI_SDK_HOST),wasi-sdk)
 
 SPEC_LEVELS ?= -O1,-O2,-O2 --profile=deterministic
 
@@ -392,7 +473,7 @@ check-linux: all
 	@rc=0; ./test/run_gowasi_linux.sh || rc=1; ./test/run_gc_linux.sh || rc=1; exit $$rc
 
 BENCH_CORPORA = gobench stdgo vecbench asbench rsbench ktbench zigbench cbench cppbench \
-                hsbench
+                hsbench javabench
 
 bench-compare: all
 	@rc=0; t=$$(mktemp); for c in $(BENCH_CORPORA); do \
@@ -400,7 +481,7 @@ bench-compare: all
 	  tail -n +2 $$t; \
 	done; rm -f $$t; exit $$rc
 
-bench-record: all
+bench-record: all $(if $(TEMURIN_HOST),$(TEMURIN_STAMP))
 	@for c in $(BENCH_CORPORA); do \
 	  python3 test/gobench.py --corpus $$c --rounds 5 --record --native | tail -1; \
 	done
@@ -448,6 +529,6 @@ clean:
 	rm -rf $(BUILD)
 
 .PHONY: all asan tsan check smoke check-tools check-linux check-encoder check-spec conformance testsuite wasm-tools \
-        kotlin-stdlib wasi-sdk fuzz check-combos clean bench-compare bench-record bench-record-o3 bench-record-warmc gc-jitter gc-jitter-full
+        kotlin-stdlib teavm temurin wasi-sdk fuzz check-combos clean bench-compare bench-record bench-record-o3 bench-record-warmc gc-jitter gc-jitter-full
 
 -include $(WARMC_DEPS)
