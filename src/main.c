@@ -135,8 +135,10 @@ static const char *usage_text =
   "                own (.wasm.custom, __TEXT,__wasm_custom, .wcustom) that a\n"
   "                --shared library also hands out by name:\n"
   "                PREFIX_custom_section.  default leaves out the debug\n"
-  "                information: the name section, which warmc does not\n"
-  "                read, and DWARF's .debug_* sections\n"
+  "                information: the name section, whose function names the\n"
+  "                symbols carry already, and DWARF's .debug_* sections\n"
+  "  --no-function-names  name each function's symbol wasm_func_N, by its\n"
+  "                index, rather than as the module's name section does\n"
   "  --no-export-names  emit only the exports a name can still be needed\n"
   "                for -- _start and main -- and drop the rest of the export\n"
   "                table.  The program can then no longer be asked for an\n"
@@ -367,6 +369,7 @@ int main(int argc, char **argv) {
     else if (!strcmp(a, "--keep-obj")) keep_obj = true;
     else if (!strcmp(a, "--no-dead-strip")) dead_strip = false;
     else if (!strcmp(a, "--no-export-names")) g_no_export_names = true;
+    else if (!strcmp(a, "--no-function-names")) codegen_set_function_names(false);
     else if (!strncmp(a, "--custom-sections=", 18)) {
       const char *v = a + 18;
       if (!strcmp(v, "default")) codegen_set_custom_sections(CUSTOM_DEFAULT);

@@ -725,8 +725,8 @@ Mach-O, `.wcustom` in COFF and PE. A tool finds them there
 (`otool -s __TEXT __wasm_custom`, `llvm-objcopy --dump-section`), and the
 runtime hands them out by name: `warmc_custom_section` for an embedder, and
 `PREFIX_custom_section` from a library. By default every one is kept but the
-debug information: the name section, which warmc does not read (its symbols
-are `wasm_func_N`), and DWARF's `.debug_*` sections. `--custom-sections=all`
+debug information: the name section, whose function names the symbols
+carry already, and DWARF's `.debug_*` sections. `--custom-sections=all`
 keeps those too, and `--custom-sections=none` keeps none, so the output then
 has no such section. For a component, the sections carried are its core
 modules'; the component's own custom sections are not.
@@ -972,6 +972,7 @@ on each corpus (Apple M-series):
 | `--symbol-prefix=P` | name the module descriptor `P_module`; with `--shared`, the prefix of the library's own functions instead; ignored for a component |
 | `--custom-sections=default\|all\|none` | which of the module's custom sections the output carries (see [Custom sections](#custom-sections)); `default` leaves out the name section and `.debug_*` |
 | `--no-export-names` | drop the export-name table, keeping only `_start` and `main`; not for a component or with `--shared` |
+| `--no-function-names` | name every function's symbol `wasm_func_N`, by its index, rather than as the name section does |
 | `--no-dead-strip` | keep unreferenced sections in the link |
 | `--system-ld`, `--ld PATH` | link with an external linker instead (Linux and macOS only, not with `--shared`) |
 | `--keep-obj` | keep the intermediate object |
@@ -1045,7 +1046,8 @@ These decode, assemble and validate core modules, components and WIT. The text
 assembler handles both flat and folded syntax, names in every index space,
 inline imports, exports and segments, GC type definitions, and custom
 sections: `(@custom ...)` where it says, `(@producers ...)` last and
-`(@dylink.0 ...)` first. It reads the 3.0 text grammar as written, down to
+`(@dylink.0 ...)` first. It writes a name section of the functions' names:
+each one's `(@name "...")` annotation, or else its `$id`. It reads the 3.0 text grammar as written, down to
 its tokens: a run like `data"a"` is one reserved token and refused, and so is
 source that is not UTF-8.
 
@@ -1079,9 +1081,17 @@ laid out deterministically.
   stub per export that enters the runtime through `rt/lib.c`, which reads the
   platform's C calling convention and makes the instance on the first call.
 - On Linux and macOS the executable keeps its function names, local ones
-  included: each compiled wasm function is `wasm_func_N` (its index in the
-  module), next to the runtime's own functions, so `perf`, Instruments,
-  `sample` and debuggers can name the code they land in.
+  included, so `perf`, Instruments, `sample` and debuggers can name the code
+  they land in, and demangle a C++ or Rust name: each compiled wasm function
+  is named as the module's name section names it, next to the runtime's own
+  functions, and `wasm_func_N`, its index, where the section gives it no name
+  a symbol can carry, or under `--no-function-names`. Nothing refers to a
+  function by that name, which is in the symbol table alone, so it may be
+  anything -- a runtime function's, or another function's too. A name
+  section that is not as the spec's appendix has it gives no names at all,
+  and the module is valid all the same. `--print-ir` and `WARMC_TIME` give
+  the names too. Windows output has no symbol table; a COFF object (`-c`)
+  carries the names.
 
 **Runtime** (`rt/`):
 - **Platforms.** On Linux the runtime makes raw syscalls, on macOS it uses
@@ -1360,7 +1370,8 @@ The other rows check what has no second engine to compare with:
   (`test/run_levels.sh`) and the thread count never reaches the output
   (`test/run_jobs.sh`)
 - linking, shared libraries, register pressure, rejected modules, binary
-  cases, the WAT assembler against other assemblers (`test/run_wat.py`), and
+  cases, function symbols named from the name section (`test/run_names.py`),
+  the WAT assembler against other assemblers (`test/run_wat.py`), and
   a module without GC references compiling to the same bytes with and
   without load barriers (`test/run_nobar.sh`)
 - the compiler under AddressSanitizer and ThreadSanitizer (`run_asan.sh`,
@@ -1469,8 +1480,8 @@ Makefile        the build, the pinned dependencies and the test targets
 - **Guarded memories:** at most 1024 per process (see [Embedding compiled
   modules in C](#embedding-compiled-modules-in-c)).
 - **`--system-ld`** does not link Windows output.
-- **The name section is ignored**, so functions appear as `wasm_func_N`
-  (`--custom-sections=all` still carries it into the output).
+- **Windows executables** carry no symbol table, so there the name section's
+  names reach only a COFF object (`-c`).
 - **Exceptions** do not propagate through host (C) frames.
 - **The collector** does not run while wasm is re-entered from a host call.
 - **Instances** are never freed, and a process holds at most 4096 of them.

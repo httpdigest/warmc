@@ -154,8 +154,9 @@ def classify(insts, lo, hi):
 def wasm_names(wasm):
     """Function index -> the name the producer gave it, when there is one.
 
-    warmc names its symbols `wasm_func_N` by index, so the module's own name
-    section is what turns a sweep into something a person can act on.
+    warmc's symbols carry the name section's names already; a function
+    goes by `wasm_func_N`, its index, only where the section gives it no name
+    a symbol can carry, or under --no-function-names, and this names those.
     """
     wt = os.path.join(ROOT, "build", "tools", "bin",
                       "wasm-tools.exe" if os.name == "nt" else "wasm-tools")

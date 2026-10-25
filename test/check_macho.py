@@ -61,8 +61,19 @@ for _ in range(ncmds):
 # profiler can name the code it samples -- and carries a UUID, without which
 # Instruments will not match those names to the binary at all.
 assert uuid and uuid != bytes(16), "no LC_UUID"
-assert any(n.startswith("_wasm_func_") for n in local_text), \
+# The module's functions are named as its name section names them, and the
+# rest wasm_func_N by index -- none of the named ones so.
+_names = {}
+if wasm:
+    sys.path.insert(0, __import__("os").path.dirname(__file__))
+    import custom_check
+    _bin = open(wasm, "rb").read()
+    _names = custom_check.func_names(custom_check.wasm_customs(_bin),
+                                     custom_check.wasm_nfuncs(_bin))
+assert any(n.startswith("_wasm_func_") or n[1:] in _names.values() for n in local_text), \
     "no wasm function names among %d local text symbols" % len(local_text)
+_misnamed = [n for n in local_text if n.startswith("_wasm_func_") and n[11:].isdigit()
+             and int(n[11:]) in _names]
 
 def read(addr, n):
     for vmaddr, vmsize, fileoff, filesize in segments:
@@ -172,6 +183,10 @@ if wasm:
                        u64(md + custom_check.DESC_CUSTOM),
                        custom_check.wasm_customs(open(wasm, "rb").read()),
                        __import__("os").environ.get("CUSTOM_SECTIONS", "default"))
+
+for n in _misnamed:
+    problems.append("function %s has the name %r, and its symbol is %s"
+                    % (n[11:], _names[int(n[11:])], n[1:]))
 
 if problems:
     for p in problems:

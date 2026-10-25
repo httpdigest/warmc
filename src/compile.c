@@ -56,7 +56,7 @@ static void ftime_report(const Module *m, uint32_t first, uint32_t n) {
   for (uint32_t k = 0; k < nt; k++) {
     const Func *fn = &m->funcs[first + top[k]];
     fprintf(stderr, " f%u", first + top[k]);
-    if (fn->sym) fprintf(stderr, " (%s)", fn->sym);
+    if (fn->name || fn->sym) fprintf(stderr, " (%s)", fn->name ? fn->name : fn->sym);
     fprintf(stderr, " %.1fms %ub%s", g_ftime[top[k]],
             (uint32_t)(fn->body_end - fn->body), k + 1 < nt ? "," : "");
   }
