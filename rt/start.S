@@ -600,9 +600,113 @@ SYM(\name):
     GC_TRAMPOLINE warmc_array_new_data
     GC_TRAMPOLINE warmc_array_new_elem
 
+/* warmc_gc_load_stub: the load barrier's slow path, for a reference in x14
+   whose colour is not the good one, loaded from the slot at x15; the healed
+   reference comes back in x14 and every other register is as it was.  Most
+   need only the good colour: the object is on no page chosen for
+   relocation, and no mark is on or the object is marked already.  Those it
+   heals here, from warmc_gc_fast (rt.c GcFast, at the offsets named below),
+   with six registers saved, and while a mark is on it shades the object if
+   no one has: its mark bit set, it goes onto the program's end of the mark
+   queue, shown to the collector every GC_MQ_BATCH, as gc_mark_ref does --
+   an object the program loads a reference to has its header written, so
+   none is being born.  Anything else -- an object that may have moved, a
+   page whose bits this mark has not claimed -- goes to
+   warmc_gc_load_barrier with every register saved.  The granule's map byte
+   says whether its object may have moved and how far back its page's head
+   is, whose epoch is read with acquire, so that the mark bits are this
+   mark's, not the last's. */
+#define GCF_BASE   0
+#define GCF_MAP    16
+#define GCF_EPOCH  24
+#define GCF_BITS   32
+#define GCF_GOOD   40
+#define GCF_MARK   48
+#define GCF_READY  52
+#define GCF_HEALED 56
+#define GCF_MQ     64
+#define GCF_MQP    72
+#define GCF_SHADED 80
     .globl SYM(warmc_gc_load_stub)
     FUNC_DIRECTIVES(SYM(warmc_gc_load_stub))
 SYM(warmc_gc_load_stub):
+    stp     x16, x17, [sp, #-48]!
+    stp     x12, x13, [sp, #16]
+    stp     x10, x11, [sp, #32]
+    LOADADDR x16, SYM(warmc_gc_fast)
+    ldp     x12, x13, [x16, #GCF_BASE]      /* the heap's base and size */
+    and     x17, x14, #0xf8ffffffffffffff   /* the address, its colour off */
+    sub     x12, x17, x12
+    cmp     x12, x13
+    b.hs    LOCAL(gcb_slow)
+    ldr     x13, [x16, #GCF_MAP]
+    lsr     x11, x12, #16                   /* its granule (GC_GRAN_SHIFT) */
+    ldrb    w10, [x13, x11]
+    tbnz    w10, #0, LOCAL(gcb_slow)        /* GCM_MOVED */
+    ldr     w13, [x16, #GCF_MARK]
+    cbz     w13, LOCAL(gcb_heal)
+    sub     x11, x11, x10, lsr #1           /* its page's head */
+    ldr     x13, [x16, #GCF_EPOCH]
+    add     x13, x13, x11, lsl #2
+    ldar    w10, [x13]
+    ldr     w13, [x16, #GCF_READY]
+    cmp     w10, w13
+    b.ne    LOCAL(gcb_slow)
+    lsr     x11, x12, #4                    /* its unit (GC_UNIT) */
+    ldr     x13, [x16, #GCF_BITS]
+    lsr     x10, x11, #6
+    ldr     x10, [x13, x10, lsl #3]
+    lsr     x10, x10, x11
+    tbz     x10, #0, LOCAL(gcb_shade)
+LOCAL(gcb_heal):
+    ldr     x10, [x16, #GCF_GOOD]
+    orr     x14, x17, x10
+    str     x14, [x15]
+    ldr     x10, [x16, #GCF_HEALED]
+    add     x10, x10, #1
+    str     x10, [x16, #GCF_HEALED]
+    ldp     x10, x11, [sp, #32]
+    ldp     x12, x13, [sp, #16]
+    ldp     x16, x17, [sp], #48
+    ret
+LOCAL(gcb_shade):
+    lsr     x12, x11, #6
+    add     x13, x13, x12, lsl #3           /* the word of its mark bit */
+    mov     x10, #1
+    lsl     x10, x10, x11
+LOCAL(gcb_set):
+    ldxr    x12, [x13]
+    tst     x12, x10
+    b.ne    LOCAL(gcb_taken)
+    orr     x12, x12, x10
+    stxr    w11, x12, [x13]
+    cbnz    w11, LOCAL(gcb_set)
+    ldr     x10, [x16, #GCF_GOOD]
+    orr     x14, x17, x10                   /* queued healed, as gc_mark_ref queues it */
+    ldr     x13, [x16, #GCF_MQ]
+    ldr     x12, [x16, #GCF_MQP]
+    ldr     x10, [x12]                      /* the queue's head */
+    str     x14, [x13, x10, lsl #3]
+    add     x10, x10, #1
+    str     x10, [x12]
+    ldr     x11, [x12, #8]                  /* as far as the collector was shown */
+    sub     x11, x10, x11
+    cmp     x11, #32                        /* GC_MQ_BATCH */
+    b.lo    LOCAL(gcb_shaded)
+    add     x11, x12, #8
+    stlr    x10, [x11]
+LOCAL(gcb_shaded):
+    ldr     x10, [x16, #GCF_SHADED]
+    add     x10, x10, #1
+    str     x10, [x16, #GCF_SHADED]
+    b       LOCAL(gcb_heal)
+LOCAL(gcb_taken):
+    clrex
+    b       LOCAL(gcb_heal)
+LOCAL(gcb_slow):
+    ldp     x10, x11, [sp, #32]
+    ldp     x12, x13, [sp, #16]
+    ldp     x16, x17, [sp], #48
     sub     sp, sp, #672
     stp     x0, x1, [sp, #0]
     stp     x2, x3, [sp, #16]

@@ -1098,6 +1098,68 @@ static bool emit_gc_fastnew(Isel *s, Ref v, uint32_t type_idx, uint64_t total,
   return true;
 }
 
+/* array.new_default of a length the code works out: bumped in the
+   allocation buffer as a constant length's is, the size made from the
+   length -- at most 2^36 bytes from a 32-bit one, so the buffer's own bound
+   sends any that does not fit to the call -- and the buffer's bytes zero
+   already, every element's default.  A string's characters, a list's
+   backing array: TeaVM's and Kotlin's programs made most of their arrays
+   through the runtime's call, javabench/strapi 800 thousand of them.  Never
+   one whose loop keeps the buffer in a register (lab_fast_alloc takes
+   constant lengths alone). */
+static bool emit_gc_fastnew_len(Isel *s, Ref v, uint32_t type_idx, const Ref *args) {
+  const Inst *in = &s->f->insts[v];
+  uint32_t stride = (uint32_t)(in->imm2 & 0xff);
+  uint32_t hdrsz = (uint32_t)((in->imm2 >> 8) & 0xff);
+  if (!hdrsz || !stride || (stride & (stride - 1)) || stride > 16) return false;
+  if (in->imm2 & GCA_CACHED) return false;
+  uint32_t enc;
+  if (!a64_logical_imm(~15ull, SF64, &enc)) return false;
+
+  int len = rd(s, args[0], TMP1);
+  /* the bytes: the header and the elements, a whole number of units */
+  a64_load_imm(B, SF64, TMP0, hdrsz + 15u);
+  a64_add_uxtw(B, TMP0, TMP0, len, __builtin_ctz(stride));
+  a64_and_imm(B, SF64, TMP0, TMP0, enc);
+
+  a64_ldr_imm(B, 3, S0, REG_VMCTX, VMCTX_GC_LAB);
+  a64_ldr_imm(B, 3, S1, S0, 0);
+  a64_ldr_imm(B, 3, S2, S0, 8);
+  a64_add_reg(B, SF64, S3, S1, TMP0);
+  a64_cmp_reg(B, SF64, S3, S2);
+  size_t bslow = br_cc(s, 0, CC_HI, 0, 0);
+  a64_str_imm(B, 3, S3, S0, 0);
+
+  /* the header, then the length, through the cursor before x0 takes the
+     object: the length may be in x0 */
+  a64_ldr_imm(B, 2, S2, REG_VMCTX, VMCTX_GC_HDR);
+  if (type_idx) {
+    uint32_t off = type_idx << GC_TYPE_SHIFT;
+    if (off <= 0xfffu) {
+      a64_add_imm(B, SF32, S2, S2, off, 0);
+    } else {
+      a64_load_imm(B, SF32, S0, off);
+      a64_add_reg(B, SF32, S2, S2, S0);
+    }
+  }
+  a64_str_imm(B, 2, S2, S1, 0);
+  a64_str_imm(B, 2, len, S1, 4);
+  a64_mov_reg(B, SF64, R0, S1);
+
+  struct AllocFix *af = xmalloc(sizeof *af);
+  af->site = bslow;
+  af->back = B->len;
+  af->args = args; af->nargs = 1;
+  af->helper = "warmc_array_new"; af->type_idx = type_idx;
+  af->inst = s->cur_inst;
+  af->cached = false;
+  af->next = s->allocs;
+  s->allocs = af;
+  s->mem_valid = false;
+  commit(s, v, R0);
+  return true;
+}
+
 static void emit_alloc_slow_arms(Isel *s) {
   for (struct AllocFix *af = s->allocs; af;) {
     struct AllocFix *n = af->next;
