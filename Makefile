@@ -509,7 +509,8 @@ smoke: all $(WIN_CHECKS) check-encoder wasm-tools
 check-tools: $(CHECK_TOOLS)
 
 check-linux: all
-	@rc=0; ./test/run_gowasi_linux.sh || rc=1; ./test/run_gc_linux.sh || rc=1; exit $$rc
+	@rc=0; ./test/run_gowasi_linux.sh || rc=1; ./test/run_gc_linux.sh || rc=1; \
+	  ./test/run_wasi_linux.sh || rc=1; exit $$rc
 
 BENCH_CORPORA = gobench stdgo vecbench asbench rsbench ktbench zigbench cbench cppbench \
                 hsbench javabench

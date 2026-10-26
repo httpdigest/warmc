@@ -249,6 +249,8 @@ start wasi     ./test/run_wasi.sh
 
 start wasi-noexp env WARMC_FLAGS="--no-export-names" ./test/run_wasi.sh
 start gowasi   ./test/run_gowasi.sh
+# Go's net/http server, on a listener and a directory preopened
+start gohttp   python3 test/run_gohttp.py
 start wasip2   ./test/run_wasip2.sh
 start gowasip2 ./test/run_gowasip2.sh
 start rswasip2 ./test/run_rswasip2.sh
