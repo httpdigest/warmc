@@ -1278,18 +1278,34 @@ edges becomes a tree of compares, and any other a jump table. On arm64, a
 function whose entry block tests only what it is passed and what it loads
 from memory, and may return at once -- a destructor called on a null
 pointer -- makes that test, and that return with the block's stores, ahead
-of its prologue; a wrap whose readers take the low half only -- an indirect
+of its prologue; a function with a loop small enough for one 64-byte fetch
+block starts at the offset in its block that lets such loops fit with the
+least padding run on their entry, the rest of the block left ahead of it,
+where nothing runs; a wrap whose readers take the low half only -- an indirect
 call's table index among them -- is no instruction, they read the i64's
 register; and an i32 extended to i64 where a w-register write made it, its
 high half zero already, is no instruction either, as in the return of every
-Go function. The register allocator is a linear scan over SSA webs with
+Go function. On arm64 the instance and memory 0's base stay in `x19` and
+`x20`: a function is entered with them there and leaves them there, so it
+neither loads nor saves them, and a call of the module's own code passes
+nothing for them. In an object (`-c`) or a component, where another instance
+may call in, a function it can reach -- exported, or named by a segment or an
+initialiser, which is how a reference to one is made -- starts with a compare
+of the caller's instance against `x19`, and a call from another instance goes
+on to a runtime trampoline (`warmc_xenter`) that sets the two for the callee,
+copies its stack arguments, and puts the caller's back after; an executable's
+or a shared library's module is the only instance, which the host enters
+with the two set, and has no such compare. The register allocator is a linear scan over SSA webs with
 lifetime holes. It rematerialises constants -- on arm64 a zero takes no
 register at all, its readers reading the zero register, two stores of zeros
 one `stp xzr, xzr` -- recomputes a spilled frame address or other cheap
 operation from registers instead of reloading it, holds a spilled value that
 a loop reads in a register that is free across the loop, and chooses between
 callee-saved registers and caller-saved registers with save and restore
-around calls, whichever is cheaper.
+around calls, whichever is cheaper. A value live across a call in a loop
+takes the callee-saved registers from the other end than the rest do, so
+that a callee's save and restore of the few it uses rarely puts a loop's
+counter through memory on every call.
 Functions compile in parallel and are laid out deterministically.
 
 **Linker** (`src/link.c`, `pe.c`, `elf.c`, `macho.c`, `coff.c`):
@@ -1645,7 +1661,11 @@ The other rows check what has no second engine to compare with:
   (`test/run_levels.sh`) and the thread count never reaches the output
   (`test/run_jobs.sh`)
 - linking, shared libraries, register pressure, rejected modules, binary
-  cases, another module's object cast in a module it reached each way a
+  cases, calls between two instances with memories of their own by each
+  route one takes into the other -- an import, a table, a reference, each
+  also as a tail call -- with stack arguments, more results than registers
+  and exceptions caught across them (`test/link/pin_a.wat`, `pin_b.wat`),
+  another module's object cast in a module it reached each way a
   reference can cross a boundary (`test/gen_link_seal.py`), which `sealed`
   must not take the module for, a global of the class-initializer pattern
   the embedder sets (`test/link/once_x.wat`), which `once` must not take
