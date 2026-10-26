@@ -2121,7 +2121,8 @@ static void analyse_immediates(Isel *s) {
       Ref u = b->insts[i];
       if (!is_zero_test(s, u)) continue;
 
-      if (s->fused[u]) continue;
+      /* a branch's test too: tst and b.ne leave the and's operand where it
+         is, where and and cbnz took a register for its result */
       Ref cand = ir_args(f, u)[0];
       if (f->insts[cand].op != I_AND || f->insts[cand].nargs != 2) continue;
       if (uses[cand] != 1 || blocked[cand] || s->folded[cand]) continue;
@@ -2129,6 +2130,10 @@ static void analyse_immediates(Isel *s) {
       Ref *ca = ir_args(f, cand);
 
       if (s->folded[ca[0]] || s->folded[ca[1]]) continue;
+      /* a mask some other use keeps in a register would be made again for
+         the test, which reads it as an immediate (appendgrow's 3, also a
+         call's argument) */
+      if (f->insts[ca[1]].op == I_CONST && !s->imm_fold[ca[1]]) continue;
 
       if (vt_is_64((ValType)f->insts[cand].type) !=
           vt_is_64((ValType)f->insts[ir_args(f, u)[0]].type)) continue;

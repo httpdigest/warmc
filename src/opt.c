@@ -3217,11 +3217,89 @@ static bool retype_bit_loads(IrFunc *f) {
   return changed;
 }
 
+/* A branch on wrap(x >> k) of an i64 call result x, 0 < k <= 32, that
+   nothing else reads -- Go's unwind flag, the high half of what a call of
+   Go's type returns once gosp.c packs its stack pointer below it -- branches on
+   x & (0xffffffff << k) != 0 instead: one tst of x, its low half left in
+   place, where the shift took a register of its own and the stack pointer
+   the call returned two moves to keep (mov, mov, lsr, cbnz after each of
+   Go's calls). */
+/* the call whose unwind flag the branch condition c tests -- wrap(r >> 32),
+   r & 0xffffffff00000000 != 0, or an i32 call's result itself -- or
+   REF_NONE */
+static Ref flag_branch_call(IrFunc *f, Ref c) {
+  const Inst *ci = &f->insts[c];
+  Ref r = REF_NONE;
+  uint64_t k;
+  if (ci->op == I_WRAP && ci->nargs == 1) {
+    Ref sh = ir_args(f, c)[0];
+    const Inst *si = &f->insts[sh];
+    if (si->op == I_SHRU && si->nargs == 2 && is_const(f, ir_args(f, sh)[1], &k) && k == 32)
+      r = ir_args(f, sh)[0];
+  } else if (ci->op == I_NE && ci->nargs == 2 && is_const(f, ir_args(f, c)[1], &k) && k == 0) {
+    Ref an = ir_args(f, c)[0];
+    const Inst *ai = &f->insts[an];
+    if (ai->op == I_AND && ai->nargs == 2 && is_const(f, ir_args(f, an)[1], &k) &&
+        k == 0xffffffff00000000ull)
+      r = ir_args(f, an)[0];
+  } else if (ci->op == I_CALL && ci->type == VT_I32) {
+    r = c;
+  }
+  return r != REF_NONE && f->insts[r].op == I_CALL ? r : REF_NONE;
+}
+
+static bool fold_flag_branches(IrFunc *f, const uint32_t *uses) {
+  bool changed = false;
+  for (uint32_t oi = 0; oi < f->norder; oi++) {
+    uint32_t bi = f->order[oi];
+    if (f->blocks[bi].term != T_BRIF) continue;
+    Ref c = f->blocks[bi].term_arg;
+    /* a call of a function of Go's that never returns normally unwinds */
+    const uint8_t *noret = f->m->go_noret;
+    Ref fc = noret ? flag_branch_call(f, c) : REF_NONE;
+    if (fc != REF_NONE && (uint32_t)f->insts[fc].imm < f->m->nfuncs &&
+        noret[(uint32_t)f->insts[fc].imm]) {
+      f->blocks[bi].term_arg = ir_emit(f, bi, I_CONST, VT_I32, NULL, 0, 1, 0);
+      g_stats.go_noret_calls++;
+      changed = true;
+      continue;
+    }
+    const Inst *ci = &f->insts[c];
+    if (ci->op != I_WRAP || ci->nargs != 1 || uses[c] != 1) continue;
+    Ref sh = ir_args(f, c)[0];
+    const Inst *si = &f->insts[sh];
+    uint64_t k;
+    if (si->op != I_SHRU || si->nargs != 2 || si->type != VT_I64 ||
+        !is_const(f, ir_args(f, sh)[1], &k))
+      continue;
+    k &= 63;
+    if (k == 0 || k > 32) continue;
+    /* a call's result: an inlined callee's packed result folds whole once
+       its flag is known, which this form would hide */
+    Ref x = ir_args(f, sh)[0];
+    uint16_t xop = f->insts[x].op;
+    if (xop != I_CALL && xop != I_CALL_INDIRECT && xop != I_CALL_REF) continue;
+    uint32_t cb = ci->block, at = 0;
+    Block *b = &f->blocks[cb];
+    while (at < b->ninsts && b->insts[at] != c) at++;
+    if (at == b->ninsts) continue;
+    Ref m = emit_before(f, cb, &at, I_CONST, VT_I64, NULL, 0, 0xffffffffull << k);
+    Ref aa[2] = { x, m };
+    Ref an = emit_before(f, cb, &at, I_AND, VT_I64, aa, 2, 0);
+    Ref z = emit_before(f, cb, &at, I_CONST, VT_I64, NULL, 0, 0);
+    Ref na[2] = { an, z };
+    f->blocks[bi].term_arg = emit_before(f, cb, &at, I_NE, VT_I32, na, 2, 0);
+    changed = true;
+  }
+  return changed;
+}
+
 static bool pass_fold(IrFunc *f, const OptOpts *o) {
   bool changed = false;
   uint32_t *uses = count_uses(f);
   for (uint32_t oi = 0; oi < f->norder; oi++)
     if (fold_block(f, f->order[oi], o, uses)) changed = true;
+  if (fold_flag_branches(f, uses)) changed = true;
   xfree(uses);
   if (changed) ir_apply_subst(f);
   if (retype_bit_loads(f)) changed = true;
@@ -6229,6 +6307,17 @@ static const CallFx *call_effects(Module *m, const OptOpts *o, uint32_t fi,
 static const CallFx *indirect_effects(Module *m, const OptOpts *o);
 static const CallFx *ref_effects(Module *m, const OptOpts *o);
 
+/* a function of Go's summed up for nr_solve (see nr_scan) */
+typedef struct {
+  uint32_t nnodes;     /* blocks, then extra nodes; NORMAL is nnodes */
+  uint32_t entry;
+  uint32_t *first;     /* nnodes + 1 */
+  uint32_t *to, *kill; /* per edge: target, and the callee whose never
+                          returning makes it dead, or UINT32_MAX */
+} NrSum;
+static NrSum *nr_sum;
+static void nr_solve(Module *m);
+
 void opt_effects_begin(Module *m, const OptOpts *o) {
   if (fx_mod == m && fx_opts == o) return;
   xfree(fx_func);
@@ -6256,6 +6345,13 @@ void opt_effects_begin(Module *m, const OptOpts *o) {
   xfree(df_func);
   df_func = o->dead_frames ? xcalloc(m->nfuncs ? m->nfuncs : 1, sizeof(DfFunc)) : NULL;
   df_sp = UINT32_MAX;
+  if (nr_sum)
+    for (uint32_t i = 0; i < fx_nfuncs; i++) {
+      xfree(nr_sum[i].first); xfree(nr_sum[i].to); xfree(nr_sum[i].kill);
+    }
+  xfree(nr_sum);
+  nr_sum = m->go_stack && o->go_noret && !m->go_noret
+               ? xcalloc(m->nfuncs ? m->nfuncs : 1, sizeof(NrSum)) : NULL;
   df_scanfree = false;
   fx_mod = m;
   fx_opts = o;
@@ -6282,6 +6378,7 @@ void opt_effects_end(Module *m, const OptOpts *o) {
   ref_effects(m, o);
   fx_facts_build(m);
   if (df_func) df_resolve(m);
+  nr_solve(m);
   fx_warming = false;
   fx_resolved = true;
 }
@@ -6386,6 +6483,238 @@ static void once_scan(Module *m, IrFunc *g, DirectFx *d) {
   d->inert = only_stores && g->nblocks == 1 && g->blocks[g->entry].term == T_RETURN &&
              !g->sig->nresults;
   d->empty = d->inert && !d->nost;
+}
+
+/* ---- calls of Go's that never return normally -------------------------------
+
+   A function of Go's returns 0 to its caller to say it returned and 1 to say
+   the wasm stack is unwinding (a goroutine switch, a stack that grows, a
+   panic), in the high half of an i64 once gosp.c packs its stack pointer
+   below; the caller tests that after every call and unwinds too.  Go's
+   compiler writes no unreachable after a call that cannot return --
+   runtime.sigpanic behind a nil check, goPanicIndex behind a bounds check,
+   morestack in every prologue -- so the way on past each test joins the
+   hot path again, and the stack pointer the call returned is one of two the
+   join takes: every frame access after a check goes through that join's
+   parameter, which no forwarding sees through, and in a loop the stack
+   pointer becomes a parameter it carries round.
+
+   Each function of Go's is summed up as a graph of its blocks (nr_scan):
+   the way on after a call's test is an edge that is dead when the callee
+   never returns normally, and a return of flag 0, of a flag not known, or
+   of a callee's flag is an edge to a node NORMAL, the last dead the same way.
+   A function never returns normally (nr_solve) when NORMAL is out of reach
+   from its entry once the edges of the calls of such functions are dead --
+   the greatest such set: starting from every function, any that reaches
+   NORMAL is taken out, until none does.  That is sound because a normal
+   return of one of the set would have needed a normal return of one of the
+   set before it on its path, and the first of them in time had none.
+   fold_flag_branches then takes the test after a call of one as true. */
+#define NR_ZERO 0xffffffffu
+#define NR_ONE  0xfffffffeu
+#define NR_UNK  0xfffffffdu
+
+/* the callee whose unwind flag c is -- wrap(call >> 32) of a packed result,
+   or an i32 call's result itself -- or UINT32_MAX */
+static uint32_t nr_flag_call(IrFunc *g, Ref c) {
+  const Inst *ci = &g->insts[c];
+  if (ci->op == I_WRAP && ci->nargs == 1) {
+    Ref sh = ir_args(g, c)[0];
+    const Inst *si = &g->insts[sh];
+    uint64_t k;
+    if (si->op != I_SHRU || si->nargs != 2 || !is_const(g, ir_args(g, sh)[1], &k) || k != 32)
+      return UINT32_MAX;
+    c = ir_args(g, sh)[0];
+    ci = &g->insts[c];
+  } else if (ci->type != VT_I32) {
+    return UINT32_MAX;
+  }
+  return ci->op == I_CALL ? (uint32_t)ci->imm : UINT32_MAX;
+}
+
+/* what a flag value F is: NR_ZERO, NR_ONE, a callee's flag, or NR_UNK */
+static uint32_t nr_flag_kind(IrFunc *g, Ref f) {
+  uint64_t k;
+  if (is_const(g, f, &k)) return (k & 0xffffffffu) ? NR_ONE : NR_ZERO;
+  uint32_t c = nr_flag_call(g, f);
+  return c == UINT32_MAX ? NR_UNK : c;
+}
+
+/* the flag a function's returned value v carries: v itself for an i32, the
+   F of (extendu(F) << 32) | extendu(sp) for gosp.c's i64, else REF_NONE */
+static Ref nr_ret_flag(IrFunc *g, Ref v) {
+  const Inst *in = &g->insts[v];
+  if (in->type == VT_I32) return v;
+  if (in->op != I_OR || in->nargs != 2) return REF_NONE;
+  for (int side = 0; side < 2; side++) {
+    Ref x = ir_args(g, v)[side];
+    const Inst *xi = &g->insts[x];
+    uint64_t k;
+    if (xi->op != I_SHL || xi->nargs != 2 || !is_const(g, ir_args(g, x)[1], &k) || k != 32)
+      continue;
+    Ref e = ir_args(g, x)[0];
+    if (g->insts[e].op != I_EXTENDU || g->insts[e].nargs != 1) continue;
+    return ir_args(g, e)[0];
+  }
+  return REF_NONE;
+}
+
+typedef struct { uint32_t *from, *to, *kill; uint32_t n, cap, nodes; } NrBuild;
+
+static void nr_edge(NrBuild *b, uint32_t from, uint32_t to, uint32_t kill) {
+  if (b->n == b->cap) {
+    b->cap = b->cap ? b->cap * 2 : 64;
+    b->from = xrealloc(b->from, b->cap * sizeof(uint32_t));
+    b->to = xrealloc(b->to, b->cap * sizeof(uint32_t));
+    b->kill = xrealloc(b->kill, b->cap * sizeof(uint32_t));
+  }
+  b->from[b->n] = from; b->to[b->n] = to; b->kill[b->n] = kill;
+  b->n++;
+}
+
+/* an edge from `from` that reaches a normal return of flag kind fk, when
+   the edge itself is dead with `kill`: to NORMAL, through a node of its own
+   when both a kill and a callee's flag decide it */
+static void nr_ret_edge(NrBuild *b, uint32_t from, uint32_t kill, uint32_t fk) {
+  if (fk == NR_ONE) return;
+  uint32_t normal = UINT32_MAX;   /* resolved once the node count is known */
+  if (fk == NR_ZERO || fk == NR_UNK) { nr_edge(b, from, normal, kill); return; }
+  if (kill == UINT32_MAX) { nr_edge(b, from, normal, fk); return; }
+  uint32_t mid = b->nodes++;
+  nr_edge(b, from, mid, kill);
+  nr_edge(b, mid, normal, fk);
+}
+
+static void nr_scan(Module *m, IrFunc *g, uint32_t fi) {
+  /* Go's type, (i32) -> i32, or gosp.c's (i32, i32) -> i64 */
+  const CompType *sig = g->sig;
+  if (!nr_sum || sig->nresults != 1 || sig->nparams < 1 || sig->nparams > 2) return;
+  for (uint32_t k = 0; k < sig->nparams; k++)
+    if (sig->params[k] != VT_I32) return;
+  if (sig->results[0] != (sig->nparams == 1 ? VT_I32 : VT_I64)) return;
+  (void)m;
+  NrBuild b = { NULL, NULL, NULL, 0, 0, g->nblocks };
+  for (uint32_t bi = 0; bi < g->nblocks; bi++) {
+    Block *bk = &g->blocks[bi];
+    /* a tail call returns its callee's flag as the function's own: the IR
+       ends its block in a trap, which would say the path ends */
+    bool tail = false;
+    for (uint32_t i = 0; i < bk->ninsts && !tail; i++) {
+      const Inst *in = &g->insts[bk->insts[i]];
+      if (in->op == I_RETURN_CALL) {
+        nr_ret_edge(&b, bi, UINT32_MAX, (uint32_t)in->imm);
+        tail = true;
+      } else if (in->op == I_RETURN_CALL_INDIRECT || in->op == I_RETURN_CALL_REF) {
+        nr_ret_edge(&b, bi, UINT32_MAX, NR_UNK);
+        tail = true;
+      }
+    }
+    if (tail) continue;
+    switch (bk->term) {
+      case T_JUMP: case T_BRTABLE: case T_BRIF: {
+        uint32_t kill = UINT32_MAX;
+        if (bk->term == T_BRIF && bk->nsuccs == 2)
+          kill = nr_flag_call(g, bk->term_arg);
+        for (uint32_t k = 0; k < bk->nsuccs; k++) {
+          const Edge *ed = &bk->succs[k];
+          uint32_t ek = bk->term == T_BRIF && k == 1 ? kill : UINT32_MAX;
+          const Block *t = &g->blocks[ed->target];
+          /* into a return whose flag is one of its parameters: what this
+             edge passes decides it */
+          if (t->term == T_RETURN && t->nret == 1) {
+            Ref fv = nr_ret_flag(g, t->ret_args[0]);
+            uint32_t pi = UINT32_MAX;
+            for (uint32_t q = 0; fv != REF_NONE && q < t->nparams; q++)
+              if (t->params[q] == fv) pi = q;
+            if (pi != UINT32_MAX) {
+              nr_ret_edge(&b, bi, ek, pi < ed->nargs ? nr_flag_kind(g, ed->args[pi]) : NR_UNK);
+              continue;
+            }
+          }
+          nr_edge(&b, bi, ed->target, ek);
+        }
+        break;
+      }
+      case T_RETURN: {
+        Ref fv = bk->nret == 1 ? nr_ret_flag(g, bk->ret_args[0]) : REF_NONE;
+        bool param = false;
+        for (uint32_t q = 0; fv != REF_NONE && q < bk->nparams; q++)
+          if (bk->params[q] == fv) param = true;
+        if (param) break;   /* its incoming edges said it */
+        nr_ret_edge(&b, bi, UINT32_MAX, fv == REF_NONE ? NR_UNK : nr_flag_kind(g, fv));
+        break;
+      }
+      case T_TRAP:
+        break;
+      default:
+        /* a tail call or anything else: it may return normally */
+        nr_edge(&b, bi, UINT32_MAX, UINT32_MAX);
+        break;
+    }
+  }
+  NrSum *ns = &nr_sum[fi];
+  ns->nnodes = b.nodes;
+  ns->entry = g->entry;
+  ns->first = xcalloc(b.nodes + 2, sizeof(uint32_t));
+  ns->to = xmalloc((b.n ? b.n : 1) * sizeof(uint32_t));
+  ns->kill = xmalloc((b.n ? b.n : 1) * sizeof(uint32_t));
+  for (uint32_t e = 0; e < b.n; e++) ns->first[b.from[e] + 1]++;
+  for (uint32_t i = 0; i < b.nodes; i++) ns->first[i + 1] += ns->first[i];
+  uint32_t *at = xmalloc((b.nodes + 1) * sizeof(uint32_t));
+  memcpy(at, ns->first, (b.nodes + 1) * sizeof(uint32_t));
+  for (uint32_t e = 0; e < b.n; e++) {
+    uint32_t k = at[b.from[e]]++;
+    ns->to[k] = b.to[e] == UINT32_MAX ? b.nodes : b.to[e];
+    ns->kill[k] = b.kill[e];
+  }
+  xfree(at); xfree(b.from); xfree(b.to); xfree(b.kill);
+}
+
+/* whether NORMAL is in reach of f's entry, the edges killed by a callee in
+   `noret` dead */
+static bool nr_reaches_normal(const NrSum *ns, const uint8_t *noret, uint32_t nfuncs,
+                              uint8_t *seen, uint32_t *stk) {
+  uint32_t n = ns->nnodes, sp = 0;
+  memset(seen, 0, n + 1);
+  seen[ns->entry] = 1;
+  stk[sp++] = ns->entry;
+  while (sp) {
+    uint32_t x = stk[--sp];
+    if (x == n) return true;
+    for (uint32_t e = ns->first[x]; e < ns->first[x + 1]; e++) {
+      uint32_t k = ns->kill[e];
+      if (k != UINT32_MAX && k < nfuncs && noret[k]) continue;
+      uint32_t t = ns->to[e];
+      if (!seen[t]) { seen[t] = 1; stk[sp++] = t; }
+    }
+  }
+  return false;
+}
+
+static void nr_solve(Module *m) {
+  if (!nr_sum) return;
+  uint8_t *noret = xcalloc(m->nfuncs ? m->nfuncs : 1, 1);
+  uint32_t maxn = 1;
+  for (uint32_t i = 0; i < m->nfuncs; i++)
+    if (nr_sum[i].first) { noret[i] = 1; if (nr_sum[i].nnodes + 1 > maxn) maxn = nr_sum[i].nnodes + 1; }
+  uint8_t *seen = xmalloc(maxn);
+  uint32_t *stk = xmalloc(maxn * sizeof(uint32_t));
+  for (bool changed = true; changed;) {
+    changed = false;
+    for (uint32_t i = 0; i < m->nfuncs; i++)
+      if (noret[i] && nr_reaches_normal(&nr_sum[i], noret, m->nfuncs, seen, stk)) {
+        noret[i] = 0;
+        changed = true;
+      }
+  }
+  xfree(seen); xfree(stk);
+  for (uint32_t i = 0; i < m->nfuncs; i++) {
+    xfree(nr_sum[i].first); xfree(nr_sum[i].to); xfree(nr_sum[i].kill);
+  }
+  xfree(nr_sum);
+  nr_sum = NULL;
+  xfree(m->go_noret);
+  m->go_noret = noret;
 }
 
 static void fx_scan_direct(Module *m, const OptOpts *o, uint32_t fi) {
@@ -6544,6 +6873,7 @@ static void fx_scan_direct(Module *m, const OptOpts *o, uint32_t fi) {
     }
   }
   if (df_func) df_scan(m, g, fi);
+  if (nr_sum) nr_scan(m, g, fi);
   once_scan(m, g, d);
   d->built_insts = g->ninsts;
   for (uint32_t bi = 0; bi < g->nblocks && !d->makes_calls; bi++) {
@@ -7531,6 +7861,164 @@ const Table0Facts *module_table0_facts(Module *m) {
   t0->n = n;
   t0->entry = entry;
   return t0;
+}
+
+/* For pass_go_resume, before any worker starts: where each function sits
+   in table 0, which is what the high half of the return addresses it
+   stores names, and which function is runtime.deferreturn. */
+void module_go_resume_facts(Module *m) {
+  if (!m->go_stack || m->go_pcf) return;
+  m->go_deferreturn = UINT32_MAX;
+  for (uint32_t i = 0; i < m->nfuncs; i++)
+    if (m->funcs[i].name && !strcmp(m->funcs[i].name, "runtime.deferreturn"))
+      m->go_deferreturn = i;
+  const Table0Facts *t0 = module_table0_facts(m);
+  if (!t0->frozen || !t0->entry) return;
+  uint32_t *pcf = xmalloc((m->nfuncs ? m->nfuncs : 1) * sizeof(uint32_t));
+  for (uint32_t i = 0; i < m->nfuncs; i++) pcf[i] = GO_PCF_NONE;
+  for (uint32_t i = 0; i < t0->n; i++) {
+    uint32_t fi = t0->entry[i];
+    if (fi >= m->nfuncs) continue;
+    pcf[fi] = pcf[fi] == GO_PCF_NONE ? i : GO_PCF_MANY;
+  }
+  m->go_pcf = pcf;
+}
+
+/* ---- Go's resume dispatch --------------------------------------------------
+
+   Go's wasm port starts every function with a br_table on its first
+   parameter, the block to resume at: 0 for a call, and after the wasm stack
+   unwound -- a goroutine switch, a stack that grew -- the block after the
+   call it unwound through, which the function stored as the low half of a
+   return address ((its index in table 0 << 16) | block) before the call.
+   The table also takes the jumps between blocks that wasm's structured
+   control cannot make, as a constant set and a branch back to it.  Every
+   block has a case, though few can be resumed at.
+
+   What can arrive is 0 and 1 (the runtime resumes goexit at its entry plus
+   PCQuantum, which is 1 on wasm), the low halves of the return addresses
+   the function stores, and the constants the jumps back pass; every other
+   case, and the default, trap.  A function that calls runtime.deferreturn
+   is left alone: a recovered panic resumes it at its deferreturn, an
+   offset of Go's function data that no constant of the code names.  Then
+   0 and 1, a call's way in, are tested first, the rest of the table behind
+   that one compare: a call makes one compare and a branch it does not take
+   instead of descending the compare tree (two compares and branches for
+   main.fib, more for a function with more blocks), and the blocks only a
+   pruned case reached go. */
+static bool pass_go_resume(IrFunc *f) {
+  Module *m = f->m;
+  if (!m->go_stack || !m->go_pcf || f->func_index >= m->nfuncs) return false;
+  uint32_t pcf = m->go_pcf[f->func_index];
+  if (pcf == GO_PCF_MANY) return false;
+  Block *e = &f->blocks[f->entry];
+  if (!e->nparams) return false;
+  Ref p0 = e->params[0];
+  /* the dispatch: a block the entry jumps to, switching on the parameter
+     the entry passes it the first one of the function's for; or, once the
+     jumps back are threaded away and the two merged, the entry itself */
+  uint32_t h, j = UINT32_MAX;
+  Ref idx;
+  if (e->term == T_BRTABLE && e->term_arg == p0) {
+    h = f->entry;
+    idx = p0;
+  } else {
+    if (e->term != T_JUMP || e->nsuccs != 1) return false;
+    h = e->succs[0].target;
+    if (h == f->entry || f->blocks[h].term != T_BRTABLE) return false;
+    idx = f->blocks[h].term_arg;
+    if (idx != p0) {
+      for (uint32_t k = 0; k < f->blocks[h].nparams; k++)
+        if (f->blocks[h].params[k] == idx) j = k;
+      if (j == UINT32_MAX || j >= e->succs[0].nargs || e->succs[0].args[j] != p0) return false;
+    }
+  }
+  Block *hb = &f->blocks[h];
+  if (hb->nsuccs < 3) return false;
+  for (uint32_t k = 0; k < hb->nsuccs; k++)
+    if (hb->succs[k].eh) return false;
+
+  uint32_t ncases = hb->nsuccs - 1;
+  uint8_t *reach = xcalloc(ncases + 1, 1);
+#define GR_ADD(v) do { uint64_t _v = (v); reach[_v < ncases ? _v : ncases] = 1; } while (0)
+  GR_ADD(0); GR_ADD(1);
+  bool ok = true;
+  for (uint32_t bi = 0; bi < f->nblocks && ok; bi++) {
+    Block *b = &f->blocks[bi];
+    for (uint32_t k = 0; k < b->nsuccs && ok; k++) {
+      const Edge *ed = &b->succs[k];
+      /* a jump back changes the switch only through the dispatch's
+         parameter, when the switch reads one */
+      if (ed->target != h || j == UINT32_MAX || bi == f->entry) continue;
+      if (j >= ed->nargs) { ok = false; break; }
+      Ref a = ed->args[j];
+      if (a == idx) continue;
+      if (f->insts[a].op != I_CONST) { ok = false; break; }
+      GR_ADD(f->insts[a].imm & 0xffffffffu);
+    }
+    for (uint32_t i = 0; i < b->ninsts && ok; i++) {
+      const Inst *in = &f->insts[b->insts[i]];
+      if (in->op == I_CALL && (uint32_t)in->imm == m->go_deferreturn) ok = false;
+      else if (in->op == I_CONST && in->type == VT_I64 && pcf != GO_PCF_NONE &&
+               (in->imm >> 32) == 0 && (in->imm >> 16) == pcf)
+        GR_ADD(in->imm & 0xffffu);
+    }
+  }
+#undef GR_ADD
+  if (!ok) { xfree(reach); return false; }
+
+  uint32_t pruned = 0, live = 0;
+  for (uint32_t k = 0; k <= ncases; k++) {
+    if (reach[k]) live++;
+    else pruned++;
+  }
+  /* 0 and 1 on one edge, and another case or the default live: the entry
+     goes first */
+  bool split = live > 2 && reach[0] && reach[1] && ncases >= 2 &&
+               hb->succs[0].target == hb->succs[1].target &&
+               hb->succs[0].nargs == hb->succs[1].nargs &&
+               !memcmp(hb->succs[0].args, hb->succs[1].args, hb->succs[0].nargs * sizeof(Ref));
+  if (!pruned && !split) { xfree(reach); return false; }
+
+  Edge *edges = xmalloc((ncases + 1) * sizeof(Edge));
+  memcpy(edges, hb->succs, (ncases + 1) * sizeof(Edge));
+  uint32_t tb = UINT32_MAX;
+  if (pruned) {
+    tb = ir_new_block(f);
+    f->blocks[tb].term = T_TRAP;
+    f->blocks[tb].term_imm = TRAP_UNREACHABLE;
+  }
+  uint32_t tab = h;
+  if (split) {
+    tab = ir_new_block(f);
+    Ref two = ir_emit(f, h, I_CONST, VT_I32, NULL, 0, 2, 0);
+    Ref ca[2] = { idx, two };
+    Ref c = ir_emit(f, h, I_LTU, VT_I32, ca, 2, 0, 0);
+    hb = &f->blocks[h];
+    hb->nsuccs = 0;
+    hb->term = T_BRIF;
+    hb->term_arg = c;
+    ir_add_edge(f, h, edges[0].target, edges[0].args, edges[0].nargs);
+    ir_add_edge(f, h, tab, NULL, 0);
+    f->blocks[tab].term = T_BRTABLE;
+    f->blocks[tab].term_arg = idx;
+    g_stats.go_resume_split++;
+  } else {
+    hb->nsuccs = 0;
+  }
+  /* behind the entry's test, 0 and 1 never arrive: they go where 2 does,
+     one range with it, so that the table tests nothing twice */
+  for (uint32_t k = 0; k <= ncases; k++) {
+    uint32_t src = split && k < 2 ? 2 : k;
+    if (reach[src])
+      ir_add_edge(f, tab, edges[src].target, edges[src].args, edges[src].nargs);
+    else ir_add_edge(f, tab, tb, NULL, 0);
+  }
+  g_stats.go_resume_pruned += pruned;
+  xfree(edges);
+  xfree(reach);
+  ir_recompute_preds(f);
+  return true;
 }
 
 static void fx_table_freeze(Module *m) {
@@ -19627,6 +20115,13 @@ void ir_optimize(IrFunc *f, const OptOpts *o) {
   }
 
   opt_cleanup(f, o);
+
+  /* after a cleanup has threaded the jumps back to Go's dispatch */
+  if (o->go_resume && pass_go_resume(f)) {
+    ir_order(f);
+    ir_verify(f, "post-go-resume");
+    opt_cleanup(f, o);
+  }
 
   for (int r = 0; o->inl && o->reinline && r < OPT_INLINE_ROUNDS; r++) {
     devirt_round(f, o);

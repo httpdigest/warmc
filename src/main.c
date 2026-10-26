@@ -58,8 +58,8 @@ static const char *usage_text =
   "                partial-escape, gloop, gssa, loopclose, cpool, ictab, reach,\n"
   "                prune, merge, devirt, reinline, throw-jump, closed-world,\n"
   "                sealed, once, gcpure, split, labcache, ifconv, mulwide,\n"
-  "                barelide, small-loop-align, trampoline, go-sp, fma,\n"
-  "                dead-frames, exact-trap\n"
+  "                barelide, small-loop-align, trampoline, go-sp, go-resume,\n"
+  "                go-noret, fma, dead-frames, exact-trap\n"
   "                fma is off below -O3: it fuses a float multiply\n"
   "                into the add that reads it, rounded once, which is not\n"
   "                wasm's arithmetic and can change a result's last bit\n"
@@ -436,6 +436,7 @@ int main(int argc, char **argv) {
   opt.closed_world = true;
   opt.sealed = true;
   opt.once = true;
+  opt.go_resume = opt.go_noret = true;
 
   for (int i = 1; i < argc; i++) {
     const char *a = argv[i];
@@ -562,6 +563,8 @@ int main(int argc, char **argv) {
       else if (!strcmp(name, "ictab")) opt.ictab = on;
       else if (!strcmp(name, "trampoline")) opt.trampoline = on;
       else if (!strcmp(name, "go-sp")) opt.go_sp = on;
+      else if (!strcmp(name, "go-resume")) opt.go_resume = on;
+      else if (!strcmp(name, "go-noret")) opt.go_noret = on;
       else if (!strcmp(name, "gssa")) opt.gssa = on;
       else if (!strcmp(name, "gssa-all")) { opt.gssa_all = on; if (on) opt.gssa = true; }
       else if (!strcmp(name, "small-loop-align")) opt.small_loop_align = on;
@@ -779,7 +782,8 @@ int main(int argc, char **argv) {
             " exact_store_checks=%llu exact_memop_checks=%llu\n"
             "             reloads=%llu caller_saves=%llu csa_restores=%llu"
             " v128_spills=%llu rb_trips=%llu split_cuts=%llu split_invs=%llu pieces=%llu"
-            " loop_pieces=%llu recomputes=%llu dead_frame_stores=%llu tramp_funcs=%llu gosp_funcs=%llu\n"
+            " loop_pieces=%llu recomputes=%llu dead_frame_stores=%llu tramp_funcs=%llu gosp_funcs=%llu"
+            " go_resume_pruned=%llu go_resume_split=%llu go_noret_calls=%llu\n"
             "             escape_removed=%llu escape_forwarded=%llu escape_made=%llu gloop=%llu\n"
             "             loop_closed=%llu reassoc=%llu cmp_reused=%llu csel_fused=%llu mul_wide=%llu fma=%llu gssa=%llu\n"
             "             bar_masks=%llu bar_elided=%llu\n"
@@ -828,6 +832,9 @@ int main(int argc, char **argv) {
             (unsigned long long)g_stats.dead_frame_stores,
             (unsigned long long)g_stats.tramp_funcs,
             (unsigned long long)g_stats.gosp_funcs,
+            (unsigned long long)g_stats.go_resume_pruned,
+            (unsigned long long)g_stats.go_resume_split,
+            (unsigned long long)g_stats.go_noret_calls,
             (unsigned long long)g_stats.escape_removed,
             (unsigned long long)g_stats.escape_forwarded,
             (unsigned long long)g_stats.escape_made,

@@ -382,6 +382,17 @@ typedef struct {
      (arguments above the callee's stack pointer, frames re-entered after
      the wasm stack unwinds) */
   bool go_stack;
+  /* For a module of Go's whose table 0 is frozen (opt.c
+     module_go_resume_facts): per function, its index in table 0 --
+     GO_PCF_NONE when it is not there, GO_PCF_MANY when it is there more
+     than once -- the high half of the return addresses it stores before
+     its calls; and runtime.deferreturn's index, or UINT32_MAX. */
+  uint32_t *go_pcf;
+  uint32_t go_deferreturn;
+  /* per function of Go's, whether it can never return without unwinding
+     (opt.c nr_solve): runtime.sigpanic, goPanicIndex, morestack and what
+     only reaches its returns through them; NULL when not known */
+  uint8_t *go_noret;
   /* No reference crosses the module's boundary (compile.c module_gc_sealed),
      so every GC object its code meets is one it allocated: a cast to one of
      its types is decided by the object's type slot alone, with no runtime
@@ -424,6 +435,9 @@ typedef struct {
 uint32_t compile_want_threads(Module *m, uint32_t nfuncs);
 
 const Table0Facts *module_table0_facts(Module *m);
+#define GO_PCF_NONE 0xffffffffu
+#define GO_PCF_MANY 0xfffffffeu
+void module_go_resume_facts(Module *m);
 
 static inline uint32_t gctype_slot(const Module *m, uint32_t ti) {
   return m->type_slot ? m->type_slot[ti] : ti;

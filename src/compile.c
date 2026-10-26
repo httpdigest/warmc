@@ -667,6 +667,7 @@ void compile_module(Module *m, ObjBuilder *o, const OptOpts *opts) {
 
   /* Workers read table 0's facts, so they are known before any starts. */
   module_table0_facts(m);
+  module_go_resume_facts(m);
   codegen_prewarm_symbols(m, o);
   codegen_plan_icall_tables(m, o, opts->ictab);
   if (compile_parallel(m, o, opts, out_bytes, tm)) return;
