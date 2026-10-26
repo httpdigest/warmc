@@ -9,7 +9,10 @@ twice over or a mangled one, and nothing resolves to it.  This checks:
   * the names in an ELF, a Mach-O and a COFF object, exactly: each named
     function by its name, two functions of one name both, a name that is
     empty or holds a NUL left as wasm_func_N, and --no-function-names
-    giving every one wasm_func_N;
+    giving every one wasm_func_N -- and on arm64, where an object's
+    exported functions have the check of another instance's call ahead of
+    them (src/isel.c emit_entry_check), that code by its function's name
+    and "$entry";
   * that a name section not as the appendix has it gives no names at all,
     and the module is no less valid for it;
   * that the code is the same with names and without: every section but the
@@ -191,9 +194,14 @@ def coff_local_funcs(b):
         k += 1 + naux
     return out
 
-def module_names(names, prefix=""):
-    """what the module's own functions are called, as a sorted list"""
+# sum, fill and div, whose entry checks an arm64 object has
+EXPORTED = (12, 13, 14)
+
+def module_names(names, prefix="", leads=()):
+    """what the module's own functions are called, as a sorted list, with
+    the entry check ahead of each of leads"""
     out = [names.get(i, "wasm_func_%d" % i) for i in range(NFUNCS)]
+    out += [names.get(i, "wasm_func_%d" % i) + "$entry" for i in leads]
     return sorted(prefix + n for n in out)
 
 def main():
@@ -222,7 +230,7 @@ def main():
                        "windows": coff_local_funcs}
             for tgt, b in objs.items():
                 got = sorted(readers[tgt](b))
-                exp = module_names(want)
+                exp = module_names(want, leads=EXPORTED if tgt != "windows" else ())
                 if got != exp:
                     fails.append("%s: %s object's functions are %r, not %r"
                                  % (label, tgt, got, exp))
@@ -252,7 +260,9 @@ def main():
             r = sh([WARMC, "-O0", "--target=linux", "-c", "-o", to, tw])
             with open(to, "rb") as f:
                 syms = sorted(elf_local_funcs(f.read()))
-            want = sorted([TEXT_NAMES.get(i, "wasm_func_%d" % i) for i in range(1, 5)])
+            # function 4 is exported: its entry check too
+            want = sorted([TEXT_NAMES.get(i, "wasm_func_%d" % i) for i in range(1, 5)] +
+                          ["wasm_func_4$entry"])
             if syms != want:
                 fails.append("the text module's functions are %r, not %r" % (syms, want))
 

@@ -162,6 +162,77 @@ if [ -x "$WTG" ]; then
   fi
 fi
 
+# Calls from one instance into another's code by every route -- import,
+# table, reference, each also as a tail call -- with stack arguments, more
+# results than registers, and exceptions caught across one crossing or
+# partway down a stack that alternates between the two.  Each instance has
+# its own memory and global, so a crossing that left either side with the
+# other's instance or memory base in x19 or x20 (isel.c's pinned registers)
+# changes a sum.  At every level, and with the registers not pinned.
+pinwant='call_wide=3415
+ind_wide=3415
+ref_wide=3415
+tail_wide=1395
+tail_ind_wide=1395
+tail_ref_wide=1395
+call_fwide=2700
+call_multi=2111
+catch_mem=2035
+nested=101530
+nested_throw=2130
+nested_mid=6200
+by_global=2031
+by_table=3022
+given=2050
+call_tail_more=2047
+call_deep=2030
+tail_deep=10
+tail_bounce=6120
+deep=10'
+if [ -x "$BUILD/tools/bin/wasm-tools" ]; then
+  for m in a b; do
+    "$BUILD/tools/bin/wasm-tools" parse "test/link/pin_$m.wat" -o "$WORK/p$m.wasm" \
+      || { echo "FAIL[link]: assembling pin_$m.wat"; exit 1; }
+  done
+  pinok=1
+  for cfg in -O0 -O1 -O2 "-O2 nopin"; do
+    lv=${cfg% nopin}
+    for m in a b; do
+      ( if [ "$cfg" != "$lv" ]; then export WARMC_NO_PIN=1; fi
+        wtimeout ./$BUILD/warmc $lv $WARMC_TARGET_FLAGS --symbol-prefix=p$m --stats \
+          -c -o "$WORK/p$m.o" "$WORK/p$m.wasm" 2>"$WORK/p$m.err" ) \
+        || { echo "FAIL[link]: compiling pin_$m.wat ($cfg)"; exit 1; }
+    done
+    # An object's functions another instance may call -- A's eight exports,
+    # the two its ref.funcs name, the one a global's initialiser names and
+    # the one a table's does -- each have the check of the caller's instance
+    # ahead of them: cmp x0, x19 and the branch back to the stub that goes on
+    # to warmc_xenter.  Pinned on arm64 only.
+    if [ "$cfg" = -O2 ] && [ "$(uname -m)" = arm64 -o "$(uname -m)" = aarch64 ] \
+       && [ -z "${WARMC_TARGET_FLAGS:-}" ]; then
+      grep -q '\bentry_checks=12\b' "$WORK/pa.err" \
+        || { echo "FAIL[link/pin]: $(grep -o 'entry_checks=[0-9]*' "$WORK/pa.err"), not entry_checks=12, in pin_a.o"; pinok=0; fail=1; }
+      objd=$(command -v llvm-objdump || command -v objdump)
+      lead=$("$objd" -d --no-show-raw-insn "$WORK/pa.o" 2>/dev/null \
+             | sed -n '/wide\$entry>:/,/^$/p')
+      case "$lead" in
+        *"cmp	x0, x19"*"b.ne"*) ;;
+        *) echo "FAIL[link/pin]: no entry check ahead of pin_a.wat's wide:"; echo "$lead" | head -8
+           pinok=0; fail=1 ;;
+      esac
+    fi
+    tag=$(echo "$cfg" | tr -d ' -')
+    link_prog "pinprog$tag" test/link/pindriver.c "$WORK/pa.o" "$WORK/pb.o" || exit 1
+    got=$(wruntimeout $WARMC_RUN "$LINKED" 2>&1)
+    if [ "$got" != "$pinwant" ]; then
+      echo "FAIL[link/pin]: $cfg output differs"
+      diff <(echo "$pinwant") <(echo "$got") | head -20
+      pinok=0; fail=1
+    fi
+  done
+  [ "$pinok" = 1 ] && echo "link: calls between two instances with their own memories, 4 configurations"
+fi
+
 # An import of a memory is checked against the maximum its module declared,
 # not the one the runtime lets it grow to.
 for m in a b c; do
