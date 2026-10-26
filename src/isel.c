@@ -2575,8 +2575,27 @@ static bool cold_calls_only(Isel *s) {
    and branches to a return of its own that makes its result from
    constants and parameters; the entry block, emitted after the prologue as
    before, then only goes the other way.  The early path skips what the
-   entry block and the return block compute but the result, so all of that
-   must be pure and unable to trap. */
+   entry block and the return block compute but the result, so the rest of
+   that must be pure and unable to trap.
+
+   The entry block may load from memory 0 and store to it too, the loads
+   first: a destructor's `p = *this; *this = 0; if (!p) return;`
+   (cppbench/uniqtree's ~unique_ptr, half of whose calls are on null) or
+   Rust's drop of an Option<Box<T>>.  The test makes every load of the entry,
+   in order, into a register of its own (ER_LOAD0 on, from the memory base in
+   ER_MB) and tests what they make; the early return makes the entry's stores
+   from those registers, then its result.  The other way the entry block runs
+   whole after the prologue, its loads reading what the test's read: nothing
+   came between to write memory, which no other thread writes either -- a
+   shared memory is refused when parsing, and an embedder's calls on one
+   instance take turns.  A load that traps traps in the test, as it would
+   have in the entry block before any of its stores. */
+#define ER_LOADS  5
+#define ER_STORES 4
+#define ER_MB     R9
+#define ER_LOAD0  R10
+#define ER_TA     R15
+#define ER_TB     TMP0
 typedef struct {
   uint32_t edge;       /* the entry's edge to the return */
   int kind;            /* 1 cbz, 2 cbnz, 0 a compare and b.cc */
@@ -2584,6 +2603,9 @@ typedef struct {
   uint32_t imm;
   bool neg;
   Ref res;             /* what it returns, REF_NONE for nothing */
+  uint32_t nloads, nstores;
+  Ref loads[ER_LOADS], stores[ER_STORES];
+  Ref ta, tb;          /* operands of the test made into ER_TA and ER_TB */
 } EarlyRet;
 
 /* The register an integer parameter of the function arrives in, or -1. */
@@ -2619,6 +2641,16 @@ static bool early_pure_op(uint16_t op) {
   }
 }
 
+/* The register v is in ahead of the prologue: a parameter's, or a load's
+   the test made; -1 for anything else. */
+static int early_reg(IrFunc *f, const EarlyRet *er, Ref v) {
+  int p = entry_param_reg(f, v);
+  if (p >= 0 || !er) return p;
+  for (uint32_t i = 0; i < er->nloads; i++)
+    if (er->loads[i] == v) return ER_LOAD0 + (int)i;
+  return -1;
+}
+
 /* v with the return block's parameters replaced by what the edge passes */
 static Ref early_arg(IrFunc *f, const Edge *ed, Ref v) {
   const Inst *in = &f->insts[v];
@@ -2630,11 +2662,12 @@ static Ref early_arg(IrFunc *f, const Edge *ed, Ref v) {
 }
 
 /* Makes v, an integer computed by the return block or the entry from the
-   entry's parameters and constants, in d -- which no parameter arrives in
-   -- writing no other register; with b NULL only says whether it can.
-   Rust's fib returns acc + n, both arguments of the return block, and the
-   entry passes it 0 and n. */
-static bool early_make(IrFunc *f, const Edge *ed, Ref v, int d, Buf *b, int depth) {
+   entry's parameters, the test's loads and constants, in d -- which none of
+   those is in -- writing no other register; with b NULL only says whether
+   it can.  Rust's fib returns acc + n, both arguments of the return block,
+   and the entry passes it 0 and n. */
+static bool early_make(IrFunc *f, const EarlyRet *er, const Edge *ed, Ref v, int d, Buf *b,
+                       int depth) {
   const Inst *in = &f->insts[v];
   ValType t = (ValType)in->type;
   if ((t != VT_I32 && t != VT_I64) || depth > 6) return false;
@@ -2643,14 +2676,14 @@ static bool early_make(IrFunc *f, const Edge *ed, Ref v, int d, Buf *b, int dept
     if (b) a64_load_imm(b, sf, d, in->imm);
     return true;
   }
-  int p = entry_param_reg(f, v);
+  int p = early_reg(f, er, v);
   if (p >= 0) {
     if (b) a64_mov_reg(b, SF64, d, p);
     return true;
   }
   if (in->op == I_PARAM) {
     Ref x = early_arg(f, ed, v);
-    return x != v && x != REF_NONE && early_make(f, ed, x, d, b, depth + 1);
+    return x != v && x != REF_NONE && early_make(f, er, ed, x, d, b, depth + 1);
   }
   if (in->block != ed->target && in->block != f->entry) return false;
   Ref *a = ir_args(f, v);
@@ -2658,18 +2691,18 @@ static bool early_make(IrFunc *f, const Edge *ed, Ref v, int d, Buf *b, int dept
     case I_EXTENDU: case I_EXTENDS: {
       if ((ValType)f->insts[a[0]].type != VT_I32) return false;
       Ref x = early_arg(f, ed, a[0]);
-      int q = x == REF_NONE ? -1 : entry_param_reg(f, x);
+      int q = x == REF_NONE ? -1 : early_reg(f, er, x);
       if (in->op == I_EXTENDU && q >= 0) {
         if (b) a64_mov_reg(b, SF32, d, q);
         return true;
       }
-      if (!early_make(f, ed, a[0], d, b, depth + 1)) return false;
+      if (!early_make(f, er, ed, a[0], d, b, depth + 1)) return false;
       if (b && in->op == I_EXTENDU) a64_uxtw(b, d, d);
       else if (b) a64_sxtw(b, d, d);
       return true;
     }
     case I_WRAP:
-      return early_make(f, ed, a[0], d, b, depth + 1);
+      return early_make(f, er, ed, a[0], d, b, depth + 1);
     case I_ADD: case I_SUB: case I_AND: case I_OR: case I_XOR: {
       Ref x = early_arg(f, ed, a[0]), y = early_arg(f, ed, a[1]);
       if (x == REF_NONE || y == REF_NONE) return false;
@@ -2677,7 +2710,7 @@ static bool early_make(IrFunc *f, const Edge *ed, Ref v, int d, Buf *b, int dept
       const Inst *yi = &f->insts[y];
       if (yi->op == I_CONST) {
         uint64_t k = sf ? yi->imm : (yi->imm & 0xffffffffu);
-        if (k == 0 && in->op != I_AND) return early_make(f, ed, x, d, b, depth + 1);
+        if (k == 0 && in->op != I_AND) return early_make(f, er, ed, x, d, b, depth + 1);
         if (in->op == I_ADD || in->op == I_SUB) {
           bool sub = in->op == I_SUB;
           uint64_t neg = sf ? 0 - k : (uint32_t)(0 - (uint32_t)k);
@@ -2685,21 +2718,21 @@ static bool early_make(IrFunc *f, const Edge *ed, Ref v, int d, Buf *b, int dept
           if (k <= 0xfff) imm = (uint32_t)k;
           else if (neg <= 0xfff) { imm = (uint32_t)neg; sub = !sub; }
           else return false;
-          if (!early_make(f, ed, x, d, b, depth + 1)) return false;
+          if (!early_make(f, er, ed, x, d, b, depth + 1)) return false;
           if (b && sub) a64_sub_imm(b, sf, d, d, imm, 0);
           else if (b) a64_add_imm(b, sf, d, d, imm, 0);
           return true;
         }
         uint32_t enc;
-        if (!a64_logical_imm(k, sf, &enc) || !early_make(f, ed, x, d, b, depth + 1))
+        if (!a64_logical_imm(k, sf, &enc) || !early_make(f, er, ed, x, d, b, depth + 1))
           return false;
         if (b && in->op == I_AND) a64_and_imm(b, sf, d, d, enc);
         else if (b && in->op == I_OR) a64_orr_imm(b, sf, d, d, enc);
         else if (b) a64_eor_imm(b, sf, d, d, enc);
         return true;
       }
-      int q = entry_param_reg(f, y);
-      if (q < 0 || !early_make(f, ed, x, d, b, depth + 1)) return false;
+      int q = early_reg(f, er, y);
+      if (q < 0 || !early_make(f, er, ed, x, d, b, depth + 1)) return false;
       if (!b) return true;
       switch (in->op) {
         case I_ADD: a64_add_reg(b, sf, d, d, q); break;
@@ -2715,6 +2748,96 @@ static bool early_make(IrFunc *f, const Edge *ed, Ref v, int d, Buf *b, int dept
   }
 }
 
+/* Whether v is the constant 0 of its type: a store of it stores xzr. */
+static bool early_zero(IrFunc *f, Ref v) {
+  const Inst *vi = &f->insts[v];
+  if (vi->op != I_CONST) return false;
+  return ((ValType)vi->type == VT_I64 ? vi->imm : (vi->imm & 0xffffffffu)) == 0;
+}
+
+/* The access v of the entry -- an integer load or store of memory 0 -- as
+   the test (a load) or the early return (a store) makes it: at the index in
+   *idx (REF_NONE for none, the address all in the offset) plus *off, which
+   an ldr or str carries; a store's value early_make can make or zero. */
+static bool early_access_ok(IrFunc *f, const EarlyRet *er, const Edge *ed, Ref v, Ref *idx,
+                            uint64_t *off) {
+  const Inst *in = &f->insts[v];
+  if (MEMF_MEM(in->imm2) != 0 || !f->m->nmemories || f->m->memories[0].index64) return false;
+  uint32_t size = (uint32_t)MEMF_SIZE(in->imm2);
+  Ref val = in->op == I_STORE ? ir_args(f, v)[1] : REF_NONE;
+  ValType t = (ValType)(val == REF_NONE ? in->type : f->insts[val].type);
+  if (t != VT_I32 && t != VT_I64) return false;
+  Ref a0 = ir_args(f, v)[0];
+  const Inst *ai = &f->insts[a0];
+  /* the address, or the pointer pass_mem_ptr gives accesses at offsets from
+     one base, the memory base plus the same index */
+  uint64_t at = ai->imm;
+  if ((ai->op == I_MEM_ADDR || (ai->op == I_MEM_PTR && ai->imm2 == 0)) && ai->nargs == 1) {
+    *idx = ir_args(f, a0)[0];
+  } else if (ai->op == I_MEM_ADDR && ai->nargs == 2 &&
+             f->insts[ir_args(f, a0)[1]].op == I_MEM_BASE && f->insts[ir_args(f, a0)[1]].imm2 == 0) {
+    /* the index on a pointer to the offset (the ptr_fuse form) */
+    *idx = ir_args(f, a0)[0];
+    at = f->insts[ir_args(f, a0)[1]].imm;
+  } else if (ai->op == I_CONST) {
+    *idx = REF_NONE;
+  } else {
+    return false;
+  }
+  if (*idx != REF_NONE && is64(f, *idx)) return false;
+  *off = at + in->imm;
+  if ((*off & ((1u << size) - 1u)) ? *off >= 256 : (*off >> size) > 0xfff) return false;
+  if (*idx != REF_NONE && early_reg(f, er, *idx) < 0 &&
+      !early_make(f, er, ed, *idx, TMP0, NULL, 0))
+    return false;
+  if (val != REF_NONE && !early_zero(f, val) && !early_make(f, er, ed, val, TMP1, NULL, 0))
+    return false;
+  return true;
+}
+
+/* The access v, which early_access_ok has passed: a load into rt, or a
+   store of what rt holds, the address made in at where it takes a
+   register. */
+static void early_access(IrFunc *f, const EarlyRet *er, const Edge *ed, Ref v, int rt, int at,
+                         Buf *b) {
+  const Inst *in = &f->insts[v];
+  int size = (int)MEMF_SIZE(in->imm2);
+  bool load = in->op == I_LOAD;
+  bool sgn = load && (in->imm2 & MEMF_SIGNED) && size < 3;
+  int wide = load && (ValType)in->type == VT_I64;
+  Ref idx;
+  uint64_t off;
+  if (!early_access_ok(f, er, ed, v, &idx, &off))
+    warmc_fatal("internal: an early return's access could not be made");
+  int base = ER_MB;
+  if (idx != REF_NONE) {
+    int x = early_reg(f, er, idx);
+    if (x < 0) { early_make(f, er, ed, idx, at, b, 0); x = at; }
+    if (off == 0) {
+      if (!load) a64_str_reg(b, size, rt, ER_MB, x, A64_IDX_UXTW, 0);
+      else if (sgn) a64_ldrs_reg(b, size, wide, rt, ER_MB, x, A64_IDX_UXTW, 0);
+      else a64_ldr_reg(b, size, rt, ER_MB, x, A64_IDX_UXTW, 0);
+      return;
+    }
+    a64_add_uxtw(b, at, ER_MB, x, 0);
+    base = at;
+  }
+  if (!load) a64_str_imm(b, size, rt, base, (uint32_t)off);
+  else if (sgn) a64_ldrs_imm(b, size, wide, rt, base, (uint32_t)off);
+  else a64_ldr_imm(b, size, rt, base, (uint32_t)off);
+}
+
+/* x as an operand of the test: the register it is in, or d after the test
+   has made it there (noted in *made); -1 when it can be neither. */
+static int early_operand(IrFunc *f, const EarlyRet *er, const Edge *ed, Ref x, int d,
+                         Ref *made) {
+  int r = early_reg(f, er, x);
+  if (r >= 0) return r;
+  if (!early_make(f, er, ed, x, d, NULL, 0)) return -1;
+  *made = x;
+  return d;
+}
+
 static bool early_ret_shape(Isel *s, EarlyRet *er) {
   IrFunc *f = s->f;
   if (s->far_br || s->opt->profile || f->sig->nresults > 1 || !f->norder ||
@@ -2724,8 +2847,28 @@ static bool early_ret_shape(Isel *s, EarlyRet *er) {
   if (e->term != T_BRIF || e->npreds || e->is_pad || e->nsuccs != 2 ||
       e->succs[0].eh || e->succs[1].eh || e->succs[0].target == e->succs[1].target)
     return false;
-  for (uint32_t i = 0; i < e->ninsts; i++)
-    if (!early_pure_op(f->insts[e->insts[i]].op)) return false;
+  er->nloads = er->nstores = 0;
+  er->ta = er->tb = REF_NONE;
+  bool stored = false;
+  for (uint32_t i = 0; i < e->ninsts; i++) {
+    Ref v = e->insts[i];
+    uint16_t op = f->insts[v].op;
+    if (early_pure_op(op)) continue;
+    Ref idx;
+    uint64_t off;
+    if (op == I_LOAD && !stored && er->nloads < ER_LOADS &&
+        early_access_ok(f, er, &e->succs[0], v, &idx, &off)) {
+      er->loads[er->nloads++] = v;
+      continue;
+    }
+    if (op == I_STORE && er->nstores < ER_STORES &&
+        early_access_ok(f, er, &e->succs[0], v, &idx, &off)) {
+      er->stores[er->nstores++] = v;
+      stored = true;
+      continue;
+    }
+    return false;
+  }
   int which = -1;
   for (int k = 0; k < 2 && which < 0; k++) {
     const Edge *ed = &e->succs[k];
@@ -2737,29 +2880,31 @@ static bool early_ret_shape(Isel *s, EarlyRet *er) {
     Ref res = r->nret ? r->ret_args[0] : REF_NONE;
     if (ok && res != REF_NONE)
       ok = !vt_is_float(f->sig->results[0]) && f->sig->results[0] != VT_V128 &&
-           early_make(f, ed, res, R0, NULL, 0);
+           early_make(f, er, ed, res, R0, NULL, 0);
     if (ok) { which = k; er->res = res; }
   }
   if (which < 0) return false;
   er->edge = (uint32_t)which;
   bool on_true = which == 0;
+  const Edge *ed = &e->succs[which];
 
   Ref c = e->term_arg;
   const Inst *ci = &f->insts[c];
   Ref *a = ir_args(f, c);
   er->rb = -1; er->imm = 0; er->neg = false; er->cc = CC_AL;
-  if ((er->ra = entry_param_reg(f, c)) >= 0) {
-    er->kind = on_true ? 2 : 1;
-    er->sf = is64(f, c) ? SF64 : SF32;
-    return true;
-  }
   if (ci->op == I_EQZ) {
-    if ((er->ra = entry_param_reg(f, a[0])) < 0) return false;
+    if ((er->ra = early_operand(f, er, ed, a[0], ER_TA, &er->ta)) < 0) return false;
     er->kind = on_true ? 1 : 2;
     er->sf = is64(f, a[0]) ? SF64 : SF32;
     return true;
   }
-  if (!is_int_cmp(ci->op) || (er->ra = entry_param_reg(f, a[0])) < 0) return false;
+  if (!is_int_cmp(ci->op)) {
+    if ((er->ra = early_operand(f, er, ed, c, ER_TA, &er->ta)) < 0) return false;
+    er->kind = on_true ? 2 : 1;
+    er->sf = is64(f, c) ? SF64 : SF32;
+    return true;
+  }
+  if ((er->ra = early_operand(f, er, ed, a[0], ER_TA, &er->ta)) < 0) return false;
   er->sf = is64(f, a[0]) ? SF64 : SF32;
   if (f->insts[a[1]].op == I_CONST) {
     uint64_t m = er->sf ? f->insts[a[1]].imm : (f->insts[a[1]].imm & 0xffffffffu);
@@ -2771,7 +2916,7 @@ static bool early_ret_shape(Isel *s, EarlyRet *er) {
     if (m <= 0xfff) er->imm = (uint32_t)m;
     else if (neg <= 0xfff) { er->imm = (uint32_t)neg; er->neg = true; }
     else return false;
-  } else if ((er->rb = entry_param_reg(f, a[1])) < 0) {
+  } else if ((er->rb = early_operand(f, er, ed, a[1], ER_TB, &er->tb)) < 0) {
     return false;
   }
   er->kind = 0;
@@ -2779,8 +2924,15 @@ static bool early_ret_shape(Isel *s, EarlyRet *er) {
   return true;
 }
 
-/* The test, its branch left for early_ret_stub to aim; the branch's offset. */
-static size_t early_ret_test(Buf *b, const EarlyRet *er) {
+/* The test, its branch left for early_ret_stub to aim; the branch's offset.
+   The loads of the entry first, then the operands made, then the test. */
+static size_t early_ret_test(IrFunc *f, Buf *b, const EarlyRet *er) {
+  const Edge *ed = &f->blocks[f->entry].succs[er->edge];
+  if (er->nloads || er->nstores) a64_ldr_imm(b, 3, ER_MB, R0, VMCTX_MEM_BASE);
+  for (uint32_t i = 0; i < er->nloads; i++)
+    early_access(f, er, ed, er->loads[i], ER_LOAD0 + (int)i, ER_LOAD0 + (int)i, b);
+  if (er->ta != REF_NONE) early_make(f, er, ed, er->ta, ER_TA, b, 0);
+  if (er->tb != REF_NONE) early_make(f, er, ed, er->tb, ER_TB, b, 0);
   if (er->kind == 0) {
     if (er->rb >= 0) a64_cmp_reg(b, er->sf, er->ra, er->rb);
     else if (er->neg) a64_adds_imm(b, er->sf, RZR, er->ra, er->imm, 0);
@@ -2793,16 +2945,25 @@ static size_t early_ret_test(Buf *b, const EarlyRet *er) {
   return site;
 }
 
-/* The return the test goes to, after the body: the result, and ret with
-   nothing to undo. */
+/* The return the test goes to, after the body: the entry's stores, the
+   result, and ret with nothing to undo. */
 static void early_ret_stub(Isel *s, const EarlyRet *er, Buf *pro, size_t site) {
   IrFunc *f = s->f;
   if (!a64_patch_b19_ok(pro, site, pro->len + B->len)) {
     s->far_br_needed = true;
     return;
   }
-  if (er->res != REF_NONE &&
-      !early_make(f, &f->blocks[f->entry].succs[er->edge], er->res, R0, B, 0))
+  const Edge *ed = &f->blocks[f->entry].succs[er->edge];
+  for (uint32_t i = 0; i < er->nstores; i++) {
+    Ref st = er->stores[i], val = ir_args(f, st)[1];
+    int rt = RZR;
+    if (!early_zero(f, val)) {
+      early_make(f, er, ed, val, TMP1, B, 0);
+      rt = TMP1;
+    }
+    early_access(f, er, ed, st, rt, TMP0, B);
+  }
+  if (er->res != REF_NONE && !early_make(f, er, ed, er->res, R0, B, 0))
     warmc_fatal("internal: an early return's result could not be made");
   a64_ret(B);
 }
@@ -3025,7 +3186,7 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
   EarlyRet er;
   size_t er_site = 0;
   bool early = early_ret_shape(s, &er);
-  if (early) er_site = early_ret_test(&pro, &er);
+  if (early) er_site = early_ret_test(f, &pro, &er);
   size_t pro_from = pro.len;
   emit_prologue(s, &pro);
   if (early && pro.len == pro_from) { pro.len = 0; early = false; }
