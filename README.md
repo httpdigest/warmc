@@ -659,7 +659,7 @@ The rest of the API, in [`rt/warm_rt.h`](rt/warm_rt.h):
 | `warmc_register(name, inst)`, `warmc_register_n(name, len, inst)` | make an instance's exports importable under module `name`, so modules can import one another. Imported memories, tables, globals and tags all work. |
 | `warmc_find_export(inst, name)`, `warmc_find_export_n(inst, name, len)`, `warmc_export_func(inst, e)` | look an export up, and get the function an export names |
 | `warmc_bind_import(inst, module, name, fn, self)` | rebind an already-linked function import to a host function, which then receives `self` first (`test/tinygo/driver.c` passes the guest, to reach its memory); returns how many imports it rebound |
-| `warmc_invoke(...)`, `warmc_invoke_catching(...)` | call an export. Integer and reference args go in `iargs`: up to 7 on arm64 and 3 on x64. Floats go in `fargs[2*i]`: up to 8 on arm64 and 4 on x64, a `v128` in `fargs[2*i]` and `fargs[2*i+1]`. Results come back in `ret[WARMC_RET_X0]` (integer), `ret[WARMC_RET_V0]` (float; a `v128` in it and the next word) or `ret[WARMC_RET_MULTI(i)]` (multi-value). |
+| `warmc_invoke(...)`, `warmc_invoke_catching(...)` | call an export. Integer and reference args go in `iargs`: up to 7 on arm64 and 3 on x64; an `i32` is its slot's low half, the high half whatever it holds, so an `int32_t` may go in sign-extended. Floats go in `fargs[2*i]`: up to 8 on arm64 and 4 on x64, a `v128` in `fargs[2*i]` and `fargs[2*i+1]`. Results come back in `ret[WARMC_RET_X0]` (integer), `ret[WARMC_RET_V0]` (float; a `v128` in it and the next word) or `ret[WARMC_RET_MULTI(i)]` (multi-value). |
 | `warmc_invoke_s`, `warmc_invoke_catching_s` | for functions with more parameters than the registers above carry, which take the rest from an image of their stack slots, in parameter order: on x64 8 bytes per scalar and an aligned 16 per `v128`, at most `WARMC_X64_STACK_BYTES`; on arm64 16 bytes per parameter (`WARMC_A64_STACK_SLOT`), a scalar in the low 8, any number of them. |
 | `warmc_global_cell(inst, idx)`, `inst->mem_base` / `mem_size` | access globals and linear memory 0 |
 | `warmc_gc_collect()`, `warmc_gc_hold()` / `warmc_gc_release()` | drive the collector; register C-side roots |
@@ -1295,7 +1295,16 @@ of the caller's instance against `x19`, and a call from another instance goes
 on to a runtime trampoline (`warmc_xenter`) that sets the two for the callee,
 copies its stack arguments, and puts the caller's back after; an executable's
 or a shared library's module is the only instance, which the host enters
-with the two set, and has no such compare. The register allocator is a linear scan over SSA webs with
+with the two set, and has no such compare. On arm64 a `memory.copy` or
+`memory.fill` of memory 0 is no call to the register allocator either, so
+the values live across one stay in the registers they have: a constant
+length of up to 96 bytes is made inline in `v26`-`v31`, its bounds tested,
+where it tests them, against a branch to the trap, so a function with no
+other call needs no frame; a length up to 16 bytes is made inline as well;
+and any other is a call of `warmc_memmove_r` or `warmc_memset_r`
+(`rt/start.S`), which check both ranges and move the bytes in registers the
+allocator never hands out, and on macOS hand a long one to libSystem with
+every register it may touch saved. The register allocator is a linear scan over SSA webs with
 lifetime holes. It rematerialises constants -- on arm64 a zero takes no
 register at all, its readers reading the zero register, two stores of zeros
 one `stp xzr, xzr` -- recomputes a spilled frame address or other cheap
