@@ -13,6 +13,11 @@ pass changes what there is to count, or at a level it names:
     ;; stats: slot_tests=20 slot_nullchks=7
     ;; stats -O2: once_dead=1
 
+or, with a64, what only the AArch64 back end's target counts, checked where
+warmc makes AArch64 code (everywhere but Windows, whose is x86-64):
+
+    ;; stats -O2 a64: wrap_params=3
+
 and how many instructions of a function's AArch64 code at -O2 match a
 pattern, checked on an AArch64 host -- for what changes the code and not
 what it computes:
@@ -42,7 +47,7 @@ import hostbuild
 
 LEVELS = ["-O0", "-O1", "-O2", "-O3"]
 RUN_LINE = re.compile(r"^;; run: (\S+)((?: \S+)*) => (.*)$")
-STATS_LINE = re.compile(r"^;; stats(?: (-O[0-3]))?: (.*)$")
+STATS_LINE = re.compile(r"^;; stats(?: (-O[0-3]))?( a64)?: (.*)$")
 SHAPE_LINE = re.compile(r"^;; shape: (\S+) (.*)=(\d+)$")
 OBJDUMP = shutil.which("llvm-objdump") or shutil.which("objdump")
 AARCH64 = platform.machine() in ("arm64", "aarch64")
@@ -62,8 +67,8 @@ def stats(path):
     out = {}
     for line in open(path):
         m = STATS_LINE.match(line.rstrip("\n"))
-        if m:
-            out.setdefault(m.group(1) or "-O0", []).extend(m.group(2).split())
+        if m and not (m.group(2) and hostbuild.WINDOWS):
+            out.setdefault(m.group(1) or "-O0", []).extend(m.group(3).split())
     return out
 
 

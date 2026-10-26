@@ -18,7 +18,7 @@
 ;; test that traps, and a store of the early return that does, trap as they
 ;; would have ($oob, $stoob).
 ;;
-;; stats -O2: early_rets=12
+;; stats -O2 a64: early_rets=12
 ;;
 ;; run: chain 256 => i32:112
 ;; run: chain 272 => i32:100
