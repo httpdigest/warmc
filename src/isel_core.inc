@@ -899,6 +899,11 @@ static void analyse_function(Isel *s) {
         case I_GC_BADMASK: case I_REF_FUNC: case I_GC_LAB_OPEN: case I_GC_LAB_FLUSH:
           touches_instance = true;
           break;
+        /* the inline type test reads the type slots' base from the instance
+           (emit_slot_test) */
+        case I_REF_SLOT:
+          touches_instance = true;
+          break;
         case I_CALL: case I_CALL_INDIRECT: case I_CALL_REF: {
           CompType *sig = (in->op == I_CALL)
               ? &f->m->types[f->m->funcs[in->imm].type_index]
