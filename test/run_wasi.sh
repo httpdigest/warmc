@@ -347,43 +347,34 @@ else
 fi
 
 # A preopened listening socket, which is the only way a guest can ever reach
-# the four sock_* calls.  wasmtime 47 refuses -S tcplisten for wasip1, so the
-# reply is written out rather than diffed.
+# the four sock_* calls.  The driver writes the replies out: wasmtime 47
+# refuses -S tcplisten for wasip1.
 if [ "$WIN" = 1 ]; then
   echo "wasi/echoserver: SKIPPED (sockets are not part of the Windows WASI"
   echo "    host -- rt/winposix.c answers the socket calls ENOSYS, so"
   echo "    --tcplisten has nothing to preopen; Winsock is a follow-up)"
 elif build_driven echoserver; then
-  port=0
-  for try in $(seq 0 9); do
-    cand=$((34500 + RANDOM % 1000))
-    "$DRIVEN_EXE" --tcplisten=127.0.0.1:$cand >"$WORK/echo.out" 2>"$WORK/echo.err" &
-    srv=$!
-    for i in $(seq 1 60); do
-      if exec 3<>/dev/tcp/127.0.0.1/$cand; then port=$cand; break; fi
-      perl -e 'select(undef,undef,undef,0.05)'
-    done 2>/dev/null
-    [ "$port" != 0 ] && break
-    kill $srv 2>/dev/null; wait $srv 2>/dev/null
-  done
-  if [ "$port" = 0 ]; then
-    echo "FAIL[wasi/echoserver]: the guest never came up on a port"
-    sed 's/^/    /' "$WORK/echo.err"
-    fail=1
+  if ./test/wasi-driven/echoserver.sh "$DRIVEN_EXE" "$WORK"; then
+    pass=$((pass + 1))
   else
-    printf 'hi' >&3
-    reply=$(cat <&3)
-    exec 3<&-
-    wait $srv; rc=$?
-    said=$(tr -d '\n' < "$WORK/echo.out")
-    if [ "$reply" != "echo: hi" ] || [ "$said" != 2 ] || [ "$rc" != 0 ]; then
-      echo "FAIL[wasi/echoserver]: reply [$reply], stdout [$said], exit $rc"
-      echo "    (want reply [echo: hi], stdout [2], exit 0)"
-      sed 's/^/    /' "$WORK/echo.err"
-      fail=1
-    else
-      pass=$((pass + 1))
-    fi
+    fail=1
+  fi
+else
+  fail=1
+fi
+
+# stdin and stdout non-blocking to the guest alone: the host files are the
+# parent's too, and keep their flags after the program.  The driver holds the
+# other ends of the pipes and checks their flags; wasmtime refuses
+# fd_fdstat_set_flags on all three, so nothing is diffed.  Not on Windows,
+# whose host keeps its flags per process already.
+if [ "$WIN" = 1 ]; then
+  :
+elif build_driven stdioflags; then
+  if python3 test/wasi-driven/stdioflags.py "$DRIVEN_EXE"; then
+    pass=$((pass + 1))
+  else
+    fail=1
   fi
 else
   fail=1
