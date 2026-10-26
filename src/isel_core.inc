@@ -79,6 +79,12 @@ typedef struct {
   bool has_call;
   /* has_call for something other than a wasm call */
   bool call_other;
+  /* a call of a wasm function, which reads the instance and memory base
+     where they are pinned (a64) */
+  bool calls_wasm;
+  /* The instance and memory 0's base stay in x19 and x20 across calls,
+     which a function is entered with set (a64, codegen_pinned). */
+  bool pin;
   /* Every call is a quasi-leaf's cold one, made in a frame of its own
      (cold_calls_only in isel.c); cold_out is that frame's outgoing area. */
   bool cold_frame;
@@ -851,6 +857,7 @@ static void analyse_function(Isel *s) {
   IrFunc *f = s->f;
   s->has_call = false;
   s->call_other = false;
+  s->calls_wasm = false;
   s->needs_mem = false;
   s->needs_memsize = false;
   s->needs_retarea = false;
@@ -910,6 +917,7 @@ static void analyse_function(Isel *s) {
               : &f->m->types[in->imm];
           if (sig->nresults > 1) s->needs_retarea = true;
           s->has_call = true;
+          if (in->op != I_CALL || !f->m->funcs[in->imm].native) s->calls_wasm = true;
           touches_instance = true;
           break;
         }

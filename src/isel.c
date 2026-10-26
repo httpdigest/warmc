@@ -103,20 +103,30 @@ static int isel_cs_index(int r) {
 
 static int isel_break_reg(int bank) { return bank ? F3 : TMP1; }
 
-/* x19 and x20 hold the instance and memory base, but a leaf moves those to
-   x9 and x10, where they need no save, and a function that touches neither
-   never loads them.  Whichever of the two is then idle is a callee-saved
-   register like x22-x28, which the allocator falls back on before it spills
-   a value read in a loop (regalloc_linear): one save and restore per call,
-   against a reload on every iteration.  BLAKE3's compressPre carries its
-   sixteen state words, a round counter and a base round a loop, and spilled
-   a temporary at almost every step of it.  The stack check of a function
-   with a call reads the instance from x19 whether or not the body does, so
-   x19 stays put there. */
+/* x19 and x20 hold the instance and memory base.  Pinned (codegen_pinned),
+   a function is entered with them there and leaves them there for the wasm
+   functions it calls, so one that reads neither itself nor through such a
+   call may lend them -- the stack check reads x19 in the prologue, ahead
+   of any value, and a tail call or a cold call is made after the epilogue
+   has put them back.  Not pinned, a leaf moves them to x9 and x10, where
+   they need no save, and a function that touches neither never loads them;
+   the stack check of a function with a call reads the instance from x19
+   whether or not the body does, so x19 stays put there.  Whichever of the
+   two is idle is a callee-saved register like x22-x28, which the allocator
+   falls back on before it spills a value read in a loop (regalloc_linear):
+   one save and restore per call, against a reload on every iteration.
+   BLAKE3's compressPre carries its sixteen state words, a round counter and
+   a base round a loop, and spilled a temporary at almost every step of
+   it. */
 static int isel_spare_gprs(Isel *s, int *out) {
   int n = 0;
-  if (s->vmctx_reg != R19 || (!s->needs_vmctx && !s->has_call)) out[n++] = R19;
-  if (s->membase_reg != R20 || !s->needs_mem) out[n++] = R20;
+  if (s->pin) {
+    if (!s->needs_vmctx) out[n++] = R19;
+    if (!s->needs_mem && !s->calls_wasm) out[n++] = R20;
+  } else {
+    if (s->vmctx_reg != R19 || (!s->needs_vmctx && !s->has_call)) out[n++] = R19;
+    if (s->membase_reg != R20 || !s->needs_mem) out[n++] = R20;
+  }
   /* Without a call x29 and x30 are two more: x30 is read only by the ret,
      after the epilogue has restored it, and the frame record x29 would
      point to is one this code never builds -- a function with calls uses
@@ -152,6 +162,9 @@ static IrOp recomp_shape(IrFunc *f, Ref v, Ref *x, Ref *y, uint64_t *c);
 #define RA_ZERO_REG 1
 /* an extend of an i32 a w-register write made is no instruction in place */
 #define RA_EXTENDU_TIED 1
+/* a value live across a call in a loop takes callee-saved registers from
+   x28 down (regalloc_linear's cs_top) */
+#define RA_CS_TOP 1
 
 #define A64_IDX_UXTW 2
 #define A64_IDX_LSL  3
@@ -712,8 +725,14 @@ static void emit_call_args_core(Isel *s, const Ref *args, uint32_t nargs,
 static void emit_call_args_to(Isel *s, const Ref *args, uint32_t nargs,
                               int stack_base) {
   s->tail_args = true;
-  emit_call_args_core(s, args, nargs, stack_base, 1, true, false);
+  emit_call_args_core(s, args, nargs, stack_base, 1, !s->pin, false);
   s->tail_args = false;
+}
+
+/* A call of one of the module's own functions: the instance in x0, unless
+   the callee finds it pinned in x19. */
+static void emit_call_args_own(Isel *s, const Ref *args, uint32_t nargs) {
+  emit_call_args_core(s, args, nargs, RSP, 1, !s->pin, false);
 }
 
 static void emit_call_args(Isel *s, const Ref *args, uint32_t nargs) {
@@ -1388,6 +1407,53 @@ static uint32_t fit_pad(uint32_t at, uint32_t span, uint32_t align) {
   if (span <= 64)
     while (((at + p) & 63) + span > 64) p += align;
   return p;
+}
+
+/* Where in a 64-byte block the function starts, a multiple of the loop
+   alignment so that every other loop's stays: the one whose small loops of
+   the deepest nest, at the offsets the first emission measured, fit with
+   the least padding run on their entry -- a nop for each word of it, and
+   the branch over more than 16 bytes, which costs about a cycle, as eight
+   nops do.  The padding a phase puts ahead of the function is never run.
+   vecbench/condsum's 28-byte inner loop, entered for almost every element
+   by the loop round it, sat 16 bytes later once the prologue had shrunk,
+   needed a branch over 24 bytes of padding to fit, and ran 26% slower; a
+   phase of 16 puts it back.  Only a nest at least two deep counts, its
+   innermost loops entered once each time round the loop around them, and
+   only when every loop at that depth is a small one measured here: a phase
+   moves the whole function, and the code around its loops with it, and
+   asbench/virtual ran 15% slower when a phase saved the branch over the
+   padding of a loop entered once a call.  rec holds (header, order index,
+   offset, padding) per small loop, in order, and spans each one's bytes;
+   header marks every loop header. */
+static uint32_t loop_phase(IrFunc *f, const uint32_t *rec, uint32_t nrec,
+                           const uint16_t *spans, uint32_t align,
+                           const uint8_t *header) {
+  uint32_t deep = 0;
+  for (uint32_t b = 0; b < f->nblocks; b++)
+    if (header[b] && f->blocks[b].loop_depth > deep) deep = f->blocks[b].loop_depth;
+  if (deep < 2) return 0;
+  for (uint32_t b = 0; b < f->nblocks; b++) {
+    if (!header[b] || f->blocks[b].loop_depth != deep) continue;
+    uint32_t i = 0;
+    while (i < nrec && rec[4 * i] != b) i++;
+    if (i == nrec || !spans[b]) return 0;
+  }
+  uint32_t best = 0;
+  uint64_t best_cost = UINT64_MAX;
+  for (uint32_t k = 0; k < 64; k += align) {
+    uint64_t cost = 0;
+    int64_t shift = 0;
+    for (uint32_t i = 0; i < nrec; i++) {
+      uint32_t h = rec[4 * i], at = rec[4 * i + 2], pad = rec[4 * i + 3];
+      uint32_t span = spans[h];
+      uint32_t np = span ? fit_pad((uint32_t)((int64_t)at + shift + k), span, align) : pad;
+      if (f->blocks[h].loop_depth == deep) cost += np > 16 ? 8 : np / 4;
+      shift += (int64_t)np - (int64_t)pad;
+    }
+    if (cost < best_cost) { best_cost = cost; best = k; }
+  }
+  return best;
 }
 
 /* The bytes the loop headed by h took, h at order index oi: its blocks laid
@@ -2150,8 +2216,8 @@ static int cs_gpr_list(Isel *s, int *list) {
     int r = CS_GPR[i];
     bool needed;
 
-    if (r == R19) needed = s->needs_vmctx && s->vmctx_reg == R19;
-    else if (r == R20) needed = s->needs_mem && s->membase_reg == R20;
+    if (r == R19) needed = !s->pin && s->needs_vmctx && s->vmctx_reg == R19;
+    else if (r == R20) needed = !s->pin && s->needs_mem && s->membase_reg == R20;
     else if (r == R21) needed = s->needs_memsize;
     else needed = false;
     if (s->used_gpr_cs & (1u << r)) needed = true;
@@ -2198,7 +2264,7 @@ static void emit_prologue(Isel *s, Buf *b) {
   for (int i = 0; i < fn_; i++)
     a64_fstr_imm(b, 3, fl[i], RSP, s->fpsave_off + 8u * (uint32_t)i);
 
-  if (s->needs_vmctx) a64_mov_reg(b, SF64, REG_VMCTX, R0);
+  if (s->needs_vmctx && !s->pin) a64_mov_reg(b, SF64, REG_VMCTX, R0);
 
   /* The stack check falls through: its trap is one of the function's trap
      stubs after the body (patched by produce_body), not a branch over a
@@ -2316,7 +2382,7 @@ static void emit_prologue(Isel *s, Buf *b) {
   }
 
   if (s->needs_mem) {
-    a64_ldr_imm(b, 3, REG_MEMBASE, REG_VMCTX, VMCTX_MEM_BASE);
+    if (!s->pin) a64_ldr_imm(b, 3, REG_MEMBASE, REG_VMCTX, VMCTX_MEM_BASE);
     if (s->needs_memsize) a64_ldr_imm(b, 3, REG_MEMSIZE, REG_VMCTX, VMCTX_MEM_SIZE);
   }
   if (s->tid_tab) emit_ictab_addr(s, b, f->m->ict[s->tid_ict].sym, s->tid_reg, true);
@@ -2597,7 +2663,7 @@ static bool cold_calls_only(Isel *s) {
    (cppbench/uniqtree's ~unique_ptr, half of whose calls are on null) or
    Rust's drop of an Option<Box<T>>.  The test makes every load of the entry,
    in order, into a register of its own (ER_LOAD0 on, from the memory base in
-   ER_MB) and tests what they make; the early return makes the entry's stores
+   er->mb) and tests what they make; the early return makes the entry's stores
    from those registers, then its result.  The other way the entry block runs
    whole after the prologue, its loads reading what the test's read: nothing
    came between to write memory, which no other thread writes either -- a
@@ -2606,7 +2672,6 @@ static bool cold_calls_only(Isel *s) {
    have in the entry block before any of its stores. */
 #define ER_LOADS  5
 #define ER_STORES 4
-#define ER_MB     R9
 #define ER_LOAD0  R10
 #define ER_TA     R15
 #define ER_TB     TMP0
@@ -2620,6 +2685,7 @@ typedef struct {
   uint32_t nloads, nstores;
   Ref loads[ER_LOADS], stores[ER_STORES];
   Ref ta, tb;          /* operands of the test made into ER_TA and ER_TB */
+  int mb;              /* memory 0's base: x20 where pinned, else loaded to x9 */
 } EarlyRet;
 
 /* The register an integer parameter of the function arrives in, or -1. */
@@ -2823,17 +2889,17 @@ static void early_access(IrFunc *f, const EarlyRet *er, const Edge *ed, Ref v, i
   uint64_t off;
   if (!early_access_ok(f, er, ed, v, &idx, &off))
     warmc_fatal("internal: an early return's access could not be made");
-  int base = ER_MB;
+  int base = er->mb;
   if (idx != REF_NONE) {
     int x = early_reg(f, er, idx);
     if (x < 0) { early_make(f, er, ed, idx, at, b, 0); x = at; }
     if (off == 0) {
-      if (!load) a64_str_reg(b, size, rt, ER_MB, x, A64_IDX_UXTW, 0);
-      else if (sgn) a64_ldrs_reg(b, size, wide, rt, ER_MB, x, A64_IDX_UXTW, 0);
-      else a64_ldr_reg(b, size, rt, ER_MB, x, A64_IDX_UXTW, 0);
+      if (!load) a64_str_reg(b, size, rt, er->mb, x, A64_IDX_UXTW, 0);
+      else if (sgn) a64_ldrs_reg(b, size, wide, rt, er->mb, x, A64_IDX_UXTW, 0);
+      else a64_ldr_reg(b, size, rt, er->mb, x, A64_IDX_UXTW, 0);
       return;
     }
-    a64_add_uxtw(b, at, ER_MB, x, 0);
+    a64_add_uxtw(b, at, er->mb, x, 0);
     base = at;
   }
   if (!load) a64_str_imm(b, size, rt, base, (uint32_t)off);
@@ -2863,6 +2929,7 @@ static bool early_ret_shape(Isel *s, EarlyRet *er) {
     return false;
   er->nloads = er->nstores = 0;
   er->ta = er->tb = REF_NONE;
+  er->mb = s->pin ? R20 : R9;
   bool stored = false;
   for (uint32_t i = 0; i < e->ninsts; i++) {
     Ref v = e->insts[i];
@@ -2942,7 +3009,8 @@ static bool early_ret_shape(Isel *s, EarlyRet *er) {
    The loads of the entry first, then the operands made, then the test. */
 static size_t early_ret_test(IrFunc *f, Buf *b, const EarlyRet *er) {
   const Edge *ed = &f->blocks[f->entry].succs[er->edge];
-  if (er->nloads || er->nstores) a64_ldr_imm(b, 3, ER_MB, R0, VMCTX_MEM_BASE);
+  if ((er->nloads || er->nstores) && er->mb != R20)
+    a64_ldr_imm(b, 3, er->mb, R0, VMCTX_MEM_BASE);
   for (uint32_t i = 0; i < er->nloads; i++)
     early_access(f, er, ed, er->loads[i], ER_LOAD0 + (int)i, ER_LOAD0 + (int)i, b);
   if (er->ta != REF_NONE) early_make(f, er, ed, er->ta, ER_TA, b, 0);
@@ -2982,6 +3050,41 @@ static void early_ret_stub(Isel *s, const EarlyRet *er, Buf *pro, size_t site) {
   a64_ret(B);
 }
 
+/* The lead of a function another instance may call, with the instance and
+   memory base pinned (codegen_entry_off): the address the module hands
+   out for it -- to its exports, its references, the imports bound to it --
+   is the cmp, ENTRY_CHECK_BYTES ahead of the body, and a call from code of
+   the same instance, whose x19 and x20 are already the body's, goes
+   straight on into it.  One from any other, or from the host with its own
+   instance in x0, takes the branch back to the stub ahead, which hands
+   the body to warmc_xenter (rt/start.S) to call with the two set and to
+   put the caller's back after, and the area of stack arguments to copy:
+   the body's own, and room for those of any tail call the module makes,
+   which go where the body's arrived.  The direct calls of the module's
+   own code, and its call_indirect code tables, name the body.  The lead's
+   relocation is returned through *rel. */
+static void emit_entry_check(Isel *s, Buf *lead, uint32_t out_bytes, Reloc *rel) {
+  const CompType *sig = s->f->sig;
+  uint32_t ints = 1, flts = 0, slots = 0;
+  for (uint32_t i = 0; i < sig->nparams; i++) {
+    if (vt_is_vec_reg(sig->params[i])) { if (flts < 8) { flts++; continue; } }
+    else if (ints <= 7) { ints++; continue; }
+    slots++;
+  }
+  uint32_t area = ARG_STACK_SLOT * slots;
+  if (out_bytes > area) area = out_bytes;
+  area = (area + 15u) & ~15u;
+  a64_adr(lead, R10, 0);
+  a64_load_imm(lead, SF64, R9, area);
+  rel->kind = REL_CALL26; rel->section = 0; rel->offset = lead->len;
+  rel->sym = obj_intern_sym(s->o, "warmc_xenter", SYM_UNDEF_FUNC, -1, 0);
+  rel->addend = 0;
+  a64_b(lead, 0);
+  a64_cmp_reg(lead, SF64, R0, R19);
+  a64_bcond(lead, CC_NE, -(int32_t)(lead->len / 4));
+  a64_patch_adr(lead, 0, lead->len);
+}
+
 static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
                         uint32_t out_bytes, FuncOut *fout, bool far,
                         SplitCtl *sc, bool split_collect) {
@@ -3008,6 +3111,7 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
 
   s->no_small_memop = warmc_getenv("WARMC_NO_SMALL_MEMOP") != NULL;
   s->no_rc_def = warmc_getenv("WARMC_NO_RC_DEF") != NULL;
+  s->pin = codegen_pinned();
   analyse_function(s);
 
   s->lab_reg = 0;
@@ -3051,7 +3155,7 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
         }
     }
 
-    if (leaf || quasi) {
+    if ((leaf || quasi) && !s->pin) {
       if (s->needs_vmctx) s->vmctx_reg = R9;
       if (s->needs_mem) s->membase_reg = R10;
     }
@@ -3248,6 +3352,7 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
      more.  Off with far branches, whose sizes are not the first run's. */
   bool fit = small_align && !s->far_br;
   const uint16_t *span_of = fit ? f->loop_bytes : NULL;
+  uint32_t phase = span_of ? f->loop_phase : 0;
   uint32_t *blk_end = fit && !span_of ? xmalloc(f->nblocks * sizeof(uint32_t)) : NULL;
   uint32_t *rec = NULL, nrec = 0;
 
@@ -3264,7 +3369,7 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
       bool small = header && small_align && small_loop(f, bi);
       uint32_t want = small ? 64 : lalign;
       if (header) {
-        uint32_t at = (uint32_t)(pro.len + B->len);
+        uint32_t at = phase + (uint32_t)(pro.len + B->len);
         uint32_t pad = (want - (at & (want - 1))) & (want - 1);
         if (small && span_of && span_of[bi]) pad = fit_pad(at, span_of[bi], lalign);
         if (small && blk_end) {
@@ -3276,10 +3381,10 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
         if (pad > 16) {
           size_t site = B->len;
           a64_b(B, 0);
-          while (pro.len + B->len < at + pad) a64_nop(B);
+          while (phase + pro.len + B->len < at + pad) a64_nop(B);
           patch_b26_checked(s, site, B->len);
         } else {
-          while (pro.len + B->len < at + pad) a64_nop(B);
+          while (phase + pro.len + B->len < at + pad) a64_nop(B);
         }
       }
     }
@@ -3315,17 +3420,32 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
   if (blk_end && nrec) {
     uint16_t *spans = ir_alloc(f, f->nblocks * sizeof(uint16_t));
     memset(spans, 0, f->nblocks * sizeof(uint16_t));
+    for (uint32_t k = 0; k < nrec; k++) {
+      uint32_t span = loop_span(s, rec[4 * k], eo, neo, rec[4 * k + 1], blk_end);
+      if (span && span <= 0xffff) spans[rec[4 * k]] = (uint16_t)span;
+    }
+    uint32_t ph = 0;
+    if (!warmc_getenv("WARMC_NO_LOOP_PHASE")) {
+      uint8_t *hdr = xcalloc(f->nblocks ? f->nblocks : 1, 1);
+      for (uint32_t b = 0; b < f->nblocks; b++) {
+        Block *lb = &f->blocks[b];
+        if (!lb->reachable || !lb->loop_depth) continue;
+        for (uint32_t p = 0; p < lb->npreds; p++)
+          if (f->blocks[lb->preds[p]].rpo >= lb->rpo) hdr[b] = 1;
+      }
+      ph = loop_phase(f, rec, nrec, spans, lalign, hdr);
+      xfree(hdr);
+    }
     int64_t shift = 0;
     for (uint32_t k = 0; k < nrec; k++) {
       uint32_t h = rec[4 * k], at = rec[4 * k + 2], pad = rec[4 * k + 3];
-      uint32_t span = loop_span(s, h, eo, neo, rec[4 * k + 1], blk_end);
-      if (!span || span > 0xffff) continue;
-      spans[h] = (uint16_t)span;
-      uint32_t np = fit_pad((uint32_t)((int64_t)at + shift), span, lalign);
+      if (!spans[h]) continue;
+      uint32_t np = fit_pad((uint32_t)((int64_t)at + shift + ph), spans[h], lalign);
       if (np != pad) refit = true;
       shift += (int64_t)np - (int64_t)pad;
     }
-    if (refit) f->loop_bytes = spans;
+    if (ph) refit = true;
+    if (refit) { f->loop_bytes = spans; f->loop_phase = (uint8_t)ph; }
   }
   xfree(blk_end); xfree(rec);
 
@@ -3410,14 +3530,25 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
 
   if (s->cold_frame) g_stats.cold_frames++;
   if (early) g_stats.early_rets++;
+  Buf lead;
+  memset(&lead, 0, sizeof lead);
+  Reloc lead_rel;
+  if (s->pin && codegen_entry_off(f->m, f->func_index)) {
+    emit_entry_check(s, &lead, out_bytes, &lead_rel);
+    g_stats.entry_checks++;
+  }
   memset(fout, 0, sizeof *fout);
   fout->want_align = opt->align && has_loop;
-  fout->code_len = (uint32_t)(pro.len + s->body.len);
+  fout->phase = fout->want_align ? (uint8_t)phase : 0;
+  if (fout->phase) g_stats.loop_phases++;
+  fout->entry_off = (uint32_t)lead.len;
+  fout->code_len = (uint32_t)(lead.len + pro.len + s->body.len);
   fout->code = xmalloc(fout->code_len ? fout->code_len : 1);
-  if (pro.len) memcpy(fout->code, pro.data, pro.len);
-  if (s->body.len) memcpy(fout->code + pro.len, s->body.data, s->body.len);
-  fout->nrelocs = s->nrelocs;
-  fout->relocs = xmalloc((s->nrelocs ? s->nrelocs : 1) * sizeof(Reloc));
+  if (lead.len) memcpy(fout->code, lead.data, lead.len);
+  if (pro.len) memcpy(fout->code + lead.len, pro.data, pro.len);
+  if (s->body.len) memcpy(fout->code + lead.len + pro.len, s->body.data, s->body.len);
+  fout->nrelocs = s->nrelocs + (lead.len ? 1u : 0u);
+  fout->relocs = xmalloc((fout->nrelocs ? fout->nrelocs : 1) * sizeof(Reloc));
   for (uint32_t i = 0; i < s->nrelocs; i++) {
     Reloc *r = &s->relocs[i];
     uint64_t off = r->offset;
@@ -3425,11 +3556,13 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
     else off += pro.len;
     fout->relocs[i] = *r;
     fout->relocs[i].section = 0;
-    fout->relocs[i].offset = off;
+    fout->relocs[i].offset = off + lead.len;
   }
+  if (lead.len) fout->relocs[s->nrelocs] = lead_rel;
+  buf_free(&lead);
   const char *sym = f->m->funcs[f->func_index].sym;
   fout->sym = sym;
-  fout->insts_emitted = (pro.len + s->body.len) / 4;
+  fout->insts_emitted = fout->code_len / 4;
   collect_refs(f, fout);
 
   {
@@ -3635,6 +3768,7 @@ const Target warmc_target_a64 = {
   .name = "a64",
   .is_x64 = false,
   .wrap_alias = true,
+  .pin_regs = true,
   .imm_ok = imm_ok_a64,
   .const_cost = const_cost_a64,
   .vconst_cost = vconst_cost_a64,

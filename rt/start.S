@@ -8,6 +8,19 @@
 #define SIZE_DIRECTIVE(x) .size x, . - x
 #endif
 
+#if defined(WARMC_DARWIN)
+#define LOCAL(x) L##x
+#else
+#define LOCAL(x) .L##x
+#endif
+
+/* The offset of warmc_xenter's return address, which rt.c's unwinder and
+   collector know its frame by.  A label of its own there would be a symbol,
+   and on Darwin, with .subsections_via_symbols, the linker would be free to
+   move the code after it away from the call -- a dead-stripping link did,
+   and the callee returned into the function laid out next. */
+#define XENTER_RET_OFF 60
+
     .macro LOADADDR reg, sym
 #if defined(WARMC_DARWIN)
     adrp    \reg, \sym@PAGE
@@ -54,13 +67,16 @@ SYM(warmc_invoke):
    of exactly those slots, stk_bytes of it, a multiple of 16, and it is
    copied to the bottom of the cushion, which grows to hold it.  The cushion
    is 512 bytes at least, so a callee's reads of slots no image wrote stay
-   in memory that is ours. */
+   in memory that is ours.  The instance goes in x0 and, with memory 0's
+   base, in x19 and x20 too, where code that keeps them pinned there
+   expects them (the compiler's isel.c). */
     .globl SYM(warmc_invoke_s)
     FUNC_DIRECTIVES(SYM(warmc_invoke_s))
 SYM(warmc_invoke_s):
     stp     x29, x30, [sp, #-16]!
     mov     x29, sp
     stp     x19, x20, [sp, #-16]!
+    stp     x21, x22, [sp, #-16]!
 
     add     x9, x6, #15
     and     x9, x9, #-16
@@ -76,7 +92,7 @@ SYM(warmc_invoke_s):
     add     x10, x10, #8
     b       1b
 2:
-    mov     x19, x4
+    mov     x21, x4
     mov     x16, x0
     mov     x17, x1
 
@@ -98,27 +114,73 @@ SYM(warmc_invoke_s):
     mov     x5, x13
     mov     x6, x14
     mov     x7, x15
-    add     x8, x19, #32
+    add     x8, x21, #32
 
-    LOADADDR x20, SYM(warmc_gc_invoke_depth)
-    ldr     x9, [x20]
+    mov     x19, x17
+    cbz     x17, 3f
+    ldr     x20, [x17]
+3:
+    LOADADDR x22, SYM(warmc_gc_invoke_depth)
+    ldr     x9, [x22]
     add     x9, x9, #1
-    str     x9, [x20]
+    str     x9, [x22]
 
     blr     x16
 
-    ldr     x9, [x20]
+    ldr     x9, [x22]
     sub     x9, x9, #1
-    str     x9, [x20]
+    str     x9, [x22]
 
-    str     x0, [x19, #0]
-    str     q0, [x19, #16]
+    str     x0, [x21, #0]
+    str     q0, [x21, #16]
 
-    sub     sp, x29, #16
+    sub     sp, x29, #32
+    ldp     x21, x22, [sp], #16
     ldp     x19, x20, [sp], #16
     ldp     x29, x30, [sp], #16
     ret
     SIZE_DIRECTIVE(SYM(warmc_invoke_s))
+
+/* warmc_xenter(instance x0, body x10, area x9): a call from another
+   instance into a function that keeps the instance and memory 0's base in
+   x19 and x20 (the compiler's isel.c, emit_entry_check), which the caller
+   made with its own there.  The function's arguments are where the call
+   left them, stack ones in the caller's outgoing area at sp; they are
+   copied down, the area's x9 bytes, below a frame that saves the caller's
+   x19 and x20, and the body is called with its own -- and the caller's
+   are back when it returns, as at any call.  A tail call into the
+   function comes here like a call, and so returns to its caller through
+   this frame.  The frame record goes at x29, which the body saves at its
+   entry - 16 like every frame that calls, and the unwinder and the
+   collector find it there to walk through, by its return address
+   (XENTER_RET_OFF). */
+    .globl SYM(warmc_xenter)
+    FUNC_DIRECTIVES(SYM(warmc_xenter))
+SYM(warmc_xenter):
+    stp     x29, x30, [sp, #-32]!
+    stp     x19, x20, [sp, #16]
+    mov     x29, sp
+    sub     sp, sp, x9
+    mov     x11, #0
+1:  cmp     x11, x9
+    b.hs    2f
+    add     x12, x29, #32
+    ldr     x13, [x12, x11]
+    str     x13, [sp, x11]
+    add     x11, x11, #8
+    b       1b
+2:  mov     x19, x0
+    ldr     x20, [x0]
+    blr     x10
+LOCAL(xenter_ret):
+    mov     sp, x29
+    ldp     x19, x20, [sp, #16]
+    ldp     x29, x30, [sp], #32
+    ret
+    .if LOCAL(xenter_ret) - SYM(warmc_xenter) - XENTER_RET_OFF
+    .error "warmc_xenter's return address is not XENTER_RET_OFF bytes in"
+    .endif
+    SIZE_DIRECTIVE(SYM(warmc_xenter))
 
     .globl SYM(warmc_setjmp)
     FUNC_DIRECTIVES(SYM(warmc_setjmp))

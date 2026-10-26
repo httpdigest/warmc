@@ -118,6 +118,7 @@ static bool isel_fp_remat_ok(Isel *s, const Inst *in) {
 #define RA_FMA_TIED 1
 #define RA_ZERO_REG 0
 #define RA_EXTENDU_TIED 0
+#define RA_CS_TOP 0
 
 static const int ARG_GPR[4] = { X_RCX, X_RDX, X_R8, X_R9 };
 

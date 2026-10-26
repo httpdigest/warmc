@@ -1089,6 +1089,7 @@ void module_free(Module *m) {
   xfree(m->datas);
   if (m->t0) { xfree(m->t0->entry); xfree(m->t0->sites); xfree(m->t0); }
   xfree(m->ict); xfree(m->ict_of);
+  xfree(m->escapes);
   for (uint32_t i = 0; i < m->nowned_bodies; i++) xfree(m->owned_bodies[i]);
   xfree(m->owned_bodies);
   xfree(m);

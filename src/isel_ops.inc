@@ -1986,7 +1986,7 @@ static void emit_inst(Isel *s, Ref v) {
       }
       emit_ret_area(s, sig);
       if (fn->imported) emit_call_args_novmctx(s, a, in->nargs);
-      else emit_call_args(s, a, in->nargs);
+      else emit_call_args_own(s, a, in->nargs);
       if (fn->imported) {
 
         uint32_t off = VMCTX_IMPORTS(f->m->nglobals) + 16u * (uint32_t)in->imm;
@@ -2021,7 +2021,7 @@ static void emit_inst(Isel *s, Ref v) {
 
       emit_ret_area(s, sig);
       if (own) {
-        emit_call_args(s, a, in->nargs - 1);
+        emit_call_args_own(s, a, in->nargs - 1);
       } else {
         emit_call_args_novmctx(s, a, in->nargs - 1);
         a64_ldr_imm(B, 3, R0, S1, FUNCREF_INSTANCE);
