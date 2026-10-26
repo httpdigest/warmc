@@ -1834,7 +1834,17 @@ static u64 gc_gran_peak;
 
 static u64 gc_gran_hwm;
 
-static u32 gc_small_page = (u32)-1, gc_medium_page = (u32)-1;
+/* The pages allocation bumps into: small and medium objects, and the
+   program's allocation buffers (gc_lab_refill), small pages of their own --
+   in a medium one, the small objects the program makes there would take
+   eight granules together to compact into.  None is relocated or freed
+   while allocation may still bump into it. */
+static u32 gc_small_page = (u32)-1, gc_medium_page = (u32)-1,
+           gc_lab_page = (u32)-1;
+
+static u32 gc_page_current(u32 h) {
+  return h == gc_small_page || h == gc_medium_page || h == gc_lab_page;
+}
 
 static u32 gc_page_of(const void *p) {
   return (u32)((GC_ADDR(p) - (u64)(uptr)gc_base) >> GC_GRAN_SHIFT);
@@ -1878,7 +1888,21 @@ static void gc_gran_mark_free(u64 g, u64 n, u32 free) {
   }
 }
 
+/* Granules the program's allocations leave free for relocation to compact
+   into: a heap the program fills has something live on every page, so a
+   cycle frees none of them, and without room relocation cannot empty any
+   either (gc_select_reloc).  A thirty-second of the heap, at least two
+   medium pages and at most an eighth of it; gc_evacuating while relocation
+   takes its pages, and gc_reserve_open for an allocation that two cycles
+   have not made room for (gc_alloc), which takes it as a last resort: a
+   heap whose live data fills it should hold as much as it did without. */
+static u64 gc_reserve_gran;
+static u32 gc_evacuating, gc_reserve_open;
+
 static u64 gc_gran_take(u32 n) {
+  if (!gc_evacuating && !gc_reserve_open &&
+      gc_gran_used + n + gc_reserve_gran > gc_ngran)
+    return (u64)-1;
   u64 run = 0, start = 0;
   u64 lim = (gc_gran_hwm + n + 64) / 64 + 1;
   if (lim > gc_granfree_words) lim = gc_granfree_words;
@@ -2021,6 +2045,9 @@ static void gc_init(void) {
   gc_heap_bytes &= ~(GC_GRAN - 1);
   if (gc_heap_bytes < 2 * GC_GRAN) die("the managed heap is smaller than two pages");
   gc_ngran = gc_heap_bytes / GC_GRAN;
+  gc_reserve_gran = gc_ngran / 32;
+  if (gc_reserve_gran < 2 * GC_MEDIUM_GRAN) gc_reserve_gran = 2 * GC_MEDIUM_GRAN;
+  if (gc_reserve_gran > gc_ngran / 8) gc_reserve_gran = gc_ngran / 8;
 
   gc_pages = (GcPage *)sys_mmap(0, (usz)(gc_ngran * sizeof(GcPage)),
                                 PROT_READ | PROT_WRITE,
@@ -2249,7 +2276,9 @@ static void gc_lab_refill(void) {
   if (q > GC_LAB_CAP) q = GC_LAB_CAP;
   q &= ~(u64)(GC_UNIT - 1);
   if (q < 2 * GC_LAB_MIN_TAIL) return;
-  u8 *p = gc_alloc_raw(q);
+  u32 held = gc_lock();
+  u8 *p = gc_bump(&gc_lab_page, GC_SMALL_GRAN, GCP_SMALL, q);
+  gc_unlock(held);
   if (!p) return;
   gc_nlabs++;
   gc_lab_start = p;
@@ -2476,7 +2505,7 @@ static u64 gc_page_nlive(u32 h) {
 static u32 gc_reloc_candidate(u32 h, u32 eighths) {
   const GcPage *P = &gc_pages[h];
   if (P->kind != GCP_SMALL && P->kind != GCP_MEDIUM) return 0;
-  if (h == gc_small_page || h == gc_medium_page) return 0;
+  if (gc_page_current(h)) return 0;
 
   if (P->alloc_cycle == (u32)gc_cycle_no) return 0;
   if (P->reloc) return 0;
@@ -2490,7 +2519,9 @@ static void gc_select_reloc(void) {
   if (!gc_opt_reloc) return;
   u64 room = (gc_ngran - gc_gran_used) * GC_GRAN;
 
-  room = room > 4 * GC_GRAN ? room - 4 * GC_GRAN : 0;
+  /* four granules kept for the program's allocations while relocation
+     runs, out of what the reserve leaves it */
+  if (room > (gc_reserve_gran + 4) * GC_GRAN) room -= 4 * GC_GRAN;
   u64 nobj = 0;
   for (u32 eighths = 1; eighths <= gc_opt_reloc && eighths <= 8; eighths++) {
     for (u32 h = 0; h < gc_gran_hwm; h++) {
@@ -3046,9 +3077,11 @@ static u64 gc_reloc_object(u64 from) {
       __atomic_fetch_add(&gc_reloc_tried, 1ull, __ATOMIC_RELAXED) %
               gc_opt_reloc_stall) {
     u32 held = gc_lock();
+    gc_evacuating = 1;
     dst = gc_pages[h].kind == GCP_SMALL
               ? gc_bump(&gc_evac_small, GC_SMALL_GRAN, GCP_SMALL, bytes)
               : gc_bump(&gc_evac_medium, GC_MEDIUM_GRAN, GCP_MEDIUM, bytes);
+    gc_evacuating = 0;
     gc_unlock(held);
   }
 
@@ -3144,7 +3177,7 @@ static void gc_mark_finish(void) {
     if (gc_pages[h].live) continue;
     if (gc_pages[h].alloc_cycle == (u32)gc_cycle_no) continue;
 
-    if (h == gc_small_page || h == gc_medium_page) continue;
+    if (gc_page_current(h)) continue;
     gc_page_free(h);
   }
 
@@ -3387,7 +3420,9 @@ static void *gc_alloc(u32 type_id, const GcTypeInfo *ti, u64 payload, u64 len) {
   gc_collect_if_due();
 
   for (u32 round = 0; ; round++) {
+    gc_reserve_open = round == 2;
     u8 *p = gc_alloc_raw(total);
+    gc_reserve_open = 0;
     if (p) {
       gc_mut.alloc_since += total;
       gc_mut.bytes_alloc += total;
@@ -3403,7 +3438,12 @@ static void *gc_alloc(u32 type_id, const GcTypeInfo *ti, u64 payload, u64 len) {
       return p;
     }
 
-    if (round >= 1 || !gc_may_collect()) warmc_trap(TRAP_HEAP_OOM);
+    /* Two cycles, then the relocation reserve, before giving up: the pages
+       one cycle relocates out of are still the forwarding table's until the
+       next mark ends, so in a heap with something live on every page only
+       the second frees any.  With no cycle to be had, the reserve at once. */
+    if (round >= 2) warmc_trap(TRAP_HEAP_OOM);
+    if (!gc_may_collect()) { round = 1; continue; }
     gc_request_cycle();
   }
 }
