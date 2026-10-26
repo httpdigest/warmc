@@ -1755,8 +1755,7 @@ static const GcTypeInfo *gc_typeinfo(u32 w) {
   return gc_typetab[id];
 }
 
-static u64 gc_object_bytes(const GcHeader *h) {
-  const GcTypeInfo *ti = gc_typeinfo(h->w);
+static u64 gc_object_bytes_ti(const GcHeader *h, const GcTypeInfo *ti) {
   u64 payload = ti->kind == GCK_ARRAY ? (u64)h->len * ti->body_size
                                       : (u64)ti->body_size;
   u64 total = ti->hdr_size + payload;
@@ -1764,10 +1763,19 @@ static u64 gc_object_bytes(const GcHeader *h) {
   return (total + (GC_UNIT - 1)) & ~(u64)(GC_UNIT - 1);
 }
 
+static u64 gc_object_bytes(const GcHeader *h) {
+  return gc_object_bytes_ti(h, gc_typeinfo(h->w));
+}
+
 static u32 gc_opt_stress;
 static u32 gc_opt_stats;
 static u32 gc_opt_growth = 200;
-static u64 gc_opt_min_kb = 4096;
+/* The least a cycle waits for: 16 MB of allocation, four times Go's 4 MB --
+   javabench and ktbench ran 0.905x the time for some 9 MB more at their
+   peak -- or a quarter of a heap smaller than four times that
+   (gc_min_trigger): one no larger than the trigger would collect only when
+   an allocation failed, the program waiting out whole cycles each time. */
+static u64 gc_opt_min_kb = 16384;
 static u32 gc_opt_reloc = 4;
 static u64 gc_opt_release;
 
@@ -1782,7 +1790,7 @@ static u64 gc_live, gc_marked, gc_trigger;
    ran in 70 ms or 130 ms depending on it. */
 #define GC_LINE 128u
 static struct {
-  u64 alloc_since, bytes_alloc, fast_bytes, barrier_slow;
+  u64 alloc_since, bytes_alloc, fast_bytes, barrier_slow, barrier_shaded;
 } __attribute__((aligned(GC_LINE))) gc_mut;
 /* The program's end of the mark queue: head moves with every object a
    barrier shades, and the collector polls pub while it waits for work, so
@@ -1827,6 +1835,54 @@ typedef struct {
 
 static GcPage *gc_pages;
 static u64 gc_ngran;
+
+/* Per granule, for the load barrier's fast path (rt/start.S,
+   warmc_gc_load_stub) and the collector's mark (gc_head_of): GCM_MOVED, a
+   granule of a page chosen for relocation whose forwarding table is not yet
+   retired (gc_may_have_moved), which the fast path leaves to the C slow
+   path; and above it how many granules back the page's head is, whose mark
+   epoch the granule's bits answer to.  An object starts at most seven
+   granules from its head: anywhere in a medium page's eight, and at the
+   head of a large page, whose later granules' distances, clipped to the
+   byte, nothing reads. */
+#define GCM_MOVED 1u
+static u8 *gc_gran_map;
+
+/* What that fast path reads, at the offsets start.S names: the heap's
+   range, the map, each page's mark epoch and the mark bits, the colour that
+   is good, whether a mark is on and the epoch its pages' bits are valid in,
+   and the mark queue with the program's end of it (gc_mqp), where it puts
+   an object it shades.  The collector writes it where it writes what it
+   mirrors, at the rounds the program answers, and the program reads it
+   after them.  healed and shaded count the loads the fast path healed and
+   the objects it shaded. */
+typedef struct {
+  u64 base, heap_bytes;
+  u8 *map;
+  u32 *page_epoch;
+  u64 *markbits;
+  u64 good;
+  u32 marking, ready;
+  u64 healed;
+  u8 **mq;
+  u64 *mqp;
+  u64 shaded;
+} GcFast;
+__attribute__((visibility("hidden"))) GcFast warmc_gc_fast = { .good = GC_C_R };
+_Static_assert(__builtin_offsetof(GcFast, base) == 0 &&
+               __builtin_offsetof(GcFast, heap_bytes) == 8 &&
+               __builtin_offsetof(GcFast, map) == 16 &&
+               __builtin_offsetof(GcFast, page_epoch) == 24 &&
+               __builtin_offsetof(GcFast, markbits) == 32 &&
+               __builtin_offsetof(GcFast, good) == 40 &&
+               __builtin_offsetof(GcFast, marking) == 48 &&
+               __builtin_offsetof(GcFast, ready) == 52 &&
+               __builtin_offsetof(GcFast, healed) == 56 &&
+               __builtin_offsetof(GcFast, mq) == 64 &&
+               __builtin_offsetof(GcFast, mqp) == 72 &&
+               __builtin_offsetof(GcFast, shaded) == 80,
+               "warmc_gc_load_stub reads GcFast at these offsets");
+
 static u64 *gc_granfree;
 static u64 gc_granfree_words;
 static u64 gc_gran_used;
@@ -1939,6 +1995,9 @@ static u64 gc_cycle_no = 1;
 static u8 **gc_mq;
 
 #define GC_MQ_BATCH 32u
+_Static_assert(GC_GRAN_SHIFT == 16 && GC_UNIT == 16 && GC_COLOUR_SHIFT == 56 &&
+               GC_MQ_BATCH == 32 && GC_TYPE_SHIFT == 0,
+               "warmc_gc_load_stub's shifts, colour mask, batch and header");
 
 enum { GCPH_IDLE = 0, GCPH_MARK = 1, GCPH_RELOC = 2 };
 __attribute__((aligned(GC_LINE))) static u32 gc_phase;
@@ -2031,6 +2090,11 @@ static void gc_release_pages(u32 h, u32 n) {
   }
 }
 
+static u64 gc_min_trigger(void) {
+  u64 t = gc_opt_min_kb * 1024ull;
+  return t > gc_heap_bytes / 4 ? gc_heap_bytes / 4 : t;
+}
+
 static void gc_init(void) {
   if (gc_base) return;
 
@@ -2061,6 +2125,8 @@ static void gc_init(void) {
                                 MAP_PRIVATE | MAP_ANONYMOUS);
 
   gc_markbits = (u64 *)sys_mmap_lazy((usz)(gc_heap_bytes / GC_UNIT / 8));
+  gc_gran_map = (u8 *)sys_mmap(0, (usz)gc_ngran, PROT_READ | PROT_WRITE,
+                               MAP_PRIVATE | MAP_ANONYMOUS);
 
   /* Each as large as the heap's units, 512 MB a piece by default, and
      touched only as far as a cycle's grey objects reach. */
@@ -2070,8 +2136,16 @@ static void gc_init(void) {
   if (!gc_pages || gc_pages == (GcPage *)-1 || !gc_granfree ||
       gc_granfree == (u64 *)-1 || !gc_markbits || gc_markbits == (u64 *)-1 ||
       !gc_grey || gc_grey == (u8 **)-1 || !gc_page_epoch ||
-      gc_page_epoch == (u32 *)-1 || !gc_mq || gc_mq == (u8 **)-1)
+      gc_page_epoch == (u32 *)-1 || !gc_mq || gc_mq == (u8 **)-1 ||
+      !gc_gran_map || gc_gran_map == (u8 *)-1)
     die("cannot reserve the collector's side tables");
+  warmc_gc_fast.base = (u64)(uptr)gc_base;
+  warmc_gc_fast.heap_bytes = gc_heap_bytes;
+  warmc_gc_fast.map = gc_gran_map;
+  warmc_gc_fast.page_epoch = gc_page_epoch;
+  warmc_gc_fast.markbits = gc_markbits;
+  warmc_gc_fast.mq = gc_mq;
+  warmc_gc_fast.mqp = &gc_mqp.head;
   gc_gran_mark_free(0, gc_ngran, 1);
   gc_check_tbi();
 
@@ -2082,7 +2156,7 @@ static void gc_init(void) {
 
   gc_typetab[0] = &gc_type_reserved;
   gc_ntypes = 1;
-  gc_trigger = gc_opt_min_kb * 1024ull;
+  gc_trigger = gc_min_trigger();
 }
 
 static u32 gc_register_types(const ModuleDesc *md) {
@@ -2109,6 +2183,7 @@ static u32 gc_mark_epoch;
 
 static void gc_publish_colour(void) {
   gc_badmask = GC_COLOUR_MASK & ~gc_good;
+  warmc_gc_fast.good = gc_good;
   for (u32 i = 0; i < ninstances; i++)
     if (instances[i]) instances[i]->vm.gc_badmask = gc_badmask;
 }
@@ -2161,6 +2236,7 @@ static u32 gc_page_open(u32 ngran, u8 kind) {
     T->head = (u32)g;
     T->ngran = 0;
     T->live = 0;
+    gc_gran_map[g + i] = (u8)((i < 0x7fu ? i : 0x7fu) << 1);
     __atomic_store_n(&T->kind, (u8)GCP_TAIL, __ATOMIC_RELEASE);
   }
   GcPage *P = &gc_pages[g];
@@ -2185,6 +2261,7 @@ static void gc_page_free(u32 h) {
     gc_pages[h + i].ngran = 0;
     gc_pages[h + i].live = 0;
     gc_pages[h + i].reloc = 0;
+    gc_gran_map[h + i] = 0;
   }
   gc_gran_mark_free(h, n, 1);
   gc_gran_used -= n;
@@ -2300,26 +2377,40 @@ static u32 gc_being_born(u64 v) {
   return 1;
 }
 
-static void gc_mark_word(u64 v) {
-  if (!gc_in_heap(v)) return;
-  if (gc_being_born(v)) return;
-  u32 g = gc_page_of((void *)(uptr)v);
-  if (!gc_bit_set(g, v)) return;
-  u8 *p = (u8 *)(uptr)GC_CANON(v);
-  u32 h = gc_page_head(g);
-  gc_add_live(h, gc_object_bytes((const GcHeader *)p));
-  if (gc_col.ngrey >= gc_capgrey) die("the collector's mark stack overflowed");
-  gc_grey[gc_col.ngrey++] = p;
+/* The head granule of the page of granule g, where an object starts: the
+   map says how far back it is. */
+static u32 gc_head_of(u64 g) {
+  return (u32)g - ((u32)gc_gran_map[g] >> 1);
 }
 
+/* The collector's mark of v, a healed reference into the heap: its bit,
+   read before anything else is, since most a mark meets are marked already,
+   then set; the object onto the grey stack.  Its bytes are counted as live
+   when it is scanned (gc_scan_object), its type looked up once. */
+static void gc_mark_word(u64 v) {
+  u64 off = GC_ADDR(v) - (u64)(uptr)gc_base;
+  u32 h = gc_head_of(off >> GC_GRAN_SHIFT);
+  if (__atomic_load_n(&gc_page_epoch[h], __ATOMIC_ACQUIRE) != GC_EPOCH_READY(gc_cycle_no))
+    gc_bits_claim_page(h);
+  u64 i = off / GC_UNIT, m = 1ull << (i & 63);
+  if (__atomic_load_n(&gc_markbits[i >> 6], __ATOMIC_RELAXED) & m) return;
+  if (gc_being_born(v)) return;
+  if (!gc_conc_on) gc_markbits[i >> 6] |= m;
+  else if (__atomic_fetch_or(&gc_markbits[i >> 6], m, __ATOMIC_RELAXED) & m) return;
+  if (gc_col.ngrey >= gc_capgrey) die("the collector's mark stack overflowed");
+  gc_grey[gc_col.ngrey++] = (u8 *)(uptr)GC_CANON(v);
+}
+
+/* The program's shade: the object's bit, and the object onto the queue for
+   the collector, which counts its bytes as live when it scans it
+   (gc_scan_object) -- before the mark ends, which reads the counts. */
 static void gc_mark_ref(u64 v) {
   if (!gc_in_heap(v)) return;
   if (gc_being_born(v)) return;
   u32 g = gc_page_of((void *)(uptr)v);
   if (!gc_bit_set(g, v)) return;
   u8 *p = (u8 *)(uptr)GC_CANON(v);
-  u32 h = gc_page_head(g);
-  gc_add_live(h, gc_object_bytes((const GcHeader *)p));
+  gc_mut.barrier_shaded++;
   gc_mq[gc_mqp.head++] = p;
 
   if (gc_mqp.head - gc_mqp.pub >= GC_MQ_BATCH)
@@ -2337,7 +2428,7 @@ enum {
 
 static void gc_jitter(u32 point);
 
-static void gc_mark_slot(u64 *slot) {
+static inline __attribute__((always_inline)) void gc_mark_slot(u64 *slot) {
   u64 v = __atomic_load_n(slot, __ATOMIC_RELAXED);
   if (!gc_in_heap(v)) return;
   u64 h = gc_heal_ptr(v);
@@ -2359,6 +2450,8 @@ static void gc_reloc_slot(u64 *slot) {
 static void gc_scan_object(u8 *p) {
   const GcHeader *h = (const GcHeader *)p;
   const GcTypeInfo *ti = gc_typeinfo(h->w);
+  gc_add_live(gc_head_of((GC_ADDR(p) - (u64)(uptr)gc_base) >> GC_GRAN_SHIFT),
+              gc_object_bytes_ti(h, ti));
   if (ti->kind == GCK_ARRAY) {
     if (!ti->elem_is_ref) return;
     u64 n = h->len;
@@ -2448,6 +2541,11 @@ static u64 gc_fwd_claim(u64 from, u32 *mine) {
 
 static void gc_page_free(u32 h);
 
+/* No granule may have moved any more: the forwarding table is gone. */
+static void gc_map_settle(void) {
+  for (u64 g = 0; g < gc_gran_hwm; g++) gc_gran_map[g] &= (u8)~GCM_MOVED;
+}
+
 static u64 *gc_fwd_dead;
 static u64 gc_fwd_dead_slots;
 
@@ -2456,6 +2554,7 @@ static void gc_fwd_retire(void) {
   gc_fwd_dead_slots = gc_fwd_slots;
   gc_fwd = 0;
   gc_fwd_slots = 0;
+  gc_map_settle();
 
   for (u32 h = 0; h < gc_gran_hwm; h++)
     if (gc_pages[h].kind == GCP_FWD) gc_page_free(h);
@@ -2477,14 +2576,27 @@ static u32 gc_reloc_wanted(u64 a) {
   return __atomic_load_n(&gc_pages[h].reloc, __ATOMIC_ACQUIRE);
 }
 
+/* Whether the object at a may have moved: only one on a page chosen for
+   relocation can, and only until the forwarding table that says where to
+   is retired at the next mark end.  Every other reference is healed by its
+   colour alone, with no look in the table -- most of those the program's
+   barrier and the collector's mark heal. */
+static u32 gc_may_have_moved(u64 a) {
+  u64 off = a - (u64)(uptr)gc_base;
+  if (off >= gc_heap_bytes) return 0;
+  return __atomic_load_n(&gc_gran_map[off >> GC_GRAN_SHIFT], __ATOMIC_ACQUIRE) & GCM_MOVED;
+}
+
 static u64 gc_heal_ptr(u64 v) {
   u64 a = GC_ADDR(v);
+  if (!gc_may_have_moved(a)) return a | gc_good;
   u64 to = gc_fwd_get(a);
   return (to ? to : a) | gc_good;
 }
 
 static u64 gc_heal_reloc(u64 v) {
   u64 a = GC_ADDR(v);
+  if (!gc_may_have_moved(a)) return a | gc_good;
   u64 to = gc_fwd_get(a);
   if (!to) {
     if (gc_reloc_wanted(a)) to = gc_reloc_object(a);
@@ -2531,6 +2643,7 @@ static void gc_select_reloc(void) {
       if (!gc_reloc_candidate(h, eighths)) continue;
       if (gc_pages[h].live > room) continue;
       gc_pages[h].reloc = 1;
+      for (u32 i = 0; i < gc_pages[h].ngran; i++) gc_gran_map[h + i] |= GCM_MOVED;
       room -= gc_pages[h].live;
       gc_reloc_bytes += gc_pages[h].live;
       gc_reloc_pages++;
@@ -2547,6 +2660,7 @@ static void gc_select_reloc(void) {
   if (!t || t == (u64 *)-1) {
 
     for (u32 h = 0; h < gc_gran_hwm; h++) gc_pages[h].reloc = 0;
+    gc_map_settle();
     gc_reloc_pages = gc_reloc_bytes = 0;
     return;
   }
@@ -3159,6 +3273,8 @@ static void gc_mark_start(void) {
 
   gc_cycle_serves = __atomic_load_n(&gc_full_req, __ATOMIC_ACQUIRE);
   gc_mut.alloc_since = 0;
+  warmc_gc_fast.ready = GC_EPOCH_READY(gc_cycle_no);
+  warmc_gc_fast.marking = 1;
   __atomic_store_n(&gc_phase, GCPH_MARK, __ATOMIC_RELEASE);
   gc_visit_strong_roots(gc_mark_slot);
 }
@@ -3167,6 +3283,7 @@ static void gc_mark_finish(void) {
   __atomic_store_n(&gc_mqp.pub, gc_mqp.head, __ATOMIC_RELEASE);
   gc_mark_end_took += gc_take_queue();
   gc_drain();
+  warmc_gc_fast.marking = 0;
   __atomic_store_n(&gc_phase, GCPH_IDLE, __ATOMIC_RELEASE);
 
   gc_fwd_retire();
@@ -3190,7 +3307,7 @@ static void gc_mark_finish(void) {
 
   gc_live = gc_marked;
   gc_trigger = gc_live * gc_opt_growth / 100;
-  if (gc_trigger < gc_opt_min_kb * 1024ull) gc_trigger = gc_opt_min_kb * 1024ull;
+  if (gc_trigger < gc_min_trigger()) gc_trigger = gc_min_trigger();
   gc_ncycles++;
 }
 
@@ -3201,18 +3318,26 @@ static void gc_prepare(void) {
   gc_select_reloc();
 }
 
+/* With nothing to move no reference is stale, and the colour stays the
+   mark's, which every reference the mark reached wears, until the next
+   mark flips it: a flip to R would send every reference the program loads
+   until then through the barrier's slow path for nothing. */
 static void gc_reloc_start(void) {
+  if (!gc_reloc_pages) {
+    __atomic_store_n(&gc_phase, (u32)GCPH_IDLE, __ATOMIC_RELEASE);
+    return;
+  }
   gc_good = GC_C_R;
   gc_publish_colour();
 
   gc_lab_recolour();
-  __atomic_store_n(&gc_phase, gc_reloc_pages ? (u32)GCPH_RELOC : (u32)GCPH_IDLE,
-                   __ATOMIC_RELEASE);
+  __atomic_store_n(&gc_phase, (u32)GCPH_RELOC, __ATOMIC_RELEASE);
   gc_visit_strong_roots(gc_reloc_slot);
 }
 
 static void gc_reloc_abandon(void) {
   for (u32 h = 0; h < gc_gran_hwm; h++) gc_pages[h].reloc = 0;
+  gc_map_settle();
   gc_fwd_dead = gc_fwd;
   gc_fwd_dead_slots = gc_fwd_slots;
   gc_fwd = 0;
@@ -4582,8 +4707,14 @@ static void gc_report(void) {
   eputs(" claims lost\n");
 
   eputs("  barrier: ");
-  put_u64_e(gc_mut.barrier_slow);
-  eputs(" loads healed\n");
+  put_u64_e(gc_mut.barrier_slow + warmc_gc_fast.healed);
+  eputs(" loads healed (");
+  put_u64_e(warmc_gc_fast.healed);
+  eputs(" by the fast path), ");
+  put_u64_e(gc_mut.barrier_shaded + warmc_gc_fast.shaded);
+  eputs(" objects shaded (");
+  put_u64_e(warmc_gc_fast.shaded);
+  eputs(" by the fast path)\n");
 
   eputs("  mark: ");
   put_u64_e(gc_col.mark_conc_objs);

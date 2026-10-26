@@ -2252,6 +2252,8 @@ static void emit_inst(Isel *s, Ref v) {
       if (gc_fastnew_shape(f, v, &total, &alen))
         fast = emit_gc_fastnew(s, v, gctype_slot(f->m, (uint32_t)in->imm),
                                total, alen, "warmc_array_new", a, 1);
+      else if (in->nargs == 1 && f->insts[a[0]].op != I_CONST)
+        fast = emit_gc_fastnew_len(s, v, gctype_slot(f->m, (uint32_t)in->imm), a);
       if (!fast)
         call_helper_imm_first(s, in->nargs == 1 ? "warmc_array_new"
                                                : "warmc_array_new_fill",
