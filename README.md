@@ -1203,7 +1203,7 @@ as in `--target=macos`.
 | `WARMC_JOBS` | compiler | same as `-j` |
 | `WARMC_TIME` | compiler | print phase timings, peak memory and the slowest functions |
 | `WARMC_GC_HEAP_KB` | program | GC heap reservation (default 1 GiB) |
-| `WARMC_GC_MIN_KB`, `WARMC_GC_GROWTH` | program | collection trigger: minimum size, and growth as a percentage of live data |
+| `WARMC_GC_MIN_KB`, `WARMC_GC_GROWTH` | program | collection trigger: minimum size (default 16384, or a quarter of the heap if that is less), and growth as a percentage of live data (default 200) |
 | `WARMC_GC_CONC` | program | `0` disables the background collector thread |
 | `WARMC_GC_STATS` | program | print a GC report at exit |
 | `WARMC_GC_VERIFY`, `WARMC_GC_STRESS` | program | heap verification after each cycle; collect on every allocation |
@@ -1352,9 +1352,21 @@ Functions compile in parallel and are laid out deterministically.
   - Pointers are coloured. AArch64 top-byte-ignore lets compiled code
     dereference tagged references directly, and x64 masks the tag off.
   - Marking and evacuation of sparse pages run on a background thread.
+  - Evacuation has room kept for it: the program's allocations leave a
+    thirty-second of the heap free, at least 1 MB and at most an eighth of
+    it. An allocation that finds no room waits for up to two cycles, then
+    takes that room, before it fails.
   - The program stops only for short handshake rounds.
   - Roots come from precise per-call-site stack maps.
-  - A load barrier in compiled code heals stale references.
+  - A load barrier in compiled code heals stale references. On AArch64 one
+    that needs only the current colour, and while a mark is on its object
+    shaded, is handled in a few instructions with six registers saved; a
+    reference to an object that may have moved, or one being born, goes to
+    the runtime. A cycle that relocates nothing leaves the mark's colour
+    current, so the program's next loads take no barrier at all.
+  - Objects, and arrays of a constant length, are bumped inline from the
+    program's allocation buffer, zeroed when their page was opened; on
+    AArch64 so are arrays of a computed length.
 - **Exceptions.** They are unwound by walking warmc's own compact unwind
   tables, with no DWARF and no libunwind.
 
