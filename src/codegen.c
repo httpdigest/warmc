@@ -582,6 +582,21 @@ void codegen_commit_function(ObjBuilder *obj, FuncOut *fo) {
     xfree(fo->code); xfree(fo->relocs);
     return;
   }
+  /* WARMC_LAYOUT_SEED=s: up to 60 bytes of nops, as s and the function's
+     name pick, ahead of each function that aligns no loop, which moves the
+     code without changing it -- for timing a change over several layouts,
+     a change of a few percent being less than what layout alone moves a
+     kernel by.  Measurement only: off unless set. */
+  {
+    const char *ls = warmc_getenv("WARMC_LAYOUT_SEED");
+    if (ls && !fo->want_align) {
+      uint64_t h = 1469598103934665603ull ^ strtoull(ls, NULL, 0);
+      for (const char *c = fo->sym; c && *c; c++) h = (h ^ (uint8_t)*c) * 1099511628211ull;
+      uint32_t pad = (uint32_t)(h >> 59) * 4;
+      for (uint64_t end = obj->text.len + pad; obj->text.len < end;)
+        g_target->pad_nop(&obj->text);
+    }
+  }
   if (fo->want_align)
     while (obj->text.len & (ALIGN_BYTES - 1)) g_target->pad_nop(&obj->text);
   uint64_t base = obj->text.len;
