@@ -647,12 +647,11 @@ static void escape_init(Module *m, const InitExpr *e) {
 
 /* Module.escapes: the functions a reference can be made to -- exported, or
    named by a segment or by a global's or a table's initialiser, the set a
-   ref.func must name (validate.c) -- which is how a call from another
-   instance finds one.  None, where no other instance will be. */
-static void module_escape_facts(Module *m, bool sole) {
+   ref.func must name (validate.c) -- which is how a call from C or from
+   another instance finds one. */
+static void module_escape_facts(Module *m) {
   xfree(m->escapes);
   m->escapes = xcalloc(m->nfuncs ? m->nfuncs : 1, 1);
-  if (sole) return;
   for (uint32_t i = 0; i < m->nexports; i++)
     if (m->exports[i].kind == EK_FUNC && m->exports[i].index < m->nfuncs)
       m->escapes[m->exports[i].index] = 1;
@@ -687,7 +686,8 @@ void compile_module(Module *m, ObjBuilder *o, const OptOpts *opts) {
     }
   }
   m->gc_sealed = opts->sealed && module_gc_sealed(m);
-  module_escape_facts(m, opts->sole_instance);
+  m->sole_instance = opts->sole_instance;
+  module_escape_facts(m);
   uint32_t out_bytes = codegen_tail_out_bytes(m);
 
   bool tm = warmc_getenv("WARMC_TIME") != NULL;

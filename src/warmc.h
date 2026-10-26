@@ -415,6 +415,9 @@ typedef struct {
      declared set, which every ref.func names (compile.c
      module_escape_facts); NULL before compile_module works it out */
   uint8_t *escapes;
+  /* the module is the only instance its code meets (OptOpts.sole_instance):
+     an escaping function is called from C, but from no other instance */
+  bool sole_instance;
 
   bool *type_live;
 

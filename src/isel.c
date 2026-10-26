@@ -648,10 +648,14 @@ __attribute__((unused))
 
 /* c_abi: the arguments of a C function, which takes no vmctx and has its
    stack arguments where the platform's convention puts them, each in 8
-   bytes or, on Apple's, packed at its own size's alignment. */
+   bytes or, on Apple's, packed at its own size's alignment.  zext: a
+   runtime helper's, whose u64 parameters take an i32 operand too -- a
+   memory.grow's delta, a table's index -- where an i32 has its high half
+   zero; a wasm function reads an i32's low half only, and a C function's
+   own i32 parameter is its low half by its convention. */
 static void emit_call_args_core(Isel *s, const Ref *args, uint32_t nargs,
                                 int stack_base, int first_int,
-                                bool want_vmctx, bool c_abi) {
+                                bool want_vmctx, bool c_abi, bool zext) {
   IrFunc *f = s->f;
   int next_int = first_int, next_flt = 0, stack_slot = 0;
   uint32_t c_at = 0;
@@ -696,6 +700,11 @@ static void emit_call_args_core(Isel *s, const Ref *args, uint32_t nargs,
     }
   }
 
+  /* A move or a reload copies all 64 bits, so an i32 has a high half other
+     than zero in its argument register where its own register or slot had
+     one: a parameter has the one its C caller gave it, and a spill slot
+     keeps the whole register (memop_r_operand).  zx: those to make zero. */
+  int zx[8], nzx = 0;
   for (uint32_t i = 0; i < nargs; i++) {
     Ref v = args[i];
     int fp = is_fp_value(f, v), wide = is64(f, v), vec = is_vec_value(f, v);
@@ -706,6 +715,8 @@ static void emit_call_args_core(Isel *s, const Ref *args, uint32_t nargs,
       mv[nmv++] = (Move){ l, next_flt++, 1, (uint8_t)wide, (uint8_t)vec, 0, 0 };
     } else {
       if (next_int > 7) { next_int++; continue; }
+      if (zext && (ValType)f->insts[v].type == VT_I32 && !w_written(f, v))
+        zx[nzx++] = next_int;
       if (l == LOC_NONE) { late[nlate] = v; late_dst[nlate++] = next_int++; continue; }
       mv[nmv++] = (Move){ l, next_int++, 0, (uint8_t)wide, 0, 0, 0 };
     }
@@ -720,36 +731,39 @@ static void emit_call_args_core(Isel *s, const Ref *args, uint32_t nargs,
     int r = rd(s, late[k], late_dst[k]);
     if (r != late_dst[k]) a64_mov_reg(B, SF64, late_dst[k], r);
   }
+  for (int k = 0; k < nzx; k++) a64_mov_reg(B, SF32, zx[k], zx[k]);
 }
 
 static void emit_call_args_to(Isel *s, const Ref *args, uint32_t nargs,
                               int stack_base) {
   s->tail_args = true;
-  emit_call_args_core(s, args, nargs, stack_base, 1, !s->pin, false);
+  emit_call_args_core(s, args, nargs, stack_base, 1, !s->pin, false, false);
   s->tail_args = false;
 }
 
 /* A call of one of the module's own functions: the instance in x0, unless
    the callee finds it pinned in x19. */
 static void emit_call_args_own(Isel *s, const Ref *args, uint32_t nargs) {
-  emit_call_args_core(s, args, nargs, RSP, 1, !s->pin, false);
+  emit_call_args_core(s, args, nargs, RSP, 1, !s->pin, false, false);
 }
 
+/* a runtime helper's arguments, after the instance */
 static void emit_call_args(Isel *s, const Ref *args, uint32_t nargs) {
-  emit_call_args_core(s, args, nargs, RSP, 1, true, false);
+  emit_call_args_core(s, args, nargs, RSP, 1, true, false, true);
 }
 
 static void emit_call_args_novmctx(Isel *s, const Ref *args, uint32_t nargs) {
-  emit_call_args_core(s, args, nargs, RSP, 1, false, false);
+  emit_call_args_core(s, args, nargs, RSP, 1, false, false, false);
 }
 
 static void emit_call_args_c(Isel *s, const Ref *args, uint32_t nargs) {
-  emit_call_args_core(s, args, nargs, RSP, 0, false, true);
+  emit_call_args_core(s, args, nargs, RSP, 0, false, true, false);
 }
 
+/* a runtime helper's arguments from x<first_int> */
 static void emit_call_args_at(Isel *s, const Ref *args, uint32_t nargs,
                               int first_int) {
-  emit_call_args_core(s, args, nargs, RSP, first_int, true, false);
+  emit_call_args_core(s, args, nargs, RSP, first_int, true, false, true);
 }
 
 static void emit_call_ret(Isel *s, Ref call, CompType *sig) {

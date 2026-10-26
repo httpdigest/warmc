@@ -137,7 +137,8 @@ static bool g_pin;
 bool codegen_pinned(void) { return g_pin; }
 
 uint32_t codegen_entry_off(const Module *m, uint32_t fi) {
-  return g_pin && m->escapes && fi < m->nfuncs && m->escapes[fi] ? ENTRY_CHECK_BYTES : 0;
+  return g_pin && !m->sole_instance && m->escapes && fi < m->nfuncs && m->escapes[fi]
+             ? ENTRY_CHECK_BYTES : 0;
 }
 
 void codegen_prepare_module(Module *m, ObjBuilder *o) {

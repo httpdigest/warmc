@@ -1242,6 +1242,24 @@ static void emit_prologue(Isel *s, Buf *b) {
     x64_store64(b, X_R10, X_RSP, X64_NOIDX, 0, (int32_t)s->retptr_slot);
 
   Block *e = &f->blocks[f->entry];
+
+  /* This code keeps every i32 in a register zero-extended: each 32-bit
+     operation makes it so.  An i32 parameter a C caller passes -- through
+     warmc_invoke, to an export or to a function whose reference the host
+     holds -- has whatever high half its register had, which the C
+     convention leaves to the caller, so a function C can reach makes its
+     own zero before anything reads one.  Those on the stack are loaded as
+     32 bits already. */
+  if (f->m->escapes && f->func_index < f->m->nfuncs && f->m->escapes[f->func_index]) {
+    int ni = 1;
+    for (uint32_t i = 0; i < f->sig->nparams && ni <= 3; i++) {
+      ValType t = f->sig->params[i];
+      if (vt_is_vec_reg(t)) continue;
+      int src = ARG_GPR[ni++];
+      if (t == VT_I32 && s->loc[e->params[i]] != LOC_NONE) x64_mov_rr(b, 0, src, src);
+    }
+  }
+
   bool clash = false;
   {
     int ni = 1, nf = 0;
