@@ -132,9 +132,11 @@ void codegen_note_unwind(const FuncUnwind *u) {
   } else d->gcroots = NULL;
 }
 
-static bool g_pin;
+static bool g_pin, g_memop_r;
 
 bool codegen_pinned(void) { return g_pin; }
+
+bool codegen_memop_r(void) { return g_memop_r; }
 
 uint32_t codegen_entry_off(const Module *m, uint32_t fi) {
   return g_pin && !m->sole_instance && m->escapes && fi < m->nfuncs && m->escapes[fi]
@@ -144,6 +146,7 @@ uint32_t codegen_entry_off(const Module *m, uint32_t fi) {
 void codegen_prepare_module(Module *m, ObjBuilder *o) {
   (void)o;
   g_pin = g_target->pin_regs && !warmc_getenv("WARMC_NO_PIN");
+  g_memop_r = g_pin && !warmc_getenv("WARMC_NO_MEMOP_R");
   codegen_reset_unwind();
   codegen_reset_merge();
   if (module_max_outgoing(m) > INVOKE_OUTGOING_BYTES && module_tail_calls(m))
@@ -203,6 +206,10 @@ void codegen_prewarm_symbols(Module *m, ObjBuilder *o) {
   for (size_t i = 0; i < sizeof helpers / sizeof helpers[0]; i++)
     obj_intern_sym(o, helpers[i], SYM_UNDEF_FUNC, -1, 0);
   if (g_pin) obj_intern_sym(o, "warmc_xenter", SYM_UNDEF_FUNC, -1, 0);
+  if (g_memop_r) {
+    obj_intern_sym(o, "warmc_memmove_r", SYM_UNDEF_FUNC, -1, 0);
+    obj_intern_sym(o, "warmc_memset_r", SYM_UNDEF_FUNC, -1, 0);
+  }
 
   /* the C functions a --native-module's imports call */
   for (uint32_t i = 0; i < m->nimported_funcs; i++)

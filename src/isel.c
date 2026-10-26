@@ -162,6 +162,9 @@ static IrOp recomp_shape(IrFunc *f, Ref v, Ref *x, Ref *y, uint64_t *c);
 #define RA_ZERO_REG 1
 /* an extend of an i32 a w-register write made is no instruction in place */
 #define RA_EXTENDU_TIED 1
+/* memory.copy and memory.fill of memory 0 save nothing round them
+   (regalloc.inc memop_preserves) */
+#define RA_MEMOP_PRESERVES 1
 /* a value live across a call in a loop takes callee-saved registers from
    x28 down (regalloc_linear's cs_top) */
 #define RA_CS_TOP 1
@@ -1176,13 +1179,14 @@ static void call_helper_imm2(Isel *s, const char *name, const Ref *args, uint32_
 #define SMO_CONST_MAX 256u
 /* emit_small_memop's answer when it did the whole op and no call follows */
 #define SMO_INLINE ((size_t)-2)
-static size_t emit_const_memop(Isel *s, const Ref *a, bool fill, uint32_t n);
+static size_t emit_const_memop(Isel *s, const Ref *a, bool fill, uint32_t n, int vb,
+                               bool trap);
 
 static size_t emit_small_memop(Isel *s, const Inst *in, const Ref *a, bool fill) {
   if (!small_memop_ok(s, in, fill)) return (size_t)-1;
   uint64_t cn;
   if (const_arg(s->f, a[2], &cn) && cn >= 1 && cn <= SMO_CONST_MAX)
-    return emit_const_memop(s, a, fill, (uint32_t)cn);
+    return emit_const_memop(s, a, fill, (uint32_t)cn, 16, false);
 
   int d = rd(s, a[0], S0);
   int x = rd(s, a[1], S1);
@@ -1286,8 +1290,11 @@ static size_t emit_small_memop(Isel *s, const Inst *in, const Ref *a, bool fill)
    region.  The two tests and the call path were a fifth of what C's struct
    arguments cost (cbench/structval).  That store faulting writes nothing
    on Apple's cores, but AArch64 lets one that crosses into the guard page
-   write the bytes before it: with -fexact-trap the tests are made. */
-static size_t emit_const_memop(Isel *s, const Ref *a, bool fill, uint32_t n) {
+   write the bytes before it: with -fexact-trap the tests are made.  They
+   branch to the call, which traps, or with trap to the trap itself.  The
+   q registers are v16 up, or vb up for an op that is no call. */
+static size_t emit_const_memop(Isel *s, const Ref *a, bool fill, uint32_t n, int vb,
+                               bool trap) {
   int d = rd(s, a[0], S0);
   int x = rd(s, a[1], S1);
   bool guarded = g_guard_pages && !s->opt->exact_trap;
@@ -1299,12 +1306,14 @@ static size_t emit_const_memop(Isel *s, const Ref *a, bool fill, uint32_t n) {
     a64_uxtw(B, S3, d);
     a64_add_imm(B, SF64, S3, S3, n, 0);
     a64_cmp_reg(B, SF64, S3, TMP0);
-    slow[nslow++] = br_cc(s, 0, CC_HI, 0, 0);
+    if (trap) trap_if_cc(s, CC_HI, TRAP_MEM_OOB);
+    else slow[nslow++] = br_cc(s, 0, CC_HI, 0, 0);
     if (!fill) {
       a64_uxtw(B, S3, x);
       a64_add_imm(B, SF64, S3, S3, n, 0);
       a64_cmp_reg(B, SF64, S3, TMP0);
-      slow[nslow++] = br_cc(s, 0, CC_HI, 0, 0);
+      if (trap) trap_if_cc(s, CC_HI, TRAP_MEM_OOB);
+      else slow[nslow++] = br_cc(s, 0, CC_HI, 0, 0);
     }
   }
   a64_add_uxtw(B, TMP0, REG_MEMBASE, d, 0);
@@ -1335,22 +1344,22 @@ static size_t emit_const_memop(Isel *s, const Ref *a, bool fill, uint32_t n) {
     for (; o + 32 <= n; o += 32) { off[nq++] = o; off[nq++] = o + 16; }
     if (o + 16 <= n) { off[nq++] = o; o += 16; }
     if (o < n) off[nq++] = n - 16;
-    if (fill) a64_vdup_gpr(B, 0, 16, x);
+    if (fill) a64_vdup_gpr(B, 0, vb, x);
     for (int pass = fill ? 1 : 0; pass < 2; pass++) {
       int base = pass ? TMP0 : TMP1;
       /* the last access ends at n: stored first */
       int lim = nq;
       if (pass) {
-        int r = fill ? 16 : 16 + nq - 1;
+        int r = fill ? vb : vb + nq - 1;
         if (!(off[nq - 1] & 15)) a64_str_q(B, r, base, off[nq - 1]);
         else a64_stur_q(B, r, base, (int)off[nq - 1]);
         lim = nq - 1;
       }
       for (int i = 0; i < lim; i++) {
-        int r = fill ? 16 : 16 + i;
+        int r = fill ? vb : vb + i;
         bool pair = i + 1 < lim && off[i + 1] == off[i] + 16 && !(off[i] & 15);
         if (pair) {
-          int r2 = fill ? 16 : 16 + i + 1;
+          int r2 = fill ? vb : vb + i + 1;
           if (pass) a64_stp_q(B, r, r2, base, (int)off[i]);
           else a64_ldp_q(B, r, r2, base, (int)off[i]);
           i++;
@@ -1366,7 +1375,7 @@ static size_t emit_const_memop(Isel *s, const Ref *a, bool fill, uint32_t n) {
   }
   s->smo_cond_zero = -1;
   s->smo_ndone = 0;
-  if (guarded) return SMO_INLINE;
+  if (guarded || trap) return SMO_INLINE;
   size_t out = B->len;
   a64_b(B, 0);
   for (int i = 0; i < nslow; i++) br_patch(s, slow[i], B->len);
@@ -1380,6 +1389,50 @@ static void emit_small_memop_done(Isel *s) {
     else patch_b26_checked(s, s->smo_done[i], B->len);
   }
   s->smo_ndone = 0;
+}
+
+/* The operand v in the scratch register r for warmc_memmove_r or
+   warmc_memset_r, its high half zero: moved there as a w register, and
+   made so in place where it was reloaded there whole and a w-register write
+   did not make it -- an i32 parameter's high half is whatever its C caller
+   passed, and its spill slot keeps all 64 bits. */
+static void memop_r_operand(Isel *s, Ref v, int r) {
+  int x = rd(s, v, r);
+  if (x != r || !w_written(s->f, v)) a64_mov_reg(B, SF32, r, x);
+}
+
+/* A memory.copy or memory.fill of memory 0 that saves nothing round it
+   (memop_preserves): a constant length of at most MEMOP_R_CONST_MAX inline
+   in v26-v31 (memop_r_inline), its bounds tests, where it makes them,
+   branching to the trap; a length up to 16 inline as emit_small_memop
+   makes it; and every other a bl of warmc_memmove_r or warmc_memset_r
+   (rt/start.S) with the operands in x12-x14, which checks both ranges,
+   traps on one past the memory, and moves the bytes in the scratch
+   registers alone. */
+static void emit_memop_r(Isel *s, Ref v, const Ref *a, bool fill) {
+  uint64_t cn;
+  bool cst = const_arg(s->f, a[2], &cn);
+  if (memop_r_inline(s, v)) {
+    emit_const_memop(s, a, fill, (uint32_t)cn, F0, true);
+    return;
+  }
+  size_t site = (size_t)-1;
+  if (!cst || cn <= 16) site = emit_small_memop(s, &s->f->insts[v], a, fill);
+  if (site == SMO_INLINE) return;
+  memop_r_operand(s, a[2], S2);
+  if (fill) {
+    /* the byte, of which the routine reads only the low eight bits */
+    int x = rd(s, a[1], S1);
+    if (x != S1) a64_mov_reg(B, SF32, S1, x);
+  } else {
+    memop_r_operand(s, a[1], S1);
+  }
+  memop_r_operand(s, a[0], S0);
+  uint32_t sym = obj_intern_sym(s->o, fill ? "warmc_memset_r" : "warmc_memmove_r",
+                                SYM_UNDEF_FUNC, -1, 0);
+  isel_reloc(s, REL_CALL26, B->len, sym, 0);
+  a64_bl(B, 0);
+  if (site != (size_t)-1) emit_small_memop_done(s);
 }
 
 #define SMALL_LOOP_INSTS 12u
@@ -1680,7 +1733,10 @@ static void analyse_immediates(Isel *s) {
       Ref *a = ir_args(f, u);
 
       /* Calls make a rematerialised argument in place (see
-         emit_call_args_core); the rest move every operand from a location. */
+         emit_call_args_core); the rest move every operand from a location.
+         A memory.copy or memory.fill that saves nothing round it makes a
+         constant operand where it reads it (emit_memop_r), in no register. */
+      bool in_place = memop_preserves(f, in);
       bool via_moves = (in->op == I_MEM_GROW || in->op == I_MEM_COPY ||
                         in->op == I_MEM_FILL || in->op == I_MEM_INIT ||
                         in->op == I_TABLE_GET || in->op == I_TABLE_SET ||
@@ -1693,7 +1749,7 @@ static void analyse_immediates(Isel *s) {
       for (uint32_t j = 0; j < in->nargs; j++) {
         uses[a[j]]++;
         if (via_moves) s->no_remat[a[j]] = 1;
-        if (!s->imm_fold[a[j]]) continue;
+        if (!s->imm_fold[a[j]] || in_place) continue;
         if (!ir_imm_ok(f, u, j, f->insts[a[j]].imm, (ValType)f->insts[a[j]].type))
           s->imm_fold[a[j]] = 0;
       }
@@ -2589,7 +2645,7 @@ static uint32_t call_out_bytes(IrFunc *f, uint32_t tail_bytes) {
     for (uint32_t i = 0; i < b->ninsts; i++) {
       Ref v = b->insts[i];
       uint16_t op = f->insts[v].op;
-      if (!op_clobbers_caller_saved(op) || op == I_RETURN_CALL ||
+      if (!inst_clobbers_caller_saved(f, v) || op == I_RETURN_CALL ||
           op == I_RETURN_CALL_INDIRECT || op == I_RETURN_CALL_REF)
         continue;
       bool wc = op == I_CALL || op == I_CALL_INDIRECT || op == I_CALL_REF;
@@ -2635,7 +2691,7 @@ static bool cold_calls_only(Isel *s) {
     for (uint32_t i = 0; i < b->ninsts; i++) {
       Ref v = b->insts[i];
       Inst *in = &f->insts[v];
-      if (!op_clobbers_caller_saved(in->op)) continue;
+      if (!inst_clobbers_caller_saved(f, v)) continue;
       if (in->op != I_CALL && in->op != I_CALL_INDIRECT && in->op != I_CALL_REF)
         return false;
       if (i + 1 != b->ninsts) return false;
@@ -3157,7 +3213,7 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
       if (!bb->reachable) continue;
       if (bb->is_pad) { leaf = quasi = false; break; }
       for (uint32_t i = 0; i < bb->ninsts; i++)
-        if (op_clobbers_caller_saved(f->insts[bb->insts[i]].op)) {
+        if (inst_clobbers_caller_saved(f, bb->insts[i])) {
           leaf = false;
           bool traps = i + 1 == bb->ninsts &&
                        (bb->term == T_TRAP || bb->term == T_JUMP);

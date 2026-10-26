@@ -3596,12 +3596,7 @@ void warmc_array_copy(WarmInstance *vm, u32 type_index, void *d, u32 di,
     return;
   }
 
-  if (dp + (u64)di * w <= sp + (u64)si * w)
-    for (u64 i = 0; i < (u64)n * w; i++) dp[(u64)di * w + i] = sp[(u64)si * w + i];
-  else
-    for (u64 i = (u64)n * w; i > 0; i--)
-      dp[(u64)di * w + i - 1] = sp[(u64)si * w + i - 1];
-  if (n && ti->elem_is_ref) gc_mark_copied((u64 *)(dp + (u64)di * w), n);
+  mem_move(dp + (u64)di * w, sp + (u64)si * w, (u64)n * w);
 }
 
 static void arr_init_data(Instance *in, const GcTypeInfo *ti, void *a,

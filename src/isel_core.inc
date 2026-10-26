@@ -323,6 +323,10 @@ static bool isel_fp_remat_ok(Isel *s, const Inst *in);
 static int isel_spare_gprs(Isel *s, int *out);
 static bool skip_location(Isel *s, Ref v);
 static bool op_clobbers_caller_saved(uint16_t op);
+/* op_clobbers_caller_saved for the instruction v itself, and whether it is
+   a memory.copy or memory.fill that saves nothing round it (regalloc.inc) */
+static bool inst_clobbers_caller_saved(const IrFunc *f, Ref v);
+static bool memop_preserves(const IrFunc *f, const Inst *in);
 
 static void isel_reloc(Isel *s, RelKind kind, uint64_t off, uint32_t sym, int64_t addend) {
   if (s->nrelocs == s->cap_relocs) {
@@ -405,7 +409,7 @@ static bool used_soon(Isel *s, Ref v) {
     Inst *in = &f->insts[u];
     Ref *a = ir_args(f, u);
     for (uint32_t j = 0; j < in->nargs; j++) if (a[j] == v) return true;
-    if (op_clobbers_caller_saved(in->op)) return false;
+    if (inst_clobbers_caller_saved(f, u)) return false;
   }
   return end == b->ninsts && b->term_arg == v &&
          (b->term == T_BRIF || b->term == T_BRTABLE);
@@ -853,6 +857,22 @@ static bool small_memop_ok(Isel *s, const Inst *in, bool fill) {
   return f->m->nmemories && !f->m->memories[0].index64;
 }
 
+/* The longest constant length a memory.copy or memory.fill that saves
+   nothing round it makes inline: six q registers, v26-v31, the ones the
+   allocator never hands out. */
+#define MEMOP_R_CONST_MAX 96u
+
+/* Whether emit_memop_r makes the op v with no call: a memory.copy or
+   memory.fill that saves nothing round it, of a constant length up to
+   MEMOP_R_CONST_MAX, whose bounds tests, where it makes them, branch to the
+   trap. */
+static bool memop_r_inline(Isel *s, Ref v) {
+  uint64_t cn;
+  return memop_preserves(s->f, &s->f->insts[v]) && !s->no_small_memop &&
+         const_arg(s->f, ir_args(s->f, v)[2], &cn) && cn >= 1 &&
+         cn <= MEMOP_R_CONST_MAX;
+}
+
 static void analyse_function(Isel *s) {
   IrFunc *f = s->f;
   s->has_call = false;
@@ -926,8 +946,11 @@ static void analyse_function(Isel *s) {
           touches_instance = true;
           break;
         case I_MEM_COPY: case I_MEM_FILL:
-          if (small_memop_ok(s, in, in->op == I_MEM_FILL)) s->needs_mem = true;
-          s->has_call = s->call_other = true;
+          /* the inline path reads the memory base, and so do
+             warmc_memmove_r and warmc_memset_r */
+          if (small_memop_ok(s, in, in->op == I_MEM_FILL) || memop_preserves(f, in))
+            s->needs_mem = true;
+          if (!memop_r_inline(s, b->insts[i])) s->has_call = s->call_other = true;
           touches_instance = true;
           break;
         case I_MEM_GROW: case I_MEM_INIT:
