@@ -64,6 +64,7 @@ void a64_add_uxtw(Buf *b, int rd, int rn, int rm, int shift);
 void a64_addsub_extw(Buf *b, int sub, int rd, int rn, int rm, int sxtw, int shift);
 void a64_add_extx(Buf *b, int rd, int rn, int rm, int shift);
 void a64_cmp_uxtw(Buf *b, int rn, int rm, int shift);
+void a64_cmp_sp(Buf *b, int rm);
 void a64_neg(Buf *b, int sf, int rd, int rm);
 void a64_cmp_reg(Buf *b, int sf, int rn, int rm);
 void a64_ccmp_imm(Buf *b, int sf, int rn, uint32_t imm5, int nzcv, int cond);

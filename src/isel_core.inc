@@ -86,6 +86,10 @@ typedef struct {
   /* With an early return tested ahead of the prologue (early_ret_shape):
      1 + the entry's edge the rest of the function goes by, else 0. */
   uint32_t early_main;
+  /* 1 + the offset in the prologue of the stack check's branch to the
+     function's stack-overflow trap, which is emitted with the others after
+     the body, else 0. */
+  size_t so_site;
   bool needs_mem;
   bool needs_memsize;
   bool needs_vmctx;
