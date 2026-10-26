@@ -32,6 +32,7 @@ assemble test/cases_gc/escape.wat escape
 assemble test/cases_gc/castfacts.wat castfacts
 assemble test/cases_gc/castfacts.wat castfacts_nt
 assemble test/cases_gc/brcast.wat brcast
+assemble test/cases_gc/tailcast.wat tailcast
 assemble "$WORK/gcgen.wat" gcgen
 
 [ "${1:-}" = --prepare ] && exit 0
@@ -308,6 +309,17 @@ expect fail_branch  "OK" 0 10 20
 expect fail_branch  "OK" 1 10 30
 expect fail_branch  "OK" 3 10 20
 expect fail_branch  "OK" 2 10 40
+
+# Without inlining, so that the functions whose only use of the instance is a
+# cast's type test stay functions of their own.
+WARMC_FLAGS="${WARMC_FLAGS:-} -fno-inline" build_one tailcast
+expect pressure_cast "OK" 0
+expect pressure_cast "OK" 1
+for y in 0 1; do
+  got=$(wruntimeout $WARMC_RUN "$BIN" tail_cast $y 2>&1)
+  if [ "$got" = "i32:$((3 * y))" ]; then pass=$((pass+1)); else
+    echo "FAIL[gc] tail_cast $y: expected i32:$((3 * y)), got: $got"; fail=$((fail+1)); fi
+done
 
 build_one exnpayload
 expect payload_survives   "OK"
