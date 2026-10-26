@@ -34,6 +34,7 @@ assemble test/cases_gc/castfacts.wat castfacts_nt
 assemble test/cases_gc/brcast.wat brcast
 assemble test/cases_gc/tailcast.wat tailcast
 assemble test/cases_gc/arraycopy.wat arraycopy
+assemble test/cases_gc/tightheap.wat tightheap
 assemble "$WORK/gcgen.wat" gcgen
 
 [ "${1:-}" = --prepare ] && exit 0
@@ -324,6 +325,33 @@ done
 
 build_one arraycopy
 for t in 8 16 32 64; do expect array_copy_$t "OK"; done
+
+# A 4 MB heap with little room to spare (cases_gc/tightheap.wat): live data
+# on every page, of 1.75 to 3 MB, that only relocation frees; and one filled
+# past where the program's allocations stop for the room relocation keeps,
+# then an exception thrown.  Stopped-the-world and with the collector on its
+# thread.  Each passes with 256 KB or more of live data to spare, and one or
+# more runs out of memory without any one of: the room relocation keeps
+# (rt.c gc_reserve_gran), relocation's use of it and a last resort's, the
+# second cycle a failed allocation waits for, or the allocation buffers'
+# small pages.
+case "${WARMC_GC_STRESS:-}${WARMC_GC_RELOC:-}${WARMC_GC_RELOCATE_ALL:-}\
+${WARMC_GC_RELOC_STALL:-}${WARMC_GC_HEAP_KB:-}${WARMC_GC_MIN_KB:-}\
+${WARMC_GC_GROWTH:-}${WARMC_GC_LAB:-}${WARMC_GC_ROUNDS:-}${WARMC_GC_CONC:-}\
+${WARMC_GC_JITTER:-}" in
+  "")
+    build_one tightheap
+    for conc in 0 1; do
+      export WARMC_GC_HEAP_KB=4096 WARMC_GC_CONC=$conc
+      expect frag           "OK" 458752 20000 7 40 6
+      expect frag           "OK" 720896 20000 7 8 6
+      expect frag           "OK" 622592 20000 61 400 6
+      expect frag_structs   "OK" 589824 20000 7 6
+      expect full_then_throw "OK" 942
+      unset WARMC_GC_HEAP_KB WARMC_GC_CONC
+    done
+    ;;
+esac
 
 build_one exnpayload
 expect payload_survives   "OK"
