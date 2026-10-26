@@ -135,6 +135,30 @@
   (func (export "churn") (param $n i32)
     (call $churn (local.get $n)))
 
+  ;; A chain of `len` built once, then `n` turns of `k` walks of it with a
+  ;; churn of `m` between turns to bring collections round: a load the
+  ;; barrier heals writes the healed reference back to its slot, so the
+  ;; turn's second walk finds every slot healed and heals none -- with two
+  ;; walks as many loads are healed as with one (test/run_gc.sh).
+  (func (export "rewalk") (param $n i32) (param $len i32) (param $k i32) (param $m i32)
+    (local $h (ref null $node)) (local $i i32) (local $j i32)
+    (local.set $h (call $chain (local.get $len)))
+    (block $done (loop $l
+      (br_if $done (i32.ge_u (local.get $i) (local.get $n)))
+      (local.set $j (i32.const 0))
+      (block $dw (loop $lw
+        (br_if $dw (i32.ge_u (local.get $j) (local.get $k)))
+        (call $eq32 (call $chain_sum (local.get $h))
+          (i32.wrap_i64 (i64.div_u
+            (i64.mul (i64.extend_i32_u (local.get $len))
+                     (i64.extend_i32_u (i32.sub (local.get $len) (i32.const 1))))
+            (i64.const 2))))
+        (local.set $j (i32.add (local.get $j) (i32.const 1)))
+        (br $lw)))
+      (call $churn (local.get $m))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br $l))))
+
   ;; The same, with each object briefly reachable from a global and then not.
   (func (export "churn_global") (param $n i32)
     (local $i i32)

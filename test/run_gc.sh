@@ -34,10 +34,16 @@ assemble test/cases_gc/castfacts.wat castfacts_nt
 assemble test/cases_gc/brcast.wat brcast
 assemble test/cases_gc/tailcast.wat tailcast
 assemble test/cases_gc/arraycopy.wat arraycopy
+assemble test/cases_gc/arraynew.wat arraynew
 assemble test/cases_gc/tightheap.wat tightheap
 assemble "$WORK/gcgen.wat" gcgen
 
 [ "${1:-}" = --prepare ] && exit 0
+
+# The code is AArch64's but on Windows, whose is x86-64: the load barrier's
+# fast path and the inline arrays of a computed length are AArch64's alone.
+A64=1
+[ "${WARMC_HOST:-}" = native-windows ] && A64=0
 
 FTAG=$(wftag)
 
@@ -114,9 +120,34 @@ expect() {
   fi
 }
 
+# What the program's barrier shades it shows the collector 32 at a time
+# (warmc_gc_load_stub, gc_mark_ref), so the collector takes most of it while
+# it marks rather than at the mark's end -- given a core of its own, which is
+# why this runs where pause_check does.  Shown only at the end, 220 thousand
+# waited for the pause in a concurrent walk, two thirds of what was shaded;
+# shown as it goes, hundreds, and under a loaded machine a quarter at most.
+publish_check() {
+  local out shaded atend
+  out=$(log_run walk_no_alloc "60 20000")
+  shaded=$(printf '%s' "$out" | sed -n 's/.*, \([0-9]*\) objects shaded.*/\1/p')
+  atend=$(printf '%s' "$out" | sed -n 's/.*, \([0-9]*\) taken at mark end.*/\1/p')
+  case "$out" in
+    *"on a thread"*)
+      if [ -n "$shaded" ] && [ -n "$atend" ] && [ "$shaded" -gt 1000 ] &&
+         [ $((atend * 2)) -lt "$shaded" ]; then
+        pass=$((pass+1))
+      else
+        echo "FAIL[gc] what the program shaded waited for the mark's end: $out"
+        fail=$((fail+1))
+      fi
+      ;;
+  esac
+}
+
 if [ "${GC_PAUSE_CHECK:-1}" = only ]; then
   build_one gccollect
   pause_check
+  publish_check
   echo "gc: $pass passed, $fail failed (the mark end pause alone)"
   [ "$fail" -eq 0 ]
   exit
@@ -325,6 +356,49 @@ done
 
 build_one arraycopy
 for t in 8 16 32 64; do expect array_copy_$t "OK"; done
+
+build_one arraynew
+for t in 8 16 32 64 f32 f64 v128 ref; do expect lengths_$t "OK"; done
+expect keep_across_cycles "OK" $N
+expect too_long "allocation failed" 2147483647
+# and inline: most of those arrays' bytes from the allocation buffer, not
+# the runtime's call, which made them all before -- stopped-the-world, so
+# that a collector short of a core does not hold the next cycle back and
+# send what comes past the trigger to the call
+case "$A64${WARMC_GC_STRESS:-}${WARMC_GC_LAB:-}${WARMC_GC_MIN_KB:-}${WARMC_GC_GROWTH:-}\
+${WARMC_GC_HEAP_KB:-}" in
+  1)
+    out=$(WARMC_GC_STATS=1 WARMC_GC_CONC=0 \
+          wruntimeout $WARMC_RUN "$BIN" keep_across_cycles 150000 2>&1 >/dev/null)
+    cb=$(printf '%s' "$out" | sed -n 's/.*live, \([0-9]*\) bytes allocated.*/\1/p')
+    fb=$(printf '%s' "$out" | sed -n 's/.*regions, \([0-9]*\) bytes fast-allocated.*/\1/p')
+    if [ -n "$cb" ] && [ -n "$fb" ] && [ "$fb" -ge $((cb * 2)) ]; then
+      pass=$((pass+1))
+    else
+      echo "FAIL[gc] arrays of a computed length were not allocated inline: $out"
+      fail=$((fail+1))
+    fi
+    ;;
+esac
+
+# A heap smaller than four times the minimum trigger (16 MB) waits a quarter
+# of itself between cycles (rt.c gc_min_trigger), not 16 MB it does not
+# have: waiting for the whole of it, it would collect only when an
+# allocation failed, the program waiting out whole cycles each time.
+case "${WARMC_GC_MIN_KB:-}${WARMC_GC_GROWTH:-}${WARMC_GC_STRESS:-}" in
+  "")
+    out=$(WARMC_GC_STATS=1 WARMC_GC_HEAP_KB=8192 \
+          wruntimeout $WARMC_RUN "$BIN" keep_across_cycles 150000 2>&1 >/dev/null)
+    trig=$(printf '%s' "$out" | sed -n 's/.*[ ,]\([0-9][0-9]*\) byte trigger.*/\1/p')
+    cyc=$(printf '%s' "$out" | sed -n 's/^gc: \([0-9]*\) cycles.*/\1/p')
+    if [ "$trig" = 2097152 ] && [ -n "$cyc" ] && [ "$cyc" -gt 4 ]; then
+      pass=$((pass+1))
+    else
+      echo "FAIL[gc] a small heap did not wait a quarter of itself between cycles: $out"
+      fail=$((fail+1))
+    fi
+    ;;
+esac
 
 # A 4 MB heap with little room to spare (cases_gc/tightheap.wat): live data
 # on every page, of 1.75 to 3 MB, that only relocation frees; and one filled
@@ -687,6 +761,68 @@ ${WARMC_GC_RELEASE:-}${WARMC_GC_RELOC_STALL:-}${WARMC_GC_RELOCATE_ALL:-}" in
     ;;
 esac
 
+# The barrier's fast path (rt/start.S, warmc_gc_load_stub) heals a reference
+# that needs only the good colour, and shades its object while a mark is on,
+# with no call of the C slow path.  A concurrent walk of a chain rebuilt each
+# turn loads every reference of it stale, and nearly all take the fast path:
+# the chain's nodes come from allocation buffers on medium pages, most past
+# their head granule, whose mark epoch the granule map leads it to.  Half is
+# the floor, which an object on a later granule sent to C would break.  (What
+# it shades it shows the collector as it goes: publish_check.)  It writes
+# what it heals back to
+# the slot, so a second walk of a chain between the same two flips heals
+# nothing more: stopped-the-world, the count is a number, and without the
+# write it doubled.  And a cycle that relocates nothing leaves the mark's
+# colour good, so stopped-the-world with relocation off the program heals
+# nothing at all: a flip to R after every mark had it heal half a million
+# loads.
+case "${WARMC_GC_STRESS:-}${WARMC_GC_VERIFY:-}${WARMC_GC_RELOC:-}\
+${WARMC_GC_CONC:-}${WARMC_GC_ROUNDS:-}${WARMC_GC_JITTER:-}${WARMC_GC_MIN_KB:-}\
+${WARMC_GC_GROWTH:-}${WARMC_GC_HEAP_KB:-}${WARMC_GC_LAB:-}\
+${WARMC_GC_RELEASE:-}${WARMC_GC_RELOC_STALL:-}${WARMC_GC_RELOCATE_ALL:-}" in
+  "")
+    out=$(WARMC_GC_STATS=1 WARMC_GC_MIN_KB=64 \
+          wruntimeout $WARMC_RUN "$BIN" walk_no_alloc 60 20000 2>&1 >/dev/null)
+    healed=$(printf '%s' "$out" | sed -n 's/.*barrier: \([0-9]*\) loads healed.*/\1/p')
+    hfast=$(printf '%s' "$out" | sed -n 's/.*loads healed (\([0-9]*\) by the fast path).*/\1/p')
+    shaded=$(printf '%s' "$out" | sed -n 's/.*, \([0-9]*\) objects shaded.*/\1/p')
+    sfast=$(printf '%s' "$out" | sed -n 's/.*objects shaded (\([0-9]*\) by the fast path).*/\1/p')
+    if [ "$A64" = 0 ]; then
+      :
+    elif [ -n "$healed" ] && [ -n "$hfast" ] && [ -n "$shaded" ] && [ -n "$sfast" ] && \
+       [ "$healed" -gt 1000 ] && [ $((hfast * 2)) -ge "$healed" ] && \
+       [ "$shaded" -gt 1000 ] && [ $((sfast * 2)) -ge "$shaded" ]; then
+      pass=$((pass+1))
+    else
+      echo "FAIL[gc] the barrier's fast path healed or shaded too few: $out"
+      fail=$((fail+1))
+    fi
+    once=$(WARMC_GC_STATS=1 WARMC_GC_MIN_KB=64 WARMC_GC_CONC=0 \
+           wruntimeout $WARMC_RUN "$BIN" rewalk 100 10000 1 10000 2>&1 >/dev/null |
+           sed -n 's/.*barrier: \([0-9]*\) loads healed.*/\1/p')
+    twice=$(WARMC_GC_STATS=1 WARMC_GC_MIN_KB=64 WARMC_GC_CONC=0 \
+            wruntimeout $WARMC_RUN "$BIN" rewalk 100 10000 2 10000 2>&1 >/dev/null |
+            sed -n 's/.*barrier: \([0-9]*\) loads healed.*/\1/p')
+    if [ -n "$once" ] && [ -n "$twice" ] && [ "$once" -gt 1000 ] && \
+       [ "$twice" -le $((once + once / 20)) ]; then
+      pass=$((pass+1))
+    else
+      echo "FAIL[gc] a healed load left its slot stale: $once healed walking once, $twice twice"
+      fail=$((fail+1))
+    fi
+    out=$(WARMC_GC_STATS=1 WARMC_GC_MIN_KB=64 WARMC_GC_CONC=0 WARMC_GC_RELOC=0 \
+          wruntimeout $WARMC_RUN "$BIN" walk_no_alloc 20 20000 2>&1 >/dev/null)
+    healed=$(printf '%s' "$out" | sed -n 's/.*barrier: \([0-9]*\) loads healed.*/\1/p')
+    cycles=$(printf '%s' "$out" | sed -n 's/^gc: \([0-9]*\) cycles.*/\1/p')
+    if [ "$healed" = 0 ] && [ -n "$cycles" ] && [ "$cycles" -gt 5 ]; then
+      pass=$((pass+1))
+    else
+      echo "FAIL[gc] a cycle that moved nothing left references stale: $out"
+      fail=$((fail+1))
+    fi
+    ;;
+esac
+
 case "${WARMC_GC_STRESS:-0}${WARMC_GC_GROWTH:+g}" in
   0)
     out=$(WARMC_GC_STATS=1 WARMC_GC_MIN_KB=16 WARMC_GC_CONC=0 \
@@ -720,14 +856,16 @@ case "${WARMC_GC_STRESS:-0}${WARMC_GC_GROWTH:+g}" in
         [ "$op" -gt 8 ] && echo $((op - fr))
       printf '%s\n' "$o" >&2
     }
-    short=$(held 50000 2>"$WORK/held.$FTAG.$$.s")
+    # 100000: churn's arrays are allocated inline, from buffers of 16 KB,
+    # and 50000 of them opened only 8 pages with the collector stopped
+    short=$(held 100000 2>"$WORK/held.$FTAG.$$.s")
     long=$(held 400000 2>"$WORK/held.$FTAG.$$.l")
 
     if [ -n "$short" ] && [ -n "$long" ] && [ "$long" -le $((short * 3 + 8)) ]; then
       pass=$((pass+1))
     else
       echo "FAIL[gc] pages held by the concurrent collector grew with the run:" \
-           "$short at 50000, $long at 400000"
+           "$short at 100000, $long at 400000"
       cat "$WORK/held.$FTAG.$$.s" "$WORK/held.$FTAG.$$.l"
       fail=$((fail+1))
     fi
@@ -760,6 +898,7 @@ fi
 
 if [ "${WARMC_GC_STRESS:-0}" = 0 ] && [ "${GC_PAUSE_CHECK:-1}" = 1 ]; then
   pause_check
+  publish_check
 fi
 
 oom_err="$WORK/oom.$FTAG.$$"
