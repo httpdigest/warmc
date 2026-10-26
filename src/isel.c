@@ -150,6 +150,8 @@ static IrOp recomp_shape(IrFunc *f, Ref v, Ref *x, Ref *y, uint64_t *c);
 #define RA_FMA_TIED 0
 /* a constant zero is read as wzr/xzr where it has no register (rd_zr) */
 #define RA_ZERO_REG 1
+/* an extend of an i32 a w-register write made is no instruction in place */
+#define RA_EXTENDU_TIED 1
 
 #define A64_IDX_UXTW 2
 #define A64_IDX_LSL  3
@@ -231,6 +233,7 @@ static int recomp_read(Isel *s, Ref v, int scratch) {
 }
 
 static int rd(Isel *s, Ref v, int scratch) {
+  if (s->walias && s->walias[v]) return rd(s, ir_args(s->f, v)[0], scratch);
   int pr = piece_reg(s, v);
   if (pr >= 0) return pr;
   int l = s->loc[v];
@@ -1389,7 +1392,8 @@ static uint32_t fit_pad(uint32_t at, uint32_t span, uint32_t align) {
 
 /* The bytes the loop headed by h took, h at order index oi: its blocks laid
    out in a row from h on, up to the end of the last of them. */
-static uint32_t loop_span(Isel *s, uint32_t h, uint32_t oi, const uint32_t *blk_end) {
+static uint32_t loop_span(Isel *s, uint32_t h, const uint32_t *eo, uint32_t neo,
+                          uint32_t oi, const uint32_t *blk_end) {
   IrFunc *f = s->f;
   uint32_t nb = f->nblocks, sp = 0;
   uint8_t *in = xcalloc(nb ? nb : 1, 1);
@@ -1406,7 +1410,7 @@ static uint32_t loop_span(Isel *s, uint32_t h, uint32_t oi, const uint32_t *blk_
       if (!in[xb->preds[p]]) { in[xb->preds[p]] = 1; stk[sp++] = xb->preds[p]; }
   }
   uint32_t last = h;
-  for (uint32_t j = oi; j < f->norder && in[f->order[j]]; j++) last = f->order[j];
+  for (uint32_t j = oi; j < neo && in[eo[j]]; j++) last = eo[j];
   xfree(in); xfree(stk);
   return blk_end[last] - s->block_off[h];
 }
@@ -2032,24 +2036,8 @@ static void analyse_immediates(Isel *s) {
       Ref u = b->insts[i];
       Inst *in = &f->insts[u];
       Ref *a = ir_args(f, u);
-      for (uint32_t j = 0; j < in->nargs; j++) {
-        if (!s->lowonly[a[j]]) continue;
-        bool low;
-        switch (in->op) {
-          case I_ADD: case I_SUB: case I_MUL: case I_AND: case I_OR: case I_XOR:
-          case I_SHL: case I_SHRU: case I_SHRS: case I_ROTL: case I_ROTR:
-          case I_EQ: case I_NE: case I_LTS: case I_LTU: case I_GTS: case I_GTU:
-          case I_LES: case I_LEU: case I_GES: case I_GEU: case I_EQZ:
-          case I_CLZ: case I_CTZ: case I_POPCNT: case I_EXT8S: case I_EXT16S:
-          case I_EXTENDU: case I_EXTENDS: case I_CONVERTS: case I_CONVERTU:
-          case I_REINTERPRET: case I_SELECT: case I_GLOBAL_SET:
-            low = true; break;
-          case I_STORE: low = j == 1 && MEMF_SIZE(in->imm2) <= 2; break;
-          case I_MEM_ADDR: case I_MEM_PTR: low = j == 0; break;
-          default: low = false; break;
-        }
-        if (!low) s->lowonly[a[j]] = 0;
-      }
+      for (uint32_t j = 0; j < in->nargs; j++)
+        if (s->lowonly[a[j]] && !ir_reads_low32(f, u, j)) s->lowonly[a[j]] = 0;
     }
     for (uint32_t r = 0; r < b->nret; r++) s->lowonly[b->ret_args[r]] = 0;
     for (uint32_t e = 0; e < b->nsuccs; e++)
@@ -2390,6 +2378,27 @@ static int ra_cs_frame_ops(Isel *s) {
 }
 
 #include "regalloc.inc"
+
+/* A wrap whose every reader takes the low half only (lowonly) is no
+   instruction: they read its operand's register, the operand living on to
+   them in its place.  Where the operand outlived the wrap, the wrap took a
+   register of its own and a move to it -- after each of Go's calls, whose
+   result's low half is the stack pointer the code after reads and whose
+   high half the branch after tests.  Not a branch's own operand, which
+   liveness takes as it is. */
+static void analyse_wrap_alias(Isel *s) {
+  IrFunc *f = s->f;
+  uint32_t n = f->ninsts;
+  s->walias = xcalloc(n ? n : 1, 1);
+  if (warmc_getenv("WARMC_NO_WALIAS")) return;
+  for (uint32_t i = 0; i < n; i++)
+    if (s->lowonly[i] && f->insts[i].op == I_WRAP && !skip_location(s, i))
+      s->walias[i] = 1;
+  for (uint32_t oi = 0; oi < f->norder; oi++) {
+    Block *b = &f->blocks[f->order[oi]];
+    if (b->term == T_BRIF || b->term == T_BRTABLE) s->walias[b->term_arg] = 0;
+  }
+}
 
 /* What the allocation leaves on the Isel, moved to the function when the
    first emission asks to run again to place its loops: nothing the second
@@ -3107,6 +3116,7 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
 
   analyse_immediates(s);
   compute_mem_validity(s);
+  analyse_wrap_alias(s);
 
   s->pinned = xcalloc(f->ninsts ? f->ninsts : 1, 1);
   if (s->has_pads)
@@ -3241,10 +3251,11 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
   uint32_t *blk_end = fit && !span_of ? xmalloc(f->nblocks * sizeof(uint32_t)) : NULL;
   uint32_t *rec = NULL, nrec = 0;
 
+  uint32_t neo;
+  const uint32_t *eo = ir_emit_order(f, dead_ret, &neo);
   s->prev_bi = UINT32_MAX;
-  for (uint32_t oi = 0; oi < f->norder; oi++) {
-    uint32_t bi = f->order[oi];
-    if (bi == dead_ret) continue;
+  for (uint32_t oi = 0; oi < neo; oi++) {
+    uint32_t bi = eo[oi];
     if (lalign && opt->align && f->blocks[bi].loop_depth) {
       Block *lb = &f->blocks[bi];
       bool header = false;
@@ -3283,8 +3294,7 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
       s->prof_start[bi] = B->len;
       s->prof_skip = 0;
     }
-    uint32_t ni = oi + 1 < f->norder && f->order[oi + 1] == dead_ret ? oi + 2 : oi + 1;
-    emit_block(s, bi, ni < f->norder ? f->order[ni] : 0xffffffffu);
+    emit_block(s, bi, oi + 1 < neo ? eo[oi + 1] : 0xffffffffu);
     s->prev_bi = bi;
     if (blk_end) blk_end[bi] = (uint32_t)B->len;
     if (opt->profile) {
@@ -3308,7 +3318,7 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
     int64_t shift = 0;
     for (uint32_t k = 0; k < nrec; k++) {
       uint32_t h = rec[4 * k], at = rec[4 * k + 2], pad = rec[4 * k + 3];
-      uint32_t span = loop_span(s, h, rec[4 * k + 1], blk_end);
+      uint32_t span = loop_span(s, h, eo, neo, rec[4 * k + 1], blk_end);
       if (!span || span > 0xffff) continue;
       spans[h] = (uint16_t)span;
       uint32_t np = fit_pad((uint32_t)((int64_t)at + shift), span, lalign);
@@ -3506,7 +3516,7 @@ give_up:
   xfree(s->pc); xfree(s->pc_bfirst); xfree(s->pc_bn); xfree(s->pc_head);
   xfree(s->recomp);
   xfree(s->pc_next);
-  xfree(s->lowonly);
+  xfree(s->lowonly); xfree(s->walias);
   xfree(s->sites); xfree(s->clauses);
   xfree(s->gcsites); xfree(s->gcroots);
   xfree(s->sp_first); xfree(s->sp_n); xfree(s->sp_vals);
@@ -3624,6 +3634,7 @@ static void emit_trap_stub_a64(ObjBuilder *obj, uint32_t sym, int code) {
 const Target warmc_target_a64 = {
   .name = "a64",
   .is_x64 = false,
+  .wrap_alias = true,
   .imm_ok = imm_ok_a64,
   .const_cost = const_cost_a64,
   .vconst_cost = vconst_cost_a64,
