@@ -46,6 +46,7 @@ import gen_gosp
 import hostbuild
 
 LEVELS = ["-O0", "-O1", "-O2", "-O3"]
+RUN_TIMEOUT = float(os.environ.get("WARMC_RUN_TIMEOUT", "30"))
 RUN_LINE = re.compile(r"^;; run: (\S+)((?: \S+)*) => (.*)$")
 STATS_LINE = re.compile(r"^;; stats(?: (-O[0-3]))?( a64)?: (.*)$")
 SHAPE_LINE = re.compile(r"^;; shape: (\S+) (.*)=(\d+)$")
@@ -134,8 +135,13 @@ def check(path, build, warmc, target, run, tmp):
                     fails.append("%s %s: --stats has %s, not %s"
                                  % (name, level, " ".join(have) or "nothing", c))
         for export, args, expect in want:
-            p = subprocess.run(run + [exe, export] + args, capture_output=True, text=True,
-                               timeout=30)
+            try:
+                p = subprocess.run(run + [exe, export] + args, capture_output=True, text=True,
+                                   timeout=RUN_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                fails.append("%s %s: %s %s runs past %g s, not %s"
+                             % (name, level, export, " ".join(args), RUN_TIMEOUT, expect))
+                continue
             got = p.stdout.strip()
             if expect.startswith("trap"):
                 err = p.stderr.strip()
