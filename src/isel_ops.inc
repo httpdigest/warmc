@@ -480,7 +480,7 @@ static void emit_inst(Isel *s, Ref v) {
 
   s->rc_used[0] = s->rc_used[1] = 0;
   s->frc_used[0] = s->frc_used[1] = 0;
-  if (op_clobbers_caller_saved(in->op)) rc_clear(s);
+  if (inst_clobbers_caller_saved(f, v)) rc_clear(s);
   if (s->frc_reg[0]) {
     bool vec = in->type == VT_V128;
     for (uint32_t j = 0; j < in->nargs && !vec; j++) vec = f->insts[a[j]].type == VT_V128;
@@ -1837,6 +1837,7 @@ static void emit_inst(Isel *s, Ref v) {
       call_helper_imm(s, "warmc_memory_grow", a, 1, in->imm, v, true);
       break;
     case I_MEM_COPY: {
+      if (memop_preserves(f, in)) { emit_memop_r(s, v, a, false); break; }
       size_t site = emit_small_memop(s, in, a, false);
       if (site == SMO_INLINE) break;
       call_helper_imm2(s, "warmc_memory_copy", a, 3, in->imm, in->imm2);
@@ -1844,6 +1845,7 @@ static void emit_inst(Isel *s, Ref v) {
       break;
     }
     case I_MEM_FILL: {
+      if (memop_preserves(f, in)) { emit_memop_r(s, v, a, true); break; }
       size_t site = emit_small_memop(s, in, a, true);
       if (site == SMO_INLINE) break;
       call_helper_imm(s, "warmc_memory_fill", a, 3, in->imm, 0, false);

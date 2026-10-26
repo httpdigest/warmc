@@ -182,6 +182,302 @@ LOCAL(xenter_ret):
     .endif
     SIZE_DIRECTIVE(SYM(warmc_xenter))
 
+/* warmc_memmove_r(dst x12, src x13, n x14) and warmc_memset_r(dst x12,
+   byte x13, n x14): memory.copy and memory.fill within memory 0, for code
+   that keeps the instance in x19 and the memory's base in x20 (the
+   compiler's isel.c, memop_preserves).  The arguments are 32-bit wasm
+   values, zero-extended (isel.c memop_r_operand).  They touch only x12-x17, v26-v31 and the flags, registers the compiler keeps
+   no value in, so their call is no call to its register allocator: it
+   saves nothing around one.  Both ranges are checked against the memory's
+   size before a byte moves, and one past it traps.  A copy loads what it
+   stores last before it stores anything -- the last 32 bytes going
+   forwards, the first 32 backwards, the direction an overlap needs -- so
+   an overlapping one is a memmove.  On Darwin a copy of 65536 bytes or
+   more, or of 512 or more whose ranges overlap, and a fill of 1024 or more
+   go to libSystem's memmove or memset, with every register they may use
+   saved first, the upper halves of v8-v15 too. */
+#define MEMOP_SAVE 528
+    .macro MEMOP_SAVE_ALL
+    sub     sp, sp, #MEMOP_SAVE
+    stp     x0, x1, [sp, #0]
+    stp     x2, x3, [sp, #16]
+    stp     x4, x5, [sp, #32]
+    stp     x6, x7, [sp, #48]
+    stp     x8, x9, [sp, #64]
+    stp     x10, x11, [sp, #80]
+    stp     x29, x30, [sp, #96]
+    stp     q0, q1, [sp, #112]
+    stp     q2, q3, [sp, #144]
+    stp     q4, q5, [sp, #176]
+    stp     q6, q7, [sp, #208]
+    stp     q8, q9, [sp, #240]
+    stp     q10, q11, [sp, #272]
+    stp     q12, q13, [sp, #304]
+    stp     q14, q15, [sp, #336]
+    stp     q16, q17, [sp, #368]
+    stp     q18, q19, [sp, #400]
+    stp     q20, q21, [sp, #432]
+    stp     q22, q23, [sp, #464]
+    stp     q24, q25, [sp, #496]
+    .endm
+    .macro MEMOP_RESTORE_ALL
+    ldp     x0, x1, [sp, #0]
+    ldp     x2, x3, [sp, #16]
+    ldp     x4, x5, [sp, #32]
+    ldp     x6, x7, [sp, #48]
+    ldp     x8, x9, [sp, #64]
+    ldp     x10, x11, [sp, #80]
+    ldp     x29, x30, [sp, #96]
+    ldp     q0, q1, [sp, #112]
+    ldp     q2, q3, [sp, #144]
+    ldp     q4, q5, [sp, #176]
+    ldp     q6, q7, [sp, #208]
+    ldp     q8, q9, [sp, #240]
+    ldp     q10, q11, [sp, #272]
+    ldp     q12, q13, [sp, #304]
+    ldp     q14, q15, [sp, #336]
+    ldp     q16, q17, [sp, #368]
+    ldp     q18, q19, [sp, #400]
+    ldp     q20, q21, [sp, #432]
+    ldp     q22, q23, [sp, #464]
+    ldp     q24, q25, [sp, #496]
+    add     sp, sp, #MEMOP_SAVE
+    .endm
+
+    .globl SYM(warmc_memmove_r)
+    FUNC_DIRECTIVES(SYM(warmc_memmove_r))
+SYM(warmc_memmove_r):
+    ldr     x15, [x19, #8]          /* the memory's size (VMCTX_MEM_SIZE) */
+    add     x16, x12, x14
+    cmp     x16, x15
+    b.hi    LOCAL(memop_oob)
+    add     x16, x13, x14
+    cmp     x16, x15
+    b.hi    LOCAL(memop_oob)
+    add     x12, x20, x12
+    add     x13, x20, x13
+    cmp     x14, #16
+    b.hi    LOCAL(mm_17)
+    cmp     x14, #8
+    b.lo    LOCAL(mm_lt8)
+    add     x16, x13, x14
+    ldr     x15, [x13]
+    ldur    x16, [x16, #-8]
+    add     x17, x12, x14
+    str     x15, [x12]
+    stur    x16, [x17, #-8]
+    ret
+LOCAL(mm_lt8):
+    cmp     x14, #4
+    b.lo    LOCAL(mm_lt4)
+    add     x16, x13, x14
+    ldr     w15, [x13]
+    ldur    w16, [x16, #-4]
+    add     x17, x12, x14
+    str     w15, [x12]
+    stur    w16, [x17, #-4]
+    ret
+LOCAL(mm_lt4):
+    cbz     x14, LOCAL(memop_ret)
+    cmp     x14, #2
+    b.lo    LOCAL(mm_one)
+    add     x16, x13, x14
+    ldrh    w15, [x13]
+    ldurh   w16, [x16, #-2]
+    add     x17, x12, x14
+    strh    w15, [x12]
+    sturh   w16, [x17, #-2]
+    ret
+LOCAL(mm_one):
+    ldrb    w15, [x13]
+    strb    w15, [x12]
+LOCAL(memop_ret):
+    ret
+LOCAL(mm_17):
+    cmp     x14, #32
+    b.hi    LOCAL(mm_33)
+    add     x16, x13, x14
+    ldr     q26, [x13]
+    ldur    q27, [x16, #-16]
+    add     x17, x12, x14
+    str     q26, [x12]
+    stur    q27, [x17, #-16]
+    ret
+LOCAL(mm_33):
+    cmp     x14, #64
+    b.hi    LOCAL(mm_65)
+    add     x16, x13, x14
+    ldp     q26, q27, [x13]
+    ldp     q28, q29, [x16, #-32]
+    add     x17, x12, x14
+    stp     q26, q27, [x12]
+    stp     q28, q29, [x17, #-32]
+    ret
+LOCAL(mm_65):
+#if defined(WARMC_DARWIN)
+    /* rt.c's mem_move hands the same to libSystem: from 65536 bytes, and
+       from 512 where the two ranges overlap, which it moves faster */
+    mov     x15, #65536
+    cmp     x14, x15
+    b.hs    LOCAL(mm_sys)
+    cmp     x14, #512
+    b.lo    LOCAL(mm_own)
+    sub     x16, x12, x13
+    cmp     x16, x14
+    b.lo    LOCAL(mm_sys)
+    sub     x16, x13, x12
+    cmp     x16, x14
+    b.lo    LOCAL(mm_sys)
+LOCAL(mm_own):
+#endif
+    sub     x16, x12, x13
+    cmp     x16, x14
+    b.lo    LOCAL(mm_back)
+    add     x16, x13, x14
+    ldp     q30, q31, [x16, #-32]
+    add     x17, x12, x14
+    mov     x15, x14
+LOCAL(mm_fwd):
+    cmp     x15, #64
+    b.ls    LOCAL(mm_fwd_end)
+    ldp     q26, q27, [x13]
+    ldp     q28, q29, [x13, #32]
+    stp     q26, q27, [x12]
+    stp     q28, q29, [x12, #32]
+    add     x13, x13, #64
+    add     x12, x12, #64
+    sub     x15, x15, #64
+    b       LOCAL(mm_fwd)
+LOCAL(mm_fwd_end):
+    cmp     x15, #32
+    b.ls    LOCAL(mm_fwd_tail)
+    ldp     q26, q27, [x13]
+    stp     q26, q27, [x12]
+LOCAL(mm_fwd_tail):
+    stp     q30, q31, [x17, #-32]
+    ret
+LOCAL(mm_back):
+    ldp     q30, q31, [x13]
+    mov     x17, x12
+    add     x13, x13, x14
+    add     x12, x12, x14
+    mov     x15, x14
+LOCAL(mm_bwd):
+    cmp     x15, #64
+    b.ls    LOCAL(mm_bwd_end)
+    ldp     q26, q27, [x13, #-64]
+    ldp     q28, q29, [x13, #-32]
+    stp     q28, q29, [x12, #-32]
+    stp     q26, q27, [x12, #-64]
+    sub     x13, x13, #64
+    sub     x12, x12, #64
+    sub     x15, x15, #64
+    b       LOCAL(mm_bwd)
+LOCAL(mm_bwd_end):
+    cmp     x15, #32
+    b.ls    LOCAL(mm_bwd_head)
+    ldp     q26, q27, [x13, #-32]
+    stp     q26, q27, [x12, #-32]
+LOCAL(mm_bwd_head):
+    stp     q30, q31, [x17]
+    ret
+#if defined(WARMC_DARWIN)
+LOCAL(mm_sys):
+    MEMOP_SAVE_ALL
+    mov     x0, x12
+    mov     x1, x13
+    mov     x2, x14
+    bl      SYM(memmove)
+    MEMOP_RESTORE_ALL
+    ret
+#endif
+LOCAL(memop_oob):
+    mov     w0, #2
+    b       SYM(warmc_trap)
+    SIZE_DIRECTIVE(SYM(warmc_memmove_r))
+
+    .globl SYM(warmc_memset_r)
+    FUNC_DIRECTIVES(SYM(warmc_memset_r))
+SYM(warmc_memset_r):
+    ldr     x15, [x19, #8]
+    add     x16, x12, x14
+    cmp     x16, x15
+    b.hi    LOCAL(ms_oob)
+    add     x12, x20, x12
+    dup     v26.16b, w13
+    cmp     x14, #16
+    b.hi    LOCAL(ms_17)
+    fmov    x15, d26
+    cmp     x14, #8
+    b.lo    LOCAL(ms_lt8)
+    add     x17, x12, x14
+    str     x15, [x12]
+    stur    x15, [x17, #-8]
+    ret
+LOCAL(ms_lt8):
+    cmp     x14, #4
+    b.lo    LOCAL(ms_lt4)
+    add     x17, x12, x14
+    str     w15, [x12]
+    stur    w15, [x17, #-4]
+    ret
+LOCAL(ms_lt4):
+    cbz     x14, LOCAL(ms_ret)
+    cmp     x14, #2
+    b.lo    LOCAL(ms_one)
+    add     x17, x12, x14
+    strh    w15, [x12]
+    sturh   w15, [x17, #-2]
+    ret
+LOCAL(ms_one):
+    strb    w15, [x12]
+LOCAL(ms_ret):
+    ret
+LOCAL(ms_17):
+    cmp     x14, #32
+    b.hi    LOCAL(ms_33)
+    add     x17, x12, x14
+    str     q26, [x12]
+    stur    q26, [x17, #-16]
+    ret
+LOCAL(ms_33):
+    cmp     x14, #64
+    b.hi    LOCAL(ms_65)
+    add     x17, x12, x14
+    stp     q26, q26, [x12]
+    stp     q26, q26, [x17, #-32]
+    ret
+LOCAL(ms_65):
+#if defined(WARMC_DARWIN)
+    cmp     x14, #1024
+    b.hs    LOCAL(ms_sys)
+#endif
+    add     x17, x12, x14
+LOCAL(ms_loop):
+    stp     q26, q26, [x12]
+    stp     q26, q26, [x12, #32]
+    add     x12, x12, #64
+    sub     x14, x14, #64
+    cmp     x14, #64
+    b.hi    LOCAL(ms_loop)
+    stp     q26, q26, [x17, #-64]
+    stp     q26, q26, [x17, #-32]
+    ret
+#if defined(WARMC_DARWIN)
+LOCAL(ms_sys):
+    MEMOP_SAVE_ALL
+    mov     x0, x12
+    and     w1, w13, #0xff
+    mov     x2, x14
+    bl      SYM(memset)
+    MEMOP_RESTORE_ALL
+    ret
+#endif
+LOCAL(ms_oob):
+    mov     w0, #2
+    b       SYM(warmc_trap)
+    SIZE_DIRECTIVE(SYM(warmc_memset_r))
+
     .globl SYM(warmc_setjmp)
     FUNC_DIRECTIVES(SYM(warmc_setjmp))
 SYM(warmc_setjmp):

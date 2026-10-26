@@ -20,6 +20,26 @@ static bool op_clobbers_caller_saved(uint16_t op) {
   }
 }
 
+/* A memory.copy or memory.fill of memory 0 is no call where the back end
+   keeps the instance and memory base in their registers (RA_MEMOP_PRESERVES,
+   codegen_pinned): what it does not do inline goes to warmc_memmove_r or
+   warmc_memset_r (rt/start.S), which touch only the scratch registers, and
+   values live across it may stay in any register, none saved round it --
+   zigbench/arraylist saved six around each copy of a slice.  A bl all the
+   same: x30 is still lost (op_clobbers_caller_saved, for the reload
+   cache). */
+static bool memop_preserves(const IrFunc *f, const Inst *in) {
+  if (!RA_MEMOP_PRESERVES || !codegen_memop_r()) return false;
+  if (in->op != I_MEM_COPY && in->op != I_MEM_FILL) return false;
+  if (in->imm != 0 || (in->op == I_MEM_COPY && in->imm2 != 0)) return false;
+  return f->m->nmemories && !f->m->memories[0].index64;
+}
+
+static bool inst_clobbers_caller_saved(const IrFunc *f, Ref v) {
+  const Inst *in = &f->insts[v];
+  return op_clobbers_caller_saved(in->op) && !memop_preserves(f, in);
+}
+
 /* A throw allocates the exception on the collector's heap, and once its
    payload is in the object the runtime may collect there -- in a program that
    allocates nothing else on that heap, nowhere else would. */
@@ -32,6 +52,10 @@ static bool op_is_safepoint(uint16_t op) {
     default:
       return false;
   }
+}
+
+static bool inst_is_safepoint(const IrFunc *f, Ref v) {
+  return op_is_safepoint(f->insts[v].op);
 }
 
 #if RA_HAVE_RECOMP
@@ -851,7 +875,8 @@ static const Ref *lw_sorted(LiveWalk *w) {
 /* Backward walk over the emission order invoking fn at every instruction
    want(op) picks, with the values live across it in increasing order (the
    site's own def is still among them; callers exclude it). */
-static void for_each_live_site(Isel *s, IrFunc *f, bool (*want)(uint16_t),
+static void for_each_live_site(Isel *s, IrFunc *f,
+                               bool (*want)(const IrFunc *, Ref),
                                void (*fn)(Isel *, IrFunc *, Ref, const Ref *,
                                           uint32_t, void *),
                                void *ctx) {
@@ -870,7 +895,7 @@ static void for_each_live_site(Isel *s, IrFunc *f, bool (*want)(uint16_t),
       lw_add(&w, s->lv_out[k]);
     for (int32_t i = (int32_t)b->ninsts - 1; i >= 0; i--) {
       Ref r2 = b->insts[i];
-      if (want(f->insts[r2].op)) fn(s, f, r2, lw_sorted(&w), w.nmem, ctx);
+      if (want(f, r2)) fn(s, f, r2, lw_sorted(&w), w.nmem, ctx);
       lw_del(&w, r2);
       uint32_t ne = eff_uses(s, f, r2, eu, eucap);
       for (uint32_t j = 0; j < ne; j++) lw_add(&w, eu[j]);
@@ -884,7 +909,7 @@ static void for_each_clobber_site(Isel *s, IrFunc *f,
                                   void (*fn)(Isel *, IrFunc *, Ref, const Ref *,
                                              uint32_t, void *),
                                   void *ctx) {
-  for_each_live_site(s, f, op_clobbers_caller_saved, fn, ctx);
+  for_each_live_site(s, f, inst_clobbers_caller_saved, fn, ctx);
 }
 
 static void mark_crosses_call(Isel *s, IrFunc *f, Ref site,
@@ -1103,7 +1128,7 @@ static void place_loop_pieces(Isel *s, IrFunc *f, RList rl[2][32],
             ir_block_has_eh(f, bi) || b->term == T_RETURN || b->term == T_TRAP;
       for (uint32_t i = 0; i < b->ninsts && !bad; i++) {
         uint16_t op = f->insts[b->insts[i]].op;
-        bad = op_clobbers_caller_saved(op) || op == I_RETURN_CALL ||
+        bad = inst_clobbers_caller_saved(f, b->insts[i]) || op == I_RETURN_CALL ||
               op == I_RETURN_CALL_INDIRECT || op == I_RETURN_CALL_REF;
       }
       work += b->ninsts;
@@ -1317,7 +1342,7 @@ static void mark_recompute(Isel *s, IrFunc *f, const Interval *iv, const Range *
     for (uint32_t i = 0; i < b->ninsts; i++) {
       Ref r = b->insts[i];
       uint16_t op = f->insts[r].op;
-      bool marshals = op_clobbers_caller_saved(op) || op == I_RETURN_CALL ||
+      bool marshals = inst_clobbers_caller_saved(f, r) || op == I_RETURN_CALL ||
                       op == I_RETURN_CALL_INDIRECT || op == I_RETURN_CALL_REF;
       uint32_t ne = eff_uses(s, f, r, eu, eucap);
       for (uint32_t j = 0; j < ne; j++) RC_READ(eu[j], num[r], true, marshals);
@@ -1658,7 +1683,7 @@ static void regalloc_linear(Isel *s) {
     for (uint32_t i = 0; i < b->ninsts; i++) {
       Ref r = b->insts[i];
       num[r] = pos;
-      if (op_clobbers_caller_saved(f->insts[r].op)) {
+      if (inst_clobbers_caller_saved(f, r)) {
         uint64_t ft;
         int64_t fl;
         call_depth[ncalls] = (uint8_t)(b->loop_depth < 8 ? b->loop_depth : 8);
@@ -2029,9 +2054,8 @@ static void regalloc_linear(Isel *s) {
     lseg++;
     for (uint32_t i = 0; i < b->ninsts; i++) {
       Ref r2 = b->insts[i];
-      Inst *in = &f->insts[r2];
       Ref *a = ir_args(f, r2);
-      if (op_clobbers_caller_saved(in->op)) lseg++;
+      if (inst_clobbers_caller_saved(f, r2)) lseg++;
       weight[web[r2]] += w;
       wlat[web[r2]] += w;
       wdef[web[r2]] += w;
@@ -2799,7 +2823,7 @@ static void regalloc_linear(Isel *s) {
            among them, so its reads are no piece's and a piece never spans
            one; a tail call likewise. */
         uint16_t rop = f->insts[r].op;
-        bool barrier = op_clobbers_caller_saved(rop) || rop == I_RETURN_CALL ||
+        bool barrier = inst_clobbers_caller_saved(f, r) || rop == I_RETURN_CALL ||
                        rop == I_RETURN_CALL_INDIRECT || rop == I_RETURN_CALL_REF;
         clob[i + 1] = clob[i] + (barrier ? 1 : 0);
         if (barrier) continue;
@@ -3519,5 +3543,5 @@ static void compute_safepoints(Isel *s) {
   if (f->ghost_ref) any_ref = true;
   if (!any_site || !any_ref) return;
 
-  for_each_live_site(s, f, op_is_safepoint, list_safepoint, NULL);
+  for_each_live_site(s, f, inst_is_safepoint, list_safepoint, NULL);
 }

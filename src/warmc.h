@@ -724,6 +724,10 @@ uint32_t codegen_tail_out_bytes(Module *m);
 /* arm64 keeps the instance in x19 and memory 0's base in x20 across calls
    (isel.c), unless WARMC_NO_PIN is set */
 bool codegen_pinned(void);
+/* with the registers pinned, memory.copy and memory.fill of memory 0 save
+   nothing round them (regalloc.inc memop_preserves), unless
+   WARMC_NO_MEMOP_R is set */
+bool codegen_memop_r(void);
 /* The bytes ahead of function fi's symbol: with the registers pinned, the
    check of a function another instance may call that they are its own
    (isel.c emit_entry_check), and 0 otherwise.  The address the module
