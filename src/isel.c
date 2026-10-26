@@ -2182,17 +2182,19 @@ static void emit_prologue(Isel *s, Buf *b) {
 
   uint32_t nsave = (uint32_t)(saves_lr(s) ? 16 : 0) + 16u * ((uint32_t)n / 2u);
 
-  bool record_only = saves_lr(s) && n == 0;
-  if (record_only) {
-    a64_stp(b, SF64, R29, R30, RSP, -16, LSP_PRE);
-  } else if (nsave) {
-    a64_sub_imm(b, SF64, RSP, RSP, nsave, 0);
-    uint32_t at = nsave;
-    if (saves_lr(s)) { at -= 16; a64_stp(b, SF64, R29, R30, RSP, (int)at, LSP_OFF); }
-    for (int i = 0; i < n; i += 2) {
-      at -= 16;
-      a64_stp(b, SF64, list[i], list[i + 1], RSP, (int)at, LSP_OFF);
-    }
+  /* The pairs go from the lowest address up, list's last pair first, and
+     the frame record on top, at entry - 16, where the unwinder looks for
+     it.  The first store moves sp down by the whole area (pre-index), as
+     native code's does, so the area costs no sub of its own: in a
+     recursive fib that is one of the two dozen instructions a call is. */
+  uint32_t at = 0;
+  for (int i = n - 2; i >= -2; i -= 2) {
+    int r1 = R29, r2 = R30;
+    if (i >= 0) { r1 = list[i]; r2 = list[i + 1]; }
+    else if (!saves_lr(s)) break;
+    if (at == 0) a64_stp(b, SF64, r1, r2, RSP, -(int)nsave, LSP_PRE);
+    else a64_stp(b, SF64, r1, r2, RSP, (int)at, LSP_OFF);
+    at += 16;
   }
 
   if (s->frame & 0xfff) a64_sub_imm(b, SF64, RSP, RSP, s->frame & 0xfff, 0);
@@ -2205,18 +2207,26 @@ static void emit_prologue(Isel *s, Buf *b) {
 
   if (s->needs_vmctx) a64_mov_reg(b, SF64, REG_VMCTX, R0);
 
+  /* The stack check falls through: its trap is one of the function's trap
+     stubs after the body (patched by produce_body), not a branch over a
+     stub here that every call took. */
   if (s->has_call) {
     a64_ldr_imm(b, 3, TMP0, REG_VMCTX, 48);
-    a64_mov_sp(b, SF64, TMP1, RSP);
-    a64_cmp_reg(b, SF64, TMP1, TMP0);
+    a64_cmp_sp(b, TMP0);
     size_t site = b->len;
-    a64_bcond(b, CC_HI, 0);
-    a64_load_imm(b, SF32, R0, TRAP_STACK_OVERFLOW);
-    uint32_t sym = obj_intern_sym(s->o, "warmc_trap", SYM_UNDEF_FUNC, -1, 0);
-    isel_reloc(s, REL_CALL26, b->len | 0x8000000000000000ull, sym, 0);
-    a64_bl(b, 0);
-    a64_brk(b, 0);
-    a64_patch_b19(b, site, b->len);
+    if (!s->far_br) {
+      a64_bcond(b, CC_LS, 0);
+      s->so_site = site + 1;
+      s->trap_used[TRAP_STACK_OVERFLOW] = 1;
+    } else {
+      a64_bcond(b, CC_HI, 0);
+      a64_load_imm(b, SF32, R0, TRAP_STACK_OVERFLOW);
+      uint32_t sym = obj_intern_sym(s->o, "warmc_trap", SYM_UNDEF_FUNC, -1, 0);
+      isel_reloc(s, REL_CALL26, b->len | 0x8000000000000000ull, sym, 0);
+      a64_bl(b, 0);
+      a64_brk(b, 0);
+      a64_patch_b19(b, site, b->len);
+    }
   }
 
   if (f->sig->nresults > 1) a64_str_imm(b, 3, R8, RSP, s->retptr_slot);
@@ -2332,15 +2342,16 @@ static void emit_teardown(Isel *s) {
 
   uint32_t nsave = (uint32_t)(saves_lr(s) ? 16 : 0) + 16u * ((uint32_t)n / 2u);
 
-  if (saves_lr(s) && n == 0) {
-    a64_ldp(B, SF64, R29, R30, RSP, 16, LSP_POST);
-  } else if (nsave) {
-    uint32_t top = nsave - (uint32_t)(saves_lr(s) ? 16 : 0);
-    for (int i = n - 2; i >= 0; i -= 2)
-      a64_ldp(B, SF64, list[i], list[i + 1], RSP,
-              (int)(top - 16u - 16u * (uint32_t)(i / 2)), LSP_OFF);
-    if (saves_lr(s)) a64_ldp(B, SF64, R29, R30, RSP, (int)(nsave - 16), LSP_OFF);
-    a64_add_imm(B, SF64, RSP, RSP, nsave, 0);
+  /* From the top down, so that the pair at sp itself comes last and gives
+     the area back (post-index), and x30 comes first, ahead of the ret. */
+  uint32_t at = nsave;
+  for (int i = -2; i < n; i += 2) {
+    int r1 = R29, r2 = R30;
+    if (i >= 0) { r1 = list[i]; r2 = list[i + 1]; }
+    else if (!saves_lr(s)) continue;
+    at -= 16;
+    if (at == 0) a64_ldp(B, SF64, r1, r2, RSP, (int)nsave, LSP_POST);
+    else a64_ldp(B, SF64, r1, r2, RSP, (int)at, LSP_OFF);
   }
 }
 
@@ -3173,6 +3184,9 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
     t = n;
   }
   s->traps = NULL;
+  if (s->so_site &&
+      !a64_patch_b19_ok(&pro, s->so_site - 1, pro.len + trap_at[TRAP_STACK_OVERFLOW]))
+    s->far_br_needed = true;
 
   for (BrFix *fx = s->fixups; fx;) {
     BrFix *n = fx->next;

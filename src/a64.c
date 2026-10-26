@@ -125,9 +125,17 @@ void a64_add_extx(Buf *b, int rd, int rn, int rm, int shift) {
 }
 
 void a64_cmp_uxtw(Buf *b, int rn, int rm, int shift) {
+  b->flags_epoch++;
   W((1u << 31) | (1u << 30) | (1u << 29) | (0x0Bu << 24) | (1u << 21) |
     (M5(rm) << 16) | (2u << 13) | ((uint32_t)(shift & 7) << 10) |
     (M5(rn) << 5) | M5(RZR));
+}
+
+/* cmp sp, xm: the extended-register form, the one whose rn may be sp. */
+void a64_cmp_sp(Buf *b, int rm) {
+  b->flags_epoch++;
+  W((1u << 31) | (1u << 30) | (1u << 29) | (0x0Bu << 24) | (1u << 21) |
+    (M5(rm) << 16) | (3u << 13) | (31u << 5) | M5(RZR));
 }
 void a64_neg(Buf *b, int sf, int rd, int rm) { a64_sub_reg(b, sf, rd, RZR, rm); }
 void a64_cmp_reg(Buf *b, int sf, int rn, int rm) { a64_subs_reg(b, sf, RZR, rn, rm); }
