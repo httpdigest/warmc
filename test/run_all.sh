@@ -272,6 +272,11 @@ start cases-farbr env WARMC_FAR_BRANCH=1 WARMC_FLAGS=-O2 ./test/run_tests.sh
 start traps-farbr env WARMC_FAR_BRANCH=1 ./test/run_traps.sh
 start gc-farbr    env WARMC_FAR_BRANCH=1 ./test/run_gc.sh
 
+# Without the inline memory.copy and memory.fill code every one is
+# warmc_memmove_r's or warmc_memset_r's, or the runtime's, and nothing
+# inline needs the memory's base for them (memop_r.wat).
+start cases-nosmallmemop env WARMC_NO_SMALL_MEMOP=1 WARMC_FLAGS=-O2 ./test/run_tests.sh
+
 # Three lowerings that had no coverage outside one generated module.
 # -fgssa-all is the global promotion -O2 makes only where a loop pays for
 # it, applied to every global a function reads and writes; the naive

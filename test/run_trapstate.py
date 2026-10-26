@@ -34,6 +34,7 @@ import shutil
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LEVELS = ["-O0", "-O1", "-O2", "-O3"]
+RUN_TIMEOUT = float(os.environ.get("WARMC_RUN_TIMEOUT", "30"))
 RUN_LINE = re.compile(r"^;; run: (.*?) => (.*)$")
 STATS_LINE = re.compile(r"^;; stats: (.*)$")
 
@@ -99,7 +100,12 @@ def main():
             r = sh(["python3", "test/hostbuild.py", "exe", prog])
             exe = r.stdout.strip() or prog
             for calls, want in lines:
-                p = sh(run + [exe] + calls.split(), timeout=30)
+                try:
+                    p = sh(run + [exe] + calls.split(), timeout=RUN_TIMEOUT)
+                except subprocess.TimeoutExpired:
+                    bad.append("%s %s: %s runs past %g s, not [%s]"
+                               % (name, level, calls, RUN_TIMEOUT, want))
+                    continue
                 got = " ".join(p.stdout.split())
                 if p.returncode or got != want:
                     bad.append("%s %s: %s gives [%s], not [%s]" % (name, level, calls, got, want))

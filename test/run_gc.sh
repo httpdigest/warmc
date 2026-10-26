@@ -33,6 +33,7 @@ assemble test/cases_gc/castfacts.wat castfacts
 assemble test/cases_gc/castfacts.wat castfacts_nt
 assemble test/cases_gc/brcast.wat brcast
 assemble test/cases_gc/tailcast.wat tailcast
+assemble test/cases_gc/arraycopy.wat arraycopy
 assemble "$WORK/gcgen.wat" gcgen
 
 [ "${1:-}" = --prepare ] && exit 0
@@ -320,6 +321,9 @@ for y in 0 1; do
   if [ "$got" = "i32:$((3 * y))" ]; then pass=$((pass+1)); else
     echo "FAIL[gc] tail_cast $y: expected i32:$((3 * y)), got: $got"; fail=$((fail+1)); fi
 done
+
+build_one arraycopy
+for t in 8 16 32 64; do expect array_copy_$t "OK"; done
 
 build_one exnpayload
 expect payload_survives   "OK"
