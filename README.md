@@ -349,7 +349,7 @@ other argument, an unknown flag included, becomes the guest's `argv`:
 | `--dir=HOST[::GUEST]` | preopen a host directory, under the guest path `GUEST`, or `HOST` as written |
 | `--env NAME=VALUE` | pass one environment variable |
 | `--inherit-env` | pass the whole host environment instead, ignoring every `--env` (nothing is inherited by default) |
-| `--tcplisten=[ADDR:]PORT` | hand the guest a listening socket, at a dotted IPv4 address (default 127.0.0.1). Without it, the guest has no network access. Not on Windows. |
+| `--tcplisten=[ADDR:]PORT` | hand the guest a listening socket, at a dotted IPv4 address (default 127.0.0.1), non-blocking. Its descriptor comes after the preopened directories': 3 when there are none. Without it, the guest has no network access. Not on Windows. |
 
 Each flag also takes its value after a space or an `=`: `--dir HOST`,
 `--env=NAME=VALUE`, `--tcplisten PORT`.
@@ -374,6 +374,12 @@ Sandbox behaviour:
   rules of its own for a path that ends in a slash (`EACCES` for a directory
   removed by one, a symlink to nothing refused).
 - Rights are enforced per descriptor.
+- The flags a guest sets on stdin, stdout and stderr (`fd_fdstat_set_flags`)
+  are its own. The host carries out non-blocking and append itself rather
+  than setting them on the files, which are the parent's too and keep their
+  flags after the program: Go's runtime makes all three non-blocking as it
+  starts, and a terminal would stay so. A sync flag is refused on them
+  (`ENOTSUP`).
 
 The exit status is the guest's `proc_exit` code. A code of 126 or more, which
 the system would cut to 8 bits or a shell takes for its own, is a trap, as
@@ -386,6 +392,65 @@ under wasmtime. The host reserves a few codes of its own:
 | 72 | no `_start` |
 | 73 | a trap in `_start`, printed to stderr, a `proc_exit` code of 126 or more included |
 | 74 | a `--dir` that cannot be opened, a `--tcplisten` that cannot listen, or no memory for the flags |
+
+#### An HTTP server in Go
+
+wasip1 has no call that opens a socket, so a server takes the one
+`--tcplisten` hands it: the first descriptor from 3 up that is a stream
+socket. Go's runtime waits for connections, and for each one's reads and
+writes, in `poll_oneoff`, so one thread serves them all:
+
+```go
+package main
+
+import (
+	"errors"
+	"fmt"
+	"net"
+	"net/http"
+	"os"
+	"syscall"
+)
+
+// listener is the socket --tcplisten hands the program
+func listener() (net.Listener, error) {
+	var st syscall.Stat_t
+	for fd := 3; syscall.Fstat(fd, &st) == nil; fd++ {
+		if st.Filetype == syscall.FILETYPE_SOCKET_STREAM {
+			return net.FileListener(os.NewFile(uintptr(fd), "listener"))
+		}
+	}
+	return nil, errors.New("no listening socket: run with --tcplisten")
+}
+
+func main() {
+	l, err := listener()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "hello from %s\n", r.URL.Path)
+	})
+	http.Serve(l, nil)
+}
+```
+
+```sh
+GOOS=wasip1 GOARCH=wasm go build -o server.wasm .
+build/warmc --target macos --rt build/warmrt-macos.a --wasi -o server server.wasm
+./server --tcplisten=8080 --dir=./static::/static
+```
+
+`net.Listen` and `http.ListenAndServe` build for wasip1 too, but Go
+implements them there with a network inside the program, which nothing
+outside it can connect to. Nor can the program connect out (`http.Get`).
+preview1 has no call that tells the program its listener's address or a
+connection's peer, so `Addr()` and `RemoteAddr` do not say them.
+`test/gohttp/main.go` is a fuller server, and `test/run_gohttp.py` what is
+checked of it.
+
+#### Linux
 
 On Linux a WASI program is a static executable with no libc, like every
 other Linux output: `rt/linuxposix.c` answers the WASI hosts' POSIX calls
@@ -1570,7 +1635,7 @@ make conformance    # write CONFORMANCE.md: spec results grouped by proposal
 make fuzz           # random modules vs wasm-interp (FUZZ_SEED, FUZZ_COUNT)
 make check-combos   # the cases, traps and GC tests with every triple of passes turned off and on in all combinations, the language corpora with every pair
 make gc-jitter      # GC schedule sweep with randomised collector delays (gc-jitter-full: every mode under every seed)
-make check-linux    # run the GC tests, and on a macOS host with tinygo the TinyGo WASI corpus, as real Linux binaries (podman/docker arm64)
+make check-linux    # run the GC tests, the WASI host's sockets and stdio flags (test/run_wasi_linux.sh), and on a macOS host with tinygo the TinyGo WASI corpus, as real Linux binaries (podman/docker arm64)
 make check-tools    # fetch the pinned tools make check uses, alone
 ```
 
@@ -1663,6 +1728,13 @@ Most of the suite is **differential**. warmc's output is compared with:
   and for the names its functions' symbols take in Mach-O and ELF
 
 The other rows check what has no second engine to compare with:
+- a Go `net/http` server (`test/gohttp`, `test/run_gohttp.py`), built by
+  Go's own compiler and run at `-O0`, `-O1` and `-O2` with a listener and a
+  directory preopened: many requests on one connection and many connections
+  at once, large bodies both ways, clients that go away, a socket's reader
+  and stdout's that are slow, while stdin is waited on throughout and the
+  pipes' own flags stay as they were. wasmtime has no listener for preview 1
+  to compare with.
 - the trap tests (`test/cases_traps`), against the trap each export must
   raise, listed in `test/run_traps.sh`, at each level, at `-O3`, with
   `-fexact-trap`, without guard pages, without the register allocator and
