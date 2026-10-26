@@ -1036,7 +1036,7 @@ and `ldcomb` need `guard-pages`; `small-loop-align` needs `align`; and
 
 | Pass | What it does |
 |---|---|
-| `fold` | constant folding and algebraic simplification, including a constant reinterpreted between integer and float and two xor-shifts that cancel, a test of an `Ordering` -- Rust's `(a > b) - (a < b)`, alone or masked to its byte -- as the compare of `a` and `b` it stands for, and a branch on the high half of a call's i64 result, Go's unwind flag once `go-sp` packs it, as a `tst` of the result; a reinterpret undone, a store of reinterpreted bits, and an integer load read only as float bits, as the C ABI copies a struct's doubles, move the bits in the float registers |
+| `fold` | constant folding and algebraic simplification, including a constant reinterpreted between integer and float and two xor-shifts that cancel, a test of an `Ordering` -- Rust's `(a > b) - (a < b)`, alone or masked to its byte -- as the compare of `a` and `b` it stands for, a branch on the high half of a call's i64 result, Go's unwind flag once `go-sp` packs it, as a `tst` of the result, and an i64 put back together from its halves, `x & 0xffffffff00000000` or'd with `x`'s low half extended, as `x`; a reinterpret undone, a store of reinterpreted bits, and an integer load read only as float bits, as the C ABI copies a struct's doubles, move the bits in the float registers |
 | `dce` | dead-code elimination |
 | `cse` | common-subexpression elimination over dominators |
 | `licm` | loop-invariant code motion, including hoisting invariant stores and trap guards; a value is taken out of the innermost loop that reads it and no further, and a native address stays by the access it serves, which folds it |
@@ -1066,8 +1066,9 @@ and `ldcomb` need `guard-pages`; `small-loop-align` needs `align`; and
 | `devirt`, `closed-world` | turn `call_ref` and `call_indirect` into direct calls, also through vtables in immutable globals; with a closed world, use vtable slots too, and let `reach` drop what only a struct field of a global's initialiser names that no `struct.get` reads (on at every level, off for a component) |
 | `trampoline` | a module whose functions each return the table index of the next to run, to one loop that calls through the table until one returns 0, as GHC's code returns to its runtime's `StgRun`, has them tail-call the next themselves, directly when the index is a constant, with up to three globals they alone use, the most used, passed as arguments and written back when the loop ends, and stored before and loaded after a call that can run the loop again -- the loop's function, what calls it, an import other than WASI's when an export can run it -- or stored before every call in a module that catches exceptions; made only where nothing else can tell: the module has one table, the loop's is the module's one call of that type and alone in a loop that calls again with what it returns until that is 0, as `StgRun`'s is, nothing calls or takes a reference to those functions any other way, and a call through another type that reached one still traps |
 | `go-sp` | a module Go's compiler made (a `go:buildid` section) has each function of Go's one type take the stack pointer as an argument and return it beside its result, in place of reading and writing global 0 at every call; arguments, results and frames stay in Go's stack memory for its collector and stack growth, the global is stored before a call into a function of another type that can reach it -- the write barrier, the resume loop, an import the host could call back through, by an export or a reference it could be handed -- and loaded after, and a goroutine's switch to another stack goes through the resume loop, which hands each function the pointer it resumes on; made only where nothing else can tell: no function of Go's type exported or taken by `ref.func`, none imported into a table or taken by `ref.func`, no table or stack pointer imported or exported, and no tail call, `call_ref`, `table.get`, `array.new_elem`, `array.init_elem`, function type with a supertype, or exception handling in the module |
-| `go-resume` | in a module of Go's whose table 0 nothing writes, a function's resume dispatch -- the `br_table` on its first parameter that Go's compiler starts it with -- keeps only the cases something can resume it at: 0 and 1, the blocks after its calls, named by the return addresses it stores, and the jumps back it makes; every other case traps, and 0 and 1, a call's way in, are tested ahead of the rest. A function that calls `runtime.deferreturn`, whose recovered panics resume at an offset Go's function data holds, is left alone |
+| `go-resume` | in a module of Go's whose table 0 nothing writes, a function's resume dispatch -- the `br_table` on its first parameter that Go's compiler starts it with -- keeps only the cases something can resume it at: 0 and 1, the blocks after its calls, named by the return addresses it stores, and the jumps back it makes; every other case traps, and 0 and 1, a call's way in, are tested ahead of the rest, which only a resume reaches and which is laid out after the function's code: a call falls through to the entry, and the return of each call made to the code after it. A function that calls `runtime.deferreturn`, whose recovered panics resume at an offset Go's function data holds, is left alone |
 | `go-noret` | in a module of Go's, a function of Go's type whose returns can only be reached past calls of functions that never return normally -- `runtime.sigpanic`, the bounds checks' panics, `morestack`, and what only returns through them, the greatest such set -- never returns normally either, and the test after a call of one is taken as unwinding: the way on past a nil or bounds check no longer joins the hot path, nor the stack pointer it returned the one the code goes on with |
+| `wrap-params` | on arm64, an i32 block parameter every reader of which takes its low half only, and that an edge passes the wrap of an i64 read on after the wrap, takes the i64s, wrapped once at the block's head: Go's stack pointer after a call, the low half of the call's result, stays in the result's register on both ways on, to the code after the call and to the unwinding return |
 | `ictab` | a `call_indirect` through table 0, when nothing writes it, it holds no imported function and it is not table64, loads its target from a code table per type, whose slots that fail the call's checks hold trap stubs, so the call needs no signature, null or instance check |
 | `reinline` | after the cleanup passes, inline again what devirtualisation made direct and the calls an allocation leaves by |
 | `throw-jump` | a `throw` caught in its own function, without the exnref, becomes a jump to the catch |
@@ -1277,12 +1278,18 @@ edges becomes a tree of compares, and any other a jump table. On arm64, a
 function whose entry block tests only what it is passed and what it loads
 from memory, and may return at once -- a destructor called on a null
 pointer -- makes that test, and that return with the block's stores, ahead
-of its prologue. The register allocator is a linear scan over SSA webs with
-lifetime holes. It rematerialises constants, recomputes a spilled frame
-address or other cheap operation from registers instead of reloading it,
-holds a spilled value that a loop reads in a register that is free across
-the loop, and chooses between callee-saved registers and caller-saved
-registers with save and restore around calls, whichever is cheaper.
+of its prologue; a wrap whose readers take the low half only -- an indirect
+call's table index among them -- is no instruction, they read the i64's
+register; and an i32 extended to i64 where a w-register write made it, its
+high half zero already, is no instruction either, as in the return of every
+Go function. The register allocator is a linear scan over SSA webs with
+lifetime holes. It rematerialises constants -- on arm64 a zero takes no
+register at all, its readers reading the zero register, two stores of zeros
+one `stp xzr, xzr` -- recomputes a spilled frame address or other cheap
+operation from registers instead of reloading it, holds a spilled value that
+a loop reads in a register that is free across the loop, and chooses between
+callee-saved registers and caller-saved registers with save and restore
+around calls, whichever is cheaper.
 Functions compile in parallel and are laid out deterministically.
 
 **Linker** (`src/link.c`, `pe.c`, `elf.c`, `macho.c`, `coff.c`):
