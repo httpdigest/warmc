@@ -86,7 +86,12 @@ def shape_fails(name, exe, want):
         if not body:
             fails.append("%s -O2: no function %s in the code" % (name, fn))
             continue
-        got = len([l for l in body.group(1).split("\n") if re.search(pat, l)])
+        # nops after the function's last instruction are the padding the
+        # next function starts after, not its own
+        lines = body.group(1).split("\n")
+        while lines and re.search(r"\snop$", lines[-1]):
+            lines.pop()
+        got = len([l for l in lines if re.search(pat, l)])
         if got != n:
             fails.append("%s -O2: %s has %d instructions matching %s, not %d"
                          % (name, fn, got, pat, n))
