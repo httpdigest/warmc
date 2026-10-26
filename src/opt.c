@@ -13774,9 +13774,10 @@ static bool addr_users_are_accesses(IrFunc *f, const UseIdx *ui, Ref ea,
    displacement makes the back end build the address every time -- a mov and
    a movk on arm64 -- and C's globals are such addresses: nbody reads and
    writes its bodies at 0x10970 and on, fifteen of them a step.  Accesses
-   near one another share one native pointer instead, made once at entry,
-   and reach their slots by displacement from it.  The address each one
-   makes is the one it made before, so it traps where it did. */
+   near one another in a block share one native pointer instead, made at the
+   block's start, and reach their slots by displacement from it.  The
+   address each one makes is the one it made before, so it traps where it
+   did. */
 typedef struct { Ref inst; uint64_t addr; uint32_t size, mem, block; } ConstAcc;
 
 static int const_acc_cmp(const void *x, const void *y) {
@@ -13805,16 +13806,25 @@ static bool mem_ptr_consts(IrFunc *f) {
     }
   }
   bool changed = false;
-  if (na >= 2) {
+  if (na >= 1) {
     qsort(acc, na, sizeof *acc, const_acc_cmp);
     uint32_t entry;
     for (uint32_t s = 0; s < na;) {
-      uint64_t base = acc[s].addr & ~(uint64_t)7;
+      /* The pointer is the page below the first access where the access
+         reaches its slot from there: one add of the page to the memory
+         base (lsl 12) makes it, where the address itself took a mov and a
+         movk before the add.  So even an access alone in its block gains,
+         an add where it built its address in two: dlmalloc tests
+         mparams.magic, then gm's smallmap, at 0x10f50 and 0x11110, each
+         by itself on its way through. */
+      uint64_t page = acc[s].addr & ~(uint64_t)0xfff;
+      bool one_add = page < (1u << 24) && ir_mem_disp_ok(acc[s].addr - page, acc[s].size);
+      uint64_t base = one_add ? page : acc[s].addr & ~(uint64_t)7;
       uint32_t e = s;
       while (e < na && acc[e].block == acc[s].block && acc[e].mem == acc[s].mem &&
              ir_mem_disp_ok(acc[e].addr - base, acc[e].size))
         e++;
-      if (e - s >= 2) {
+      if (e - s >= 2 || (e - s == 1 && one_add && ir_const_cost(acc[s].addr, false) > 1)) {
         /* one pointer per block: a pointer shared by the code before a loop
            and the code after it holds a register right through the loop,
            which measured worse than the moves it saves */
