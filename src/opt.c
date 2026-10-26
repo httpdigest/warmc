@@ -862,6 +862,8 @@ static void brt_node(IrFunc *f, uint32_t nb, Ref idx, const BrtSeg *seg,
       continue;
     }
     uint32_t child = ir_new_block(f);
+    /* the tree is where its root was, out of line */
+    f->blocks[child].outline = f->blocks[nb].outline;
     ir_add_edge(f, nb, child, NULL, 0);
     brt_node(f, child, idx, s, n, edges);
   }
@@ -2362,6 +2364,25 @@ static bool fold_mulwide(IrFunc *f, uint32_t bi, uint32_t *idx, Ref v) {
   return true;
 }
 
+/* x when hi is x & 0xffffffff00000000 and lo is extendu(wrap(x)): the two
+   halves of x put back together, as an inlined function of Go's returns
+   the i64 a call of its gave it, once gosp.c packs the stack pointer in
+   (morestack_noctxt in every prologue), which hid that call's unwind flag
+   from fold_flag_branches */
+static Ref repacked(IrFunc *f, Ref hi, Ref lo) {
+  const Inst *h = &f->insts[hi], *l = &f->insts[lo];
+  uint64_t k;
+  if (h->op != I_AND || h->nargs != 2 || h->type != VT_I64 ||
+      !is_const(f, ir_args(f, hi)[1], &k) || k != 0xffffffff00000000ull)
+    return REF_NONE;
+  Ref x = ir_args(f, hi)[0];
+  if (l->op != I_EXTENDU || l->nargs != 1) return REF_NONE;
+  Ref w = ir_args(f, lo)[0];
+  const Inst *wi = &f->insts[w];
+  if (wi->op != I_WRAP || wi->nargs != 1 || ir_args(f, w)[0] != x) return REF_NONE;
+  return x;
+}
+
 static bool fold_block(IrFunc *f, uint32_t bi, const OptOpts *o, const uint32_t *uses) {
   Block *b = &f->blocks[bi];
   bool changed = false;
@@ -3129,6 +3150,17 @@ static bool fold_block(IrFunc *f, uint32_t bi, const OptOpts *o, const uint32_t 
     }
     if (in->op == I_SUB && in->nargs == 2 && a[0] == a[1]) {
       replace_with_const(f, v, 0); changed = true; g_stats.folded++;
+    }
+    if (in->op == I_OR && in->nargs == 2) {
+      Ref x = repacked(f, a[0], a[1]);
+      if (x == REF_NONE) x = repacked(f, a[1], a[0]);
+      if (x != REF_NONE) {
+        ir_replace(f, v, x);
+        in->op = I_NOP;
+        changed = true;
+        g_stats.folded++;
+        continue;
+      }
     }
     if (in->op == I_XOR && in->nargs == 2 && a[0] == a[1]) {
       replace_with_const(f, v, 0); changed = true; g_stats.folded++;
@@ -8002,6 +8034,10 @@ static bool pass_go_resume(IrFunc *f) {
     ir_add_edge(f, h, tab, NULL, 0);
     f->blocks[tab].term = T_BRTABLE;
     f->blocks[tab].term_arg = idx;
+    /* only a resume goes on to the table, laid out of line: a call falls
+       through to its entry, and the code after the calls, the table's
+       cases, falls through from them */
+    f->blocks[tab].outline = true;
     g_stats.go_resume_split++;
   } else {
     hb->nsuccs = 0;
@@ -8019,6 +8055,130 @@ static bool pass_go_resume(IrFunc *f) {
   xfree(reach);
   ir_recompute_preds(f);
   return true;
+}
+
+/* An i32 block parameter whose readers all take its low half only
+   (ir_reads_low32), and into which some edge passes the wrap of an i64 that
+   is read after the wrap too, takes the i64s instead, wrapped once at its
+   block's head.  Go's stack pointer after a call is the low half of the
+   call's result, whose high half the branch after the call tests: the wrap
+   took a register of its own and a move after every call, for the code
+   after it and for the unwinding return alike, where now the result and
+   the parameters it reaches share one register and the wrap at the head
+   is no instruction (isel's walias).  Every other edge passes the wrap of
+   an i64 too, or a constant, or comes from a block laid out of line (Go's
+   resume table), whose extend is no cost on the way through.  Not a
+   parameter passed on to another: widened as a group with those, as the
+   stack pointer a loop carries round its calls, stdgo ran 1% more cycles
+   for 1% fewer instructions (closures and deferred a tenth slower, over
+   four layouts).  Run last: the folds narrow such a parameter back.  Where
+   a wrap is an instruction (x86-64), the head's would be one more. */
+static bool pass_wrap_params(IrFunc *f) {
+  if (!ir_wrap_alias()) return false;
+  uint32_t n = f->ninsts;
+  uint8_t *bad = xcalloc(n ? n : 1, 1);
+  uint32_t *nuse = xcalloc(n ? n : 1, sizeof(uint32_t));
+  for (uint32_t oi = 0; oi < f->norder; oi++) {
+    const Block *b = &f->blocks[f->order[oi]];
+    for (uint32_t i = 0; i < b->ninsts; i++) {
+      Ref u = b->insts[i];
+      const Ref *a = ir_args(f, u);
+      for (uint32_t j = 0; j < f->insts[u].nargs; j++) {
+        nuse[a[j]]++;
+        if (!ir_reads_low32(f, u, j)) bad[a[j]] = 1;
+      }
+    }
+    if (b->term == T_BRIF || b->term == T_BRTABLE) {
+      nuse[b->term_arg]++;
+      bad[b->term_arg] = 1;
+    }
+    for (uint32_t r = 0; r < b->nret; r++) {
+      nuse[b->ret_args[r]]++;
+      bad[b->ret_args[r]] = 1;
+    }
+    for (uint32_t e = 0; e < b->nsuccs; e++)
+      for (uint32_t j = 0; j < b->succs[e].nargs; j++) {
+        nuse[b->succs[e].args[j]]++;
+        bad[b->succs[e].args[j]] = 1;
+      }
+  }
+
+  uint8_t *wide = xcalloc(n ? n : 1, 1);
+  bool any = false;
+  for (uint32_t oi = 0; oi < f->norder; oi++) {
+    uint32_t bi = f->order[oi];
+    const Block *b = &f->blocks[bi];
+    if (bi == f->entry || b->is_pad) continue;
+    for (uint32_t pi = 0; pi < b->nparams; pi++) {
+      Ref p = b->params[pi];
+      if (f->insts[p].type != VT_I32 || bad[p] || !nuse[p]) continue;
+      bool ok = true, gain = false;
+      for (uint32_t q = 0; q < b->npreds && ok; q++) {
+        const Block *pb = &f->blocks[b->preds[q]];
+        for (uint32_t k = 0; k < pb->nsuccs && ok; k++) {
+          const Edge *e = &pb->succs[k];
+          if (e->target != bi) continue;
+          if (e->eh || pi >= e->nargs) { ok = false; break; }
+          const Inst *a = &f->insts[e->args[pi]];
+          if (a->op == I_WRAP && a->nargs == 1) {
+            if (nuse[ir_args(f, e->args[pi])[0]] > 1) gain = true;
+          } else if (a->op != I_CONST && !pb->outline) {
+            ok = false;
+          }
+        }
+      }
+      if (ok && gain) { wide[p] = 1; any = true; }
+    }
+  }
+
+  Ref *head = NULL;
+  if (any) {
+    head = xcalloc(n, sizeof(Ref));
+    /* the edges into the widened */
+    for (uint32_t oi = 0; oi < f->norder; oi++) {
+      uint32_t pbi = f->order[oi];
+      for (uint32_t e = 0; e < f->blocks[pbi].nsuccs; e++) {
+        uint32_t ti = f->blocks[pbi].succs[e].target;
+        for (uint32_t j = 0; j < f->blocks[pbi].succs[e].nargs && j < f->blocks[ti].nparams; j++) {
+          Ref q = f->blocks[ti].params[j], a = f->blocks[pbi].succs[e].args[j];
+          if (q >= n || !wide[q]) continue;
+          const Inst *ai = &f->insts[a];
+          Ref w;
+          if (ai->op == I_WRAP) w = ir_args(f, a)[0];
+          else if (ai->op == I_CONST) w = ir_const(f, pbi, VT_I64, ai->imm & 0xffffffffu);
+          else w = ir_emit(f, pbi, I_EXTENDU, VT_I64, &a, 1, 0, 0);
+          f->blocks[pbi].succs[e].args[j] = w;
+        }
+      }
+    }
+    for (uint32_t oi = 0; oi < f->norder; oi++) {
+      uint32_t bi = f->order[oi];
+      for (uint32_t pi = 0; pi < f->blocks[bi].nparams; pi++) {
+        Ref p = f->blocks[bi].params[pi];
+        if (p >= n || !wide[p]) continue;
+        f->insts[p].type = VT_I64;
+        Ref w = ir_emit(f, bi, I_WRAP, VT_I32, &p, 1, 0, 0);
+        Block *b = &f->blocks[bi];
+        memmove(b->insts + 1, b->insts, (b->ninsts - 1) * sizeof(uint32_t));
+        b->insts[0] = w;
+        head[p] = w;
+        g_stats.wrap_params++;
+      }
+    }
+    for (uint32_t oi = 0; oi < f->norder; oi++) {
+      const Block *b = &f->blocks[f->order[oi]];
+      for (uint32_t i = 0; i < b->ninsts; i++) {
+        Ref u = b->insts[i];
+        if (f->insts[u].op == I_WRAP && ir_args(f, u)[0] < n && head[ir_args(f, u)[0]] == u)
+          continue;
+        Ref *a = ir_args(f, u);
+        for (uint32_t j = 0; j < f->insts[u].nargs; j++)
+          if (a[j] < n && head[a[j]]) a[j] = head[a[j]];
+      }
+    }
+  }
+  xfree(bad); xfree(nuse); xfree(wide); xfree(head);
+  return any;
 }
 
 static void fx_table_freeze(Module *m) {
@@ -20325,6 +20485,7 @@ void ir_optimize(IrFunc *f, const OptOpts *o) {
     ir_order(f);
   }
   if (o->fma && TP("fma", pass_fma(f)) && o->dce) pass_dce(f);
+  if (o->wrap_params) TP("wrap_params", pass_wrap_params(f));
   if (o->print_ir) ir_print(f, "optimised");
   ir_verify(f, "post-opt");
 }

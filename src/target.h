@@ -53,6 +53,9 @@ typedef struct SplitCtl {
 typedef struct Target {
   const char *name;
   bool is_x64;
+  // Is a wrap whose readers take the low half only no instruction, its
+  // readers reading the i64's register (a64's analyse_wrap_alias)?
+  bool wrap_alias;
 
   // May the idx-th argument of `user` be folded as the immediate `cval`?
   bool (*imm_ok)(IrFunc *f, Ref user, uint32_t idx, uint64_t cval, ValType ct);

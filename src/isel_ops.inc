@@ -178,15 +178,19 @@ static void emit_compare_raw(Isel *s, Ref v) {
     return;
   }
   int sf = is64(f, a[0]) ? SF64 : SF32;
-  int x = rd(s, a[0], S0);
   if (is_imm_at(s, v, 1, a[1])) {
+    /* an immediate compare's register 31 is sp: a zero is made */
+    int x = rd(s, a[0], S0);
     uint64_t c = imm_of(s, a[1]);
     uint64_t m = sf ? c : (c & 0xffffffffu);
     if (m <= 0xfff) { a64_cmp_imm(B, sf, x, (uint32_t)m); return; }
     uint64_t neg = (uint64_t)(-(int64_t)(sf ? (int64_t)m : (int64_t)(int32_t)m));
     if (neg <= 0xfff) { a64_adds_imm(B, sf, RZR, x, (uint32_t)neg, 0); return; }
+    a64_cmp_reg(B, sf, x, rd_zr(s, a[1], S1));
+    return;
   }
-  int y = rd(s, a[1], S1);
+  int x = rd_zr(s, a[0], S0);
+  int y = rd_zr(s, a[1], S1);
   a64_cmp_reg(B, sf, x, y);
 }
 
@@ -486,7 +490,8 @@ static void emit_inst(Isel *s, Ref v) {
   if (s->loc[v] == LOC_NONE &&
       (is_imm(s, v) || in->op == I_CONST || in->op == I_MEM_BASE ||
        in->op == I_GLOBAL_GET ||
-       (s->fused && s->fused[v]) || (s->folded && s->folded[v]))) return;
+       (s->fused && s->fused[v]) || (s->folded && s->folded[v]) ||
+       (s->walias && s->walias[v]))) return;
 
   s->t1_was = s->t1_ok && !s->no_ldpair;
   s->t1_ok = false;
@@ -521,7 +526,10 @@ static void emit_inst(Isel *s, Ref v) {
       if (s->folded && s->folded[a[1]]) {
         Inst *ci = &f->insts[a[1]];
         Ref *ca = ir_args(f, a[1]);
-        int x = rd(s, a[0], S0);
+        /* the extended-register form's first register 31 is sp; the
+           shifted-register form's and madd's the zero register */
+        bool ext = ci->op == I_EXTENDU || ci->op == I_EXTENDS || ci->op == I_EXT32S;
+        int x = ext ? rd(s, a[0], S0) : rd_zr(s, a[0], S0);
         int d = wr(s, v, S2);
         if (ci->op == I_SHL || ci->op == I_SHRU || ci->op == I_SHRS) {
           int y = rd(s, ca[0], S1);
@@ -540,9 +548,11 @@ static void emit_inst(Isel *s, Ref v) {
         commit(s, v, d);
         break;
       }
-      int x = rd(s, a[0], S0);
+      /* an immediate's register 31 is sp, the registers' form's zero */
+      bool imm = is_imm_at(s, v, 1, a[1]);
+      int x = imm ? rd(s, a[0], S0) : rd_zr(s, a[0], S0);
       int d = wr(s, v, S2);
-      if (is_imm_at(s, v, 1, a[1])) {
+      if (imm) {
         uint64_t c = imm_of(s, a[1]);
         uint64_t m = sf ? c : (c & 0xffffffffu);
         uint64_t neg = (uint64_t)(-(int64_t)(sf ? (int64_t)m : (int64_t)(int32_t)m));
@@ -557,7 +567,7 @@ static void emit_inst(Isel *s, Ref v) {
         commit(s, v, d);
         break;
       }
-      int y = rd(s, a[1], S1);
+      int y = rd_zr(s, a[1], S1);
       if (in->op == I_ADD) a64_add_reg(B, sf, d, x, y);
       else a64_sub_reg(B, sf, d, x, y);
       commit(s, v, d);
@@ -795,7 +805,8 @@ static void emit_inst(Isel *s, Ref v) {
 
       if (s->zx_fuse && s->zx_fuse[v]) break;
       int x = rd(s, a[0], S0); int d = wr(s, v, S0);
-      a64_uxtw(B, d, x); commit(s, v, d); break; }
+      if (d != x || !w_written(f, a[0])) a64_uxtw(B, d, x);
+      commit(s, v, d); break; }
     case I_EXT8S: { int x = rd(s, a[0], S0); int d = wr(s, v, S0);
                     a64_sxtb(B, sf, d, x); commit(s, v, d); break; }
     case I_EXT16S: { int x = rd(s, a[0], S0); int d = wr(s, v, S0);
@@ -2562,6 +2573,15 @@ static bool pair_reg(Isel *s, Ref r) {
   return l != LOC_NONE && !IS_SLOT(l);
 }
 
+/* A zero a store reads as the zero register (rd_zr), which is there at
+   either site */
+static bool pair_zr(Isel *s, Ref r) {
+  const Inst *in = &s->f->insts[r];
+  return in->op == I_CONST && s->loc[r] == LOC_NONE &&
+         ((ValType)in->type == VT_I64 ? in->imm
+          : (ValType)in->type == VT_I32 ? (in->imm & 0xffffffffu) : 1) == 0;
+}
+
 static bool pair_pure_op(uint16_t op) {
   switch (op) {
     case I_CONST: case I_ADD: case I_SUB: case I_MUL: case I_MULHU: case I_MULHS:
@@ -2658,7 +2678,8 @@ static bool pair_reads(Isel *s, Ref u, int reg, bool fp, int depth) {
   for (uint32_t t = 0; t < un->nargs; t++) {
     Ref x = ua[t];
     if (s->loc[x] == reg && pair_is_fpr(f, x) == fp) return true;
-    if (s->folded && s->folded[x] && depth < 8 && pair_reads(s, x, reg, fp, depth + 1))
+    if (((s->folded && s->folded[x]) || (s->walias && s->walias[x])) && depth < 8 &&
+        pair_reads(s, x, reg, fp, depth + 1))
       return true;
   }
   return false;
@@ -2691,6 +2712,7 @@ static bool pair_load_ok(Isel *s, Block *b, uint32_t idx, uint32_t j) {
 static bool pair_store_ok(Isel *s, Block *b, uint32_t idx, uint32_t j) {
   IrFunc *f = s->f;
   Ref valj = ir_args(f, b->insts[j])[1];
+  if (pair_zr(s, valj)) return true;
   if (!pair_reg(s, valj)) return false;
   bool fj = pair_is_fpr(f, valj);
   for (uint32_t k = idx + 1; k < j; k++) {
@@ -2914,7 +2936,9 @@ static bool maybe_pair(Isel *s, Block *b, uint32_t idx) {
      pair in all three shapes. */
   if (!st && si.kind == 0) return false;
   bool narrow_st = st && si.kind == 0 && si.size == 2;
-  if (st ? !pair_reg(s, ir_args(f, vi)[1]) : !pair_reg(s, vi)) return false;
+  if (st ? !pair_reg(s, ir_args(f, vi)[1]) && !pair_zr(s, ir_args(f, vi)[1])
+         : !pair_reg(s, vi))
+    return false;
   uint32_t lim = idx + 9;
   if (lim > b->ninsts) lim = b->ninsts;
   for (uint32_t j = idx + 1; j < lim; j++) {

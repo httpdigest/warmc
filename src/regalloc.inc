@@ -103,6 +103,7 @@ static bool skip_location(Isel *s, Ref v) {
   if (s->addr_fuse && s->addr_fuse[v]) return true;
   if (s->ptr_fuse && s->ptr_fuse[v]) return true;
   if (s->folded && s->folded[v]) return true;
+  if (s->walias && s->walias[v]) return true;
   return false;
 }
 
@@ -152,15 +153,17 @@ static double remat_discount(Isel *s, Ref v) {
   return 0.5;
 }
 
-/* A constant zero is never worth a callee-saved register: that costs a
-   save and a restore on every run of the function, where each use -- an
-   argument, a result, a stored value -- reads the zero register or makes
-   the zero in one move, no more than the copy from a register was.  Go
-   passes PC_B = 0 to every call and returns 0 from nearly every function:
-   12115 of stdgo/recurse's 16809 calls read that zero from x22, which half
-   of its functions saved and restored for it.  So a zero across a call is
-   rematerialised, and any other takes a caller-saved register or none --
-   on a64, where uses read the zero register; x64 has none to read. */
+/* A constant zero is worth no register on a64: each use -- an argument, a
+   result, a stored value -- reads the zero register or makes the zero in
+   one move, no more than the copy from a register was, where the register
+   costs a move where the zero is made, and a save and a restore on every
+   run of the function when callee-saved.  Go passes PC_B = 0 to every call
+   and returns 0 from nearly every function: 12115 of stdgo/recurse's 16809
+   calls read that zero from x22, which half of its functions saved and
+   restored for it; in a caller-saved register it was still a move at the
+   entry and a register taken from the code around it (internal/strconv's
+   readFloat loop, bytes.Reader.ReadByte).  So a zero is rematerialised,
+   never allocated nor refilled -- on a64; x64 has no zero register. */
 static bool ra_zero_const(Isel *s, Ref v, int cls) {
   const Inst *in = &s->f->insts[v];
   if (!RA_ZERO_REG || cls || in->op != I_CONST ||
@@ -201,6 +204,11 @@ static int op_tied_arg(uint16_t op) {
        count of a clz or popcnt, the 32-bit result Go and TinyGo keep in an
        i64 -- and one in-place uxtw otherwise. */
     case I_WRAP: return 0;
+    /* An extend of an i32 a w-register write made (w_written), whose
+       source dies here, stays in its register, where a64 makes nothing
+       (isel_ops.inc's I_EXTENDU): every Go function's return of its stack
+       pointer, the i32 sum it packs into the i64 result. */
+    case I_EXTENDU: return RA_EXTENDU_TIED ? 0 : -1;
     /* A lane insert whose vector dies here inserts in place; in a register
        of its own it first copies the whole vector, once per lane of a
        gather built up an insert at a time. */
@@ -214,6 +222,27 @@ static int op_tied_arg(uint16_t op) {
     case I_VEXTMLA: return 0;
     case I_FMA: return RA_FMA_TIED ? 2 : -1;
     default: return -1;
+  }
+}
+
+/* Whether v, an i32, is in its register with a zero high half: made by
+   one of the instructions that write a w register (a64), which zeroes the
+   rest.  Not a parameter or a call's result, whose high half a caller or
+   callee of C's leaves unspecified, nor a wrap, whose register may be the
+   i64's (lowonly, walias). */
+static bool w_written(const IrFunc *f, Ref v) {
+  const Inst *in = &f->insts[v];
+  if ((ValType)in->type != VT_I32) return false;
+  switch (in->op) {
+    case I_ADD: case I_SUB: case I_MUL: case I_AND: case I_OR: case I_XOR:
+    case I_SHL: case I_SHRU: case I_SHRS: case I_ROTL: case I_ROTR:
+    case I_CLZ: case I_CTZ: case I_POPCNT: case I_EXT8S: case I_EXT16S:
+    case I_EQ: case I_NE: case I_LTS: case I_LTU: case I_GTS: case I_GTU:
+    case I_LES: case I_LEU: case I_GES: case I_GEU: case I_EQZ:
+    case I_LOAD: case I_CONST:
+      return true;
+    default:
+      return false;
   }
 }
 
@@ -234,6 +263,9 @@ static Ref tied_operand_of(IrFunc *f, Ref def) {
   }
   int ti = op_tied_arg(in->op);
   if (ti < 0 || (uint32_t)ti >= in->nargs) return REF_NONE;
+  /* an extend that has to be made is made into the register it is
+     hinted to as well as into its source's */
+  if (in->op == I_EXTENDU && !w_written(f, ir_args(f, def)[0])) return REF_NONE;
   return ir_args(f, def)[ti];
 }
 
@@ -582,7 +614,7 @@ static uint32_t eff_uses_at(Isel *s, IrFunc *f, Ref u, Ref *out, uint32_t k,
   Ref *a = ir_args(f, u);
   for (uint32_t j = 0; j < in->nargs; j++) {
     Ref x = a[j];
-    if (s->folded && s->folded[x]) {
+    if ((s->folded && s->folded[x]) || (s->walias && s->walias[x])) {
       k = eff_uses_at(s, f, x, out, k, cap);
     } else {
       if (k >= cap) warmc_fatal("internal: effective-use buffer overflow");
@@ -2253,8 +2285,7 @@ static void regalloc_linear(Isel *s) {
       if (hint[cur->value] < 0 && cur->value < n)
         hint[cur->value] = web_hint[cur->value];
 
-      bool zero = ra_zero_const(s, cur->value, cur->cls);
-      if (zero && cur->crosses_call) {
+      if (ra_zero_const(s, cur->value, cur->cls)) {
         s->loc[cur->value] = LOC_NONE;
         continue;
       }
@@ -2290,11 +2321,10 @@ static void regalloc_linear(Isel *s) {
                                      : gpr_is_callee_saved(want));
         bool in_pool = false;
         for (int k = 0; k < npool; k++) if (pool[k] == want) { in_pool = true; break; }
-        if (in_pool && !((barred >> want) & 1) && (!cur->crosses_call || cs) &&
-            !(zero && cs))
+        if (in_pool && !((barred >> want) & 1) && (!cur->crosses_call || cs))
           chosen = want;
       }
-      for (int pass = 0; pass < (zero ? 1 : 2) && chosen < 0; pass++) {
+      for (int pass = 0; pass < 2 && chosen < 0; pass++) {
         for (int k = 0; k < npool; k++) {
           int rr = pool[k];
           bool cs = cur->cls ? fpr_is_callee_saved(rr) : gpr_is_callee_saved(rr);
@@ -2308,10 +2338,6 @@ static void regalloc_linear(Isel *s) {
         }
       }
 
-      if (chosen < 0 && zero) {
-        s->loc[cur->value] = LOC_NONE;
-        continue;
-      }
       if (chosen < 0) {
 
         int victim_reg = -1;
@@ -2498,12 +2524,11 @@ static void regalloc_linear(Isel *s) {
         const Range *xr = X->rcount ? &R[X->rfirst] : &whole;
         uint32_t nx = X->rcount ? X->rcount : 1;
         int got = -1;
-        bool zero = ra_zero_const(s, X->value, X->cls);
+        if (ra_zero_const(s, X->value, X->cls)) continue;
         for (int pass = 0; pass < 2 && got < 0; pass++)
           for (int k = 0; k < npool && got < 0; k++) {
             int rr = pool[k];
             bool cs = X->cls ? fpr_is_callee_saved(rr) : gpr_is_callee_saved(rr);
-            if (zero && cs) continue;
             if (X->crosses_call && (v128 || !cs)) continue;
             if (!X->cls && ((spare >> rr) & 1)) continue;
             bool want_cs = X->crosses_call ? true : (pass == 1);
@@ -2768,6 +2793,9 @@ static void regalloc_linear(Isel *s) {
             continue;
           int l = s->loc[web[u]];
           if (l != LOC_NONE && !IS_SLOT(l)) continue;
+          /* a zero's readers read the zero register (rd_zr): a piece's
+             would be made and never read */
+          if (ra_zero_const(s, u, s->cls[u])) continue;
           if (nlps) {
             uint64_t key = (uint64_t)u << 32 | bi;
             uint32_t a = 0, z = nlps;

@@ -262,6 +262,11 @@ typedef struct {
      resumes.  Its loop depth is the copied loop's, but its uses are not hot. */
   bool cold;
 
+  /* Emitted after the function's other blocks, out of the way of the hot
+     path: entered only by branches, never by falling through.  Go's resume
+     table (pass_go_resume), which only a resume reaches. */
+  bool outline;
+
   bool is_pad;
   uint8_t pad_kind;
   uint32_t pad_tag;
@@ -366,12 +371,20 @@ typedef struct { uint32_t *off, *src, *si; } IrEdgeIdx;
 IrEdgeIdx ir_edge_index(IrFunc *f);
 void ir_edge_index_free(IrEdgeIdx *x);
 void ir_order(IrFunc *f);
+/* f->order with the outline blocks moved after the rest, but for skip: the
+   order the back ends emit the blocks in.  Sets *n to its length. */
+const uint32_t *ir_emit_order(IrFunc *f, uint32_t skip, uint32_t *n);
 /* ir_order, saying whether the graph had changed since the last. */
 bool ir_order_changed(IrFunc *f);
 void ir_compact(IrFunc *f);
 void ir_path_share(const IrFunc *f, float *share);
 
 int ir_succ_score(const IrFunc *f, const Block *b, uint32_t si);
+/* Whether u reads its operand j, an i32, for the low 32 bits only: a
+   w-register op, a store of 4 bytes or fewer, an index its address extends,
+   an indirect call's table index.  A register holding such an operand may
+   have anything in its high half. */
+bool ir_reads_low32(const IrFunc *f, Ref u, uint32_t j);
 const char *ir_op_name(uint16_t op);
 void ir_verify(IrFunc *f, const char *stage);
 void ir_print(IrFunc *f, const char *stage);
@@ -395,6 +408,8 @@ static inline uint64_t mem_guaranteed_bytes(const Module *m, uint32_t k) {
 int ir_const_cost(uint64_t bits, bool wide);
 int ir_vconst_cost(uint64_t lo, uint64_t hi);
 uint32_t ir_vec_copies(void);
+/* Is a wrap that only low-half readers read no instruction (Target)? */
+bool ir_wrap_alias(void);
 bool ir_vec_mul_one(uint32_t lane);
 
 bool ir_imm_ok(IrFunc *f, Ref user, uint32_t idx, uint64_t cval, ValType ct);
@@ -444,6 +459,9 @@ typedef struct {
   /* a call of Go's that can never return normally is taken to unwind
      (opt.c nr_solve, fold_flag_branches) */
   bool go_noret;
+  /* an i32 block parameter edges pass the wraps of i64s takes the i64s
+     (opt.c pass_wrap_params) */
+  bool wrap_params;
   bool gssa;
 
   bool labcache;
@@ -558,7 +576,7 @@ typedef struct {
   uint64_t caller_saves, csa_restores, spills_v128_xcall, range_budget_trips;
   uint64_t split_cuts, split_invs, pieces, loop_pieces, recomputes,
            dead_frame_stores, tramp_funcs, gosp_funcs,
-           go_resume_pruned, go_resume_split, go_noret_calls;
+           go_resume_pruned, go_resume_split, go_noret_calls, wrap_params;
   uint64_t devirt_ref, devirt_indirect, devirt_null_kept;
   uint64_t const_reads, throw_jumps, inl_more;
   uint64_t inl_flat, inl_spliced, inl_once_forced, inl_retcall_sites;

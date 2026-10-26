@@ -356,6 +356,26 @@ static int branch_bias(const IrFunc *f, const Block *b) {
   }
 }
 
+bool ir_reads_low32(const IrFunc *f, Ref u, uint32_t j) {
+  const Inst *in = &f->insts[u];
+  switch (in->op) {
+    case I_ADD: case I_SUB: case I_MUL: case I_AND: case I_OR: case I_XOR:
+    case I_SHL: case I_SHRU: case I_SHRS: case I_ROTL: case I_ROTR:
+    case I_EQ: case I_NE: case I_LTS: case I_LTU: case I_GTS: case I_GTU:
+    case I_LES: case I_LEU: case I_GES: case I_GEU: case I_EQZ:
+    case I_CLZ: case I_CTZ: case I_POPCNT: case I_EXT8S: case I_EXT16S:
+    case I_EXTENDU: case I_EXTENDS: case I_CONVERTS: case I_CONVERTU:
+    case I_REINTERPRET: case I_SELECT: case I_GLOBAL_SET:
+      return true;
+    case I_STORE: return j == 1 && MEMF_SIZE(in->imm2) <= 2;
+    case I_MEM_ADDR: case I_MEM_PTR: return j == 0;
+    /* a 32-bit table's index, compared and scaled as a w register: Go's
+       closure calls take it from the function value's high bits */
+    case I_CALL_INDIRECT: case I_RETURN_CALL_INDIRECT: return j + 1 == in->nargs;
+    default: return false;
+  }
+}
+
 static int layout_score_of(const IrFunc *f, const Block *b, uint32_t si);
 
 int ir_succ_score(const IrFunc *f, const Block *b, uint32_t si) {
@@ -730,6 +750,33 @@ void ir_path_share(const IrFunc *f, float *share) {
 
 void ir_order(IrFunc *f) { (void)ir_order_changed(f); }
 
+const uint32_t *ir_emit_order(IrFunc *f, uint32_t skip, uint32_t *n) {
+  uint32_t *eo = ir_alloc(f, (f->norder ? f->norder : 1) * sizeof(uint32_t));
+  /* late: the outline blocks, and what only they lead to, as the trap of
+     Go's pruned resume cases; the order has a block's predecessors before
+     it but for a loop's back edges, which keep a block where it is */
+  uint8_t *late = ir_alloc(f, f->nblocks ? f->nblocks : 1);
+  memset(late, 0, f->nblocks);
+  for (uint32_t oi = 0; oi < f->norder; oi++) {
+    uint32_t bi = f->order[oi];
+    const Block *b = &f->blocks[bi];
+    bool out = b->outline;
+    if (!out && bi != f->entry && b->npreds) {
+      out = true;
+      for (uint32_t p = 0; p < b->npreds && out; p++) out = late[b->preds[p]];
+    }
+    late[bi] = out;
+  }
+  uint32_t k = 0;
+  for (uint8_t pass = 0; pass < 2; pass++)
+    for (uint32_t oi = 0; oi < f->norder; oi++) {
+      uint32_t bi = f->order[oi];
+      if (bi != skip && late[bi] == pass) eo[k++] = bi;
+    }
+  *n = k;
+  return eo;
+}
+
 bool ir_order_changed(IrFunc *f) {
   pthread_once(&g_dom_check_once, dom_check_init);
   size_t len = order_sig_len_of(f);
@@ -858,6 +905,10 @@ int ir_vconst_cost(uint64_t lo, uint64_t hi) {
 
 uint32_t ir_vec_copies(void) {
   return g_target->vec_copies;
+}
+
+bool ir_wrap_alias(void) {
+  return g_target->wrap_alias;
 }
 
 bool ir_vec_mul_one(uint32_t lane) {

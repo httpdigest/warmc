@@ -117,6 +117,7 @@ static bool isel_fp_remat_ok(Isel *s, const Inst *in) {
 #define RA_HAVE_RECOMP 0
 #define RA_FMA_TIED 1
 #define RA_ZERO_REG 0
+#define RA_EXTENDU_TIED 0
 
 static const int ARG_GPR[4] = { X_RCX, X_RDX, X_R8, X_R9 };
 
@@ -300,6 +301,9 @@ static int mem_base_reg(Isel *s, uint64_t k, int scratch);
 static int mem_base_reg_fwd(Isel *s, uint64_t k, int scratch) {
   return mem_base_reg(s, k, scratch);
 }
+
+/* x86-64 has no zero register */
+static int rd_zr(Isel *s, Ref v, int scratch) { return rd(s, v, scratch); }
 
 static int rd(Isel *s, Ref v, int scratch) {
   int l = s->loc[v];
@@ -1524,8 +1528,10 @@ static int produce_body_x64(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
   uint32_t lalign = lal_s ? (uint32_t)strtoul(lal_s, NULL, 0) : 16;
   if (lalign != 16 && lalign != 32) lalign = 0;
 
-  for (uint32_t oi = 0; oi < f->norder; oi++) {
-    uint32_t bi = f->order[oi];
+  uint32_t neo;
+  const uint32_t *eo = ir_emit_order(f, UINT32_MAX, &neo);
+  for (uint32_t oi = 0; oi < neo; oi++) {
+    uint32_t bi = eo[oi];
     if (lalign && opt->align && f->blocks[bi].loop_depth) {
       Block *lb = &f->blocks[bi];
       bool header = false;
@@ -1555,7 +1561,7 @@ static int produce_body_x64(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
       s->prof_start[bi] = B->ninstr;
       s->prof_skip = 0;
     }
-    emit_block(s, bi, oi + 1 < f->norder ? f->order[oi + 1] : 0xffffffffu);
+    emit_block(s, bi, oi + 1 < neo ? eo[oi + 1] : 0xffffffffu);
     if (opt->profile) {
       uint32_t w = (uint32_t)(B->ninstr - s->prof_start[bi]);
       w = (w > s->prof_skip) ? w - s->prof_skip : 0;

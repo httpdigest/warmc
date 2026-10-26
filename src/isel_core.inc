@@ -159,6 +159,8 @@ typedef struct {
   uint8_t *recomp;
   /* a wrap all of whose readers read only the low half of a register */
   uint8_t *lowonly;
+  /* A wrap that takes no register: its readers read its operand's (a64) */
+  uint8_t *walias;
   uint8_t *no_remat;
   uint8_t *paired;
   /* (base, offset) of every 32-bit raw-pointer load, sorted; built on the
@@ -306,6 +308,10 @@ static void emit_reg_move(Buf *out, int dst, int src, int fp, int wide,
                           int vec);
 static int isel_break_reg(int bank);
 static int rd(Isel *s, Ref v, int scratch);
+/* rd, but the zero register for a zero with no location, where the target
+   has one */
+static int rd_zr(Isel *s, Ref v, int scratch);
+static bool w_written(const IrFunc *f, Ref v);
 static int isel_cs_index(int reg);
 static bool isel_fp_remat_ok(Isel *s, const Inst *in);
 static int isel_spare_gprs(Isel *s, int *out);
@@ -532,7 +538,7 @@ static void emit_remat_move(Isel *s, Buf *out, const Move *m) {
   if (IS_SLOT(m->dst)) {
     rc_kill_slot(s, SLOT_OF(m->dst));
     s->rc_noconst = true;
-    int r = rd(s, m->rv, (m->fp || m->vec) ? FTMP : TMP0);
+    int r = (m->fp || m->vec) ? rd(s, m->rv, FTMP) : rd_zr(s, m->rv, TMP0);
     s->rc_noconst = false;
     slot_store(s, out, m->fp, m->vec, r, slot_off(s, SLOT_OF(m->dst)));
   } else {
