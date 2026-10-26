@@ -1036,7 +1036,7 @@ and `ldcomb` need `guard-pages`; `small-loop-align` needs `align`; and
 
 | Pass | What it does |
 |---|---|
-| `fold` | constant folding and algebraic simplification, including a constant reinterpreted between integer and float and two xor-shifts that cancel; a reinterpret undone, a store of reinterpreted bits, and an integer load read only as float bits, as the C ABI copies a struct's doubles, move the bits in the float registers |
+| `fold` | constant folding and algebraic simplification, including a constant reinterpreted between integer and float and two xor-shifts that cancel, and a test of an `Ordering` -- Rust's `(a > b) - (a < b)`, alone or masked to its byte -- as the compare of `a` and `b` it stands for; a reinterpret undone, a store of reinterpreted bits, and an integer load read only as float bits, as the C ABI copies a struct's doubles, move the bits in the float registers |
 | `dce` | dead-code elimination |
 | `cse` | common-subexpression elimination over dominators |
 | `licm` | loop-invariant code motion, including hoisting invariant stores and trap guards; a value is taken out of the innermost loop that reads it and no further, and a native address stays by the access it serves, which folds it |
@@ -1056,7 +1056,7 @@ and `ldcomb` need `guard-pages`; `small-loop-align` needs `align`; and
 | `rotate` | loop rotation, of call-free loops that touch memory, whose latch ends in an unconditional jump and whose header is at most 8 pure instructions |
 | `unroll` | unrolling by up to 4: a constant trip count by its largest divisor up to that, a run-time one behind a guard, the original loop kept for the rest; complete unrolling of short loops, and of a nest, at a depth of 2 or more and at most 1200 instructions, whose outer loop runs at most 8 times; a loop that runs once loses its back edge |
 | `vectorize` | auto-vectoriser: contiguous accesses, loads interleaved two, three or four ways (`ld3` and `ld4` on arm64) and stores two, if-converted bodies, bytes and halfwords computed in lanes twice as wide where their values need it (widening multiply-adds, a rounding shift as an add-high-narrow), integer, widening and float min/max reductions, argmin and argmax (an index kept beside a min or max), search loops, saturating arithmetic, high-half multiplies, byte reversal and int/float conversions; several copies of the body per iteration, each with its own accumulator; a loop a producer unrolled by three, unrolled again until it spans whole vectors; with runtime alias checks and a scalar fallback |
-| `addroff`, `memptr` | fold address arithmetic into displacements; compute a native pointer once per base, and once per block for constant addresses too large for a displacement |
+| `addroff`, `memptr` | fold address arithmetic into displacements; compute a native pointer once per base, and for constant addresses too large for a displacement one per block, to the 4 KiB page below them where that reaches them (one add to the memory base), also for an access alone in its block |
 | `ldcomb` | merge byte-assembling loads into one wide load |
 | `selftail` | turn self `return_call` into a loop |
 | `gloop`, `gssa` | keep globals in registers across loops; promote a global to SSA where that does fewer memory operations on it, such as a shadow stack pointer moved in a loop, or Go's where `go-sp` does not pass it (`-fgssa-all` promotes every one, which costs more than it saves) |
@@ -1270,14 +1270,18 @@ devirtualisation.
 **Back end** (`src/isel*.c`, `regalloc.inc`, `a64.c`, `x64.c`, `codegen.c`).
 Instruction selection fuses compares into branches and selects, folds shifts,
 bitfield extracts, multiply-adds and addressing modes, and pairs loads and
-stores into `ldp`/`stp`. `br_table` becomes a jump table. The register
-allocator is a linear scan over SSA webs with lifetime holes. It
-rematerialises constants, recomputes a spilled frame address or other cheap
-operation from registers instead of reloading it, holds a spilled value that
-a loop reads in a register that is free across the loop, and chooses between
-callee-saved registers and caller-saved registers with save and restore
-around calls, whichever is cheaper. Functions compile in parallel and are
-laid out deterministically.
+stores into `ldp`/`stp`. From `-O1` a `br_table` of at most eight distinct
+edges becomes a tree of compares, and any other a jump table. On arm64, a
+function whose entry block tests only what it is passed and what it loads
+from memory, and may return at once -- a destructor called on a null
+pointer -- makes that test, and that return with the block's stores, ahead
+of its prologue. The register allocator is a linear scan over SSA webs with
+lifetime holes. It rematerialises constants, recomputes a spilled frame
+address or other cheap operation from registers instead of reloading it,
+holds a spilled value that a loop reads in a register that is free across
+the loop, and chooses between callee-saved registers and caller-saved
+registers with save and restore around calls, whichever is cheaper.
+Functions compile in parallel and are laid out deterministically.
 
 **Linker** (`src/link.c`, `pe.c`, `elf.c`, `macho.c`, `coff.c`):
 - Linux: a static, non-PIE ELF with no libc.
