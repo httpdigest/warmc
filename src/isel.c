@@ -3401,6 +3401,10 @@ static bool imm_ok_a64(IrFunc *f, Ref user, uint32_t idx, uint64_t cval, ValType
       if (cval & ((1u << size) - 1)) return false;
       return (cval >> size) <= 0xfff;
     }
+    /* the memory base plus a constant below 4 KiB, or plus a page below
+       16 MiB, by one add (mem_ptr_consts' pointers) */
+    case I_MEM_PTR:
+      return idx == 0 && (masked <= 0xfff || ((masked & 0xfff) == 0 && masked < (1u << 24)));
     default:
       return false;
   }

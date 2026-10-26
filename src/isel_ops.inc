@@ -996,6 +996,15 @@ static void emit_inst(Isel *s, Ref v) {
     }
 
     case I_MEM_PTR: {
+      if (is_imm_at(s, v, 0, a[0])) {
+        uint64_t k = imm_of(s, a[0]) & 0xffffffffu;
+        int mb = mem_base_reg(s, in->imm2, S2);
+        int d = wr(s, v, S1);
+        if (k <= 0xfff) a64_add_imm(B, SF64, d, mb, (uint32_t)k, 0);
+        else a64_add_imm(B, SF64, d, mb, (uint32_t)(k >> 12), 1);
+        commit(s, v, d);
+        break;
+      }
       Ref ax = addr_index(s, f, a[0]);
       int x = rd(s, ax, S0);
       int mb = mem_base_reg(s, in->imm2, S2);
