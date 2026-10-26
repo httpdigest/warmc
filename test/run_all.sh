@@ -239,6 +239,12 @@ for c in ctests cpptests rstests gotests stdgotests astests kttests zigtests hst
     --variant -O0 --variant -O1 --variant -O2 --variant '-O2 -fdead-frames'
 done
 
+# Go's resume dispatch with the jumps back to it left in place, which jump
+# threading otherwise takes away before pass_go_resume runs: its cases for
+# the constants they pass must stay.
+start stdgotests-nothread python3 test/gobench.py --corpus stdgotests --check \
+  --variant '-O2 -fno-thread'
+
 start wasi     ./test/run_wasi.sh
 
 start wasi-noexp env WARMC_FLAGS="--no-export-names" ./test/run_wasi.sh

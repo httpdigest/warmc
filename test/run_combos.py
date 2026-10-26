@@ -39,8 +39,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PASSES = """fold dce cse licm branch thread nodesplit mem bce strength inline reassoc
 rotate addroff memptr align guard-pages regalloc split vectorize edge-tests
 selftail ldcomb escape partial-escape gloop loopclose cpool ictab trampoline
-go-sp gssa small-loop-align labcache barelide merge reach prune devirt
-reinline throw-jump unroll ifconv mulwide gcpure closed-world sealed once""".split()
+go-sp go-resume go-noret gssa small-loop-align labcache barelide merge reach
+prune devirt reinline throw-jump unroll ifconv mulwide gcpure closed-world sealed once""".split()
 LEFT_OUT = {"fma", "dead-frames", "gssa-all", "exact-trap"}
 
 SUITES = {
