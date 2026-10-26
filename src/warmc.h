@@ -410,6 +410,11 @@ typedef struct {
   uint32_t nowned_bodies;
 
   bool *reached;
+  /* per function, whether its address can leave its code: exported, or
+     named by a segment or a global's or table's initialiser -- validate.c's
+     declared set, which every ref.func names (compile.c
+     module_escape_facts); NULL before compile_module works it out */
+  uint8_t *escapes;
 
   bool *type_live;
 
@@ -482,6 +487,9 @@ bool heap_subtype(const Module *m, HeapType a, HeapType b);
 ValType vt_join(const Module *m, ValType a, ValType b);
 
 #define VMCTX_MEM_BASE      0
+/* the check ahead of a function another instance may call, with its
+   registers pinned (codegen_entry_off) */
+#define ENTRY_CHECK_BYTES   8u
 #define VMCTX_MEM_SIZE      8
 #define VMCTX_MEM_PAGES     16
 #define VMCTX_MEM_MAX_PAGES 24
@@ -710,6 +718,14 @@ void codegen_emit_component(const struct LinkPlan *p, ObjBuilder *o);
 uint64_t wasm_type_hash(const CompType *t);
 void codegen_emit_module_data(Module *m, ObjBuilder *o);
 uint32_t codegen_tail_out_bytes(Module *m);
+/* arm64 keeps the instance in x19 and memory 0's base in x20 across calls
+   (isel.c), unless WARMC_NO_PIN is set */
+bool codegen_pinned(void);
+/* The bytes ahead of function fi's symbol: with the registers pinned, the
+   check of a function another instance may call that they are its own
+   (isel.c emit_entry_check), and 0 otherwise.  The address the module
+   hands out for the function is its symbol less these. */
+uint32_t codegen_entry_off(const Module *m, uint32_t fi);
 extern bool g_guard_pages;
 
 extern bool g_det_profile;

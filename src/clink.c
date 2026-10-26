@@ -1306,6 +1306,7 @@ void clink_compile(LinkPlan *p, ObjBuilder *o, const OptOpts *opts) {
 
   OptOpts mopts = *opts;
   mopts.closed_world = false;
+  mopts.sole_instance = false;
   for (uint32_t i = 0; i < p->nmodules; i++) {
     codegen_set_symbol_prefix(p->modules[i].prefix);
     codegen_rename_funcs(p->modules[i].m, p->modules[i].prefix);

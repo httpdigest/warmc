@@ -1098,10 +1098,32 @@ static const FuncUnwind *find_unwind(u64 pc) { return find_unwind_in(pc, 0); }
 
 static u64 load64(u64 addr) { return *(const u64 *)(uptr)addr; }
 
+#if !defined(__x86_64__)
+/* The return address in warmc_xenter (start.S, XENTER_RET_OFF there), the
+   frame another instance's call into a function is made in: its record is
+   at the x29 the function below saved at its entry - 16, the x19 and x20
+   it saved above that.  Walked through, it gives back the caller's two and
+   its sp, its return address and the x29 it found. */
+#define XENTER_RET_OFF 60   /* start.S checks it */
+extern char warmc_xenter[];
+#define XENTER_RET ((u64)(uptr)warmc_xenter + XENTER_RET_OFF)
+#else
+#define XENTER_RET 0ull
+#endif
+
 __attribute__((noreturn))
 static void unwind(WarmExn *exn, u64 pc, u64 sp, WarmRegs regs) {
   const WarmExn *xw = (const WarmExn *)(uptr)GC_CANON((u64)(uptr)exn);
+  u64 fp = 0;
   for (;;) {
+    if (XENTER_RET && pc == XENTER_RET) {
+      regs.gpr[0] = load64(fp + 16);
+      regs.gpr[1] = load64(fp + 24);
+      sp = fp + 32;
+      pc = load64(fp + 8);
+      fp = load64(fp);
+      continue;
+    }
     const FuncUnwind *u = find_unwind(pc);
 
     if (!u) warmc_trap(TRAP_UNCAUGHT_EXN);
@@ -1129,6 +1151,7 @@ static void unwind(WarmExn *exn, u64 pc, u64 sp, WarmRegs regs) {
     if (!(u->saved & UW_HAS_LR)) warmc_trap(TRAP_UNCAUGHT_EXN);
     u64 entry = sp + u->frame + u->saved_bytes;
     u64 next_pc = load64(entry - 8);
+    fp = load64(entry - 16);
     u64 base = entry - 16;
     u32 k = 0;
     for (u32 r = 0; r < 10; r++) {
@@ -2527,9 +2550,18 @@ static void gc_visit_frames(GcRootFn fn) {
   u64 pc = warmc_gc_ctx.pc, sp = warmc_gc_ctx.sp;
   u64 *gprloc[10];
   for (u32 i = 0; i < 10; i++) gprloc[i] = &warmc_gc_ctx.gpr[i];
+  u64 fp = 0;
   for (u32 guard = 0; ; guard++) {
     if (guard > (1u << 24)) die("the collector's frame walk did not terminate");
 
+    if (XENTER_RET && pc == XENTER_RET) {
+      gprloc[0] = (u64 *)(uptr)(fp + 16);
+      gprloc[1] = (u64 *)(uptr)(fp + 24);
+      sp = fp + 32;
+      pc = load64(fp + 8);
+      fp = load64(fp);
+      continue;
+    }
     const ModuleDesc *md = 0;
     const FuncUnwind *u = find_unwind_in(pc, &md);
 
@@ -2555,6 +2587,7 @@ static void gc_visit_frames(GcRootFn fn) {
     if (!(u->saved & UW_HAS_LR)) return;
     u64 entry = sp + u->frame + u->saved_bytes;
     u64 next_pc = load64(entry - 8);
+    fp = load64(entry - 16);
     u64 base = entry - 16;
     u32 k = 0;
     for (u32 r = 0; r < 10; r++) {

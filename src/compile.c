@@ -639,6 +639,32 @@ static bool module_gc_sealed(const Module *m) {
   return true;
 }
 
+static void escape_init(Module *m, const InitExpr *e) {
+  for (uint32_t i = 0; i < e->n; i++)
+    if (e->ins[i].op == IOP_REF_FUNC && e->ins[i].lo < m->nfuncs)
+      m->escapes[e->ins[i].lo] = 1;
+}
+
+/* Module.escapes: the functions a reference can be made to -- exported, or
+   named by a segment or by a global's or a table's initialiser, the set a
+   ref.func must name (validate.c) -- which is how a call from another
+   instance finds one.  None, where no other instance will be. */
+static void module_escape_facts(Module *m, bool sole) {
+  xfree(m->escapes);
+  m->escapes = xcalloc(m->nfuncs ? m->nfuncs : 1, 1);
+  if (sole) return;
+  for (uint32_t i = 0; i < m->nexports; i++)
+    if (m->exports[i].kind == EK_FUNC && m->exports[i].index < m->nfuncs)
+      m->escapes[m->exports[i].index] = 1;
+  for (uint32_t i = 0; i < m->nelems; i++)
+    for (uint32_t k = 0; k < m->elems[i].n; k++)
+      escape_init(m, &m->elems[i].items[k]);
+  for (uint32_t i = 0; i < m->nglobals; i++)
+    if (!m->globals[i].imported) escape_init(m, &m->globals[i].init);
+  for (uint32_t i = 0; i < m->ntables; i++)
+    if (m->tables[i].has_init) escape_init(m, &m->tables[i].init);
+}
+
 void compile_module(Module *m, ObjBuilder *o, const OptOpts *opts) {
   g_guard_pages = opts->guard_pages;
   g_det_profile = opts->det_profile;
@@ -661,6 +687,7 @@ void compile_module(Module *m, ObjBuilder *o, const OptOpts *opts) {
     }
   }
   m->gc_sealed = opts->sealed && module_gc_sealed(m);
+  module_escape_facts(m, opts->sole_instance);
   uint32_t out_bytes = codegen_tail_out_bytes(m);
 
   bool tm = warmc_getenv("WARMC_TIME") != NULL;

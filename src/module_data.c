@@ -132,8 +132,17 @@ void codegen_note_unwind(const FuncUnwind *u) {
   } else d->gcroots = NULL;
 }
 
+static bool g_pin;
+
+bool codegen_pinned(void) { return g_pin; }
+
+uint32_t codegen_entry_off(const Module *m, uint32_t fi) {
+  return g_pin && m->escapes && fi < m->nfuncs && m->escapes[fi] ? ENTRY_CHECK_BYTES : 0;
+}
+
 void codegen_prepare_module(Module *m, ObjBuilder *o) {
   (void)o;
+  g_pin = g_target->pin_regs && !warmc_getenv("WARMC_NO_PIN");
   codegen_reset_unwind();
   codegen_reset_merge();
   if (module_max_outgoing(m) > INVOKE_OUTGOING_BYTES && module_tail_calls(m))
@@ -192,6 +201,7 @@ void codegen_prewarm_symbols(Module *m, ObjBuilder *o) {
   };
   for (size_t i = 0; i < sizeof helpers / sizeof helpers[0]; i++)
     obj_intern_sym(o, helpers[i], SYM_UNDEF_FUNC, -1, 0);
+  if (g_pin) obj_intern_sym(o, "warmc_xenter", SYM_UNDEF_FUNC, -1, 0);
 
   /* the C functions a --native-module's imports call */
   for (uint32_t i = 0; i < m->nimported_funcs; i++)
@@ -897,9 +907,9 @@ static void data_ptr(ObjBuilder *o, int section, uint64_t off) {
   buf_u64(&o->data, 0);
 }
 
-static void func_ptr(ObjBuilder *o, Module *m, uint32_t fi) {
+static void func_ptr(ObjBuilder *o, Module *m, uint32_t fi, uint32_t ahead) {
   uint32_t sym = obj_intern_sym(o, m->funcs[fi].sym, SYM_UNDEF_FUNC, -1, 0);
-  obj_add_reloc(o, REL_ABS64, 2, o->data.len, sym, 0);
+  obj_add_reloc(o, REL_ABS64, 2, o->data.len, sym, -(int64_t)ahead);
   buf_u64(&o->data, 0);
 }
 
@@ -1218,7 +1228,7 @@ void codegen_emit_module_data(Module *m, ObjBuilder *o) {
       obj_add_reloc(o, REL_ABS64, 2, o->data.len, sym, 0);
       buf_u64(&o->data, 0);
     }
-    else func_ptr(o, m, i);
+    else func_ptr(o, m, i, codegen_entry_off(m, i));
     buf_u64(&o->data, type_hash(&m->types[m->funcs[i].type_index]));
     data_ptr(o, 1, rtt_off[m->funcs[i].type_index]);
   }
@@ -1398,7 +1408,7 @@ void codegen_emit_module_data(Module *m, ObjBuilder *o) {
     const FuncUnwind *u = &g_unwind[i];
     if (!(u->saved & UW_HAS_LR)) continue;
     nunwind++;
-    func_ptr(o, m, u->func_index);
+    func_ptr(o, m, u->func_index, 0);
     buf_u32(&o->data, u->code_len);
     buf_u32(&o->data, u->frame);
     buf_u32(&o->data, u->saved_bytes);

@@ -317,6 +317,10 @@ typedef struct {
      take, by header block, from one emission for the next (see fit_pad in
      isel.c); NULL when not measured. */
   uint16_t *loop_bytes;
+  /* Where, mod 64, the function goes for those loops to fit with the least
+     padding run on their entry (isel.c loop_phase), from the same emission
+     for the next; 0 when not measured. */
+  uint8_t loop_phase;
   /* The register allocation a first emission made, kept for the second when
      only the loops' padding differs between them (isel.c); ra_keep_drop
      frees it if the second does not take it. */
@@ -498,6 +502,11 @@ typedef struct {
   bool gcpure;
 
   bool closed_world;
+  /* The output is an executable or a shared library of this one module, the
+     only wasm instance there will be, entered from the host only through
+     warmc_invoke_s: no function needs the check of another instance's call
+     (Module.escapes) */
+  bool sole_instance;
   /* -fonce: drop the calls through a global of TeaVM's class-initializer
      pattern that do nothing (opt.c pass_once) */
   bool once;
@@ -523,6 +532,13 @@ typedef struct {
   uint8_t *code; uint32_t code_len;
   Reloc *relocs; uint32_t nrelocs;
   bool want_align;
+  /* with want_align, the offset in a 64-byte block the function's symbol is
+     placed at (loop_phase in isel.c), the rest of the block left ahead of
+     it, where nothing runs */
+  uint8_t phase;
+  /* the bytes of code ahead of the function's symbol: the check an entry
+     from outside the module makes (codegen_entry_off), or 0 */
+  uint32_t entry_off;
   const char *sym;
   FuncUnwind uw;
   uint64_t insts_emitted;
@@ -597,6 +613,12 @@ typedef struct {
   uint64_t once_looped;
   uint64_t ldpairs, stpairs;
   uint64_t cold_frames, early_rets;
+  /* functions given the check ahead that another instance's call passes
+     (isel.c emit_entry_check) */
+  uint64_t entry_checks;
+  /* functions placed past the start of their 64-byte block for their small
+     loops to fit (isel.c loop_phase) */
+  uint64_t loop_phases;
   /* -fexact-trap: stores checked that guard pages would have left to the
      page, and constant-length bulk ops given their tests */
   uint64_t exact_store_checks, exact_memop_checks;

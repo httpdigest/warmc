@@ -2179,6 +2179,7 @@ static void regalloc_linear(Isel *s) {
       web_hint[web[v]] = hint[v];
 
   bool no_tie = warmc_getenv("WARMC_NO_TIE") != NULL;
+  bool cs_top = RA_CS_TOP && warmc_getenv("WARMC_NO_CS_TOP") == NULL;
   bool no_hint = warmc_getenv("WARMC_NO_HINT") != NULL;
   bool no_evict = warmc_getenv("WARMC_NO_EVICT") != NULL;
 
@@ -2324,8 +2325,25 @@ static void regalloc_linear(Isel *s) {
         if (in_pool && !((barred >> want) & 1) && (!cur->crosses_call || cs))
           chosen = want;
       }
+      /* A value live across a call made in a loop takes the callee-saved
+         registers from the other end of the pool (RA_CS_TOP): callees take
+         theirs from x22 up, and one that saves and restores the register a
+         loop's counter is in puts the counter through memory each time
+         round -- a store, and a load the next test of the counter waits
+         for.  javabench/virtual's loop over 300 objects kept its index in
+         x22, which every deposit method saves, and ran 37% slower than with
+         it in a register no callee touched. */
+      bool from_top = false;
+      if (cs_top && chosen < 0 && cur->crosses_call && !cur->cls) {
+        uint64_t wk = 0;
+        uint8_t deep = 0;
+        csa_crossing_cost(cur, R, num[cur->value], call_pos, call_depth, call_cold,
+                          NULL, ncalls, 1.0, &wk, &deep);
+        from_top = deep > 0;
+      }
       for (int pass = 0; pass < 2 && chosen < 0; pass++) {
-        for (int k = 0; k < npool; k++) {
+        for (int kk = 0; kk < npool; kk++) {
+          int k = from_top ? npool - 1 - kk : kk;
           int rr = pool[k];
           bool cs = cur->cls ? fpr_is_callee_saved(rr) : gpr_is_callee_saved(rr);
           if (cur->crosses_call && (v128 || !cs)) continue;

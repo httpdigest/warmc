@@ -331,6 +331,7 @@ static int produce_once(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
   if (r == 4)
     r = g_target->produce_body(f, obj, opt, out_bytes, fout, far, sc, collect);
   f->loop_bytes = NULL;
+  f->loop_phase = 0;
   if (f->ra_keep) {
     f->ra_keep_drop(f->ra_keep);
     f->ra_keep = NULL;
@@ -449,6 +450,8 @@ static void aux_build(AuxBuf *a, const FuncOut *fo) {
   const FuncUnwind *u = &fo->uw;
   a->len = 0;
   aux_u32(a, fo->want_align ? 1u : 0u);
+  aux_u32(a, fo->entry_off);
+  aux_u32(a, fo->phase);
   aux_u32(a, fo->nrelocs);
   for (uint32_t i = 0; i < fo->nrelocs; i++) {
     aux_u32(a, (uint32_t)fo->relocs[i].kind);
@@ -570,10 +573,10 @@ void codegen_commit_function(ObjBuilder *obj, FuncOut *fo) {
   uint64_t at = g_merge_on ? mb_find(obj, fo, &g_aux, h) : UINT64_MAX;
   if (at != UINT64_MAX) {
 
-    obj_intern_sym(obj, fo->sym, SYM_LOCAL_FUNC, 0, at);
+    obj_intern_sym(obj, fo->sym, SYM_LOCAL_FUNC, 0, at + fo->entry_off);
     uint32_t si = obj_find_sym(obj, fo->sym);
-    obj->syms[si].value = at;
-    obj->syms[si].size = fo->code_len;
+    obj->syms[si].value = at + fo->entry_off;
+    obj->syms[si].size = fo->code_len - fo->entry_off;
     g_mb_hits++;
     g_mb_bytes += fo->code_len;
     g_stats.insts_emitted += fo->insts_emitted;
@@ -598,16 +601,31 @@ void codegen_commit_function(ObjBuilder *obj, FuncOut *fo) {
     }
   }
   if (fo->want_align)
-    while (obj->text.len & (ALIGN_BYTES - 1)) g_target->pad_nop(&obj->text);
+    while (((obj->text.len + fo->entry_off) & (ALIGN_BYTES - 1)) != fo->phase)
+      g_target->pad_nop(&obj->text);
   uint64_t base = obj->text.len;
   buf_bytes(&obj->text, fo->code, fo->code_len);
   for (uint32_t i = 0; i < fo->nrelocs; i++)
     obj_add_reloc(obj, fo->relocs[i].kind, 0, base + fo->relocs[i].offset,
                   fo->relocs[i].sym, fo->relocs[i].addend);
-  obj_intern_sym(obj, fo->sym, SYM_LOCAL_FUNC, 0, base);
+  obj_intern_sym(obj, fo->sym, SYM_LOCAL_FUNC, 0, base + fo->entry_off);
   uint32_t si = obj_find_sym(obj, fo->sym);
-  obj->syms[si].value = base;
-  obj->syms[si].size = fo->code_len;
+  obj->syms[si].value = base + fo->entry_off;
+  obj->syms[si].size = fo->code_len - fo->entry_off;
+  /* the lead ahead of the symbol (isel.c emit_entry_check) is a symbol of
+     its own, so that a disassembly or a profile does not file it under the
+     function before */
+  if (fo->entry_off) {
+    char name[256];
+    snprintf(name, sizeof name, "%s$entry", fo->sym);
+    uint32_t li = obj_intern_sym(obj, name, SYM_LOCAL_FUNC, 0, base);
+    obj->syms[li].value = base;
+    obj->syms[li].size = fo->entry_off;
+    if (obj->syms[si].display && !obj->syms[li].display) {
+      snprintf(name, sizeof name, "%s$entry", obj->syms[si].display);
+      obj->syms[li].display = xstrndup(name, strlen(name));
+    }
+  }
   g_stats.insts_emitted += fo->insts_emitted;
   codegen_note_unwind(&fo->uw);
   if (g_merge_on) mb_add(base, fo, &g_aux, h);
