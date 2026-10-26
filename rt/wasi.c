@@ -670,6 +670,18 @@ static u64 wasi_fd_fdstat_set_flags(WarmInstance *vm, u64 fd_, u64 flags_) {
   if (!(f->rights & R_FD_FDSTAT_SET_FLAGS)) return WASI_ENOTCAPABLE;
   u16 want = (u16)((u32)flags_ & FDFLAG_ALL);
 
+  /* stdin, stdout and stderr are open files of the parent's, whose flags it
+     shares with the program, and whatever else it runs, and which outlive
+     the program: Go's runtime makes all three non-blocking as it starts,
+     which left a terminal so when the program ended.  Their flags are the
+     guest's alone, and fs_io carries out APPEND and NONBLOCK; a sync flag
+     it could not, and it is refused */
+  if (f->keep_host) {
+    if (want & (FDFLAG_DSYNC | FDFLAG_RSYNC | FDFLAG_SYNC)) return WASI_ENOTSUP;
+    f->fdflags = want;
+    return WASI_ESUCCESS;
+  }
+
   int cur = fcntl(f->host, 3 , 0);
   if (cur < 0) return to_wasi_errno(h_errno);
   if (fcntl(f->host, 4 , (cur & ~H_SETTABLE) | host_fdflags(want)) < 0) {
@@ -699,7 +711,11 @@ static u64 wasi_fd_filestat_get(WarmInstance *vm, u64 fd_, u64 buf_) {
   if (!(f->rights & R_FD_FILESTAT_GET)) return WASI_ENOTCAPABLE;
   u8 st[ST_SIZE];
   if (fstat(f->host, st) < 0) return to_wasi_errno(h_errno);
-  return put_filestat(vm, buf_, st);
+  u32 rc = put_filestat(vm, buf_, st);
+  /* a socket is of the kind it was made as, which fstat does not say */
+  if (!rc && (f->type == FT_SOCK_STREAM || f->type == FT_SOCK_DGRAM))
+    vm->mem_base[(u32)buf_ + 16] = f->type;
+  return rc;
 }
 
 static u64 wasi_path_filestat_get(WarmInstance *vm, u64 fd_, u64 flags_,
@@ -721,6 +737,20 @@ static u64 wasi_path_filestat_get(WarmInstance *vm, u64 fd_, u64 flags_,
   return put_filestat(vm, buf_, st);
 }
 
+#define WASI_EAGAIN 6
+
+extern int poll(void *fds, unsigned nfds, int timeout);
+
+/* whether host descriptor fd reads (or writes) without blocking, waiting up
+   to `wait` ms for it, or for ever at -1; where poll itself fails, the read
+   or write is made, and says why */
+static int host_ready(int fd, int writing, int wait) {
+  struct { int fd; short ev; short rev; } p = { fd, (short)(writing ? 4 : 1), 0 };
+  int r;
+  while ((r = poll(&p, 1, wait)) < 0 && h_errno == 4 ) {}
+  return r != 0;
+}
+
 static u64 fs_io(WarmInstance *vm, u64 fd_, u64 iovs, u64 niov, u64 pn,
                  int writing) {
   Fd *f = fd_get((u32)fd_);
@@ -728,7 +758,20 @@ static u64 fs_io(WarmInstance *vm, u64 fd_, u64 iovs, u64 niov, u64 pn,
   if (!(f->rights & (writing ? R_FD_WRITE : R_FD_READ))) return WASI_ENOTCAPABLE;
   if (f->type == FT_DIR) return WASI_EISDIR;
   if ((f->fdflags & FDFLAG_APPEND) && writing) lseek(f->host, 0, 2 );
-  return iov_walk_fd(vm, f->host, writing, iovs, niov, pn);
+  if (!f->keep_host) return iov_walk_fd(vm, f->host, writing, iovs, niov, pn);
+
+  /* an inherited descriptor blocks or not as the guest's flags say, whatever
+     its host file's say (wasi_fd_fdstat_set_flags): a non-blocking one is
+     read or written only once poll calls it ready -- a write longer than
+     the room there is then waits for the rest, as a blocking one does --
+     and a blocking one whose host file is not waits for it */
+  int nb = (f->fdflags & FDFLAG_NONBLOCK) != 0;
+  if (nb && !host_ready(f->host, writing, 0)) return WASI_EAGAIN;
+  u64 rc;
+  while ((rc = iov_walk_fd(vm, f->host, writing, iovs, niov, pn)) == WASI_EAGAIN &&
+         !nb)
+    host_ready(f->host, writing, -1);
+  return rc;
 }
 
 static u64 fs_pio(WarmInstance *vm, u64 fd_, u64 iovs_, u64 niov_, u64 off_,
@@ -1352,11 +1395,13 @@ static u64 wasi_sock_accept(WarmInstance *vm, u64 fd_, u64 flags_, u64 pfd_) {
   int hostfd = accept(f->host, 0, 0);
   if (hostfd < 0) return to_wasi_errno(h_errno);
 
+  /* blocking as asked, either way: on macOS a connection takes its
+     listener's O_NONBLOCK, which --tcplisten's has */
   u16 fdflags = (u16)((u32)flags_ & FDFLAG_ALL);
-  if (fdflags & FDFLAG_NONBLOCK) {
-    int cur = fcntl(hostfd, 3 , 0);
-    if (cur >= 0) fcntl(hostfd, 4 , cur | H_NONBLOCK);
-  }
+  int cur = fcntl(hostfd, 3 , 0);
+  if (cur >= 0)
+    fcntl(hostfd, 4 , (fdflags & FDFLAG_NONBLOCK) ? cur | H_NONBLOCK
+                                                   : cur & ~H_NONBLOCK);
 
   int slot = fd_alloc();
   if (slot < 0) { close(hostfd); return 33 ; }
@@ -1538,11 +1583,18 @@ static int add_listener(const char *spec) {
   if (bind(s, sa, sizeof sa) < 0) { close(s); return 0; }
   if (listen(s, 128) < 0) { close(s); return 0; }
 
+  /* non-blocking, and saying so: Go's runtime waits for a connection in
+     poll_oneoff when sock_accept says EAGAIN, and one that waited in
+     sock_accept would stop every goroutine with it */
+  int cur = fcntl(s, 3 , 0);
+  if (cur < 0 || fcntl(s, 4 , cur | H_NONBLOCK) < 0) { close(s); return 0; }
+
   int slot = fd_alloc();
   if (slot < 0) { close(s); return 0; }
   fd_clear(&g_fds[slot]);
   g_fds[slot].host = s;
   g_fds[slot].type = FT_SOCK_STREAM;
+  g_fds[slot].fdflags = FDFLAG_NONBLOCK;
   g_fds[slot].rights = RIGHTS_LISTENER;
   return 1;
 }
@@ -1622,6 +1674,13 @@ static int drive(int argc, char **argv) {
 
   signal(13 , (void (*)(int))1 );
 
+  /* the listeners are numbered after every preopened directory, wherever
+     their flags are: wasi-libc and Go look for preopens from 3 up and stop
+     at the first that is none, which a socket before them would be */
+  const char **listen_at = (const char **)malloc(sizeof(char *) * (usz)argc);
+  int nlisten = 0;
+  if (!listen_at) { err("warmc-wasi: out of memory\n"); return 74; }
+
   int keep = 1;
   for (int i = 1; i < argc; i++) {
     const char *a = argv[i];
@@ -1646,17 +1705,11 @@ static int drive(int argc, char **argv) {
     if (a[0] == '-' && a[1] == '-' && a[2] == 't' && a[3] == 'c' &&
         a[4] == 'p' && a[5] == 'l' && a[6] == 'i' && a[7] == 's' &&
         a[8] == 't' && a[9] == 'e' && a[10] == 'n' && a[11] == '=') {
-      if (!add_listener(a + 12)) {
-        err("warmc-wasi: cannot listen on "); err(a + 12); err("\n");
-        return 74;
-      }
+      listen_at[nlisten++] = a + 12;
       continue;
     }
     if (str_eq(a, "--tcplisten") && i + 1 < argc) {
-      if (!add_listener(argv[++i])) {
-        err("warmc-wasi: cannot listen on "); err(argv[i]); err("\n");
-        return 74;
-      }
+      listen_at[nlisten++] = argv[++i];
       continue;
     }
     if (str_eq(a, "--inherit-env")) { g_env_inherit = 1; continue; }
@@ -1667,6 +1720,12 @@ static int drive(int argc, char **argv) {
     argv[keep++] = argv[i];
   }
   argc = keep;
+  for (int i = 0; i < nlisten; i++)
+    if (!add_listener(listen_at[i])) {
+      err("warmc-wasi: cannot listen on "); err(listen_at[i]); err("\n");
+      return 74;
+    }
+  free(listen_at);
 
   g_argc = argc;
   g_argv = argv;
