@@ -1837,6 +1837,95 @@ static bool fold_cmp_arith(IrFunc *f, uint32_t bi, uint32_t *idx, Ref v,
   return true;
 }
 
+/* Rust's Ord::cmp, an Ordering as an i8: d = (a > b) - (a < b), -1, 0 or 1,
+   each compare spelled either way round, both signed or both unsigned.  In
+   *x and *y the a and b, and in *sgn whether the compares are signed. */
+static bool order_pair(IrFunc *f, Ref g, Ref l, Ref *x, Ref *y, bool *sgn) {
+  const Inst *gi = &f->insts[g], *li = &f->insts[l];
+  if (gi->nargs != 2 || li->nargs != 2) return false;
+  Ref *ga = ir_args(f, g), *la = ir_args(f, l);
+  Ref ga0 = ga[0], ga1 = ga[1];
+  bool s;
+  if (gi->op == I_GTU || gi->op == I_GTS) s = gi->op == I_GTS;
+  else if (gi->op == I_LTU || gi->op == I_LTS) { s = gi->op == I_LTS; ga0 = ga[1]; ga1 = ga[0]; }
+  else return false;
+  Ref la0, la1;
+  if (li->op == (s ? I_LTS : I_LTU)) { la0 = la[0]; la1 = la[1]; }
+  else if (li->op == (s ? I_GTS : I_GTU)) { la0 = la[1]; la1 = la[0]; }
+  else return false;
+  if (ga0 != la0 || ga1 != la1) return false;
+  *x = ga0; *y = ga1; *sgn = s;
+  return true;
+}
+
+/* d = (a > b) - (a < b) as order_pair has it, alone or in d & m for an odd
+   m above 1 -- the byte of Ordering Rust compares, -1 being m there -- and
+   in *m that mask, or all ones. */
+static bool order_value(IrFunc *f, Ref t, Ref *x, Ref *y, bool *sgn, uint64_t *m) {
+  const Inst *ti = &f->insts[t];
+  if (ti->type != VT_I32) return false;
+  *m = 0xffffffffu;
+  if (ti->op == I_AND && ti->nargs == 2) {
+    uint64_t k;
+    Ref *ta = ir_args(f, t);
+    if (!is_const(f, ta[1], &k)) return false;
+    k &= 0xffffffffu;
+    if (k < 2 || !(k & 1)) return false;
+    *m = k;
+    t = ta[0];
+    ti = &f->insts[t];
+  }
+  if (ti->op != I_SUB || ti->nargs != 2) return false;
+  Ref *sa = ir_args(f, t);
+  return order_pair(f, sa[0], sa[1], x, y, sgn);
+}
+
+/* A test of an Ordering is a compare of what was ordered: d & m == 1 is
+   a > b, == 0 is a == b, == m is a < b and == anything else never; ne the
+   other way; eqz(d & m) is a == b; d <s 0 is a < b and d >s 0 a > b; and
+   (a > b) == (a < b), what eqz(d) folds to, is a == b.  Rust's BTreeMap
+   searched a node with cset, cset, sub, and, cmp and b.eq per key where one
+   cmp and b.hi do. */
+static bool fold_order_cmp(IrFunc *f, uint32_t bi, uint32_t *idx, Ref v) {
+  Inst *in = &f->insts[v];
+  Ref *a = ir_args(f, v);
+  Ref x, y;
+  bool sgn;
+  uint64_t m, k;
+  uint16_t op;
+  if (in->op == I_EQZ && in->nargs == 1) {
+    if (!order_value(f, a[0], &x, &y, &sgn, &m)) return false;
+    op = I_EQ;
+  } else if ((in->op == I_EQ || in->op == I_NE) && in->nargs == 2 &&
+             order_pair(f, a[0], a[1], &x, &y, &sgn)) {
+    op = in->op;
+  } else if ((in->op == I_EQ || in->op == I_NE) && in->nargs == 2 &&
+             is_const(f, a[1], &k) && order_value(f, a[0], &x, &y, &sgn, &m)) {
+    k &= 0xffffffffu;
+    bool eq = in->op == I_EQ;
+    if (k == 1) op = eq ? (sgn ? I_GTS : I_GTU) : (sgn ? I_LES : I_LEU);
+    else if (k == 0) op = eq ? I_EQ : I_NE;
+    else if (k == m) op = eq ? (sgn ? I_LTS : I_LTU) : (sgn ? I_GES : I_GEU);
+    else { replace_with_const(f, v, eq ? 0 : 1); return true; }
+  } else if ((in->op == I_LTS || in->op == I_GTS || in->op == I_LES || in->op == I_GES) &&
+             in->nargs == 2 && is_const(f, a[1], &k) && (k & 0xffffffffu) == 0 &&
+             order_value(f, a[0], &x, &y, &sgn, &m) && m == 0xffffffffu) {
+    switch (in->op) {
+      case I_LTS: op = sgn ? I_LTS : I_LTU; break;
+      case I_GTS: op = sgn ? I_GTS : I_GTU; break;
+      case I_LES: op = sgn ? I_LES : I_LEU; break;
+      default:    op = sgn ? I_GES : I_GEU; break;
+    }
+  } else {
+    return false;
+  }
+  Ref ca[2] = { x, y };
+  Ref nv = emit_before(f, bi, idx, op, VT_I32, ca, 2, 0);
+  ir_replace(f, v, nv);
+  f->insts[v].op = I_NOP;
+  return true;
+}
+
 /* eq or ne of a bool -- a value only bit 0 of which can be set -- against 0
    or 1: the bool itself, or its eqz. */
 static bool fold_bool_cmp(IrFunc *f, Ref v) {
@@ -2854,6 +2943,12 @@ static bool fold_block(IrFunc *f, uint32_t bi, const OptOpts *o, const uint32_t 
         break;
       }
       case I_EQZ: {
+        if (fold_order_cmp(f, bi, &i, v)) {
+          in = &f->insts[v]; a = ir_args(f, v);
+          changed = true;
+          g_stats.folded++;
+          break;
+        }
 
         Ref src = a[0];
         uint16_t sop = f->insts[src].op;
@@ -2980,6 +3075,10 @@ static bool fold_block(IrFunc *f, uint32_t bi, const OptOpts *o, const uint32_t 
       }
       case I_EQ: case I_LES: case I_LEU: case I_GES: case I_GEU:
         if (in->nargs == 2 && a[0] == a[1]) { replace_with_const(f, v, 1); changed = true; g_stats.folded++; }
+        else if (fold_order_cmp(f, bi, &i, v)) {
+          in = &f->insts[v]; a = ir_args(f, v);
+          changed = true; g_stats.folded++;
+        }
         else if (fold_cmp_widened(f, v)) { changed = true; g_stats.folded++; }
         else if (in->op == I_EQ && fold_bool_cmp(f, v)) { changed = true; g_stats.folded++; }
         else if (in->op == I_EQ && fold_cmp_arith(f, bi, &i, v, uses)) {
@@ -3003,6 +3102,10 @@ static bool fold_block(IrFunc *f, uint32_t bi, const OptOpts *o, const uint32_t 
         break;
       case I_NE: case I_LTS: case I_LTU: case I_GTS: case I_GTU:
         if (in->nargs == 2 && a[0] == a[1]) { replace_with_const(f, v, 0); changed = true; g_stats.folded++; }
+        else if (fold_order_cmp(f, bi, &i, v)) {
+          in = &f->insts[v]; a = ir_args(f, v);
+          changed = true; g_stats.folded++;
+        }
         else if (fold_cmp_widened(f, v)) { changed = true; g_stats.folded++; }
         else if (in->op == I_NE && fold_bool_cmp(f, v)) { changed = true; g_stats.folded++; }
         else if (in->op == I_NE && fold_cmp_arith(f, bi, &i, v, uses)) {
