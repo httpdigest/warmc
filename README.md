@@ -1676,7 +1676,14 @@ make bench-record                                       # re-record it, native c
 make bench-record-warmc                                 # re-time warmc's column alone against it
 make bench-record-o3                                    # warmc at -O3 beside -O2, for the -O3 columns
 make bench-ab BASE=origin/main                          # this tree's warmc against BASE's, kernel by kernel (test/ab.py)
+make bench-llvm                                         # warmc against wasm2c and clang -O2 on the same wasm (test/llvm_compare.py)
 ```
+
+`make bench-llvm` sets warmc beside LLVM rather than beside the source's own
+native build: each kernel's wasm through WABT's `wasm2c` and `clang -O2`
+(SIMDe for its SIMD, `make simde`), so that what it finds is what warmc's
+code generation leaves behind, not what the source's compiler put in the
+wasm; it lists each kernel warmc takes more than 5% longer on.
 
 ---
 
