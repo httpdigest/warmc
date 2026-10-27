@@ -646,6 +646,9 @@ void a64_vadd(Buf *b, int size, int rd, int rn, int rm) { V3(0x4E208400u | VSZ(s
 void a64_vsub(Buf *b, int size, int rd, int rn, int rm) { V3(0x6E208400u | VSZ(size), rd, rn, rm); }
 
 void a64_vmul(Buf *b, int size, int rd, int rn, int rm) { V3(0x4E209C00u | VSZ(size), rd, rn, rm); }
+/* rd += rn * rm, rd -= rn * rm, lane by lane: bytes, halfwords or words */
+void a64_vmla(Buf *b, int size, int rd, int rn, int rm) { V3(0x4E209400u | VSZ(size), rd, rn, rm); }
+void a64_vmls(Buf *b, int size, int rd, int rn, int rm) { V3(0x6E209400u | VSZ(size), rd, rn, rm); }
 void a64_vneg(Buf *b, int size, int rd, int rn)         { V2(0x6E20B800u | VSZ(size), rd, rn); }
 
 void a64_vsmax(Buf *b, int size, int rd, int rn, int rm) { V3(0x4E206400u | VSZ(size), rd, rn, rm); }

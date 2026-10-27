@@ -225,6 +225,8 @@ void a64_vnot(Buf *b, int rd, int rn);
 void a64_vadd(Buf *b, int size, int rd, int rn, int rm);
 void a64_vsub(Buf *b, int size, int rd, int rn, int rm);
 void a64_vmul(Buf *b, int size, int rd, int rn, int rm);
+void a64_vmla(Buf *b, int size, int rd, int rn, int rm);
+void a64_vmls(Buf *b, int size, int rd, int rn, int rm);
 void a64_vneg(Buf *b, int size, int rd, int rn);
 void a64_vsmax(Buf *b, int size, int rd, int rn, int rm);
 void a64_vsmin(Buf *b, int size, int rd, int rn, int rm);

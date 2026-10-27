@@ -2200,6 +2200,39 @@ static void analyse_immediates(Isel *s) {
     }
   }
 
+  /* A vector product added into a sum, or taken from one, is an mla or an
+     mls into it, in lanes of 8, 16 or 32 bits, which mla has.  Not into a
+     value a loop carries round: there the multiply joins the chain each
+     iteration waits on, where with an add it is off it -- Zig's sum of
+     products (zigbench/simdsum), its multiplies made one (opt.c
+     fold_common_factor), ran 15% slower with the accumulator's add an mla,
+     as uadalp above. */
+  s->vmla = xcalloc(n ? n : 1, 1);
+  if (!warmc_getenv("WARMC_NO_VMLA"))
+  for (uint32_t oi = 0; oi < f->norder; oi++) {
+    uint32_t bi = f->order[oi];
+    Block *b = &f->blocks[bi];
+    for (uint32_t i = 0; i < b->ninsts; i++) {
+      Ref u = b->insts[i];
+      Inst *in = &f->insts[u];
+      if ((in->op != I_VADD && in->op != I_VSUB) || in->nargs != 2 || s->folded[u] ||
+          s->vadal[u] || in->imm2 > VLANE_I32)
+        continue;
+      Ref *a = ir_args(f, u);
+      for (int slot = in->op == I_VSUB ? 1 : 0; slot < 2; slot++) {
+        Ref e = a[slot];
+        Inst *ei = &f->insts[e];
+        if (ei->op != I_VMUL || ei->imm2 != in->imm2 || ei->block != bi) continue;
+        if (uses[e] != 1 || blocked[e] || s->folded[e]) continue;
+        const Inst *acc = &f->insts[a[slot ^ 1]];
+        if (acc->op == I_PARAM && f->blocks[acc->block].loop_depth) continue;
+        s->folded[e] = 1;
+        s->vmla[u] = (uint8_t)(slot + 1);
+        break;
+      }
+    }
+  }
+
   if (!warmc_getenv("WARMC_NO_FUSE"))
   for (uint32_t oi = 0; oi < f->norder; oi++) {
     uint32_t bi = f->order[oi];
@@ -3825,7 +3858,7 @@ give_up:
   xfree(s->zx_fuse); xfree(s->no_remat); xfree(s->paired); xfree(s->nl); xfree(s->pool);
   xfree(s->folded); xfree(s->uses); xfree(s->bfx); xfree(s->pinned); xfree(s->csinc);
   xfree(s->bfi);
-  xfree(s->vrot); xfree(s->vadal);
+  xfree(s->vrot); xfree(s->vadal); xfree(s->vmla);
   xfree(s->extr);
   xfree(s->pc); xfree(s->pc_bfirst); xfree(s->pc_bn); xfree(s->pc_head);
   xfree(s->recomp);
