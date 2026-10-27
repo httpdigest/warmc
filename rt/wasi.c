@@ -1682,6 +1682,7 @@ static int drive(int argc, char **argv) {
   if (!listen_at) { err("warmc-wasi: out of memory\n"); return 74; }
 
   int keep = 1;
+  const char *module = 0;
   for (int i = 1; i < argc; i++) {
     const char *a = argv[i];
     if (a[0] == '-' && a[1] == '-' && a[2] == 'd' && a[3] == 'i' &&
@@ -1713,6 +1714,17 @@ static int drive(int argc, char **argv) {
       continue;
     }
     if (str_eq(a, "--inherit-env")) { g_env_inherit = 1; continue; }
+    /* which module, in a program warmc made of several: a flag only there,
+       so that a program of one passes its guest every argument it did */
+    if (warmc_nmodules > 1 && str_eq(a, "--module") && i + 1 < argc) {
+      module = argv[++i];
+      continue;
+    }
+    if (warmc_nmodules > 1 && a[0] == '-' && a[1] == '-' && a[2] == 'm' && a[3] == 'o' &&
+        a[4] == 'd' && a[5] == 'u' && a[6] == 'l' && a[7] == 'e' && a[8] == '=') {
+      module = a + 9;
+      continue;
+    }
     if (str_eq(a, "--")) {
       for (int j = i + 1; j < argc; j++) argv[keep++] = argv[j];
       break;
@@ -1744,7 +1756,19 @@ static int drive(int argc, char **argv) {
   /* WASI's functions bound as the module is made, so that its start
      function can call them; one this host does not have is the stub's,
      which traps */
-  const ModuleDesc *md = &warmc_module;
+  const ModuleDesc *md = warmc_modules[0];
+  if (warmc_nmodules > 1) {
+    u32 k = 0;
+    while (module && k < warmc_nmodules && !str_eq(warmc_module_names[k], module)) k++;
+    if (!module || k == warmc_nmodules) {
+      err(module ? "warmc-wasi: no such module: " : "warmc-wasi: name a module with --module:");
+      if (module) err(module);
+      for (u32 j = 0; j < warmc_nmodules; j++) { err(" "); err(warmc_module_names[j]); }
+      err("\n");
+      return 74;
+    }
+    md = warmc_modules[k];
+  }
   WarmBinding *binds = md->nimports ? realloc(0, sizeof(WarmBinding) * md->nimports) : 0;
   for (u32 i = 0; i < md->nimports; i++) {
     const ImportDesc *im = &md->imports[i];

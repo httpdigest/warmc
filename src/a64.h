@@ -114,6 +114,7 @@ void a64_lsr_imm(Buf *b, int sf, int rd, int rn, int shift);
 void a64_asr_imm(Buf *b, int sf, int rd, int rn, int shift);
 void a64_ubfm(Buf *b, int sf, int rd, int rn, int immr, int imms);
 void a64_sbfm(Buf *b, int sf, int rd, int rn, int immr, int imms);
+void a64_bfm(Buf *b, int sf, int rd, int rn, int immr, int imms);
 void a64_clz(Buf *b, int sf, int rd, int rn);
 void a64_rbit(Buf *b, int sf, int rd, int rn);
 void a64_rev(Buf *b, int sf, int rd, int rn);

@@ -420,16 +420,16 @@ static bool nonzero_by_dominating_branch(IrFunc *f, uint32_t blk, Ref d) {
         Ref *ca = ir_args(f, pb->term_arg);
         switch (c->op) {
           case I_EQZ:
-            if (ca[0] == d && fallthru) return true;
+            if (ir_nonzero_with(f, ca[0], d) && fallthru) return true;
             break;
           case I_EQ:
-            if (fallthru && ((ca[0] == d && is_const_zero(f, ca[1])) ||
-                             (ca[1] == d && is_const_zero(f, ca[0]))))
+            if (fallthru && ((ir_nonzero_with(f, ca[0], d) && is_const_zero(f, ca[1])) ||
+                             (ir_nonzero_with(f, ca[1], d) && is_const_zero(f, ca[0]))))
               return true;
             break;
           case I_NE:
-            if (taken && ((ca[0] == d && is_const_zero(f, ca[1])) ||
-                          (ca[1] == d && is_const_zero(f, ca[0]))))
+            if (taken && ((ir_nonzero_with(f, ca[0], d) && is_const_zero(f, ca[1])) ||
+                          (ir_nonzero_with(f, ca[1], d) && is_const_zero(f, ca[0]))))
               return true;
             break;
           default: break;
@@ -477,7 +477,8 @@ static void emit_div(Isel *s, Ref v, bool sgn, bool rem) {
       !nonzero_by_dominating_branch(f, s->cur_block, a[1]))
     trap_if_zero(s, w, y, TRAP_DIV_ZERO);
 
-  bool need_m1 = sgn && !(known && dc != all) && !div_guarded_earlier(s, v, true);
+  bool need_m1 = sgn && !(known && dc != all) && !ir_not_int_min(f, a[0]) &&
+                 !div_guarded_earlier(s, v, true);
   if (sgn && rem) {
     /* idiv faults on INT_MIN / -1; any x rem -1 is 0, so a -1 divisor
        skips the divide entirely. */
@@ -929,6 +930,8 @@ static void emit_inst(Isel *s, Ref v) {
     case I_BSWAP: { int x = rd(s, a[0], S0);
                     int d = rmw2(s, v, x, -1, S1);
                     x64_bswap(B, sf, d); commit(s, v, d); break; }
+    /* made only where the target reverses bits in one (ir_has_bitrev) */
+    case I_BITREV: warmc_fatal("isel: bitrev on x86-64");
 
     case I_EQ: case I_NE: case I_LTS: case I_LTU: case I_GTS: case I_GTU:
     case I_LES: case I_LEU: case I_GES: case I_GEU: case I_EQZ:

@@ -1499,9 +1499,19 @@ static void emit_memop_r(Isel *s, Ref v, const Ref *a, bool fill) {
 
 #define SMALL_LOOP_INSTS 12u
 
+static bool block_calls(IrFunc *f, const Block *b) {
+  for (uint32_t i = 0; i < b->ninsts; i++) {
+    uint16_t op = f->insts[b->insts[i]].op;
+    if (op == I_CALL || op == I_CALL_INDIRECT || op == I_CALL_REF) return true;
+  }
+  return false;
+}
+
 /* Whether the natural loop headed by h is small: its blocks, found back
    from the latches, hold at most SMALL_LOOP_INSTS IR instructions and
-   terminators -- about what fits in 64 bytes once lowered. */
+   terminators -- about what fits in 64 bytes once lowered -- and no call.
+   A loop that calls waits on the call, not on fetching itself: the branch
+   over its padding was gobench/recurse's whole gap to clang. */
 static bool small_loop(IrFunc *f, uint32_t h) {
   uint32_t nb = f->nblocks, n = 0, sp = 0;
   uint8_t *in = xcalloc(nb ? nb : 1, 1);
@@ -1513,12 +1523,12 @@ static bool small_loop(IrFunc *f, uint32_t h) {
     uint32_t l = hb->preds[p];
     if (f->blocks[l].rpo >= hb->rpo && !in[l]) { in[l] = 1; stk[sp++] = l; }
   }
-  bool ok = true;
+  bool ok = !block_calls(f, hb);
   while (sp && ok) {
     uint32_t x = stk[--sp];
     Block *xb = &f->blocks[x];
     n += xb->ninsts + 1;
-    if (n > SMALL_LOOP_INSTS || x == f->entry) ok = false;
+    if (n > SMALL_LOOP_INSTS || x == f->entry || block_calls(f, xb)) ok = false;
     for (uint32_t p = 0; p < xb->npreds && ok; p++) {
       uint32_t q = xb->preds[p];
       if (!in[q]) { in[q] = 1; stk[sp++] = q; }
@@ -1973,6 +1983,39 @@ static void analyse_immediates(Isel *s) {
       if (!r.ok) continue;
       s->bfx[u] = r;
       s->folded[ir_args(f, u)[0]] = 1;
+    }
+  }
+
+  s->bfi = xcalloc(n ? n : 1, 1);
+  for (uint32_t oi = 0; oi < f->norder; oi++) {
+    uint32_t bi = f->order[oi];
+    Block *b = &f->blocks[bi];
+    for (uint32_t i = 0; i < b->ninsts; i++) {
+      Ref u = b->insts[i];
+      Inst *in = &f->insts[u];
+      if (in->op != I_OR || in->nargs != 2 || s->folded[u] || s->bfx[u].ok) continue;
+      Ref *a = ir_args(f, u);
+      int width = vt_is_64((ValType)in->type) ? 64 : 32;
+      for (int slot = 0; slot < 2; slot++) {
+        Ref c = a[slot], o = a[slot ^ 1];
+        struct Bfx *bf = &s->bfx[c];
+        if (!bf->ok || bf->sign || uses[c] != 1 || blocked[c] || s->folded[c] ||
+            f->insts[c].block != bi)
+          continue;
+        /* a constant is better an orr's immediate; a folded value is in
+           no register to insert into */
+        if (f->insts[o].op == I_CONST || s->folded[o]) continue;
+        /* where ubfm puts the field: the low bits for an extract, at
+           width - immr for an insert */
+        uint64_t field = bf->imms >= bf->immr
+                             ? (2ull << (bf->imms - bf->immr)) - 1
+                             : ((2ull << bf->imms) - 1) << (width - bf->immr);
+        if (width == 32) field &= 0xffffffffu;
+        if (ir_known_bits(f, o, 4) & field) continue;
+        s->folded[c] = 1;
+        s->bfi[u] = (uint8_t)(slot + 1);
+        break;
+      }
     }
   }
 
@@ -3488,7 +3531,7 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
   uint32_t *blk_end = fit && !span_of ? xmalloc(f->nblocks * sizeof(uint32_t)) : NULL;
   uint32_t *rec = NULL, nrec = 0;
 
-  uint32_t neo;
+  uint32_t neo, nsmall = 0;
   const uint32_t *eo = ir_emit_order(f, dead_ret, &neo);
   s->prev_bi = UINT32_MAX;
   for (uint32_t oi = 0; oi < neo; oi++) {
@@ -3499,6 +3542,7 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
       for (uint32_t p = 0; p < lb->npreds && !header; p++)
         if (f->blocks[lb->preds[p]].rpo >= lb->rpo) header = true;
       bool small = header && small_align && small_loop(f, bi);
+      if (small) nsmall++;
       uint32_t want = small ? 64 : lalign;
       if (header) {
         uint32_t at = phase + (uint32_t)(pro.len + B->len);
@@ -3665,6 +3709,7 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
 
   if (s->cold_frame) g_stats.cold_frames++;
   if (early) g_stats.early_rets++;
+  g_stats.small_loops += nsmall;
   Buf lead;
   memset(&lead, 0, sizeof lead);
   Reloc lead_rel;
@@ -3779,6 +3824,7 @@ give_up:
   xfree(s->imm_fold); xfree(s->fused); xfree(s->addr_fuse); xfree(s->ptr_fuse);
   xfree(s->zx_fuse); xfree(s->no_remat); xfree(s->paired); xfree(s->nl); xfree(s->pool);
   xfree(s->folded); xfree(s->uses); xfree(s->bfx); xfree(s->pinned); xfree(s->csinc);
+  xfree(s->bfi);
   xfree(s->vrot); xfree(s->vadal);
   xfree(s->extr);
   xfree(s->pc); xfree(s->pc_bfirst); xfree(s->pc_bn); xfree(s->pc_head);

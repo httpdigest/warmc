@@ -14,13 +14,27 @@
 #ifdef _WIN32
 #include <fcntl.h>
 #include <io.h>
+#else
+#include <dirent.h>
+#include <fcntl.h>
+#include <sys/time.h>
+#include <unistd.h>
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#endif
+extern char **environ;
 #endif
 
 static const char *usage_text =
   "warmc -- WebAssembly to native ahead-of-time compiler: AArch64 for Linux\n"
   "         and macOS, x86-64 for Windows\n"
   "\n"
-  "usage: warmc [options] input.wasm|input.wat\n"
+  "usage: warmc [options] input.wasm|input.wat ...\n"
+  "\n"
+  "  several core modules make one program holding them all, each compiled\n"
+  "  as it would be alone; it is asked for one by its file's name, the\n"
+  "  directory and the last extension left off -- the first argument, or\n"
+  "  with --wasi the host's --module NAME\n"
   "\n"
   "  a module may be given in either the binary or the text format: a name\n"
   "  ending in .wat is read as text and one ending in .wasm as binary; any\n"
@@ -380,7 +394,495 @@ static void set_level(OptOpts *o, int level) {
   o->fma = o->dead_frames = level >= 3;
 }
 
+static void print_stats(void) {
+  fprintf(stderr,
+          "warmc stats: folded=%llu dce=%llu cse=%llu licm=%llu branch=%llu\n"
+          "             loads_fwd=%llu dead_stores=%llu checks_removed=%llu params=%llu\n"
+          "             strength=%llu inlined=%llu rotated=%llu vectorised=%llu\n"
+          "             self_tail=%llu ldcomb=%llu spills=%llu insts=%llu\n"
+          "             ldpairs=%llu stpairs=%llu cold_frames=%llu early_rets=%llu entry_checks=%llu loop_phases=%llu"
+          " exact_store_checks=%llu exact_memop_checks=%llu\n"
+          "             reloads=%llu caller_saves=%llu csa_restores=%llu"
+          " v128_spills=%llu rb_trips=%llu split_cuts=%llu split_invs=%llu pieces=%llu"
+          " loop_pieces=%llu recomputes=%llu dead_frame_stores=%llu tramp_funcs=%llu gosp_funcs=%llu"
+          " go_resume_pruned=%llu go_resume_split=%llu go_noret_calls=%llu wrap_params=%llu\n"
+          "             escape_removed=%llu escape_forwarded=%llu escape_made=%llu gloop=%llu\n"
+          "             loop_closed=%llu reassoc=%llu cmp_reused=%llu csel_fused=%llu mul_wide=%llu fma=%llu gssa=%llu bitrevs=%llu small_loops=%llu\n"
+          "             bar_masks=%llu bar_elided=%llu\n"
+          "             devirt_ref=%llu devirt_indirect=%llu"
+          " devirt_null_kept=%llu const_reads=%llu throw_jumps=%llu"
+          " inl_more=%llu\n"
+          "             inl_flat=%llu inl_spliced=%llu inl_once=%llu"
+          " inl_retcall_sites=%llu inl_trans=%llu inl_escape=%llu rej_size=%llu"
+          " rej_budget=%llu rej_tail=%llu rej_retcalls=%llu rej_pads=%llu"
+          " rej_score=%llu rej_depth=%llu rej_rec=%llu max_frame=%llu\n"
+          "             unrolled=%llu unr_guarded=%llu unr_rej_shape=%llu"
+          " unr_rej_body=%llu unr_rej_exit=%llu unr_rej_trip=%llu"
+          " unr_rej_escape=%llu unr_addr_folded=%llu gc_nullchk=%llu\n"
+          "             slot_tests=%llu slot_nullchks=%llu once_dead=%llu once_dominated=%llu once_looped=%llu\n",
+          (unsigned long long)g_stats.folded, (unsigned long long)g_stats.dce_removed,
+          (unsigned long long)g_stats.cse_removed, (unsigned long long)g_stats.licm_hoisted,
+          (unsigned long long)g_stats.branch_simplified,
+          (unsigned long long)g_stats.loads_forwarded,
+          (unsigned long long)g_stats.stores_removed,
+          (unsigned long long)g_stats.checks_removed,
+          (unsigned long long)g_stats.params_removed,
+          (unsigned long long)g_stats.strength_reduced,
+          (unsigned long long)g_stats.inlined,
+          (unsigned long long)g_stats.rotated,
+          (unsigned long long)g_stats.vectorized,
+          (unsigned long long)g_stats.self_tail,
+          (unsigned long long)g_stats.loads_combined,
+          (unsigned long long)g_stats.spills,
+          (unsigned long long)g_stats.insts_emitted,
+          (unsigned long long)g_stats.ldpairs,
+          (unsigned long long)g_stats.stpairs,
+          (unsigned long long)g_stats.cold_frames,
+          (unsigned long long)g_stats.early_rets,
+          (unsigned long long)g_stats.entry_checks,
+          (unsigned long long)g_stats.loop_phases,
+          (unsigned long long)g_stats.exact_store_checks,
+          (unsigned long long)g_stats.exact_memop_checks,
+          (unsigned long long)g_stats.reloads,
+          (unsigned long long)g_stats.caller_saves,
+          (unsigned long long)g_stats.csa_restores,
+          (unsigned long long)g_stats.spills_v128_xcall,
+          (unsigned long long)g_stats.range_budget_trips,
+          (unsigned long long)g_stats.split_cuts,
+          (unsigned long long)g_stats.split_invs,
+          (unsigned long long)g_stats.pieces,
+          (unsigned long long)g_stats.loop_pieces,
+          (unsigned long long)g_stats.recomputes,
+          (unsigned long long)g_stats.dead_frame_stores,
+          (unsigned long long)g_stats.tramp_funcs,
+          (unsigned long long)g_stats.gosp_funcs,
+          (unsigned long long)g_stats.go_resume_pruned,
+          (unsigned long long)g_stats.go_resume_split,
+          (unsigned long long)g_stats.go_noret_calls,
+          (unsigned long long)g_stats.wrap_params,
+          (unsigned long long)g_stats.escape_removed,
+          (unsigned long long)g_stats.escape_forwarded,
+          (unsigned long long)g_stats.escape_made,
+          (unsigned long long)g_stats.globals_promoted,
+          (unsigned long long)g_stats.loops_closed,
+          (unsigned long long)g_stats.reassoc,
+          (unsigned long long)g_stats.cmp_reused,
+          (unsigned long long)g_stats.csel_fused,
+          (unsigned long long)g_stats.mul_wide,
+          (unsigned long long)g_stats.fma_fused,
+          (unsigned long long)g_stats.globals_ssa,
+          (unsigned long long)g_stats.bitrevs,
+          (unsigned long long)g_stats.small_loops,
+          (unsigned long long)g_stats.bar_masks,
+          (unsigned long long)g_stats.bar_elided,
+          (unsigned long long)g_stats.devirt_ref,
+          (unsigned long long)g_stats.devirt_indirect,
+          (unsigned long long)g_stats.devirt_null_kept,
+          (unsigned long long)g_stats.const_reads,
+          (unsigned long long)g_stats.throw_jumps,
+          (unsigned long long)g_stats.inl_more,
+          (unsigned long long)g_stats.inl_flat,
+          (unsigned long long)g_stats.inl_spliced,
+          (unsigned long long)g_stats.inl_once_forced,
+          (unsigned long long)g_stats.inl_retcall_sites,
+          (unsigned long long)g_stats.inl_transitive,
+          (unsigned long long)g_stats.inl_escape,
+          (unsigned long long)g_stats.inl_rej_size,
+          (unsigned long long)g_stats.inl_rej_budget,
+          (unsigned long long)g_stats.inl_rej_tailcall,
+          (unsigned long long)g_stats.inl_rej_retcalls,
+          (unsigned long long)g_stats.inl_rej_pads,
+          (unsigned long long)g_stats.inl_rej_score,
+          (unsigned long long)g_stats.inl_rej_depth,
+          (unsigned long long)g_stats.inl_rej_recursion,
+          (unsigned long long)g_stats.max_frame_bytes,
+          (unsigned long long)g_stats.unrolled,
+          (unsigned long long)g_stats.unr_guarded,
+          (unsigned long long)g_stats.unr_rej_shape,
+          (unsigned long long)g_stats.unr_rej_body,
+          (unsigned long long)g_stats.unr_rej_exit,
+          (unsigned long long)g_stats.unr_rej_trip,
+          (unsigned long long)g_stats.unr_rej_escape,
+          (unsigned long long)g_stats.unr_addr_folded,
+          (unsigned long long)g_stats.gc_nullchk_removed,
+          (unsigned long long)g_stats.slot_tests,
+          (unsigned long long)g_stats.slot_nullchks,
+          (unsigned long long)g_stats.once_dead,
+          (unsigned long long)g_stats.once_dominated,
+          (unsigned long long)g_stats.once_looped);
+}
+
+/* A core module read from path, the text format assembled */
+static Module *read_module(const char *path, uint8_t **binp) {
+  size_t len;
+  uint8_t *bin = read_file(path, &len);
+  if (ends_with(path, ".wat") || (!ends_with(path, ".wasm") && wat_is_text(bin, len))) {
+    size_t blen;
+    uint8_t *assembled = wat_assemble((const char *)bin, len, path, &blen);
+    xfree(bin);
+    bin = assembled;
+    len = blen;
+  }
+  if (wasm_is_component(bin, len))
+    warmc_fatal("%s is a component; several modules make one program of core modules only", path);
+  Module *m = wasm_parse(bin, len);
+  wasm_validate(m);
+  *binp = bin;
+  return m;
+}
+
+/* Several core modules, one program: each compiled as it would be alone,
+   under a symbol prefix of its own, and a table of them by name -- what
+   rt/modules.c holds for one -- which the program is asked for by name:
+   the CLI harness's first argument, the WASI host's --module.  Only the
+   one named is made an instance, so each keeps the code a program of its
+   own would have (sole_instance as there).  A test suite links hundreds of
+   modules into one program this way where it linked hundreds of programs,
+   and a program's first run, which macOS checks, is what those cost. */
+static void compile_several(const char **inputs, uint32_t n, OptOpts *opt, TargetFmt fmt,
+                            const char *output, bool obj_only, bool keep_obj, bool want_wasi,
+                            const char *wasi, const char *rt, const char *entry_sym,
+                            bool dead_strip) {
+  char **names = xcalloc(n, sizeof(char *)), **prefixes = xcalloc(n, sizeof(char *));
+  Module **mods = xcalloc(n, sizeof(Module *));
+  uint8_t **bins = xcalloc(n, sizeof(uint8_t *));
+  ObjBuilder o;
+  memset(&o, 0, sizeof o);
+  opt->sole_instance = !obj_only;
+  for (uint32_t i = 0; i < n; i++) {
+    /* named by the file's name, its directory and last extension left off */
+    const char *b = strrchr(inputs[i], '/');
+    b = b ? b + 1 : inputs[i];
+    const char *dot = strrchr(b, '.');
+    size_t len = dot && dot != b ? (size_t)(dot - b) : strlen(b);
+    names[i] = xstrndup(b, len);
+    for (uint32_t k = 0; k < i; k++)
+      if (!strcmp(names[k], names[i]))
+        warmc_fatal("%s and %s would both be the module %s", inputs[k], inputs[i], names[i]);
+    char pfx[32];
+    snprintf(pfx, sizeof pfx, "warmc_m%u", i);
+    prefixes[i] = xstrndup(pfx, strlen(pfx));
+    mods[i] = read_module(inputs[i], &bins[i]);
+    if (!obj_only && !want_wasi)
+      for (uint32_t k = 0; k < mods[i]->nimports; k++) {
+        const Import *im = &mods[i]->imports[k];
+        if (im->module_len == 22 && !memcmp(im->module, "wasi_snapshot_preview1", 22))
+          warmc_fatal("%s imports wasi_snapshot_preview1.%.*s, and nothing linked into the "
+                      "program provides it; pass --wasi to link the host that does",
+                      inputs[i], (int)im->name_len, im->name);
+      }
+    codegen_set_symbol_prefix(prefixes[i]);
+    codegen_set_display_prefix(names[i]);
+    codegen_rename_funcs(mods[i], prefixes[i]);
+    compile_module(mods[i], &o, opt);
+  }
+  codegen_set_display_prefix("");
+  codegen_emit_module_table(&o, (const char *const *)prefixes, (const char *const *)names, n);
+  if (opt->stats) print_stats();
+
+  char objpath[4096];
+  if (obj_only) snprintf(objpath, sizeof objpath, "%s", output);
+  else snprintf(objpath, sizeof objpath, "%s.o", output);
+  if (fmt == TGT_MACHO) write_macho64(&o, objpath);
+  else if (fmt == TGT_PE) write_coff64(&o, objpath);
+  else write_elf64(&o, objpath);
+  if (!obj_only) {
+    if (!keep_obj) warmc_temp_output(objpath);
+    warmc_link_exec(fmt, output, objpath, want_wasi ? wasi : NULL, rt, entry_sym, dead_strip);
+    if (!keep_obj) { remove(objpath); warmc_temp_output(NULL); }
+  }
+  for (uint32_t i = 0; i < n; i++) {
+    module_free(mods[i]);
+    xfree(bins[i]);
+    xfree(names[i]);
+    xfree(prefixes[i]);
+  }
+  xfree(mods); xfree(bins); xfree(names); xfree(prefixes);
+}
+
+static int warmc_main(int argc, char **argv);
+
+/* ---- WARMC_CACHE=DIR: what a compile made, kept under what it made it of --
+   The key is a digest of warmc itself, every argument (the output by its
+   file name alone, which a program's signature carries), every file an
+   argument names, every archive beside the runtime, which the link may take
+   from, and every WARMC_ setting but those only a program reads
+   (warmc_runtime_setting: the collector's, the random seed), so that the
+   GC suite run in each of its modes compiles once.  What is kept is the
+   exit status, what warmc said on stdout and stderr, and the output: a
+   compile with a key already kept makes its output a hard link to the kept
+   one -- a program macOS has checked on its first run is not checked again
+   -- says what it said then, and exits as it did, a module refused as
+   malformed or invalid included, and --validate-only's and --dump-*'s
+   verdicts, which write no file.  The test suites compile and refuse the
+   same modules the same way run after run: make check sets it.  Not for
+   what writes more than the output (--shared, --header, --keep-obj,
+   --emit-wasm), --print-ir, an external linker, whose own files are not in
+   the key, a compile that crashed or was killed, nor in a sanitiser's
+   build, whose report is the point.  The writers remove what they write
+   over, which may be an entry under another name. */
+#if !defined(_WIN32) && !defined(__SANITIZE_ADDRESS__) && !defined(__SANITIZE_THREAD__)
+#if defined(__has_feature)
+#if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer)
+#define NO_COMPILE_CACHE 1
+#endif
+#endif
+#else
+#define NO_COMPILE_CACHE 1
+#endif
+
+#ifndef NO_COMPILE_CACHE
+static struct {
+  char entry[4096];       /* DIR/xx/KEY: status, err, and stdout and out */
+  char err[4200], out1[4200];   /* where stderr and stdout go meanwhile */
+  const char *output;     /* -o's file; NULL for a command that writes none */
+  int real_err, real_out; /* the stderr and stdout warmc was given */
+  bool done;
+} g_cc = { .real_err = -1, .real_out = -1 };
+
+static bool cc_regular(const char *p) {
+  struct stat st;
+  return stat(p, &st) == 0 && S_ISREG(st.st_mode);
+}
+
+static void cc_digest_file(WarmDigest *d, const char *path) {
+  FILE *f = fopen(path, "rb");
+  if (!f) { warmc_digest_update(d, "-", 1); return; }
+  static char buf[1 << 16];
+  size_t n;
+  while ((n = fread(buf, 1, sizeof buf, f)) > 0) warmc_digest_update(d, buf, n);
+  fclose(f);
+}
+
+static int cc_cmp(const void *a, const void *b) {
+  return strcmp(*(char *const *)a, *(char *const *)b);
+}
+
+static bool cc_key(int argc, char **argv, char hex[65]) {
+  static const char *const no[] = { "--shared", "--header", "--keep-obj", "--emit-wasm",
+    "--print-ir", "--system-ld", "--ld", "--help", "-h" };
+  const char *rt = getenv("WARMC_RT");
+  bool says = false;    /* a command whose result is what it says */
+  for (int i = 1; i < argc; i++) {
+    for (size_t k = 0; k < sizeof no / sizeof no[0]; k++) {
+      size_t n = strlen(no[k]);
+      if (!strncmp(argv[i], no[k], n) && (argv[i][n] == 0 || argv[i][n] == '=')) return false;
+    }
+    if (!strncmp(argv[i], "--dump-", 7) || !strcmp(argv[i], "--validate-only")) says = true;
+    if (!strcmp(argv[i], "-o") && i + 1 < argc) g_cc.output = argv[i + 1];
+    if (!strcmp(argv[i], "--rt") && i + 1 < argc) rt = argv[i + 1];
+    if (!strncmp(argv[i], "--rt=", 5)) rt = argv[i] + 5;
+  }
+  /* a file of its own: never a device, which a link would replace */
+  struct stat ost;
+  if (g_cc.output && stat(g_cc.output, &ost) == 0 && !S_ISREG(ost.st_mode)) return false;
+  if (!g_cc.output && !says) return false;
+
+  WarmDigest d;
+  warmc_digest_init(&d);
+  warmc_digest_update(&d, "warmc compile cache 2", 22);
+  char self[4096];
+  uint32_t sn = sizeof self;
+#ifdef __APPLE__
+  if (_NSGetExecutablePath(self, &sn) != 0) return false;
+#else
+  ssize_t r = readlink("/proc/self/exe", self, sizeof self - 1);
+  if (r <= 0) return false;
+  self[r] = 0;
+  (void)sn;
+#endif
+  cc_digest_file(&d, self);
+  for (int i = 1; i < argc; i++) {
+    if (!strcmp(argv[i], "-o") && i + 1 < argc) {
+      const char *b = strrchr(argv[++i], '/');
+      warmc_digest_update(&d, "-o", 3);
+      warmc_digest_update(&d, b ? b + 1 : argv[i], strlen(b ? b + 1 : argv[i]) + 1);
+      continue;
+    }
+    warmc_digest_update(&d, argv[i], strlen(argv[i]) + 1);
+    const char *eq = argv[i][0] == '-' ? strchr(argv[i], '=') : NULL;
+    const char *path = eq ? eq + 1 : argv[i];
+    if (cc_regular(path)) cc_digest_file(&d, path);
+  }
+  if (rt) {
+    char dir[4096];
+    const char *slash = strrchr(rt, '/');
+    snprintf(dir, sizeof dir, "%.*s", slash ? (int)(slash - rt) : 1, slash ? rt : ".");
+    DIR *dp = opendir(dir);
+    char *names[512];
+    int nn = 0;
+    struct dirent *e;
+    while (dp && (e = readdir(dp)) && nn < 512) {
+      size_t n = strlen(e->d_name);
+      if (n > 2 && !strcmp(e->d_name + n - 2, ".a")) names[nn++] = xstrndup(e->d_name, n);
+    }
+    if (dp) closedir(dp);
+    qsort(names, (size_t)nn, sizeof *names, cc_cmp);
+    for (int k = 0; k < nn; k++) {
+      char p[8192];
+      snprintf(p, sizeof p, "%s/%s", dir, names[k]);
+      warmc_digest_update(&d, names[k], strlen(names[k]) + 1);
+      cc_digest_file(&d, p);
+      xfree(names[k]);
+    }
+  }
+  int ne = 0;
+  for (char **e = environ; *e; e++) ne++;
+  char **env = xcalloc((size_t)ne + 1, sizeof(char *));
+  int k = 0;
+  for (char **e = environ; *e; e++) {
+    const char *eq = strchr(*e, '=');
+    char name[256];
+    snprintf(name, sizeof name, "%.*s", eq ? (int)(eq - *e) : 0, *e);
+    if (!strncmp(*e, "WARMC_", 6) && !warmc_runtime_setting(name)) env[k++] = *e;
+  }
+  qsort(env, (size_t)k, sizeof *env, cc_cmp);
+  for (int i = 0; i < k; i++) warmc_digest_update(&d, env[i], strlen(env[i]) + 1);
+  xfree(env);
+
+  uint8_t h[32];
+  warmc_digest_final(&d, h);
+  for (int i = 0; i < 32; i++) snprintf(hex + 2 * i, 3, "%02x", h[i]);
+  return true;
+}
+
+static void cc_copy_fd(const char *path, int fd) {
+  int in = open(path, O_RDONLY);
+  if (in < 0) return;
+  char buf[1 << 14];
+  ssize_t n;
+  while ((n = read(in, buf, sizeof buf)) > 0)
+    if (write(fd, buf, (size_t)n) != n) break;
+  close(in);
+}
+
+static bool cc_link_or_copy(const char *from, const char *to) {
+  warmc_remove_file(to);
+  if (link(from, to) == 0) return true;
+  struct stat st;
+  if (stat(from, &st) != 0) return false;
+  int out = open(to, O_WRONLY | O_CREAT | O_TRUNC, st.st_mode & 0777);
+  if (out < 0) return false;
+  cc_copy_fd(from, out);
+  close(out);
+  return true;
+}
+
+/* stdout and stderr back where they were, what this compile said on them
+   passed on, and the files that held it gone unless an entry took them */
+static void cc_restore(void) {
+  if (g_cc.real_err < 0) return;
+  fflush(stdout);
+  fflush(stderr);
+  cc_copy_fd(g_cc.out1, g_cc.real_out);
+  cc_copy_fd(g_cc.err, g_cc.real_err);
+  dup2(g_cc.real_out, 1);
+  dup2(g_cc.real_err, 2);
+  close(g_cc.real_out);
+  close(g_cc.real_err);
+  g_cc.real_err = g_cc.real_out = -1;
+  remove(g_cc.out1);
+  remove(g_cc.err);
+}
+
+/* the entry: the exit status, what was said, and the output a success made
+   -- unless the compile read a setting the key leaves out */
+static void cc_keep(int rc) {
+  if (g_cc.real_err < 0 || rc < 0 || rc > 3 || warmc_runtime_setting_read()) return;
+  fflush(stdout);
+  fflush(stderr);
+  char tmp[4300], p[4400];
+  snprintf(tmp, sizeof tmp, "%s.%d", g_cc.entry, (int)getpid());
+  if (mkdir(tmp, 0755) != 0) return;
+  bool ok = true;
+  if (rc == 0 && g_cc.output && cc_regular(g_cc.output)) {
+    snprintf(p, sizeof p, "%s/out", tmp);
+    ok = cc_link_or_copy(g_cc.output, p);
+  }
+  snprintf(p, sizeof p, "%s/err", tmp);
+  ok = ok && cc_link_or_copy(g_cc.err, p);
+  snprintf(p, sizeof p, "%s/stdout", tmp);
+  ok = ok && cc_link_or_copy(g_cc.out1, p);
+  snprintf(p, sizeof p, "%s/status", tmp);
+  FILE *f = ok ? fopen(p, "w") : NULL;
+  if (f) { fprintf(f, "%d\n", rc); fclose(f); }
+  if (f && rename(tmp, g_cc.entry) == 0) return;
+  const char *const parts[] = { "out", "err", "stdout", "status" };
+  for (size_t i = 0; i < 4; i++) { snprintf(p, sizeof p, "%s/%s", tmp, parts[i]); remove(p); }
+  rmdir(tmp);
+}
+
+/* a compile that ends by exit(): a diagnostic's verdict is kept */
+static void cc_at_exit(void) {
+  if (warmc_exit_status) cc_keep(warmc_exit_status);
+  cc_restore();
+}
+
+/* the kept status where the entry was there (its output made of it, what
+   it said said again), or -1 */
+static int cc_begin(int argc, char **argv) {
+  const char *dir = getenv("WARMC_CACHE");
+  char hex[65];
+  if (!dir || !*dir || !cc_key(argc, argv, hex)) return -1;
+  char sub[4200], p[4300];
+  snprintf(sub, sizeof sub, "%s/%.2s", dir, hex);
+  snprintf(g_cc.entry, sizeof g_cc.entry, "%s/%s", sub, hex);
+  snprintf(p, sizeof p, "%s/status", g_cc.entry);
+  FILE *f = fopen(p, "r");
+  int rc = -1;
+  if (f) { if (fscanf(f, "%d", &rc) != 1) rc = -1; fclose(f); }
+  if (rc >= 0) {
+    snprintf(p, sizeof p, "%s/out", g_cc.entry);
+    if (rc == 0 && g_cc.output && (!cc_regular(p) || !cc_link_or_copy(p, g_cc.output))) rc = -1;
+  }
+  if (rc >= 0) {
+    fflush(stdout);
+    fflush(stderr);
+    snprintf(p, sizeof p, "%s/stdout", g_cc.entry);
+    cc_copy_fd(p, 1);
+    snprintf(p, sizeof p, "%s/err", g_cc.entry);
+    cc_copy_fd(p, 2);
+    utimes(g_cc.entry, NULL);
+    return rc;
+  }
+  mkdir(dir, 0755);
+  mkdir(sub, 0755);
+  snprintf(g_cc.err, sizeof g_cc.err, "%s.%d.err", g_cc.entry, (int)getpid());
+  snprintf(g_cc.out1, sizeof g_cc.out1, "%s.%d.out", g_cc.entry, (int)getpid());
+  int fe = open(g_cc.err, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  int fo = open(g_cc.out1, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  if (fe < 0 || fo < 0) {
+    if (fe >= 0) close(fe);
+    if (fo >= 0) close(fo);
+    return -1;
+  }
+  fflush(stdout);
+  fflush(stderr);
+  g_cc.real_err = dup(2);
+  g_cc.real_out = dup(1);
+  dup2(fe, 2);
+  dup2(fo, 1);
+  close(fe);
+  close(fo);
+  atexit(cc_at_exit);
+  return -1;
+}
+#endif
+
 int main(int argc, char **argv) {
+#ifndef NO_COMPILE_CACHE
+  int kept = cc_begin(argc, argv);
+  if (kept >= 0) return kept;
+  int rc = warmc_main(argc, argv);
+  cc_keep(rc);
+  cc_restore();
+  return rc;
+#else
+  return warmc_main(argc, argv);
+#endif
+}
+
+static int warmc_main(int argc, char **argv) {
 #ifdef _WIN32
   /* Dumps are byte-compared against golden files; keep the streams free
      of CRLF translation so output matches the POSIX hosts exactly. */
@@ -388,6 +890,8 @@ int main(int argc, char **argv) {
   _setmode(_fileno(stderr), _O_BINARY);
 #endif
   const char *input = NULL, *output = NULL, *target = "linux";
+  const char **inputs = xmalloc(sizeof(char *) * (size_t)(argc > 0 ? argc : 1));
+  uint32_t ninputs = 0;
   const char *rt = warmc_getenv("WARMC_RT");
   const char *ld = warmc_getenv("WARMC_LD");
   const char *wasi = warmc_getenv("WARMC_WASI");
@@ -597,7 +1101,7 @@ int main(int argc, char **argv) {
       else warmc_fatal("unknown pass %s", name);
     }
     else if (a[0] == '-') warmc_fatal("unknown option %s (try --help)", a);
-    else input = a;
+    else input = inputs[ninputs++] = a;
   }
   /* -fexact-trap: these keep what a trap would see where it cannot see it,
      a global in an argument or a frame's stores left out, whatever their
@@ -623,6 +1127,22 @@ int main(int argc, char **argv) {
   const char *outdef = fmt == TGT_PE ? "a.exe" : "a.out";
   const char *entry_sym = fmt == TGT_PE ? "warmc_win_entry"
                         : macho ? "_main" : "_start";
+
+  if (ninputs > 1) {
+    if (shared || sym_prefix || emit_wasm || validate_only || dump_component || dump_wit ||
+        dump_canon || dump_adapter || dump_cwit || dump_link || nnative_mods || system_ld)
+      warmc_fatal("several modules make one program with the built-in linker: "
+                  "--shared, --symbol-prefix, --emit-wasm, --validate-only, --dump-*, "
+                  "--native-module and --system-ld take one");
+    if (!obj_only && !rt) warmc_fatal("no runtime specified; pass --rt or set WARMC_RT");
+    char wasipath[4096];
+    const char *w = want_wasi ? wasi_archive(rt, wasi, false, wasipath, sizeof wasipath) : NULL;
+    compile_several(inputs, ninputs, &opt, fmt, output ? output : obj_only ? "out.o" : outdef,
+                    obj_only, keep_obj, want_wasi, w, rt, entry_sym, dead_strip);
+    xfree(inputs);
+    return 0;
+  }
+  xfree(inputs);
 
   if (dump_wit || is_directory(input) ||
       (validate_only && ends_with(input, ".wit"))) {
@@ -781,121 +1301,7 @@ int main(int argc, char **argv) {
   STAMP(_t3);
   if (wtm) fprintf(stderr, "front: compile_module total %.1f (peak %.0f MB)\n",
                    _t3 - _t2, peak_rss_mb());
-  if (opt.stats) {
-    fprintf(stderr,
-            "warmc stats: folded=%llu dce=%llu cse=%llu licm=%llu branch=%llu\n"
-            "             loads_fwd=%llu dead_stores=%llu checks_removed=%llu params=%llu\n"
-            "             strength=%llu inlined=%llu rotated=%llu vectorised=%llu\n"
-            "             self_tail=%llu ldcomb=%llu spills=%llu insts=%llu\n"
-            "             ldpairs=%llu stpairs=%llu cold_frames=%llu early_rets=%llu entry_checks=%llu loop_phases=%llu"
-            " exact_store_checks=%llu exact_memop_checks=%llu\n"
-            "             reloads=%llu caller_saves=%llu csa_restores=%llu"
-            " v128_spills=%llu rb_trips=%llu split_cuts=%llu split_invs=%llu pieces=%llu"
-            " loop_pieces=%llu recomputes=%llu dead_frame_stores=%llu tramp_funcs=%llu gosp_funcs=%llu"
-            " go_resume_pruned=%llu go_resume_split=%llu go_noret_calls=%llu wrap_params=%llu\n"
-            "             escape_removed=%llu escape_forwarded=%llu escape_made=%llu gloop=%llu\n"
-            "             loop_closed=%llu reassoc=%llu cmp_reused=%llu csel_fused=%llu mul_wide=%llu fma=%llu gssa=%llu\n"
-            "             bar_masks=%llu bar_elided=%llu\n"
-            "             devirt_ref=%llu devirt_indirect=%llu"
-            " devirt_null_kept=%llu const_reads=%llu throw_jumps=%llu"
-            " inl_more=%llu\n"
-            "             inl_flat=%llu inl_spliced=%llu inl_once=%llu"
-            " inl_retcall_sites=%llu inl_trans=%llu inl_escape=%llu rej_size=%llu"
-            " rej_budget=%llu rej_tail=%llu rej_retcalls=%llu rej_pads=%llu"
-            " rej_score=%llu rej_depth=%llu rej_rec=%llu max_frame=%llu\n"
-            "             unrolled=%llu unr_guarded=%llu unr_rej_shape=%llu"
-            " unr_rej_body=%llu unr_rej_exit=%llu unr_rej_trip=%llu"
-            " unr_rej_escape=%llu unr_addr_folded=%llu gc_nullchk=%llu\n"
-            "             slot_tests=%llu slot_nullchks=%llu once_dead=%llu once_dominated=%llu once_looped=%llu\n",
-            (unsigned long long)g_stats.folded, (unsigned long long)g_stats.dce_removed,
-            (unsigned long long)g_stats.cse_removed, (unsigned long long)g_stats.licm_hoisted,
-            (unsigned long long)g_stats.branch_simplified,
-            (unsigned long long)g_stats.loads_forwarded,
-            (unsigned long long)g_stats.stores_removed,
-            (unsigned long long)g_stats.checks_removed,
-            (unsigned long long)g_stats.params_removed,
-            (unsigned long long)g_stats.strength_reduced,
-            (unsigned long long)g_stats.inlined,
-            (unsigned long long)g_stats.rotated,
-            (unsigned long long)g_stats.vectorized,
-            (unsigned long long)g_stats.self_tail,
-            (unsigned long long)g_stats.loads_combined,
-            (unsigned long long)g_stats.spills,
-            (unsigned long long)g_stats.insts_emitted,
-            (unsigned long long)g_stats.ldpairs,
-            (unsigned long long)g_stats.stpairs,
-            (unsigned long long)g_stats.cold_frames,
-            (unsigned long long)g_stats.early_rets,
-            (unsigned long long)g_stats.entry_checks,
-            (unsigned long long)g_stats.loop_phases,
-            (unsigned long long)g_stats.exact_store_checks,
-            (unsigned long long)g_stats.exact_memop_checks,
-            (unsigned long long)g_stats.reloads,
-            (unsigned long long)g_stats.caller_saves,
-            (unsigned long long)g_stats.csa_restores,
-            (unsigned long long)g_stats.spills_v128_xcall,
-            (unsigned long long)g_stats.range_budget_trips,
-            (unsigned long long)g_stats.split_cuts,
-            (unsigned long long)g_stats.split_invs,
-            (unsigned long long)g_stats.pieces,
-            (unsigned long long)g_stats.loop_pieces,
-            (unsigned long long)g_stats.recomputes,
-            (unsigned long long)g_stats.dead_frame_stores,
-            (unsigned long long)g_stats.tramp_funcs,
-            (unsigned long long)g_stats.gosp_funcs,
-            (unsigned long long)g_stats.go_resume_pruned,
-            (unsigned long long)g_stats.go_resume_split,
-            (unsigned long long)g_stats.go_noret_calls,
-            (unsigned long long)g_stats.wrap_params,
-            (unsigned long long)g_stats.escape_removed,
-            (unsigned long long)g_stats.escape_forwarded,
-            (unsigned long long)g_stats.escape_made,
-            (unsigned long long)g_stats.globals_promoted,
-            (unsigned long long)g_stats.loops_closed,
-            (unsigned long long)g_stats.reassoc,
-            (unsigned long long)g_stats.cmp_reused,
-            (unsigned long long)g_stats.csel_fused,
-            (unsigned long long)g_stats.mul_wide,
-            (unsigned long long)g_stats.fma_fused,
-            (unsigned long long)g_stats.globals_ssa,
-            (unsigned long long)g_stats.bar_masks,
-            (unsigned long long)g_stats.bar_elided,
-            (unsigned long long)g_stats.devirt_ref,
-            (unsigned long long)g_stats.devirt_indirect,
-            (unsigned long long)g_stats.devirt_null_kept,
-            (unsigned long long)g_stats.const_reads,
-            (unsigned long long)g_stats.throw_jumps,
-            (unsigned long long)g_stats.inl_more,
-            (unsigned long long)g_stats.inl_flat,
-            (unsigned long long)g_stats.inl_spliced,
-            (unsigned long long)g_stats.inl_once_forced,
-            (unsigned long long)g_stats.inl_retcall_sites,
-            (unsigned long long)g_stats.inl_transitive,
-            (unsigned long long)g_stats.inl_escape,
-            (unsigned long long)g_stats.inl_rej_size,
-            (unsigned long long)g_stats.inl_rej_budget,
-            (unsigned long long)g_stats.inl_rej_tailcall,
-            (unsigned long long)g_stats.inl_rej_retcalls,
-            (unsigned long long)g_stats.inl_rej_pads,
-            (unsigned long long)g_stats.inl_rej_score,
-            (unsigned long long)g_stats.inl_rej_depth,
-            (unsigned long long)g_stats.inl_rej_recursion,
-            (unsigned long long)g_stats.max_frame_bytes,
-            (unsigned long long)g_stats.unrolled,
-            (unsigned long long)g_stats.unr_guarded,
-            (unsigned long long)g_stats.unr_rej_shape,
-            (unsigned long long)g_stats.unr_rej_body,
-            (unsigned long long)g_stats.unr_rej_exit,
-            (unsigned long long)g_stats.unr_rej_trip,
-            (unsigned long long)g_stats.unr_rej_escape,
-            (unsigned long long)g_stats.unr_addr_folded,
-            (unsigned long long)g_stats.gc_nullchk_removed,
-            (unsigned long long)g_stats.slot_tests,
-            (unsigned long long)g_stats.slot_nullchks,
-            (unsigned long long)g_stats.once_dead,
-            (unsigned long long)g_stats.once_dominated,
-            (unsigned long long)g_stats.once_looped);
-  }
+  if (opt.stats) print_stats();
 
   char objpath[4096];
   if (obj_only) snprintf(objpath, sizeof objpath, "%s", output ? output : "out.o");

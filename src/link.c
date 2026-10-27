@@ -1633,6 +1633,7 @@ static void write_elf_exec(Linker *L, const char *path, uint64_t entry) {
   emit_secs(&out, L, K_DATA, L->data_addr, data_off);
   elf_append_symbols(L, &out);
 
+  warmc_remove_file(path);  /* a new file: the old may be a compile cache's entry (main.c) */
   FILE *f = fopen(path, "wb");
   if (!f) warmc_fatal("link: cannot write %s", path);
   if (out.len && fwrite(out.data, 1, out.len, f) != out.len)
@@ -1868,6 +1869,7 @@ static void write_elf_shared(Linker *L, const char *path) {
   wr16(out.data + 0x3c, (uint16_t)nsh);
   wr16(out.data + 0x3e, 9);
 
+  warmc_remove_file(path);  /* a new file: the old may be a compile cache's entry (main.c) */
   FILE *f = fopen(path, "wb");
   if (!f) warmc_fatal("link: cannot write %s", path);
   if (out.len && fwrite(out.data, 1, out.len, f) != out.len)
@@ -2144,6 +2146,40 @@ static void sha_update(Sha256 *s, const void *p, size_t n) {
     if (s->nbuf == 64) { sha_block(s, s->buf); s->nbuf = 0; }
   }
 }
+/* SHA-256 for main.c's compile cache: the platform's where it has one, ours
+   otherwise */
+_Static_assert(sizeof(WarmDigest) >= sizeof(Sha256), "WarmDigest too small");
+#ifdef SHA_HW
+_Static_assert(sizeof(WarmDigest) >= sizeof(CC_SHA256_CTX), "WarmDigest too small");
+#endif
+static void sha_final(Sha256 *s, uint8_t out[32]);
+void warmc_digest_init(WarmDigest *d) {
+#ifdef SHA_HW
+  CC_SHA256_Init((CC_SHA256_CTX *)d);
+#else
+  sha_init((Sha256 *)d);
+#endif
+}
+void warmc_digest_update(WarmDigest *d, const void *p, size_t n) {
+#ifdef SHA_HW
+  while (n) {
+    CC_LONG k = n > (1u << 30) ? (1u << 30) : (CC_LONG)n;
+    CC_SHA256_Update((CC_SHA256_CTX *)d, p, k);
+    p = (const uint8_t *)p + k;
+    n -= k;
+  }
+#else
+  sha_update((Sha256 *)d, p, n);
+#endif
+}
+void warmc_digest_final(WarmDigest *d, uint8_t out[32]) {
+#ifdef SHA_HW
+  CC_SHA256_Final(out, (CC_SHA256_CTX *)d);
+#else
+  sha_final((Sha256 *)d, out);
+#endif
+}
+
 __attribute__((unused))
 static void sha_final(Sha256 *s, uint8_t out[32]) {
   uint64_t bits = s->n * 8;
@@ -2777,6 +2813,7 @@ static void write_macho(Linker *L, const char *path, uint64_t entry) {
     warmc_fatal("link: signature is %u bytes but %llu were reserved",
                 sb_len, (unsigned long long)sig_len);
 
+  warmc_remove_file(path);  /* a new file: the old may be a compile cache's entry (main.c) */
   FILE *f = fopen(path, "wb");
   if (!f) warmc_fatal("link: cannot write %s", path);
   if (out.len && fwrite(out.data, 1, out.len, f) != out.len)

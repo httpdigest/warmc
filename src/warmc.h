@@ -57,6 +57,11 @@ size_t xmalloc_fit(size_t n);
 double peak_rss_mb(void);
 /* getenv for the WARMC_ switches, from a copy taken on first use (util.c). */
 const char *warmc_getenv(const char *name);
+/* whether a WARMC_ setting is a program's alone (the GC's, the random
+   seed), which the compile cache keys nothing on, and whether this compile
+   read one even so (util.c) */
+bool warmc_runtime_setting(const char *name);
+bool warmc_runtime_setting_read(void);
 char *xstrndup(const char *s, size_t n);
 
 typedef int32_t HeapType;
@@ -707,6 +712,7 @@ typedef enum { CUSTOM_DEFAULT, CUSTOM_ALL, CUSTOM_NONE } CustomMode;
 void codegen_set_custom_sections(CustomMode mode);
 /* whether a function's symbol takes its name from the name section */
 void codegen_set_function_names(bool on);
+void codegen_set_display_prefix(const char *prefix);
 
 void codegen_set_load_barrier(bool on);
 extern bool warmc_load_barrier;
@@ -724,8 +730,20 @@ extern bool warmc_darwin_abi;
 
 void codegen_rename_funcs(Module *m, const char *prefix);
 
+void warmc_remove_file(const char *path);
+/* the status a diagnostic exits with, for main.c's compile cache to keep */
+extern int warmc_exit_status;
+
+/* SHA-256, incrementally (link.c) */
+typedef struct { uint64_t opaque[32]; } WarmDigest;
+void warmc_digest_init(WarmDigest *d);
+void warmc_digest_update(WarmDigest *d, const void *p, size_t n);
+void warmc_digest_final(WarmDigest *d, uint8_t out[32]);
+
 struct LinkPlan;
 void codegen_emit_component(const struct LinkPlan *p, ObjBuilder *o);
+void codegen_emit_module_table(ObjBuilder *o, const char *const *prefixes,
+                               const char *const *names, uint32_t n);
 
 uint64_t wasm_type_hash(const CompType *t);
 void codegen_emit_module_data(Module *m, ObjBuilder *o);
