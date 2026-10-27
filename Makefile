@@ -456,13 +456,11 @@ wasi-sdk: $(WASI_SDK_STAMP)
 # `make check` brings the pinned tools up to date first, and the official
 # testsuite its spec row runs; ktbench skips itself without a Kotlin
 # compiler, so the stdlib is only fetched when there is one, TeaVM only with
-# a JDK to run it, wasi-sdk only where it publishes a release, and GLFW and
-# LWJGL, which lwjgl/ builds its programs with, on macOS.
+# a JDK to run it, and wasi-sdk only where it publishes a release.
 # hsbench's GHC is not fetched: ghc-wasm-meta installs it, and the corpus
 # skips itself without.
 CHECK_TOOLS := wasm-tools testsuite $(if $(KOTLIN_VERSION),kotlin-stdlib) \
-               $(if $(JAVAC_VERSION),teavm) $(if $(WASI_SDK_HOST),wasi-sdk) \
-               $(if $(filter Darwin,$(UNAME_S)),glfw lwjgl)
+               $(if $(JAVAC_VERSION),teavm) $(if $(WASI_SDK_HOST),wasi-sdk)
 
 SPEC_LEVELS ?= -O1,-O2,-O2 --profile=deterministic
 

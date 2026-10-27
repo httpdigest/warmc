@@ -1,0 +1,82 @@
+#!/usr/bin/env python3
+"""wasmtime, as the test suites run it, answered from test/testcache.py where
+it was asked the same before: under wasmtime's version, every argument, the
+contents of every file an argument names and what came in on stdin.  A run
+whose result is more than its output and exit status -- a preopened
+directory it may write, a network, a subcommand other than run, a stdin
+that is not a file or /dev/null -- goes to wasmtime every time, and so does
+a run that did not end on its own.  A run that must not be an earlier one's
+again -- one that checks two draws of random_get differ -- sets
+WARMC_NO_TESTCACHE=1.  run_all.sh puts this directory first on PATH."""
+import os
+import subprocess
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.dirname(HERE))
+import testcache  # noqa: E402
+
+
+def real():
+    """the wasmtime PATH has after this one, or, where a suite ran it under
+    `env -i` with no PATH at all, one where wasmtime is installed"""
+    import pwd
+    home = pwd.getpwuid(os.getuid()).pw_dir
+    dirs = os.environ.get("PATH", "").split(os.pathsep) + \
+        os.defpath.split(os.pathsep) + ["/opt/homebrew/bin", "/usr/local/bin",
+                                         os.path.join(home, ".wasmtime", "bin")]
+    for d in dirs:
+        if d and os.path.abspath(d) != HERE:
+            p = os.path.join(d, "wasmtime")
+            if os.path.isfile(p) and os.access(p, os.X_OK):
+                return p
+    sys.exit("wasmtime shim: no wasmtime on PATH")
+
+
+def keepable(args):
+    if not args or args[0] not in ("run",) and not args[0].endswith((".wasm", ".wat", ".cwasm")):
+        return False
+    for a in args:
+        if a.startswith(("--dir", "--tcplisten", "--listenfd")) or "inherit-network" in a \
+                or "tcplisten" in a or a == "serve":
+            return False
+    return True
+
+
+def stdin_data():
+    """what stdin holds where it is finite -- a file, or /dev/null -- and
+    None where it is a pipe, a terminal or a socket, which may never end"""
+    import stat
+    st = os.fstat(0)
+    if stat.S_ISREG(st.st_mode):
+        return sys.stdin.buffer.read()
+    null = os.stat(os.devnull)
+    if stat.S_ISCHR(st.st_mode) and st.st_rdev == null.st_rdev:
+        return b""
+    return None
+
+
+def main():
+    wt = real()
+    args = sys.argv[1:]
+    data = stdin_data() if keepable(args) else None
+    if testcache.OFF or data is None:
+        os.execv(wt, [wt] + args)
+    parts = [testcache.File(a) if os.path.isfile(a) else a for a in args]
+    # wasmtime's own settings and Rust's change what it prints on a trap
+    env = sorted((k, v) for k, v in os.environ.items() if k.startswith(("WASMTIME_", "RUST_")))
+    k = testcache.key("wasmtime", testcache.File(wt), os.path.basename(wt), parts, data, env)
+    v = testcache.get("wasmtime", k)
+    if v is None:
+        r = subprocess.run([wt] + args, input=data, capture_output=True)
+        v = [r.returncode, r.stdout.decode("latin-1"), r.stderr.decode("latin-1")]
+        if r.returncode >= 0:
+            testcache.put("wasmtime", k, v)
+    sys.stdout.buffer.write(v[1].encode("latin-1"))
+    sys.stderr.buffer.write(v[2].encode("latin-1"))
+    sys.stdout.flush()
+    sys.stderr.flush()
+    sys.exit(v[0])
+
+
+main()

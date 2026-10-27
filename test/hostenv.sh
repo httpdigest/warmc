@@ -96,7 +96,34 @@ export WARMC_TIMEOUT WARMC_RUN_TIMEOUT
 # change nothing about the object warmc writes.
 WFTAG_IGNORE=" WARMC_FLAGS WARMC_TIMEOUT WARMC_RUN_TIMEOUT WARMC_RUN"
 WFTAG_IGNORE="$WFTAG_IGNORE WARMC_HOST WARMC_TARGET_FLAGS"
-WFTAG_IGNORE="$WFTAG_IGNORE WARMC_MACOS_LIBDIR WARMC_MACOS_LD "
+WFTAG_IGNORE="$WFTAG_IGNORE WARMC_MACOS_LIBDIR WARMC_MACOS_LD"
+# the caches (warmc's WARMC_CACHE, test/testcache.py's), which change no output
+WFTAG_IGNORE="$WFTAG_IGNORE WARMC_CACHE WARMC_NO_TESTCACHE WARMC_TESTCACHE_MB "
+
+# Compile to OUT by way of a directory of its own: what warmc writes is under
+# OUT's own name, which a macOS program's signature carries, so that the same
+# compile makes the same bytes run after run (and warmc's WARMC_CACHE finds
+# it), and it takes OUT's place whole.  wbuild OUT WARMC-ARGS...
+wbuild() {
+  local out="$1" d
+  shift
+  d=$(mktemp -d "${out%/*}/.build.XXXXXX") || return 1
+  # (where OUT is already the same file, a hard link of warmc's cache,
+  # mv leaves the new name in place: the directory goes whole)
+  if wtimeout "$@" -o "$d/${out##*/}"; then
+    mv -f "$d/${out##*/}" "$out"
+    rm -rf "$d"
+  else
+    rm -rf "$d"
+    return 1
+  fi
+}
+
+# warmc keeps what each compile made under what it made it of (src/main.c's
+# WARMC_CACHE): a suite compiles every program every time, and the ones
+# nothing changed for come back as hard links, by their contents -- never by
+# which file is newer.
+export WARMC_CACHE="${WARMC_CACHE:-$PWD/$BUILD/warmc-cache}"
 
 wftag() {
   local parts="${WARMC_FLAGS:-}" n

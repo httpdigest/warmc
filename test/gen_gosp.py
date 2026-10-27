@@ -323,9 +323,15 @@ def target_flags(build):
     return ["--rt", os.path.join(build, "warmrt.a")]
 
 def fuzz(seed, count, levels, flags, out):
-    """Each seed's module against wasm-interp at each level; the number bad."""
+    """Each seed's module against wasm-interp at each level; the number bad.
+    The modules of a level are one program (warmc given several), asked for
+    each by name: a program each was four hundred that macOS checks on their
+    first run.  Every Go function of every module must be rewritten, so the
+    program's gosp_funcs is the sum of theirs; where it is not, or a module
+    disagrees, each is compiled alone to say which."""
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import compare as cmp_mod
+    import concurrent.futures
     build = os.environ.get("BUILD", "build")
     os.makedirs(out, exist_ok=True)
     import hostbuild
@@ -333,52 +339,73 @@ def fuzz(seed, count, levels, flags, out):
     target = target_flags(build)
     warmc = os.path.join(build, "warmc")
     sh = lambda c, **kw: subprocess.run(c, capture_output=True, text=True, **kw)
-    bad = 0
-    for n in range(count):
-        s = seed + n
+
+    def prep(s):
+        """(seed, its Go functions, wasm, ref), or a message"""
         g = Gen(random.Random(s))
-        wat, wasm, ref = (os.path.join(out, "m." + x) for x in ("wat", "wasm", "ref"))
+        wat, wasm, ref = (os.path.join(out, "g%d.%s" % (s, x)) for x in ("wat", "wasm", "ref"))
         with open(wat, "w") as f:
             f.write(g.module())
         r = sh(["wat2wasm"] + wabt + [wat, "-o", wasm])
         if r.returncode:
-            print("seed %d: not assembled: %s" % (s, r.stderr[:300]))
-            bad += 1
-            continue
+            return "seed %d: not assembled: %s" % (s, r.stderr[:300])
         r = sh(["wasm-interp"] + wabt + ["--run-all-exports", wasm], timeout=60)
         with open(ref, "w") as f:
             f.write(r.stdout + r.stderr)
         if "error" in r.stdout + r.stderr or "trap" in r.stdout + r.stderr:
-            print("seed %d: the interpreter trapped: %s" % (s, (r.stdout + r.stderr)[:300]))
-            bad += 1
-            continue
-        for lv in levels:
-            # one of its own per seed and level, removed once run: Windows
-            # refuses to write over the image of one that has only just exited
-            binary = os.path.join(out, "m%d%s.bin" % (s, lv.replace(" ", "")))
-            r = sh([warmc] + lv.split() + ["--stats"] + flags + target + ["-o", binary, wasm], timeout=30)
-            if r.returncode:
-                print("seed %d %s: warmc: %s" % (s, lv, r.stderr[:400]))
-                bad += 1
-                break
-            if not re.search(r"\bgosp_funcs=%d\b" % (g.n + 1), r.stderr):
-                print("seed %d %s: gosp.c did not rewrite the %d Go functions" % (s, lv, g.n + 1))
-                bad += 1
-                break
-            nexp, fails, msgs = cmp_mod.compare(ref, binary, "g%d%s" % (s, lv), run=[], timeout=30)
-            try:
-                os.remove(binary)
-            except OSError:
-                pass
+            return "seed %d: the interpreter trapped: %s" % (s, (r.stdout + r.stderr)[:300])
+        return s, g.n + 1, wasm, ref
+
+    def level(lv):
+        """the messages of one level's run"""
+        # one of its own per level, removed once run: Windows refuses to
+        # write over the image of one that has only just exited
+        binary = os.path.join(out, "all%s.bin" % lv.replace(" ", ""))
+        r = sh([warmc] + lv.split() + ["--stats"] + flags + target + ["-o", binary] +
+               [m[2] for m in mods], timeout=600)
+        got = re.search(r"\bgosp_funcs=(\d+)\b", r.stderr)
+        msgs = []
+        if r.returncode or not got or int(got.group(1)) != sum(m[1] for m in mods):
+            for s, n, wasm, ref in mods:
+                one = os.path.join(out, "g%d%s.bin" % (s, lv.replace(" ", "")))
+                r1 = sh([warmc] + lv.split() + ["--stats"] + flags + target + ["-o", one, wasm],
+                        timeout=30)
+                if r1.returncode:
+                    msgs.append("seed %d %s: warmc: %s" % (s, lv, r1.stderr[:400]))
+                elif not re.search(r"\bgosp_funcs=%d\b" % n, r1.stderr):
+                    msgs.append("seed %d %s: gosp.c did not rewrite the %d Go functions" % (s, lv, n))
+            return msgs or ["%s: warmc: %s" % (lv, r.stderr[:400])]
+        for s, n, wasm, ref in mods:
+            nexp, fails, m = cmp_mod.compare(ref, binary, "g%d%s" % (s, lv), run=[], timeout=30,
+                                             prefix=("g%d" % s,))
             if fails:
-                print("seed %d %s: %d/%d failed" % (s, lv, fails, nexp))
-                for m in msgs[:6]:
-                    print("   ", m)
-                os.replace(wat, os.path.join(out, "bad-%d.wat" % s))
+                msgs.append("seed %d %s: %d/%d failed" % (s, lv, fails, nexp))
+                msgs += ["    " + x for x in m[:6]]
+                wat = os.path.join(out, "g%d.wat" % s)
+                if os.path.exists(wat):
+                    os.replace(wat, os.path.join(out, "bad-%d.wat" % s))
+        try:
+            os.remove(binary)
+        except OSError:
+            pass
+        return msgs
+
+    bad = 0
+    with concurrent.futures.ThreadPoolExecutor(os.cpu_count() or 4) as ex:
+        mods = []
+        for m in ex.map(prep, range(seed, seed + count)):
+            if isinstance(m, str):
+                print(m)
                 bad += 1
-                break
+            else:
+                mods.append(m)
+        for msgs in ex.map(level, levels):
+            for m in msgs:
+                print(m)
+            bad += len([m for m in msgs if not m.startswith("    ")])
     print("gosp fuzz: %d seeds from %d at %s, %d bad" % (count, seed, " ".join(levels), bad))
     return bad
+
 
 def main():
     ap = argparse.ArgumentParser()

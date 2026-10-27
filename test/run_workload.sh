@@ -19,7 +19,10 @@ case "$SRC" in *.wat) TAG="bench_$NAME";; *) TAG="$NAME${SRCOPT#-}";; esac
 WASM="$WORK/$TAG.wasm"
 REF="$WORK/$TAG.ref"
 
-FTAG=$(printf '%s' "${WARMC_FLAGS:-default}" | tr -c 'A-Za-z0-9' '_')
+# the configuration's name, test/hostenv.sh's: the flags and every WARMC_
+# setting, cut short with a checksum where run_combos.py's flags would make
+# a name past what a file name holds
+FTAG=$(wftag)
 BIN="$WORK/$TAG$FTAG"
 
 if [ "$NAME" = addr32 ] || [ "$NAME" = addrmulti ] || [ "$NAME" = addr64 ]; then

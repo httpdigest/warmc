@@ -22,11 +22,18 @@ its own too.  This script reads src/main.c's
 list and fails if a pass is missing from both PASSES and LEFT_OUT, so a new
 pass joins the combinations.
 
-  python3 test/run_combos.py                    # make check: pairs, cases + traps + gc
+make check's rows turn no pass off on their own: these settings are where
+each pass is off, beside every other on and off.  The cases run with the
+register allocator verified, as cases-O2 does; the settings run side by
+side, a suite of one setting at a time each, their work directories apart
+(test/hostenv.sh's wftag names them by WARMC_COMBO).
+
+  python3 test/run_combos.py                    # make check: pairs, cases + traps + gc + workload
   python3 test/run_combos.py --strength 3 --suites cases,traps,gc &&
     python3 test/run_combos.py --suites corpora          # make check-combos
 """
 import argparse
+import concurrent.futures
 import itertools
 import os
 import random
@@ -45,9 +52,11 @@ compress-data""".split()
 LEFT_OUT = {"fma", "dead-frames", "gssa-all", "exact-trap"}
 
 SUITES = {
-    "cases": ["./test/run_tests.sh"],
+    "cases": ["env", "WARMC_VERIFY_RA=1", "./test/run_tests.sh"],
     "traps": ["./test/run_traps.sh"],
     "gc": ["./test/run_gc.sh"],
+    # the C workload compiled by clang at -O0, whose wasm is the plainest
+    "workload": ["env", "WORKLOAD_CLANG_OPT=-O0", "./test/run_workload.sh"],
 }
 CORPORA = ["ctests", "cpptests", "rstests", "gotests", "stdgotests", "astests", "kttests",
            "zigtests", "hstests", "javatests"]
@@ -95,7 +104,7 @@ def triples_array(k, seed=1):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--strength", type=int, default=2, choices=(2, 3))
-    ap.add_argument("--suites", default="cases,traps,gc",
+    ap.add_argument("--suites", default="cases,traps,gc,workload",
                     help="comma-separated: %s, corpora (the language test corpora), or all"
                     % ", ".join(SUITES))
     ap.add_argument("--print", action="store_true", help="print the settings and stop")
@@ -113,28 +122,36 @@ def main():
         for s in settings:
             print(s)
         return 0
-    fails = 0
+    jobs = []
     for i, flags in enumerate(settings):
         for s in suites:
             if s == "corpora":
-                cmds = [["python3", "test/gobench.py", "--corpus", c, "--check", "--variant", flags]
-                        for c in CORPORA]
+                jobs += [(i, flags, c, ["python3", "test/gobench.py", "--corpus", c, "--check",
+                                        "--variant", flags]) for c in CORPORA]
             else:
-                cmds = [SUITES[s]]
-            for cmd in cmds:
-                # WARMC_COMBO only names the setting: its binaries and
-                # objects go under their own name, apart from those of the
-                # rows make check runs beside it at the same flags (row 1's
-                # are -O2's, and the two used to overwrite each other)
-                env = dict(os.environ, WARMC_FLAGS=flags, WARMC_COMBO=str(i + 1))
-                p = subprocess.run(cmd, env=env, capture_output=True, text=True)
-                if p.returncode:
-                    fails += 1
-                    name = cmd[3] if s == "corpora" else s
-                    print("FAIL[combos]: setting %d (%s), %s:" % (i + 1, flags, name))
-                    for line in (p.stdout + p.stderr).splitlines():
-                        if "FAIL" in line or "differ" in line:
-                            print("    " + line)
+                jobs.append((i, flags, s, SUITES[s]))
+
+    def run(job):
+        i, flags, name, cmd = job
+        # WARMC_COMBO only names the setting: its binaries and objects go
+        # under their own name, apart from those of the other settings
+        # running beside it and of the rows make check runs at the same
+        # flags (row 1's are -O2's, and the two used to overwrite each other)
+        env = dict(os.environ, WARMC_FLAGS=flags, WARMC_COMBO=str(i + 1))
+        return job, subprocess.run(cmd, env=env, capture_output=True, text=True)
+
+    # a quarter of the cores at once: the cases and the corpora each use
+    # them all, the traps, the collector and the workload one
+    width = max(2, (os.cpu_count() or 4) // 4)
+    fails = 0
+    with concurrent.futures.ThreadPoolExecutor(width) as ex:
+        for (i, flags, name, cmd), p in ex.map(run, jobs):
+            if p.returncode:
+                fails += 1
+                print("FAIL[combos]: setting %d (%s), %s:" % (i + 1, flags, name))
+                for line in (p.stdout + p.stderr).splitlines():
+                    if "FAIL" in line or "differ" in line:
+                        print("    " + line)
     if not fails:
         print("combos: %s at %d settings that turn every %s of %d passes off and on in every "
               "combination" % ("+".join(suites), len(settings),

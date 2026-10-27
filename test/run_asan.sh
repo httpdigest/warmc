@@ -39,29 +39,41 @@ export ASAN_OPTIONS=abort_on_error=0:detect_leaks=0
 
 LEVELS=${ASAN_LEVELS:--O2 -O0}
 
-pass=0; fail=0
+# One compile, its verdict on stdout: "ok", or FAIL and the report.  The
+# loop below runs one per input and level, on every core at once (alone,
+# one after another, they were make check's longest row by two minutes).
 check() {
   local input="$1" level="$2" label
   label="$(basename "$input")$level"
-  local err="$WORK/report.err"
-  wtimeout ./"$ASAN" $level -c -o "$WORK/out.o" "$input" >/dev/null 2>"$err"
+  local err out
+  err=$(mktemp "$WORK/report.XXXXXX") out=$(mktemp "$WORK/out.XXXXXX")
+  wtimeout ./"$ASAN" $level -c -o "$out" "$input" >/dev/null 2>"$err"
   local rc=$?
   if grep -q "AddressSanitizer\|runtime error\|LeakSanitizer" "$err"; then
     printf 'FAIL[asan] %s\n' "$label"
     sed -n '1,12p' "$err" | sed 's/^/    /'
-    fail=$((fail + 1))
-    return
-  fi
   # A rejection is a verdict, not a crash: these fixtures include modules that
   # are meant to be refused, and 1/2/3 are how warmc says so.
-  if [ "$rc" -gt 3 ]; then
+  elif [ "$rc" -gt 3 ]; then
     printf 'FAIL[asan] %s: exit %s\n' "$label" "$rc"
     sed -n '1,4p' "$err" | sed 's/^/    /'
-    fail=$((fail + 1))
-    return
+  else
+    echo ok
+    # clean: kept under the key its caller worked out
+    [ -n "${3:-}" ] && mkdir -p "$CLEAN/${3:0:2}" && : >"$CLEAN/${3:0:2}/$3"
   fi
-  pass=$((pass + 1))
+  rm -f "$err" "$out"
 }
+
+# Compiles found clean, each an empty file named by a digest of the ASan
+# build, the input, the level and ASAN_OPTIONS: what a clean compile depends
+# on.  WARMC_NO_TESTCACHE=1 makes them all again.
+CLEAN="$BUILD/testcache/asan-clean"
+
+if [ "${1:-}" = --one ]; then
+  check "$2" "$3" "${4:-}"
+  exit 0
+fi
 
 inputs=()
 for d in test/cases test/cases_gc test/cases_traps test/cases_relaxed test/wasi; do
@@ -76,11 +88,51 @@ for f in "$BUILD"/testrun/*.wasm; do [ -e "$f" ] && inputs+=("$f"); done
 # command line, and the one thing that road did not do was validate them.
 for f in "$BUILD"/components/*.wasm; do [ -e "$f" ] && inputs+=("$f"); done
 
+# Each input at every level, but where the levels add nothing: a probe of
+# run_components.py's mutation sweep, nearly always refused before any pass
+# runs, and the binary in build/testrun of a fixture that is here as text
+# (whose text goes through the binary parser too), at the first level alone.
+# The probes are four fifths of the inputs, and an ASan process takes 40 ms
+# to start.
+JOBS=$( (sysctl -n hw.logicalcpu 2>/dev/null || nproc 2>/dev/null) || echo 4)
+first=${LEVELS%% *}
+results="$WORK/results"
+want=0
+pairs="$WORK/pairs"
+: >"$pairs"
 for input in "${inputs[@]}"; do
-  for level in $LEVELS; do
-    check "$input" "$level"
-  done
+  levels=$LEVELS
+  case "$input" in
+    "$BUILD"/components/probe-*) levels=$first ;;
+    "$BUILD"/testrun/*.wasm)
+      b=$(basename "$input" .wasm)
+      for d in test/cases test/cases_gc test/cases_traps test/cases_relaxed test/wasi; do
+        [ -e "$d/$b.wat" ] && levels=$first
+      done ;;
+  esac
+  for level in $levels; do printf '%s\0%s\0' "$input" "$level" >>"$pairs"; want=$((want + 1)); done
 done
+# each pair with its key, those already clean answered here
+python3 - "$ASAN" "$CLEAN" "$pairs" "$WORK/todo" "$results" <<'EOF'
+import os, sys
+sys.path.insert(0, "test")
+import testcache
+asan, clean, pairs, todo, results = sys.argv[1:]
+items = open(pairs, "rb").read().split(b"\0")[:-1]
+with open(todo, "wb") as t, open(results, "w") as r:
+    for i in range(0, len(items), 2):
+        inp, lv = items[i].decode(), items[i + 1].decode()
+        k = testcache.key("asan clean", testcache.File(asan), testcache.File(inp), lv,
+                          os.environ.get("ASAN_OPTIONS", ""))
+        if not testcache.OFF and os.path.exists(os.path.join(clean, k[:2], k)):
+            r.write("ok\n")
+        else:
+            t.write(items[i] + b"\0" + items[i + 1] + b"\0" + k.encode() + b"\0")
+EOF
+xargs -0 -n 3 -P "$JOBS" "$0" --one <"$WORK/todo" >>"$results"
 
+pass=$(grep -c '^ok$' "$results")
+fail=$(grep -c '^FAIL' "$results")
+grep -v '^ok$' "$results"
 echo "asan: $pass compiled clean, $fail failed (${#inputs[@]} inputs)"
-[ "$fail" -eq 0 ]
+[ "$fail" -eq 0 ] && [ "$pass" -eq "$want" ]

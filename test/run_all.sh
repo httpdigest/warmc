@@ -9,6 +9,48 @@ LOGS="$BUILD/checklogs"
 rm -rf "$LOGS"
 mkdir -p "$LOGS"
 
+# A compile's limit (test/hostenv.sh's wtimeout): six seconds alone, where
+# the slowest of the suites' modules takes a fifth of one, but every row
+# starts at once here, and in that first half minute a compile of a tenth of
+# a second has taken more than six.  Thirty still ends a hang.
+export WARMC_TIMEOUT=${WARMC_TIMEOUT:-30}
+
+# What a compile made, kept under what it made it of (src/main.c's
+# WARMC_CACHE): the rows compile the same modules the same way run after
+# run.  At most WARMC_CACHE_MB of it (20 GB: a change to warmc makes every
+# corpus's programs anew), the least recently used going first, taken away
+# here, before any row reads it; test/testcache.py keeps the suites' own
+# results beside it, under the same rule.
+export WARMC_CACHE=${WARMC_CACHE:-$PWD/$BUILD/warmc-cache}
+# wasmtime, which a dozen suites compare with, answered from that cache too
+# where it was asked the same before (test/shims/wasmtime); a row reads no
+# stdin of make's, which the shim would wait on
+
+# (not on Windows, where wasmtime is wasmtime.exe and the shim no program)
+case "$(uname -s)" in
+  MINGW*|CLANG*|MSYS*) ;;
+  *) export PATH="$PWD/test/shims:$PATH" ;;
+esac
+python3 test/testcache.py trim
+python3 - "$WARMC_CACHE" "${WARMC_CACHE_MB:-20000}" <<'EOF'
+import os, shutil, sys
+root, cap = sys.argv[1], int(sys.argv[2]) << 20
+entries = []
+for sub in os.listdir(root) if os.path.isdir(root) else []:
+    for e in os.listdir(os.path.join(root, sub)):
+        p = os.path.join(root, sub, e)
+        if not os.path.isdir(p):
+            continue
+        size = sum(os.path.getsize(os.path.join(p, f)) for f in os.listdir(p))
+        entries.append((os.path.getmtime(p), size, p))
+total = sum(e[1] for e in entries)
+for _t, size, p in sorted(entries):
+    if total <= cap:
+        break
+    shutil.rmtree(p, ignore_errors=True)
+    total -= size
+EOF
+
 fail=0
 
 # The prepares are disjoint by construction -- each writes its own generator
@@ -57,6 +99,13 @@ done
 
 labels=()
 
+# what every row's answer depends on but its own command and settings
+# (test/row.py base): warmc, the runtimes, the pinned tools, the tree outside
+# src/, the toolchains on PATH
+CHECK_ROW_BASE=""
+[ -n "${WARMC_NO_TESTCACHE:-}" ] || CHECK_ROW_BASE=$(python3 test/row.py base)
+export CHECK_ROW_BASE
+
 # Left to the end, run on its own: see pause_check in run_gc.sh.
 export GC_PAUSE_CHECK=0
 
@@ -99,16 +148,18 @@ start() {
   fi
   labels[${#labels[@]}]="$label"
 
-  if [ -n "${CHECK_TIMING:-}" ]; then
-    ( t0=$(perl -MTime::HiRes=time -e 'print time')
-      "$@" >"$LOGS/$label.log" 2>&1; rc=$?; echo $rc >"$LOGS/$label.rc"
+  # through test/row.py, which answers a row that passed before with nothing
+  # it depends on changed, and keeps its CPU time, its descendants'
+  # included, for CHECK_TIMING: on a machine every row loads, a row's wall
+  # time says more about the others than itself
+  ( [ -n "${CHECK_TIMING:-}" ] && t0=$(perl -MTime::HiRes=time -e 'print time')
+    python3 test/row.py run "$label" "${CHECK_TIMING:+$LOGS/$label.cpu}" -- "$@" \
+      </dev/null >"$LOGS/$label.log" 2>&1
+    rc=$?; echo $rc >"$LOGS/$label.rc"
+    [ -n "${CHECK_TIMING:-}" ] &&
       perl -e "printf \"%.1f\", $(perl -MTime::HiRes=time -e 'print time')-$t0" \
         >"$LOGS/$label.sec"
-      row_done "$label" $rc ) &
-  else
-    ( "$@" >"$LOGS/$label.log" 2>&1; rc=$?; echo $rc >"$LOGS/$label.rc"
-      row_done "$label" $rc ) &
-  fi
+    row_done "$label" $rc ) &
 }
 
 # Every half minute, how far the run has got, and once few rows are left,
@@ -142,18 +193,9 @@ start cases-O2 env WARMC_VERIFY_RA=1 WARMC_VERIFY_SSA=1 WARMC_FLAGS=-O2 ./test/r
 start cases-wasmtime \
   bash -c '. test/hostenv.sh; WARMC_FLAGS=-O2 python3 test/run_wasmtime.py'
 
-start cases-noinl env WARMC_VERIFY_RA=1 WARMC_FLAGS="-O2 -fno-inline" ./test/run_tests.sh
-start gc-noinl    env WARMC_FLAGS="-O2 -fno-inline" ./test/run_gc.sh
-start workload-noinl \
-  env WARMC_FLAGS="-O2 -fno-inline" WORKLOAD_CLANG_OPT=-O0 ./test/run_workload.sh
-
-for p in mem strength cse loopclose dce; do
-  start "cases-no-$p" env WARMC_FLAGS="-O2 -fno-$p" ./test/run_tests.sh
-done
-
-for p in mem cse licm dce fold bce escape partial-escape reinline throw-jump loopclose barelide sealed; do
-  start "gc-no-$p" env WARMC_FLAGS="-O2 -fno-$p" ./test/run_gc.sh
-done
+# No row turns a single pass off: test/run_combos.py, after the rows, runs
+# the cases, traps, GC tests and the C workload at nine settings in which
+# every pass is off beside every other pass both on and off.
 
 # The benchmark corpora -- the Makefile's BENCH_CORPORA -- are programs
 # sized to be timed, and building and running them is most of a run on a
@@ -194,11 +236,6 @@ for lv in -O0 -O1 -O2; do
   done
 done
 
-for p in cse mem licm branch rotate vectorize loopclose; do
-  start "workload-no-$p" \
-    env WARMC_FLAGS="-O2 -fno-$p" WORKLOAD_CLANG_OPT=-O0 ./test/run_workload.sh
-done
-
 start pressure ./test/run_pressure.sh
 start link     ./test/run_link.sh
 # functions' symbols named as the name section names them, in each object
@@ -209,8 +246,6 @@ start names    python3 test/run_names.py
 start teavm    python3 test/run_teavm.py
 # --native-module: imports called as C functions, on the host's own target
 start native   python3 test/run_native.py
-# lwjgl/: LWJGL 3 programs through TeaVM and warmc, a window and its pixels
-start lwjgl    python3 test/run_lwjgl.py
 start shared   ./test/run_shared.sh
 
 start elf      ./test/run_elf.sh
@@ -268,16 +303,13 @@ start customs   python3 test/run_customs.py
 
 start wat       python3 test/run_wat.py
 
-start cases-nofold env WARMC_FLAGS="-O2 -fno-fold" ./test/run_tests.sh
-
 # The active data segments as src/datapack.c packs them: its compressor and
 # rt/lzunpack.inc's decoder on their own, random segments against
 # wasm-interp, and the cases with blocks of 64 bytes, whose ends fall where
-# their data is, and with no compression at all
+# their data is (with no compression at all they are run_combos')
 start datapack   ./build/datapack_test
 start datapack-gen python3 test/gen_datapack.py --seed 1 --count 60
 start cases-packsmall env WARMC_PACK_BLOCK_LOG2=6 WARMC_FLAGS=-O2 ./test/run_tests.sh
-start cases-nocompress env WARMC_FLAGS="-O2 -fno-compress-data" ./test/run_tests.sh
 # br_table's halfword entries reaching 8 instructions: most functions with a
 # table are made again, their branches far and their entries words
 start cases-table16 env WARMC_TABLE16_REACH=8 WARMC_FLAGS=-O2 ./test/run_tests.sh
@@ -295,24 +327,14 @@ start gc-farbr    env WARMC_FAR_BRANCH=1 ./test/run_gc.sh
 # inline needs the memory's base for them (memop_r.wat).
 start cases-nosmallmemop env WARMC_NO_SMALL_MEMOP=1 WARMC_FLAGS=-O2 ./test/run_tests.sh
 
-# Three lowerings that had no coverage outside one generated module.
 # -fgssa-all is the global promotion -O2 makes only where a loop pays for
-# it, applied to every global a function reads and writes; the naive
-# allocator and the explicit bounds checks were exercised only by
-# run_pressure.sh.  The naive allocator gives every value its own slot, so
-# the three widest fixtures in test/cases ask for a frame past the
-# addressing limit and it runs on the other two suites instead.  The
-# promotion also gets a real program: it once passed every hand-written
-# case and returned from TinyGo's runtime with the stack pointer of the
-# last call it made.
+# it, applied to every global a function reads and writes; it is no pass of
+# its own, so not run_combos'.  It also gets a real program: it once passed
+# every hand-written case and returned from TinyGo's runtime with the stack
+# pointer of the last call it made.
 start cases-gssa  env WARMC_FLAGS="-O2 -fgssa-all" ./test/run_tests.sh
 start gc-gssa     env WARMC_FLAGS="-O2 -fgssa-all" ./test/run_gc.sh
 bench gobench-gssa python3 test/gobench.py --corpus gobench --check --variant '-O2 -fgssa-all'
-start traps-naive env WARMC_FLAGS="-O2 -fno-regalloc" ./test/run_traps.sh
-start gc-naive    env WARMC_FLAGS="-O2 -fno-regalloc" ./test/run_gc.sh
-start cases-noguard env WARMC_FLAGS="-O2 -fno-guard-pages" ./test/run_tests.sh
-start traps-noguard env WARMC_FLAGS="-O2 -fno-guard-pages" ./test/run_traps.sh
-start gc-noguard    env WARMC_FLAGS="-O2 -fno-guard-pages" ./test/run_gc.sh
 # -fdead-frames removes stores into a frame that nothing reads again, so the
 # hand-written cases run with it too (deadframes.wat holds its shapes, and
 # deadframes_above.wat a stack it must leave alone), and so do the corpora
@@ -330,6 +352,10 @@ start gc-exacttrap    env WARMC_FLAGS="-O2 -fexact-trap" ./test/run_gc.sh
 
 start magic    python3 test/magic.py
 start optcases python3 test/run_optcases.py
+# random shapes of the optimiser's folds and their near misses -- bit
+# reversals, float computations of integers truncated and compared,
+# TinyGo's select tree round a truncation -- against wasm-interp
+start folds    python3 test/gen_folds.py --seed 1 --count 40
 start trapstate python3 test/run_trapstate.py
 start reject   ./test/run_reject.sh
 start asan     ./test/run_asan.sh
@@ -376,10 +402,10 @@ if [ -z "${CHECK_SMOKE:-}" ]; then
   start spec python3 test/spec/run.py "--levels=${SPEC_LEVELS:--O1,-O2,-O2 --profile=deterministic}"
   wait
   # Every pair of passes, off and on in all four combinations, over the
-  # cases, traps and the collector: nine settings (make check-combos does
-  # triples).  Last and alone, since each setting runs those suites on
-  # every core, which beside the other rows pushes their compiles past
-  # their timeouts.
+  # cases, traps, the collector and the C workload: nine settings (make
+  # check-combos does triples).  Last and alone, since its settings run side
+  # by side on every core, which beside the other rows pushes their
+  # compiles past their timeouts.
   start combos python3 test/run_combos.py
   wait
 fi
@@ -395,9 +421,10 @@ for label in "${labels[@]}"; do
 done
 
 if [ -n "${CHECK_TIMING:-}" ]; then
-  echo "--- timing (slowest first; the run costs the longest job)"
+  echo "--- timing (wall and CPU seconds, slowest first; the run costs the longest job)"
   for label in "${labels[@]}"; do
-    printf '%8s  %s\n' "$(cat "$LOGS/$label.sec" 2>/dev/null || echo '?')" "$label"
+    printf '%8s %8s  %s\n' "$(cat "$LOGS/$label.sec" 2>/dev/null || echo '?')" \
+      "$(cat "$LOGS/$label.cpu" 2>/dev/null || echo '?')" "$label"
   done | sort -rn
 fi
 
