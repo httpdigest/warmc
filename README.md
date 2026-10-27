@@ -1675,6 +1675,7 @@ make bench-compare                                      # all corpora vs the rec
 make bench-record                                       # re-record it, native column included
 make bench-record-warmc                                 # re-time warmc's column alone against it
 make bench-record-o3                                    # warmc at -O3 beside -O2, for the -O3 columns
+make bench-ab BASE=origin/main                          # this tree's warmc against BASE's, kernel by kernel (test/ab.py)
 ```
 
 ---
@@ -1840,7 +1841,7 @@ Most of the suite is **differential**. warmc's output is compared with:
   instructions at `-O2` match a pattern, in the whole function or after its
   `ret`, where the blocks emitted after the rest go, for what changes the code
   and not what it computes; `test/cases_opt/trunc_exact.wat` is made by
-  `test/gen_fexact.py`
+  `test/gen_fexact.py`, `addchain.wat` by `test/gen_addchain.py`
 - exact arithmetic, for every division's magic numbers (`test/magic.py`)
 - the module itself, for the custom sections each linked image carries, read
   back from Mach-O, ELF and PE (`test/check_macho.py`, `check_elf.py`,
