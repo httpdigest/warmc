@@ -12,7 +12,8 @@
 ;; each compare on and past each bound, a fraction or a value outside never
 ;; equal, a single value, NaN, f32; not where the bounds straddle the
 ;; constant, the value is not exact, or itself is any float.  Answers are
-;; wasm's float semantics, worked out in Python.
+;; wasm's float semantics, worked out in Python by test/gen_fexact.py, which
+;; writes this file: a change goes there.
 ;;
 ;; shape: bigstruct fcvtz=0
 ;; shape: bigstruct cvtf=0
@@ -37,6 +38,7 @@
 ;; shape: anyi64 fcvtz=1
 ;; shape: sat31 fcvtz=1
 ;; shape: negu fcvtz=1
+;; shape: negu64 fcvtz=1
 ;; shape: subu fcvtz=1
 ;; shape: mulu fcvtz=1
 ;; shape: negx fcvtz=1
@@ -265,6 +267,22 @@
 ;; run: negu -2147483648 => i32:0
 ;; run: negu -1 => i32:0
 ;; run: negu -5 => i32:0
+;; run: negu64 0 => i64:1
+;; run: negu64 1 => i64:2
+;; run: negu64 2 => i64:3
+;; run: negu64 3 => i64:4
+;; run: negu64 5 => i64:6
+;; run: negu64 100 => i64:101
+;; run: negu64 255 => i64:256
+;; run: negu64 256 => i64:257
+;; run: negu64 321 => i64:322
+;; run: negu64 4095 => i64:4096
+;; run: negu64 65535 => i64:65536
+;; run: negu64 16777215 => i64:16777216
+;; run: negu64 2147483647 => i64:2147483648
+;; run: negu64 -2147483648 => i64:0
+;; run: negu64 -1 => i64:0
+;; run: negu64 -5 => i64:0
 ;; run: subu 0 0 => i32:0
 ;; run: subu 1 5 => i32:0
 ;; run: subu 5 1 => i32:4
@@ -855,6 +873,8 @@
     (i32.trunc_sat_f64_s (f64.add (f64.convert_i32_u (i32.and (local.get 0) (i32.const 0x7fffffff))) (f64.const 1))))
   (func $negu (export "negu") (param i32) (result i32)
     (i32.trunc_sat_f64_u (f64.add (f64.convert_i32_s (local.get 0)) (f64.const 1))))
+  (func $negu64 (export "negu64") (param i32) (result i64)
+    (i64.trunc_sat_f64_u (f64.add (f64.convert_i32_s (local.get 0)) (f64.const 1))))
   (func $subu (export "subu") (param i32 i32) (result i32)
     (i32.trunc_sat_f64_u (f64.sub (f64.convert_i32_u (i32.and (local.get 0) (i32.const 255))) (f64.convert_i32_u (i32.and (local.get 1) (i32.const 255))))))
   (func $mulu (export "mulu") (param i32 i32) (result i32)
