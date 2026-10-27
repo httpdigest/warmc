@@ -13,24 +13,24 @@ A kernel whose two programs are the same bytes is not timed, nor one whose
 two are those an earlier run timed: its figure is that run's, kept in
 build/ab/results.json under the two programs' digests, so that after a
 change that moves three kernels only those three run again (--fresh times
-every one).  J kernels run
-at once (6 by default: the author's machine has 12 performance cores), each
-its two programs in turn, the other order every round.  A program's figure
-is its least: what a kernel takes is never less than its own work and
-anything else running only adds -- the median of two copies of one program
-differed by 8% where the least agreed to 0.1%.  So the first run, which
-macOS checks, needs no run before it, and a kernel is done after 3 rounds
-once each program's two least agree to 0.5%, or the two programs' to 1%;
-the rest go on to N (7).  Kernels timed at once share the memory's
-bandwidth, so one 2% or more apart is timed again alone, up to N rounds,
-done once each program's two least agree, and that is what counts.  The whole corpus
-takes about a minute and a half where one kernel at a time took half an
-hour.  --aa times this tree's warmc against itself, built twice, each time
-anew: what the
-figures move by when nothing changed (on the author's machine a handful
-of kernels 3-9% -- empty, memcpy, addf64, bintree, cbench/lexer and
-asbench/virtual among them -- the rest within 2%; a figure kept from an
-earlier run keeps such a kernel's luck, which --fresh redraws).
+every one).  J kernels run at once (6 by default: the author's machine has
+12 performance cores), each its two programs in turn, the other order every
+round.  A program's figure is its least: what a kernel takes is never less
+than its own work and anything else running only adds -- the median of two
+copies of one program differed by 8% where the least agreed to 0.1%.  So
+the first run, which macOS checks, needs no run before it, and a kernel is
+done after 3 rounds once each program's two least agree to 0.5%, or the two
+programs' to 1%; the rest go on to N (7).  Kernels timed at once share the
+memory's bandwidth, so one 2% or more apart is timed again alone, up to N
+rounds, done once each program's two least agree, and that is what counts.
+Every kernel of every corpus takes about 40 seconds, and 30 more to compile
+them, where one kernel at a time took half an hour.
+
+--aa times this tree's warmc against itself, built twice, each time anew:
+what the figures move by when nothing changed -- on the author's machine a
+handful of kernels 3-9% (empty, memcpy, addf64, bintree, cbench/lexer and
+asbench/virtual among them), the rest within 2%.  A figure kept from an
+earlier run keeps such a kernel's luck, which --fresh redraws.
 
 Cycles are what /usr/bin/time -l reports, so this runs on macOS only.
 """
