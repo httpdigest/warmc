@@ -2901,7 +2901,7 @@ static bool carried_chain(IrFunc *f, Ref v, const uint32_t *uses, Ref *base, uin
   for (int d = 0; f->insts[x].op != I_PARAM; d++) {
     const Inst *xi = &f->insts[x];
     uint64_t k;
-    if (d == CHAIN_DEPTH || xi->op != in->op || xi->nargs != 2 || xi->type != in->type ||
+    if (d == CHAIN_DEPTH || xi->op != in->op || xi->nargs != 2 ||
         !is_const(f, ir_args(f, x)[1], &k) || !fold_int_binop(in->op, in->type, k, *c, c))
       return false;
     x = ir_args(f, x)[0];
@@ -2915,7 +2915,7 @@ static bool carried_chain(IrFunc *f, Ref v, const uint32_t *uses, Ref *base, uin
   for (uint32_t p = 0; p < h->npreds; p++) {
     const Block *pb = &f->blocks[h->preds[p]];
     for (uint32_t si = 0; si < pb->nsuccs; si++)
-      if (pb->succs[si].target == hb && ir_resolve(f, pb->succs[si].args[q]) == v) {
+      if (pb->succs[si].target == hb && pb->succs[si].args[q] == v) {
         *base = x;
         return true;
       }
