@@ -2888,6 +2888,101 @@ static Ref repacked(IrFunc *f, Ref hi, Ref lo) {
   return x;
 }
 
+/* Whether v, x op c1 op c2 ... with x a block's parameter, is what an
+   edge hands x: one from a block x's dominates, a loop's back edge.  *c
+   comes in as v's constant and goes out as all of them folded into one; at
+   most CHAIN_DEPTH links.  Not where nothing else reads x: the chain would
+   keep it live to its end, where it dies at its start (one of
+   zigbench/arena's loops, 6% slower with it). */
+#define CHAIN_DEPTH 16
+static bool carried_chain(IrFunc *f, Ref v, const uint32_t *uses, Ref *base, uint64_t *c) {
+  const Inst *in = &f->insts[v];
+  Ref x = ir_args(f, v)[0];
+  for (int d = 0; f->insts[x].op != I_PARAM; d++) {
+    const Inst *xi = &f->insts[x];
+    uint64_t k;
+    if (d == CHAIN_DEPTH || xi->op != in->op || xi->nargs != 2 || xi->type != in->type ||
+        !is_const(f, ir_args(f, x)[1], &k) || !fold_int_binop(in->op, in->type, k, *c, c))
+      return false;
+    x = ir_args(f, x)[0];
+  }
+  if (uses[x] < 2) return false;
+  uint32_t hb = f->insts[x].block;
+  const Block *h = &f->blocks[hb];
+  uint32_t q = 0;
+  while (q < h->nparams && h->params[q] != x) q++;
+  if (q == h->nparams) return false;
+  for (uint32_t p = 0; p < h->npreds; p++) {
+    const Block *pb = &f->blocks[h->preds[p]];
+    for (uint32_t si = 0; si < pb->nsuccs; si++)
+      if (pb->succs[si].target == hb && ir_resolve(f, pb->succs[si].args[q]) == v) {
+        *base = x;
+        return true;
+      }
+  }
+  return false;
+}
+
+/* Whether i64 x is the sign extension of its low 32 bits: its top 33 bits
+   copies of bit 31.  A signed load, an extension, a constant in range, an
+   and, or or xor of two such, a select of two, and a block parameter every
+   edge hands one -- assumed of a parameter while its own edges are asked,
+   so that a loop's value is one where all it starts from and is made of
+   are: Go keeps an int32 in an i64 and sign-extends it again at each use
+   (stdgo/multiret's min and max, two sxtw on the chain each element). */
+#define SX_DEPTH 8
+static bool sext32_rec(IrFunc *f, Ref x, int depth, Ref *asked, uint32_t nasked) {
+  const Inst *in = &f->insts[x];
+  if (in->type != VT_I64) return false;
+  uint64_t c;
+  if (is_const(f, x, &c)) return (uint64_t)(int64_t)(int32_t)(uint32_t)c == c;
+  if ((ir_known_bits(f, x, KB_DEPTH) >> 31) == 0) return true;
+  switch (in->op) {
+    case I_EXT8S: case I_EXT16S: case I_EXT32S: case I_EXTENDS: return true;
+    case I_LOAD:
+      return MEMF_SIZE(in->imm2) < 2 || (MEMF_SIZE(in->imm2) == 2 && (in->imm2 & MEMF_SIGNED));
+    default: break;
+  }
+  if (depth <= 0) return false;
+  const Ref *a = ir_args(f, x);
+  switch (in->op) {
+    case I_AND: case I_OR: case I_XOR:
+      return in->nargs == 2 && sext32_rec(f, a[0], depth - 1, asked, nasked) &&
+             sext32_rec(f, a[1], depth - 1, asked, nasked);
+    case I_SELECT:
+      return in->nargs == 3 && sext32_rec(f, a[0], depth - 1, asked, nasked) &&
+             sext32_rec(f, a[1], depth - 1, asked, nasked);
+    case I_PARAM: {
+      for (uint32_t i = 0; i < nasked; i++)
+        if (asked[i] == x) return true;
+      /* each parameter asked takes a level of depth: nasked < SX_DEPTH */
+      asked[nasked] = x;
+      const Block *b = &f->blocks[in->block];
+      uint32_t q = 0;
+      while (q < b->nparams && b->params[q] != x) q++;
+      if (q == b->nparams || !b->npreds) return false;
+      for (uint32_t pk = 0; pk < b->npreds; pk++) {
+        const Block *pb = &f->blocks[b->preds[pk]];
+        for (uint32_t si = 0; si < pb->nsuccs; si++) {
+          const Edge *e = &pb->succs[si];
+          if (e->target != in->block) continue;
+          if (e->nargs != b->nparams ||
+              !sext32_rec(f, e->args[q], depth - 1, asked, nasked + 1))
+            return false;
+        }
+      }
+      return true;
+    }
+    default:
+      return false;
+  }
+}
+
+static bool ir_sext32(IrFunc *f, Ref x) {
+  Ref asked[SX_DEPTH];
+  return sext32_rec(f, x, SX_DEPTH, asked, 0);
+}
+
 /* x * c + y * c is (x + y) * c, and x * c - y * c is (x - y) * c: the
    distributive law, exact in wrapping arithmetic, an integer's or lane by
    lane, where each product is read here alone -- one multiply where there
@@ -3065,6 +3160,32 @@ static bool fold_block(IrFunc *f, uint32_t bi, const OptOpts *o, const uint32_t 
         in = &f->insts[v]; a = ir_args(f, v);
         Ref inner_lhs = ir_args(f, a[0])[0];
         a[0] = inner_lhs;
+        a[1] = m;
+        g_stats.folded++;
+        changed = true;
+        i++;
+        continue;
+      }
+    }
+
+    /* x op c1 op c2 ... that a loop hands its parameter x on a back edge is
+       x op c, the constants folded into one, also where the links are read
+       elsewhere: they are kept for those, and the next iteration no longer
+       waits on each in turn (gobench/bigstruct's loop unrolled four times
+       was a chain of four adds an iteration).  Only there: elsewhere x and
+       x op c1 would both be live where one was, for no shorter wait. */
+    if (in->nargs == 2 && is_associative(in->op) && is_const(f, a[1], &y) &&
+        f->insts[a[0]].op == in->op) {
+      Ref base;
+      uint64_t c = y;
+      if (carried_chain(f, v, uses, &base, &c)) {
+        Ref m = ir_emit(f, bi, I_CONST, t, NULL, 0, c, 0);
+        b->ninsts--;
+        for (uint32_t j = b->ninsts; j > i; j--) b->insts[j] = b->insts[j - 1];
+        b->insts[i] = m;
+        b->ninsts++;
+        in = &f->insts[v]; a = ir_args(f, v);
+        a[0] = base;
         a[1] = m;
         g_stats.folded++;
         changed = true;
@@ -3466,6 +3587,14 @@ static bool fold_block(IrFunc *f, uint32_t bi, const OptOpts *o, const uint32_t 
         }
         break;
       case I_EXT8S: case I_EXT16S: case I_EXT32S: {
+        /* a value already the sign extension of its low 32 bits */
+        if (in->op == I_EXT32S && in->type == VT_I64 && ir_sext32(f, a[0])) {
+          ir_replace(f, v, a[0]);
+          in->op = I_NOP;
+          changed = true;
+          g_stats.folded++;
+          break;
+        }
         /* The sign extension of a narrow unsigned load is the signed load:
            ldrsb where there was ldrb and sxtb. */
         Inst *li = &f->insts[a[0]];
@@ -3500,7 +3629,18 @@ static bool fold_block(IrFunc *f, uint32_t bi, const OptOpts *o, const uint32_t 
             break;
           }
         }
-        if (in->op == I_EXTENDS) break;
+        /* an i64 narrowed and widened again by its sign: itself, where it
+           was the sign extension of its low half already */
+        if (in->op == I_EXTENDS) {
+          if (f->insts[a[0]].op == I_WRAP && f->insts[a[0]].nargs == 1 &&
+              ir_sext32(f, ir_args(f, a[0])[0])) {
+            ir_replace(f, v, ir_args(f, a[0])[0]);
+            in->op = I_NOP;
+            changed = true;
+            g_stats.folded++;
+          }
+          break;
+        }
       }
         if (f->insts[a[0]].op == I_WRAP && f->insts[a[0]].nargs == 1) {
           Ref x0 = ir_args(f, a[0])[0];
