@@ -271,34 +271,22 @@ jobs:
             build/testsuite
           key: ${{ steps.make-tools.outputs.cache-primary-key }}
 
-      # A module found here newer than its source is not built again, so
-      # only an exact match on every source and pin is restored.
+      # The corpora's modules, wasmtime's answers for them, and TeaVM's builds
+      # and JVM answers, as test/testcache.py keeps them, each under what it
+      # is made of: the same modules as the corpora's directories hold, so no
+      # more room.  Only an
+      # exact match on every source and pin is restored, so that what is
+      # kept never gathers the modules of sources gone since.
       - name: Restore the built corpora
         if: inputs.full
         id: corpora
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: &corpora |
-            build/astests/*.wasm
-            build/astests/*.wasm.flags
-            build/ctests/*.wasm
-            build/ctests/*.wasm.flags
-            build/cpptests/*.wasm
-            build/cpptests/*.wasm.flags
-            build/gotests/*.wasm
-            build/gotests/*.wasm.flags
-            build/hstests/*.wasm
-            build/hstests/*.wasm.flags
-            build/javatests/*.wasm
-            build/javatests/*.wasm.flags
-            build/kttests/*.wasm
-            build/kttests/*.wasm.flags
-            build/rstests/*.wasm
-            build/rstests/*.wasm.flags
-            build/stdgotests/*.wasm
-            build/stdgotests/*.wasm.flags
-            build/zigtests/*.wasm
-            build/zigtests/*.wasm.flags
+            build/testcache/corpus
+            build/testcache/ref
+            build/testcache/teavm
+            build/testcache/teavm-ref
           key: corpora-macos-arm64-${{ inputs.full }}-${{ steps.pins.outputs.makefile }}-${{ steps.pins.outputs.producers }}-${{ hashFiles('test/*tests/**', 'test/teavm/**', 'test/gobench.py') }}
 
       # The test modules assembled from the cases and the interpreter's answers
