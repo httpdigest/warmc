@@ -7,7 +7,8 @@ The other warmc is REV's (HEAD by default), checked out as a worktree under
 build/ab and built there once.  Kernels are the corpora's modules as
 test/gobench.py left them in build/CORPUS, all of make's BENCH_CORPORA by
 default, each compiled at -O2 by both, the programs cached under build/ab by
-the compiler's, runtimes' and module's contents.
+the compiler's, runtimes' and module's contents, the least recently used
+going past AB_CACHE_MB (2000).
 
 A kernel whose two programs are the same bytes is not timed, nor one whose
 two are those an earlier run timed: its figure is that run's, kept in
@@ -55,6 +56,7 @@ AB = os.path.join(BUILD, "ab")
 CACHE = os.path.join(AB, "cache")
 RESULTS = os.path.join(AB, "results.json")
 KEEP = 20000
+CACHE_MB = int(os.environ.get("AB_CACHE_MB", "2000"))
 CORPORA = ("gobench stdgo vecbench asbench rsbench ktbench zigbench cbench cppbench "
            "hsbench javabench").split()
 ENV = dict(os.environ, WARMC_RANDOM_SEED="1")
@@ -96,10 +98,10 @@ def base_build(rev):
     return os.path.join(wt, "build"), sha
 
 
-def build(warmc, flags, cdig, wasm, used):
+def build(warmc, flags, cdig, wasm, used, cache=CACHE):
     # one name for every program, so that the ad-hoc signature, which
     # carries it, is the same for the same code
-    d = os.path.join(CACHE, digest([wasm]) + cdig)
+    d = os.path.join(cache, digest([wasm]) + cdig)
     used.add(os.path.basename(d))
     exe = os.path.join(d, "k")
     if os.path.exists(exe):
@@ -116,6 +118,26 @@ def build(warmc, flags, cdig, wasm, used):
     except OSError:
         shutil.rmtree(tmp, ignore_errors=True)
     return exe
+
+
+def trim(cache, used, mb):
+    """The programs used now marked so; past mb, the least recently used go"""
+    ents = []
+    for d in os.listdir(cache):
+        p = os.path.join(cache, d)
+        if ".tmp" in d:
+            continue
+        if d in used:
+            os.utime(p)
+        st = os.stat(p)
+        size = sum(e.stat().st_size for e in os.scandir(p) if e.is_file())
+        ents.append((st.st_mtime, size, p))
+    total = sum(e[1] for e in ents)
+    for _, size, p in sorted(ents):
+        if total <= mb << 20:
+            break
+        shutil.rmtree(p, ignore_errors=True)
+        total -= size
 
 
 def cycles(exe):
@@ -211,8 +233,13 @@ def main():
             return r + (2,)
         return r + (1,)
 
+    # a module two corpora share is timed once
+    first = {}
+    for i, k in enumerate(keys):
+        first.setdefault(k, i)
     with concurrent.futures.ThreadPoolExecutor(jobs) as ex:
-        res = list(ex.map(one, range(len(mods))))
+        done = dict(zip(first.values(), ex.map(one, first.values())))
+    res = [done[first[k]] for k in keys]
     rows, same, reused = [], 0, 0
     for i, r in enumerate(res):
         name = os.path.basename(os.path.dirname(mods[i])) + "/" + os.path.basename(mods[i])[:-5]
@@ -249,10 +276,7 @@ def main():
     if rows:
         print("all        geomean %.4f over %d, %d the same program, %d timed before"
               % (geomean([q for _, q in rows]), len(rows), same, reused))
-    # the programs this run did not use go: the cache holds one run's
-    for d in os.listdir(CACHE):
-        if d not in used and ".tmp" not in d:
-            shutil.rmtree(os.path.join(CACHE, d), ignore_errors=True)
+    trim(CACHE, used, CACHE_MB)
 
 
 if __name__ == "__main__":
