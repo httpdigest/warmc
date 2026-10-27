@@ -598,6 +598,8 @@ typedef struct {
   uint64_t fma_fused;    /* -ffma: multiplies fused into the add reading them */
   uint64_t bitrevs;      /* bit reversals written as swaps made one (I_BITREV) */
   uint64_t common_factors; /* x * c + y * c made (x + y) * c */
+  uint64_t threaded_known; /* edges past a test their way in decided */
+  uint64_t param_compares; /* parameters found to be a compare, made again */
   uint64_t small_loops;  /* loops aligned to 64 bytes as small, in code emitted */
 
   uint64_t bar_masks, bar_elided;
