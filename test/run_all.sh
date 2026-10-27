@@ -19,37 +19,41 @@ export WARMC_TIMEOUT=${WARMC_TIMEOUT:-30}
 # WARMC_CACHE): the rows compile the same modules the same way run after
 # run.  At most WARMC_CACHE_MB of it (20 GB: a change to warmc makes every
 # corpus's programs anew), the least recently used going first, taken away
-# here, before any row reads it; test/testcache.py keeps the suites' own
-# results beside it, under the same rule.
+# at the end; test/testcache.py keeps the suites' own results beside it,
+# under the same rule.
 export WARMC_CACHE=${WARMC_CACHE:-$PWD/$BUILD/warmc-cache}
-# wasmtime, which a dozen suites compare with, answered from that cache too
-# where it was asked the same before (test/shims/wasmtime); a row reads no
-# stdin of make's, which the shim would wait on
-
-# (not on Windows, where wasmtime is wasmtime.exe and the shim no program)
+# wasmtime, which a dozen suites compare with, answered from test/testcache.py
+# where it was asked the same before (test/shims/wasmtime), and so are
+# tinygo's, go's and rustc's builds (test/shims/buildcache.py); a row reads
+# no stdin of make's, which the wasmtime shim would wait on.  The shims are
+# run by wrappers made here, in $BUILD/shims, one for each tool there is,
+# naming python3, the shim and the tool by absolute path: a suite that runs
+# one under `env -i` leaves it no PATH to find them on, and CI's wasmtime is
+# under build/ci.  What wasmtime answers there must be what it answers with a
+# PATH, or every suite comparing with it would fail.  (Not on Windows, where
+# wasmtime is wasmtime.exe and a shim no program.)
 case "$(uname -s)" in
   MINGW*|CLANG*|MSYS*) ;;
-  *) export PATH="$PWD/test/shims:$PATH" ;;
+  *)
+    SHIMS="$PWD/$BUILD/shims"
+    rm -rf "$SHIMS"; mkdir -p "$SHIMS"
+    noshims=$(printf '%s' "$PATH" | tr ':' '\n' | grep -vxF -e "$PWD/test/shims" -e "$SHIMS" |
+              paste -sd: -)
+    py=$(PATH="$noshims" command -v python3)
+    for t in wasmtime tinygo go rustc; do
+      tool=$(PATH="$noshims" command -v "$t") || continue
+      printf '#!/bin/sh\nWARMC_SHIM_REAL=%s exec %s %s "$@"\n' "'$tool'" "'$py'" \
+        "'$PWD/test/shims/$t'" >"$SHIMS/$t"
+      chmod +x "$SHIMS/$t"
+    done
+    export PATH="$SHIMS:$PATH"
+    if [ -x "$SHIMS/wasmtime" ] &&
+       [ "$(env -i "$SHIMS/wasmtime" --version 2>&1)" != "$(PATH="$noshims" wasmtime --version 2>&1)" ]; then
+      echo "FAIL[shims]: wasmtime under env -i is not wasmtime: $(env -i "$SHIMS/wasmtime" --version 2>&1)"
+      exit 1
+    fi
+    ;;
 esac
-python3 test/testcache.py trim
-python3 - "$WARMC_CACHE" "${WARMC_CACHE_MB:-20000}" <<'EOF'
-import os, shutil, sys
-root, cap = sys.argv[1], int(sys.argv[2]) << 20
-entries = []
-for sub in os.listdir(root) if os.path.isdir(root) else []:
-    for e in os.listdir(os.path.join(root, sub)):
-        p = os.path.join(root, sub, e)
-        if not os.path.isdir(p):
-            continue
-        size = sum(os.path.getsize(os.path.join(p, f)) for f in os.listdir(p))
-        entries.append((os.path.getmtime(p), size, p))
-total = sum(e[1] for e in entries)
-for _t, size, p in sorted(entries):
-    if total <= cap:
-        break
-    shutil.rmtree(p, ignore_errors=True)
-    total -= size
-EOF
 
 fail=0
 
@@ -361,6 +365,31 @@ start reject   ./test/run_reject.sh
 start asan     ./test/run_asan.sh
 start tsan     ./test/run_tsan.sh
 
+# gosp.c: the modules in Go's shape that rule its rewrite out, and random
+# ones it makes, against wasm-interp; tramp.c: the modules in GHC's shape
+# that rule its rewrite out or need more of it, at -O0 and -O2.  Programs on
+# a 64-bit memory past 4 GiB, at each level against -O0 and wasmtime.  The
+# Mach-O row's modules.  These ran after the other rows, alone, while each
+# of their modules was a fresh program of its own, which macOS checks on its
+# first run one at a time across the machine, and while a compile had six
+# seconds; now their modules share a few programs, and a compile has thirty.
+start gosp  python3 test/run_gosp.py
+start mem64 python3 test/gen_mem64.py --seed 1 --count 100
+start tramp python3 test/run_tramp.py
+start macho ./test/run_macho.sh
+# -fexact-trap over programs in Go's, C's, Rust's and AssemblyScript's shape
+for c in stdgo cbench rsbench asbench; do
+  bench "$c-exacttrap" python3 test/gobench.py --corpus "$c" --check --variant '-O2 -fexact-trap'
+done
+# The official testsuite, as make check-spec runs it: every malformed and
+# invalid module refused, and every assertion of the rest held -- the
+# bounds, traps and type checks a module has no way round.
+start spec python3 test/spec/run.py "--levels=${SPEC_LEVELS:--O1,-O2,-O2 --profile=deterministic}"
+# Every pair of passes, off and on in all four combinations, over the
+# cases, traps, the collector and the C workload: nine settings (make
+# check-combos does triples), a quarter of the cores' worth at a time.
+start combos python3 test/run_combos.py
+
 printf '[%4ds] %d rows started\n' "$SECONDS" "${#labels[@]}"
 watch_rows &
 wait
@@ -369,44 +398,6 @@ wait
 # of a machine no row is loading any more.
 if [ -z "${CHECK_SMOKE:-}" ]; then
   start gc-pause env GC_PAUSE_CHECK=only WARMC_FLAGS=-O2 ./test/run_gc.sh
-  wait
-  # gosp.c: the modules in Go's shape that rule its rewrite out, and random
-  # ones it makes, against wasm-interp; tramp.c: the modules in GHC's shape
-  # that rule its rewrite out or need more of it, at -O0 and -O2.  Also
-  # after the others: they link and run some five hundred fresh binaries,
-  # and macOS checks a fresh binary's signature on its first run one at a
-  # time across the machine (test/run_cases.py), which beside the other
-  # rows starves their runs.
-  start gosp python3 test/run_gosp.py
-  # Programs on a 64-bit memory past 4 GiB, at each level against -O0 and
-  # wasmtime: four hundred fresh binaries, so here too.
-  start mem64 python3 test/gen_mem64.py --seed 1 --count 100
-  start tramp python3 test/run_tramp.py
-  # The Mach-O row builds a module per CPU, each with a 6 s limit, which the
-  # first half minute of the rows above, when all of them start at once,
-  # pushed past it; here it takes a second or two.
-  start macho ./test/run_macho.sh
-  wait
-  # -fexact-trap over programs in Go's, C's, Rust's and AssemblyScript's
-  # shape.  Each compiles a whole corpus, a module per CPU; with the rows
-  # above, which all start at once, they pushed the cases rows' compiles
-  # past their 6 s.
-  for c in stdgo cbench rsbench asbench; do
-    bench "$c-exacttrap" python3 test/gobench.py --corpus "$c" --check --variant '-O2 -fexact-trap'
-  done
-  wait
-  # The official testsuite, as make check-spec runs it: every malformed and
-  # invalid module refused, and every assertion of the rest held -- the
-  # bounds, traps and type checks a module has no way round.  Alone, after
-  # the rest: it links and runs some 750 fresh binaries.
-  start spec python3 test/spec/run.py "--levels=${SPEC_LEVELS:--O1,-O2,-O2 --profile=deterministic}"
-  wait
-  # Every pair of passes, off and on in all four combinations, over the
-  # cases, traps, the collector and the C workload: nine settings (make
-  # check-combos does triples).  Last and alone, since its settings run side
-  # by side on every core, which beside the other rows pushes their
-  # compiles past their timeouts.
-  start combos python3 test/run_combos.py
   wait
 fi
 
@@ -427,5 +418,15 @@ if [ -n "${CHECK_TIMING:-}" ]; then
       "$(cat "$LOGS/$label.cpu" 2>/dev/null || echo '?')" "$label"
   done | sort -rn
 fi
+
+# Each cache cut to its size where a run took it past, the least recently
+# used first: after the rows, and on its own, since taking away tens of
+# thousands of entries is seconds of unlinking no row should wait on -- a
+# run that starts meanwhile reads an entry whole or not at all (warmc and
+# test/testcache.py hold one open before using it).  Its output goes
+# nowhere, so a pipe from make check ends with make check.
+( python3 test/testcache.py trim
+  python3 test/testcache.py trim "$WARMC_CACHE" "${WARMC_CACHE_MB:-20000}" 2
+) </dev/null >/dev/null 2>&1 &
 
 exit $fail

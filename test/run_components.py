@@ -29,6 +29,8 @@ something the others cannot:
 import concurrent.futures
 import os
 import subprocess
+import tempfile
+import shutil
 import sys
 import threading
 
@@ -295,12 +297,8 @@ def check_built(stem, wasm):
     else:
         ok()
 
-def _verdict(args):
-    """One warmc run over a byte string; returns None or a description."""
-    label, data = args
-    path = os.path.join(WORK, "probe-%d.wasm" % threading.get_ident())
-    with open(path, "wb") as f:
-        f.write(data)
+def _verdict(label, path):
+    """One warmc run over a probe; returns None or a description."""
     try:
         rc, so, se = run([WARMC, "--validate-only", path])
     except subprocess.TimeoutExpired:
@@ -309,11 +307,13 @@ def _verdict(args):
         return "%s: %s" % (label, se.strip().splitlines()[0][:140])
     if rc not in (0, 2, 3):
         return "%s gave exit %d (not a verdict): %s" % (label, rc, (se or so).strip()[:160])
-    # --validate-only stops before the link plan, so a probe that only ever
-    # asks for a verdict never reaches the half of the component path that
-    # compiles anything.  Anything it accepts goes through once more.
-    if rc != 0:
-        return None
+    return None if rc else _compiled(label, path)
+
+
+def _compiled(label, path):
+    """--validate-only stops before the link plan, so a probe that only ever
+    asks for a verdict never reaches the half of the component path that
+    compiles anything.  Anything it accepts goes through once more."""
     try:
         rc, so, se = run([WARMC, "-c", "-o", os.devnull, path])
     except subprocess.TimeoutExpired:
@@ -324,15 +324,60 @@ def _verdict(args):
         return "%s gave exit %d while compiling: %s" % (label, rc, (se or so).strip()[:160])
     return None
 
+
+SWEEP_BATCH = 64
+
+
 def _sweep(jobs_in, what):
-    """Run a batch of probes and report every one that did not get a verdict."""
+    """Run a batch of probes and report every one that did not get a verdict.
+    The probes go to a directory of their own, gone afterwards, and warmc
+    gives the verdicts of SWEEP_BATCH of them in one process (--validate-only
+    with several inputs): a process each was most of this suite's time.  A
+    batch whose process did not answer for every probe, or that a sanitiser
+    spoke in, is asked again one probe at a time, to say which."""
     jobs_in = list(jobs_in)
+    tmp = tempfile.mkdtemp(prefix=".probes.", dir=WORK)
+    paths = []
+    for i, (_label, data) in enumerate(jobs_in):
+        paths.append(os.path.join(tmp, "p%d.wasm" % i))
+        with open(paths[-1], "wb") as f:
+            f.write(data)
+
+    def batch(group):
+        try:
+            rc, so, se = run([WARMC, "--validate-only"] + [paths[i] for i in group])
+        except subprocess.TimeoutExpired:
+            so = None
+        verdicts = {}
+        for line in (so or "").splitlines():
+            path, _, rest = line.partition("\t")
+            code, _, msg = rest.partition(" ")
+            if code.isdigit():
+                verdicts[path] = (int(code), msg)
+        if so is None or len(verdicts) != len(group) or "AddressSanitizer" in se or \
+                "runtime error" in se:
+            return [_verdict(jobs_in[i][0], paths[i]) for i in group]
+        out = []
+        for i in group:
+            code, msg = verdicts[paths[i]]
+            if code not in (0, 2, 3):
+                out.append("%s gave exit %d (not a verdict): %s" % (jobs_in[i][0], code, msg[:160]))
+            elif code == 0:
+                out.append(_compiled(jobs_in[i][0], paths[i]))
+        return out
+
+    groups = [list(range(k, min(k + SWEEP_BATCH, len(jobs_in))))
+              for k in range(0, len(jobs_in), SWEEP_BATCH)]
     bad = 0
-    with concurrent.futures.ThreadPoolExecutor(max_workers=JOBS) as pool:
-        for why in pool.map(_verdict, jobs_in):
-            if why:
-                fail(why)
-                bad += 1
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=JOBS) as pool:
+            for whys in pool.map(batch, groups):
+                for why in whys:
+                    if why:
+                        fail(why)
+                        bad += 1
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
     print("components: %d %s, every one answered" % (len(jobs_in), what)
           if not bad else
           "components: %d %s, %d without a verdict" % (len(jobs_in), what, bad))

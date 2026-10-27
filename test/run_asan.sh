@@ -88,12 +88,10 @@ for f in "$BUILD"/testrun/*.wasm; do [ -e "$f" ] && inputs+=("$f"); done
 # command line, and the one thing that road did not do was validate them.
 for f in "$BUILD"/components/*.wasm; do [ -e "$f" ] && inputs+=("$f"); done
 
-# Each input at every level, but where the levels add nothing: a probe of
-# run_components.py's mutation sweep, nearly always refused before any pass
-# runs, and the binary in build/testrun of a fixture that is here as text
-# (whose text goes through the binary parser too), at the first level alone.
-# The probes are four fifths of the inputs, and an ASan process takes 40 ms
-# to start.
+# Each input at every level, but where the levels add nothing: the binary in
+# build/testrun of a fixture that is here as text (whose text goes through
+# the binary parser too), at the first level alone.  An ASan process takes
+# 40 ms to start.
 JOBS=$( (sysctl -n hw.logicalcpu 2>/dev/null || nproc 2>/dev/null) || echo 4)
 first=${LEVELS%% *}
 results="$WORK/results"
@@ -103,7 +101,6 @@ pairs="$WORK/pairs"
 for input in "${inputs[@]}"; do
   levels=$LEVELS
   case "$input" in
-    "$BUILD"/components/probe-*) levels=$first ;;
     "$BUILD"/testrun/*.wasm)
       b=$(basename "$input" .wasm)
       for d in test/cases test/cases_gc test/cases_traps test/cases_relaxed test/wasi; do

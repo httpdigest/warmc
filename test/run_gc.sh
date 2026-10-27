@@ -83,15 +83,24 @@ build_one() {
   built="$built$1 "
 }
 
-# Every program the checks run, made first: what the row answers depends on
-# them, warmc (the escape check compiles), this script, the tools it reads
-# modules with and the settings, and where none of those changed since a run
-# that passed, it is that run's answer again (test/testcache.py;
+# Every program the checks run, made first, and what the escape check reads
+# of warmc (its verdicts and the optimised IR, WARMC_ESCAPE_DEBUG): what the
+# row answers depends on them, this script, the tools it reads modules with
+# and the settings -- not on warmc itself, so that a change to it that
+# leaves these as they were costs no run -- and where none of those changed
+# since a run that passed, it is that run's answer again (test/testcache.py;
 # WARMC_NO_TESTCACHE=1 runs it anyway).
 WARMC_FLAGS="${WARMC_FLAGS:-} -fno-inline" build_one tailcast
 WARMC_FLAGS="${WARMC_FLAGS:-} -fno-thread" build_one castfacts_nt
+ESCAPE_IR="$WORK/escape_ir$FTAG.txt"
+: >"$ESCAPE_IR"
+escape_rc=0
+if [ -z "${WARMC_FLAGS:-}" ] || [ "${WARMC_FLAGS:-}" = -O2 ]; then
+  WARMC_ESCAPE_DEBUG=1 wtimeout ./$BUILD/warmc -O2 -j1 --print-ir -c -o /dev/null \
+    "$WORK/escape.wasm" >/dev/null 2>"$ESCAPE_IR" || escape_rc=$?
+fi
 ROWKEY=$(python3 test/testcache.py key --file test/run_gc.sh --file test/hostenv.sh \
-  --file "./$BUILD/warmc" --file "$BUNDLE" --file "$WORK/tailcast$FTAG" --file "$WORK/castfacts_nt$FTAG" \
+  --file "$ESCAPE_IR" --str "$escape_rc" --file "$BUNDLE" --file "$WORK/tailcast$FTAG" --file "$WORK/castfacts_nt$FTAG" \
   --file "$WT" --file "$WORK/escape.wasm" --env WARMC_ --env GC_ --str "$*")
 if python3 test/testcache.py get row "$ROWKEY"; then exit 0; fi
 
@@ -633,9 +642,10 @@ expect keep_dispatch_mutable "OK" 10 3 150
 # branch, is not left standing.
 # WARMC_ESCAPE_DEBUG names functions by index; wasm-tools maps them back.
 if [ -z "${WARMC_FLAGS:-}" ] || [ "${WARMC_FLAGS:-}" = -O2 ]; then
-  if why=$(WARMC_ESCAPE_DEBUG=1 wtimeout ./$BUILD/warmc -O2 -j1 --print-ir -c -o /dev/null \
-             "$WORK/escape.wasm" 2>&1 >/dev/null |
-           python3 -c '
+  if [ "$escape_rc" != 0 ]; then
+    echo "FAIL[gc] escape: warmc exited $escape_rc"
+    fail=$((fail+1))
+  elif why=$(python3 -c '
 import re, subprocess, sys
 text = subprocess.run([sys.argv[1], "print", sys.argv[2]],
                       capture_output=True, text=True).stdout
@@ -668,7 +678,7 @@ bad += ["%s: nothing was made at an escape point" % n for f, n in sorted(names.i
         if n.startswith("pe_") and not any(k[0] == f and w.startswith("partial:")
                                           for k, w in last.items())]
 print("; ".join(bad))
-sys.exit(1 if bad else 0)' "$WT" "$WORK/escape.wasm"); then
+sys.exit(1 if bad else 0)' "$WT" "$WORK/escape.wasm" <"$ESCAPE_IR"); then
     pass=$((pass+1))
   else
     echo "FAIL[gc] escape: an sr_ or pe_ allocation was not replaced: $why"

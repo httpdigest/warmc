@@ -7,7 +7,8 @@ directory it may write, a network, a subcommand other than run, a stdin
 that is not a file or /dev/null -- goes to wasmtime every time, and so does
 a run that did not end on its own.  A run that must not be an earlier one's
 again -- one that checks two draws of random_get differ -- sets
-WARMC_NO_TESTCACHE=1.  run_all.sh puts this directory first on PATH."""
+WARMC_NO_TESTCACHE=1.  run_all.sh puts a wrapper that runs this first on
+PATH ($BUILD/shims/wasmtime), naming the real one in WARMC_SHIM_REAL."""
 import os
 import subprocess
 import sys
@@ -18,15 +19,15 @@ import testcache  # noqa: E402
 
 
 def real():
-    """the wasmtime PATH has after this one, or, where a suite ran it under
-    `env -i` with no PATH at all, one where wasmtime is installed"""
-    import pwd
-    home = pwd.getpwuid(os.getuid()).pw_dir
-    dirs = os.environ.get("PATH", "").split(os.pathsep) + \
-        os.defpath.split(os.pathsep) + ["/opt/homebrew/bin", "/usr/local/bin",
-                                         os.path.join(home, ".wasmtime", "bin")]
-    for d in dirs:
-        if d and os.path.abspath(d) != HERE:
+    """the wasmtime run_all.sh's wrapper names, by its absolute path -- a
+    suite that runs wasmtime under `env -i` leaves no PATH to look on, and
+    CI's is under build/ci, where no default looks -- taken out of what
+    wasmtime is given; else the one PATH has after this one"""
+    p = os.environ.pop("WARMC_SHIM_REAL", None)
+    if p:
+        return p
+    for d in os.environ.get("PATH", "").split(os.pathsep):
+        if d and os.path.basename(os.path.abspath(d)) != "shims":
             p = os.path.join(d, "wasmtime")
             if os.path.isfile(p) and os.access(p, os.X_OK):
                 return p
