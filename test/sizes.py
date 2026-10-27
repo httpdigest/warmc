@@ -27,7 +27,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILD = os.environ.get("BUILD", os.path.join(ROOT, "build"))
 WARMC = os.path.join(BUILD, "warmc") + (".exe" if os.name == "nt" else "")
 
-CORPORA = ["ktbench", "asbench", "rsbench", "gobench", "vecbench", "zigbench",
+CORPORA = ["ktbench", "asbench", "rsbench", "gobench", "stdgo", "vecbench", "zigbench",
            "cbench", "cppbench", "hsbench", "javabench"]
 
 def flags_for(path):

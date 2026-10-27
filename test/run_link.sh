@@ -249,6 +249,39 @@ else
   fail=1
 fi
 
+# Data segments into an imported memory, which is not zero: their zeros are
+# written and the bytes between them kept (src/datapack.c makes an image only
+# of a memory the module defines).
+for m in a b; do
+  wat2wasm $WABT_FLAGS "test/link/dpmem_$m.wat" -o "$WORK/dp$m.wasm" || exit 1
+  wtimeout ./$BUILD/warmc ${WARMC_FLAGS:--O2} $WARMC_TARGET_FLAGS --symbol-prefix=dp$m \
+      -c -o "$WORK/dp$m.o" "$WORK/dp$m.wasm" || { echo "FAIL[link]: compiling dpmem_$m.wat"; exit 1; }
+done
+link_prog dpprog test/link/dpmemdriver.c "$WORK/dpa.o" "$WORK/dpb.o" || exit 1
+got=$(wruntimeout $WARMC_RUN "$LINKED" 2>&1)
+if [ "$got" = ok ]; then
+  echo "link: data segments into an imported memory that is not zero"
+else
+  echo "FAIL[link/dpmem]: [$got], not ok"
+  fail=1
+fi
+
+# An exception through a module that has nothing to throw or collect: its
+# frames are walked, as another object's, so it keeps its unwind records.
+for m in a b c; do
+  wat2wasm $WABT_FLAGS "test/link/exnthru_$m.wat" -o "$WORK/ex$m.wasm" || exit 1
+  wtimeout ./$BUILD/warmc ${WARMC_FLAGS:--O2} $WARMC_TARGET_FLAGS --symbol-prefix=ex$m \
+      -c -o "$WORK/ex$m.o" "$WORK/ex$m.wasm" || { echo "FAIL[link]: compiling exnthru_$m.wat"; exit 1; }
+done
+link_prog exprog test/link/exnthrudriver.c "$WORK/exa.o" "$WORK/exb.o" "$WORK/exc.o" || exit 1
+got=$(wruntimeout $WARMC_RUN "$LINKED" 2>&1)
+if [ "$got" = 41 ]; then
+  echo "link: an exception through a module with no tag of its own"
+else
+  echo "FAIL[link/exnthru]: [$got], not 41"
+  fail=1
+fi
+
 WT="$BUILD/tools/bin/wasm-tools"
 if [ ! -x "$WT" ]; then
   echo "link: $WT not found, skipping the collection pair (run \`make wasm-tools\`)"

@@ -270,6 +270,22 @@ start wat       python3 test/run_wat.py
 
 start cases-nofold env WARMC_FLAGS="-O2 -fno-fold" ./test/run_tests.sh
 
+# The active data segments as src/datapack.c packs them: its compressor and
+# rt/lzunpack.inc's decoder on their own, random segments against
+# wasm-interp, and the cases with blocks of 64 bytes, whose ends fall where
+# their data is, and with no compression at all
+start datapack   ./build/datapack_test
+start datapack-gen python3 test/gen_datapack.py --seed 1 --count 60
+start cases-packsmall env WARMC_PACK_BLOCK_LOG2=6 WARMC_FLAGS=-O2 ./test/run_tests.sh
+start cases-nocompress env WARMC_FLAGS="-O2 -fno-compress-data" ./test/run_tests.sh
+# br_table's halfword entries reaching 8 instructions: most functions with a
+# table are made again, their branches far and their entries words
+start cases-table16 env WARMC_TABLE16_REACH=8 WARMC_FLAGS=-O2 ./test/run_tests.sh
+start cases-table16-stubs env WARMC_NO_DIRECT_BRTABLE=1 WARMC_TABLE16_REACH=8 \
+  WARMC_FLAGS=-O2 ./test/run_tests.sh
+# and tables of 70000 entries, which halfwords cannot reach past
+start bigtable python3 test/run_bigtable.py
+
 start cases-farbr env WARMC_FAR_BRANCH=1 WARMC_FLAGS=-O2 ./test/run_tests.sh
 start traps-farbr env WARMC_FAR_BRANCH=1 ./test/run_traps.sh
 start gc-farbr    env WARMC_FAR_BRANCH=1 ./test/run_gc.sh

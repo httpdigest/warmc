@@ -36,6 +36,7 @@ assemble test/cases_gc/tailcast.wat tailcast
 assemble test/cases_gc/arraycopy.wat arraycopy
 assemble test/cases_gc/arraynew.wat arraynew
 assemble test/cases_gc/tightheap.wat tightheap
+assemble test/cases_gc/activedata.wat activedata
 assemble "$WORK/gcgen.wat" gcgen
 
 [ "${1:-}" = --prepare ] && exit 0
@@ -356,6 +357,10 @@ done
 
 build_one arraycopy
 for t in 8 16 32 64; do expect array_copy_$t "OK"; done
+
+build_one activedata
+for t in in_memory empty_new empty_init empty_memory_init; do expect $t "OK"; done
+expect one_byte "out of bounds"
 
 build_one arraynew
 for t in 8 16 32 64 f32 f64 v128 ref; do expect lengths_$t "OK"; done

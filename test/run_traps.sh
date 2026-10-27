@@ -8,7 +8,7 @@ export PATH="$PATH:$HOME/.npm-global/bin"
 WORK="$BUILD/testrun"
 mkdir -p "$WORK"
 
-for t in traps ictraps tramptraps gosptraps mem64big; do
+for t in traps ictraps tramptraps gosptraps mem64big exnsole; do
   if [ ! -s "$WORK/$t.wasm" ] || [ test/cases_traps/$t.wat -nt "$WORK/$t.wasm" ]; then
     wat2wasm $WABT_FLAGS test/cases_traps/$t.wat -o "$WORK/$t.wasm.$$" || exit 1
     mv -f "$WORK/$t.wasm.$$" "$WORK/$t.wasm"
@@ -231,6 +231,22 @@ expect exn_trap_after_catch        "integer divide by zero"
 
 expect exn_caught_deep_ok        "OK"
 expect exn_caught_past_pads_ok   "OK"
+
+# A program's only module with a tag and nothing of the collector's keeps the
+# unwind records an exception walks; one with no tag keeps none.
+BIN_KEEP="$BIN"
+BIN="$WORK/exnsole$FTAG"
+wtimeout ./$BUILD/warmc ${WARMC_FLAGS:-} $WARMC_TARGET_FLAGS -o "$BIN" "$WORK/exnsole.wasm" || exit 1
+expect caught_across "OK"
+expect uncaught      "uncaught exception"
+BIN="$BIN_KEEP"
+printf '(module (func $f (export "f") (param i32) (result i32)\n  (if (result i32) (i32.eqz (local.get 0)) (then (i32.const 1))\n    (else (i32.add (call $f (i32.sub (local.get 0) (i32.const 1))) (i32.const 1))))))\n' \
+  > "$WORK/notag$FTAG.wat"
+recs=$(WARMC_TABLE_STATS=1 wtimeout ./$BUILD/warmc ${WARMC_FLAGS:-} $WARMC_TARGET_FLAGS \
+         -o "$WORK/notag$FTAG" "$WORK/notag$FTAG.wat" 2>&1 | sed -n 's/^tables: \([0-9]*\)\/.*/\1/p')
+if [ "$recs" = 0 ]; then pass=$((pass+1)); else
+  echo "FAIL[traps] a module with no tag kept $recs unwind records, where nothing walks them"
+  fail=$((fail+1)); fi
 expect tail_into_catcher_ok      "OK"
 expect dead_table_get            "out of bounds table access"
 
