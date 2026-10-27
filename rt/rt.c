@@ -3389,8 +3389,21 @@ static void gc_cycle_conc(void) {
   __atomic_store_n(&gc_cycle_running, 0u, __ATOMIC_RELEASE);
 }
 
+/* WARMC_GC_MARK_STALL=US: the collector asleep that long once a mark is on,
+   so that the program runs while it is, however few cores the two have --
+   on one, a mark of a small heap ends before the program runs again, and
+   what the program does during one (the barrier's shading) goes untested */
+static u64 gc_opt_mark_stall;
+
 static void gc_cycle_body(void) {
   if (!gc_round(GCR_MARK_START)) return;
+  if (gc_opt_mark_stall) {
+    u64 end = sys_nanos() + gc_opt_mark_stall * 1000ull;
+    for (u64 now; (now = sys_nanos()) < end;) {
+      if (__atomic_load_n(&gcth_stopping, __ATOMIC_ACQUIRE)) break;
+      gcth_pause(end - now);
+    }
+  }
   for (;;) {
     gc_visit_tables(gc_mark_slot_shared);
     gc_mark_conc();
@@ -4658,6 +4671,7 @@ static void gc_read_options(void) {
 
   if (rt_getenv_u64("WARMC_GC_RELOCATE_ALL", 0)) gc_opt_reloc = 8;
   gc_opt_reloc_stall = (u32)rt_getenv_u64("WARMC_GC_RELOC_STALL", 0);
+  gc_opt_mark_stall = rt_getenv_u64("WARMC_GC_MARK_STALL", 0);
   { u64 kb = rt_getenv_u64("WARMC_GC_HEAP_KB", 0);
     if (kb) gc_heap_bytes = kb * 1024ull; }
   gcth_spin = (u32)rt_getenv_u64("WARMC_GC_THREAD_SPIN", GCTH_SPINS);
