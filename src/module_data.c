@@ -1010,12 +1010,19 @@ void codegen_emit_module_data(Module *m, ObjBuilder *o) {
   rodata_pool_reset();
   const_pool_reset();
 
+  /* the bytes of the passive segments something reads, for memory.init
+     and array.new_data to take by index; the active ones are data_init's
+     (datapack.c), and a module with no passive segment read has no table
+     of segments at all */
   uint64_t blob_off = o->rodata.len;
   uint64_t *seg_blob = xcalloc(m->ndatas ? m->ndatas : 1, sizeof(uint64_t));
   uint64_t *seg_len = xcalloc(m->ndatas ? m->ndatas : 1, sizeof(uint64_t));
+  bool any_passive = false;
   for (uint32_t i = 0; i < m->ndatas; i++) {
     seg_blob[i] = o->rodata.len - blob_off;
+    if (m->datas[i].mode == SEG_ACTIVE) continue;
     if (m->data_read && !m->data_read[i]) continue;
+    any_passive = true;
     seg_len[i] = m->datas[i].len;
     buf_bytes(&o->rodata, m->datas[i].data, m->datas[i].len);
   }
@@ -1088,26 +1095,28 @@ void codegen_emit_module_data(Module *m, ObjBuilder *o) {
   for (uint32_t i = 0; i < m->ntables; i++)
     if (m->tables[i].has_init)
       t_init[i] = emit_const_expr(o, m, consts_off, &m->tables[i].init, &nconsts);
-  uint32_t *d_off = xcalloc(m->ndatas ? m->ndatas : 1, sizeof(uint32_t));
-  uint8_t *d_off_const = xcalloc(m->ndatas ? m->ndatas : 1, 1);
   for (uint32_t i = 0; i < m->ndatas; i++)
     if (m->datas[i].mode == SEG_ACTIVE) {
       const InitExpr *e = &m->datas[i].offset;
-      if (e->n == 1 && e->ins[0].op == IOP_I32_CONST) {
-        d_off[i] = (uint32_t)e->ins[0].lo;
-        d_off_const[i] = 1;
-      } else {
+      if (e->n != 1 || (e->ins[0].op != IOP_I32_CONST && e->ins[0].op != IOP_I64_CONST))
         d_init[i] = emit_const_expr(o, m, consts_off, e, &nconsts);
-      }
     }
   {
     uint32_t k = 0;
     for (uint32_t i = 0; i < m->nelems; i++) {
       if (m->elems[i].mode == SEG_ACTIVE)
         e_init[i] = emit_const_expr(o, m, consts_off, &m->elems[i].offset, &nconsts);
-      for (uint32_t j = 0; j < m->elems[i].n; j++, k++)
-        item_init[k] = emit_const_expr(o, m, consts_off, &m->elems[i].items[j],
-                                       &nconsts);
+      /* an item that is a plain ref.func -- every one of a Go module's
+         5316 -- is its function's index in the entry itself, twice it and
+         one; any other is twice the constant expression it is */
+      for (uint32_t j = 0; j < m->elems[i].n; j++, k++) {
+        const InitExpr *it = &m->elems[i].items[j];
+        uint64_t at = it->n == 1 && it->ins[0].op == IOP_REF_FUNC
+                        ? it->ins[0].lo << 1 | 1
+                        : (uint64_t)emit_const_expr(o, m, consts_off, it, &nconsts) << 1;
+        if (at > UINT32_MAX) warmc_fatal("element %u is past what its entry can name", k);
+        item_init[k] = (uint32_t)at;
+      }
     }
   }
 
@@ -1124,18 +1133,14 @@ void codegen_emit_module_data(Module *m, ObjBuilder *o) {
   buf_align(&o->data, 8);
 
   uint64_t datasegs_off = o->data.len;
-  for (uint32_t i = 0; i < m->ndatas; i++) {
-    if (seg_blob[i] > 0xffffffffull || seg_len[i] > 0xffffffffull ||
-        m->datas[i].mem_index > 0xffffffu)
+  for (uint32_t i = 0; any_passive && i < m->ndatas; i++) {
+    if (seg_blob[i] > 0xffffffffull || seg_len[i] > 0xffffffffull)
       warmc_fatal("data segment %u is past what its descriptor can name", i);
-    uint32_t info = m->datas[i].mem_index << 8;
-    if (m->datas[i].mode != SEG_ACTIVE) info |= 1u;
-    if (d_off_const[i]) info |= 2u;
     buf_u32(&o->data, (uint32_t)seg_blob[i]);
     buf_u32(&o->data, (uint32_t)seg_len[i]);
-    buf_u32(&o->data, d_off_const[i] ? d_off[i] : d_init[i]);
-    buf_u32(&o->data, info);
   }
+  Buf data_init = { 0 };
+  datapack_emit(m, d_init, &data_init);
 
   uint64_t *seg_first = xcalloc(m->nelems ? m->nelems : 1, sizeof(uint64_t));
   uint64_t entries_off = o->data.len;
@@ -1227,19 +1232,42 @@ void codegen_emit_module_data(Module *m, ObjBuilder *o) {
     else buf_u64(&o->data, 0);
   }
 
+  /* Each function's reference, as instantiation makes it: where its code
+     is in the module's text (ModuleDesc.text_base), and its type's slot in
+     ftypes, the types functions have, each its id and rtt -- eight bytes
+     for what were 24, with a pointer for each that the loader rebased: 16
+     of them for each of the 5344 functions of a Go net/http server */
+  uint32_t *ftslot = xmalloc(sizeof(uint32_t) * (m->ntypes ? m->ntypes : 1));
+  uint32_t *ftlist = xmalloc(sizeof(uint32_t) * (m->ntypes ? m->ntypes : 1));
+  uint32_t nftypes = 0;
+  for (uint32_t i = 0; i < m->ntypes; i++) ftslot[i] = UINT32_MAX;
+  for (uint32_t i = 0; i < m->nfuncs; i++) {
+    uint32_t ti = m->funcs[i].type_index;
+    if (ftslot[ti] == UINT32_MAX) { ftslot[ti] = nftypes; ftlist[nftypes++] = ti; }
+  }
+  uint64_t ftypes_off = o->data.len;
+  for (uint32_t k = 0; k < nftypes; k++) {
+    buf_u64(&o->data, type_hash(&m->types[ftlist[k]]));
+    data_ptr(o, 1, rtt_off[ftlist[k]]);
+  }
   uint64_t funcrefs_off = o->data.len;
   for (uint32_t i = 0; i < m->nfuncs; i++) {
-
-    if (m->funcs[i].imported) buf_u64(&o->data, 0);
-    else if (m->reached && !m->reached[i]) {
-      uint32_t sym = obj_intern_sym(o, "warmc_unreached", SYM_UNDEF_FUNC, -1, 0);
-      obj_add_reloc(o, REL_ABS64, 2, o->data.len, sym, 0);
-      buf_u64(&o->data, 0);
+    uint64_t at;
+    if (m->funcs[i].imported) at = FUNCREF_IMPORTED;
+    else if (m->reached && !m->reached[i]) at = FUNCREF_UNREACHED;
+    else {
+      uint32_t si = obj_find_sym(o, m->funcs[i].sym);
+      if (si == UINT32_MAX || o->syms[si].section != 0)
+        warmc_fatal("function %u has no code in the module's text", i);
+      at = o->syms[si].value - codegen_entry_off(m, i);
+      if (at >= FUNCREF_UNREACHED)
+        warmc_fatal("function %u is past what its reference can name", i);
     }
-    else func_ptr(o, m, i, codegen_entry_off(m, i));
-    buf_u64(&o->data, type_hash(&m->types[m->funcs[i].type_index]));
-    data_ptr(o, 1, rtt_off[m->funcs[i].type_index]);
+    buf_u32(&o->data, (uint32_t)at);
+    buf_u32(&o->data, ftslot[m->funcs[i].type_index]);
   }
+  buf_align(&o->data, 8);
+  xfree(ftslot); xfree(ftlist);
 
   uint64_t *imp_module = xcalloc(m->nimports ? m->nimports : 1, sizeof(uint64_t));
   uint64_t *imp_name = xcalloc(m->nimports ? m->nimports : 1, sizeof(uint64_t));
@@ -1412,7 +1440,17 @@ void codegen_emit_module_data(Module *m, ObjBuilder *o) {
   buf_align(&o->data, 8);
   uint64_t unwind_off = o->data.len;
   uint32_t nunwind = 0;
-  for (uint32_t i = 0; i < g_nunwind; i++) {
+  /* The runtime walks frames for an exception and for the collector's
+     roots, and for nothing else: a program's only module (no other's frames
+     among its own) that has no tag to throw and no type of the collector's
+     has its frames walked by neither, and needs no record of them -- 5040
+     records, 322 KB, of a Go net/http server.  A module allocates on the
+     collector's heap only what its struct and array types make, or an
+     exception */
+  bool walked = !m->sole_instance || m->ntags;
+  for (uint32_t i = 0; i < m->ntypes && !walked; i++)
+    if (m->types[i].kind == CT_STRUCT || m->types[i].kind == CT_ARRAY) walked = true;
+  for (uint32_t i = 0; i < g_nunwind && walked; i++) {
     const FuncUnwind *u = &g_unwind[i];
     if (!(u->saved & UW_HAS_LR)) continue;
     nunwind++;
@@ -1542,7 +1580,8 @@ void codegen_emit_module_data(Module *m, ObjBuilder *o) {
   buf_u32(&o->data, m->nelems);
   buf_u32(&o->data, nexports);
   data_ptr(o, 2, globals_off);
-  data_ptr(o, 2, datasegs_off);
+  if (any_passive) data_ptr(o, 2, datasegs_off);
+  else buf_u64(&o->data, 0);
   data_ptr(o, 1, blob_off);
   data_ptr(o, 2, elemsegs_off);
   data_ptr(o, 2, entries_off);
@@ -1589,6 +1628,26 @@ void codegen_emit_module_data(Module *m, ObjBuilder *o) {
   if (custom_off != UINT64_MAX) data_ptr(o, 3, custom_off);
   else buf_u64(&o->data, 0);
 
+  uint64_t init_off = o->rodata.len;
+  buf_bytes(&o->rodata, data_init.data, data_init.len);
+  buf_free(&data_init);
+  data_ptr(o, 1, init_off);
+  /* the text's start, as one of its functions' less where that function
+     is in it: a symbol of its own there would name the first function a
+     second time to a debugger */
+  {
+    uint32_t si = UINT32_MAX;
+    for (uint32_t i = 0; i < m->nfuncs && si == UINT32_MAX; i++) {
+      if (m->funcs[i].imported || (m->reached && !m->reached[i])) continue;
+      uint32_t k = obj_find_sym(o, m->funcs[i].sym);
+      if (k != UINT32_MAX && o->syms[k].section == 0) si = k;
+    }
+    if (si != UINT32_MAX)
+      obj_add_reloc(o, REL_ABS64, 2, o->data.len, si, -(int64_t)o->syms[si].value);
+    buf_u64(&o->data, 0);
+  }
+  data_ptr(o, 2, ftypes_off);
+
   uint64_t ictab_off = o->data.len;
   emit_icall_tables(m, o);
 
@@ -1597,7 +1656,8 @@ void codegen_emit_module_data(Module *m, ObjBuilder *o) {
     uint32_t dead_segs = 0;
     for (uint32_t i = 0; i < m->ndatas; i++)
       if (m->data_read && !m->data_read[i]) { dead_segs++; dead_bytes += m->datas[i].len; }
-    fprintf(stderr, "tables: %u/%u unwind records (%u leaves dropped), "
+    fprintf(stderr, "tables: %u/%u unwind records (%u of leaves, or walked by "
+                    "nothing, dropped), "
                     "%llu rodata bytes shared over %u payloads, "
                     "%u/%u data segments dropped (%llu bytes), "
                     "%u constant-pool instructions shared\n",
@@ -1644,10 +1704,10 @@ void codegen_emit_module_data(Module *m, ObjBuilder *o) {
             (unsigned long long)o->data.len);
     static const char *const RONAMES[] = {
       "blob", "expstrings", "displays", "supers+imports", "unwind",
-      "type tables", "gctypes", "exntypes" };
+      "type tables", "gctypes", "exntypes", "data init" };
     const uint64_t rooffs[] = {
       0, ro_after_blob, ro_after_expstr, ro_after_rtt, ro_after_supers,
-      ro_after_uw, gctypes_off, ro_after_types, o->rodata.len };
+      ro_after_uw, gctypes_off, ro_after_types, init_off, o->rodata.len };
     for (size_t i = 0; i < sizeof RONAMES / sizeof RONAMES[0]; i++)
       fprintf(stderr, "  rodata %-14s %8llu\n", RONAMES[i],
               (unsigned long long)(rooffs[i + 1] - rooffs[i]));
@@ -1660,7 +1720,6 @@ void codegen_emit_module_data(Module *m, ObjBuilder *o) {
   xfree(exp_name); xfree(exp_ptypes); xfree(exp_rtypes); xfree(rtt_off);
   xfree(exp_supers); xfree(exp_flags); xfree(exp_heap); xfree(exp_has_supers);
   xfree(g_init); xfree(d_init); xfree(e_init); xfree(t_init); xfree(item_init);
-  xfree(d_off); xfree(d_off_const);
 }
 
 void codegen_rename_funcs(Module *m, const char *prefix) {

@@ -108,8 +108,13 @@ if expected_exports:
         "exports are %s, expected %s" % (names, sorted(expected_exports))
 
 text = [(v, f) for v, o, f, m in loads if v == loads[0][0]]
+# each function's code where it is in the module's text, from its base
+text_base = u64(md + 256)
 for i in range(nfuncrefs):
-    code = u64(funcrefs + i * 24)
+    off = u32(funcrefs + i * 8)
+    if off in (0xffffffff, 0xfffffffe):   # imported, or reached by nothing
+        continue
+    code = text_base + off
     assert any(v <= code < v + f for v, o, f, m in loads), \
         "funcref %d points at %#x, which is not mapped" % (i, code)
 

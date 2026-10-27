@@ -49,11 +49,20 @@ typedef struct {
   const u64 *rtt;
 } FuncRef;
 
+/* A function's reference as the module's descriptor has it: code is where
+   in ModuleDesc.text_base its code starts, type its slot in
+   ModuleDesc.ftypes */
+#define FUNCREF_IMPORTED  0xffffffffu
+#define FUNCREF_UNREACHED 0xfffffffeu
 typedef struct {
-  void *code;
+  u32 code;
+  u32 type;
+} FuncRefTemplate;
+
+typedef struct {
   u64 type_id;
   const u64 *rtt;
-} FuncRefTemplate;
+} FuncTypeDesc;
 
 typedef void *TableEntry;
 
@@ -91,19 +100,16 @@ typedef struct {
   u32 init;
 } GlobalInitDesc;
 
-#define DSEG_PASSIVE      1u
-
-#define DSEG_OFF_CONST    2u
-#define DSEG_MEM_INDEX(i) ((i) >> 8)
-
+/* A data segment as memory.init and array.new_data take it: a passive one
+   that something reads, its bytes in data_blob; any other, nothing (len 0).
+   A module with no passive segment read has no table of them.  The active
+   segments are ModuleDesc.data_init's (src/datapack.c). */
 typedef struct {
   u32 blob_off;
   u32 len;
-  u32 offset_init;
-  u32 info;
 } DataSegDesc;
-_Static_assert(sizeof(DataSegDesc) == 16,
-               "src/module_data.c writes sixteen bytes for each data segment");
+_Static_assert(sizeof(DataSegDesc) == 8,
+               "src/module_data.c writes eight bytes for each data segment");
 
 typedef struct {
   u32 mode;
@@ -345,6 +351,8 @@ typedef struct {
   const u8 *data_blob;
   const ElemSegDesc *elem;
 
+  /* per element segment item: a function's index, twice it and one, for
+     an item that is a plain ref.func; else twice the constant expression's */
   const u32 *elem_entries;
   const ExportDesc *exports;
 
@@ -382,6 +390,14 @@ typedef struct {
   /* the module's custom sections, as module_data.c's emit_custom_table
      lays them out; NULL when it carries none */
   const u8 *custom;
+
+  /* the active data segments, as src/datapack.c writes them */
+  const u8 *data_init;
+
+  /* the module's text, which FuncRefTemplate.code is from, and the types
+     its functions have */
+  const u8 *text_base;
+  const FuncTypeDesc *ftypes;
 } ModuleDesc;
 
 #define WARMC_ASSERT_OFF(type, field, n) \
@@ -405,7 +421,8 @@ WARMC_ASSERT_OFF(ExportDesc, rtypes, 40);
 _Static_assert(sizeof(ExportDesc) == 80,
                "ExportDesc size changed; update test/check_macho.py "
                "and test/check_elf.py");
-_Static_assert(sizeof(FuncRefTemplate) == 24, "FuncRefTemplate size changed; update test/check_macho.py");
+_Static_assert(sizeof(FuncRefTemplate) == 8, "FuncRefTemplate size changed; update test/check_macho.py");
+WARMC_ASSERT_OFF(ModuleDesc, text_base, 256);
 
 WARMC_ASSERT_OFF(FuncUnwind, code_len, 8);
 WARMC_ASSERT_OFF(FuncUnwind, saved, 28);

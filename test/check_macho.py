@@ -106,7 +106,9 @@ MD_NFUNCREFS, MD_FUNCREFS, MD_NIMPORTED_FUNCS = 108, 112, 124
 EXPORT_SIZE = 80
 EX_NAME, EX_KIND, EX_INDEX, EX_NPARAMS, EX_NRESULTS = 0, 12, 16, 20, 24
 EX_PTYPES, EX_RTYPES = 32, 40
-FUNCREF_SIZE, FR_CODE = 24, 0
+FUNCREF_SIZE, FR_CODE = 8, 0
+MD_TEXT_BASE = 256
+FUNCREF_IMPORTED, FUNCREF_UNREACHED = 0xffffffff, 0xfffffffe
 
 nexport = u32(md + MD_NEXPORT)
 exports_ptr = u64(md + MD_EXPORTS)
@@ -161,11 +163,15 @@ for i in range(nexport):
 nfuncrefs = u32(md + MD_NFUNCREFS)
 funcrefs_ptr = u64(md + MD_FUNCREFS)
 nimported = u32(md + MD_NIMPORTED_FUNCS)
+text_base = u64(md + MD_TEXT_BASE)
 for i in range(nfuncrefs):
-    code = u64(funcrefs_ptr + FUNCREF_SIZE * i + FR_CODE)
+    off = u32(funcrefs_ptr + FUNCREF_SIZE * i + FR_CODE)
+    code = text_base + off
     if i < nimported:
-        if code != 0:
-            problems.append("imported function %d has code %#x, expected 0" % (i, code))
+        if off != FUNCREF_IMPORTED:
+            problems.append("imported function %d has code at %#x, expected none" % (i, off))
+    elif off == FUNCREF_UNREACHED:
+        continue
     elif not in_text(code):
         problems.append("function %d points at %#x, outside __text [%#x,%#x)"
                         % (i, code, text_addr, text_addr + text_size))

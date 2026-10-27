@@ -3204,15 +3204,28 @@ static void emit_block(Isel *s, uint32_t bi, uint32_t next_bi) {
       size_t to_default = br_cc(s, 0, CC_HS, 0, 0);
       bool default_moves = edge_has_moves(s, de);
       if (!default_moves) add_fix(s, to_default, !s->far_br, de->target);
+      /* The entries are halfwords, each its target's distance from the
+         table in instructions: 128 KB either way, which a function past
+         that size makes too few, and is made again with its branches far,
+         and its entries words (148 thousand entries, 299 KB, of a Go
+         net/http server's 2271 tables) */
+      bool half = !s->far_br;
+      uint32_t esz = half ? 2 : 4;
       a64_adr(B, TMP0, 0);
       size_t adr_site = B->len - 4;
-      a64_ldrs_reg(B, 2, 1, TMP1, TMP0, idx, 2, 1);
-      a64_add_reg(B, SF64, TMP0, TMP0, TMP1);
+      if (half) {
+        a64_ldrs_reg(B, 1, 1, TMP1, TMP0, idx, 2, 1);
+        a64_add_reg_lsl(B, SF64, TMP0, TMP0, TMP1, 2);
+      } else {
+        a64_ldrs_reg(B, 2, 1, TMP1, TMP0, idx, 2, 1);
+        a64_add_reg(B, SF64, TMP0, TMP0, TMP1);
+      }
       a64_br(B, TMP0);
       buf_align(B, 4);
       size_t table_base = B->len;
       a64_patch_adr(B, adr_site, table_base);
-      for (uint32_t i = 0; i < n; i++) buf_u32(B, 0);
+      buf_zero(B, (size_t)esz * n);
+      buf_align(B, 4);
       /* An edge with nothing to move needs no code of its own, so its entry
          names the target block and the dispatch is one indirect branch; only
          an edge with moves gets a stub that makes them and branches on. */
@@ -3220,12 +3233,17 @@ static void emit_block(Isel *s, uint32_t bi, uint32_t next_bi) {
       for (uint32_t i = 0; i < n; i++) {
         Edge *e = &b->succs[i];
         if (direct && !edge_has_moves(s, e)) {
-          add_table_fix(s, table_base + 4 * i, table_base, e->target);
+          if (half) add_table16_fix(s, table_base + 2 * i, table_base, e->target);
+          else add_table_fix(s, table_base + 4 * i, table_base, e->target);
           continue;
         }
         size_t stub = B->len;
-        uint32_t w = (uint32_t)(int32_t)(stub - table_base);
-        memcpy(B->data + table_base + 4 * i, &w, 4);
+        if (half) {
+          if (!table16_put(B, table_base + 2 * i, table_base, stub)) s->far_br_needed = true;
+        } else {
+          uint32_t w = (uint32_t)(int32_t)(stub - table_base);
+          memcpy(B->data + table_base + 4 * i, &w, 4);
+        }
         emit_edge(s, e);
         add_fix(s, B->len, 0, e->target);
         a64_b(B, 0);

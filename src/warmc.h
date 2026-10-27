@@ -441,6 +441,14 @@ typedef struct {
 
 /* The threads compile_module uses for a module of nfuncs functions. */
 uint32_t compile_want_threads(Module *m, uint32_t nfuncs);
+/* datapack.c: the active data segments as rt.c's data_init reads them */
+/* FuncRefTemplate.code for a function with none of the module's own: one
+   imported, and one nothing reaches (rt/warm_rt.h) */
+#define FUNCREF_IMPORTED  0xffffffffu
+#define FUNCREF_UNREACHED 0xfffffffeu
+void datapack_emit(const Module *m, const uint32_t *d_at, Buf *out);
+void datapack_lz_block(const uint8_t *in, uint64_t n, Buf *out);
+void codegen_set_compress_data(bool on);
 
 const Table0Facts *module_table0_facts(Module *m);
 #define GO_PCF_NONE 0xffffffffu
@@ -671,6 +679,7 @@ typedef enum { TGT_ELF, TGT_MACHO, TGT_PE } TargetFmt;
 
 void write_coff64(ObjBuilder *o, const char *path);
 
+void link_set_strip(bool on);
 void warmc_link_exec(TargetFmt fmt, const char *out, const char *objpath,
                      const char *wasi, const char *rt, const char *entry,
                      bool strip);

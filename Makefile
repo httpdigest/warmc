@@ -55,7 +55,7 @@ WARMC_SRC := src/main.c src/util.c src/a64.c src/x64.c src/parse.c src/opcodes.c
              src/validate.c src/component.c src/wit.c src/wat.c \
              src/module_data.c src/elf.c src/macho.c src/coff.c src/pe.c src/ir.c src/ir_build.c \
              src/opt.c src/isel.c src/isel_x64.c src/codegen.c src/inline.c src/compile.c src/link.c src/canon.c src/witgen.c \
-             src/clink.c src/shlib.c src/tramp.c src/gosp.c
+             src/clink.c src/shlib.c src/tramp.c src/gosp.c src/datapack.c
 RT_OBJS   := $(BUILD)/rt/rt.o $(BUILD)/rt/start.o $(BUILD)/rt/hook.o \
              $(BUILD)/rt/gcthook.o \
              $(BUILD)/rt/modules.o $(BUILD)/rt/component.o $(BUILD)/rt/lib.o
@@ -99,7 +99,8 @@ all: $(BUILD)/warmc$(EXE) $(BUILD)/warmrt.a $(BUILD)/warmrt-macos.a \
      $(BUILD)/warmgcth-windows.a \
      $(BUILD)/warmwasi.a $(BUILD)/warmwasi-macos.a \
      $(BUILD)/warmwasi-windows.a \
-     $(BUILD)/warmwasip2.a $(BUILD)/warmwasip2-macos.a $(BUILD)/a64_test$(EXE)
+     $(BUILD)/warmwasip2.a $(BUILD)/warmwasip2-macos.a $(BUILD)/a64_test$(EXE) \
+     $(BUILD)/datapack_test$(EXE)
 
 $(BUILD)/obj/%.o: src/%.c
 	@mkdir -p $(BUILD)/obj
@@ -240,6 +241,12 @@ $(BUILD)/a64_test$(EXE): test/a64_test.c $(WARMC_HDRS) \
                    $(BUILD)/obj/a64.o $(BUILD)/obj/util.o
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ test/a64_test.c $(BUILD)/obj/a64.o $(BUILD)/obj/util.o $(HOST_LDLIBS) $(EXTRA_LDFLAGS)
+
+$(BUILD)/datapack_test$(EXE): test/datapack_test.c rt/lzunpack.inc $(WARMC_HDRS) \
+                   $(BUILD)/obj/datapack.o $(BUILD)/obj/util.o
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -Wno-unused-function -o $@ test/datapack_test.c $(BUILD)/obj/datapack.o \
+	  $(BUILD)/obj/util.o $(HOST_LDLIBS) $(EXTRA_LDFLAGS)
 
 $(BUILD)/x64_test$(EXE): test/x64_test.c $(WARMC_HDRS) \
                    $(BUILD)/obj/x64.o $(BUILD)/obj/util.o

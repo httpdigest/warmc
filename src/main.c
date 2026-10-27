@@ -187,6 +187,9 @@ static const char *usage_text =
   "  --link ARGS   more for the system linker, in its shell syntax: objects,\n"
   "                archives, -l and -framework; repeatable\n"
   "  --no-dead-strip  keep every section in the link, referenced or not\n"
+  "  -s, --strip   leave the names of the module's and the runtime's own\n"
+  "                functions out of the program's symbol table, which only\n"
+  "                debuggers and profilers read\n"
   "  --keep-obj    do not delete the intermediate object\n"
   "  -v            print the link command\n"
   "  --magic=D[:64]  print the multiply, add and shift that divide by D\n"
@@ -457,6 +460,7 @@ int main(int argc, char **argv) {
     }
     else if (!strcmp(a, "--keep-obj")) keep_obj = true;
     else if (!strcmp(a, "--no-dead-strip")) dead_strip = false;
+    else if (!strcmp(a, "-s") || !strcmp(a, "--strip")) link_set_strip(true);
     else if (!strcmp(a, "--no-export-names")) g_no_export_names = true;
     else if (!strcmp(a, "--no-function-names")) codegen_set_function_names(false);
     else if (!strncmp(a, "--custom-sections=", 18)) {
@@ -574,6 +578,7 @@ int main(int argc, char **argv) {
       else if (!strcmp(name, "labcache")) opt.labcache = on;
       else if (!strcmp(name, "barelide")) opt.barelide = on;
       else if (!strcmp(name, "merge")) codegen_set_merge(on);
+      else if (!strcmp(name, "compress-data")) codegen_set_compress_data(on);
       else if (!strcmp(name, "reach")) opt.reach = on;
       else if (!strcmp(name, "prune")) opt.prune = on;
       else if (!strcmp(name, "devirt")) opt.devirt = on;
