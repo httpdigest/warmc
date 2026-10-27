@@ -573,6 +573,16 @@ bench-ab: all
 bench-llvm: all simde
 	@python3 test/llvm_compare.py
 
+# every mutant of every transform under test/mutants killed by the tests, or
+# one its spec names equivalent (test/mutate.py); MUTANTS picks specs
+MUTANTS     ?= $(wildcard test/mutants/*.py)
+MUTATE_JOBS ?= 6
+check-mutants: all
+	@rc=0; t=$$(mktemp); for s in $(MUTANTS); do \
+	  echo "--- $$s"; python3 test/mutate.py $$s -j $(MUTATE_JOBS) > $$t || rc=1; \
+	  tail -n +2 $$t | grep -v ':KILL'; \
+	done; rm -f $$t; exit $$rc
+
 # every triple of passes off and on over the cases, traps and collector, and
 # every pair over the language test corpora (test/run_combos.py)
 check-combos: all
@@ -602,6 +612,6 @@ clean:
 	rm -rf $(BUILD)
 
 .PHONY: all asan tsan check smoke check-tools check-linux check-encoder check-spec conformance testsuite wasm-tools \
-        kotlin-stdlib teavm temurin glfw lwjgl wasi-sdk fuzz check-combos clean bench-compare bench-record bench-record-o3 bench-record-warmc bench-ab bench-llvm simde gc-jitter gc-jitter-full
+        kotlin-stdlib teavm temurin glfw lwjgl wasi-sdk fuzz check-combos clean bench-compare bench-record bench-record-o3 bench-record-warmc bench-ab bench-llvm simde check-mutants gc-jitter gc-jitter-full
 
 -include $(WARMC_DEPS)
