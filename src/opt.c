@@ -2021,6 +2021,36 @@ static int ts_eval(IrFunc *f, Ref v, TsTree *T, double x, uint64_t *k) {
   }
 }
 
+/* 2^k for 0 <= k <= 64, and the double or float next to p towards +inf
+   (up) or -inf: exact, from the IEEE encoding, so that nothing here calls
+   libm, which glibc keeps out of libc and warmc does not link */
+static double ts_pow2(int k) {
+  uint64_t u = (uint64_t)(1023 + k) << 52;
+  double d;
+  memcpy(&d, &u, sizeof d);
+  return d;
+}
+
+static double ts_step(double p, bool up) {
+  if (p != p || (__builtin_isinf(p) && (p > 0) == up)) return p;
+  if (p == 0) return up ? 0x1p-1074 : -0x1p-1074;
+  uint64_t u;
+  memcpy(&u, &p, sizeof u);
+  u = (p > 0) == up ? u + 1 : u - 1;
+  memcpy(&p, &u, sizeof p);
+  return p;
+}
+
+static float ts_stepf(float p, bool up) {
+  if (p != p || (__builtin_isinf(p) && (p > 0) == up)) return p;
+  if (p == 0) return up ? 0x1p-149f : -0x1p-149f;
+  uint32_t u;
+  memcpy(&u, &p, sizeof u);
+  u = (p > 0) == up ? u + 1 : u - 1;
+  memcpy(&p, &u, sizeof p);
+  return p;
+}
+
 /* what the truncation is at x, as the result type's bits */
 static uint64_t ts_value(TsTree *T, ValType rt, double x) {
   uint32_t bits = vt_is_64(rt) ? 64u : 32u;
@@ -2028,8 +2058,8 @@ static uint64_t ts_value(TsTree *T, ValType rt, double x) {
   bool sgn = T->op == I_TRUNC_SATS;
   if (x != x) return 0;
   double t = __builtin_trunc(x);
-  double lo = sgn ? -__builtin_ldexp(1.0, (int)bits - 1) : 0.0;
-  double hi = sgn ? __builtin_ldexp(1.0, (int)bits - 1) : __builtin_ldexp(1.0, (int)bits);
+  double lo = sgn ? -ts_pow2((int)bits - 1) : 0.0;
+  double hi = sgn ? ts_pow2((int)bits - 1) : ts_pow2((int)bits);
   if (t < lo) return sgn ? (1ull << (bits - 1)) & mask : 0;
   if (t >= hi) return sgn ? mask >> 1 : mask;
   return (sgn ? (uint64_t)(int64_t)t : (uint64_t)t) & mask;
@@ -2042,16 +2072,16 @@ static int ts_dcmp(const void *a, const void *b) {
 
 /* the least value of x's type above p, and the greatest below it */
 static double ts_above(bool f32, double p) {
-  if (!f32) return __builtin_nextafter(p, __builtin_inf());
+  if (!f32) return ts_step(p, true);
   float v = (float)p;
-  while ((double)v <= p) v = __builtin_nextafterf(v, __builtin_inff());
+  while ((double)v <= p) v = ts_stepf(v, true);
   return v;
 }
 
 static double ts_below(bool f32, double p) {
-  if (!f32) return __builtin_nextafter(p, -__builtin_inf());
+  if (!f32) return ts_step(p, false);
   float v = (float)p;
-  while ((double)v >= p) v = __builtin_nextafterf(v, -__builtin_inff());
+  while ((double)v >= p) v = ts_stepf(v, false);
   return v;
 }
 
