@@ -545,6 +545,12 @@ bench-record-warmc: all
 	  python3 test/gobench.py --corpus $$c --record --reuse-baseline | tail -1; \
 	done
 
+# this tree's warmc against BASE's, kernel by kernel, in cycles (test/ab.py;
+# macOS)
+BASE ?= HEAD
+bench-ab: all
+	@python3 test/ab.py --base $(BASE)
+
 # every triple of passes off and on over the cases, traps and collector, and
 # every pair over the language test corpora (test/run_combos.py)
 check-combos: all
@@ -574,6 +580,6 @@ clean:
 	rm -rf $(BUILD)
 
 .PHONY: all asan tsan check smoke check-tools check-linux check-encoder check-spec conformance testsuite wasm-tools \
-        kotlin-stdlib teavm temurin glfw lwjgl wasi-sdk fuzz check-combos clean bench-compare bench-record bench-record-o3 bench-record-warmc gc-jitter gc-jitter-full
+        kotlin-stdlib teavm temurin glfw lwjgl wasi-sdk fuzz check-combos clean bench-compare bench-record bench-record-o3 bench-record-warmc bench-ab gc-jitter gc-jitter-full
 
 -include $(WARMC_DEPS)
