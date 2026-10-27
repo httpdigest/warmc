@@ -1316,6 +1316,20 @@ static void emit_inst(Isel *s, Ref v) {
         commit(s, v, d);
         break;
       }
+      if ((in->op == I_VADD || in->op == I_VSUB) && s->vmla && s->vmla[v]) {
+        Ref e = a[s->vmla[v] - 1], acc = a[2 - s->vmla[v]];
+        int x = rd(s, ir_args(f, e)[0], F0), y = rd(s, ir_args(f, e)[1], F1);
+        int c = rd(s, acc, F3);
+        int d = wr(s, v, F2);
+        /* mla adds into its destination: the accumulator there first, where
+           that register holds no multiplicand */
+        if (d != c && (d == x || d == y)) d = FTMP;
+        if (d != c) a64_vmov(B, d, c);
+        if (in->op == I_VADD) a64_vmla(B, VLANE_SIZE(in->imm2), d, x, y);
+        else a64_vmls(B, VLANE_SIZE(in->imm2), d, x, y);
+        commit(s, v, d);
+        break;
+      }
       if (in->op == I_VOR && s->vrot && s->vrot[v]) {
         /* The shifts are folded (analyse_immediates): a[0] is the left one.
            The source dies at the earliest here, so the result never shares

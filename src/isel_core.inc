@@ -202,6 +202,9 @@ typedef struct {
   /* A vector add of a pairwise widening add: which operand that is, plus
      one, folded into the add as an add-accumulate (arm64 only). */
   uint8_t *vadal;
+  /* a vector add's (or sub's second) operand that is a multiply it takes in
+     as an mla (mls): its slot + 1 */
+  uint8_t *vmla;
   uint32_t *uses;
 
   uint32_t prof_skip;

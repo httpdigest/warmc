@@ -2888,6 +2888,61 @@ static Ref repacked(IrFunc *f, Ref hi, Ref lo) {
   return x;
 }
 
+/* x * c + y * c is (x + y) * c, and x * c - y * c is (x - y) * c: the
+   distributive law, exact in wrapping arithmetic, an integer's or lane by
+   lane, where each product is read here alone -- one multiply where there
+   were two.  Zig's @Vector sum of products, unrolled, is four multiplies by
+   one splat added into one sum (zigbench/simdsum); folded up the chain it
+   is one, which the accumulator's add takes in as an mla (isel.c's vmla). */
+static bool fold_common_factor(IrFunc *f, uint32_t bi, uint32_t *idx, Ref v,
+                               const uint32_t *uses) {
+  Inst *in = &f->insts[v];
+  bool vec = in->op == I_VADD || in->op == I_VSUB;
+  if (in->nargs != 2 || (!vec && in->op != I_ADD && in->op != I_SUB)) return false;
+  IrOp mul = vec ? I_VMUL : I_MUL;
+  Ref *a = ir_args(f, v);
+  if (uses[a[0]] != 1 || uses[a[1]] != 1) return false;
+  const Inst *p = &f->insts[a[0]], *q = &f->insts[a[1]];
+  if (p->op != mul || q->op != mul || p->nargs != 2 || q->nargs != 2 ||
+      p->type != in->type || q->type != in->type)
+    return false;
+  if (vec && (p->imm2 != in->imm2 || q->imm2 != in->imm2)) return false;
+  const Ref *pa = ir_args(f, a[0]), *qa = ir_args(f, a[1]);
+  for (int i = 0; i < 2; i++)
+    for (int j = 0; j < 2; j++) {
+      if (pa[i] != qa[j]) continue;
+      Ref c = pa[i], ops[2] = { pa[1 - i], qa[1 - j] };
+      uint32_t lanes = in->imm2;
+      Ref sum = emit_before(f, bi, idx, in->op, (ValType)in->type, ops, 2, in->imm);
+      f->insts[sum].imm2 = lanes;
+      in = &f->insts[v];
+      a = ir_args(f, v);
+      in->op = mul;
+      a[0] = sum;
+      a[1] = c;
+      g_stats.common_factors++;
+      return true;
+    }
+  return false;
+}
+
+/* fold_common_factor over the function once more after pass_reassoc, which
+   makes the sums of products it looks for: a chain into an accumulator,
+   acc + a*c + b*c + ..., is one a*c + b*c + ... only once the accumulator
+   is added last.  A rewritten add is a multiply that the next add up the
+   chain reads, so one sweep in order takes the whole chain. */
+static bool pass_common_factor(IrFunc *f) {
+  uint32_t *uses = count_uses(f);
+  bool any = false;
+  for (uint32_t oi = 0; oi < f->norder; oi++) {
+    uint32_t bi = f->order[oi];
+    for (uint32_t i = 0; i < f->blocks[bi].ninsts; i++)
+      if (fold_common_factor(f, bi, &i, f->blocks[bi].insts[i], uses)) any = true;
+  }
+  xfree(uses);
+  return any;
+}
+
 static bool fold_block(IrFunc *f, uint32_t bi, const OptOpts *o, const uint32_t *uses) {
   Block *b = &f->blocks[bi];
   bool changed = false;
@@ -3016,6 +3071,11 @@ static bool fold_block(IrFunc *f, uint32_t bi, const OptOpts *o, const uint32_t 
         i++;
         continue;
       }
+    }
+
+    if (fold_common_factor(f, bi, &i, v, uses)) {
+      in = &f->insts[v]; a = ir_args(f, v);
+      changed = true;
     }
 
     /* (x & c1) & c2 with no bit in common, or (x | c1) | c2 covering every
@@ -21004,6 +21064,9 @@ void ir_optimize(IrFunc *f, const OptOpts *o) {
   bool reassoced = o->reassoc && TP("reassoc", pass_reassoc(f));
   if (o->reassoc && TP("reassoc_carried", pass_reassoc_carried(f))) reassoced = true;
   if (reassoced && o->dce) pass_dce(f);
+  /* after the dead links of the old chain are gone, which read its terms */
+  if (reassoced && o->fold && TP("common_factor", pass_common_factor(f)) && o->dce)
+    pass_dce(f);
 
   if (o->barelide) TP("bar_elide", pass_bar_elide(f));
   bool brt_jumped = false;
