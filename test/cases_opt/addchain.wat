@@ -19,6 +19,7 @@
 ;; shape: baseonly \sadd\s+w\d+, w\d+, #0x1$=4
 ;; shape: notback \sadd\s+w\d+, w\d+, #0x[23]$=0
 ;; shape: straight \sadd\s+w\d+, w\d+, #0x[23]$=0
+;; shape: addwrap \sadd\s+w\d+, w\d+, #0x1$=1
 ;; shape: xorchain \seor\s+x\d+, x\d+, #0xf00$=1
 ;; shape: deep \sadd\s+w\d+, w\d+, #0x11$=1
 ;; shape: deeper \sadd\s+w\d+, w\d+, #0x12$=0
@@ -187,7 +188,8 @@
       (local.set $s (i32.add (i32.mul (local.get $s) (i32.const 7))
         (i32.xor (i32.xor (local.get $a) (local.get $b)) (local.get $i))))
       (local.set $i (i32.add (local.get $b) (i32.const 3)))
-      (br_if $l (i32.lt_u (local.get $i) (local.get $n))))
+      (br_if $l (i32.and (i32.lt_u (local.get $i) (local.get $n))
+                         (i32.ne (local.get $s) (i32.const 1)))))
     (local.get $s))
 
   ;; 16 links below the value: x + 17
