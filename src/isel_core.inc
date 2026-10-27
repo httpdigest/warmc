@@ -17,8 +17,10 @@ typedef struct { int src, dst; uint8_t fp, wide, vec, remat; Ref rv; } Move;
 struct Bfx { bool ok, sign; int immr, imms; Ref src; };
 
 /* is19: 0 a 26-bit branch, 1 a 19-bit one, BRFIX_TABLE a br_table word that
-   holds the target's offset from the table at base. */
+   holds the target's offset from the table at base, BRFIX_TABLE16 a
+   halfword that holds it in instructions (arm64). */
 #define BRFIX_TABLE 2
+#define BRFIX_TABLE16 3
 typedef struct BrFix {
   size_t site, base;
   int is19;
@@ -347,6 +349,29 @@ static void add_fix(Isel *s, size_t site, int is19, uint32_t target) {
 static void add_table_fix(Isel *s, size_t site, size_t base, uint32_t target) {
   add_fix(s, site, BRFIX_TABLE, target);
   s->fixups->base = base;
+}
+
+static inline void add_table16_fix(Isel *s, size_t site, size_t base, uint32_t target) {
+  add_fix(s, site, BRFIX_TABLE16, target);
+  s->fixups->base = base;
+}
+
+/* target's distance from base, in instructions, as the halfword at site;
+   false when it is not a whole number of them or too far for one.
+   WARMC_TABLE16_REACH makes too far nearer, for the tests: past it a
+   function is made again with its tables of words. */
+static inline bool table16_put(Buf *b, size_t site, size_t base, size_t target) {
+  static int64_t reach = -1;
+  if (reach < 0) {
+    const char *e = warmc_getenv("WARMC_TABLE16_REACH");
+    int64_t r = e ? atoll(e) : INT16_MAX;
+    reach = r < 0 ? 0 : r > INT16_MAX ? INT16_MAX : r;
+  }
+  int64_t d = (int64_t)target - (int64_t)base;
+  if (d & 3 || d / 4 < -reach - 1 || d / 4 > reach) return false;
+  int16_t w = (int16_t)(d / 4);
+  memcpy(b->data + site, &w, 2);
+  return true;
 }
 
 static uint32_t slot_off(Isel *s, uint32_t slot) { return s->slots_off + 8u * slot; }

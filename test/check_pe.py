@@ -219,8 +219,13 @@ if expected_exports:
 
 text_lo = image_base + tva
 text_hi = text_lo + by_name[".text"][2]
+# each function's code where it is in the module's text, from its base
+text_base = u64(md + 256)
 for i in range(nfuncrefs):
-    code = u64(funcrefs + i * 24)
+    off = u32(funcrefs + i * 8)
+    if off in (0xffffffff, 0xfffffffe):   # imported, or reached by nothing
+        continue
+    code = text_base + off
     assert text_lo <= code < text_hi, \
         "funcref %d points at %#x, which is not in .text" % (i, code)
 

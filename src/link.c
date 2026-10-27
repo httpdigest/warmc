@@ -1471,6 +1471,12 @@ static int cmp_textsym(const void *a, const void *b) {
    'l' or 'L' (a C name starts with '_'), on ELF the ".L" ones and AArch64's
    mapping symbols ($x, $d), which mark where instructions and literals start.
    Sorted by address, and each one's size runs to the next address up. */
+/* -s: no names for the functions only debuggers and profilers look up,
+   the module's own and the runtime's -- a Go net/http server's 5547 of
+   them, 284 KB of its symbol table */
+static bool g_strip_locals;
+void link_set_strip(bool on) { g_strip_locals = on; }
+
 static TextSym *text_syms(Linker *L, bool locals_only, uint32_t *count) {
   uint32_t n = 0, cap = 256;
   TextSym *v = xmalloc(cap * sizeof *v);
@@ -1485,6 +1491,7 @@ static TextSym *text_syms(Linker *L, bool locals_only, uint32_t *count) {
       if (L->fmt == TGT_MACHO ? (nm[0] == 'l' || nm[0] == 'L')
                               : (nm[0] == '$' || (nm[0] == '.' && nm[1] == 'L')))
         continue;
+      if (!sy->global && g_strip_locals) continue;
       if (sy->global) {
         if (locals_only) continue;
         int32_t g = gs_find(L, nm);

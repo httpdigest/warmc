@@ -958,17 +958,18 @@ void warmc_memory_init(WarmInstance *v, u64 dst, u64 src, u64 n, u32 seg,
   Instance *in = INST_OF(v);
   WarmMemory *M = memory_of(in, mem);
   if (seg >= in->md->ndata) warmc_trap(TRAP_MEM_OOB);
-  const DataSegDesc *d = &in->md->data[seg];
-  u64 avail = in->data_dropped[seg] ? 0 : d->len;
+  const DataSegDesc *d = in->md->data ? &in->md->data[seg] : 0;
+  u64 avail = !d || in->data_dropped[seg] ? 0 : d->len;
   bounds(src, n, avail, TRAP_MEM_OOB);
   bounds(dst, n, M ? M->size : 0, TRAP_MEM_OOB);
+  if (!n) return;
 
   mem_move(M->base + dst, in->md->data_blob + d->blob_off + src, n);
 }
 
 void warmc_data_drop(WarmInstance *v, u32 seg) {
   Instance *in = INST_OF(v);
-  if (seg < in->md->ndata) in->data_dropped[seg] = 1;
+  if (seg < in->md->ndata && in->data_dropped) in->data_dropped[seg] = 1;
 }
 
 static u64 gc_load(u64 *slot);
@@ -3767,11 +3768,12 @@ void warmc_array_copy(WarmInstance *vm, u32 type_index, void *d, u32 di,
 static void arr_init_data(Instance *in, const GcTypeInfo *ti, void *a,
                           u32 seg, u32 di, u32 so, u32 n) {
   if (seg >= in->md->ndata) warmc_trap(TRAP_MEM_OOB);
-  const DataSegDesc *d = &in->md->data[seg];
-  u64 avail = in->data_dropped[seg] ? 0 : d->len;
+  const DataSegDesc *d = in->md->data ? &in->md->data[seg] : 0;
+  u64 avail = !d || in->data_dropped[seg] ? 0 : d->len;
   u64 w = ti->body_size;
 
   if ((u64)so + (u64)n * w > avail) warmc_trap(TRAP_MEM_OOB);
+  if (!n || !w) return;
   const u8 *src = in->md->data_blob + d->blob_off + so;
   u8 *dst = arr_data(ti, a);
   for (u64 i = 0; i < (u64)n * w; i++) dst[(u64)di * w + i] = src[i];
@@ -4001,6 +4003,37 @@ WarmInstance *warmc_instantiate(const ModuleDesc *md) {
   return warmc_instantiate_bound(md, 0);
 }
 
+#include "lzunpack.inc"
+
+/* The active data segments, as src/datapack.c writes them: each memory's
+   image, then the others' segments in index order */
+static void data_init(Instance *in, const u8 *p) {
+  const ModuleDesc *md = in->md;
+  u64 blk = 1ull << rd_var(&p);
+  for (u64 ns = rd_var(&p); ns; ns--) {
+    u64 mem = rd_var(&p), base = rd_var(&p), len = rd_var(&p);
+    WarmMemory *M = mem < md->nmemories ? in->mems[mem] : 0;
+    if (!M || base > M->size || len > M->size - base) warmc_trap(TRAP_MEM_OOB);
+    for (u64 at = 0; at < len; at += blk)
+      p = lz_unpack(M->base + base + at, len - at < blk ? len - at : blk, p);
+  }
+  for (u64 ne = rd_var(&p); ne; ne--) {
+    u64 mem = rd_var(&p), kind = rd_var(&p), at = rd_var(&p), len = rd_var(&p);
+    u64 off = at;
+    if (kind) {
+      u64 v2[2];
+      const_eval(in, (u32)at, v2);
+      off = v2[0];
+    }
+    WarmMemory *M = mem < md->nmemories ? in->mems[mem] : 0;
+    if (!M || off > M->size || len > M->size - off) warmc_trap(TRAP_MEM_OOB);
+    // The bytes are in the image, never in a linear memory, so the two
+    // cannot overlap.
+    mem_move(M->base + off, p, len);
+    p += len;
+  }
+}
+
 WarmInstance *warmc_instantiate_bound(const ModuleDesc *md,
                                       const WarmBinding *binds) {
   if (ninstances >= MAX_INSTANCES) die("too many instances");
@@ -4015,7 +4048,7 @@ WarmInstance *warmc_instantiate_bound(const ModuleDesc *md,
 
   in->gctype_base = gc_register_types(md);
   in->exntype_base = in->gctype_base + md->ngctypes;
-  in->data_dropped = arena_alloc(md->ndata ? md->ndata : 1);
+  in->data_dropped = md->data && md->ndata ? arena_alloc(md->ndata) : 0;
   in->elem_dropped = arena_alloc(md->nelem ? md->nelem : 1);
   in->tabs = md->ntables ? arena_alloc(sizeof(WarmTable *) * md->ntables) : 0;
   in->mems = md->nmemories ? arena_alloc(sizeof(WarmMemory *) * md->nmemories) : 0;
@@ -4057,7 +4090,7 @@ WarmInstance *warmc_instantiate_bound(const ModuleDesc *md,
       funcrefs[fi].instance = ctx;
       funcrefs[fi].type_id = im->type_id;
       /* a host function is of the type the module imports it at */
-      funcrefs[fi].rtt = md->funcrefs[fi].rtt;
+      funcrefs[fi].rtt = md->ftypes[md->funcrefs[fi].type].rtt;
       fi++;
       continue;
     }
@@ -4145,10 +4178,13 @@ WarmInstance *warmc_instantiate_bound(const ModuleDesc *md,
     if (in->tabs[i]) republish_table(in->tabs[i]);
 
   for (u32 i = md->nimported_funcs; i < md->nfuncrefs; i++) {
-    funcrefs[i].code = md->funcrefs[i].code;
+    const FuncRefTemplate *t = &md->funcrefs[i];
+    funcrefs[i].code = t->code == FUNCREF_UNREACHED ? (void *)warmc_unreached
+                       : t->code == FUNCREF_IMPORTED ? 0
+                       : (void *)(md->text_base + t->code);
     funcrefs[i].instance = v;
-    funcrefs[i].type_id = md->funcrefs[i].type_id;
-    funcrefs[i].rtt = md->funcrefs[i].rtt;
+    funcrefs[i].type_id = md->ftypes[t->type].type_id;
+    funcrefs[i].rtt = md->ftypes[t->type].rtt;
   }
 
   for (u32 i = 0; i < md->nglobals; i++)
@@ -4174,8 +4210,10 @@ WarmInstance *warmc_instantiate_bound(const ModuleDesc *md,
     in->nelem_values = total;
     in->elem_values = total ? arena_alloc(total * sizeof(void *)) : 0;
     for (u64 k = 0; k < total; k++) {
+      u32 at = md->elem_entries[k];
+      if (at & 1) { in->elem_values[k] = &inst_funcrefs(in)[at >> 1]; continue; }
       u64 v2[2];
-      const_eval(in, md->elem_entries[k], v2);
+      const_eval(in, at >> 1, v2);
       in->elem_values[k] = (void *)(uptr)v2[0];
     }
   }
@@ -4196,26 +4234,7 @@ WarmInstance *warmc_instantiate_bound(const ModuleDesc *md,
     in->elem_dropped[i] = 1;
   }
 
-  for (u32 i = 0; i < md->ndata; i++) {
-    const DataSegDesc *d = &md->data[i];
-    if (d->info & DSEG_PASSIVE) continue;
-    u64 off;
-    if (d->info & DSEG_OFF_CONST) {
-      off = d->offset_init;
-    } else {
-      u64 v2[2];
-      const_eval(in, d->offset_init, v2);
-      off = v2[0];
-    }
-    u32 mem = DSEG_MEM_INDEX(d->info);
-    WarmMemory *M = mem < md->nmemories ? in->mems[mem] : 0;
-    if (!M || off > M->size || d->len > M->size - off) warmc_trap(TRAP_MEM_OOB);
-    // The blob is in the image, never in a linear memory, so the two cannot
-    // overlap.  A byte loop here was 2% of stdgo/regex, whose 1 MB of data
-    // comes in 30000 segments.
-    mem_move(M->base + off, md->data_blob + d->blob_off, d->len);
-    in->data_dropped[i] = 1;
-  }
+  if (md->data_init) data_init(in, md->data_init);
 
   if (md->has_start) {
     u64 zero[WARMC_FARGS_WORDS] = { 0 }, ret[WARMC_RETBUF_WORDS] = { 0 };
