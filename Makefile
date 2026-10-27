@@ -453,6 +453,23 @@ $(WASI_SDK_STAMP):
 
 wasi-sdk: $(WASI_SDK_STAMP)
 
+# SIMDe, the portable SIMD headers wasm2c's C for SIMD kernels needs, for
+# test/llvm_compare.py
+SIMDE_VERSION := 0.8.2
+SIMDE_STAMP   := $(BUILD)/tools/simde-$(SIMDE_VERSION)/.fetched
+
+$(SIMDE_STAMP):
+	@mkdir -p $(BUILD)/tools
+	@rm -rf $(BUILD)/tools/simde-*
+	curl -sSLf -o $(BUILD)/tools/simde.tar.gz \
+	  "https://github.com/simd-everywhere/simde/archive/refs/tags/v$(SIMDE_VERSION).tar.gz"
+	@mkdir -p $(BUILD)/tools/simde-$(SIMDE_VERSION)
+	@tar xzf $(BUILD)/tools/simde.tar.gz -C $(BUILD)/tools/simde-$(SIMDE_VERSION) --strip-components=1
+	@rm -f $(BUILD)/tools/simde.tar.gz
+	@touch $@
+
+simde: $(SIMDE_STAMP)
+
 # `make check` brings the pinned tools up to date first, and the official
 # testsuite its spec row runs; ktbench skips itself without a Kotlin
 # compiler, so the stdlib is only fetched when there is one, TeaVM only with
@@ -551,6 +568,11 @@ BASE ?= HEAD
 bench-ab: all
 	@python3 test/ab.py --base $(BASE)
 
+# warmc against wasm2c and clang -O2 on the same wasm, kernel by kernel, in
+# cycles (test/llvm_compare.py; macOS)
+bench-llvm: all simde
+	@python3 test/llvm_compare.py
+
 # every triple of passes off and on over the cases, traps and collector, and
 # every pair over the language test corpora (test/run_combos.py)
 check-combos: all
@@ -580,6 +602,6 @@ clean:
 	rm -rf $(BUILD)
 
 .PHONY: all asan tsan check smoke check-tools check-linux check-encoder check-spec conformance testsuite wasm-tools \
-        kotlin-stdlib teavm temurin glfw lwjgl wasi-sdk fuzz check-combos clean bench-compare bench-record bench-record-o3 bench-record-warmc bench-ab gc-jitter gc-jitter-full
+        kotlin-stdlib teavm temurin glfw lwjgl wasi-sdk fuzz check-combos clean bench-compare bench-record bench-record-o3 bench-record-warmc bench-ab bench-llvm simde gc-jitter gc-jitter-full
 
 -include $(WARMC_DEPS)
