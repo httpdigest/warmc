@@ -317,6 +317,32 @@ PROG [--catch] [--bench N] EXPORT ARGS... [-- EXPORT ARGS...]...
 `_start` and `main`. The harness still runs those with no arguments, but it
 cannot call an export by name or list the exports.
 
+### Several modules in one program
+
+Given several core modules, warmc makes one program holding them all. Each
+module is compiled exactly as it would be alone: the code is the same, the
+symbols take a prefix of the module's own, and a function's name in the
+symbol table is `MODULE.FUNCTION`. The program is asked for a module by its
+file's name, without the directory and the last extension. The harness takes
+that name as its first argument; with `--wasi`, the host takes
+`--module NAME`, an option that exists only in a program of several modules.
+Only the module named becomes an instance.
+
+```console
+$ build/warmc --target macos --rt build/warmrt-macos.a -o both fib.wat sum.wat
+$ ./both                      # lists the modules
+modules:
+  fib
+  sum
+$ ./both fib fib 40
+i64:102334155
+$ build/warmc --target macos --rt build/warmrt-macos.a --wasi -o tools a.wasm b.wasm
+$ ./tools --module b ARGS...
+```
+
+The test suites use this to link hundreds of modules into a few programs:
+macOS checks a new program on its first run, which costs about 150 ms.
+
 ### WASI preview 1 programs
 
 Most toolchains that target `wasm32-wasi` / `wasip1` produce modules that
@@ -349,6 +375,7 @@ other argument, an unknown flag included, becomes the guest's `argv`:
 | `--dir=HOST[::GUEST]` | preopen a host directory, under the guest path `GUEST`, or `HOST` as written |
 | `--env NAME=VALUE` | pass one environment variable |
 | `--inherit-env` | pass the whole host environment instead, ignoring every `--env` (nothing is inherited by default) |
+| `--module NAME` | in a program of several modules, the one to run (see [Several modules in one program](#several-modules-in-one-program)); a program of one passes it to the guest |
 | `--tcplisten=[ADDR:]PORT` | hand the guest a listening socket, at a dotted IPv4 address (default 127.0.0.1), non-blocking. Its descriptor comes after the preopened directories': 3 when there are none. Without it, the guest has no network access. Not on Windows. |
 
 Each flag also takes its value after a space or an `=`: `--dir HOST`,
@@ -1268,6 +1295,7 @@ as in `--target=macos`.
 | `WARMC_SYSTEM_LD` | compiler | the same as `--system-ld`, whatever its value |
 | `WARMC_MACOS_LIBDIR` | compiler | directory holding `libSystem.tbd` for `--system-ld` on macOS (otherwise found with `xcrun`) |
 | `WARMC_JOBS` | compiler | same as `-j` |
+| `WARMC_CACHE` | compiler | a directory that keeps what each compile did, under a digest of warmc itself, every argument (the output by its file name only), every file an argument names, every archive next to the runtime, and every `WARMC_` setting except the ones only a program reads: its exit status, what it printed, and its output. A compile whose digest is already there makes its output a hard link to the kept copy, prints what it printed then and exits as it did -- a refusal and the verdicts of `--validate-only` and `--dump-*` included. Not used with `--shared`, `--header`, `--keep-obj`, `--emit-wasm`, `--print-ir` or an external linker, nor for a compile that crashed. `make check` and the test scripts set it to `build/warmc-cache` |
 | `WARMC_TIME` | compiler | print phase timings, peak memory and the slowest functions |
 | `WARMC_GC_HEAP_KB` | program | GC heap reservation (default 1 GiB) |
 | `WARMC_GC_MIN_KB`, `WARMC_GC_GROWTH` | program | collection trigger: minimum size (default 16384, or a quarter of the heap if that is less), and growth as a percentage of live data (default 200) |
@@ -1664,17 +1692,37 @@ Before its rows, `make check` runs `check-encoder` and, except on Windows,
 builds the sanitiser compilers; on Windows it checks that the Win32 offsets
 the runtime hard-codes match `windows.h` instead. CI runs the whole of it
 nightly. `CHECK_BENCH=0` leaves out the benchmark corpora, as CI does, and
-`CHECK_TIMING=1` lists each row's time at the end.
+`CHECK_TIMING=1` lists each row's wall and CPU time at the end.
+
+`make check` keeps what it can, each thing under exactly what it depends
+on. warmc's compiles go to `WARMC_CACHE=build/warmc-cache`.
+`test/testcache.py` keeps the suites' own results in `build/testcache`:
+- wasmtime's answers, under wasmtime's version, its arguments, the bytes of
+  every file they name, and its stdin (`test/shims/wasmtime`, first on
+  `make check`'s `PATH`; a run with a preopened directory, a network, or a
+  stdin that may not end goes to wasmtime every time);
+- a program's output, under the program's bytes, its arguments and its
+  settings;
+- a suite's whole result, where none of its programs, its scripts or its
+  settings changed since a run that passed;
+- and each row's whole answer (`test/row.py`), under warmc and its sanitiser
+  builds, the runtimes, the pinned tools, every file of the tree outside
+  `src/`, the toolchains on `PATH` the suites call, and the row's own
+  command and settings: a `make check` with nothing changed answers from it,
+  and one after a change to warmc runs every row, through the caches above.
+
+Each suite links its modules into a few programs of several modules, not a
+program per test. `WARMC_NO_TESTCACHE=1` runs everything.
 
 Most of the suite is **differential**. warmc's output is compared with:
 - wabt's `wasm-interp`, for the hand-written cases in `test/cases`: at `-O0`,
-  `-O1` and `-O2`; with the register allocator and SSA verified; without
-  inlining, without each of several passes, with `-fgssa-all`, without guard
-  pages, with `-fdead-frames`, with `-fexact-trap`, and with far branches
-  forced; and at nine
-  settings that turn every pair of passes off and on in all four
-  combinations (`test/run_combos.py`, which runs the trap and GC tests at
-  them too). wasmtime runs the cases as a second engine.
+  `-O1` and `-O2`; with the register allocator and SSA verified; with
+  `-fgssa-all`, with `-fdead-frames`, with `-fexact-trap`, and with far
+  branches forced; and at nine settings that turn every pair of passes off
+  and on in all four combinations, so that each pass is off beside every
+  other both on and off (`test/run_combos.py`, which runs the trap and GC
+  tests and the C workload at them too). wasmtime runs the cases as a second
+  engine.
 - wabt's `wasm-interp`, for C, SIMD, control-flow and addressing workloads
   at each level (`test/run_workload.sh`), whose addressing variants must also
   compute what the 32-bit one does
@@ -1710,7 +1758,8 @@ Most of the suite is **differential**. warmc's output is compared with:
   loaded into C's registers rather than moved there, and the address called
   in the register it is in; and each use of a native import warmc refuses
 - the JVM with LWJGL's own natives, GLFW and macOS's OpenGL, for `lwjgl/`
-  (`test/run_lwjgl.py`): LWJGL's HelloWorld built; LWJGL's off-heap memory,
+  (`test/run_lwjgl.py`, run by hand -- `make teavm glfw lwjgl` and a display
+  first -- and not by `make check`): LWJGL's HelloWorld built; LWJGL's off-heap memory,
   in the program's and in C's, printing what the JVM does; calls through
   `JNI` of C of the program's own, with results narrower than a register,
   arrays of each type, 23 arguments, floating point and callbacks, an
@@ -1724,6 +1773,12 @@ Most of the suite is **differential**. warmc's output is compared with:
   function by an import of its own
 - the Component Model's reference `definitions.py`, for canonical-ABI layout
   and for what the generated adapter code computes (`test/run_adapter.py`)
+- wabt's `wasm-interp` again, for random expressions of the optimiser's folds
+  and their near misses (`test/gen_folds.py`): ladders of field swaps, whole,
+  rotated, cut short or with a mask, a shift or a step changed; float
+  computations of converted integers truncated, saturating or compared with
+  a constant; and TinyGo's select tree round a truncation, a bound or its
+  NaN test now and then changed
 - wabt's `wasm-interp` again, for random data segments (`test/gen_datapack.py`)
   in one or two memories, 32- or 64-bit, laid out as Go's linker lays them
   or at random, overlapping, empty, at the memory's end, across a block of
@@ -1876,7 +1931,7 @@ rt/             the runtime linked into every program and shared library
   win.inc winposix.c                      Windows platform layer
   warm_rt.h                               the embedding API
   const_ops.inc                           the constant-expression opcodes, shared with the compiler
-test/           test drivers (run_all.sh is make check), cases, benchmark and test corpora, the spec harness (spec/), TeaVM's driver and WASI adapter (teavm/)
+test/           test drivers (run_all.sh is make check), cases, benchmark and test corpora, the spec harness (spec/), TeaVM's driver and WASI adapter (teavm/), the suites' cache (testcache.py) and the caching wasmtime make check runs (shims/)
 lwjgl/          LWJGL 3 programs through TeaVM and warmc: the platform layer (platform/), the TeaVM transformer (teavm/), the C glue (native/), the build driver and a demo
 example/        TinyGo and Kotlin sample programs (source, .wasm and a macOS build)
 Makefile        the build, the pinned dependencies and the test targets
