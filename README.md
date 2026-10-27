@@ -1700,6 +1700,7 @@ make check-combos   # the cases, traps and GC tests with every triple of passes 
 make gc-jitter      # GC schedule sweep with randomised collector delays (gc-jitter-full: every mode under every seed)
 make check-linux    # run the GC tests, the WASI host's sockets and stdio flags (test/run_wasi_linux.sh), and on a macOS host with tinygo the TinyGo WASI corpus, as real Linux binaries (podman/docker arm64)
 make check-tools    # fetch the pinned tools make check uses, alone
+make check-mutants  # every mutant of the transforms under test/mutants killed by the tests (test/mutate.py)
 ```
 
 Before its rows, `make check` runs `check-encoder` and, except on Windows,
@@ -1849,6 +1850,13 @@ Most of the suite is **differential**. warmc's output is compared with:
   `ret`, where the blocks emitted after the rest go, for what changes the code
   and not what it computes; `test/cases_opt/trunc_exact.wat` is made by
   `test/gen_fexact.py`, `addchain.wat` by `test/gen_addchain.py`
+- mutants of a transform -- a test it makes dropped or loosened, a bound
+  moved, an operand swapped -- each of which some test must tell from the
+  transform, or the spec names it equivalent and why (`make
+  check-mutants`: `test/mutate.py`, one spec per transform in
+  `test/mutants`); each mutant builds only warmc, in a worker's own copy of
+  `src/` under `build/mut`, and runs the suites its spec names until one
+  fails
 - exact arithmetic, for every division's magic numbers (`test/magic.py`)
 - the module itself, for the custom sections each linked image carries, read
   back from Mach-O, ELF and PE (`test/check_macho.py`, `check_elf.py`,
