@@ -1145,6 +1145,7 @@ and `ldcomb` need `guard-pages`; `small-loop-align` needs `align`; and
 | `split` | live-range splitting at loop boundaries in loops that make no call, so a value the loop carries keeps a register inside it although it is spilled outside |
 | `align`, `small-loop-align` | code alignment; a loop small enough for one 64-byte fetch block is placed inside one (arm64) |
 | `cpool`, `regalloc`, `guard-pages` | constant pools; the real register allocator (off: every value lives in a stack slot); guard-page bounds checking |
+| `compress-data` | write the active data segments of a memory the module defines, when every one has a constant offset in bounds, as one compressed image of what they make of it, which instantiation decodes into the memory (see [Runtime](#how-it-works)); off, each segment's bytes as they are. On at every level |
 
 `-fno-loadbar` stops emitting GC load barriers. That is unsound for a module
 with GC references, because relocation heals them through the barrier; it
@@ -1245,6 +1246,7 @@ on each corpus (Apple M-series):
 | `--no-export-names` | drop the export-name table, keeping only `_start` and `main`; not for a component or with `--shared` |
 | `--no-function-names` | name every function's symbol `wasm_func_N`, by its index, rather than as the name section does |
 | `--no-dead-strip` | keep unreferenced sections in the link |
+| `-s`, `--strip` | leave the names of the module's and the runtime's functions out of the executable's symbol table (Linux and macOS), which only debuggers and profilers read |
 | `--system-ld`, `--ld PATH` | link with an external linker instead (Linux and macOS only, not with `--shared`) |
 | `--native-module NAME` | call the C function of each function import of module `NAME` (see [Calling C functions](#calling-c-functions)); implies `--system-ld` |
 | `--link ARGS` | more for the system linker: objects, archives, `-framework` and `-l` options, in its shell syntax; repeatable |
@@ -1339,7 +1341,10 @@ devirtualisation.
 Instruction selection fuses compares into branches and selects, folds shifts,
 bitfield extracts, multiply-adds and addressing modes, and pairs loads and
 stores into `ldp`/`stp`. From `-O1` a `br_table` of at most eight distinct
-edges becomes a tree of compares, and any other a jump table. On arm64, a
+edges becomes a tree of compares, and any other a jump table, whose entries
+on arm64 are halfwords, each its target's distance in instructions; a
+function too large for that reach, 128 KB, is made again with its tables of
+words. On arm64, a
 function whose entry block tests only what it is passed and what it loads
 from memory, and may return at once -- a destructor called on a null
 pointer -- makes that test, and that return with the block's stores, ahead
@@ -1403,8 +1408,8 @@ Functions compile in parallel and are laid out deterministically.
   anything -- a runtime function's, or another function's too. A name
   section that is not as the spec's appendix has it gives no names at all,
   and the module is valid all the same. `--print-ir` and `WARMC_TIME` give
-  the names too. Windows output has no symbol table; a COFF object (`-c`)
-  carries the names.
+  the names too. `-s` leaves them out. Windows output has no symbol table; a
+  COFF object (`-c`) carries the names.
 
 **Runtime** (`rt/`):
 - **Platforms.** On Linux the runtime makes raw syscalls, on macOS it uses
@@ -1433,7 +1438,23 @@ Functions compile in parallel and are laid out deterministically.
     program's allocation buffer, zeroed when their page was opened; on
     AArch64 so are arrays of a computed length.
 - **Exceptions.** They are unwound by walking warmc's own compact unwind
-  tables, with no DWARF and no libunwind.
+  tables, with no DWARF and no libunwind. The collector walks the same
+  tables for its roots, and nothing else does: a program's only module with
+  no tag to throw and no type of the collector's has none.
+- **Data segments.** A memory the module defines, whose every active segment
+  has a constant offset that fits its initial size, gets the image those
+  segments make of it, compressed at compile time (`src/datapack.c`, LZ77 in
+  LZ4's tokens, a run of zeros skipped) and decoded into the new memory as
+  it is instantiated (`rt/lzunpack.inc`). Any other memory's active segments
+  are each its own bytes, applied in order; only the passive segments the
+  code reads are kept by index, for `memory.init` and `array.new_data`. A Go
+  `net/http` server's 90688 segments, 2.5 MB of bytes and 1.45 MB of their
+  descriptors, are a 1.1 MB image, which takes 0.3 ms more to start.
+- **Function references.** Each function's is eight bytes in the module's
+  descriptor -- where its code is in the module's text, and which of the
+  types its functions have it is -- made into the instance's at
+  instantiation; an element segment's item that is a plain `ref.func` is the
+  function's index in its entry.
 
 ---
 
@@ -1703,6 +1724,12 @@ Most of the suite is **differential**. warmc's output is compared with:
   function by an import of its own
 - the Component Model's reference `definitions.py`, for canonical-ABI layout
   and for what the generated adapter code computes (`test/run_adapter.py`)
+- wabt's `wasm-interp` again, for random data segments (`test/gen_datapack.py`)
+  in one or two memories, 32- or 64-bit, laid out as Go's linker lays them
+  or at random, overlapping, empty, at the memory's end, across a block of
+  the compressed image, some with an offset that is an expression and some
+  passive, compiled with the image's blocks 64 bytes long and with no
+  compression too; and what the binary keeps of the passive ones
 - wabt's `wasm-interp` again, for random modules in Go's shape whose stack
   pointer `go-sp` passes as an argument (`test/gen_gosp.py`), and for small
   ones with one thing each that rules the rewrite out (`test/run_gosp.py`;
@@ -1728,6 +1755,13 @@ Most of the suite is **differential**. warmc's output is compared with:
   and for the names its functions' symbols take in Mach-O and ELF
 
 The other rows check what has no second engine to compare with:
+- the data image's compressor and decoder on their own
+  (`test/datapack_test.c`): every block decoding to what was compressed
+  into memory that starts zero, nothing written outside it, streams that
+  ask for more than the block or a match from before it trapping; and data
+  segments into an imported memory that is not zero (`test/link/dpmem_*`)
+- `br_table`'s jump tables past the reach of arm64's halfword entries, of
+  70000 entries, against answers worked out by hand (`test/run_bigtable.py`)
 - a Go `net/http` server (`test/gohttp`, `test/run_gohttp.py`), built by
   Go's own compiler and run at `-O0`, `-O1` and `-O2` with a listener and a
   directory preopened: many requests on one connection and many connections
