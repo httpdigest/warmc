@@ -143,8 +143,18 @@ uint32_t codegen_entry_off(const Module *m, uint32_t fi) {
              ? ENTRY_CHECK_BYTES : 0;
 }
 
+/* where the module being compiled starts in the object's rodata and data:
+   one object holds several modules (components', and warmc given several),
+   and WARMC_TABLE_STATS counts this one's */
+static uint64_t g_ro_start, g_data_start;
+
 void codegen_prepare_module(Module *m, ObjBuilder *o) {
-  (void)o;
+  /* a module after another starts aligned, as the first does at offset 0,
+     so that what it lays out and measures is what it would alone */
+  while (o->rodata.len & 15) buf_u8(&o->rodata, 0);
+  while (o->data.len & 15) buf_u8(&o->data, 0);
+  g_ro_start = o->rodata.len;
+  g_data_start = o->data.len;
   g_pin = g_target->pin_regs && !warmc_getenv("WARMC_NO_PIN");
   g_memop_r = g_pin && !warmc_getenv("WARMC_NO_MEMOP_R");
   codegen_reset_unwind();
@@ -169,6 +179,12 @@ void codegen_prepare_module(Module *m, ObjBuilder *o) {
 
 static bool g_func_names = true;
 void codegen_set_function_names(bool on) { g_func_names = on; }
+/* in a program of several modules, the module's name before each function's,
+   "module.function", so that a tool tells their functions apart */
+static char g_display_prefix[128];
+void codegen_set_display_prefix(const char *prefix) {
+  snprintf(g_display_prefix, sizeof g_display_prefix, "%s", prefix);
+}
 
 void codegen_prewarm_symbols(Module *m, ObjBuilder *o) {
   static const char *const helpers[] = {
@@ -221,8 +237,11 @@ void codegen_prewarm_symbols(Module *m, ObjBuilder *o) {
   for (uint32_t i = m->nimported_funcs; i < m->nfuncs; i++)
     if (!m->reached || m->reached[i]) {
       uint32_t s = obj_intern_sym(o, m->funcs[i].sym, SYM_LOCAL_FUNC, -1, 0);
-      if (g_func_names && m->funcs[i].name && !o->syms[s].display)
-        o->syms[s].display = xstrndup(m->funcs[i].name, strlen(m->funcs[i].name));
+      if (g_func_names && m->funcs[i].name && !o->syms[s].display) {
+        char *d = xmalloc(strlen(g_display_prefix) + strlen(m->funcs[i].name) + 2);
+        sprintf(d, "%s%s%s", g_display_prefix, *g_display_prefix ? "." : "", m->funcs[i].name);
+        o->syms[s].display = d;
+      }
     }
 }
 
@@ -1701,18 +1720,18 @@ void codegen_emit_module_data(Module *m, ObjBuilder *o) {
       fprintf(stderr, "  data %-9s %8llu\n", NAMES[i],
               (unsigned long long)(offs[i + 1] - offs[i]));
     fprintf(stderr, "  data %-9s %8llu\n", "TOTAL",
-            (unsigned long long)o->data.len);
+            (unsigned long long)(o->data.len - g_data_start));
     static const char *const RONAMES[] = {
       "blob", "expstrings", "displays", "supers+imports", "unwind",
       "type tables", "gctypes", "exntypes", "data init" };
     const uint64_t rooffs[] = {
-      0, ro_after_blob, ro_after_expstr, ro_after_rtt, ro_after_supers,
+      g_ro_start, ro_after_blob, ro_after_expstr, ro_after_rtt, ro_after_supers,
       ro_after_uw, gctypes_off, ro_after_types, init_off, o->rodata.len };
     for (size_t i = 0; i < sizeof RONAMES / sizeof RONAMES[0]; i++)
       fprintf(stderr, "  rodata %-14s %8llu\n", RONAMES[i],
               (unsigned long long)(rooffs[i + 1] - rooffs[i]));
     fprintf(stderr, "  rodata %-14s %8llu\n", "TOTAL",
-            (unsigned long long)o->rodata.len);
+            (unsigned long long)(o->rodata.len - g_ro_start));
   }
 
   xfree(imp_module); xfree(imp_name);
@@ -1729,6 +1748,37 @@ void codegen_rename_funcs(Module *m, const char *prefix) {
     xfree(m->funcs[i].sym);
     m->funcs[i].sym = xstrndup(name, strlen(name));
   }
+}
+
+/* Several core modules in one program (main.c compile_several): the table
+   rt/modules.c holds for one, each module's descriptor (its prefix's
+   _module) beside the name the program is asked for it by. */
+void codegen_emit_module_table(ObjBuilder *o, const char *const *prefixes,
+                               const char *const *names, uint32_t n) {
+  codegen_set_symbol_prefix("warmc_several");
+  obj_intern_sym(o, g_anchor[1], SYM_LOCAL_DATA, 1, 0);
+  obj_intern_sym(o, g_anchor[2], SYM_LOCAL_DATA, 2, 0);
+  uint64_t *name_off = xcalloc(n ? n : 1, sizeof(uint64_t));
+  for (uint32_t i = 0; i < n; i++) name_off[i] = emit_string(o, names[i]);
+  while (o->data.len & 7) buf_u8(&o->data, 0);
+  uint64_t mods_off = o->data.len;
+  for (uint32_t i = 0; i < n; i++) {
+    char sym[80];
+    snprintf(sym, sizeof sym, "%s_module", prefixes[i]);
+    uint32_t s = obj_intern_sym(o, sym, SYM_UNDEF_DATA, -1, 0);
+    obj_add_reloc(o, REL_ABS64, 2, o->data.len, s, 0);
+    buf_u64(&o->data, 0);
+  }
+  uint64_t names_off = o->data.len;
+  for (uint32_t i = 0; i < n; i++) data_ptr(o, 1, name_off[i]);
+  obj_intern_sym(o, "warmc_modules", SYM_GLOBAL_DATA, 2, o->data.len);
+  data_ptr(o, 2, mods_off);
+  obj_intern_sym(o, "warmc_module_names", SYM_GLOBAL_DATA, 2, o->data.len);
+  data_ptr(o, 2, names_off);
+  obj_intern_sym(o, "warmc_nmodules", SYM_GLOBAL_DATA, 2, o->data.len);
+  buf_u32(&o->data, n);
+  buf_u32(&o->data, 0);
+  xfree(name_off);
 }
 
 void codegen_emit_component(const struct LinkPlan *p, ObjBuilder *o) {

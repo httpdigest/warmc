@@ -6,6 +6,7 @@
 #include <string.h>
 #include <pthread.h>
 #include <stdatomic.h>
+#include <sys/stat.h>
 #ifndef _WIN32
 #include <sys/resource.h>
 #include <sys/mman.h>
@@ -13,10 +14,19 @@
 
 static _Thread_local DiagCatch *g_catch;
 
+int warmc_exit_status;
+
 /* The object a link is made from, while it exists only for that link: an
    error that ends warmc removes it rather than leave it beside the output
    that was never made. */
 static char g_temp[4096];
+
+/* path removed where it is a file of its own: never /dev/null, which a
+   compile run as root may have been told to write */
+void warmc_remove_file(const char *path) {
+  struct stat st;
+  if (stat(path, &st) == 0 && (st.st_mode & S_IFMT) == S_IFREG) remove(path);
+}
 
 void warmc_temp_output(const char *path) {
   snprintf(g_temp, sizeof g_temp, "%s", path ? path : "");
@@ -45,6 +55,7 @@ void warmc_diag_rethrow(const DiagCatch *c) {
   }
   fprintf(stderr, "warmc: %s: %s\n", c->tag, c->msg);
   remove_temp();
+  warmc_exit_status = c->code;
   exit(c->code);
 }
 
@@ -69,6 +80,7 @@ static void diag(const char *tag, int code, const char *fmt, va_list ap) {
   vfprintf(stderr, fmt, ap);
   fputc('\n', stderr);
   remove_temp();
+  warmc_exit_status = code;
   exit(code);
 }
 
@@ -330,7 +342,18 @@ static void wenv_init(void) {
     if (!strncmp(*e, "WARMC_", 6)) g_wenv[g_nwenv++] = *e;
 }
 
+/* settings only a program reads, which main.c's compile cache leaves out of
+   its key: a compile that reads one after all is not kept */
+bool warmc_runtime_setting(const char *name) {
+  return !strncmp(name, "WARMC_GC_", 9) || !strcmp(name, "WARMC_RANDOM_SEED") ||
+         !strcmp(name, "WARMC_TIMEOUT") || !strcmp(name, "WARMC_RUN_TIMEOUT") ||
+         !strcmp(name, "WARMC_CACHE");
+}
+static atomic_bool warmc_read_runtime_setting;
+bool warmc_runtime_setting_read(void) { return atomic_load(&warmc_read_runtime_setting); }
+
 const char *warmc_getenv(const char *name) {
+  if (warmc_runtime_setting(name)) atomic_store(&warmc_read_runtime_setting, true);
   pthread_once(&g_wenv_once, wenv_init);
   if (!g_nwenv) return NULL;
   size_t len = strlen(name);

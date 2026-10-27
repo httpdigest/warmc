@@ -216,6 +216,7 @@ void write_macho64(ObjBuilder *o, const char *path) {
   buf_bytes(&out, strtab.data, strtab.len);
   while (out.len < total) buf_u8(&out, 0);
 
+  warmc_remove_file(path);  /* a new file: the old may be a compile cache's entry (main.c) */
   FILE *f = fopen(path, "wb");
   if (!f) warmc_fatal("cannot open %s for writing", path);
   if (fwrite(out.data, 1, out.len, f) != out.len)

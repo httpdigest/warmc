@@ -17,6 +17,8 @@ typedef enum {
   I_CLZ, I_CTZ, I_POPCNT,
 
   I_BSWAP,
+  /* the bits reversed, which arm64 has an instruction for (ir_has_bitrev) */
+  I_BITREV,
 
   I_EQ, I_NE, I_LTS, I_LTU, I_GTS, I_GTU, I_LES, I_LEU, I_GES, I_GEU, I_EQZ,
 
@@ -375,8 +377,9 @@ typedef struct { uint32_t *off, *src, *si; } IrEdgeIdx;
 IrEdgeIdx ir_edge_index(IrFunc *f);
 void ir_edge_index_free(IrEdgeIdx *x);
 void ir_order(IrFunc *f);
-/* f->order with the outline blocks moved after the rest, but for skip: the
-   order the back ends emit the blocks in.  Sets *n to its length. */
+/* f->order with the outline blocks and the call arms of loops moved after
+   the rest, but for skip: the order the back ends emit the blocks in.  Sets
+   *n to its length. */
 const uint32_t *ir_emit_order(IrFunc *f, uint32_t skip, uint32_t *n);
 /* ir_order, saying whether the graph had changed since the last. */
 bool ir_order_changed(IrFunc *f);
@@ -414,12 +417,18 @@ int ir_vconst_cost(uint64_t lo, uint64_t hi);
 uint32_t ir_vec_copies(void);
 /* Is a wrap that only low-half readers read no instruction (Target)? */
 bool ir_wrap_alias(void);
+bool ir_has_bitrev(void);
 bool ir_vec_mul_one(uint32_t lane);
 
 bool ir_imm_ok(IrFunc *f, Ref user, uint32_t idx, uint64_t cval, ValType ct);
 bool ir_mem_disp_ok(uint64_t off, uint32_t size_log2);
 
 uint64_t ir_value_max(IrFunc *f, Ref v, int depth);
+/* Is v never its type's least value (signed division's overflow)? */
+bool ir_not_int_min(IrFunc *f, Ref v);
+/* Is d nonzero wherever c is: the same value, or one the other widened or
+   narrowed (a zero test the source made before widening the divisor)? */
+bool ir_nonzero_with(IrFunc *f, Ref c, Ref d);
 
 uint64_t ir_known_bits(IrFunc *f, Ref v, int depth);
 bool ir_has_result(const Inst *in);
@@ -587,6 +596,8 @@ typedef struct {
   uint64_t csel_fused;
   uint64_t mul_wide;     /* 64x64 multiplies in halves made mul, mulhu or mulhs */
   uint64_t fma_fused;    /* -ffma: multiplies fused into the add reading them */
+  uint64_t bitrevs;      /* bit reversals written as swaps made one (I_BITREV) */
+  uint64_t small_loops;  /* loops aligned to 64 bytes as small, in code emitted */
 
   uint64_t bar_masks, bar_elided;
   uint64_t caller_saves, csa_restores, spills_v128_xcall, range_budget_trips;

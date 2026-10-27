@@ -311,16 +311,16 @@ static bool nonzero_by_dominating_branch(IrFunc *f, uint32_t blk, Ref d) {
         switch (c->op) {
 
           case I_EQZ:
-            if (ca[0] == d && fallthru) return true;
+            if (ir_nonzero_with(f, ca[0], d) && fallthru) return true;
             break;
           case I_EQ:
-            if (fallthru && ((ca[0] == d && is_const_zero(f, ca[1])) ||
-                             (ca[1] == d && is_const_zero(f, ca[0]))))
+            if (fallthru && ((ir_nonzero_with(f, ca[0], d) && is_const_zero(f, ca[1])) ||
+                             (ir_nonzero_with(f, ca[1], d) && is_const_zero(f, ca[0]))))
               return true;
             break;
           case I_NE:
-            if (taken && ((ca[0] == d && is_const_zero(f, ca[1])) ||
-                          (ca[1] == d && is_const_zero(f, ca[0]))))
+            if (taken && ((ir_nonzero_with(f, ca[0], d) && is_const_zero(f, ca[1])) ||
+                          (ir_nonzero_with(f, ca[1], d) && is_const_zero(f, ca[0]))))
               return true;
             break;
           default: break;
@@ -367,7 +367,7 @@ static void emit_div(Isel *s, Ref v, bool sgn, bool rem) {
       !nonzero_by_dominating_branch(f, s->cur_block, a[1]))
     trap_if_zero(s, sf, y, TRAP_DIV_ZERO);
   if (sgn && !rem && !(known && dc != (sf ? ~0ull : 0xffffffffu)) &&
-      !div_guarded_earlier(s, v, true)) {
+      !ir_not_int_min(f, a[0]) && !div_guarded_earlier(s, v, true)) {
 
     a64_adds_imm(B, sf, RZR, y, 1, 0);
     a64_ccmp_imm(B, sf, x, 1, 0, CC_EQ);
@@ -577,6 +577,22 @@ static void emit_inst(Isel *s, Ref v) {
 
       if (emit_bfx(s, v)) break;
 
+      if (s->bfi && s->bfi[v]) {
+        int slot = s->bfi[v] - 1;
+        struct Bfx *bf = &s->bfx[a[slot]];
+        int x = rd(s, bf->src, S0);
+        int o = rd(s, a[slot ^ 1], S1);
+        int d = wr(s, v, S2);
+        /* d starts as the value the field goes into; x is read after, so
+           it must not be d unless the value is there already */
+        int t = (d == x && d != o) ? S2 : d;
+        if (t != o) a64_mov_reg(B, sf, t, o);
+        a64_bfm(B, sf, t, x, bf->immr, bf->imms);
+        if (t != d) a64_mov_reg(B, sf, d, t);
+        commit(s, v, d);
+        break;
+      }
+
       if (s->extr && s->extr[v]) {
         Ref *la = ir_args(f, a[0]), *ra = ir_args(f, a[1]);
         int hi = rd(s, la[0], S0);
@@ -715,6 +731,8 @@ static void emit_inst(Isel *s, Ref v) {
                   a64_clz(B, sf, d, x); commit(s, v, d); break; }
     case I_BSWAP: { int x = rd(s, a[0], S0); int d = wr(s, v, S0);
                     a64_rev(B, sf, d, x); commit(s, v, d); break; }
+    case I_BITREV: { int x = rd(s, a[0], S0); int d = wr(s, v, S0);
+                     a64_rbit(B, sf, d, x); commit(s, v, d); break; }
     case I_CTZ: { int x = rd(s, a[0], S0); int d = wr(s, v, S0);
                   a64_rbit(B, sf, d, x); a64_clz(B, sf, d, d); commit(s, v, d); break; }
     case I_POPCNT: { int x = rd(s, a[0], S0);
@@ -2591,7 +2609,7 @@ static bool pair_pure_op(uint16_t op) {
     case I_CONST: case I_ADD: case I_SUB: case I_MUL: case I_MULHU: case I_MULHS:
     case I_AND: case I_OR: case I_XOR: case I_SHL: case I_SHRS: case I_SHRU:
     case I_ROTL: case I_ROTR: case I_CLZ: case I_CTZ: case I_POPCNT:
-    case I_BSWAP:
+    case I_BSWAP: case I_BITREV:
     case I_EQ: case I_NE: case I_LTS: case I_LTU: case I_GTS: case I_GTU:
     case I_LES: case I_LEU: case I_GES: case I_GEU: case I_EQZ:
     case I_FADD: case I_FSUB: case I_FMUL: case I_FDIV: case I_FMIN:

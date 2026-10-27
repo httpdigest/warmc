@@ -441,6 +441,7 @@ void write_pe_exec(Linker *L, const char *path, uint64_t entry) {
   xfree(edata.data);
   xfree(reloc.data);
 
+  warmc_remove_file(path);  /* a new file: the old may be a compile cache's entry (main.c) */
   FILE *f = fopen(path, "wb");
   if (!f) warmc_fatal("link: cannot write %s", path);
   if (out.len && fwrite(out.data, 1, out.len, f) != out.len)

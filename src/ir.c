@@ -750,17 +750,47 @@ void ir_path_share(const IrFunc *f, float *share) {
 
 void ir_order(IrFunc *f) { (void)ir_order_changed(f); }
 
+/* A block in a loop that only a conditional branch reaches, that goes on,
+   through blocks only it reaches, to where the branch's other edge goes,
+   calling on the way: rsbench/vecgrow's push growing its vector.  In line,
+   the way round the loop past it takes two branches, the one over it and
+   the back edge; emitted after the rest, one.  Where the call is frequent
+   after all, it costs more than the branch to it and the one back.  The
+   blocks after it follow it there, as only it leads to them. */
+static bool call_arm(const IrFunc *f, uint32_t bi) {
+  const Block *b = &f->blocks[bi];
+  if (!b->loop_depth || bi == f->entry || b->npreds != 1) return false;
+  const Block *p = &f->blocks[b->preds[0]];
+  if (p->term != T_BRIF || p->nsuccs != 2) return false;
+  uint32_t other = p->succs[0].target == bi ? p->succs[1].target : p->succs[0].target;
+  if (other == bi) return false;
+  bool calls = false;
+  for (int steps = 0; steps < 8; steps++) {
+    for (uint32_t i = 0; i < b->ninsts && !calls; i++) {
+      uint16_t op = f->insts[b->insts[i]].op;
+      calls = op == I_CALL || op == I_CALL_INDIRECT || op == I_CALL_REF;
+    }
+    if (b->term != T_JUMP || b->nsuccs != 1 || b->succs[0].eh) return false;
+    uint32_t t = b->succs[0].target;
+    if (t == other) return calls;
+    b = &f->blocks[t];
+    if (b->npreds != 1) return false;
+  }
+  return false;
+}
+
 const uint32_t *ir_emit_order(IrFunc *f, uint32_t skip, uint32_t *n) {
   uint32_t *eo = ir_alloc(f, (f->norder ? f->norder : 1) * sizeof(uint32_t));
-  /* late: the outline blocks, and what only they lead to, as the trap of
-     Go's pruned resume cases; the order has a block's predecessors before
-     it but for a loop's back edges, which keep a block where it is */
+  /* late: the outline blocks and the call arms, and what only they lead
+     to, as the trap of Go's pruned resume cases; the order has a block's
+     predecessors before it but for a loop's back edges, which keep a block
+     where it is */
   uint8_t *late = ir_alloc(f, f->nblocks ? f->nblocks : 1);
   memset(late, 0, f->nblocks);
   for (uint32_t oi = 0; oi < f->norder; oi++) {
     uint32_t bi = f->order[oi];
     const Block *b = &f->blocks[bi];
-    bool out = b->outline;
+    bool out = b->outline || call_arm(f, bi);
     if (!out && bi != f->entry && b->npreds) {
       out = true;
       for (uint32_t p = 0; p < b->npreds && out; p++) out = late[b->preds[p]];
@@ -911,6 +941,10 @@ bool ir_wrap_alias(void) {
   return g_target->wrap_alias;
 }
 
+bool ir_has_bitrev(void) {
+  return !g_target->is_x64;
+}
+
 bool ir_vec_mul_one(uint32_t lane) {
   return !VLANE_IS_FLOAT(lane) && ((g_target->vec_mul_lanes >> VLANE_SIZE(lane)) & 1);
 }
@@ -983,6 +1017,29 @@ static uint64_t chain_bound(IrFunc *f, uint32_t pbi, Ref v, int depth) {
     pbi = qi;
   }
   return best;
+}
+
+bool ir_not_int_min(IrFunc *f, Ref v) {
+  Inst *in = &f->insts[v];
+  bool w64 = vt_is_64((ValType)in->type);
+  uint64_t sign = w64 ? 1ull << 63 : 1ull << 31;
+  uint64_t all = w64 ? ~0ull : 0xffffffffu;
+  if (!(ir_known_bits(f, v, 4) & sign)) return true;
+  Ref *a = ir_args(f, v);
+  /* an or that sets a bit below the sign: rsbench/div64's x | 1 */
+  if (in->op == I_OR && in->nargs == 2)
+    for (int k = 0; k < 2; k++)
+      if (f->insts[a[k]].op == I_CONST && (f->insts[a[k]].imm & all & ~sign)) return true;
+  /* an i32 widened (to an i64): at least -2^31 */
+  return in->op == I_EXTENDS;
+}
+
+bool ir_nonzero_with(IrFunc *f, Ref c, Ref d) {
+  if (c == d) return true;
+  const Inst *ci = &f->insts[c], *di = &f->insts[d];
+  bool cext = ci->op == I_EXTENDU || ci->op == I_EXTENDS || ci->op == I_WRAP;
+  bool dext = di->op == I_EXTENDU || di->op == I_EXTENDS;
+  return (dext && ir_args(f, d)[0] == c) || (cext && ir_args(f, c)[0] == d);
 }
 
 uint64_t ir_value_max(IrFunc *f, Ref v, int depth) {
@@ -1230,7 +1287,7 @@ bool ir_has_no_effect(const Inst *in) {
     case I_ADD: case I_SUB: case I_MUL: case I_MULHU: case I_MULHS:
     case I_AND: case I_OR: case I_XOR:
     case I_SHL: case I_SHRS: case I_SHRU: case I_ROTL: case I_ROTR:
-    case I_CLZ: case I_CTZ: case I_POPCNT: case I_BSWAP:
+    case I_CLZ: case I_CTZ: case I_POPCNT: case I_BSWAP: case I_BITREV:
     case I_EQ: case I_NE: case I_LTS: case I_LTU: case I_GTS: case I_GTU:
     case I_LES: case I_LEU: case I_GES: case I_GEU: case I_EQZ:
     case I_FADD: case I_FSUB: case I_FMUL: case I_FDIV:
@@ -1352,7 +1409,7 @@ const char *ir_op_name(uint16_t op) {
     N(I_AND, "and"), N(I_OR, "or"), N(I_XOR, "xor"),
     N(I_SHL, "shl"), N(I_SHRS, "shrs"), N(I_SHRU, "shru"),
     N(I_ROTL, "rotl"), N(I_ROTR, "rotr"),
-    N(I_CLZ, "clz"), N(I_CTZ, "ctz"), N(I_POPCNT, "popcnt"), N(I_BSWAP, "bswap"),
+    N(I_CLZ, "clz"), N(I_CTZ, "ctz"), N(I_POPCNT, "popcnt"), N(I_BSWAP, "bswap"), N(I_BITREV, "bitrev"),
     N(I_EQ, "eq"), N(I_NE, "ne"), N(I_LTS, "lts"), N(I_LTU, "ltu"),
     N(I_GTS, "gts"), N(I_GTU, "gtu"), N(I_LES, "les"), N(I_LEU, "leu"),
     N(I_GES, "ges"), N(I_GEU, "geu"), N(I_EQZ, "eqz"),

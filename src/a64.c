@@ -280,6 +280,7 @@ static void bfm(Buf *b, int sf, int opc, int rd, int rn, int immr, int imms) {
 }
 void a64_sbfm(Buf *b, int sf, int rd, int rn, int immr, int imms) { bfm(b, sf, 0, rd, rn, immr, imms); }
 void a64_ubfm(Buf *b, int sf, int rd, int rn, int immr, int imms) { bfm(b, sf, 2, rd, rn, immr, imms); }
+void a64_bfm(Buf *b, int sf, int rd, int rn, int immr, int imms) { bfm(b, sf, 1, rd, rn, immr, imms); }
 
 void a64_lsl_imm(Buf *b, int sf, int rd, int rn, int sh) {
   int width = sf ? 64 : 32;

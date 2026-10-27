@@ -168,6 +168,7 @@ void write_elf64(ObjBuilder *o, const char *path) {
   memcpy(h + 60, &shnum, 2);
   memcpy(h + 62, &shstrndx, 2);
 
+  warmc_remove_file(path);  /* a new file: the old may be a compile cache's entry (main.c) */
   FILE *f = fopen(path, "wb");
   if (!f) warmc_fatal("cannot open %s for writing", path);
   if (fwrite(out.data, 1, out.len, f) != out.len)

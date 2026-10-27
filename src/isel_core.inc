@@ -147,6 +147,11 @@ typedef struct {
 #define CS_INV 8u
   /* an or or xor of x << k and y >> (width - k), both folded: one extr */
   uint8_t *extr;
+  /* an or of a bitfield of x (a bfx, folded) and a value with zeros where
+     the field goes: 1 + the bitfield's slot, and the or is x inserted into
+     the value, bfi or bfxil -- one step on a chain through x where ubfiz
+     and orr are two (cbench/strings' h = h << 8 & 0xff00 | c) */
+  uint8_t *bfi;
   /* Use-cluster pieces: a value with no register of its own (a slot or a
      rematerialisation) held in a register that is free across a run of its
      uses in one block, filled once before the first of them.  pc is sorted

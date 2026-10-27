@@ -417,6 +417,145 @@ static Ref bswap_src(IrFunc *f, Ref v) {
   return m.src;
 }
 
+/* The bit each bit of v comes from, as byte_map tracks bytes, through masks
+   that keep any bits, shifts and rotates by any amount, byte swaps and bit
+   reversals, and ors, xors and adds of disjoint parts of one value: a bit
+   reversal written as swaps of ever wider fields -- hsbench/bits' sixteen
+   instructions for one rbit.  A value none of that makes is a source, its
+   own bits.  Each swap reads the one before twice, so a walk keeps the maps
+   it has made, and stops after so many steps. */
+#define BITM_ZERO (-1)
+#define BITM_MEMO 32
+typedef struct { Ref src; int8_t from[64]; } BitMap;
+typedef struct {
+  int work;
+  uint32_t n;
+  Ref at[BITM_MEMO];
+  BitMap map[BITM_MEMO];
+} BitWalk;
+
+static bool bit_map(IrFunc *f, Ref v, uint32_t w, BitMap *m, int depth, BitWalk *bw) {
+  if (depth > 32 || v >= f->ninsts || --bw->work < 0) return false;
+  v = ir_resolve(f, v);
+  for (uint32_t k = 0; k < bw->n; k++)
+    if (bw->at[k] == v) { *m = bw->map[k]; return true; }
+  Inst *in = &f->insts[v];
+  if ((vt_is_64((ValType)in->type) ? 64u : 32u) != w) return false;
+  Ref *a = ir_args(f, v);
+  uint64_t c;
+  bool made = false;
+  switch (in->op) {
+    case I_AND:
+      if (in->nargs != 2 || !is_const(f, a[1], &c)) break;
+      if (!bit_map(f, a[0], w, m, depth + 1, bw)) return false;
+      for (uint32_t i = 0; i < w; i++) if (!((c >> i) & 1)) m->from[i] = BITM_ZERO;
+      made = true;
+      break;
+    case I_SHL: case I_SHRU: case I_ROTL: case I_ROTR: {
+      if (in->nargs != 2 || !is_const(f, a[1], &c)) break;
+      uint32_t k = (uint32_t)(c & (w - 1));
+      if (!bit_map(f, a[0], w, m, depth + 1, bw)) return false;
+      int8_t old[64];
+      memcpy(old, m->from, sizeof old);
+      for (uint32_t i = 0; i < w; i++) {
+        switch (in->op) {
+          case I_SHL:  m->from[i] = i >= k ? old[i - k] : BITM_ZERO; break;
+          case I_SHRU: m->from[i] = i + k < w ? old[i + k] : BITM_ZERO; break;
+          case I_ROTL: m->from[i] = old[(i + w - k) % w]; break;
+          default:     m->from[i] = old[(i + k) % w]; break;
+        }
+      }
+      made = true;
+      break;
+    }
+    case I_BITREV: case I_BSWAP: {
+      if (in->nargs != 1) break;
+      if (!bit_map(f, a[0], w, m, depth + 1, bw)) return false;
+      int8_t old[64];
+      memcpy(old, m->from, sizeof old);
+      for (uint32_t i = 0; i < w; i++)
+        m->from[i] = in->op == I_BITREV ? old[w - 1 - i]
+                                        : old[(w / 8 - 1 - i / 8) * 8 + i % 8];
+      made = true;
+      break;
+    }
+    case I_OR: case I_XOR: case I_ADD: {
+      if (in->nargs != 2) break;
+      BitMap l, r;
+      if (!bit_map(f, a[0], w, &l, depth + 1, bw) ||
+          !bit_map(f, a[1], w, &r, depth + 1, bw)) return false;
+      if (l.src != r.src) break;
+      m->src = l.src;
+      made = true;
+      for (uint32_t i = 0; i < w && made; i++) {
+        if (l.from[i] == BITM_ZERO) m->from[i] = r.from[i];
+        else if (r.from[i] == BITM_ZERO) m->from[i] = l.from[i];
+        else made = false;
+      }
+      break;
+    }
+    default: break;
+  }
+  if (!made) {
+    m->src = v;
+    for (uint32_t i = 0; i < w; i++) m->from[i] = (int8_t)i;
+  }
+  if (bw->n < BITM_MEMO) { bw->at[bw->n] = v; bw->map[bw->n] = *m; bw->n++; }
+  return true;
+}
+
+/* v as a bit reversal of a value, then rotated right by *rot: its source, or
+   REF_NONE where v is no such thing */
+static Ref bitrev_src(IrFunc *f, Ref v, uint32_t *rot) {
+  Inst *in = &f->insts[v];
+  ValType t = (ValType)in->type;
+  if ((t != VT_I32 && t != VT_I64) || !ir_has_bitrev()) return REF_NONE;
+  uint32_t w = vt_is_64(t) ? 64u : 32u;
+  BitMap m;
+  BitWalk bw;
+  bw.work = 256;
+  bw.n = 0;
+  if (!bit_map(f, v, w, &m, 0, &bw)) return REF_NONE;
+  /* reversed and rotated right by r: bit i from bit (w - 1 - i - r) mod w;
+     a bit that is zero, or v its own source, is no reversal */
+  uint32_t r = (w - 1 - (uint32_t)m.from[0]) % w;
+  for (uint32_t i = 0; i < w; i++)
+    if (m.from[i] != (int8_t)((2 * w - 1 - i - r) % w)) return REF_NONE;
+  *rot = r;
+  return m.src;
+}
+
+static Ref emit_before(IrFunc *f, uint32_t bi, uint32_t *idx, IrOp op, ValType t,
+                       const Ref *args, uint32_t nargs, uint64_t imm);
+
+/* v, where it is a bit reversal (rotated), made one: rbit, and a ror after */
+static bool fold_bitrev(IrFunc *f, uint32_t bi, uint32_t *idx, Ref v) {
+  /* already one: made again, it would be made again every round */
+  Inst *vi = &f->insts[v];
+  if ((vi->op == I_ROTL || vi->op == I_ROTR) &&
+      f->insts[ir_resolve(f, ir_args(f, v)[0])].op == I_BITREV) return false;
+  uint32_t rot;
+  Ref src = bitrev_src(f, v, &rot);
+  if (src == REF_NONE) return false;
+  g_stats.bitrevs++;
+  ValType t = (ValType)f->insts[v].type;
+  if (rot) {
+    Ref rv = emit_before(f, bi, idx, I_BITREV, t, &src, 1, 0);
+    Ref k = emit_before(f, bi, idx, I_CONST, t, NULL, 0, rot);
+    Inst *in = &f->insts[v];
+    in->op = I_ROTR;
+    in->nargs = 2;
+    ir_args(f, v)[0] = rv;
+    ir_args(f, v)[1] = k;
+  } else {
+    Inst *in = &f->insts[v];
+    in->op = I_BITREV;
+    in->nargs = 1;
+    ir_args(f, v)[0] = src;
+  }
+  return true;
+}
+
 static void replace_with_const(IrFunc *f, Ref v, uint64_t bits) {
   Inst *in = &f->insts[v];
   in->op = I_CONST;
@@ -675,6 +814,11 @@ static bool fold_int_unop(uint16_t op, ValType t, uint64_t a, uint64_t *out) {
     case I_BSWAP: {
       r = 0;
       for (int i = 0; i < bits; i += 8) r |= ((ua >> i) & 0xffull) << (bits - 8 - i);
+      break;
+    }
+    case I_BITREV: {
+      r = 0;
+      for (int i = 0; i < bits; i++) r |= ((ua >> i) & 1ull) << (bits - 1 - i);
       break;
     }
     case I_EQZ: r = (ua == 0); break;
@@ -1025,7 +1169,7 @@ static int ifc_cost(IrFunc *f, Ref v, uint32_t *lat) {
       return 0;
     case I_ADD: case I_SUB: case I_AND: case I_OR: case I_XOR:
     case I_SHL: case I_SHRS: case I_SHRU: case I_ROTL: case I_ROTR:
-    case I_CLZ: case I_BSWAP:
+    case I_CLZ: case I_BSWAP: case I_BITREV:
     case I_EQ: case I_NE: case I_LTS: case I_LTU: case I_GTS: case I_GTU:
     case I_LES: case I_LEU: case I_GES: case I_GEU: case I_EQZ:
     case I_WRAP: case I_EXTENDS: case I_EXTENDU:
@@ -1782,6 +1926,337 @@ static bool fold_add_neg(IrFunc *f, Ref v) {
     return true;
   }
   return false;
+}
+
+/* A tree of selects that only works out again what a saturating truncation
+   of a float x says is that truncation -- Go's conversion of a float to an
+   int as TinyGo spells it: the truncation, then x against the int's bounds,
+   and x == x, choosing between it, the bounds and 0 (gobench/bigstruct:
+   twelve instructions a conversion, where fcvtzs alone saturates).  The
+   tree's conditions each compare x with a constant or with itself, perhaps
+   under eqz, and its leaves are constants or the truncation; it is worked
+   out on one value of each class the constants cut x's values into, NaN
+   among them, and when on every class it is what the truncation is there,
+   it is the truncation.  The truncation never falls as x rises, so on a
+   stretch between two constants it is one value where it is that at both
+   ends, and the tree, whose conditions all decide alike there, one leaf. */
+#define TS_NODES 24
+#define TS_POINTS 16
+typedef struct {
+  Ref x, t;
+  uint16_t op;
+  bool f32;
+  double pts[TS_POINTS];
+  uint32_t npts, nodes;
+} TsTree;
+
+static bool ts_fconst(IrFunc *f, Ref r, bool f32, double *out) {
+  uint64_t b;
+  if (!is_const(f, r, &b)) return false;
+  if (f32) { float x; uint32_t w = (uint32_t)b; memcpy(&x, &w, 4); *out = x; }
+  else memcpy(out, &b, 8);
+  return true;
+}
+
+static bool ts_cond_ok(IrFunc *f, Ref c, TsTree *T) {
+  c = ir_resolve(f, c);
+  Inst *in = &f->insts[c];
+  if (in->op == I_EQZ && in->nargs == 1) return ts_cond_ok(f, ir_args(f, c)[0], T);
+  if (in->op < I_FEQ || in->op > I_FGE || in->nargs != 2) return false;
+  for (int k = 0; k < 2; k++) {
+    Ref o = ir_resolve(f, ir_args(f, c)[k]);
+    double p;
+    if (o == T->x) continue;
+    if (!ts_fconst(f, o, T->f32, &p) || p != p || T->npts == TS_POINTS) return false;
+    T->pts[T->npts++] = p;
+  }
+  return true;
+}
+
+static bool ts_walk(IrFunc *f, Ref v, TsTree *T, int depth) {
+  v = ir_resolve(f, v);
+  if (++T->nodes > TS_NODES || depth > 8) return false;
+  Inst *in = &f->insts[v];
+  if (in->op == I_CONST) return true;
+  if (v == T->t) return true;
+  if (in->op != I_SELECT || in->nargs != 3) return false;
+  Ref *a = ir_args(f, v);
+  return ts_cond_ok(f, a[2], T) && ts_walk(f, a[0], T, depth + 1) &&
+         ts_walk(f, a[1], T, depth + 1);
+}
+
+static bool ts_cmp(uint16_t op, double l, double r) {
+  switch (op) {
+    case I_FEQ: return l == r;
+    case I_FNE: return l != r;
+    case I_FLT: return l < r;
+    case I_FGT: return l > r;
+    case I_FLE: return l <= r;
+    default:    return l >= r;
+  }
+}
+
+static bool ts_cond(IrFunc *f, Ref c, TsTree *T, double x) {
+  c = ir_resolve(f, c);
+  Inst *in = &f->insts[c];
+  if (in->op == I_EQZ) return !ts_cond(f, ir_args(f, c)[0], T, x);
+  double o[2];
+  for (int k = 0; k < 2; k++) {
+    Ref r = ir_resolve(f, ir_args(f, c)[k]);
+    if (r == T->x) o[k] = x;
+    else ts_fconst(f, r, T->f32, &o[k]);
+  }
+  return ts_cmp(in->op, o[0], o[1]);
+}
+
+/* the tree's leaf for x: 1 and *k for a constant, 0 for the truncation */
+static int ts_eval(IrFunc *f, Ref v, TsTree *T, double x, uint64_t *k) {
+  for (;;) {
+    v = ir_resolve(f, v);
+    if (v == T->t) return 0;
+    Inst *in = &f->insts[v];
+    if (in->op == I_CONST) { *k = in->imm; return 1; }
+    Ref *a = ir_args(f, v);
+    v = ts_cond(f, a[2], T, x) ? a[0] : a[1];
+  }
+}
+
+/* what the truncation is at x, as the result type's bits */
+static uint64_t ts_value(TsTree *T, ValType rt, double x) {
+  uint32_t bits = vt_is_64(rt) ? 64u : 32u;
+  uint64_t mask = bits == 64 ? ~0ull : 0xffffffffull;
+  bool sgn = T->op == I_TRUNC_SATS;
+  if (x != x) return 0;
+  double t = __builtin_trunc(x);
+  double lo = sgn ? -__builtin_ldexp(1.0, (int)bits - 1) : 0.0;
+  double hi = sgn ? __builtin_ldexp(1.0, (int)bits - 1) : __builtin_ldexp(1.0, (int)bits);
+  if (t < lo) return sgn ? (1ull << (bits - 1)) & mask : 0;
+  if (t >= hi) return sgn ? mask >> 1 : mask;
+  return (sgn ? (uint64_t)(int64_t)t : (uint64_t)t) & mask;
+}
+
+static int ts_dcmp(const void *a, const void *b) {
+  double x = *(const double *)a, y = *(const double *)b;
+  return x < y ? -1 : x > y;
+}
+
+/* the least value of x's type above p, and the greatest below it */
+static double ts_above(bool f32, double p) {
+  if (!f32) return __builtin_nextafter(p, __builtin_inf());
+  float v = (float)p;
+  while ((double)v <= p) v = __builtin_nextafterf(v, __builtin_inff());
+  return v;
+}
+
+static double ts_below(bool f32, double p) {
+  if (!f32) return __builtin_nextafter(p, -__builtin_inf());
+  float v = (float)p;
+  while ((double)v >= p) v = __builtin_nextafterf(v, -__builtin_inff());
+  return v;
+}
+
+static Ref select_trunc_sat(IrFunc *f, Ref v) {
+  Inst *in = &f->insts[v];
+  ValType rt = (ValType)in->type;
+  if (rt != VT_I32 && rt != VT_I64) return REF_NONE;
+  /* the truncation: a leaf the tree reaches without a select on the way */
+  Ref t = REF_NONE;
+  Ref stack[TS_NODES];
+  uint32_t sp = 0, seen = 0;
+  stack[sp++] = v;
+  while (sp && t == REF_NONE && seen++ < TS_NODES) {
+    Ref r = ir_resolve(f, stack[--sp]);
+    Inst *ri = &f->insts[r];
+    if (ri->op == I_TRUNC_SATS || ri->op == I_TRUNC_SATU) t = r;
+    else if (ri->op == I_SELECT && ri->nargs == 3 && sp + 2 <= TS_NODES) {
+      stack[sp++] = ir_args(f, r)[0];
+      stack[sp++] = ir_args(f, r)[1];
+    }
+  }
+  if (t == REF_NONE) return REF_NONE;
+  TsTree T;
+  memset(&T, 0, sizeof T);
+  T.t = t;
+  T.op = f->insts[t].op;
+  T.x = ir_resolve(f, ir_args(f, t)[0]);
+  ValType xt = (ValType)f->insts[T.x].type;
+  if (xt != VT_F32 && xt != VT_F64) return REF_NONE;
+  T.f32 = xt == VT_F32;
+  if (!ts_walk(f, v, &T, 0)) return REF_NONE;
+  uint32_t bits = vt_is_64(rt) ? 64u : 32u;
+  qsort(T.pts, T.npts, sizeof(double), ts_dcmp);
+  /* NaN, each point, and each stretch between two points, from the least
+     value of x's type in it to the greatest: where the truncation varies
+     over a stretch, only itself will do as the tree's leaf */
+  uint64_t mask = bits == 64 ? ~0ull : 0xffffffffull;
+  for (uint32_t c = 0; c <= 2 * T.npts + 1; c++) {
+    double x, x2;
+    if (c == 2 * T.npts + 1) x = x2 = __builtin_nan("");
+    else if (c & 1) {
+      x = x2 = T.pts[c / 2];
+    } else {
+      x = c ? ts_above(T.f32, T.pts[c / 2 - 1]) : -__builtin_inf();
+      x2 = c / 2 < T.npts ? ts_below(T.f32, T.pts[c / 2]) : __builtin_inf();
+      if (x > x2) continue;
+    }
+    uint64_t got;
+    if (!ts_eval(f, v, &T, x, &got)) continue;     /* the truncation itself */
+    if (ts_value(&T, rt, x) != ts_value(&T, rt, x2) ||
+        (got & mask) != ts_value(&T, rt, x)) return REF_NONE;
+  }
+  return t;
+}
+
+/* A float computation every value of which is an integer the float type
+   holds: integers converted, integral constants, and sums, differences,
+   products and negations of them, no value as far as 2^53 from zero (2^24
+   for f32), so that no operation rounds; at most FX_OPS operations, each
+   shared one counted as often as it is reached.  Truncated to an integer type that
+   holds its every value, it is that integer arithmetic (gobench/bigstruct's
+   int(float64(r&3) + 5 + 9)).  Integer arithmetic modulo 2^n gives the true
+   value modulo 2^n, so the result's width does for every step. */
+#define FX_OPS 16
+
+static bool fx_range(IrFunc *f, Ref v, int *ops, double *lo, double *hi) {
+  v = ir_resolve(f, v);
+  Inst *in = &f->insts[v];
+  bool f32 = in->type == VT_F32;
+  if (!f32 && in->type != VT_F64) return false;
+  double lim = f32 ? 16777216.0 : 9007199254740992.0;
+  Ref *a = ir_args(f, v);
+  double l0, h0, l1, h1;
+  switch (in->op) {
+    case I_CONST: {
+      double c;
+      if (!ts_fconst(f, v, f32, &c) || c != __builtin_trunc(c)) return false;
+      *lo = *hi = c;
+      break;
+    }
+    case I_CONVERTS: case I_CONVERTU: {
+      ValType st = (ValType)f->insts[a[0]].type;
+      if (st != VT_I32 && st != VT_I64) return false;
+      double m = (double)ir_value_max(f, a[0], 6);
+      double half = st == VT_I64 ? 9223372036854775808.0 : 2147483648.0;
+      *lo = 0;
+      *hi = m;
+      if (in->op == I_CONVERTS && m >= half) { *lo = -half; *hi = half - 1; }
+      break;
+    }
+    case I_FADD: case I_FSUB: case I_FMUL:
+      if (in->nargs != 2 || --*ops < 0 || !fx_range(f, a[0], ops, &l0, &h0) ||
+          !fx_range(f, a[1], ops, &l1, &h1)) return false;
+      if (in->op == I_FADD) { *lo = l0 + l1; *hi = h0 + h1; }
+      else if (in->op == I_FSUB) { *lo = l0 - h1; *hi = h0 - l1; }
+      else {
+        double p[4] = {l0 * l1, l0 * h1, h0 * l1, h0 * h1};
+        *lo = *hi = p[0];
+        for (int k = 1; k < 4; k++) {
+          if (p[k] < *lo) *lo = p[k];
+          if (p[k] > *hi) *hi = p[k];
+        }
+      }
+      break;
+    case I_FNEG:
+      if (in->nargs != 1 || --*ops < 0 || !fx_range(f, a[0], ops, &l0, &h0)) return false;
+      *lo = -h0;
+      *hi = -l0;
+      break;
+    default:
+      return false;
+  }
+  /* bounds computed in double past 2^53 may have rounded, but never below
+     it: strictly inside, every value is exact */
+  return *lo > -lim && *hi < lim;
+}
+
+static Ref fx_emit(IrFunc *f, uint32_t bi, uint32_t *idx, Ref v, ValType t) {
+  v = ir_resolve(f, v);
+  Inst *in = &f->insts[v];
+  Ref *a = ir_args(f, v);
+  switch (in->op) {
+    case I_CONST: {
+      double c;
+      ts_fconst(f, v, in->type == VT_F32, &c);
+      return emit_before(f, bi, idx, I_CONST, t, NULL, 0, trunc_to(t, (uint64_t)(int64_t)c));
+    }
+    case I_CONVERTS: case I_CONVERTU: {
+      Ref x = a[0];
+      ValType st = (ValType)f->insts[x].type;
+      if (st == t) return x;
+      if (t == VT_I32) return emit_before(f, bi, idx, I_WRAP, VT_I32, &x, 1, 0);
+      return emit_before(f, bi, idx, in->op == I_CONVERTS ? I_EXTENDS : I_EXTENDU, VT_I64, &x, 1, 0);
+    }
+    case I_FNEG: {
+      Ref ops[2] = {emit_before(f, bi, idx, I_CONST, t, NULL, 0, 0), fx_emit(f, bi, idx, a[0], t)};
+      return emit_before(f, bi, idx, I_SUB, t, ops, 2, 0);
+    }
+    default: {
+      Ref ops[2] = {fx_emit(f, bi, idx, a[0], t), fx_emit(f, bi, idx, a[1], t)};
+      IrOp op = in->op == I_FADD ? I_ADD : in->op == I_FSUB ? I_SUB : I_MUL;
+      return emit_before(f, bi, idx, op, t, ops, 2, 0);
+    }
+  }
+}
+
+/* v, a truncation (saturating or not) of such a computation to a type that
+   holds its every value, made the integer arithmetic */
+static bool fold_trunc_exact(IrFunc *f, uint32_t bi, uint32_t *idx, Ref v) {
+  Inst *in = &f->insts[v];
+  ValType t = (ValType)in->type;
+  if ((t != VT_I32 && t != VT_I64) || in->nargs != 1) return false;
+  double lo, hi;
+  Ref x = ir_resolve(f, ir_args(f, v)[0]);
+  Inst *xi = &f->insts[x];
+  /* the computation's own operations, not a bare conversion or constant */
+  if (xi->op != I_FADD && xi->op != I_FSUB && xi->op != I_FMUL && xi->op != I_FNEG) return false;
+  int ops = FX_OPS;
+  if (!fx_range(f, x, &ops, &lo, &hi)) return false;
+  bool sgn = in->op == I_TRUNCS || in->op == I_TRUNC_SATS;
+  double half = t == VT_I64 ? 9223372036854775808.0 : 2147483648.0;
+  if (sgn ? lo < -half || hi >= half : lo < 0 || hi >= 2 * half) return false;
+  Ref r = fx_emit(f, bi, idx, x, t);
+  ir_replace(f, v, r);
+  f->insts[v].op = I_NOP;
+  return true;
+}
+
+/* A compare of such a computation with a constant, or with itself, that its
+   bounds decide -- the tests of x against the int's bounds and of x == x
+   that TinyGo's conversion keeps beside a truncation made integer
+   arithmetic above: 1 or 0, or -1 where the bounds do not decide. */
+static int fcmp_exact(IrFunc *f, Ref v) {
+  Inst *in = &f->insts[v];
+  if (in->op < I_FEQ || in->op > I_FGE || in->nargs != 2) return -1;
+  Ref *a = ir_args(f, v);
+  Ref l = ir_resolve(f, a[0]), r = ir_resolve(f, a[1]);
+  bool f32 = f->insts[l].type == VT_F32;
+  uint16_t op = in->op;
+  int ops = FX_OPS;
+  double lo, hi, c;
+  if (l == r) {
+    /* never NaN: equal to itself */
+    if (!fx_range(f, l, &ops, &lo, &hi)) return -1;
+    return op == I_FEQ || op == I_FLE || op == I_FGE;
+  }
+  Ref x = l;
+  if (!ts_fconst(f, r, f32, &c)) {
+    if (!ts_fconst(f, l, f32, &c)) return -1;
+    /* c op x is x op' c */
+    x = r;
+    op = op == I_FLT ? I_FGT : op == I_FGT ? I_FLT : op == I_FLE ? I_FGE : op == I_FGE ? I_FLE : op;
+  }
+  if (!fx_range(f, x, &ops, &lo, &hi)) return -1;
+  if (c != c) return op == I_FNE;
+  switch (op) {
+    case I_FEQ: case I_FNE: {
+      int eq = c != __builtin_trunc(c) || c < lo || c > hi ? 0 : lo == hi ? 1 : -1;
+      return eq < 0 ? -1 : op == I_FEQ ? eq : !eq;
+    }
+    case I_FLT: return hi < c ? 1 : lo >= c ? 0 : -1;
+    case I_FLE: return hi <= c ? 1 : lo > c ? 0 : -1;
+    case I_FGT: return lo > c ? 1 : hi <= c ? 0 : -1;
+    default:    return lo >= c ? 1 : hi < c ? 0 : -1;
+  }
 }
 
 /* A compare of two i32s widened the same way is the compare of the i32s:
@@ -2607,6 +3082,12 @@ static bool fold_block(IrFunc *f, uint32_t bi, const OptOpts *o, const uint32_t 
             const uint64_t mask = 0x00ff00ffu;
 
             Ref src = bswap_src(f, v);
+            if (src == REF_NONE && fold_bitrev(f, bi, &i, v)) {
+              in = &f->insts[v]; a = ir_args(f, v);
+              g_stats.strength_reduced++;
+              changed = true;
+              break;
+            }
             if (src == REF_NONE && vt_is_64(t)) break;
 
             for (int k = 0; src == REF_NONE && k < 2; k++) {
@@ -2685,7 +3166,11 @@ static bool fold_block(IrFunc *f, uint32_t bi, const OptOpts *o, const uint32_t 
         }
         break;
       case I_SHL: case I_SHRU: case I_SHRS: case I_ROTL: case I_ROTR:
-        if (!has_c1 && in->nargs == 2 && fold_shift_mask(f, v)) {
+        if ((in->op == I_ROTL || in->op == I_ROTR) && has_c1 && fold_bitrev(f, bi, &i, v)) {
+          in = &f->insts[v]; a = ir_args(f, v);
+          changed = true;
+          g_stats.strength_reduced++;
+        } else if (!has_c1 && in->nargs == 2 && fold_shift_mask(f, v)) {
           changed = true;
           g_stats.folded++;
         } else if (in->op == I_SHL && has_c1 && uses && uses[a[0]] == 1 &&
@@ -3091,6 +3576,14 @@ static bool fold_block(IrFunc *f, uint32_t bi, const OptOpts *o, const uint32_t 
           in->op = I_NOP;
           changed = true;
           g_stats.folded++;
+        } else {
+          Ref t = select_trunc_sat(f, v);
+          if (t != REF_NONE) {
+            ir_replace(f, v, t);
+            in->op = I_NOP;
+            changed = true;
+            g_stats.folded++;
+          }
         }
         break;
       }
@@ -3146,6 +3639,23 @@ static bool fold_block(IrFunc *f, uint32_t bi, const OptOpts *o, const uint32_t 
           changed = true; g_stats.folded++;
         }
         break;
+      case I_TRUNCS: case I_TRUNCU: case I_TRUNC_SATS: case I_TRUNC_SATU:
+        if (fold_trunc_exact(f, bi, &i, v)) {
+          g_stats.folded++;
+          changed = true;
+          continue;
+        }
+        break;
+      case I_FEQ: case I_FNE: case I_FLT: case I_FGT: case I_FLE: case I_FGE: {
+        int k = fcmp_exact(f, v);
+        if (k >= 0) {
+          replace_with_const(f, v, (uint64_t)k);
+          g_stats.folded++;
+          changed = true;
+          continue;
+        }
+        break;
+      }
       default: break;
     }
     if (in->op == I_SUB && in->nargs == 2 && a[0] == a[1]) {
@@ -9786,7 +10296,7 @@ static bool gdse_transparent(uint16_t op) {
     case I_ADD: case I_SUB: case I_MUL: case I_MULHU:
     case I_AND: case I_OR: case I_XOR:
     case I_SHL: case I_SHRS: case I_SHRU: case I_ROTL: case I_ROTR:
-    case I_CLZ: case I_CTZ: case I_POPCNT: case I_BSWAP:
+    case I_CLZ: case I_CTZ: case I_POPCNT: case I_BSWAP: case I_BITREV:
     case I_EQ: case I_NE: case I_LTS: case I_LTU: case I_GTS: case I_GTU:
     case I_LES: case I_LEU: case I_GES: case I_GEU: case I_EQZ:
     case I_WRAP: case I_EXTENDS: case I_EXTENDU:
@@ -11493,7 +12003,7 @@ static bool lab_cannot_escape(IrFunc *f, Ref v) {
     case I_ADD: case I_SUB: case I_MUL:
     case I_AND: case I_OR: case I_XOR:
     case I_SHL: case I_SHRS: case I_SHRU: case I_ROTL: case I_ROTR:
-    case I_CLZ: case I_CTZ: case I_POPCNT: case I_BSWAP:
+    case I_CLZ: case I_CTZ: case I_POPCNT: case I_BSWAP: case I_BITREV:
     case I_EQ: case I_NE: case I_LTS: case I_LTU: case I_GTS: case I_GTU:
     case I_LES: case I_LEU: case I_GES: case I_GEU: case I_EQZ:
     case I_WRAP: case I_EXTENDS: case I_EXTENDU:
@@ -16539,7 +17049,7 @@ static bool vectorize_one(IrFunc *f, uint32_t hb, uint8_t *reach, uint8_t *inloo
       case I_LEU: case I_LES: case I_GEU: case I_GES: case I_EQZ:
       case I_SELECT:
       case I_FEQ: case I_FNE: case I_FLT: case I_FGT: case I_FLE: case I_FGE:
-      case I_BSWAP: case I_MULHU:
+      case I_BSWAP: case I_BITREV: case I_MULHU:
       case I_CONVERTS: case I_CONVERTU: case I_TRUNC_SATS: case I_TRUNC_SATU:
 
       case I_EXTENDU: case I_EXTENDS: case I_WRAP:
@@ -19182,7 +19692,7 @@ static bool uac_pure(uint16_t op) {
     case I_CONST: case I_ADD: case I_SUB: case I_MUL: case I_MULHU: case I_MULHS:
     case I_AND: case I_OR: case I_XOR: case I_SHL: case I_SHRS: case I_SHRU:
     case I_ROTL: case I_ROTR: case I_CLZ: case I_CTZ: case I_POPCNT:
-    case I_BSWAP:
+    case I_BSWAP: case I_BITREV:
     case I_EQ: case I_NE: case I_LTS: case I_LTU: case I_GTS: case I_GTU:
     case I_LES: case I_LEU: case I_GES: case I_GEU: case I_EQZ:
     case I_FADD: case I_FSUB: case I_FMUL: case I_FDIV: case I_FMIN:
@@ -19704,7 +20214,7 @@ static bool ldc_crossable(const Inst *in) {
     case I_ADD: case I_SUB: case I_MUL:
     case I_AND: case I_OR: case I_XOR:
     case I_SHL: case I_SHRS: case I_SHRU: case I_ROTL: case I_ROTR:
-    case I_CLZ: case I_CTZ: case I_POPCNT: case I_BSWAP:
+    case I_CLZ: case I_CTZ: case I_POPCNT: case I_BSWAP: case I_BITREV:
     case I_EQ: case I_NE: case I_LTS: case I_LTU: case I_GTS: case I_GTU:
     case I_LES: case I_LEU: case I_GES: case I_GEU: case I_EQZ:
     case I_SELECT:
