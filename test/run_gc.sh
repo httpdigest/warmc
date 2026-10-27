@@ -455,7 +455,7 @@ esac
 # second cycle a failed allocation waits for, or the allocation buffers'
 # small pages.
 case "${WARMC_GC_STRESS:-}${WARMC_GC_RELOC:-}${WARMC_GC_RELOCATE_ALL:-}\
-${WARMC_GC_RELOC_STALL:-}${WARMC_GC_HEAP_KB:-}${WARMC_GC_MIN_KB:-}\
+${WARMC_GC_RELOC_STALL:-}${WARMC_GC_MARK_STALL:-}${WARMC_GC_HEAP_KB:-}${WARMC_GC_MIN_KB:-}\
 ${WARMC_GC_GROWTH:-}${WARMC_GC_LAB:-}${WARMC_GC_ROUNDS:-}${WARMC_GC_CONC:-}\
 ${WARMC_GC_JITTER:-}" in
   "")
@@ -790,11 +790,11 @@ expect promote_chain      "OK" $M
 case "${WARMC_GC_STRESS:-}${WARMC_GC_VERIFY:-}${WARMC_GC_RELOC:-}\
 ${WARMC_GC_CONC:-}${WARMC_GC_ROUNDS:-}${WARMC_GC_JITTER:-}${WARMC_GC_MIN_KB:-}\
 ${WARMC_GC_GROWTH:-}${WARMC_GC_HEAP_KB:-}${WARMC_GC_LAB:-}\
-${WARMC_GC_RELEASE:-}${WARMC_GC_RELOC_STALL:-}${WARMC_GC_RELOCATE_ALL:-}" in
+${WARMC_GC_RELEASE:-}${WARMC_GC_RELOC_STALL:-}${WARMC_GC_MARK_STALL:-}${WARMC_GC_RELOCATE_ALL:-}" in
   "")
     out=$(unset WARMC_GC_VERIFY WARMC_GC_RELOCATE_ALL WARMC_GC_HEAP_KB \
                 WARMC_GC_LAB WARMC_GC_RELEASE WARMC_GC_GROWTH WARMC_GC_JITTER \
-                WARMC_GC_CONC WARMC_GC_ROUNDS WARMC_GC_RELOC_STALL
+                WARMC_GC_CONC WARMC_GC_ROUNDS WARMC_GC_RELOC_STALL WARMC_GC_MARK_STALL
           WARMC_GC_STATS=1 WARMC_GC_MIN_KB=4 WARMC_GC_RELOC=8 WARMC_GC_CONC=0 \
           wruntimeout $WARMC_RUN "${BIN[@]}" tree_survives 60000 2>&1 >/dev/null)
     healed=$(printf '%s' "$out" | sed -n 's/.*barrier: \([0-9]*\) loads healed.*/\1/p')
@@ -822,27 +822,38 @@ esac
 # colour good, so stopped-the-world with relocation off the program heals
 # nothing at all: a flip to R after every mark had it heal half a million
 # loads.
+# The program shades only what it loads while a mark is on, and a mark of a
+# heap this small is over in the time the collector's thread has a core to
+# itself: on one core, or on CI's four with every row running, it ended
+# before the program ran again, every time, and nothing was shaded.  So the
+# collector sleeps a millisecond into each mark (WARMC_GC_MARK_STALL) and
+# the program, allocating meanwhile, does not stop to wait for it
+# (WARMC_GC_ASSIST=0); and where taskset is, the walk runs on one core too.
 case "${WARMC_GC_STRESS:-}${WARMC_GC_VERIFY:-}${WARMC_GC_RELOC:-}\
 ${WARMC_GC_CONC:-}${WARMC_GC_ROUNDS:-}${WARMC_GC_JITTER:-}${WARMC_GC_MIN_KB:-}\
 ${WARMC_GC_GROWTH:-}${WARMC_GC_HEAP_KB:-}${WARMC_GC_LAB:-}\
-${WARMC_GC_RELEASE:-}${WARMC_GC_RELOC_STALL:-}${WARMC_GC_RELOCATE_ALL:-}" in
+${WARMC_GC_RELEASE:-}${WARMC_GC_RELOC_STALL:-}${WARMC_GC_MARK_STALL:-}${WARMC_GC_RELOCATE_ALL:-}" in
   "")
-    out=$(WARMC_GC_STATS=1 WARMC_GC_MIN_KB=64 \
-          wruntimeout $WARMC_RUN "${BIN[@]}" walk_no_alloc 60 20000 2>&1 >/dev/null)
-    healed=$(printf '%s' "$out" | sed -n 's/.*barrier: \([0-9]*\) loads healed.*/\1/p')
-    hfast=$(printf '%s' "$out" | sed -n 's/.*loads healed (\([0-9]*\) by the fast path).*/\1/p')
-    shaded=$(printf '%s' "$out" | sed -n 's/.*, \([0-9]*\) objects shaded.*/\1/p')
-    sfast=$(printf '%s' "$out" | sed -n 's/.*objects shaded (\([0-9]*\) by the fast path).*/\1/p')
-    if [ "$A64" = 0 ]; then
-      :
-    elif [ -n "$healed" ] && [ -n "$hfast" ] && [ -n "$shaded" ] && [ -n "$sfast" ] && \
-       [ "$healed" -gt 1000 ] && [ $((hfast * 2)) -ge "$healed" ] && \
-       [ "$shaded" -gt 1000 ] && [ $((sfast * 2)) -ge "$shaded" ]; then
-      pass=$((pass+1))
-    else
-      echo "FAIL[gc] the barrier's fast path healed or shaded too few: $out"
-      fail=$((fail+1))
-    fi
+    pins=("")
+    taskset -c 0 true 2>/dev/null && pins+=("taskset -c 0")
+    for pin in "${pins[@]}"; do
+      out=$(WARMC_GC_STATS=1 WARMC_GC_MIN_KB=64 WARMC_GC_MARK_STALL=1000 WARMC_GC_ASSIST=0 \
+            wruntimeout $WARMC_RUN $pin "${BIN[@]}" walk_no_alloc 60 20000 2>&1 >/dev/null)
+      healed=$(printf '%s' "$out" | sed -n 's/.*barrier: \([0-9]*\) loads healed.*/\1/p')
+      hfast=$(printf '%s' "$out" | sed -n 's/.*loads healed (\([0-9]*\) by the fast path).*/\1/p')
+      shaded=$(printf '%s' "$out" | sed -n 's/.*, \([0-9]*\) objects shaded.*/\1/p')
+      sfast=$(printf '%s' "$out" | sed -n 's/.*objects shaded (\([0-9]*\) by the fast path).*/\1/p')
+      if [ "$A64" = 0 ]; then
+        :
+      elif [ -n "$healed" ] && [ -n "$hfast" ] && [ -n "$shaded" ] && [ -n "$sfast" ] && \
+         [ "$healed" -gt 1000 ] && [ $((hfast * 2)) -ge "$healed" ] && \
+         [ "$shaded" -gt 1000 ] && [ $((sfast * 2)) -ge "$shaded" ]; then
+        pass=$((pass+1))
+      else
+        echo "FAIL[gc] the barrier's fast path healed or shaded too few${pin:+ ($pin)}: $out"
+        fail=$((fail+1))
+      fi
+    done
     once=$(WARMC_GC_STATS=1 WARMC_GC_MIN_KB=64 WARMC_GC_CONC=0 \
            wruntimeout $WARMC_RUN "${BIN[@]}" rewalk 100 10000 1 10000 2>&1 >/dev/null |
            sed -n 's/.*barrier: \([0-9]*\) loads healed.*/\1/p')
