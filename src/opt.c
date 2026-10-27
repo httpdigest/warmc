@@ -6012,6 +6012,39 @@ static bool thread_test(IrFunc *f, uint32_t B, const uint32_t *uses,
   return true;
 }
 
+/* The edge pi's s-th, into B, sent to a fresh block that takes B's
+   parameters and jumps where B's pick-th edge goes, or false where that is
+   B itself, a landing pad or an exception's way. */
+static bool thread_edge(IrFunc *f, uint32_t B, uint32_t pi, uint32_t s, uint32_t pick,
+                        TdVec *made) {
+  Block *bb = &f->blocks[B];
+  uint32_t t = bb->succs[pick].target;
+  if (t == B || bb->succs[pick].eh || f->blocks[t].is_pad) return false;
+  uint32_t x = ir_new_block(f);
+  for (uint32_t q = 0; q < f->blocks[B].nparams; q++)
+    ir_add_param(f, x, (ValType)f->insts[f->blocks[B].params[q]].type);
+  bb = &f->blocks[B];
+  const Edge *ce = &bb->succs[pick];
+  Ref *na = ce->nargs ? xmalloc(ce->nargs * sizeof(Ref)) : NULL;
+  for (uint32_t a = 0; a < ce->nargs; a++) {
+    Ref r = ce->args[a];
+    if (f->insts[r].op == I_PARAM && f->insts[r].block == B)
+      for (uint32_t q = 0; q < bb->nparams; q++)
+        if (bb->params[q] == r) { r = f->blocks[x].params[q]; break; }
+    na[a] = r;
+  }
+  f->blocks[x].term = T_JUMP;
+  ir_add_edge(f, x, t, na, ce->nargs);
+  xfree(na);
+  f->blocks[x].reachable = true;
+  f->blocks[pi].succs[s].target = x;
+  td_push(made, x);
+  g_stats.branch_simplified++;
+  return true;
+}
+
+static void thread_repair(IrFunc *f, uint32_t B, TdVec *made);
+
 static bool thread_dispatch(IrFunc *f, uint32_t B, const uint32_t *nread,
                             uint32_t nnread) {
   Block *b = &f->blocks[B];
@@ -6051,29 +6084,7 @@ static bool thread_dispatch(IrFunc *f, uint32_t B, const uint32_t *nread,
       uint32_t pick;
       if (bb->term == T_BRIF) pick = c ? 0 : 1;
       else pick = c < bb->nsuccs - 1 ? (uint32_t)c : bb->nsuccs - 1;
-      uint32_t t = bb->succs[pick].target;
-      if (t == B || bb->succs[pick].eh || f->blocks[t].is_pad) continue;
-
-      uint32_t x = ir_new_block(f);
-      for (uint32_t q = 0; q < f->blocks[B].nparams; q++)
-        ir_add_param(f, x, (ValType)f->insts[f->blocks[B].params[q]].type);
-      bb = &f->blocks[B];
-      const Edge *ce = &bb->succs[pick];
-      Ref *na = ce->nargs ? xmalloc(ce->nargs * sizeof(Ref)) : NULL;
-      for (uint32_t a = 0; a < ce->nargs; a++) {
-        Ref r = ce->args[a];
-        if (f->insts[r].op == I_PARAM && f->insts[r].block == B)
-          for (uint32_t q = 0; q < bb->nparams; q++)
-            if (bb->params[q] == r) { r = f->blocks[x].params[q]; break; }
-        na[a] = r;
-      }
-      f->blocks[x].term = T_JUMP;
-      ir_add_edge(f, x, t, na, ce->nargs);
-      xfree(na);
-      f->blocks[x].reachable = true;
-      f->blocks[pi].succs[s].target = x;
-      td_push(&made, x);
-      g_stats.branch_simplified++;
+      thread_edge(f, B, pi, s, pick, &made);
     }
   }
   if (!made.n) return false;
@@ -6081,6 +6092,14 @@ static bool thread_dispatch(IrFunc *f, uint32_t B, const uint32_t *nread,
     fprintf(stderr, "thread %s b%u: %s on a parameter, %u edge(s)\n",
             f->m->funcs[f->func_index].sym ? f->m->funcs[f->func_index].sym : "?", B,
             f->blocks[B].term == T_BRIF ? "brif" : "br_table", made.n);
+  thread_repair(f, B, &made);
+  return true;
+}
+
+/* The edges made fresh blocks of, and every read beyond B of B's parameters
+   put back into SSA form. */
+static void thread_repair(IrFunc *f, uint32_t B, TdVec *mv) {
+  TdVec made = *mv;
   ir_order(f);
 
   uint32_t nb = f->nblocks, np = f->blocks[B].nparams;
@@ -6133,15 +6152,482 @@ static bool thread_dispatch(IrFunc *f, uint32_t B, const uint32_t *nread,
   for (uint32_t q = 0; q < np; q++) xfree(uses[q].v);
   xfree(uses);
   xfree(fresh); xfree(need); xfree(made.v);
+}
+
+/* ---- threading on what the way into a block knows ----------------------
+
+   A block that does nothing but test a value against constants -- branch
+   on its compare with one, or with one less or more, or switch on it --
+   reached by an edge along whose way the branches taken have decided that
+   test already: TinyGo's switch on strings (gobench/strswitch) tests the
+   length of the word for each case, and a word whose bytes differ from one
+   case's goes on to the next case's test of a length the first one fixed.
+   The way is the edge's own branch and those above it through blocks each
+   entered by one edge, so each of them ran, and took the edge it did, just
+   before the block.  The edge goes to a fresh block that jumps where the
+   test would have gone, as thread_dispatch's do. */
+
+/* The values an integer can still have: sorted disjoint ranges, unsigned,
+   at most KS_MAX of them -- a fact that would make more is not taken, so
+   what the set holds stays true. */
+#define KS_MAX 8
+#define KT_DEPTH 12
+typedef struct { uint64_t lo[KS_MAX], hi[KS_MAX]; uint32_t n; } KSet;
+
+/* [lo, hi], or [lo, mask] and [0, hi] where it wraps */
+static void ks_range(KSet *r, uint64_t lo, uint64_t hi, uint64_t mask) {
+  if (lo <= hi) { r->n = 1; r->lo[0] = lo; r->hi[0] = hi; return; }
+  r->n = 0;
+  r->lo[r->n] = 0; r->hi[r->n++] = hi;
+  r->lo[r->n] = lo; r->hi[r->n++] = mask;
+}
+
+/* the set, every value plus d (mod 2^n), sorted again: a range that
+   wraps is two */
+static bool ks_shift(KSet *r, uint64_t d, uint64_t mask) {
+  KSet t = {0};
+  for (uint32_t i = 0; i < r->n; i++) {
+    uint64_t lo = (r->lo[i] + d) & mask, hi = (r->hi[i] + d) & mask;
+    KSet one;
+    ks_range(&one, lo, hi, mask);
+    for (uint32_t j = 0; j < one.n; j++) {
+      if (t.n == KS_MAX) return false;
+      t.lo[t.n] = one.lo[j]; t.hi[t.n++] = one.hi[j];
+    }
+  }
+  for (uint32_t i = 1; i < t.n; i++)
+    for (uint32_t j = i; j > 0 && t.lo[j] < t.lo[j - 1]; j--) {
+      uint64_t a = t.lo[j], b = t.hi[j];
+      t.lo[j] = t.lo[j - 1]; t.hi[j] = t.hi[j - 1];
+      t.lo[j - 1] = a; t.hi[j - 1] = b;
+    }
+  *r = t;
   return true;
+}
+
+/* how many values: of a subset, whether it is the whole */
+static unsigned __int128 ks_size(const KSet *r) {
+  unsigned __int128 n = 0;
+  for (uint32_t i = 0; i < r->n; i++) n += (unsigned __int128)(r->hi[i] - r->lo[i]) + 1;
+  return n;
+}
+
+/* r and t: false, and r as it was, where that takes more than KS_MAX */
+static bool ks_inter(KSet *r, const KSet *t, KSet *out) {
+  KSet o = {0};
+  for (uint32_t i = 0, j = 0; i < r->n && j < t->n;) {
+    uint64_t lo = r->lo[i] > t->lo[j] ? r->lo[i] : t->lo[j];
+    uint64_t hi = r->hi[i] < t->hi[j] ? r->hi[i] : t->hi[j];
+    if (lo <= hi) {
+      if (o.n == KS_MAX) return false;
+      o.lo[o.n] = lo; o.hi[o.n++] = hi;
+    }
+    if (r->hi[i] < t->hi[j]) i++; else j++;
+  }
+  *out = o;
+  return true;
+}
+
+/* The values y can have where y op k is truth, op a compare. */
+static bool ks_rel(KSet *r, uint16_t op, uint64_t k, bool truth, uint64_t mask) {
+  if (!truth) {
+    op = cmp_inverse(op);
+    if (!op) return false;
+  }
+  uint64_t sign = (mask >> 1) + 1;
+  bool sgn = op == I_LTS || op == I_LES || op == I_GTS || op == I_GES;
+  /* a signed compare is the unsigned one of both sides plus the sign bit */
+  if (sgn) {
+    k = (k + sign) & mask;
+    op = op == I_LTS ? I_LTU : op == I_LES ? I_LEU : op == I_GTS ? I_GTU : I_GEU;
+  }
+  switch (op) {
+    case I_EQ:  ks_range(r, k, k, mask); break;
+    case I_NE:  ks_range(r, (k + 1) & mask, (k - 1) & mask, mask); break;
+    case I_LTU: if (k == 0) return false; ks_range(r, 0, k - 1, mask); break;
+    case I_LEU: ks_range(r, 0, k, mask); break;
+    case I_GTU: if (k == mask) return false; ks_range(r, k + 1, mask, mask); break;
+    case I_GEU: ks_range(r, k, mask, mask); break;
+    default: return false;
+  }
+  return !sgn || ks_shift(r, sign, mask);
+}
+
+/* y as x plus *d (mod 2^n): y itself, or its sum with or difference from a
+   constant */
+static bool kt_offset(IrFunc *f, Ref y, Ref x, uint64_t *d) {
+  if (y == x) { *d = 0; return true; }
+  const Inst *yi = &f->insts[y];
+  uint64_t c;
+  if ((yi->op == I_ADD || yi->op == I_SUB) && yi->nargs == 2 && ir_args(f, y)[0] == x &&
+      is_const(f, ir_args(f, y)[1], &c)) {
+    *d = yi->op == I_ADD ? c : 0 - c;
+    return true;
+  }
+  return false;
+}
+
+/* The values x can have where the compare c is truth, or false where c is
+   not one of x, or x plus a constant, with a constant -- which fold_block
+   has put second. */
+static bool kt_test(IrFunc *f, Ref c, Ref x, bool truth, uint64_t mask, KSet *r) {
+  const Inst *ci = &f->insts[c];
+  Ref y;
+  uint16_t op;
+  uint64_t k;
+  if (ci->op == I_EQZ && ci->nargs == 1) { y = ir_args(f, c)[0]; op = I_EQ; k = 0; }
+  else if (ci->op >= I_EQ && ci->op <= I_GEU && ci->nargs == 2 &&
+           is_const(f, ir_args(f, c)[1], &k)) {
+    y = ir_args(f, c)[0];
+    op = ci->op;
+  } else return false;
+  uint64_t d;
+  if (!kt_offset(f, y, x, &d) || !ks_rel(r, op, k & mask, truth, mask)) return false;
+  return ks_shift(r, (0 - d) & mask, mask);
+}
+
+/* The values x can have where q's s-th edge is taken, or false where q's
+   branch says nothing of x. */
+static bool kt_edge(IrFunc *f, uint32_t q, uint32_t s, Ref x, uint64_t mask, KSet *r) {
+  const Block *qb = &f->blocks[q];
+  if (qb->succs[s].eh) return false;
+  /* an edge is taken where its condition holds, the other edge's target
+     the same block or not */
+  if (qb->term == T_BRIF && qb->nsuccs == 2)
+    return kt_test(f, qb->term_arg, x, s == 0, mask, r);
+  if (qb->term != T_BRTABLE) return false;
+  uint64_t d;
+  if (!kt_offset(f, qb->term_arg, x, &d)) return false;
+  /* the index is an i32 whatever x is */
+  if (mask != 0xffffffffu) return false;
+  uint32_t n = qb->nsuccs - 1;
+  if (s < n) ks_range(r, s, s, mask);
+  else ks_range(r, n, mask, mask);
+  return ks_shift(r, (0 - d) & mask, mask);
+}
+
+/* What the way into B by p's s-th edge says of x: that edge's branch, and
+   those of the blocks above it each entered by one edge. */
+static void kt_way(IrFunc *f, uint32_t p, uint32_t s, Ref x, uint64_t mask, KSet *r) {
+  ks_range(r, 0, mask, mask);
+  KSet e, t;
+  if (kt_edge(f, p, s, x, mask, &e) && ks_inter(r, &e, &t)) *r = t;
+  uint32_t y = p;
+  for (int step = 0; step < KT_DEPTH; step++) {
+    const Block *yb = &f->blocks[y];
+    if (yb->npreds != 1 || yb->is_pad) return;
+    /* one predecessor is one edge: the list has a block once per edge */
+    uint32_t q = yb->preds[0], si = 0;
+    if (q == y) return;
+    while (f->blocks[q].succs[si].target != y) si++;
+    if (kt_edge(f, q, si, x, mask, &e) && ks_inter(r, &e, &t)) *r = t;
+    y = q;
+  }
+}
+
+/* The one value a, handed to B by p's s-th edge, has there: a constant, or
+   a compare of a value with one that the way decides. */
+static bool kt_value(IrFunc *f, uint32_t p, uint32_t s, Ref a, uint64_t mask, KSet *r) {
+  uint64_t c;
+  if (is_const(f, a, &c)) { ks_range(r, c & mask, c & mask, mask); return true; }
+  const Inst *ai = &f->insts[a];
+  Ref z;
+  if (ai->op == I_EQZ && ai->nargs == 1) z = ir_args(f, a)[0];
+  else if (ai->op >= I_EQ && ai->op <= I_GEU && ai->nargs == 2 &&
+           is_const(f, ir_args(f, a)[1], &c))
+    z = ir_args(f, a)[0];
+  else return false;
+  /* the compare less what is added to its operand */
+  const Inst *zi = &f->insts[z];
+  if ((zi->op == I_ADD || zi->op == I_SUB) && zi->nargs == 2 && is_const(f, ir_args(f, z)[1], &c))
+    z = ir_args(f, z)[0];
+  ValType zt = (ValType)f->insts[z].type;
+  if (zt != VT_I32 && zt != VT_I64) return false;
+  uint64_t zm = zt == VT_I64 ? ~0ull : 0xffffffffu;
+  KSet way, yes, both;
+  kt_way(f, p, s, z, zm, &way);
+  if (!way.n || !kt_test(f, a, z, true, zm, &yes) || !ks_inter(&way, &yes, &both)) return false;
+  if (!both.n) { ks_range(r, 0, 0, mask); return true; }
+  if (ks_size(&both) == ks_size(&way)) { ks_range(r, 1, 1, mask); return true; }
+  return false;
+}
+
+/* Where B's test goes for the edge p's s-th, which hands the parameter x is
+   (xq, if x is one of B's) the value a: B's pick-th way, or UINT32_MAX
+   where the way in leaves it open.  yes is where B's branch is taken, d
+   what B's switch adds to x. */
+static uint32_t kt_pick(IrFunc *f, uint32_t B, uint32_t xq, Ref x, Ref a, uint64_t mask,
+                        const KSet *yes, uint64_t d, uint32_t p, uint32_t s) {
+  KSet way, both;
+  if (xq == UINT32_MAX || !kt_value(f, p, s, a, mask, &way))
+    kt_way(f, p, s, xq == UINT32_MAX ? x : a, mask, &way);
+  if (!way.n) return UINT32_MAX;
+  const Block *b = &f->blocks[B];
+  if (b->term == T_BRIF) {
+    if (!ks_inter(&way, yes, &both)) return UINT32_MAX;
+    if (!both.n) return 1;
+    return ks_size(&both) == ks_size(&way) ? 0 : UINT32_MAX;
+  }
+  if (!ks_shift(&way, d, mask)) return UINT32_MAX;
+  uint32_t n = b->nsuccs - 1;
+  if (way.lo[0] >= n) return n;
+  if (way.n == 1 && way.lo[0] == way.hi[0]) return (uint32_t)way.lo[0];
+  return UINT32_MAX;
+}
+
+/* A block that does nothing but hand its parameters on to B, which nothing
+   else reads: the edges into it are threaded through it, an edge it would
+   have merged reaching B's test with its own way's facts -- TinyGo's case
+   that fails falls into the merge before the next case's test. */
+static bool kt_forwarder(IrFunc *f, uint32_t F, uint32_t B, const uint32_t *nread,
+                         uint32_t nnread) {
+  const Block *fb = &f->blocks[F];
+  if (F == B || F == f->entry || fb->is_pad || !fb->reachable || fb->ninsts ||
+      fb->term != T_JUMP || fb->nsuccs != 1 || fb->succs[0].target != B || fb->succs[0].eh ||
+      !fb->nparams)
+    return false;
+  for (uint32_t q = 0; q < fb->nparams; q++) {
+    Ref par = fb->params[q];
+    uint32_t here = 0;
+    for (uint32_t j = 0; j < fb->succs[0].nargs; j++) here += fb->succs[0].args[j] == par;
+    if (par >= nnread || nread[par] != here) return false;
+  }
+  return true;
+}
+
+static bool thread_known(IrFunc *f, uint32_t B, const uint32_t *nread, uint32_t nnread) {
+  Block *b = &f->blocks[B];
+  if (!b->reachable || b->is_pad || B == f->entry || ir_block_has_eh(f, B)) return false;
+  if (b->term != T_BRIF && b->term != T_BRTABLE) return false;
+  /* Not a loop's header: an edge past its test enters the loop in the
+     middle, which no loop pass takes -- cbench/nbody's loop entered where
+     the count was known to be above zero ran 8% slower. */
+  for (uint32_t p = 0; p < b->npreds; p++)
+    if (f->blocks[b->preds[p]].rpo >= b->rpo) return false;
+  /* x, the value the test is of, made before B */
+  Ref y = b->term_arg, x = REF_NONE;
+  if (y >= nnread) return false;
+  if (b->term == T_BRIF) {
+    /* the compare B's, or one made before it that B branches on */
+    const Inst *ci = &f->insts[y];
+    uint64_t k;
+    if (ci->op == I_EQZ && ci->nargs == 1) y = ir_args(f, y)[0];
+    else if (ci->op >= I_EQ && ci->op <= I_GEU && ci->nargs == 2 &&
+             is_const(f, ir_args(f, y)[1], &k))
+      y = ir_args(f, y)[0];
+    /* a branch on a parameter itself: on its not being 0 */
+    else if (ci->op != I_PARAM || ci->block != B) return false;
+  }
+  /* the value tested, less what is added to it: a fact on the way of the
+     length, and a switch on the length less 4 */
+  const Inst *yi = &f->insts[y];
+  uint64_t c0;
+  x = (yi->op == I_ADD || yi->op == I_SUB) && yi->nargs == 2 &&
+      is_const(f, ir_args(f, y)[1], &c0) ? ir_args(f, y)[0] : y;
+  /* x is made before B, or is a parameter of B's, which each edge hands its
+     value: TinyGo keeps each case's length test in a local, which reaches
+     the next cases' tests as a parameter */
+  uint32_t xq = UINT32_MAX;
+  if (f->insts[x].block == B) {
+    if (f->insts[x].op != I_PARAM) return false;
+    for (uint32_t q = 0; q < b->nparams; q++)
+      if (b->params[q] == x) xq = q;
+    if (xq == UINT32_MAX) return false;
+  }
+  ValType t = (ValType)f->insts[x].type;
+  if (t != VT_I32 && t != VT_I64) return false;
+  uint64_t mask = t == VT_I64 ? ~0ull : 0xffffffffu;
+  /* B makes nothing that is read beyond it: constants, x plus one, the
+     compare */
+  for (uint32_t i = 0; i < b->ninsts; i++) {
+    Ref v = b->insts[i];
+    uint16_t op = f->insts[v].op;
+    if (op != I_CONST && op != I_NOP && v != b->term_arg && v != y) return false;
+    if (v >= nnread) return false;
+    uint32_t here = 0;
+    for (uint32_t j = 0; j < b->ninsts; j++) {
+      const Ref *a = ir_args(f, b->insts[j]);
+      for (uint32_t q = 0; q < f->insts[b->insts[j]].nargs; q++) here += a[q] == v;
+    }
+    if ((b->term == T_BRIF || b->term == T_BRTABLE) && b->term_arg == v) here++;
+    if (nread[v] != here) return false;
+  }
+  for (uint32_t q = 0; q < b->nparams; q++)
+    if (!td_numeric((ValType)f->insts[b->params[q]].type)) return false;
+  /* where the test is true: B's way 0 */
+  KSet yes = {0};
+  if (b->term == T_BRIF && b->term_arg == x) ks_range(&yes, 1, mask, mask);
+  else if (b->term == T_BRIF && !kt_test(f, b->term_arg, x, true, mask, &yes)) return false;
+  uint64_t d = 0;
+  if (b->term == T_BRTABLE && !kt_offset(f, b->term_arg, x, &d)) return false;
+
+  TdVec made = {0};
+  /* the predecessors as they were: threading changes B's list */
+  uint32_t np0 = f->blocks[B].npreds;
+  uint32_t *preds = xmalloc((np0 ? np0 : 1) * sizeof(uint32_t));
+  memcpy(preds, f->blocks[B].preds, np0 * sizeof(uint32_t));
+  for (uint32_t pk = 0; pk < np0; pk++) {
+    uint32_t pi = preds[pk];
+    if (!f->blocks[pi].reachable || pi == B) continue;
+    /* a predecessor listed twice is taken once */
+    bool seen = false;
+    for (uint32_t pj = 0; pj < pk; pj++) seen |= preds[pj] == pi;
+    if (seen) continue;
+    if (kt_forwarder(f, pi, B, nread, nnread)) {
+      /* each edge into the forwarder, with what it hands B */
+      uint32_t nf = f->blocks[pi].npreds;
+      uint32_t *fp = xmalloc((nf ? nf : 1) * sizeof(uint32_t));
+      memcpy(fp, f->blocks[pi].preds, nf * sizeof(uint32_t));
+      for (uint32_t fk = 0; fk < nf; fk++) {
+        uint32_t qi = fp[fk];
+        bool dup = qi == pi;
+        for (uint32_t fj = 0; fj < fk; fj++) dup |= fp[fj] == qi;
+        if (dup || !f->blocks[qi].reachable) continue;
+        for (uint32_t s = 0; s < f->blocks[qi].nsuccs; s++) {
+          Edge *e = &f->blocks[qi].succs[s];
+          const Block *fb = &f->blocks[pi];
+          if (e->target != pi || e->eh || e->nargs != fb->nparams) continue;
+          uint32_t nb = fb->succs[0].nargs;
+          Ref *ba = ir_alloc(f, (nb ? nb : 1) * sizeof(Ref));
+          for (uint32_t j = 0; j < nb; j++) {
+            Ref r = fb->succs[0].args[j];
+            for (uint32_t q = 0; q < fb->nparams; q++)
+              if (fb->params[q] == r) { r = e->args[q]; break; }
+            ba[j] = r;
+          }
+          uint32_t pick = kt_pick(f, B, xq, x, xq == UINT32_MAX ? REF_NONE : ba[xq], mask,
+                                  &yes, d, qi, s);
+          if (pick == UINT32_MAX) continue;
+          /* the edge straight to B, then on past it */
+          e = &f->blocks[qi].succs[s];
+          Edge was = *e;
+          e->target = B;
+          e->args = ba;
+          e->nargs = e->cap = nb;
+          /* put back where B's way there is B itself or no place to go */
+          if (!thread_edge(f, B, qi, s, pick, &made)) f->blocks[qi].succs[s] = was;
+        }
+      }
+      xfree(fp);
+      continue;
+    }
+    for (uint32_t s = 0; s < f->blocks[pi].nsuccs; s++) {
+      Edge *e = &f->blocks[pi].succs[s];
+      if (e->target != B || e->eh || e->nargs != f->blocks[B].nparams) continue;
+      uint32_t pick = kt_pick(f, B, xq, x, xq == UINT32_MAX ? REF_NONE : e->args[xq], mask,
+                              &yes, d, pi, s);
+      if (pick == UINT32_MAX) continue;
+      thread_edge(f, B, pi, s, pick, &made);
+    }
+  }
+  xfree(preds);
+  if (!made.n) return false;
+  if (warmc_getenv("WARMC_THREAD_STATS"))
+    fprintf(stderr, "thread %s b%u: %s decided on the way in, %u edge(s)\n",
+            f->m->funcs[f->func_index].sym ? f->m->funcs[f->func_index].sym : "?", B,
+            f->blocks[B].term == T_BRIF ? "brif" : "br_table", made.n);
+  g_stats.threaded_known += made.n;
+  thread_repair(f, B, &made);
+  return true;
+}
+
+/* A parameter every edge hands one compare of a value made before the
+   block -- that compare itself, or a constant the way in shows it has
+   there -- is that compare: made again at the block's start, and the
+   parameter left unread.  TinyGo keeps each case's length test of a switch
+   on strings in a local, the result where it made the test and its
+   outcome where an earlier test had decided it (gobench/strswitch); the
+   cases after test the local, which as the compare is a test of the length
+   the threading above decides, and no edge copies it any more. */
+static bool param_compares(IrFunc *f) {
+  bool any = false;
+  for (uint32_t B = 0; B < f->nblocks; B++) {
+    Block *b = &f->blocks[B];
+    if (!b->reachable || b->is_pad || B == f->entry || !b->nparams) continue;
+    for (uint32_t q = 0; q < b->nparams; q++) {
+      Ref par = f->blocks[B].params[q];
+      if (f->insts[par].type != VT_I32) continue;
+      /* the compare: one an edge hands it, of a value made above B */
+      Ref c = REF_NONE, z = REF_NONE;
+      uint64_t k = 0;
+      bool ok = true;
+      uint32_t nedges = 0;
+      for (uint32_t pk = 0; pk < f->blocks[B].npreds && ok; pk++) {
+        uint32_t pi = f->blocks[B].preds[pk];
+        const Block *pb = &f->blocks[pi];
+        bool seen = false;
+        for (uint32_t pj = 0; pj < pk; pj++) seen |= f->blocks[B].preds[pj] == pi;
+        if (seen || !pb->reachable) continue;
+        for (uint32_t si = 0; si < pb->nsuccs && ok; si++) {
+          const Edge *e = &pb->succs[si];
+          if (e->target != B) continue;
+          if (e->eh || e->nargs != f->blocks[B].nparams) { ok = false; break; }
+          nedges++;
+          Ref a = e->args[q];
+          if (a == par || a == c) continue;
+          uint64_t ac;
+          if (is_const(f, a, &ac)) continue;
+          const Inst *ai = &f->insts[a];
+          if (c != REF_NONE) {
+            if (!same_inst(f, a, c)) ok = false;
+            continue;
+          }
+          if (ai->nargs != 2 || ai->op < I_EQ || ai->op > I_GEU ||
+              !is_const(f, ir_args(f, a)[1], &k)) { ok = false; continue; }
+          z = ir_args(f, a)[0];
+          ValType zt = (ValType)f->insts[z].type;
+          if ((zt != VT_I32 && zt != VT_I64) || !dominates(f, f->insts[z].block, B) ||
+              f->insts[z].block == B) { ok = false; continue; }
+          c = a;
+        }
+      }
+      if (!ok || c == REF_NONE || nedges < 2) continue;
+      /* each constant the compare's value on its way */
+      uint64_t zm = f->insts[z].type == VT_I64 ? ~0ull : 0xffffffffu;
+      for (uint32_t pk = 0; pk < f->blocks[B].npreds && ok; pk++) {
+        uint32_t pi = f->blocks[B].preds[pk];
+        const Block *pb = &f->blocks[pi];
+        bool seen = false;
+        for (uint32_t pj = 0; pj < pk; pj++) seen |= f->blocks[B].preds[pj] == pi;
+        if (seen || !pb->reachable) continue;
+        for (uint32_t si = 0; si < pb->nsuccs && ok; si++) {
+          const Edge *e = &pb->succs[si];
+          uint64_t ac;
+          if (e->target != B || !is_const(f, e->args[q], &ac)) continue;
+          KSet way, yes, both;
+          kt_way(f, pi, si, z, zm, &way);
+          if (!way.n || !kt_test(f, c, z, true, zm, &yes) || !ks_inter(&way, &yes, &both)) {
+            ok = false;
+            break;
+          }
+          bool known1 = ks_size(&both) == ks_size(&way);
+          if ((ac & 0xffffffffu) == 1 ? !known1 : (ac & 0xffffffffu) == 0 ? both.n != 0 : true)
+            ok = false;
+        }
+      }
+      if (!ok) continue;
+      uint32_t at = 0;
+      Ref kc = emit_before(f, B, &at, I_CONST, (ValType)f->insts[z].type, NULL, 0,
+                           k & zm);
+      Ref ops[2] = { z, kc };
+      Ref nc = emit_before(f, B, &at, (IrOp)f->insts[c].op, VT_I32, ops, 2, 0);
+      ir_replace(f, par, nc);
+      ir_apply_subst(f);
+      g_stats.param_compares++;
+      any = true;
+    }
+  }
+  return any;
 }
 
 static bool pass_thread(IrFunc *f) {
   if (f->npads) return false;
-  bool changed = false;
+  bool changed = !warmc_getenv("WARMC_NO_PCMP") && param_compares(f);
+  if (changed) prune_params(f);
   uint32_t *nread = count_uses(f), nnread = f->ninsts;
   for (uint32_t bi = 0, n = f->nblocks; bi < n; bi++)
-    if (thread_dispatch(f, bi, nread, nnread)) {
+    if (thread_dispatch(f, bi, nread, nnread) ||
+        (!warmc_getenv("WARMC_NO_TKNOWN") && thread_known(f, bi, nread, nnread))) {
       changed = true;
       if (warmc_getenv("WARMC_THREAD_DEBUG")) { ir_print(f, "thread"); ir_verify(f, "thread"); }
     }
