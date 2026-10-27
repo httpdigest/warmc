@@ -78,6 +78,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import gen
 import hostbuild
 import proposals
+import run_wat
 import wasttext
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -181,6 +182,15 @@ def validate(path):
     msg = (r.stderr.strip().splitlines() or [""])[0]
     return r.returncode, msg
 
+def validate_all(paths):
+    """validate() of each path: {path: (exit code, message)}, one warmc for
+    them all where it says each one's verdict"""
+    got = run_wat.verdicts(sh, [WARMC, "--validate-only"], paths, WARMC_TIMEOUT)
+    for p in paths:
+        if p not in got:
+            got[p] = validate(p)
+    return got
+
 def run_file(wast, idx, levels, verbose=False):
     """Validate one file once, then build its tables for each level."""
     stem = os.path.basename(wast)[:-5]
@@ -201,6 +211,9 @@ def run_file(wast, idx, levels, verbose=False):
 
     npass = nfail = nskip = 0
     failures = []
+    verdict = validate_all([os.path.join(outdir, cmd["filename"]) for cmd in spec["commands"]
+                            if cmd["type"] in ("module", "module_definition", "assert_malformed",
+                                               "assert_invalid") and "filename" in cmd])
     for cmd in spec["commands"]:
         kind = cmd["type"]
         if kind in RUNTIME_COMMANDS:
@@ -212,7 +225,7 @@ def run_file(wast, idx, levels, verbose=False):
                 nskip += 1
                 continue
             path = os.path.join(outdir, cmd["filename"])
-            rc, msg = validate(path)
+            rc, msg = verdict[path]
             if rc == 0:
                 npass += 1
             else:
@@ -230,7 +243,7 @@ def run_file(wast, idx, levels, verbose=False):
         if kind in ("assert_malformed", "assert_invalid"):
 
             want = EXIT_MALFORMED if kind == "assert_malformed" else EXIT_INVALID
-            rc, msg = validate(os.path.join(outdir, cmd["filename"]))
+            rc, msg = verdict[os.path.join(outdir, cmd["filename"])]
             if rc == want:
                 npass += 1
             else:
@@ -263,11 +276,14 @@ def link(objs, out):
     return hostbuild.link(objs, out, BUILD)
 
 def compile_module(wasm, obj, prefix, level):
+    """wasm one module, or several: one object, the i-th (from 1) under
+    prefix + i, as each would be alone"""
+    wasms = wasm if isinstance(wasm, list) else [wasm]
     target = ["--target=macos"] if DARWIN \
         else ["--target=windows"] if hostbuild.WINDOWS else []
     return sh([WARMC] + level + target +
-              ["--symbol-prefix=" + prefix, "-c", "-o", obj, wasm],
-              timeout=WARMC_TIMEOUT)
+              ["--symbol-prefix=" + prefix, "-c", "-o", obj] + wasms,
+              timeout=WARMC_TIMEOUT * len(wasms))
 
 def spectest_obj(level):
     return os.path.join(WORK, "spectest%s.o" % level_tag(level))
@@ -322,18 +338,30 @@ def build_file(stem, outdir, spec, level, idx):
     objdir = os.path.join(outdir, level_tag(level))
     os.makedirs(objdir, exist_ok=True)
 
-    objs = []
-    module_files = []
-    for i, fn in enumerate(wanted):
-        obj = os.path.join(objdir, "m%d.o" % (i + 1))
+    module_files = [(i + 1, fn) for i, fn in enumerate(wanted)]
+    # one object for the file's modules: a process each was most of the
+    # suite's time; one alone each where that does not compile, which
+    # finds the module that does not
+    objs = [os.path.join(objdir, "mods.o")]
+    whole = None
+    if len(wanted) > 1:
+        whole = compile_module([os.path.join(outdir, fn) for fn in wanted], objs[0],
+                               "f%dm" % idx, level)
+    if whole is None or whole.returncode != 0:
+        objs = []
+        for i, fn in enumerate(wanted):
+            obj = os.path.join(objdir, "m%d.o" % (i + 1))
 
-        r = compile_module(os.path.join(outdir, fn), obj,
-                           "f%dm%d" % (idx, i + 1), level)
-        if r.returncode != 0:
-            msg = (r.stderr.strip().splitlines() or [""])[0]
-            return {"status": "cannot compile %s: %s" % (fn, msg[:70])}
-        objs.append(obj)
-        module_files.append((i + 1, fn))
+            r = compile_module(os.path.join(outdir, fn), obj,
+                               "f%dm%d" % (idx, i + 1), level)
+            if r.returncode != 0:
+                msg = (r.stderr.strip().splitlines() or [""])[0]
+                return {"status": "cannot compile %s: %s" % (fn, msg[:70])}
+            objs.append(obj)
+        if whole is not None:
+            msg = (whole.stderr.strip().splitlines() or [""])[0]
+            return {"status": "each module compiles, not the %d as one object: %s"
+                    % (len(wanted), msg[:70])}
 
     try:
         src, ncmds, skipped = gen.generate(spec, module_files, stem, idx)

@@ -16,19 +16,70 @@ def sh(cmd):
     return subprocess.run(cmd, capture_output=True, text=True)
 
 def cc_host(src, obj, includes=()):
-    """Compile a host object for the same target the runtime is built for."""
+    """Compile a host object for the same target the runtime is built for.
+
+    Kept in test/testcache.py under what it is made of, as ccache's direct
+    mode keeps one: the compiler as it reports itself, the command, the
+    source and the names in each directory it includes from find the files
+    the compile read last time (clang's -MD), and their contents the object.
+    The spec suite's generated tables, 750 compiles a run, are the same run
+    after run."""
     if DARWIN:
         cmd = ["clang", "--target=arm64-apple-macos11", "-DWARMC_DARWIN=1"]
     elif WINDOWS:
         cmd = ["clang", "--target=x86_64-pc-windows-gnu", "-DWARMC_WINDOWS=1"]
     else:
         cmd = ["clang", "--target=aarch64-linux-gnu"]
+    dirs = [os.path.join(ROOT, "rt")] + list(includes)
     cmd += ["-O1", "-ffreestanding", "-fno-stack-protector", "-fno-builtin",
-            "-nostdlib", "-Wall", "-I", os.path.join(ROOT, "rt")]
-    for inc in includes:
+            "-nostdlib", "-Wall"]
+    for inc in dirs:
         cmd += ["-I", inc]
     cmd += ["-c", "-o", obj, src]
-    return sh(cmd)
+    try:
+        import testcache
+    except ImportError:
+        return sh(cmd)
+    names = []
+    for d in [os.path.dirname(os.path.abspath(src))] + dirs:
+        try:
+            names.append(sorted(os.listdir(d)))
+        except OSError:
+            names.append("missing")
+    k = testcache.key("host object", testcache.version(["clang", "--version"]),
+                      [c for c in cmd if c != obj], testcache.File(src), names,
+                      [os.environ.get(v, "") for v in ("CPATH", "C_INCLUDE_PATH", "SDKROOT")])
+
+    def made_of(deps):
+        try:
+            return testcache.key(k, [[d, testcache.File(d)] for d in deps])
+        except OSError:
+            return None
+
+    deps = testcache.get("host deps", k)
+    if deps is not None:
+        k2 = made_of(deps)
+        said = testcache.get("host said", k2) if k2 else None
+        if said is not None and testcache.get_file("host object", k2, obj):
+            return subprocess.CompletedProcess(cmd, 0, said[0], said[1])
+    depfile = obj + ".d"
+    r = sh(cmd[:-4] + ["-MD", "-MF", depfile] + cmd[-4:])
+    try:
+        with open(depfile) as f:
+            text = f.read().replace("\\\n", " ")
+        os.remove(depfile)
+    except OSError:
+        return r
+    if r.returncode == 0:
+        # what follows the target, the source among it
+        deps = sorted({os.path.abspath(d) for d in text.split(": ", 1)[1].split()}
+                      - {os.path.abspath(src)})
+        k2 = made_of(deps)
+        if k2:
+            testcache.put_file("host object", k2, obj)
+            testcache.put("host said", k2, [r.stdout, r.stderr])
+            testcache.put("host deps", k, deps)
+    return r
 
 def link(objs, out, build):
     """Link host objects and compiled modules against the runtime archive."""

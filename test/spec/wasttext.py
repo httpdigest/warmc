@@ -169,19 +169,30 @@ def check(wast, spec, outdir, warmc, sh, timeout):
                       "converter's %d" % (len(mods), len(cmds))]
     npass = nfail = 0
     failures = []
+    texts = []
     for (line, kind, text), cmd in zip(mods, cmds):
         if kind != "text":
             continue
         stem = os.path.splitext(cmd["filename"])[0]
         src_path = os.path.join(outdir, stem + ".text.wat")
-        mine_path = os.path.join(outdir, stem + ".text.wasm")
         with open(src_path, "w", encoding="utf-8", newline="") as f:
             f.write(text)
-        r = sh([warmc, "--emit-wasm", "-o", mine_path, src_path], timeout=timeout)
-        if r.returncode != 0:
+        # what a run before wrote is not taken for what this one did
+        if os.path.exists(src_path[:-len(".wat")] + ".wasm"):
+            os.remove(src_path[:-len(".wat")] + ".wasm")
+        texts.append((line, cmd, src_path))
+    # one warmc assembles them all, each written beside itself
+    srcs = [src for _, _, src in texts]
+    said = run_wat.verdicts(sh, [warmc, "--emit-wasm"], srcs, timeout)
+    for line, cmd, src_path in texts:
+        mine_path = src_path[:-len(".wat")] + ".wasm"
+        if src_path not in said:
+            r = sh([warmc, "--emit-wasm", "-o", mine_path, src_path], timeout=timeout)
+            said[src_path] = (r.returncode, (r.stderr.strip().splitlines() or [""])[0])
+        rc, msg = said[src_path]
+        if rc != 0:
             nfail += 1
-            failures.append("text: line %d: warmc cannot assemble it: %s"
-                            % (line, (r.stderr.strip().splitlines() or [""])[0]))
+            failures.append("text: line %d: warmc cannot assemble it: %s" % (line, msg))
             continue
         mine = run_wat.read_stripped(mine_path)
         theirs = run_wat.read_stripped(os.path.join(outdir, cmd["filename"]))

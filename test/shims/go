@@ -1,0 +1,6 @@
+#!/usr/bin/env python3
+"""go, its builds kept by contents: see buildcache.py beside this"""
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import buildcache  # noqa: E402
+buildcache.main("go")

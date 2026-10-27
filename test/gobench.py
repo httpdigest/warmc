@@ -370,13 +370,8 @@ def build_wasm(name, lang):
     if name == "empty":
         fname, text = EMPTY[lang]
         src = os.path.join(WORK, fname)
-        # Written only when it differs.  This file's mtime is what `newest`
-        # below is taken from, so rewriting it unconditionally made the stamp
-        # cache miss every time and the floor was rebuilt by every corpus on
-        # every run, to arrive back at the module already on disk: 3.52s of it
-        # for ktbench, whose producer is two JVM starts, and 0.35 / 0.17 / 0.10 /
-        # 0.04 for asbench, rsbench, zigbench and stdgo.  It is also what kept
-        # this one module being written while other rows read it.
+        # Written only when it differs, which keeps this one file from being
+        # written while other rows read it.
         current = None
         if os.path.exists(src):
             with open(src) as f:
@@ -392,16 +387,19 @@ def build_wasm(name, lang):
 
             deps.append(os.path.join(KDIR, "wasi.ts"))
 
-    newest = max([os.path.getmtime(p) for p in [src] + deps])
-
-    stampf = wasm + ".flags"
-    stamp = " ".join(FLAGS_FOR[lang])
-    old = None
-    if os.path.exists(stampf):
-        with open(stampf) as f:
-            old = f.read()
-    if (os.path.exists(wasm) and os.path.getmtime(wasm) > newest
-            and old == stamp):
+    # kept in test/testcache.py under what it is made of, by contents: the
+    # sources, the flags and the toolchain's version
+    import testcache
+    tool, probe = TOOLCHAIN[lang]
+    ver = testcache.version([tool, "-version"] if lang == "kt" else [tool] + probe)
+    extra = {"gostd": sorted(GO_WASI_ENV.items()), "rs": RUSTC_FLAGS, "zig": ZIG_FLAGS,
+             "hs": GHC_FLAGS, "as": ASC_FLAGS, "kt": KOTLIN_FLAGS}.get(lang, [])
+    key = testcache.key("corpus module", lang, name,
+                        [(os.path.basename(p), testcache.File(p)) for p in [src] + deps],
+                        FLAGS_FOR.get(lang, []), extra, ver,
+                        testcache.File(KOTLIN_KLIB) if lang == "kt" and os.path.exists(KOTLIN_KLIB)
+                        else "")
+    if testcache.get_file("corpus", key, wasm):
         return wasm
     # Built aside and moved into place, because the corpora are read while they
     # are written.  run_all.sh starts these rows alongside every consumer of
@@ -446,7 +444,7 @@ def build_wasm(name, lang):
         shutil.rmtree(hwork, ignore_errors=True)
         cmd = [GHC_WASM, src, "-o", out, "-outputdir", hwork] + GHC_FLAGS
     elif lang == "kt":
-        return build_kotlin(name, src, wasm, stampf, stamp)
+        return build_kotlin(name, src, wasm, key)
     else:
         cmd = ["asc", src, "-o", out] + ASC_FLAGS
     r = sh(cmd, env=env) if env else sh(cmd)
@@ -455,16 +453,15 @@ def build_wasm(name, lang):
               file=sys.stderr)
         return None
     os.replace(out, wasm)
-    with open(stampf, "w") as f:
-        f.write(stamp)
+    testcache.put_file("corpus", key, wasm)
     return wasm
 
-def build_kotlin(name, src, wasm, stampf, stamp):
+def build_kotlin(name, src, wasm, key):
     """Sources to klib, klib to module.  Returns the .wasm path, or None.
 
     Two invocations because K2 will not do both in one, and each is a JVM start,
     so this is the slowest producer in the suite by some way -- which is what the
-    mtime cache above is for.
+    cache above is for.
 
     The compiler names its own output and will not be told otherwise: it writes
     `<name>.wasm` into `-ir-output-dir`, alongside a .mjs loader and, with
@@ -501,8 +498,8 @@ def build_kotlin(name, src, wasm, stampf, stamp):
         return None
     shutil.move(produced, wasm)
     shutil.rmtree(work, ignore_errors=True)
-    with open(stampf, "w") as f:
-        f.write(stamp)
+    import testcache
+    testcache.put_file("corpus", key, wasm)
     return wasm
 
 def write_empty(lang):
@@ -540,15 +537,6 @@ def teavm_current():
 
 def teavm_flags():
     return FLAGS_FOR["java"] + (["strict"] if CORPUS in TEAVM_STRICT else [])
-
-def teavm_newest(name):
-    """The newest of what a kernel's module is made from: its sources, the
-    driver, TeaVM's patches, the adapter and the math it calls."""
-    src = java_dir(name)
-    files = [os.path.join(src, f) for f in os.listdir(src)]
-    files += [os.path.join(TEAVM_SRC, f) for f in ("TeaVMBuild.java", "FdLibm.java", "wasi.py")]
-    files.append(os.path.join(TEAVM_PATCHED, ".complete"))
-    return max(os.path.getmtime(p) for p in files)
 
 def teavm_driver():
     """test/teavm/TeaVMBuild.java, compiled against the fetched tooling into
@@ -611,20 +599,31 @@ def run_teavm(names):
         print(r.stderr[:2000], file=sys.stderr, end="")
     return {n: d for n, d in outs.items() if os.path.exists(os.path.join(d, "main.wasm"))}
 
+def teavm_key(name):
+    """What a Java kernel's adapted module is made of, by contents: its
+    sources, the driver, the math it calls and the adapter, TeaVM (its jars
+    and the patched classes, by their files' names and sizes), the JDK and
+    the flags -- the key test/testcache.py keeps the module under."""
+    import testcache
+    src = java_dir(name)
+    files = sorted(os.path.join(src, f) for f in os.listdir(src))
+    files += [os.path.join(TEAVM_SRC, f) for f in ("TeaVMBuild.java", "FdLibm.java", "wasi.py")]
+    return testcache.key("teavm module", [(os.path.basename(f), testcache.File(f)) for f in files],
+                         testcache.tree(TEAVM_DIR), testcache.version(["java", "-version"]),
+                         teavm_flags())
+
+
 def build_java(names):
-    """Java kernels to WASI modules: TeaVM for every one that is stale, in one
-    JVM, then the adapter.  {name: .wasm path} for those that built."""
+    """Java kernels to WASI modules: TeaVM for every one test/testcache.py
+    has none for, in one JVM, then the adapter.  {name: .wasm path} for those
+    that built."""
+    import testcache
     os.makedirs(WORK, exist_ok=True)
-    stamp = " ".join(teavm_flags())
-    out, stale = {}, []
+    out, stale, keys = {}, [], {}
     for n in names:
         wasm = os.path.join(WORK, n + ".wasm")
-        old = None
-        if os.path.exists(wasm + ".flags"):
-            with open(wasm + ".flags") as f:
-                old = f.read()
-        if (os.path.exists(wasm) and old == stamp
-                and os.path.getmtime(wasm) > teavm_newest(n)):
+        keys[n] = teavm_key(n)
+        if testcache.get_file("teavm", keys[n], wasm):
             out[n] = wasm
         else:
             stale.append(n)
@@ -641,8 +640,7 @@ def build_java(names):
         if err:
             print("teavm-wasi %s: %s" % (n, err), file=sys.stderr)
             continue
-        with open(wasm + ".flags", "w") as f:
-            f.write(stamp)
+        testcache.put_file("teavm", keys[n], wasm)
         shutil.rmtree(built[n], ignore_errors=True)
         out[n] = wasm
     return out

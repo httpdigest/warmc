@@ -5,7 +5,8 @@ What a row's answer depends on: warmc and its sanitiser builds, the
 runtimes and test programs make builds, the pinned tools (build/tools: the
 small programs by their contents, the installed toolchains by their files'
 names and sizes -- each is installed under its version and never changes in
-place), every file of the tree outside src/ that git tracks or sees (the
+place), the spec suite's corpus as checked out (build/testsuite but its
+.git), every file of the tree outside src/ that git tracks or sees (the
 suites, their cases, the corpora's sources, the runtime's sources, the
 Makefile), the toolchains on PATH the suites call, and the row's own
 command and settings.  run_all.sh works out all but the last once, before
@@ -65,6 +66,13 @@ def base():
                     h.update(("%s %d\0" % (rel, os.path.getsize(p))).encode())
                 except OSError:
                     pass
+    # the spec suite's corpus as it is checked out, which a pull in it
+    # changes with the Makefile's pin as it was
+    suite = os.environ.get("WASM_TESTSUITE", os.path.join(BUILD, "testsuite"))
+    for dp, dns, fns in os.walk(suite):
+        dns[:] = sorted(d for d in dns if d != ".git")
+        for fn in sorted(fns):
+            add("testsuite", os.path.relpath(os.path.join(dp, fn)))
     for t in TOOLS:
         p = shutil.which(t)
         add("path " + t, os.path.realpath(p) if p else "missing")

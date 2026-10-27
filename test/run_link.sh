@@ -84,6 +84,24 @@ else
   fail=1
 fi
 
+# The same three modules as one object (-c, --symbol-prefix=bat, several
+# inputs: the i-th as alone under bati), which the spec suite links a .wast's
+# modules as; the driver's names for them mapped onto those
+wtimeout ./$BUILD/warmc ${WARMC_FLAGS:--O2} $WARMC_TARGET_FLAGS --symbol-prefix=bat \
+    -c -o "$WORK/bat.o" "$WORK/a.wasm" "$WORK/b.wasm" "$WORK/c.wasm" ||
+  { echo "FAIL[link]: compiling a, b and c as one object"; exit 1; }
+printf '#define a_module bat1_module\n#define b_module bat2_module\n#define c_module bat3_module\n#include "%s/test/link/driver.c"\n' \
+  "$PWD" >"$WORK/bat_driver.c"
+link_prog bat "$WORK/bat_driver.c" "$WORK/bat.o" || exit 1
+got=$(wruntimeout $WARMC_RUN "$LINKED" 2>&1)
+if [ "$got" = "$want" ]; then
+  echo "link: the same 35 with the three modules in one object"
+else
+  echo "FAIL[link]: output differs with the three modules in one object"
+  diff <(echo "$want") <(echo "$got") | head -20
+  fail=1
+fi
+
 # The embedder's view: a trap partway through a loop, then a look at the
 # memory the loop was writing.  Run at both levels, because the answer must
 # not depend on which passes ran.

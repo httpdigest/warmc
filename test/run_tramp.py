@@ -37,6 +37,7 @@ tramp.c fails it.  The host calling back into the module from an import is
 test/shared/tramp.wat's.  wasm-tools assembles the modules, since wabt
 reads no subtypes.
 """
+import concurrent.futures
 import os
 import re
 import subprocess
@@ -211,43 +212,50 @@ def main():
     run = os.environ.get("WARMC_RUN", "").split()
     sh = lambda c, **kw: subprocess.run(c, capture_output=True, text=True, **kw)
     fails = []
-    with tempfile.TemporaryDirectory() as tmp:
-        for ci, (what, subs, want_n, want, runs) in enumerate(CASES):
-            wat, wasm = os.path.join(tmp, "m.wat"), os.path.join(tmp, "m.wasm")
-            with open(wat, "w") as f:
-                f.write(module(subs))
-            r = sh([os.path.join(build, "tools", "bin", "wasm-tools"), "parse", wat, "-o", wasm])
+
+    def check(ci, case, tmp):
+        """a case's failures"""
+        what, subs, want_n, want, runs = case
+        d = os.path.join(tmp, "c%d" % ci)
+        os.makedirs(d)
+        wat, wasm = os.path.join(d, "m.wat"), os.path.join(d, "m.wasm")
+        with open(wat, "w") as f:
+            f.write(module(subs))
+        r = sh([os.path.join(build, "tools", "bin", "wasm-tools"), "parse", wat, "-o", wasm])
+        if r.returncode:
+            return ["%s: not assembled: %s" % (what, r.stderr.strip()[:200])]
+        got = {}
+        # -fexact-trap turns the rewrite off: the registers in arguments
+        # are not where a trap would see them
+        for level in ("-O0", "-O2", "-O2 -fexact-trap"):
+            # a binary of its own per case: Windows refuses to write over
+            # the image of one that has only just exited
+            binary = os.path.join(d, "m%d%s" % (ci, level.replace(" ", "")))
+            if runs:
+                binary = hostbuild.exe(binary)
+            out = target + ["-o", binary] if runs else ["-c", "-o", binary + ".o"]
+            r = sh([warmc] + level.split() + ["--stats"] + out + [wasm], timeout=60)
             if r.returncode:
-                fails.append("%s: not assembled: %s" % (what, r.stderr.strip()[:200]))
-                continue
-            got = {}
-            # -fexact-trap turns the rewrite off: the registers in arguments
-            # are not where a trap would see them
-            for level in ("-O0", "-O2", "-O2 -fexact-trap"):
-                # a binary of its own per case: Windows refuses to write over
-                # the image of one that has only just exited
-                binary = os.path.join(tmp, "m%d%s" % (ci, level.replace(" ", "")))
-                if runs:
-                    binary = hostbuild.exe(binary)
-                out = target + ["-o", binary] if runs else ["-c", "-o", binary + ".o"]
-                r = sh([warmc] + level.split() + ["--stats"] + out + [wasm], timeout=60)
-                if r.returncode:
-                    fails.append("%s: warmc %s: %s" % (what, level, r.stderr.strip()[:300]))
-                    break
-                m = re.search(r"\btramp_funcs=(\d+)\b", r.stderr)
-                n = int(m.group(1)) if m else -1
-                if n != (want_n if level == "-O2" else 0):
-                    fails.append("%s: tramp.c rewrote %d functions at %s, not %d"
-                                 % (what, n, level, want_n if level == "-O2" else 0))
-                    break
-                if runs:
-                    p = sh(run + [binary, "run"], timeout=30)
-                    got[level] = p.stdout.strip() or p.stderr.strip()[:200]
-            else:
-                if runs and not (got["-O0"] == got["-O2"] == got["-O2 -fexact-trap"] ==
-                                 "i32:%d" % want):
-                    fails.append("%s: run() is %s at -O0, %s at -O2 and %s with -fexact-trap, not %d"
-                                 % (what, got["-O0"], got["-O2"], got["-O2 -fexact-trap"], want))
+                return ["%s: warmc %s: %s" % (what, level, r.stderr.strip()[:300])]
+            m = re.search(r"\btramp_funcs=(\d+)\b", r.stderr)
+            n = int(m.group(1)) if m else -1
+            if n != (want_n if level == "-O2" else 0):
+                return ["%s: tramp.c rewrote %d functions at %s, not %d"
+                        % (what, n, level, want_n if level == "-O2" else 0)]
+            if runs:
+                p = sh(run + [binary, "run"], timeout=30)
+                got[level] = p.stdout.strip() or p.stderr.strip()[:200]
+        if runs and not (got["-O0"] == got["-O2"] == got["-O2 -fexact-trap"] == "i32:%d" % want):
+            return ["%s: run() is %s at -O0, %s at -O2 and %s with -fexact-trap, not %d"
+                    % (what, got["-O0"], got["-O2"], got["-O2 -fexact-trap"], want)]
+        return []
+
+    # the cases side by side: each compiles and runs programs of its own,
+    # which macOS checks on their first run
+    with tempfile.TemporaryDirectory() as tmp:
+        with concurrent.futures.ThreadPoolExecutor(os.cpu_count() or 4) as ex:
+            for f in ex.map(lambda c: check(c[0], c[1], tmp), enumerate(CASES)):
+                fails += f
     for f in fails:
         print("FAIL[tramp]: %s" % f)
     if not fails:

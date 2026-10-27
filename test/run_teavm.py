@@ -20,6 +20,8 @@
 Usage: python3 test/run_teavm.py
 """
 
+import base64
+import concurrent.futures
 import os
 import re
 import shutil
@@ -33,6 +35,8 @@ WARMC = os.path.join(ROOT, BUILD, "warmc") + (".exe" if os.name == "nt" else "")
 CASES = os.path.join(ROOT, "test", "teavm", "cases")
 sys.path.insert(0, os.path.join(ROOT, "test", "teavm"))
 import wasi  # noqa: E402
+sys.path.insert(0, os.path.join(ROOT, "test"))
+import testcache  # noqa: E402
 
 TOOLS = wasi.wasm_tools()
 
@@ -265,7 +269,8 @@ TRAP_WAT = '''(module
 def run_traps(work, flags):
     # a name each: Windows can still hold an executable just run, and refuse
     # to let the next case's be written over it
-    for i, body in enumerate(TRAPS):
+    def one(job):
+        i, body = job
         src = os.path.join(work, "trap_%d.wasm" % i)
         assemble(TRAP_WAT % body, src)
         adapted = os.path.join(work, "trap_%d.w.wasm" % i)
@@ -273,18 +278,21 @@ def run_traps(work, flags):
             err = wasi.write(f.read(), adapted)
         if err:
             fail("%s: the adapter refused it: %s" % (body, err))
-            continue
+            return
         exe = os.path.join(work, "trap_%d" % i)
         r = subprocess.run([WARMC] + flags + ["-O2", "--wasi", "-o", exe, adapted],
                            capture_output=True, text=True)
         if r.returncode != 0:
             fail("%s: warmc: %s" % (body, r.stderr.strip()[:300]))
-            continue
+            return
         for who, cmd in (("wasmtime", ["wasmtime", adapted]), ("warmc", [exe])):
             r = subprocess.run(cmd, capture_output=True)
             if r.returncode == 0 or r.stdout:
                 fail("%s under %s: exit %d stdout %r, wanted a trap"
                      % (body, who, r.returncode, r.stdout))
+
+    each(one, enumerate(TRAPS))
+
 
 def run_random(work):
     """Two runs, two first draws: the generator is seeded from random_get."""
@@ -303,8 +311,16 @@ def run_random(work):
     if len(a) != 17 or a == b:
         fail("random: two runs drew %r and %r" % (a, b))
 
+def each(fn, items):
+    """fn over items side by side: each case compiles and runs programs of
+    its own, which macOS checks on their first run"""
+    with concurrent.futures.ThreadPoolExecutor(os.cpu_count() or 4) as ex:
+        list(ex.map(fn, items))
+
+
 def run_funcsrc(work, flags):
-    for i, (arg, body, identity) in enumerate(FUNCSRC):
+    def one(job):
+        i, (arg, body, identity) = job
         src = os.path.join(work, "funcsrc_%d.wasm" % i)
         assemble(FUNCSRC_WAT % (arg, body, len(arg), 1 + len(arg), len(body)), src)
         adapted = os.path.join(work, "funcsrc_%d.w.wasm" % i)
@@ -312,13 +328,13 @@ def run_funcsrc(work, flags):
             err = wasi.write(f.read(), adapted)
         if err:
             fail("funcsrc %r %r: the adapter refused it: %s" % (arg, body, err))
-            continue
+            return
         exe = os.path.join(work, "funcsrc_%d" % i)
         r = subprocess.run([WARMC] + flags + ["-O2", "--wasi", "-o", exe, adapted],
                            capture_output=True, text=True)
         if r.returncode != 0:
             fail("funcsrc %r %r: warmc: %s" % (arg, body, r.stderr.strip()[:300]))
-            continue
+            return
         for who, cmd in (("wasmtime", ["wasmtime", adapted]), ("warmc", [exe])):
             r = subprocess.run(cmd, capture_output=True)
             want = (0, b"Q\n") if identity else (69, b"")
@@ -326,8 +342,12 @@ def run_funcsrc(work, flags):
                 fail("new Function(%r, %r) under %s: exit %d stdout %r, wanted %s"
                      % (arg, body, who, r.returncode, r.stdout, want))
 
+    each(one, enumerate(FUNCSRC))
+
+
 def run_registry(work, flags):
-    for i, (change, stops) in enumerate(REGISTRY):
+    def one(job):
+        i, (change, stops) = job
         src = os.path.join(work, "registry_%d.wasm" % i)
         assemble(registry_wat(change), src)
         adapted = os.path.join(work, "registry_%d.w.wasm" % i)
@@ -335,13 +355,13 @@ def run_registry(work, flags):
             err = wasi.write(f.read(), adapted)
         if err:
             fail("registry %r: the adapter refused it: %s" % (change, err))
-            continue
+            return
         exe = os.path.join(work, "registry_%d" % i)
         r = subprocess.run([WARMC] + flags + ["-O2", "--wasi", "-o", exe, adapted],
                            capture_output=True, text=True)
         if r.returncode != 0:
             fail("registry %r: warmc: %s" % (change, r.stderr.strip()[:300]))
-            continue
+            return
         want = (0, b"ok\n", b"") if stops is None else \
             (69, b"o", ("teavm-wasi: %s has no meaning outside JavaScript\n" % stops).encode())
         for who, cmd in (("wasmtime", ["wasmtime", adapted]), ("warmc", [exe])):
@@ -350,8 +370,12 @@ def run_registry(work, flags):
                 fail("registry %r under %s: exit %d stdout %r stderr %r, wanted %s"
                      % (change, who, r.returncode, r.stdout, r.stderr, want))
 
+    each(one, enumerate(REGISTRY))
+
+
 def run_cases(work, flags):
-    for name, (main_class, want_rc, want_err) in RUNS.items():
+    def one(job):
+        name, (main_class, want_rc, want_err) = job
         src = os.path.join(work, name + ".wasm")
         assemble(os.path.join(CASES, name + ".wat"), src)
         adapted = os.path.join(work, name + ".w.wasm")
@@ -359,7 +383,7 @@ def run_cases(work, flags):
             err = wasi.write(f.read(), adapted, main_class)
         if err:
             fail("%s: the adapter refused it: %s" % (name, err))
-            continue
+            return
         if name == "host":
             with open(os.path.join(CASES, "host.out"), "rb") as f:
                 want_out = f.read()
@@ -388,6 +412,9 @@ def run_cases(work, flags):
                      % (name, who, r.stdout[:120], want_out[:120]))
             if want_err is not None and got_err != want_err:
                 fail("%s under %s: stderr %r, wanted %r" % (name, who, got_err[:200], want_err))
+
+    each(one, RUNS.items())
+
 
 # What the adapter must refuse, and the reason it gives.
 REFUSE = {
@@ -524,31 +551,69 @@ def run_patched(work, flags):
         return 0
     modes = sorted({m for _, ms in PATCHED for m in ms})
     driver = os.path.join(work, "driver")
-    r = subprocess.run(["javac", "--release", "17", "-nowarn", "-cp", os.path.join(TEAVM, "*"),
-                        "-d", driver, os.path.join(ROOT, "test", "teavm", "TeaVMBuild.java")],
-                       capture_output=True, text=True)
-    if r.returncode != 0:
-        fail("TeaVMBuild.java: javac: %s" % r.stderr[:400])
-        return 0
-    cp = os.pathsep.join([os.path.join(TEAVM, "patched"), os.path.join(TEAVM, "*"), driver])
+    teavm_src = os.path.join(ROOT, "test", "teavm")
+
+    def made_of(n, mode):
+        """what a program's module and its run on the JVM are made of, by
+        contents: its sources, TeaVM's patches, the driver and the math it
+        calls, TeaVM itself (by its files' names and sizes), the JDK and the
+        mode -- the key test/testcache.py keeps them under"""
+        files = [os.path.join(dp, f) for d in (os.path.join(FIXES, n), patches)
+                 for dp, _dn, fns in os.walk(d) for f in fns]
+        files += [os.path.join(teavm_src, f) for f in ("TeaVMBuild.java", "FdLibm.java", "patch.py")]
+        return testcache.key("teavm patched", mode, n,
+                             [(os.path.relpath(f, ROOT), testcache.File(f)) for f in sorted(files)],
+                             testcache.tree(TEAVM), testcache.version(["java", "-version"]))
+
     runs, refs = 0, {}
+    driven = False
     for mode in modes:
         names = [n for n, ms in PATCHED if mode in ms]
         out = {n: os.path.join(work, "%s.%s" % (n, mode)) for n in names}
-        cmd = ["java", "-cp", cp, "warmc.teavm.TeaVMBuild", "--teavm", TEAVM]
-        if mode == "strict":
-            cmd.append("--strict")
-        cmd += ["--support", os.path.join(ROOT, "test", "teavm", "FdLibm.java")]
-        r = subprocess.run(cmd + ["%s=%s" % (os.path.join(FIXES, n), out[n]) for n in names],
-                           capture_output=True, text=True)
-        if r.returncode != 0:
-            fail("TeaVM, %s: %s" % (mode, r.stderr[:1500]))
+        keys = {n: made_of(n, mode) for n in names}
+        built = {}
         for n in names:
-            if not os.path.isdir(os.path.join(out[n], "classes")):
+            os.makedirs(out[n], exist_ok=True)
+            kept = testcache.get("teavm-ref", keys[n])
+            if kept and testcache.get_file("teavm", keys[n], os.path.join(out[n], "main.wasm")):
+                built[n] = subprocess.CompletedProcess([], kept[0], base64.b64decode(kept[1]),
+                                                       base64.b64decode(kept[2]))
+        todo = [n for n in names if n not in built]
+        if todo and not driven:
+            r = subprocess.run(["javac", "--release", "17", "-nowarn", "-cp",
+                                os.path.join(TEAVM, "*"), "-d", driver,
+                                os.path.join(teavm_src, "TeaVMBuild.java")],
+                               capture_output=True, text=True)
+            if r.returncode != 0:
+                fail("TeaVMBuild.java: javac: %s" % r.stderr[:400])
+                return 0
+            driven = True
+        if todo:
+            cp = os.pathsep.join([os.path.join(TEAVM, "patched"), os.path.join(TEAVM, "*"), driver])
+            cmd = ["java", "-cp", cp, "warmc.teavm.TeaVMBuild", "--teavm", TEAVM]
+            if mode == "strict":
+                cmd.append("--strict")
+            cmd += ["--support", os.path.join(teavm_src, "FdLibm.java")]
+            r = subprocess.run(cmd + ["%s=%s" % (os.path.join(FIXES, n), out[n]) for n in todo],
+                               capture_output=True, text=True)
+            if r.returncode != 0:
+                fail("TeaVM, %s: %s" % (mode, r.stderr[:1500]))
+            for n in todo:
+                wasm = os.path.join(out[n], "main.wasm")
+                if not os.path.isdir(os.path.join(out[n], "classes")) or not os.path.exists(wasm):
+                    continue
+                ref = subprocess.run(["java", "-cp", os.path.join(out[n], "classes"), "Main"],
+                                     capture_output=True)
+                built[n] = ref
+                testcache.put_file("teavm", keys[n], wasm)
+                testcache.put("teavm-ref", keys[n], [ref.returncode,
+                                                     base64.b64encode(ref.stdout).decode(),
+                                                     base64.b64encode(ref.stderr).decode()])
+        for n in names:
+            if n not in built:
                 continue
             if n not in refs:
-                refs[n] = subprocess.run(["java", "-cp", os.path.join(out[n], "classes"), "Main"],
-                                         capture_output=True)
+                refs[n] = built[n]
             ref = refs[n]
             wasm = os.path.join(out[n], "main.wasm")
             if not os.path.exists(wasm):

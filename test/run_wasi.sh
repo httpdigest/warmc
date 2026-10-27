@@ -104,6 +104,9 @@ run_case() {
     diff "$tree_ref" "$WORK/$name.tree.warmc" | head -12 | sed 's/^/    /'
     bad=1
   fi
+  # the listings say what was there; deeptree's paths of 4000 bytes, past
+  # macOS's PATH_MAX, would break du and the like in the build tree
+  rm -rf "$dw" "$dr"
   if [ "$bad" = 0 ]; then pass=$((pass + 1)); else fail=1; fi
 }
 
