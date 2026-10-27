@@ -23,7 +23,8 @@ twice over or a mangled one, and nothing resolves to it.  This checks:
   * that a program whose functions are named memset, warmc_trap, main and
     wasm_func_0 runs as it should -- its 4 KiB fill goes to the C library's
     memset on macOS, its trap to the runtime's warmc_trap -- and carries
-    the names in what is linked, where the host's format has a symbol table.
+    the names in what is linked, where the host's format has a symbol table,
+    and linked with -s carries none of them, and runs the same.
 """
 import os
 import struct
@@ -303,6 +304,20 @@ def main():
                     fails.append("the -O0 program's symbols lack %r" % sorted(missing))
                 if local0.count("dup") != 2:
                     fails.append("the -O0 program has %d symbols named dup, not 2" % local0.count("dup"))
+                # -s: the same program, running the same, with no name of
+                # its functions or the runtime's
+                r = sh([WARMC, "-O0", "-s"] + gen_gosp.target_flags(BUILD) + ["-o", exe + "s", wat])
+                if r.returncode:
+                    fails.append("the -s program does not link: " + r.stderr.strip()[:200])
+                else:
+                    with open(exe + "s", "rb") as f:
+                        imgs = f.read()
+                    locs = elf_local_funcs(imgs) if imgs[:4] == b"\x7fELF" else macho_local_text(imgs)
+                    if locs:
+                        fails.append("the -s program names %d functions: %r" % (len(locs), locs[:5]))
+                    r = sh(RUN + [exe + "s", "sum"])
+                    if r.returncode or r.stdout.strip() != "i32:78":
+                        fails.append("the -s program's sum: %s (exit %d)" % (r.stdout.strip(), r.returncode))
 
     for f in fails:
         print("FAIL[names] " + f)
