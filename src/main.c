@@ -117,14 +117,18 @@ static const char *usage_text =
   "                off the instance and a live value costs edge copies and\n"
   "                register pressure (asbench/bintree, cbench/printf and\n"
   "                hsbench/fib 4-11% slower)\n"
-  "  --validate-only  validate and stop; exit 2 malformed, 3 invalid\n"
+  "  --validate-only  validate and stop; exit 2 malformed, 3 invalid.  Given\n"
+  "                several, each one's verdict a line on stdout: its path, a\n"
+  "                tab, and 0 ok or the status and the message\n"
   "  --dump-component  print a component's structure, one line per definition\n"
   "  --dump-canon      print what the canonical ABI makes of each of its types\n"
   "  --dump-component-wit  render a component's interfaces back as WIT text\n"
   "  --dump-adapter    print the canonical ABI conversion code, as wasm text\n"
   "  --dump-link       print a component's instance graph, resolved\n"
   "  --dump-wit    parse a .wit document and print what it declares\n"
-  "  --emit-wasm   assemble a text module to binary and stop, writing -o\n"
+  "  --emit-wasm   assemble a text module to binary and stop, writing -o.\n"
+  "                Given several, each is written beside itself, its last\n"
+  "                extension .wasm, its verdict a line as --validate-only's\n"
   "  --wasi        link a wasi host and run the program, instead of the CLI\n"
   "                harness that invokes an export by name.  Which host is\n"
   "                decided by the input: a core module gets the\n"
@@ -144,7 +148,9 @@ static const char *usage_text =
   "                four sock_* calls have no descriptor to work on and the\n"
   "                guest reaches no network at all\n"
   "  --symbol-prefix=P  name the module descriptor P_module, so several\n"
-  "                modules can be linked into one program\n"
+  "                modules can be linked into one program.  With -c and\n"
+  "                several modules, one object: the i-th, from 1, as alone\n"
+  "                with --symbol-prefix=Pi\n"
   "  --custom-sections=default|all|none  which of the module's custom\n"
   "                sections the output carries, in a read-only section of its\n"
   "                own (.wasm.custom, __TEXT,__wasm_custom, .wcustom) that a\n"
@@ -207,7 +213,8 @@ static const char *usage_text =
   "  --keep-obj    do not delete the intermediate object\n"
   "  -v            print the link command\n"
   "  --magic=D[:64]  print the multiply, add and shift that divide by D\n"
-  "                (unsigned, 32-bit or :64), and stop; test/magic.py's hook\n"
+  "                (unsigned, 32-bit or :64), and stop; several, comma-separated,\n"
+  "                a line each; test/magic.py's hook\n"
   "  -h, --help    this message\n";
 
 static const char *wasi_archive(const char *rt, const char *wasi, bool p2,
@@ -512,6 +519,87 @@ static void print_stats(void) {
           (unsigned long long)g_stats.once_looped);
 }
 
+/* --validate-only given several inputs: each one's verdict, a line apiece
+   on stdout -- PATH, a tab, 0 and "ok", or the status warmc exits with and
+   its message -- and the next taken all the same.  One process for a
+   thousand verdicts, where each was one: run_components.py's sweep of
+   mutated components, whose every process the sanitisers slow to start. */
+static void validate_several(const char **inputs, uint32_t n) {
+  for (uint32_t i = 0; i < n; i++) {
+    DiagCatch c;
+    if (setjmp(c.jb)) {
+      warmc_diag_catch(NULL);
+      printf("%s\t%d %s: %s\n", inputs[i], c.code, c.tag, c.msg ? c.msg : "");
+      free(c.msg);
+      fflush(stdout);
+      continue;
+    }
+    warmc_diag_catch(&c);
+    size_t len;
+    uint8_t *bin = read_file(inputs[i], &len);
+    if (ends_with(inputs[i], ".wat") || (!ends_with(inputs[i], ".wasm") && wat_is_text(bin, len))) {
+      size_t blen;
+      uint8_t *assembled = wat_assemble((const char *)bin, len, inputs[i], &blen);
+      xfree(bin);
+      bin = assembled;
+      len = blen;
+    }
+    if (wasm_is_component(bin, len)) {
+      comp_free(comp_parse(bin, len));
+    } else {
+      Module *m = wasm_parse(bin, len);
+      wasm_validate(m);
+      module_free(m);
+    }
+    xfree(bin);
+    warmc_diag_catch(NULL);
+    printf("%s\t0 ok\n", inputs[i]);
+    fflush(stdout);
+  }
+}
+
+/* --emit-wasm given several inputs: each text module assembled and written
+   beside it, its last extension .wasm, and its verdict a line on stdout as
+   validate_several's.  The spec suite's text modules and run_wat.py's
+   fixtures, thousands of them, were a process each. */
+static void emit_several(const char **inputs, uint32_t n) {
+  for (uint32_t i = 0; i < n; i++) {
+    DiagCatch c;
+    if (setjmp(c.jb)) {
+      warmc_diag_catch(NULL);
+      printf("%s\t%d %s: %s\n", inputs[i], c.code, c.tag, c.msg ? c.msg : "");
+      free(c.msg);
+      fflush(stdout);
+      continue;
+    }
+    warmc_diag_catch(&c);
+    size_t len;
+    uint8_t *bin = read_file(inputs[i], &len);
+    if (!ends_with(inputs[i], ".wat") && (ends_with(inputs[i], ".wasm") || !wat_is_text(bin, len))) {
+      xfree(bin);
+      warmc_fatal("--emit-wasm takes a text module; %s is already binary", inputs[i]);
+    }
+    size_t blen;
+    uint8_t *out = wat_assemble((const char *)bin, len, inputs[i], &blen);
+    xfree(bin);
+    const char *b = strrchr(inputs[i], '/');
+    b = b ? b + 1 : inputs[i];
+    const char *dot = strrchr(b, '.');
+    size_t stem = dot && dot != b ? (size_t)(dot - inputs[i]) : strlen(inputs[i]);
+    char path[4096];
+    snprintf(path, sizeof path, "%.*s.wasm", (int)stem, inputs[i]);
+    FILE *f = fopen(path, "wb");
+    if (!f) { xfree(out); warmc_fatal("cannot write %s", path); }
+    bool ok = !blen || fwrite(out, 1, blen, f) == blen;
+    fclose(f);
+    xfree(out);
+    if (!ok) warmc_fatal("short write on %s", path);
+    warmc_diag_catch(NULL);
+    printf("%s\t0 ok\n", inputs[i]);
+    fflush(stdout);
+  }
+}
+
 /* A core module read from path, the text format assembled */
 static Module *read_module(const char *path, uint8_t **binp) {
   size_t len;
@@ -538,11 +626,16 @@ static Module *read_module(const char *path, uint8_t **binp) {
    one named is made an instance, so each keeps the code a program of its
    own would have (sole_instance as there).  A test suite links hundreds of
    modules into one program this way where it linked hundreds of programs,
-   and a program's first run, which macOS checks, is what those cost. */
+   and a program's first run, which macOS checks, is what those cost.
+   With -c and --symbol-prefix=P the object is the caller's to link: the
+   i-th module (from 1) is as alone with --symbol-prefix=Pi -- its
+   descriptor Pi_module, its functions' names its own -- and there is no
+   table: the spec suite's modules of one .wast, an object a level where
+   each was one. */
 static void compile_several(const char **inputs, uint32_t n, OptOpts *opt, TargetFmt fmt,
                             const char *output, bool obj_only, bool keep_obj, bool want_wasi,
                             const char *wasi, const char *rt, const char *entry_sym,
-                            bool dead_strip) {
+                            bool dead_strip, const char *sym_prefix) {
   char **names = xcalloc(n, sizeof(char *)), **prefixes = xcalloc(n, sizeof(char *));
   Module **mods = xcalloc(n, sizeof(Module *));
   uint8_t **bins = xcalloc(n, sizeof(uint8_t *));
@@ -556,11 +649,12 @@ static void compile_several(const char **inputs, uint32_t n, OptOpts *opt, Targe
     const char *dot = strrchr(b, '.');
     size_t len = dot && dot != b ? (size_t)(dot - b) : strlen(b);
     names[i] = xstrndup(b, len);
-    for (uint32_t k = 0; k < i; k++)
+    for (uint32_t k = 0; k < i && !sym_prefix; k++)
       if (!strcmp(names[k], names[i]))
         warmc_fatal("%s and %s would both be the module %s", inputs[k], inputs[i], names[i]);
-    char pfx[32];
-    snprintf(pfx, sizeof pfx, "warmc_m%u", i);
+    char pfx[256];
+    if (sym_prefix) snprintf(pfx, sizeof pfx, "%s%u", sym_prefix, i + 1);
+    else snprintf(pfx, sizeof pfx, "warmc_m%u", i);
     prefixes[i] = xstrndup(pfx, strlen(pfx));
     mods[i] = read_module(inputs[i], &bins[i]);
     if (!obj_only && !want_wasi)
@@ -572,12 +666,13 @@ static void compile_several(const char **inputs, uint32_t n, OptOpts *opt, Targe
                       inputs[i], (int)im->name_len, im->name);
       }
     codegen_set_symbol_prefix(prefixes[i]);
-    codegen_set_display_prefix(names[i]);
+    if (!sym_prefix) codegen_set_display_prefix(names[i]);
     codegen_rename_funcs(mods[i], prefixes[i]);
     compile_module(mods[i], &o, opt);
   }
   codegen_set_display_prefix("");
-  codegen_emit_module_table(&o, (const char *const *)prefixes, (const char *const *)names, n);
+  if (!sym_prefix)
+    codegen_emit_module_table(&o, (const char *const *)prefixes, (const char *const *)names, n);
   if (opt->stats) print_stats();
 
   char objpath[4096];
@@ -746,14 +841,24 @@ static bool cc_key(int argc, char **argv, char hex[65]) {
   return true;
 }
 
-static void cc_copy_fd(const char *path, int fd) {
-  int in = open(path, O_RDONLY);
-  if (in < 0) return;
+static void cc_copy_from(int in, int fd) {
   char buf[1 << 14];
   ssize_t n;
   while ((n = read(in, buf, sizeof buf)) > 0)
     if (write(fd, buf, (size_t)n) != n) break;
+}
+
+static void cc_copy_fd(const char *path, int fd) {
+  int in = open(path, O_RDONLY);
+  if (in < 0) return;
+  cc_copy_from(in, fd);
   close(in);
+}
+
+static int cc_open(const char *entry, const char *name) {
+  char p[4400];
+  snprintf(p, sizeof p, "%s/%s", entry, name);
+  return open(p, O_RDONLY);
 }
 
 static bool cc_link_or_copy(const char *from, const char *to) {
@@ -827,24 +932,45 @@ static int cc_begin(int argc, char **argv) {
   char sub[4200], p[4300];
   snprintf(sub, sizeof sub, "%s/%.2s", dir, hex);
   snprintf(g_cc.entry, sizeof g_cc.entry, "%s/%s", sub, hex);
-  snprintf(p, sizeof p, "%s/status", g_cc.entry);
-  FILE *f = fopen(p, "r");
-  int rc = -1;
-  if (f) { if (fscanf(f, "%d", &rc) != 1) rc = -1; fclose(f); }
-  if (rc >= 0) {
-    snprintf(p, sizeof p, "%s/out", g_cc.entry);
-    if (rc == 0 && g_cc.output && (!cc_regular(p) || !cc_link_or_copy(p, g_cc.output))) rc = -1;
+  /* every file of the entry open before any is used: make check trims
+     the cache while a later run's compiles may read it, and what is open
+     stays whole -- an entry is there in full, or it is not there */
+  int fst = cc_open(g_cc.entry, "status"), fso = cc_open(g_cc.entry, "stdout");
+  int fse = cc_open(g_cc.entry, "err");
+  int rc = -1, fout = -1;
+  char buf[32];
+  ssize_t n = fst >= 0 && fso >= 0 && fse >= 0 ? read(fst, buf, sizeof buf - 1) : -1;
+  if (n > 0) {
+    buf[n] = 0;
+    if (sscanf(buf, "%d", &rc) != 1) rc = -1;
+  }
+  if (rc == 0 && g_cc.output) {
+    struct stat st;
+    fout = cc_open(g_cc.entry, "out");
+    if (fout < 0 || fstat(fout, &st) != 0 || !S_ISREG(st.st_mode)) {
+      rc = -1;
+    } else {
+      /* a hard link, which a program macOS has checked keeps; a copy of
+         what is open where the name is gone */
+      snprintf(p, sizeof p, "%s/out", g_cc.entry);
+      warmc_remove_file(g_cc.output);
+      if (link(p, g_cc.output) != 0) {
+        int o = open(g_cc.output, O_WRONLY | O_CREAT | O_TRUNC, st.st_mode & 0777);
+        if (o < 0) rc = -1;
+        else { cc_copy_from(fout, o); close(o); }
+      }
+    }
   }
   if (rc >= 0) {
     fflush(stdout);
     fflush(stderr);
-    snprintf(p, sizeof p, "%s/stdout", g_cc.entry);
-    cc_copy_fd(p, 1);
-    snprintf(p, sizeof p, "%s/err", g_cc.entry);
-    cc_copy_fd(p, 2);
+    cc_copy_from(fso, 1);
+    cc_copy_from(fse, 2);
     utimes(g_cc.entry, NULL);
-    return rc;
   }
+  const int fds[] = { fst, fso, fse, fout };
+  for (size_t i = 0; i < 4; i++) if (fds[i] >= 0) close(fds[i]);
+  if (rc >= 0) return rc;
   mkdir(dir, 0755);
   mkdir(sub, 0755);
   snprintf(g_cc.err, sizeof g_cc.err, "%s.%d.err", g_cc.entry, (int)getpid());
@@ -1003,13 +1129,19 @@ static int warmc_main(int argc, char **argv) {
     }
 
     else if (!strncmp(a, "--magic=", 8)) {
+      /* D[:64][,D[:64]]...: a line for each, test/magic.py asking for
+         thousands in one process */
       const char *arg = a + 8;
-      bool wide = false;
-      char *end = NULL;
-      unsigned long long d = strtoull(arg, &end, 0);
-      if (end && *end == ':') wide = !strcmp(end + 1, "64");
-      Magic mg = opt_magic_unsigned((uint64_t)d, wide);
-      printf("%llu %d %d\n", (unsigned long long)mg.m, mg.add, mg.sh);
+      for (;;) {
+        bool wide = false;
+        char *end = NULL;
+        unsigned long long d = strtoull(arg, &end, 0);
+        if (end && *end == ':') { wide = !strncmp(end + 1, "64", 2); end += 3; }
+        Magic mg = opt_magic_unsigned((uint64_t)d, wide);
+        printf("%llu %d %d\n", (unsigned long long)mg.m, mg.add, mg.sh);
+        if (!end || *end != ',') break;
+        arg = end + 1;
+      }
       return 0;
     }
     else if (a[0] == '-' && a[1] == 'O' && a[2] >= '0' && a[2] <= '3' && !a[3])
@@ -1128,17 +1260,34 @@ static int warmc_main(int argc, char **argv) {
   const char *entry_sym = fmt == TGT_PE ? "warmc_win_entry"
                         : macho ? "_main" : "_start";
 
+  if (ninputs > 1 && validate_only && !dump_component && !dump_cwit && !dump_canon &&
+      !dump_adapter && !dump_link && !dump_wit) {
+    validate_several(inputs, ninputs);
+    xfree(inputs);
+    return 0;
+  }
+  if (ninputs > 1 && emit_wasm) {
+    if (output)
+      warmc_fatal("--emit-wasm writes each of several modules beside it; -o names one");
+    emit_several(inputs, ninputs);
+    xfree(inputs);
+    return 0;
+  }
   if (ninputs > 1) {
-    if (shared || sym_prefix || emit_wasm || validate_only || dump_component || dump_wit ||
-        dump_canon || dump_adapter || dump_cwit || dump_link || nnative_mods || system_ld)
+    if (shared || validate_only || dump_component || dump_wit || dump_canon || dump_adapter ||
+        dump_cwit || dump_link || nnative_mods || system_ld)
       warmc_fatal("several modules make one program with the built-in linker: "
-                  "--shared, --symbol-prefix, --emit-wasm, --validate-only, --dump-*, "
-                  "--native-module and --system-ld take one");
+                  "--shared, --validate-only, --dump-*, --native-module and --system-ld "
+                  "take one");
+    if (sym_prefix && !obj_only)
+      warmc_fatal("--symbol-prefix with several modules: their object (-c), each module "
+                  "under the prefix and its place");
     if (!obj_only && !rt) warmc_fatal("no runtime specified; pass --rt or set WARMC_RT");
     char wasipath[4096];
     const char *w = want_wasi ? wasi_archive(rt, wasi, false, wasipath, sizeof wasipath) : NULL;
     compile_several(inputs, ninputs, &opt, fmt, output ? output : obj_only ? "out.o" : outdef,
-                    obj_only, keep_obj, want_wasi, w, rt, entry_sym, dead_strip);
+                    obj_only, keep_obj, want_wasi, w, rt, entry_sym, dead_strip,
+                    sym_prefix);
     xfree(inputs);
     return 0;
   }
