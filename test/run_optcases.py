@@ -24,6 +24,11 @@ what it computes:
 
     ;; shape: FUNCTION REGEX=N
 
+or, with late, of the instructions after its first ret, which are the blocks
+emitted after the rest of the function (ir.c ir_emit_order's late ones):
+
+    ;; late: FUNCTION REGEX=N
+
 The answer is worked out by hand from the module, so it holds whichever
 level is wrong, -O0 included; the module is compiled at -O0, -O1, -O2 and
 -O3 and each call's output must be it.  A pass the module was written for
@@ -50,7 +55,7 @@ LEVELS = ["-O0", "-O1", "-O2", "-O3"]
 RUN_TIMEOUT = float(os.environ.get("WARMC_RUN_TIMEOUT", "30"))
 RUN_LINE = re.compile(r"^;; run: (\S+)((?: \S+)*) => (.*)$")
 STATS_LINE = re.compile(r"^;; stats(?: (-O[0-3]))?( a64)?: (.*)$")
-SHAPE_LINE = re.compile(r"^;; shape: (\S+) (.*)=(\d+)$")
+SHAPE_LINE = re.compile(r"^;; (shape|late): (\S+) (.*)=(\d+)$")
 OBJDUMP = shutil.which("llvm-objdump") or shutil.which("objdump")
 AARCH64 = platform.machine() in ("arm64", "aarch64")
 
@@ -79,15 +84,15 @@ def shapes(path):
     for line in open(path):
         m = SHAPE_LINE.match(line.rstrip("\n"))
         if m:
-            out.append((m.group(1), m.group(2), int(m.group(3))))
+            out.append((m.group(2), m.group(3), int(m.group(4)), m.group(1) == "late"))
     return out
 
 
 def shape_fails(name, dump, want):
-    """Each (function, pattern, count) of want against the disassembly, where
-    the case's functions are named CASE.FUNCTION"""
+    """Each (function, pattern, count, late) of want against the disassembly,
+    where the case's functions are named CASE.FUNCTION"""
     fails = []
-    for fn, pat, n in want:
+    for fn, pat, n, late in want:
         body = re.search(r"<_?%s\.%s>:\n(.*?)(?:\n\n|\Z)" % (re.escape(name), re.escape(fn)), dump, re.S)
         if not body:
             fails.append("%s -O2: no function %s in the code" % (name, fn))
@@ -97,10 +102,13 @@ def shape_fails(name, dump, want):
         lines = body.group(1).split("\n")
         while lines and re.search(r"\snop$", lines[-1]):
             lines.pop()
+        if late:
+            first = next((i for i, l in enumerate(lines) if re.search(r"\sret$", l)), len(lines))
+            lines = lines[first + 1:]
         got = len([l for l in lines if re.search(pat, l)])
         if got != n:
-            fails.append("%s -O2: %s has %d instructions matching %s, not %d"
-                         % (name, fn, got, pat, n))
+            fails.append("%s -O2: %s has %d instructions%s matching %s, not %d"
+                         % (name, fn, got, " after its ret" if late else "", pat, n))
     return fails
 
 

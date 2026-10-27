@@ -6,7 +6,8 @@
 ;; and round a loop, where the result has the carried value's register.  Not
 ;; when the other value may have a bit in the field, the field is signed (it
 ;; fills the bits above), the other side is a constant (an orr's immediate),
-;; nor into a value folded into the or.  Answers worked out in Python.
+;; nor into a value folded into the or (an orn's), nor from another block.
+;; Answers worked out in Python.
 ;;
 ;; shape: ins8 \sbfi\s=1
 ;; shape: ins8 \sorr\s=0
@@ -18,6 +19,9 @@
 ;; shape: signed \s(bfi|bfxil)\s=0
 ;; shape: constor \s(bfi|bfxil)\s=0
 ;; shape: hash \sbfi\s=5
+;; shape: hoisted \s(bfi|bfxil)\s=0
+;; shape: notside \sorn\s=1
+;; shape: notside \s(bfi|bfxil)\s=0
 ;;
 ;; run: ins8 0 0 => i32:0
 ;; run: ins8 0 165 => i32:165
@@ -219,6 +223,38 @@
 ;; run: hash 3 7 => i32:27424
 ;; run: hash 10 20 => i32:25970
 ;; run: hash 0 55 => i32:29486
+;; run: notside 0 0 => i32:-65281
+;; run: notside 0 165 => i32:-65446
+;; run: notside 0 305419896 => i32:-305463161
+;; run: notside 0 -1 => i32:0
+;; run: notside 90 0 => i32:-42241
+;; run: notside 90 165 => i32:-42406
+;; run: notside 90 305419896 => i32:-305440121
+;; run: notside 90 -1 => i32:23040
+;; run: notside -559038737 0 => i32:-4097
+;; run: notside -559038737 165 => i32:-4262
+;; run: notside -559038737 305419896 => i32:-305401977
+;; run: notside -559038737 -1 => i32:61184
+;; run: notside -1 0 => i32:-1
+;; run: notside -1 165 => i32:-166
+;; run: notside -1 305419896 => i32:-305397881
+;; run: notside -1 -1 => i32:65280
+;; run: hoisted 0 0 => i32:116
+;; run: hoisted 0 1 => i32:116
+;; run: hoisted 0 7 => i32:101
+;; run: hoisted 0 300 => i32:116
+;; run: hoisted 90 0 => i32:23156
+;; run: hoisted 90 1 => i32:23156
+;; run: hoisted 90 7 => i32:23141
+;; run: hoisted 90 300 => i32:23156
+;; run: hoisted -559038737 0 => i32:61300
+;; run: hoisted -559038737 1 => i32:61300
+;; run: hoisted -559038737 7 => i32:61285
+;; run: hoisted -559038737 300 => i32:61300
+;; run: hoisted -1 0 => i32:65396
+;; run: hoisted -1 1 => i32:65396
+;; run: hoisted -1 7 => i32:65381
+;; run: hoisted -1 300 => i32:65396
 
 (module
   (memory 1)
@@ -261,6 +297,20 @@
     (local.set $t (i32.and (i32.shl (local.get $h) (i32.const 8)) (i32.const 0xff00)))
     (if (i32.lt_u (local.get $y) (i32.const 10)) (then (local.set $y (i32.add (local.get $y) (i32.const 3)))))
     (i32.or (local.get $t) (i32.and (local.get $y) (i32.const 0xff))))
+  (func $notside (export "notside") (param $h i32) (param $y i32) (result i32)
+    (i32.or (i32.and (i32.shl (local.get $h) (i32.const 8)) (i32.const 0xff00))
+            (i32.xor (i32.or (local.get $y) (i32.const 0xff00)) (i32.const -1))))
+  (func $hoisted (export "hoisted") (param $h i32) (param $n i32) (result i32)
+    (local $t i32) (local $x i32) (local $i i32)
+    (local.set $t (i32.and (i32.shl (local.get $h) (i32.const 8)) (i32.const 0xff00)))
+    (loop $l
+      (if (i32.and (local.get $x) (i32.const 1))
+        (then (local.set $i (i32.add (local.get $i) (i32.const 2)))))
+      (local.set $x (i32.or (local.get $t)
+        (i32.load8_u (i32.and (local.get $x) (i32.const 63)))))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br_if $l (i32.lt_u (local.get $i) (local.get $n))))
+    (local.get $x))
   (func $hash (export "hash") (param $p i32) (param $n i32) (result i32)
     (local $h i32) (local $i i32)
     (loop $l

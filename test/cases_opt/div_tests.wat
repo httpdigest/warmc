@@ -2,9 +2,10 @@
 ;; cannot be the least value needs no such test (ir.c ir_not_int_min): an or
 ;; with a bit below the sign, a sign bit known clear, an i32 widened -- not
 ;; an or with the sign bit only.  A divisor's zero test is the source's own
-;; where that tested the value before widening it, or the i64 it wraps
-;; (ir_nonzero_with: rsbench/div64's d == 0 on the i32 it narrowed) -- not a
-;; test of another value.  Answers worked out in Python.
+;; where that tested the value itself, the value before widening it, the
+;; i64 it wraps (ir_nonzero_with: rsbench/div64's d == 0 on the i32 it
+;; narrowed), or an i64 divisor's low half -- not a test of another value.
+;; Answers worked out in Python.
 ;;
 ;; shape: notmin \sccmp\s=0
 ;; shape: notmin32 \sccmp\s=0
@@ -16,6 +17,8 @@
 ;; shape: zne \scbn?z\s=1
 ;; shape: wrapd \scbn?z\s=1
 ;; shape: otherd \scbn?z\s=2
+;; shape: same \scbn?z\s=1
+;; shape: lowhalf \scbn?z\s=1
 ;;
 ;; run: notmin 0 1 => i64:1
 ;; run: positive 0 1 => i64:0
@@ -74,6 +77,61 @@
 ;; run: wrapd 100 7 => i32:14
 ;; run: wrapd 100 4294967296 => i32:-3
 ;; run: wrapd -1 3 => i32:1431655765
+;; run: same 0 0 => i32:-1
+;; run: same 0 1 => i32:0
+;; run: same 0 3 => i32:0
+;; run: same 0 -1 => i32:0
+;; run: same 0 65536 => i32:0
+;; run: same 7 0 => i32:-1
+;; run: same 7 1 => i32:7
+;; run: same 7 3 => i32:2
+;; run: same 7 -1 => i32:0
+;; run: same 7 65536 => i32:0
+;; run: same 100 0 => i32:-1
+;; run: same 100 1 => i32:100
+;; run: same 100 3 => i32:33
+;; run: same 100 -1 => i32:0
+;; run: same 100 65536 => i32:0
+;; run: same -1 0 => i32:-1
+;; run: same -1 1 => i32:-1
+;; run: same -1 3 => i32:1431655765
+;; run: same -1 -1 => i32:1
+;; run: same -1 65536 => i32:65535
+;; run: same -2147483648 0 => i32:-1
+;; run: same -2147483648 1 => i32:-2147483648
+;; run: same -2147483648 3 => i32:715827882
+;; run: same -2147483648 -1 => i32:0
+;; run: same -2147483648 65536 => i32:32768
+;; run: lowhalf 0 0 => i64:-1
+;; run: lowhalf 0 1 => i64:0
+;; run: lowhalf 0 3 => i64:0
+;; run: lowhalf 0 -1 => i64:0
+;; run: lowhalf 0 4294967296 => i64:-1
+;; run: lowhalf 0 4294967301 => i64:0
+;; run: lowhalf 7 0 => i64:-1
+;; run: lowhalf 7 1 => i64:7
+;; run: lowhalf 7 3 => i64:2
+;; run: lowhalf 7 -1 => i64:0
+;; run: lowhalf 7 4294967296 => i64:-1
+;; run: lowhalf 7 4294967301 => i64:0
+;; run: lowhalf 100 0 => i64:-1
+;; run: lowhalf 100 1 => i64:100
+;; run: lowhalf 100 3 => i64:33
+;; run: lowhalf 100 -1 => i64:0
+;; run: lowhalf 100 4294967296 => i64:-1
+;; run: lowhalf 100 4294967301 => i64:0
+;; run: lowhalf -1 0 => i64:-1
+;; run: lowhalf -1 1 => i64:-1
+;; run: lowhalf -1 3 => i64:6148914691236517205
+;; run: lowhalf -1 -1 => i64:1
+;; run: lowhalf -1 4294967296 => i64:-1
+;; run: lowhalf -1 4294967301 => i64:4294967291
+;; run: lowhalf -9223372036854775808 0 => i64:-1
+;; run: lowhalf -9223372036854775808 1 => i64:-9223372036854775808
+;; run: lowhalf -9223372036854775808 3 => i64:3074457345618258602
+;; run: lowhalf -9223372036854775808 -1 => i64:0
+;; run: lowhalf -9223372036854775808 4294967296 => i64:-1
+;; run: lowhalf -9223372036854775808 4294967301 => i64:2147483645
 
 (module
   (func $notmin (export "notmin") (param $x i64) (param $y i64) (result i64)
@@ -98,6 +156,12 @@
   (func $wrapd (export "wrapd") (param $x i32) (param $d i64) (result i32)
     (if (i64.eqz (i64.and (local.get $d) (i64.const 0xffffffff))) (then (return (i32.const -3))))
     (i32.div_u (local.get $x) (i32.wrap_i64 (local.get $d))))
+  (func $same (export "same") (param $x i32) (param $d i32) (result i32)
+    (if (i32.eqz (local.get $d)) (then (return (i32.const -1))))
+    (i32.div_u (local.get $x) (local.get $d)))
+  (func $lowhalf (export "lowhalf") (param $x i64) (param $d i64) (result i64)
+    (if (i32.eqz (i32.wrap_i64 (local.get $d))) (then (return (i64.const -1))))
+    (i64.div_u (local.get $x) (local.get $d)))
   (func $otherd (export "otherd") (param $x i64) (param $d i32) (param $e i32) (result i64)
     (if (i32.eqz (local.get $e)) (then (return (i64.const -1))))
     (i64.div_u (local.get $x) (i64.extend_i32_u (local.get $d))))
