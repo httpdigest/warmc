@@ -1131,7 +1131,7 @@ and `ldcomb` need `guard-pages`; `small-loop-align` needs `align`; and
 
 | Pass | What it does |
 |---|---|
-| `fold` | constant folding and algebraic simplification, including a constant reinterpreted between integer and float and two xor-shifts that cancel, a test of an `Ordering` -- Rust's `(a > b) - (a < b)`, alone or masked to its byte -- as the compare of `a` and `b` it stands for, a branch on the high half of a call's i64 result, Go's unwind flag once `go-sp` packs it, as a `tst` of the result, and an i64 put back together from its halves, `x & 0xffffffff00000000` or'd with `x`'s low half extended, as `x`; a reinterpret undone, a store of reinterpreted bits, and an integer load read only as float bits, as the C ABI copies a struct's doubles, move the bits in the float registers |
+| `fold` | constant folding and algebraic simplification, including a constant reinterpreted between integer and float and two xor-shifts that cancel, a test of an `Ordering` -- Rust's `(a > b) - (a < b)`, alone or masked to its byte -- as the compare of `a` and `b` it stands for, a branch on the high half of a call's i64 result, Go's unwind flag once `go-sp` packs it, as a `tst` of the result, and an i64 put back together from its halves, `x & 0xffffffff00000000` or'd with `x`'s low half extended, as `x`; `x*c + y*c` as `(x + y)*c`, and `x*c - y*c` as `(x - y)*c`, an integer's or lane by lane, where each product is read there alone; a reinterpret undone, a store of reinterpreted bits, and an integer load read only as float bits, as the C ABI copies a struct's doubles, move the bits in the float registers |
 | `dce` | dead-code elimination |
 | `cse` | common-subexpression elimination over dominators |
 | `licm` | loop-invariant code motion, including hoisting invariant stores and trap guards; a value is taken out of the innermost loop that reads it and no further, and a native address stays by the access it serves, which folds it |
@@ -1147,7 +1147,7 @@ and `ldcomb` need `guard-pages`; `small-loop-align` needs `align`; and
 | `bce` | bounds-check elimination by value range and dominating checks, of memory accesses and GC array accesses |
 | `strength` | strength reduction: induction variables, shifts, magic-number division; unsigned division by a loop-invariant divisor (32-bit, or 64-bit of operands that fit in 32 bits) through a reciprocal made before the loop; the remainder of a division just made as a multiply-subtract; a post-decrement loop test on the new count |
 | `inline` | call-site-scored inlining (on from `-O2`) |
-| `reassoc` | rebalance associative integer chains for latency, also through a wrap to 32 bits, and add the value a loop carries round last in its chain, so that an iteration waits on one op of it, in v128 lanes too |
+| `reassoc` | rebalance associative integer chains for latency, also through a wrap to 32 bits, and add the value a loop carries round last in its chain, so that an iteration waits on one op of it, in v128 lanes too; the products such a chain then adds among themselves, by one factor, are one product of their sum (`fold`'s rule): Zig's unrolled sum of four vector products by a splat, one multiply |
 | `rotate` | loop rotation, of call-free loops that touch memory, whose latch ends in an unconditional jump and whose header is at most 8 pure instructions |
 | `unroll` | unrolling by up to 4: a constant trip count by its largest divisor up to that, a run-time one behind a guard, the original loop kept for the rest; complete unrolling of short loops, and of a nest, at a depth of 2 or more and at most 1200 instructions, whose outer loop runs at most 8 times; a loop that runs once loses its back edge |
 | `vectorize` | auto-vectoriser: contiguous accesses, loads interleaved two, three or four ways (`ld3` and `ld4` on arm64) and stores two, if-converted bodies, bytes and halfwords computed in lanes twice as wide where their values need it (widening multiply-adds, a rounding shift as an add-high-narrow), integer, widening and float min/max reductions, argmin and argmax (an index kept beside a min or max), search loops, saturating arithmetic, high-half multiplies, byte reversal and int/float conversions; several copies of the body per iteration, each with its own accumulator; a loop a producer unrolled by three, unrolled again until it spans whole vectors; with runtime alias checks and a scalar fallback |
@@ -1371,7 +1371,10 @@ devirtualisation.
 **Back end** (`src/isel*.c`, `regalloc.inc`, `a64.c`, `x64.c`, `codegen.c`).
 Instruction selection fuses compares into branches and selects, folds shifts,
 bitfield extracts, multiply-adds and addressing modes, and pairs loads and
-stores into `ldp`/`stp`. From `-O1` a `br_table` of at most eight distinct
+stores into `ldp`/`stp`. A vector product added into a value, or taken from
+one, is an `mla` or `mls` into it, in lanes of 8, 16 or 32 bits, but not
+into a value a loop carries round, where the multiply would join the chain
+each iteration waits on. From `-O1` a `br_table` of at most eight distinct
 edges becomes a tree of compares, and any other a jump table, whose entries
 on arm64 are halfwords, each its target's distance in instructions; a
 function too large for that reach, 128 KB, is made again with its tables of
@@ -1833,9 +1836,11 @@ Most of the suite is **differential**. warmc's output is compared with:
 - results worked out by hand, at `-O0`, `-O1`, `-O2` and `-O3`, for small
   modules each of which some pass once compiled wrong or is to transform
   (`test/run_optcases.py`, `test/cases_opt`); a module also says what
-  `--stats` counts for it at `-O0`, and how many of a function's AArch64
-  instructions at `-O2` match a pattern, for what changes the code and not
-  what it computes
+  `--stats` counts for it at each level, and how many of a function's AArch64
+  instructions at `-O2` match a pattern, in the whole function or after its
+  `ret`, where the blocks emitted after the rest go, for what changes the code
+  and not what it computes; `test/cases_opt/trunc_exact.wat` is made by
+  `test/gen_fexact.py`
 - exact arithmetic, for every division's magic numbers (`test/magic.py`)
 - the module itself, for the custom sections each linked image carries, read
   back from Mach-O, ELF and PE (`test/check_macho.py`, `check_elf.py`,
