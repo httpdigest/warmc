@@ -686,7 +686,10 @@ call happens and names the function. It is not refused at link time.
 
 For a core module, `-c` produces an object that exports a single symbol, the
 module descriptor `warmc_module`. With `--symbol-prefix=P`, the descriptor is
-named `P_module`, so several modules can live in one program. A component's
+named `P_module`, so several modules can live in one program. Given several
+core modules, `-c --symbol-prefix=P` makes one object of them, the i-th
+(counting from 1) as it would be alone with `--symbol-prefix=Pi`, with no
+table of modules. A component's
 object instead exports a descriptor for each of its core modules plus
 `warmc_component`, `warmc_modules`, `warmc_module_names` and
 `warmc_nmodules`; `--symbol-prefix` does not apply to it.
@@ -1099,8 +1102,8 @@ are parsed but not enforced.
 
 | Flag | Effect |
 |---|---|
-| `--validate-only` | parse and validate, then stop. Exit codes: `0` valid, `2` malformed, `3` invalid. A `.wit` file, or a directory as the input with or without it, is read and checked as WIT. |
-| `--emit-wasm` | assemble a `.wat` to binary (`-o`, default `out.wasm`) and stop |
+| `--validate-only` | parse and validate, then stop. Exit codes: `0` valid, `2` malformed, `3` invalid. A `.wit` file, or a directory as the input with or without it, is read and checked as WIT. Given several inputs, each one gets a verdict, a line on stdout apiece: the path, a tab, then `0 ok` or the exit code and message it would have given alone. The exit code is then `0`. |
+| `--emit-wasm` | assemble a `.wat` to binary (`-o`, default `out.wasm`) and stop. Given several inputs, each is written next to itself, its last extension replaced by `.wasm`, and gets a verdict line as with `--validate-only`; `-o` is refused then |
 | `--print-ir` | dump each function's IR, before and after optimisation, to stderr |
 | `--stats` | print optimisation counters: folds, inlined calls, spills, `ldp`/`stp` pairs, vectorised loops, and so on |
 | `--profile` | instrument the code to count executed instructions; prints `icount: N` at exit |
@@ -1268,7 +1271,7 @@ on each corpus (Apple M-series):
 | `-fexact-trap`, `-fno-exact-trap` | leave memory, tables and globals after a trap as wasm defines them (see [What a trap leaves behind](#what-a-trap-leaves-behind)); off at every level |
 | `-j N`, `-jN` | maximum number of compile threads |
 | `--profile=full\|deterministic` | the WebAssembly profile. `deterministic` makes relaxed-SIMD and NaN results platform-independent. |
-| `--symbol-prefix=P` | name the module descriptor `P_module`; with `--shared`, the prefix of the library's own functions instead; ignored for a component |
+| `--symbol-prefix=P` | name the module descriptor `P_module`; with `-c` and several modules, the i-th is named `Pi_module`; with `--shared`, the prefix of the library's own functions instead; ignored for a component |
 | `--custom-sections=default\|all\|none` | which of the module's custom sections the output carries (see [Custom sections](#custom-sections)); `default` leaves out the name section and `.debug_*` |
 | `--no-export-names` | drop the export-name table, keeping only `_start` and `main`; not for a component or with `--shared` |
 | `--no-function-names` | name every function's symbol `wasm_func_N`, by its index, rather than as the name section does |
@@ -1280,7 +1283,7 @@ on each corpus (Apple M-series):
 | `--keep-obj` | keep the intermediate object |
 | `-v` | print the external link command |
 | `--validate-only`, `--emit-wasm`, `--dump-*`, `--print-ir`, `--stats`, `--profile`, `-fno-loadbar` | see above |
-| `--magic=D[:64]` | print the multiply, add and shift that divide by `D` (unsigned; 32-bit, or 64-bit with `:64`) and stop |
+| `--magic=D[:64]` | print the multiply, add and shift that divide by `D` (unsigned; 32-bit, or 64-bit with `:64`) and stop; several divisors, comma-separated, get a line each |
 | `-h`, `--help` | print the option summary |
 
 `--target`, `--rt`, `--ld` and `--header` also take their value after an `=`,
@@ -1703,16 +1706,46 @@ on. warmc's compiles go to `WARMC_CACHE=build/warmc-cache`.
   stdin that may not end goes to wasmtime every time);
 - a program's output, under the program's bytes, its arguments and its
   settings;
+- the corpora's modules, under their sources, the flags and the toolchain's
+  version; TeaVM's builds and the JVM's answers, under the Java sources,
+  TeaVM's patches, TeaVM itself and the JDK; and `tinygo build`, `go build`
+  and `rustc` with an `-o`, under the tool's version, the arguments and the
+  sources (`test/shims/buildcache.py`);
+- the host objects `test/hostbuild.py` compiles with clang, under clang's
+  version, the command, the source, the names in each directory it includes
+  from, and the contents of every file the compile read the time before
+  (clang's `-MD`);
+- what wasm-tools and wabt make of a file for `test/run_wat.py`, under the
+  tool's version, its command and the file's bytes;
 - a suite's whole result, where none of its programs, its scripts or its
   settings changed since a run that passed;
 - and each row's whole answer (`test/row.py`), under warmc and its sanitiser
-  builds, the runtimes, the pinned tools, every file of the tree outside
-  `src/`, the toolchains on `PATH` the suites call, and the row's own
-  command and settings: a `make check` with nothing changed answers from it,
-  and one after a change to warmc runs every row, through the caches above.
+  builds, the runtimes, the pinned tools, the spec suite's corpus as checked
+  out, every file of the tree outside `src/`, the toolchains on `PATH` the
+  suites call, and the row's own command and settings: a `make check` with
+  nothing changed answers from it, and one after a change to warmc runs
+  every row, through the caches above.
+
+After the rows, each cache that is over its size limit is cut to 90% of
+it, least recently used first: 20 GB for warmc's (`WARMC_CACHE_MB`) and
+2 GB for the suites' (`WARMC_TESTCACHE_MB`). This runs on its own once
+`make check` has ended, so no run waits for the deleting. A later run that
+reads an entry meanwhile holds all of its files open before using any of
+them, so it reads the entry whole or not at all. An entry never changes once
+it is in place, so a ledger (`.sizes`) keeps each directory's sizes. A
+directory is listed again only when its own time says an entry came or went.
+
+The shims run through wrappers that `make check` writes to `build/shims`,
+one for each of these tools that is installed. Each wrapper names python3,
+the shim and the tool by absolute path, so a suite that runs wasmtime under
+`env -i` still reaches it. `make check` stops at once if wasmtime answers
+differently there.
 
 Each suite links its modules into a few programs of several modules, not a
-program per test. `WARMC_NO_TESTCACHE=1` runs everything.
+program per test. The suites of many small modules (spec's corpus, the text
+front end's fixtures, the mutated components) hand warmc many inputs per
+process for `--validate-only`, `--emit-wasm` and `-c`. `WARMC_NO_TESTCACHE=1`
+runs everything.
 
 Most of the suite is **differential**. warmc's output is compared with:
 - wabt's `wasm-interp`, for the hand-written cases in `test/cases`: at `-O0`,
@@ -1931,7 +1964,7 @@ rt/             the runtime linked into every program and shared library
   win.inc winposix.c                      Windows platform layer
   warm_rt.h                               the embedding API
   const_ops.inc                           the constant-expression opcodes, shared with the compiler
-test/           test drivers (run_all.sh is make check), cases, benchmark and test corpora, the spec harness (spec/), TeaVM's driver and WASI adapter (teavm/), the suites' cache (testcache.py) and the caching wasmtime make check runs (shims/)
+test/           test drivers (run_all.sh is make check), cases, benchmark and test corpora, the spec harness (spec/), TeaVM's driver and WASI adapter (teavm/), the suites' cache (testcache.py, row.py) and the caching wasmtime, tinygo, go and rustc make check runs (shims/)
 lwjgl/          LWJGL 3 programs through TeaVM and warmc: the platform layer (platform/), the TeaVM transformer (teavm/), the C glue (native/), the build driver and a demo
 example/        TinyGo and Kotlin sample programs (source, .wasm and a macOS build)
 Makefile        the build, the pinned dependencies and the test targets
