@@ -72,6 +72,9 @@ all for noticing that something drifted.
 """
 
 import atexit
+import base64
+import concurrent.futures
+import glob
 import json
 import os
 import shlex
@@ -79,6 +82,7 @@ import shutil
 import re
 import subprocess
 import sys
+import tempfile
 import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -802,6 +806,63 @@ def link(wasm, flags, tag, target_flags):
         return None
     return exe
 
+GROUP_BYTES = 24 << 20
+
+
+def link_all(names, wasm, flags, tag, target_flags):
+    """Every kernel in one program, for --check: a program is asked for a
+    kernel by --module, and holds each one's code as its own program would.
+    A corpus row linked a program per kernel and variant, some 2000 across
+    make check, and macOS checks each new program on its first run, about
+    150 ms apiece -- most of what those rows cost.  Made every time, at the
+    same path under the same name: warmc's WARMC_CACHE hands back a program
+    nothing changed for as a hard link to the one checked before.  None
+    where one kernel does not compile; link() then says which."""
+    exe = os.path.join(WORK, "all." + tag)
+    tmp = tempfile.mkdtemp(dir=WORK, prefix=".build.")
+    try:
+        out = os.path.join(tmp, os.path.basename(exe))
+        r = sh([WARMC] + target_flags + flags.split() + ["--wasi", "-o", out] +
+               [wasm[n] for n in names])
+        if r.returncode != 0:
+            return None
+        os.replace(out, exe)
+        return exe
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def wasmtime_version():
+    r = subprocess.run(["wasmtime", "--version"], capture_output=True, text=True)
+    return r.stdout.strip()
+
+
+def reference(w, version):
+    """wasmtime's run of the module at w: its exit status, stdout and stderr,
+    kept in test/testcache under wasmtime's version and the module's bytes --
+    every row that checks a corpus asked wasmtime again, which compiled each
+    kernel afresh.  A run that fails is not kept: it is a broken kernel, and
+    reported as one each time."""
+    import testcache
+    k = testcache.key("wasmtime run", version, testcache.File(w))
+    v = testcache.get("ref", k)
+    if v is not None:
+        return v[0], base64.b64decode(v[1]), b""
+    r = subprocess.run(["wasmtime", w], capture_output=True)
+    if r.returncode == 0 and r.stdout.strip():
+        testcache.put("ref", k, [r.returncode, base64.b64encode(r.stdout).decode()])
+    return r.returncode, r.stdout, r.stderr
+
+
+def run_kept(argv):
+    """a kernel's run, (rc, stdout), kept under the program's bytes"""
+    import testcache
+    rc, out, _err = testcache.run(argv[0], argv[1:], lambda: (lambda r: (
+        r.returncode, base64.b64encode(r.stdout).decode(), ""))(
+            subprocess.run(argv, capture_output=True, env=RUNENV)))
+    return rc, base64.b64decode(out)
+
+
 RUNENV = dict(os.environ, WARMC_RANDOM_SEED="1")
 
 RSS_UNIT = 1 if sys.platform == "darwin" else 1024
@@ -842,22 +903,30 @@ def check(names, wasm, exes, variants):
     # Compared as bytes: a program may print anything, and output that is not
     # UTF-8 has to be a difference or an agreement, not a decoding error.
     txt = lambda b: b.decode("utf-8", "replace")
-    for k in names:
-        ref = subprocess.run(["wasmtime", wasm[k]], capture_output=True)
-        if ref.returncode != 0 or not ref.stdout.strip():
-            print("FAIL[%s/%s]: reference does not run: rc=%d out=%r err=%r"
-                  % (CORPUS, k, ref.returncode, txt(ref.stdout.strip()[:80]),
-                     txt(ref.stderr.strip()[:160])))
-            bad += 1
-            continue
+    version = wasmtime_version()
+
+    def one(k):
+        """the lines k's check prints, and how many failed"""
+        rc, out, err = reference(wasm[k], version)
+        if rc != 0 or not out.strip():
+            return ["FAIL[%s/%s]: reference does not run: rc=%d out=%r err=%r"
+                    % (CORPUS, k, rc, txt(out.strip()[:80]), txt(err.strip()[:160]))], 1
+        lines = []
         for v in variants:
-            got = subprocess.run([exes[(k, v)]], capture_output=True, env=RUNENV)
-            if got.stdout != ref.stdout or got.returncode != ref.returncode:
-                print("FAIL[%s/%s %s]: warmc %r rc=%d, wasmtime %r rc=%d"
-                      % (CORPUS, k, v, txt(got.stdout.strip()[:120]),
-                         got.returncode, txt(ref.stdout.strip()[:120]),
-                         ref.returncode))
-                bad += 1
+            e = exes[(k, v)]
+            grc, gout = run_kept(e if isinstance(e, list) else [e])
+            if gout != out or grc != rc:
+                lines.append("FAIL[%s/%s %s]: warmc %r rc=%d, wasmtime %r rc=%d"
+                             % (CORPUS, k, v, txt(gout.strip()[:120]),
+                                grc, txt(out.strip()[:120]), rc))
+        return lines, len(lines)
+
+    # the kernels side by side, a few at a time: make check runs other rows
+    with concurrent.futures.ThreadPoolExecutor(4) as ex:
+        for lines, n in ex.map(one, names):
+            for l in lines:
+                print(l)
+            bad += n
     if not bad:
         print("%s: %d kernel(s) x %d variant(s) agree with wasmtime"
               % (CORPUS, len(names), len(variants)))
@@ -1354,8 +1423,31 @@ def main():
         wasm[k] = w
 
     exes = {}
-    for k in ["empty"] + names:
+    tags = {v: "".join(c if c.isalnum() else "_" for c in v) for v in variants}
+    # the kernels in groups of at most GROUP_BYTES of wasm: warmc's linker
+    # reaches the runtime from no further than a branch does, 128 MB, and
+    # stdgotests at -O0 makes twice that
+    groups, size = [[]], 0
+    for k in names:
+        n = os.path.getsize(wasm[k])
+        if groups[-1] and size + n > GROUP_BYTES:
+            groups.append([])
+            size = 0
+        groups[-1].append(k)
+        size += n
+    jobs = [(v, i, g) for v in (variants if check_only else []) for i, g in enumerate(groups)]
+    # a few at a time: each holds a group's modules and code
+    with concurrent.futures.ThreadPoolExecutor(min(4, max(1, len(jobs)))) as ex:
+        alls = list(ex.map(lambda j: link_all(j[2], wasm, j[0], "%s.%d" % (tags[j[0]], j[1]),
+                                              target_flags), jobs))
+    for (v, _i, g), e in zip(jobs, alls):
+        if e is not None:
+            for k in g:
+                exes[(k, v)] = [e, "--module", k]
+    for k in names if check_only else ["empty"] + names:
         for v in variants:
+            if (k, v) in exes:
+                continue
             tag = "".join(c if c.isalnum() else "_" for c in v)
             e = link(wasm[k], v, tag, target_flags)
             if e is None:

@@ -182,34 +182,40 @@ def answer(r):
         return "%d" % (int(r.stdout.strip()[4:]) & (2**64 - 1))
     return "exit %d: %s" % (r.returncode, (r.stderr.strip().splitlines() or [""])[0][:80])
 
-def check(seed, levels, tmp, build, target, wasmtime, run):
+def prepare(seed, tmp, build, wasmtime):
+    """seed's module, and wasmtime's answer: (seed, wasm, answer), or a message"""
     sh = lambda c: subprocess.run(c, capture_output=True, text=True, timeout=120)
-    d = os.path.join(tmp, "s%d" % seed)
-    os.makedirs(d, exist_ok=True)
-    wat, wasm = os.path.join(d, "m.wat"), os.path.join(d, "m.wasm")
+    wat, wasm = (os.path.join(tmp, "m%d.%s" % (seed, x)) for x in ("wat", "wasm"))
     with open(wat, "w") as f:
         f.write(Gen(seed).module())
     r = sh([os.path.join(build, "tools", "bin", "wasm-tools"), "parse", wat, "-o", wasm])
     if r.returncode:
         return "seed %d: not assembled: %s" % (seed, r.stderr.strip()[:200])
-    got = {}
-    for lv in levels:
-        exe = os.path.join(d, "m%s%s" % (lv.replace("-", "_"), ".exe" if hostbuild.WINDOWS else ""))
-        r = sh([os.path.join(build, "warmc")] + lv.split() + target + ["-o", exe, wasm])
-        got[lv] = answer(sh(run + [exe, "run"])) if r.returncode == 0 else \
-            "not compiled: " + (r.stderr.strip().splitlines() or [""])[0][:100]
-    want = {}
+    want = None
     if wasmtime:
         r = sh([wasmtime, "run", "-W", "memory64=y", "--invoke", "run", wasm])
-        want["wasmtime"] = ("trap" if r.returncode else
-                            "%d" % (int(r.stdout.strip()) & (2**64 - 1)))
-    want[levels[0]] = got[levels[0]]
-    bad = ["%s %s, %s %s" % (lv, g, w, v) for lv, g in got.items()
-           for w, v in want.items() if g != v and lv != w]
-    if bad:
-        return "seed %d: %s (--seed %d --count 1 --keep DIR keeps it)" % (
-            seed, "; ".join(sorted(set(bad))[:4]), seed)
-    return None
+        want = "trap" if r.returncode else "%d" % (int(r.stdout.strip()) & (2**64 - 1))
+    return seed, wasm, want
+
+
+def program(lv, mods, tmp, build, target):
+    """every module at one level in one program (warmc given several), asked
+    for one by name: a program each was four hundred that macOS checks on
+    their first run.  (exe, {}), or (None, {seed: why}) where one does not
+    compile, each then compiled alone to say which"""
+    sh = lambda c, t=120: subprocess.run(c, capture_output=True, text=True, timeout=t)
+    exe = os.path.join(tmp, "all%s%s" % (lv.replace("-", "_"), ".exe" if hostbuild.WINDOWS else ""))
+    r = sh([os.path.join(build, "warmc")] + lv.split() + target + ["-o", exe] +
+           [m[1] for m in mods], 600)
+    if r.returncode == 0:
+        return exe, {}
+    why = {}
+    for seed, wasm, _ in mods:
+        r = sh([os.path.join(build, "warmc")] + lv.split() + target + ["-c", "-o", exe + ".o", wasm])
+        if r.returncode:
+            why[seed] = "not compiled: " + (r.stderr.strip().splitlines() or [""])[0][:100]
+    return None, why or {mods[0][0]: "not compiled: " + r.stderr.strip()[:100]}
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -230,10 +236,39 @@ def main():
     levels = [lv for lv in a.levels.split(",") if lv]
     tmp = a.keep or tempfile.mkdtemp(prefix="mem64-")
     try:
+        fails = []
+        with concurrent.futures.ThreadPoolExecutor(os.cpu_count() or 4) as ex:
+            mods = []
+            for m in ex.map(lambda s: prepare(s, tmp, build, wasmtime),
+                            range(a.seed, a.seed + a.count)):
+                (fails.append if isinstance(m, str) else mods.append)(m)
+            progs = dict(zip(levels, ex.map(lambda lv: program(lv, mods, tmp, build, target),
+                                            levels)))
+
+        def runs(m):
+            """the module's answer at each level against wasmtime's and the
+            first level's, or None"""
+            seed, wasm, want = m
+            got = {}
+            for lv in levels:
+                exe, why = progs[lv]
+                got[lv] = answer(subprocess.run(run + [exe, "m%d" % seed, "run"],
+                                                capture_output=True, text=True, timeout=120)) \
+                    if exe else why.get(seed, "not compiled with the rest")
+            wants = {levels[0]: got[levels[0]]}
+            if want is not None:
+                wants["wasmtime"] = want
+            bad = ["%s %s, %s %s" % (lv, g, w, v) for lv, g in got.items()
+                   for w, v in wants.items() if g != v and lv != w]
+            if bad:
+                return "seed %d: %s (--seed %d --count 1 --keep DIR keeps it)" % (
+                    seed, "; ".join(sorted(set(bad))[:4]), seed)
+            return None
+
+        # Windows commits a memory's pages when it is made: each run is 4 GiB
+        # of commit charge, so there they run one at a time
         with concurrent.futures.ThreadPoolExecutor(a.jobs) as ex:
-            fails = [x for x in ex.map(lambda s: check(s, levels, tmp, build, target,
-                                                         wasmtime, run),
-                                       range(a.seed, a.seed + a.count)) if x]
+            fails += [x for x in ex.map(runs, mods) if x]
     finally:
         if not a.keep:
             shutil.rmtree(tmp, ignore_errors=True)

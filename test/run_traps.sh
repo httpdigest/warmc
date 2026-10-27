@@ -18,14 +18,32 @@ done
 [ "${1:-}" = --prepare ] && exit 0
 
 FTAG=$(wftag)
-BIN="$WORK/traps$FTAG"
-wtimeout ./$BUILD/warmc ${WARMC_FLAGS:-} $WARMC_TARGET_FLAGS -o "$BIN" "$WORK/traps.wasm" || exit 1
+# Every module the row's flags compile is in one program (warmc given
+# several), asked for one by name -- a program each was six that macOS checks
+# on their first run, each row.  What a check runs is the program and which
+# module: BIN.
+ALL="$WORK/trapsall$FTAG"
+WARMC_TIMEOUT=$((WARMC_TIMEOUT * 5)) wbuild "$ALL" ./$BUILD/warmc ${WARMC_FLAGS:-} \
+  $WARMC_TARGET_FLAGS "$WORK/traps.wasm" "$WORK/exnsole.wasm" \
+  "$WORK/ictraps.wasm" "$WORK/tramptraps.wasm" "$WORK/gosptraps.wasm" \
+  "$WORK/mem64big.wasm" || exit 1
+BIN=("$ALL" traps)
+
+# What the row answers depends on that program, warmc and the runtimes (the
+# checks below compile more), this script and the settings: where none
+# changed since a run that passed, it is that run's answer again
+# (test/testcache.py; WARMC_NO_TESTCACHE=1 runs it anyway).
+archives=()
+for a in "$BUILD"/*.a; do archives+=(--file "$a"); done
+ROWKEY=$(python3 test/testcache.py key --file test/run_traps.sh --file test/hostenv.sh \
+  --file "./$BUILD/warmc" "${archives[@]}" --file "$ALL" --env WARMC_ --str "$(uname -s)")
+if python3 test/testcache.py get row "$ROWKEY"; then exit 0; fi
 
 pass=0; fail=0
 expect() {
   local name="$1" want="$2"
   local out rc
-  out=$(wruntimeout $WARMC_RUN "$BIN" "$name" 2>&1); rc=$?
+  out=$(wruntimeout $WARMC_RUN "${BIN[@]}" "$name" 2>&1); rc=$?
   if [ "$want" = "OK" ]; then
     if [ "$rc" -eq 0 ]; then pass=$((pass+1)); else
       echo "FAIL[traps] $name: expected success, got rc=$rc: $out"; fail=$((fail+1)); fi
@@ -187,7 +205,7 @@ fi
 # recursion still traps rather than dying on the guard page (SIGSEGV).
 # Windows has no RLIMIT_STACK for ulimit to set, so there this repeats the
 # case above.
-out=$( (ulimit -s 2048 2>/dev/null; wruntimeout $WARMC_RUN "$BIN" stack_overflow) 2>&1 ); rc=$?
+out=$( (ulimit -s 2048 2>/dev/null; wruntimeout $WARMC_RUN "${BIN[@]}" stack_overflow) 2>&1 ); rc=$?
 if [ "$rc" -ne 1 ] || [[ "$out" != *"call stack exhausted"* ]]; then
   echo "FAIL[traps] stack_overflow under a 2 MB stack: expected 'call stack exhausted', got rc=$rc: $out"
   fail=$((fail+1))
@@ -234,12 +252,10 @@ expect exn_caught_past_pads_ok   "OK"
 
 # A program's only module with a tag and nothing of the collector's keeps the
 # unwind records an exception walks; one with no tag keeps none.
-BIN_KEEP="$BIN"
-BIN="$WORK/exnsole$FTAG"
-wtimeout ./$BUILD/warmc ${WARMC_FLAGS:-} $WARMC_TARGET_FLAGS -o "$BIN" "$WORK/exnsole.wasm" || exit 1
+BIN=("$ALL" exnsole)
 expect caught_across "OK"
 expect uncaught      "uncaught exception"
-BIN="$BIN_KEEP"
+BIN=("$ALL" traps)
 printf '(module (func $f (export "f") (param i32) (result i32)\n  (if (result i32) (i32.eqz (local.get 0)) (then (i32.const 1))\n    (else (i32.add (call $f (i32.sub (local.get 0) (i32.const 1))) (i32.const 1))))))\n' \
   > "$WORK/notag$FTAG.wat"
 recs=$(WARMC_TABLE_STATS=1 wtimeout ./$BUILD/warmc ${WARMC_FLAGS:-} $WARMC_TARGET_FLAGS \
@@ -252,8 +268,7 @@ expect dead_table_get            "out of bounds table access"
 
 # call_indirect through the code tables of a table nothing writes: every
 # slot a stub stands in must say what the full lookup says
-BIN="$WORK/ictraps$FTAG"
-wtimeout ./$BUILD/warmc ${WARMC_FLAGS:-} $WARMC_TARGET_FLAGS -o "$BIN" "$WORK/ictraps.wasm" || exit 1
+BIN=("$ALL" ictraps)
 expect ict_ok                "OK"
 expect ict_x_null            "uninitialized element"
 expect ict_x_type            "indirect call type mismatch"
@@ -283,8 +298,7 @@ expect ict_loop_type         "indirect call type mismatch"
 # a trampoline in GHC's shape, which tramp.c turns into tail calls: each call
 # its loop would have made traps as it did, and so does one through the
 # type its functions now have the shape of
-BIN="$WORK/tramptraps$FTAG"
-wtimeout ./$BUILD/warmc ${WARMC_FLAGS:-} $WARMC_TARGET_FLAGS -o "$BIN" "$WORK/tramptraps.wasm" || exit 1
+BIN=("$ALL" tramptraps)
 expect tramp_ok              "OK"
 expect tramp_x_type          "indirect call type mismatch"
 expect tramp_x_null          "uninitialized element"
@@ -296,8 +310,7 @@ expect tramp_c_on_stg        "indirect call type mismatch"
 # each call through Go's type traps as it did, from an export or from a Go
 # function, so does one through the type its functions now have the shape
 # of, and a Go function's own trap is the one reported
-BIN="$WORK/gosptraps$FTAG"
-wtimeout ./$BUILD/warmc ${WARMC_FLAGS:-} $WARMC_TARGET_FLAGS -o "$BIN" "$WORK/gosptraps.wasm" || exit 1
+BIN=("$ALL" gosptraps)
 expect gosp_ok               "OK"
 expect gosp_x_type           "indirect call type mismatch"
 expect gosp_x_null           "uninitialized element"
@@ -322,8 +335,7 @@ case "$(uname -s)" in
                                   *) mem64big=0 ;; esac ;;
 esac
 if [ "$mem64big" = 1 ]; then
-  BIN="$WORK/mem64big$FTAG"
-  wtimeout ./$BUILD/warmc ${WARMC_FLAGS:-} $WARMC_TARGET_FLAGS -o "$BIN" "$WORK/mem64big.wasm" || exit 1
+  BIN=("$ALL" mem64big)
   for e in big_size big_widths big_offset big_active big_last big_grow big_grow_cap \
            big_fill big_copy big_init big_loop; do
     expect "$e" "OK"
@@ -335,4 +347,6 @@ if [ "$mem64big" = 1 ]; then
 fi
 
 echo "traps: $pass passed, $fail failed"
-[ "$fail" -eq 0 ]
+[ "$fail" -eq 0 ] || exit 1
+echo "traps: $pass passed, $fail failed (as when nothing it depends on was as now)" |
+  python3 test/testcache.py put row "$ROWKEY"

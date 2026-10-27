@@ -296,8 +296,10 @@ def run_random(work):
     if err:
         fail("random: the adapter refused it: %s" % err)
         return
-    a = subprocess.run(["wasmtime", adapted], capture_output=True).stdout
-    b = subprocess.run(["wasmtime", adapted], capture_output=True).stdout
+    # two runs that must differ: neither from test/shims' cache of wasmtime
+    env = dict(os.environ, WARMC_NO_TESTCACHE="1")
+    a = subprocess.run(["wasmtime", adapted], capture_output=True, env=env).stdout
+    b = subprocess.run(["wasmtime", adapted], capture_output=True, env=env).stdout
     if len(a) != 17 or a == b:
         fail("random: two runs drew %r and %r" % (a, b))
 

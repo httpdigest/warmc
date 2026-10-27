@@ -214,7 +214,9 @@ def make(seed):
     return "\n".join(w) + "\n", (blob + 7) // 8 * 8, 8 * len(segs) if pas else 0
 
 
-def run_one(seed, work, target, run, wabt):
+def prepare(seed, work, wabt):
+    """One module: its text, its binary and the interpreter's answers.
+    (name, wasm, ref, want_blob, want_table) or a failure's message."""
     name = "dp%d" % seed
     wat = os.path.join(work, name + ".wat")
     wasm = os.path.join(work, name + ".wasm")
@@ -224,25 +226,39 @@ def run_one(seed, work, target, run, wabt):
         f.write(text)
     r = subprocess.run(["wat2wasm"] + wabt + ["-o", wasm, wat], capture_output=True, text=True)
     if r.returncode:
-        return ["FAIL[datapack/%s]: wat2wasm: %s" % (name, r.stderr.strip()[:300])]
+        return "FAIL[datapack/%s]: wat2wasm: %s" % (name, r.stderr.strip()[:300])
     r = subprocess.run(["wasm-interp"] + wabt + ["--run-all-exports", wasm],
                        capture_output=True, text=True)
     with open(ref, "w") as f:
         f.write(r.stdout)
+    return name, wasm, ref, want_blob, want_table
+
+
+def check_setting(setting, mods, work, target, run):
+    """Every module at one setting, in one program (warmc given several): a
+    program each was 180 a run that macOS checks on their first run.  Each
+    module's WARMC_TABLE_STATS start at its "tables:" line, in the order the
+    modules were given."""
+    label, flags, env = setting
+    exe = os.path.join(work, "all.%s" % label)
+    r = subprocess.run([WARMC] + target + flags + ["-o", exe] + [m[1] for m in mods],
+                       capture_output=True, text=True,
+                       env=dict(os.environ, WARMC_TABLE_STATS="1", **env))
+    if r.returncode:
+        return ["FAIL[datapack %s]: warmc: %s" % (label, r.stderr.strip()[:300])]
+    parts = re.split(r"^tables:", r.stderr, flags=re.M)[1:]
+    if len(parts) != len(mods):
+        return ["FAIL[datapack %s]: %d modules' table stats for %d modules"
+                % (label, len(parts), len(mods))]
     msgs = []
-    for label, flags, env in SETTINGS:
-        exe = os.path.join(work, "%s.%s" % (name, label))
-        r = subprocess.run([WARMC] + target + flags + ["-o", exe, wasm], capture_output=True,
-                           text=True, env=dict(os.environ, WARMC_TABLE_STATS="1", **env))
-        if r.returncode:
-            msgs.append("FAIL[datapack/%s %s]: warmc: %s" % (name, label, r.stderr.strip()[:300]))
-            continue
-        stats = dict(re.findall(r"^  (?:rodata|data) (blob|datasegs) +(\d+)$", r.stderr, re.M))
+    for (name, wasm, ref, want_blob, want_table), part in zip(mods, parts):
+        stats = dict(re.findall(r"^  (?:rodata|data) (blob|datasegs) +(\d+)$", part, re.M))
         got = (int(stats.get("blob", -1)), int(stats.get("datasegs", -1)))
         if got != (want_blob, want_table):
             msgs.append("FAIL[datapack/%s %s]: passive blob %d bytes and segment table %d, "
                         "want %d and %d" % ((name, label) + got + (want_blob, want_table)))
-        n, bad, m = cmp_mod.compare(ref, exe, "datapack/%s %s" % (name, label), run=run)
+        n, bad, m = cmp_mod.compare(ref, exe, "datapack/%s %s" % (name, label), run=run,
+                                    prefix=(name,))
         if not n:
             msgs.append("FAIL[datapack/%s %s]: no export answered" % (name, label))
         msgs += m if bad else []
@@ -261,10 +277,16 @@ def main():
     fails = []
     seeds = range(a.seed, a.seed + a.count)
     with concurrent.futures.ThreadPoolExecutor(max_workers=os.cpu_count() or 4) as ex:
-        for msgs in ex.map(lambda s: run_one(s, work, target, run, wabt), seeds):
-            for m in msgs:
-                print(m)
+        mods = []
+        for m in ex.map(lambda s: prepare(s, work, wabt), seeds):
+            if isinstance(m, str):
+                fails.append(m)
+            else:
+                mods.append(m)
+        for msgs in ex.map(lambda st: check_setting(st, mods, work, target, run), SETTINGS):
             fails += msgs
+    for m in fails:
+        print(m)
     if fails:
         return 1
     print("datapack: %d modules, each at %d settings, agree with wasm-interp"

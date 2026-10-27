@@ -23,7 +23,7 @@ pass=0; fail=0
 BIN=""
 build_one() {
   BIN="$WORK/fma_$1"
-  wtimeout ./$BUILD/warmc $2 $WARMC_TARGET_FLAGS -o "$BIN.$$" "$WORK/fma.wasm" ||
+  wbuild "$BIN" ./$BUILD/warmc $2 $WARMC_TARGET_FLAGS "$WORK/fma.wasm" ||
     { echo "FAIL[fma] cannot compile $2"; exit 1; }
   mv -f "$BIN.$$" "$BIN"
 }

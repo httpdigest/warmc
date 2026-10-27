@@ -49,20 +49,51 @@ A64=1
 FTAG=$(wftag)
 
 pass=0; fail=0
-BIN=""
+# what a check runs: the program and, in the one of several modules below,
+# which module
+BIN=()
+
+# Every module the row's own flags compile is in one program (warmc given
+# several), asked for one by name: a program each was sixteen that macOS
+# checks on their first run, each row.  A module built with a flag of its
+# own has a program of its own.
+BUNDLED="gc gccollect constroot exnpayload devirt_vt ictab_sub escape castfacts brcast
+  arraycopy arraynew tightheap activedata gcgen"
+BUNDLE="$WORK/gcall$FTAG"
+
+# compiled every time: warmc's cache (hostenv.sh) hands back by their
+# contents the ones nothing changed for
+wasms=()
+for m in $BUNDLED; do wasms+=("$WORK/$m.wasm"); done
+WARMC_TIMEOUT=$((WARMC_TIMEOUT * 5)) wbuild "$BUNDLE" ./$BUILD/warmc ${WARMC_FLAGS:-} \
+  $WARMC_TARGET_FLAGS "${wasms[@]}" ||
+  { echo "FAIL[gc] cannot compile the modules"; exit 1; }
+built=" "
 
 build_one() {
-  BIN="$WORK/$1$FTAG"
-
-  local dep="$WORK/$1.wasm" d
-  for d in "./$BUILD/warmc" "$BUILD/warmrt.a" "$BUILD/warmrt-macos.a"; do
-    [ -e "$d" ] && [ "$d" -nt "$dep" ] && dep="$d"
-  done
-  if [ -s "$BIN" ] && [ "$BIN" -nt "$dep" ]; then return; fi
-  wtimeout ./$BUILD/warmc ${WARMC_FLAGS:-} $WARMC_TARGET_FLAGS \
-    -o "$BIN.$$" "$WORK/$1.wasm" || { echo "FAIL[gc] cannot compile $1"; exit 1; }
-  mv -f "$BIN.$$" "$BIN"
+  case " $(echo $BUNDLED) " in
+    *" $1 "*) BIN=("$BUNDLE" "$1"); return ;;
+  esac
+  local exe="$WORK/$1$FTAG"
+  BIN=("$exe")
+  # once a run
+  case "$built" in *" $1 "*) return ;; esac
+  wbuild "$exe" ./$BUILD/warmc ${WARMC_FLAGS:-} $WARMC_TARGET_FLAGS \
+    "$WORK/$1.wasm" || { echo "FAIL[gc] cannot compile $1"; exit 1; }
+  built="$built$1 "
 }
+
+# Every program the checks run, made first: what the row answers depends on
+# them, warmc (the escape check compiles), this script, the tools it reads
+# modules with and the settings, and where none of those changed since a run
+# that passed, it is that run's answer again (test/testcache.py;
+# WARMC_NO_TESTCACHE=1 runs it anyway).
+WARMC_FLAGS="${WARMC_FLAGS:-} -fno-inline" build_one tailcast
+WARMC_FLAGS="${WARMC_FLAGS:-} -fno-thread" build_one castfacts_nt
+ROWKEY=$(python3 test/testcache.py key --file test/run_gc.sh --file test/hostenv.sh \
+  --file "./$BUILD/warmc" --file "$BUNDLE" --file "$WORK/tailcast$FTAG" --file "$WORK/castfacts_nt$FTAG" \
+  --file "$WT" --file "$WORK/escape.wasm" --env WARMC_ --env GC_ --str "$*")
+if python3 test/testcache.py get row "$ROWKEY"; then exit 0; fi
 
 log_run() {
   local case="$1" args="$2"; shift 2
@@ -70,7 +101,7 @@ log_run() {
         WARMC_GC_RELOC WARMC_GC_RELOCATE_ALL WARMC_GC_LAB WARMC_GC_RELEASE \
         WARMC_GC_HEAP_KB WARMC_GC_JITTER WARMC_GC_JITTER_SEED
     wruntimeout env WARMC_GC_STATS=1 WARMC_GC_MIN_KB=64 \
-        "$@" sh -c 'exec "$0" "$1" $2' "$BIN" "$case" "$args" 2>&1 >/dev/null )
+        "$@" sh -c 'exec "$0" $1 "$2" $3' "${BIN[0]}" "${BIN[1]:-}" "$case" "$args" 2>&1 >/dev/null )
 }
 
 # While the collector waits for the program to answer mark end, it takes
@@ -103,7 +134,7 @@ expect() {
   local out rc t0 t1
 
   [ -n "${GC_TIMING:-}" ] && t0=$(perl -MTime::HiRes=time -e 'print time')
-  out=$(wruntimeout $WARMC_RUN "$BIN" "$name" "$@" 2>&1); rc=$?
+  out=$(wruntimeout $WARMC_RUN "${BIN[@]}" "$name" "$@" 2>&1); rc=$?
   if [ -n "${GC_TIMING:-}" ]; then
     t1=$(perl -MTime::HiRes=time -e 'print time')
     perl -e "printf \"%7.0f ms  %s\\n\", ($t1-$t0)*1000, \"$name $*\"" >&2
@@ -263,7 +294,7 @@ case "${WARMC_FLAGS:-}" in
   *-O0* | *no-escape*) ;;
   *)
     out=$(WARMC_GC_STATS=1 WARMC_GC_STRESS=0 WARMC_GC_MIN_KB=4096 \
-          wruntimeout $WARMC_RUN "$BIN" ea_elided 200000 2>&1 >/dev/null)
+          wruntimeout $WARMC_RUN "${BIN[@]}" ea_elided 200000 2>&1 >/dev/null)
     if [[ "$out" == *" 0 cycles"* ]]; then
       pass=$((pass+1))
     else
@@ -350,7 +381,7 @@ WARMC_FLAGS="${WARMC_FLAGS:-} -fno-inline" build_one tailcast
 expect pressure_cast "OK" 0
 expect pressure_cast "OK" 1
 for y in 0 1; do
-  got=$(wruntimeout $WARMC_RUN "$BIN" tail_cast $y 2>&1)
+  got=$(wruntimeout $WARMC_RUN "${BIN[@]}" tail_cast $y 2>&1)
   if [ "$got" = "i32:$((3 * y))" ]; then pass=$((pass+1)); else
     echo "FAIL[gc] tail_cast $y: expected i32:$((3 * y)), got: $got"; fail=$((fail+1)); fi
 done
@@ -374,7 +405,7 @@ case "$A64${WARMC_GC_STRESS:-}${WARMC_GC_LAB:-}${WARMC_GC_MIN_KB:-}${WARMC_GC_GR
 ${WARMC_GC_HEAP_KB:-}" in
   1)
     out=$(WARMC_GC_STATS=1 WARMC_GC_CONC=0 \
-          wruntimeout $WARMC_RUN "$BIN" keep_across_cycles 150000 2>&1 >/dev/null)
+          wruntimeout $WARMC_RUN "${BIN[@]}" keep_across_cycles 150000 2>&1 >/dev/null)
     cb=$(printf '%s' "$out" | sed -n 's/.*live, \([0-9]*\) bytes allocated.*/\1/p')
     fb=$(printf '%s' "$out" | sed -n 's/.*regions, \([0-9]*\) bytes fast-allocated.*/\1/p')
     if [ -n "$cb" ] && [ -n "$fb" ] && [ "$fb" -ge $((cb * 2)) ]; then
@@ -393,7 +424,7 @@ esac
 case "${WARMC_GC_MIN_KB:-}${WARMC_GC_GROWTH:-}${WARMC_GC_STRESS:-}" in
   "")
     out=$(WARMC_GC_STATS=1 WARMC_GC_HEAP_KB=8192 \
-          wruntimeout $WARMC_RUN "$BIN" keep_across_cycles 150000 2>&1 >/dev/null)
+          wruntimeout $WARMC_RUN "${BIN[@]}" keep_across_cycles 150000 2>&1 >/dev/null)
     trig=$(printf '%s' "$out" | sed -n 's/.*[ ,]\([0-9][0-9]*\) byte trigger.*/\1/p')
     cyc=$(printf '%s' "$out" | sed -n 's/^gc: \([0-9]*\) cycles.*/\1/p')
     if [ "$trig" = 2097152 ] && [ -n "$cyc" ] && [ "$cyc" -gt 4 ]; then
@@ -755,7 +786,7 @@ ${WARMC_GC_RELEASE:-}${WARMC_GC_RELOC_STALL:-}${WARMC_GC_RELOCATE_ALL:-}" in
                 WARMC_GC_LAB WARMC_GC_RELEASE WARMC_GC_GROWTH WARMC_GC_JITTER \
                 WARMC_GC_CONC WARMC_GC_ROUNDS WARMC_GC_RELOC_STALL
           WARMC_GC_STATS=1 WARMC_GC_MIN_KB=4 WARMC_GC_RELOC=8 WARMC_GC_CONC=0 \
-          wruntimeout $WARMC_RUN "$BIN" tree_survives 60000 2>&1 >/dev/null)
+          wruntimeout $WARMC_RUN "${BIN[@]}" tree_survives 60000 2>&1 >/dev/null)
     healed=$(printf '%s' "$out" | sed -n 's/.*barrier: \([0-9]*\) loads healed.*/\1/p')
     if [ -n "$healed" ] && [ "$healed" -gt 0 ]; then
       pass=$((pass+1))
@@ -787,7 +818,7 @@ ${WARMC_GC_GROWTH:-}${WARMC_GC_HEAP_KB:-}${WARMC_GC_LAB:-}\
 ${WARMC_GC_RELEASE:-}${WARMC_GC_RELOC_STALL:-}${WARMC_GC_RELOCATE_ALL:-}" in
   "")
     out=$(WARMC_GC_STATS=1 WARMC_GC_MIN_KB=64 \
-          wruntimeout $WARMC_RUN "$BIN" walk_no_alloc 60 20000 2>&1 >/dev/null)
+          wruntimeout $WARMC_RUN "${BIN[@]}" walk_no_alloc 60 20000 2>&1 >/dev/null)
     healed=$(printf '%s' "$out" | sed -n 's/.*barrier: \([0-9]*\) loads healed.*/\1/p')
     hfast=$(printf '%s' "$out" | sed -n 's/.*loads healed (\([0-9]*\) by the fast path).*/\1/p')
     shaded=$(printf '%s' "$out" | sed -n 's/.*, \([0-9]*\) objects shaded.*/\1/p')
@@ -803,10 +834,10 @@ ${WARMC_GC_RELEASE:-}${WARMC_GC_RELOC_STALL:-}${WARMC_GC_RELOCATE_ALL:-}" in
       fail=$((fail+1))
     fi
     once=$(WARMC_GC_STATS=1 WARMC_GC_MIN_KB=64 WARMC_GC_CONC=0 \
-           wruntimeout $WARMC_RUN "$BIN" rewalk 100 10000 1 10000 2>&1 >/dev/null |
+           wruntimeout $WARMC_RUN "${BIN[@]}" rewalk 100 10000 1 10000 2>&1 >/dev/null |
            sed -n 's/.*barrier: \([0-9]*\) loads healed.*/\1/p')
     twice=$(WARMC_GC_STATS=1 WARMC_GC_MIN_KB=64 WARMC_GC_CONC=0 \
-            wruntimeout $WARMC_RUN "$BIN" rewalk 100 10000 2 10000 2>&1 >/dev/null |
+            wruntimeout $WARMC_RUN "${BIN[@]}" rewalk 100 10000 2 10000 2>&1 >/dev/null |
             sed -n 's/.*barrier: \([0-9]*\) loads healed.*/\1/p')
     if [ -n "$once" ] && [ -n "$twice" ] && [ "$once" -gt 1000 ] && \
        [ "$twice" -le $((once + once / 20)) ]; then
@@ -816,7 +847,7 @@ ${WARMC_GC_RELEASE:-}${WARMC_GC_RELOC_STALL:-}${WARMC_GC_RELOCATE_ALL:-}" in
       fail=$((fail+1))
     fi
     out=$(WARMC_GC_STATS=1 WARMC_GC_MIN_KB=64 WARMC_GC_CONC=0 WARMC_GC_RELOC=0 \
-          wruntimeout $WARMC_RUN "$BIN" walk_no_alloc 20 20000 2>&1 >/dev/null)
+          wruntimeout $WARMC_RUN "${BIN[@]}" walk_no_alloc 20 20000 2>&1 >/dev/null)
     healed=$(printf '%s' "$out" | sed -n 's/.*barrier: \([0-9]*\) loads healed.*/\1/p')
     cycles=$(printf '%s' "$out" | sed -n 's/^gc: \([0-9]*\) cycles.*/\1/p')
     if [ "$healed" = 0 ] && [ -n "$cycles" ] && [ "$cycles" -gt 5 ]; then
@@ -831,7 +862,7 @@ esac
 case "${WARMC_GC_STRESS:-0}${WARMC_GC_GROWTH:+g}" in
   0)
     out=$(WARMC_GC_STATS=1 WARMC_GC_MIN_KB=16 WARMC_GC_CONC=0 \
-          wruntimeout $WARMC_RUN "$BIN" churn 200000 2>&1 >/dev/null)
+          wruntimeout $WARMC_RUN "${BIN[@]}" churn 200000 2>&1 >/dev/null)
     cycles=$(printf '%s' "$out" | sed -n 's/^gc: \([0-9]*\) cycles.*/\1/p')
     live=$(printf '%s' "$out" | sed -n 's/.*cycles, \([0-9]*\) bytes live.*/\1/p')
     opened=$(printf '%s' "$out" | sed -n 's/.*, \([0-9]*\) pages opened.*/\1/p')
@@ -852,7 +883,7 @@ case "${WARMC_GC_STRESS:-0}${WARMC_GC_GROWTH:+g}" in
                 WARMC_GC_RELOCATE_ALL WARMC_GC_LAB WARMC_GC_RELEASE \
                 WARMC_GC_HEAP_KB
           WARMC_GC_STATS=1 WARMC_GC_MIN_KB=16 \
-          wruntimeout $WARMC_RUN "$BIN" churn "$1" 2>&1 >/dev/null)
+          wruntimeout $WARMC_RUN "${BIN[@]}" churn "$1" 2>&1 >/dev/null)
       local op fr cy
       cy=$(printf '%s' "$o" | sed -n 's/^gc: \([0-9]*\) cycles.*/\1/p')
       op=$(printf '%s' "$o" | sed -n 's/.*, \([0-9]*\) pages opened.*/\1/p')
@@ -915,7 +946,7 @@ oom_out=$(
   export WARMC_GC_TRAP_ROUND=1
 
   export WARMC_GC_CONC=0
-  wruntimeout $WARMC_RUN "$BIN" --catch \
+  wruntimeout $WARMC_RUN "${BIN[0]}" --catch ${BIN[1]:-} \
       oom_fill 1000000 -- oom_throw -- oom_recover 2000 2>"$oom_err" )
 oom_rc=$?
 
@@ -944,7 +975,7 @@ conc_out=$(
         WARMC_GC_RELOC WARMC_GC_RELOCATE_ALL WARMC_GC_LAB WARMC_GC_RELEASE \
         WARMC_GC_HEAP_KB
   export WARMC_GC_HEAP_KB=1024 WARMC_GC_MIN_KB=16
-  wruntimeout $WARMC_RUN "$BIN" --catch \
+  wruntimeout $WARMC_RUN "${BIN[0]}" --catch ${BIN[1]:-} \
       oom_fill 1000000 -- oom_throw -- oom_recover 2000 2>"$oom_err" )
 conc_rc=$?
 conc_traps=$(grep -c '^trap: allocation failed$' "$oom_err")
@@ -958,4 +989,6 @@ fi
 rm -f "$oom_err"
 
 echo "gc: $pass passed, $fail failed"
-[ "$fail" -eq 0 ]
+[ "$fail" -eq 0 ] || exit 1
+echo "gc: $pass passed, $fail failed (as when nothing it depends on was as now)" |
+  python3 test/testcache.py put row "$ROWKEY"

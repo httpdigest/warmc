@@ -18,6 +18,7 @@ Run after `run_cases.py` (it reuses that suite's cached .wasm/.ref files and
 compiled objects).  Skips politely when wasmtime is not installed.
 """
 import concurrent.futures
+import json
 import os
 import re
 import shutil
@@ -28,13 +29,18 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import hostbuild
 import run_cases
+import testcache
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILD = os.environ.get("BUILD", "build")
 WORK = os.path.join(BUILD, "testrun")
 RUN = os.environ.get("WARMC_RUN", "").split()
 RUN_TIMEOUT = float(os.environ.get("WARMC_RUN_TIMEOUT", "30"))
-WASMTIME = os.environ.get("WASMTIME", "wasmtime")
+# wasmtime itself, not test/shims' caching one: this keeps its answers in
+# test/testcache by export, and through the shim each would be kept twice
+WASMTIME = os.environ.get("WASMTIME") or shutil.which(
+    "wasmtime", path=os.pathsep.join(d for d in os.environ.get("PATH", "").split(os.pathsep)
+                                     if os.path.basename(d.rstrip("/")) != "shims")) or "wasmtime"
 
 # One trap, two spellings.  warmc's message is the key; any listed wasmtime
 # substring matches.  A pair of traps whose texts do not line up is reported,
@@ -146,10 +152,35 @@ def export_names(wasm):
             names.append(m.group(1))
     return names
 
-def compare_export(binary, module, wasm, name):
-    """(ok, message-or-None, skipped)."""
-    w = sh(RUN + [binary, module, name])
-    t = sh([WASMTIME, "run", "-C", "cache=y", "--invoke", name, wasm])
+def wasmtime_version():
+    return sh([WASMTIME, "--version"]).stdout.strip()
+
+
+def wasmtime_answers(wasm, exports, version, pool):
+    """{export: CompletedProcess} of wasmtime's runs of the module's exports,
+    kept in test/testcache under wasmtime's version, the module's bytes and
+    the export: each run is a wasmtime process, some three thousand a row,
+    and they were most of the longest row's time"""
+    def one(e):
+        k = testcache.key("wasmtime invoke", version, testcache.File(wasm), e)
+        v = testcache.get("ref", k)
+        if v is None:
+            t = sh([WASMTIME, "run", "-C", "cache=y", "--invoke", e, wasm])
+            v = [t.returncode, t.stdout, t.stderr]
+            if t.returncode != 124:
+                testcache.put("ref", k, v)
+        return subprocess.CompletedProcess([], *v)
+    return dict(zip(exports, pool.map(one, exports)))
+
+
+def compare_export(binary, module, wasm, name, t):
+    """(ok, message-or-None, skipped), t being wasmtime's run.  warmc's run
+    is kept in test/testcache under the program's bytes."""
+    def launch():
+        r = sh(RUN + [binary, module, name])
+        return (None if r.returncode == 124 else r.returncode), r.stdout, r.stderr
+    rc, out, err = testcache.run(binary, RUN + [module, name], launch)
+    w = subprocess.CompletedProcess([], 124 if rc is None else rc, out, err)
 
     wtrap, ttrap = trap_of(w, "warmc"), trap_of(t, "wasmtime")
     if wtrap or ttrap:
@@ -256,11 +287,18 @@ def main():
         return 1
 
     jobs = []
-    for _i, name, wasm, _o in live:
-        if only and name not in only:
-            continue
-        for export in export_names(wasm):
-            jobs.append((name, wasm, export))
+    answers = {}
+    version = wasmtime_version()
+    with concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(96, 3 * (os.cpu_count() or 4))) as pool:
+        for _i, name, wasm, _o in live:
+            if only and name not in only:
+                continue
+            exports = export_names(wasm)
+            answers.update({(wasm, e): t for e, t in
+                            wasmtime_answers(wasm, exports, version, pool).items()})
+            for export in exports:
+                jobs.append((name, wasm, export))
 
     total = fails = skips = 0
     msgs = []
@@ -271,7 +309,7 @@ def main():
     with concurrent.futures.ThreadPoolExecutor(
             max_workers=min(96, 3 * (os.cpu_count() or 4))) as pool:
         results = pool.map(
-            lambda j: compare_export(binary, j[0], j[1], j[2]), jobs)
+            lambda j: compare_export(binary, j[0], j[1], j[2], answers[(j[1], j[2])]), jobs)
         for ok, msg, skipped in results:
             total += 1
             if skipped:
