@@ -123,7 +123,7 @@ static Bytes arena_take(Arena *a, WBuf *scratch) {
 static Bytes arena_bytes(Arena *a, const void *p, size_t n) {
   Bytes out;
   uint8_t *q = arena_alloc(a, n ? n : 1);
-  memcpy(q, p, n);
+  if (n) memcpy(q, p, n);
   out.p = q;
   out.n = (uint32_t)n;
   return out;
