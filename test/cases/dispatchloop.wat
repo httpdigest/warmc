@@ -6,6 +6,10 @@
 ;; that self edge, which defines them: a value made in the header after their
 ;; last use there took their register, and every case that read the program
 ;; counter read an address.  -O0 trapped out of bounds and -O2 never stopped.
+;; The program it runs goes round 30000 times (the word at 65556), not
+;; interp's 3000000: with every pass off that was 13.5 billion instructions,
+;; which under make check's load ran past the cases' 30 s, and wasm-interp
+;; took 43 s over the answer.
 (module
   (memory (;0;) 2)
   (global (;0;) (mut i32) i32.const 6220)
@@ -422,7 +426,7 @@
     i32.const -1
   )
   (data (;0;) (i32.const 65544) "\09")
-  (data (;1;) (i32.const 65556) "\c0\c6-\00\09\00\00\00\01\00\00\00\08")
+  (data (;1;) (i32.const 65556) "\30\75\00\00\09\00\00\00\01\00\00\00\08")
   (data (;2;) (i32.const 65580) "\1f\00\00\00\03\00\00\00\08\00\00\00\01\00\00\00\01\00\00\00\08")
   (data (;3;) (i32.const 65612) "\07\00\00\00\0b\00\00\00\0a\00\00\00\09\00\00\00\00\00\00\00\08\00\00\00\01\00\00\00\07\00\00\00\04\00\00\00\09\00\00\00\01\00\00\00\06\00\00\00\08\00\00\00\08\00\00\00\00\00\00\00\0c")
 )
