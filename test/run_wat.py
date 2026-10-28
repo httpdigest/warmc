@@ -118,13 +118,22 @@ def verdicts(sh, cmd, paths, timeout):
         return got
     r = sh(list(cmd) + list(paths), timeout=timeout * len(paths))
     out = r.stdout.decode("utf-8", "replace") if isinstance(r.stdout, bytes) else r.stdout
-    want = set(paths)
+    # a line each, in the order given: warmc says the path as it got it,
+    # which MSYS hands a native Windows program in Windows' spelling,
+    # D:/a/x.wat for /d/a/x.wat -- so by order, the file's name to match
+    k = 0
     for ln in out.splitlines():
-        path, tab, verdict = ln.partition("\t")
+        said, tab, verdict = ln.partition("\t")
         code, _, msg = verdict.partition(" ")
-        if tab and path in want and code.isdigit():
-            got[path] = (int(code), "" if code == "0" else msg)
+        if k < len(paths) and tab and code.isdigit() and same_name(said, paths[k]):
+            got[paths[k]] = (int(code), "" if code == "0" else msg)
+            k += 1
     return got
+
+
+def same_name(said, path):
+    """whether warmc's spelling of a path names path's file"""
+    return said.replace("\\", "/").rsplit("/", 1)[-1] == os.path.basename(path)
 
 def first_line(b):
     for ln in b.decode("utf-8", "replace").splitlines():

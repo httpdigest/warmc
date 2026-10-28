@@ -40,10 +40,23 @@ ROWKEY=$(python3 test/testcache.py key --file test/run_traps.sh --file test/host
 if python3 test/testcache.py get row "$ROWKEY"; then exit 0; fi
 
 pass=0; fail=0
+# Windows commits a memory's pages when it is made (rt/rt.c), so a run with
+# mem64big's 4 GiB memory cannot start while the rows beside it hold the
+# commit charge for that moment: CI's runner refused big_past so after the
+# group's first eleven had run.  With COMMIT_RETRY set such a start is tried
+# again, a few seconds later, up to five times -- what is checked is the
+# trap, not how much Windows has left to commit.
+COMMIT_RETRY=0
 expect() {
   local name="$1" want="$2"
-  local out rc
-  out=$(wruntimeout $WARMC_RUN "${BIN[@]}" "$name" 2>&1); rc=$?
+  local out rc try=0
+  while :; do
+    out=$(wruntimeout $WARMC_RUN "${BIN[@]}" "$name" 2>&1); rc=$?
+    [ "$COMMIT_RETRY" = 1 ] && [ "$try" -lt 5 ] &&
+      [[ "$out" == *"cannot commit initial linear memory"* ]] || break
+    try=$((try + 1))
+    sleep 3
+  done
   if [ "$want" = "OK" ]; then
     if [ "$rc" -eq 0 ]; then pass=$((pass+1)); else
       echo "FAIL[traps] $name: expected success, got rc=$rc: $out"; fail=$((fail+1)); fi
@@ -335,6 +348,7 @@ case "$(uname -s)" in
                                   *) mem64big=0 ;; esac ;;
 esac
 if [ "$mem64big" = 1 ]; then
+  case "$(uname -s)" in MINGW*|CLANG*|MSYS*) COMMIT_RETRY=1 ;; esac
   BIN=("$ALL" mem64big)
   for e in big_size big_widths big_offset big_active big_last big_grow big_grow_cap \
            big_fill big_copy big_init big_loop; do
@@ -344,6 +358,7 @@ if [ "$mem64big" = 1 ]; then
            big_loop_past; do
     expect "$e" "out of bounds memory access"
   done
+  COMMIT_RETRY=0
 fi
 
 echo "traps: $pass passed, $fail failed"

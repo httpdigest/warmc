@@ -348,18 +348,24 @@ def _sweep(jobs_in, what):
             rc, so, se = run([WARMC, "--validate-only"] + [paths[i] for i in group])
         except subprocess.TimeoutExpired:
             so = None
+        # a line each, in the order given: warmc says the path as it got
+        # it, which MSYS hands a native Windows program in Windows'
+        # spelling, D:/a/p0.wasm for /d/a/p0.wasm -- so by order, the
+        # file's name to match
         verdicts = {}
         for line in (so or "").splitlines():
-            path, _, rest = line.partition("\t")
+            said, tab, rest = line.partition("\t")
             code, _, msg = rest.partition(" ")
-            if code.isdigit():
-                verdicts[path] = (int(code), msg)
+            k = len(verdicts)
+            if k < len(group) and tab and code.isdigit() and \
+                    said.replace("\\", "/").rsplit("/", 1)[-1] == os.path.basename(paths[group[k]]):
+                verdicts[group[k]] = (int(code), msg)
         if so is None or len(verdicts) != len(group) or "AddressSanitizer" in se or \
                 "runtime error" in se:
             return [_verdict(jobs_in[i][0], paths[i]) for i in group]
         out = []
         for i in group:
-            code, msg = verdicts[paths[i]]
+            code, msg = verdicts[i]
             if code not in (0, 2, 3):
                 out.append("%s gave exit %d (not a verdict): %s" % (jobs_in[i][0], code, msg[:160]))
             elif code == 0:

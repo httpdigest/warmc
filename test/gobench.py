@@ -85,6 +85,8 @@ import sys
 import tempfile
 import time
 
+import hostbuild
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILD = os.environ.get("BUILD", "build")
 WARMC = os.path.join(ROOT, BUILD, "warmc") + (".exe" if os.name == "nt" else "")
@@ -550,7 +552,7 @@ def teavm_driver():
     part = os.path.join(staging(), "driver")
     shutil.rmtree(part, ignore_errors=True)
     r = sh(["javac", "--release", "17", "-nowarn", "-cp",
-            os.path.join(TEAVM_DIR, "*"), "-d", part, src])
+            hostbuild.classpath(os.path.join(TEAVM_DIR, "*")), "-d", part, src])
     if r.returncode != 0:
         print("javac %s failed:\n%s" % (src, r.stderr[:400]), file=sys.stderr)
         return None
@@ -588,8 +590,9 @@ def run_teavm(names):
     for n in names:
         outs[n] = os.path.join(part, n + ".teavm")
         shutil.rmtree(outs[n], ignore_errors=True)
-        jobs.append("%s=%s" % (java_dir(n), outs[n]))
-    cmd = ["java", "-cp", os.pathsep.join([TEAVM_PATCHED, os.path.join(TEAVM_DIR, "*"), driver]),
+        # SRC=DST, of which MSYS2 converts only DST for a Windows JVM
+        jobs.append("%s=%s" % (hostbuild.winpath(java_dir(n)), hostbuild.winpath(outs[n])))
+    cmd = ["java", "-cp", hostbuild.classpath(TEAVM_PATCHED, os.path.join(TEAVM_DIR, "*"), driver),
            "warmc.teavm.TeaVMBuild", "--teavm", TEAVM_DIR]
     if CORPUS in TEAVM_STRICT:
         cmd.append("--strict")
