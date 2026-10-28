@@ -60,8 +60,8 @@ static const char *usage_text =
   "                O1 the optimising pipeline, O2 adds guard pages,\n"
   "                inlining, devirtualisation, unrolling and gcpure.\n"
   "                O3 adds the passes that change what a program can see,\n"
-  "                fma and dead-frames, described below: every optimisation\n"
-  "                warmc has, where O2 keeps wasm's semantics.\n"
+  "                fma, dead-frames and acc-tail, described below: every\n"
+  "                optimisation warmc has, where O2 keeps wasm's semantics.\n"
   "                -fno-inline turns inlining off, and src/inline.c has the\n"
   "                measurements that decided both.  Options apply in order,\n"
   "                so a -f flag goes after the -O it amends\n"
@@ -73,7 +73,8 @@ static const char *usage_text =
   "                prune, merge, devirt, reinline, throw-jump, closed-world,\n"
   "                sealed, once, gcpure, split, labcache, ifconv, mulwide,\n"
   "                barelide, small-loop-align, trampoline, go-sp, go-resume,\n"
-  "                go-noret, wrap-params, fma, dead-frames, exact-trap\n"
+  "                go-noret, wrap-params, fma, dead-frames, acc-tail,\n"
+  "                exact-trap\n"
   "                fma is off below -O3: it fuses a float multiply\n"
   "                into the add that reads it, rounded once, which is not\n"
   "                wasm's arithmetic and can change a result's last bit\n"
@@ -82,6 +83,13 @@ static const char *usage_text =
   "                returns, and removes the stores into it nothing reads\n"
   "                before then; wasm keeps them, so a program that reads\n"
   "                stack memory it never wrote can see other bytes\n"
+  "                acc-tail is off below -O3: a function of at most 64\n"
+  "                instructions whose result is, one way, its own call's\n"
+  "                result added, multiplied, and'ed, or'ed or xor'ed with\n"
+  "                something else, nothing but pure work after the call,\n"
+  "                loops with an accumulator, one call a level fewer; so a\n"
+  "                recursion that never ends loops for ever, where wasm\n"
+  "                runs out of stack and traps\n"
   "                exact-trap is off at every level: with it, memory,\n"
   "                tables and globals hold what wasm says when a trap\n"
   "                happens -- every write before the trapping instruction\n"
@@ -96,8 +104,8 @@ static const char *usage_text =
   "                memory's size, on AArch64 tests a store wider than a byte\n"
   "                and a short bulk op before it is made, where a fault on\n"
   "                the guard page could leave it half written, and turns\n"
-  "                off trampoline, go-sp and dead-frames, which no flag then\n"
-  "                turns back on\n"
+  "                off trampoline, go-sp, dead-frames and acc-tail, which\n"
+  "                no flag then turns back on\n"
   "                labcache and barelide build on what the collector\n"
   "                allows -- the allocation buffer kept open over a loop of\n"
   "                small allocations, the load-barrier mask kept over a loop\n"
@@ -398,7 +406,7 @@ static void set_level(OptOpts *o, int level) {
   o->align = o->split = o->trampoline = o->go_sp = level >= 1;
   o->guard_pages = o->inl = o->devirt = o->unroll = o->gcpure = level >= 2;
   /* -O3: also the passes that change what a program can see */
-  o->fma = o->dead_frames = level >= 3;
+  o->fma = o->dead_frames = o->acc_tail = level >= 3;
 }
 
 static void print_stats(void) {
@@ -406,7 +414,7 @@ static void print_stats(void) {
           "warmc stats: folded=%llu dce=%llu cse=%llu licm=%llu branch=%llu\n"
           "             loads_fwd=%llu dead_stores=%llu checks_removed=%llu params=%llu\n"
           "             strength=%llu inlined=%llu rotated=%llu vectorised=%llu\n"
-          "             self_tail=%llu ldcomb=%llu spills=%llu insts=%llu\n"
+          "             self_tail=%llu acc_tail=%llu ldcomb=%llu spills=%llu insts=%llu\n"
           "             ldpairs=%llu stpairs=%llu cold_frames=%llu early_rets=%llu entry_checks=%llu loop_phases=%llu"
           " exact_store_checks=%llu exact_memop_checks=%llu\n"
           "             reloads=%llu caller_saves=%llu csa_restores=%llu"
@@ -439,6 +447,7 @@ static void print_stats(void) {
           (unsigned long long)g_stats.rotated,
           (unsigned long long)g_stats.vectorized,
           (unsigned long long)g_stats.self_tail,
+          (unsigned long long)g_stats.acc_tail,
           (unsigned long long)g_stats.loads_combined,
           (unsigned long long)g_stats.spills,
           (unsigned long long)g_stats.insts_emitted,
@@ -1229,6 +1238,7 @@ static int warmc_main(int argc, char **argv) {
       else if (!strcmp(name, "mulwide")) opt.mulwide = on;
       else if (!strcmp(name, "fma")) opt.fma = on;
       else if (!strcmp(name, "dead-frames")) opt.dead_frames = on;
+      else if (!strcmp(name, "acc-tail")) opt.acc_tail = on;
       else if (!strcmp(name, "exact-trap")) opt.exact_trap = on;
       else if (!strcmp(name, "gcpure")) opt.gcpure = on;
       else if (!strcmp(name, "closed-world")) opt.closed_world = on;
@@ -1242,7 +1252,7 @@ static int warmc_main(int argc, char **argv) {
   /* -fexact-trap: these keep what a trap would see where it cannot see it,
      a global in an argument or a frame's stores left out, whatever their
      own flags and their order say */
-  if (opt.exact_trap) opt.trampoline = opt.go_sp = opt.dead_frames = false;
+  if (opt.exact_trap) opt.trampoline = opt.go_sp = opt.dead_frames = opt.acc_tail = false;
   if (!input) { fputs(usage_text, stderr); return 2; }
   /* A library's runtime finds its module as warmc_module; the prefix names
      the library's C helpers instead. */

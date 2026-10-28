@@ -1627,6 +1627,86 @@ static bool web_conflict(const Interval *iv, uint32_t a, uint32_t b,
   return false;
 }
 
+/* Whether x is live just after position p of block bi: made by then --
+   earlier in bi, or live into it -- and read after, later in bi or out of
+   it.  Two made at p, a block's params, are taken to be.  (A value made
+   later in bi never decides: the earlier one, if their intervals overlap,
+   is live past it.) */
+typedef struct {
+  Isel *s;
+  const int32_t *num;
+  Ref *eu;
+  uint32_t eucap;
+  uint64_t budget;
+} LiveAfter;
+
+static bool live_out_has(const Isel *s, uint32_t bi, Ref v) {
+  uint32_t a = s->lv_out_off[bi], b = s->lv_out_off[bi + 1];
+  while (a < b) {
+    uint32_t m = a + (b - a) / 2;
+    if (s->lv_out[m] < v) a = m + 1; else b = m;
+  }
+  return a < s->lv_out_off[bi + 1] && s->lv_out[a] == v;
+}
+
+static bool live_after(LiveAfter *la, Ref x, uint32_t bi, int32_t p) {
+  Isel *s = la->s;
+  IrFunc *f = s->f;
+  if (f->insts[x].block == bi) {
+    if (la->num[x] >= p) return la->num[x] == p;
+  } else if (!live_in_has(s, bi, x)) {
+    return false;
+  }
+  /* what the block's end reads -- its branch's operands, the values it
+     returns and hands on -- is live out of it already */
+  if (live_out_has(s, bi, x)) return true;
+  Block *b = &f->blocks[bi];
+  for (uint32_t i = 0; i < b->ninsts; i++) {
+    Ref r = b->insts[i];
+    if (la->num[r] <= p) continue;
+    la->budget++;
+    uint32_t ne = eff_uses(s, f, r, la->eu, la->eucap);
+    for (uint32_t j = 0; j < ne; j++)
+      if (la->eu[j] == x) return true;
+  }
+  return false;
+}
+
+/* Whether two webs' values are ever live at once, by the values' liveness
+   rather than their intervals: an interval runs from a value's first
+   position to its last, so a loop counter read on a cold exit laid out
+   after the loop spans its successor's definition, though it is dead
+   there, and the back edge kept a move of its own.  Webs of more than a
+   few values, and functions past the budget, keep the interval's answer. */
+#define LA_PAIRS 16
+static bool web_interferes(LiveAfter *la, const Interval *iv, uint32_t a, uint32_t b,
+                           const uint32_t *next) {
+  IrFunc *f = la->s->f;
+  uint32_t na = 0, nb = 0;
+  int32_t sa = INT32_MAX, ea = -1, sb = INT32_MAX, eb = -1;
+  for (uint32_t x = a; x != UINT32_MAX; x = next[x]) {
+    na++;
+    if (iv[x].start < sa) sa = iv[x].start;
+    if (iv[x].end > ea) ea = iv[x].end;
+  }
+  for (uint32_t y = b; y != UINT32_MAX; y = next[y]) {
+    nb++;
+    if (iv[y].start < sb) sb = iv[y].start;
+    if (iv[y].end > eb) eb = iv[y].end;
+  }
+  if (na * nb > LA_PAIRS || la->budget > 4 * (uint64_t)f->ninsts + 4096) return true;
+  /* only for an argument's web, a, short beside the parameter's, b: a
+     quarter of its span at most, as a counter's step is */
+  if (4 * (int64_t)(ea - sa) > (int64_t)(eb - sb)) return true;
+
+  for (uint32_t x = a; x != UINT32_MAX; x = next[x])
+    for (uint32_t y = b; y != UINT32_MAX; y = next[y])
+      if (live_after(la, x, f->insts[y].block, la->num[y]) ||
+          live_after(la, y, f->insts[x].block, la->num[x]))
+        return true;
+  return false;
+}
+
 /* web b's members merged into web a's, both in order of their starts */
 static void web_merge(const Interval *iv, uint32_t *head, uint32_t *tail,
                       uint32_t b, uint32_t *next) {
@@ -1804,6 +1884,8 @@ static void regalloc_linear(Isel *s) {
   int co_max = co_max_s ? atoi(co_max_s) : -1, co_done = 0;
   bool co_dbg = warmc_getenv("WARMC_COALESCE_DEBUG") != NULL;
   bool co_ok = !warmc_getenv("WARMC_NO_COALESCE");
+  bool exact = !warmc_getenv("WARMC_NO_COALESCE_EXACT");
+  LiveAfter la = { s, num, eu, eucap, 0 };
   if (co_ok && co_only) co_ok = (uint32_t)atoi(co_only) == f->func_index;
   if (co_ok && co_upto) co_ok = f->func_index <= (uint32_t)atoi(co_upto);
   if (co_ok)
@@ -1838,13 +1920,26 @@ static void regalloc_linear(Isel *s) {
           if (ra == rp) continue;
           if (s->pinned[arg] || s->pinned[ra] || s->pinned[rp]) continue;
 
-          if (web_conflict(iv, mem_head[ra], mem_head[rp], mem_next)) continue;
+          /* The exact test only on a loop's back edge, whose moves run
+             every iteration.  On a forward edge it took the moves out of
+             switch cases and coalesced constants, which an edge makes again
+             in place, into registers held from the function's entry:
+             asbench/strswitch 1.11, stdgo/closures 1.05, asbench/switchtab
+             and cppbench/vector 1.04.  An argument live through most of the
+             loop, made one web with the parameter, was spilled whole where
+             the two had kept registers: rsbench/tokenize's outer loop,
+             1.044. */
+          bool by_exact = web_conflict(iv, mem_head[ra], mem_head[rp], mem_next);
+          if (by_exact && (!exact || sb->rpo < b->rpo ||
+                           web_interferes(&la, iv, mem_head[ra], mem_head[rp], mem_next)))
+            continue;
           if (co_max >= 0 && co_done >= co_max) continue;
           if (co_dbg)
             fprintf(stderr, "coalesce[%u] #%d: v%u[%d,%d) <- v%u[%d,%d)"
-                            " (block %u param %u, edge from %u)\n",
+                            " (block %u param %u, edge from %u)%s\n",
                     f->func_index, co_done, rp, iv[rp].start, iv[rp].end,
-                    ra, iv[ra].start, iv[ra].end, bi, p, src);
+                    ra, iv[ra].start, iv[ra].end, bi, p, src,
+                    by_exact ? " by liveness" : "");
           co_done++;
           web[ra] = rp;
 

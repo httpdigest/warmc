@@ -160,6 +160,8 @@
       (br_if $fill (i32.lt_u (local.get $i) (i32.const 8))))
     (call $fmany_rec (local.get 0)))
 
+  ;; a difference, not a sum, which -O3 would carry round as a loop (opt.c
+  ;; pass_acc_tail) that never runs out of stack
   (func $deep (export "deep") (param i32) (result i32)
-    (i32.add (call $deep (i32.add (local.get 0) (i32.const 1))) (local.get 0)))
+    (i32.sub (call $deep (i32.add (local.get 0) (i32.const 1))) (local.get 0)))
 )

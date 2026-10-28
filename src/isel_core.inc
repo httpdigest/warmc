@@ -242,6 +242,14 @@ typedef struct {
 
   int vmctx_reg, membase_reg;
 
+  /* Full adders (arm64, find_full_adders): FA_* bits at the add or sub that
+     takes the carry in and at the or that is the carry out; and the carry
+     out the flag holds since the epoch, with its sense. */
+  uint8_t *fa;
+  Ref fa_flag;
+  uint32_t fa_epoch;
+  bool fa_sub;
+
   int fl_kind;
   Ref fl_a, fl_b;
   uint64_t fl_imm;

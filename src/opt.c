@@ -1400,6 +1400,20 @@ static bool ifc_recurrence(IrFunc *f, uint32_t ji, uint32_t p, Ref cond) {
   return n && ifc_reaches(f, cond, hp, n, 8);
 }
 
+/* A test of one bit of a value: x & 2^k against 0 or 2^k, or the bare and */
+static bool ifc_one_bit(IrFunc *f, Ref c) {
+  const Inst *in = &f->insts[c];
+  uint64_t k = 0, m;
+  if ((in->op == I_NE || in->op == I_EQ) && in->nargs == 2 &&
+      is_const(f, ir_args(f, c)[1], &k))
+    c = ir_resolve(f, ir_args(f, c)[0]);
+  else if (in->op == I_EQZ && in->nargs == 1)
+    c = ir_resolve(f, ir_args(f, c)[0]);
+  in = &f->insts[c];
+  return in->op == I_AND && in->nargs == 2 && is_const(f, ir_args(f, c)[1], &m) &&
+         m && !(m & (m - 1)) && (k == 0 || k == m);
+}
+
 #define IFC_REJ(why) do { if (g_ifc.dbg > 1) \
     fprintf(stderr, "ifc %s b%u reject: %s (depth %u)\n", \
             f->m->funcs[f->func_index].sym, bi, why, b->loop_depth); \
@@ -1488,7 +1502,16 @@ static bool ifc_try(IrFunc *f, uint32_t bi, IfcCtx *cx) {
     if (b->loop_depth && dc > hi && ifc_recurrence(f, ji, p, cond))
       IFC_REJ("condition is the loop's own");
     if (dc > hi) hi = dc;
-    if (hi + 1 - lo > (uint32_t)g_ifc.crit) IFC_REJ("latency");
+    /* In a loop, a test of one bit of a value it computes, not loads --
+       hashed or mixed bits, which a branch guesses wrong half the time --
+       takes the select however late its condition is: each iteration's
+       waits on a condition the next does not, and out of order that is
+       hidden (hsbench/bits' testBit 17 of a splitmix value, 0.53x).  A
+       comparison keeps the rule: javabench/strbuild's digit counts and
+       asbench/smallint's bounds, guessed well, ran 1.03x as selects. */
+    if (hi + 1 - lo > (uint32_t)g_ifc.crit &&
+        !(b->loop_depth && !(dcl & IFC_LOADED) && ifc_one_bit(f, cond)))
+      IFC_REJ("latency");
     pt[nsel] = tv; pf[nsel] = fv; pty[nsel] = t; nsel++;
   }
 
@@ -2434,6 +2457,19 @@ static bool fold_order_cmp(IrFunc *f, uint32_t bi, uint32_t *idx, Ref v) {
 
 /* eq or ne of a bool -- a value only bit 0 of which can be set -- against 0
    or 1: the bool itself, or its eqz. */
+/* x == c or x != c where c has a bit x never has: decided, whatever x is */
+static bool fold_cmp_never(IrFunc *f, Ref v) {
+  Inst *in = &f->insts[v];
+  Ref *a = ir_args(f, v);
+  uint64_t c;
+  if (in->nargs != 2 || !is_const(f, a[1], &c)) return false;
+  ValType t = (ValType)f->insts[a[0]].type;
+  if ((t != VT_I32 && t != VT_I64) || !(c & ~ir_known_bits(f, a[0], KB_DEPTH)))
+    return false;
+  replace_with_const(f, v, in->op == I_NE);
+  return true;
+}
+
 static bool fold_bool_cmp(IrFunc *f, Ref v) {
   Inst *in = &f->insts[v];
   Ref *a = ir_args(f, v);
@@ -3818,6 +3854,7 @@ static bool fold_block(IrFunc *f, uint32_t bi, const OptOpts *o, const uint32_t 
       }
       case I_EQ: case I_LES: case I_LEU: case I_GES: case I_GEU:
         if (in->nargs == 2 && a[0] == a[1]) { replace_with_const(f, v, 1); changed = true; g_stats.folded++; }
+        else if (in->op == I_EQ && fold_cmp_never(f, v)) { changed = true; g_stats.folded++; }
         else if (fold_order_cmp(f, bi, &i, v)) {
           in = &f->insts[v]; a = ir_args(f, v);
           changed = true; g_stats.folded++;
@@ -3845,6 +3882,7 @@ static bool fold_block(IrFunc *f, uint32_t bi, const OptOpts *o, const uint32_t 
         break;
       case I_NE: case I_LTS: case I_LTU: case I_GTS: case I_GTU:
         if (in->nargs == 2 && a[0] == a[1]) { replace_with_const(f, v, 0); changed = true; g_stats.folded++; }
+        else if (in->op == I_NE && fold_cmp_never(f, v)) { changed = true; g_stats.folded++; }
         else if (fold_order_cmp(f, bi, &i, v)) {
           in = &f->insts[v]; a = ir_args(f, v);
           changed = true; g_stats.folded++;
@@ -21937,6 +21975,183 @@ static bool pass_self_tail(IrFunc *f) {
   return true;
 }
 
+/* Tail recursion through an accumulator, at -O3 only (-facc-tail).  A
+   function whose result is, on some path, f(args') op x -- op an add,
+   multiply, and, or or xor, which associate and commute; the call's result
+   read by op alone, and nothing after the call but pure work -- loops
+   instead, as LLVM's TailCallElim has it: a header takes the parameters
+   and an accumulator, op's identity on entry; that path hands it args' and
+   acc op x; every return gives acc op v.  A tree walk's
+   walk(left) + walk(right) makes one call a level where it made two
+   (ktbench/bintree 0.85), a sum or a factorial none.  A path's result may
+   also reach a block that only returns its parameter.  Not at -O2: a
+   recursion that never ends then loops instead of running out of stack,
+   which wasm can see -- the spec's fac.wast asserts that fac-rec of 2^30
+   exhausts the stack, and Java's StackOverflowError is caught by programs
+   that recurse to find their depth. */
+typedef struct { uint32_t b; Ref call, v, x; } AccSite;
+
+/* op's identity on t, or false where op has none here */
+static bool acc_identity(uint16_t op, ValType t, uint64_t *id) {
+  uint64_t all = t == VT_I64 ? ~0ull : 0xffffffffu;
+  switch (op) {
+    case I_ADD: case I_OR: case I_XOR: *id = 0; return true;
+    case I_MUL: *id = 1; return true;
+    case I_AND: *id = all; return true;
+    default: return false;
+  }
+}
+
+/* the value block bi gives as the function's result, by its own return or
+   by a jump to a block that only returns its one parameter */
+static Ref acc_result(IrFunc *f, uint32_t bi) {
+  Block *b = &f->blocks[bi];
+  if (b->term == T_RETURN && b->nret == 1) return b->ret_args[0];
+  if (b->term != T_JUMP || b->nsuccs != 1 || b->succs[0].nargs != 1) return REF_NONE;
+  Block *r = &f->blocks[b->succs[0].target];
+  if (r->ninsts || r->nparams != 1 || r->term != T_RETURN || r->nret != 1 ||
+      r->ret_args[0] != r->params[0])
+    return REF_NONE;
+  return b->succs[0].args[0];
+}
+
+/* A body past this many instructions is left be: TeaVM unrolls fib into
+   itself some levels, and a loop round 1,700 instructions saved one call
+   of many and ran javabench/recur 2.15 times as long. */
+#define ACC_TAIL_MAX 64
+
+static bool pass_acc_tail(IrFunc *f) {
+  if (f->npads || f->sig->nresults != 1) return false;
+  uint32_t size = 0;
+  for (uint32_t oi = 0; oi < f->norder; oi++) size += f->blocks[f->order[oi]].ninsts;
+  if (size > ACC_TAIL_MAX) return false;
+  ValType t = f->sig->results[0];
+  uint32_t np = f->sig->nparams;
+  if (f->blocks[f->entry].nparams != np) return false;
+  for (uint32_t i = 0; i < f->ninsts; i++) {
+    uint16_t op = f->insts[i].op;
+    if (op == I_RETURN_CALL || op == I_RETURN_CALL_INDIRECT || op == I_RETURN_CALL_REF)
+      return false;
+  }
+
+  uint32_t *uses = count_uses(f);
+  AccSite *site = NULL;
+  uint32_t ns = 0, cap = 0;
+  uint16_t accop = I_NOP;
+  for (uint32_t oi = 0; oi < f->norder; oi++) {
+    uint32_t bi = f->order[oi];
+    Block *b = &f->blocks[bi];
+    Ref v = acc_result(f, bi);
+    if (v == REF_NONE) continue;
+    const Inst *vi = &f->insts[v];
+    uint64_t id;
+    if (vi->nargs != 2 || !acc_identity(vi->op, t, &id)) continue;
+    if (accop != I_NOP && vi->op != accop) continue;
+    Ref *va = ir_args(f, v), c = REF_NONE, x = REF_NONE;
+    for (int k = 0; k < 2 && c == REF_NONE; k++) {
+      const Inst *ci = &f->insts[va[k]];
+      if (ci->op != I_CALL || ci->imm != f->func_index || ci->nargs != np ||
+          ci->block != bi || uses[va[k]] != 1)
+        continue;
+      /* after the call, the op and work that may run before the next
+         level's instead of after it: pure, which cannot trap either */
+      bool ok = true, after = false;
+      for (uint32_t i = 0; i < b->ninsts && ok; i++) {
+        Ref u = b->insts[i];
+        if (u == va[k]) { after = true; continue; }
+        if (!after || u == v) continue;
+        ok = ir_is_pure(&f->insts[u]);
+      }
+      if (ok) { c = va[k]; x = va[1 - k]; }
+    }
+    if (c == REF_NONE) continue;
+    if (ns == cap) { cap = cap ? 2 * cap : 4; site = xrealloc(site, cap * sizeof *site); }
+    site[ns++] = (AccSite){ bi, c, v, x };
+    accop = vi->op;
+  }
+  xfree(uses);
+  if (!ns) { xfree(site); return false; }
+
+  /* the entry's work to a header of the parameters and the accumulator */
+  uint32_t entry = f->entry;
+  Ref *eparam = xmalloc((np ? np : 1) * sizeof(Ref));
+  memcpy(eparam, f->blocks[entry].params, np * sizeof(Ref));
+  uint32_t hb = ir_new_block(f);
+  Ref *hparam = xmalloc((np + 1) * sizeof(Ref));
+  for (uint32_t i = 0; i < np; i++) hparam[i] = ir_add_param(f, hb, f->sig->params[i]);
+  Ref acc = hparam[np] = ir_add_param(f, hb, t);
+
+  Block *e = &f->blocks[entry], *h = &f->blocks[hb];
+  h->insts = e->insts; h->ninsts = e->ninsts; h->cap_insts = e->cap_insts;
+  e->insts = NULL; e->ninsts = e->cap_insts = 0;
+  for (uint32_t i = 0; i < h->ninsts; i++) f->insts[h->insts[i]].block = hb;
+  h->term = e->term; h->term_arg = e->term_arg; h->term_imm = e->term_imm;
+  h->succs = e->succs; h->nsuccs = e->nsuccs; h->cap_succs = e->cap_succs;
+  h->ret_args = e->ret_args; h->nret = e->nret; h->cap_ret = e->cap_ret;
+  e->succs = NULL; e->nsuccs = e->cap_succs = 0;
+  e->ret_args = NULL; e->nret = e->cap_ret = 0;
+  h->sealed = h->filled = h->reachable = true;
+  for (uint32_t k = 0; k < ns; k++)
+    if (site[k].b == entry) site[k].b = hb;
+
+  for (uint32_t i = 0; i < f->ninsts; i++) {
+    Inst *in = &f->insts[i];
+    Ref *a = ir_args(f, i);
+    for (uint32_t j = 0; j < in->nargs; j++)
+      for (uint32_t p = 0; p < np; p++)
+        if (a[j] == eparam[p]) { a[j] = hparam[p]; break; }
+  }
+  for (uint32_t bi = 0; bi < f->nblocks; bi++) {
+    Block *b = &f->blocks[bi];
+    for (uint32_t p = 0; p < np; p++) {
+      if ((b->term == T_BRIF || b->term == T_BRTABLE) && b->term_arg == eparam[p])
+        b->term_arg = hparam[p];
+      for (uint32_t j = 0; j < b->nret; j++)
+        if (b->ret_args[j] == eparam[p]) b->ret_args[j] = hparam[p];
+      for (uint32_t s2 = 0; s2 < b->nsuccs; s2++)
+        for (uint32_t j = 0; j < b->succs[s2].nargs; j++)
+          if (b->succs[s2].args[j] == eparam[p]) b->succs[s2].args[j] = hparam[p];
+    }
+  }
+  uint64_t id;
+  acc_identity(accop, t, &id);
+  Ref *ea = xmalloc((np + 1) * sizeof(Ref));
+  memcpy(ea, eparam, np * sizeof(Ref));
+  ea[np] = ir_const(f, entry, t, id);
+  f->blocks[entry].term = T_JUMP;
+  ir_add_edge(f, entry, hb, ea, np + 1);
+
+  /* each site hands the header its call's arguments and acc op x */
+  for (uint32_t k = 0; k < ns; k++) {
+    Block *b = &f->blocks[site[k].b];
+    memcpy(ea, ir_args(f, site[k].call), np * sizeof(Ref));
+    Ref *va = ir_args(f, site[k].v), x = site[k].x;
+    for (uint32_t p = 0; p < np; p++)
+      if (x == eparam[p]) x = hparam[p];
+    va[0] = acc;
+    va[1] = x;
+    ea[np] = site[k].v;
+    ir_make_nop(&f->insts[site[k].call]);
+    b->nsuccs = 0;
+    b->nret = 0;
+    b->term = T_JUMP;
+    ir_add_edge(f, site[k].b, hb, ea, np + 1);
+  }
+  /* and every return gives acc op its value */
+  for (uint32_t bi = 0; bi < f->nblocks; bi++) {
+    Block *b = &f->blocks[bi];
+    if (!b->reachable || b->term != T_RETURN || b->nret != 1) continue;
+    Ref a2[2] = { acc, b->ret_args[0] };
+    b->ret_args[0] = ir_emit(f, bi, (IrOp)accop, t, a2, 2, 0, 0);
+  }
+
+  xfree(ea); xfree(eparam); xfree(hparam); xfree(site);
+  ir_recompute_preds(f);
+  ir_order(f);
+  g_stats.acc_tail++;
+  return true;
+}
+
 static double pt_now(void) {
   struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
   return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
@@ -22153,6 +22368,7 @@ void ir_optimize(IrFunc *f, const OptOpts *o) {
     ir_verify(f, "post-devirt");
 
   if (o->selftail) pass_self_tail(f);
+  if (o->acc_tail && pass_acc_tail(f)) ir_verify(f, "post-acc-tail");
 
   if (o->inl && pass_inline(f, o)) {
     prune_params(f);
@@ -22163,6 +22379,7 @@ void ir_optimize(IrFunc *f, const OptOpts *o) {
     if (devirt_round(f, o))
       ir_verify(f, "post-devirt2");
   }
+
 
   opt_cleanup(f, o);
 

@@ -14,13 +14,13 @@ such sets for the 46 passes.  --strength 3 covers every triple in all eight
 combinations instead, with rows a seeded greedy search picks, which takes
 about thirty.
 
-The passes are all of -f's but four: fma and dead-frames change what a
-program can see, which these suites compare, and have rows of their own;
-gssa-all is not a pass but a stronger gssa; and exact-trap is none either,
-but a mode that turns trampoline, go-sp and dead-frames off, with rows of
-its own too.  This script reads src/main.c's
-list and fails if a pass is missing from both PASSES and LEFT_OUT, so a new
-pass joins the combinations.
+The passes are all of -f's but five: fma, dead-frames and acc-tail change
+what a program can see, which these suites compare, and have rows of their
+own; gssa-all is not a pass but a stronger gssa; and exact-trap is none
+either, but a mode that turns trampoline, go-sp, dead-frames and acc-tail
+off, with rows of its own too.  This script reads src/main.c's list and
+fails if a pass is missing from both PASSES and LEFT_OUT, so a new pass
+joins the combinations.
 
 make check's rows turn no pass off on their own: these settings are where
 each pass is off, beside every other on and off.  The cases run with the
@@ -49,7 +49,7 @@ selftail ldcomb escape partial-escape gloop loopclose cpool ictab trampoline
 go-sp go-resume go-noret wrap-params gssa small-loop-align labcache barelide merge reach
 prune devirt reinline throw-jump unroll ifconv mulwide gcpure closed-world sealed once
 compress-data""".split()
-LEFT_OUT = {"fma", "dead-frames", "gssa-all", "exact-trap"}
+LEFT_OUT = {"fma", "dead-frames", "acc-tail", "gssa-all", "exact-trap"}
 
 SUITES = {
     "cases": ["env", "WARMC_VERIFY_RA=1", "./test/run_tests.sh"],

@@ -1748,6 +1748,371 @@ static bool vshift_const(IrFunc *f, Ref v, bool left, Ref *src, int *sz,
   return true;
 }
 
+/* ---- byte shuffles ---------------------------------------------------------
+
+   i8x16.shuffle names each of the 16 bytes of its result by its place in x
+   (0-15) or y (16-31).  a64 has no one instruction for that in general, and
+   the table lookup that is (tbl) wants the 16 places in a register, and
+   two-source a second table register beside the first.  It has one for
+   each shape that occurs: a lane of either repeated (dup); lanes reversed
+   in their 16-, 32- or 64-bit containers (rev); 16 bytes of x:y at an
+   offset (ext); and two vectors' lanes interleaved, de-interleaved and
+   transposed (zip, uzp, trn) -- at 8-, 16-, 32- and 64-bit lanes, of x and
+   y in either order or of one with itself.  sh_plan takes the cheapest
+   way it finds: one of those; a vector or one of those with a few lanes
+   put in (ins); two of those, the second of the first's result; and only
+   else tbl. */
+enum { SH_MOV, SH_DUP, SH_REV, SH_EXT, SH_ZIP1, SH_ZIP2, SH_UZP1, SH_UZP2,
+       SH_TRN1, SH_TRN2, SH_INS };
+enum { SHK_PERM, SHK_INS, SHK_TBL1, SHK_TBL2 };
+
+/* op on lanes of 1 << e bytes; a and b its operands: 0 x, 1 y, 2 the first
+   step's result; k: ext's offset, rev's container (log2 bytes), dup's lane,
+   ins's lane; l: ins's source lane */
+typedef struct { uint8_t op, e, a, b, k, l; } ShStep;
+
+/* SHK_PERM: st[0..n) in turn, each but the last into a scratch register;
+   SHK_INS: st[0], the base, then its lanes st[1..n) put in; SHK_TBL1: a
+   lookup in st[0].a; SHK_TBL2: in x and y.  cost: instructions, twice. */
+typedef struct { uint8_t kind, n, cost; ShStep st[6]; } ShPlan;
+
+#define SH_MAX_INS 4
+
+static void sh_apply(const ShStep *st, const uint8_t *A, const uint8_t *Bm, uint8_t *out) {
+  uint32_t E = 1u << st->e, n = 16u >> st->e;
+  switch (st->op) {
+    case SH_MOV: memcpy(out, A, 16); break;
+    case SH_DUP:
+      for (uint32_t i = 0; i < 16; i++) out[i] = A[st->k * E + i % E];
+      break;
+    case SH_REV: {
+      uint32_t C = 1u << st->k, ne = C / E;
+      for (uint32_t i = 0; i < 16; i++) {
+        uint32_t c0 = i / C * C, w = i - c0;
+        out[i] = A[c0 + (ne - 1 - w / E) * E + w % E];
+      }
+      break;
+    }
+    case SH_EXT:
+      for (uint32_t i = 0; i < 16; i++) {
+        uint32_t j = i + st->k;
+        out[i] = j < 16 ? A[j] : Bm[j - 16];
+      }
+      break;
+    default:
+      for (uint32_t L = 0; L < n; L++) {
+        const uint8_t *S;
+        uint32_t s;
+        switch (st->op) {
+          case SH_ZIP1: case SH_ZIP2:
+            S = L & 1 ? Bm : A;
+            s = (st->op == SH_ZIP2 ? n / 2 : 0) + L / 2;
+            break;
+          case SH_UZP1: case SH_UZP2:
+            s = 2 * L + (st->op == SH_UZP2);
+            S = s < n ? A : Bm;
+            s %= n;
+            break;
+          default:
+            S = L & 1 ? Bm : A;
+            s = (L & ~1u) + (st->op == SH_TRN2);
+            break;
+        }
+        for (uint32_t b = 0; b < E; b++) out[L * E + b] = S[s * E + b];
+      }
+      break;
+  }
+}
+
+typedef struct { uint8_t m[16]; ShStep st; } ShCand;
+
+/* Every one-step result of the operands id[0..nop), whose bytes are m[id]:
+   with need >= 0, only those that read operand need. */
+static uint32_t sh_gen(const uint8_t (*m)[16], const uint8_t *id, uint32_t nop, int need,
+                       ShCand *out) {
+  uint32_t n = 0;
+#define SH_ADD(OP, E, A, B, K) do { \
+    ShStep st_ = { (OP), (uint8_t)(E), (A), (B), (uint8_t)(K), 0 }; \
+    out[n].st = st_; sh_apply(&st_, m[A], m[B], out[n].m); n++; } while (0)
+  for (uint32_t p = 0; p < nop; p++) {
+    uint8_t a = id[p];
+    for (uint32_t e = 0; e < 4; e++) {
+      if (need < 0 || a == need) {
+        for (uint32_t l = 0; l < (16u >> e); l++) SH_ADD(SH_DUP, e, a, a, l);
+        for (uint32_t c = e + 1; c <= 3; c++) SH_ADD(SH_REV, e, a, a, c);
+      }
+      for (uint32_t q = 0; q < nop; q++) {
+        uint8_t b = id[q];
+        if (need >= 0 && a != need && b != need) continue;
+        for (uint8_t op = SH_ZIP1; op <= SH_TRN2; op++) SH_ADD(op, e, a, b, 0);
+      }
+    }
+    for (uint32_t q = 0; q < nop; q++) {
+      uint8_t b = id[q];
+      if (need >= 0 && a != need && b != need) continue;
+      for (uint32_t k = 1; k < 16; k++) SH_ADD(SH_EXT, 0, a, b, k);
+    }
+  }
+#undef SH_ADD
+  return n;
+}
+
+/* The lanes base lacks of want, put in from x or y: at the widest lanes
+   that are aligned lanes of x or y, which are the fewest; false where no
+   size is. */
+static bool sh_ins(const uint8_t *want, const uint8_t *base, uint32_t nsrc, ShPlan *p) {
+  for (int e = 3; e >= 0; e--) {
+    uint32_t E = 1u << e, cnt = 0;
+    ShStep st[SH_MAX_INS];
+    bool ok = true;
+    for (uint32_t L = 0; L < (16u >> e) && ok; L++) {
+      if (!memcmp(want + L * E, base + L * E, E)) continue;
+      uint32_t b0 = want[L * E];
+      ok = b0 % E == 0 && b0 / 16 < nsrc && cnt < SH_MAX_INS;
+      for (uint32_t b = 1; b < E && ok; b++) ok = want[L * E + b] == b0 + b;
+      if (ok) {
+        ShStep s1 = { SH_INS, (uint8_t)e, (uint8_t)(b0 / 16), (uint8_t)(b0 / 16), (uint8_t)L,
+                      (uint8_t)(b0 % 16 / E) };
+        st[cnt++] = s1;
+      }
+    }
+    if (ok) {
+      p->n = (uint8_t)(cnt + 1);
+      memcpy(p->st + 1, st, cnt * sizeof *st);
+      return true;
+    }
+  }
+  return false;
+}
+
+/* The cheapest plan for want (bytes of x 0-15, of y 16-31; one: x and y
+   are one value, want's places taken mod 16).  from: which of x (1) and y
+   (2) the original names, for the table the IR holds. */
+static void sh_plan(const uint8_t *want0, bool one, uint32_t from, ShPlan *best) {
+  uint8_t want[16], m[3][16];
+  uint8_t id[3] = { 0, 1, 2 };
+  uint32_t nsrc = one ? 1 : 2;
+  for (uint32_t i = 0; i < 16; i++) {
+    want[i] = one ? want0[i] & 15 : want0[i];
+    m[0][i] = (uint8_t)i;
+    m[1][i] = (uint8_t)(16 + i);
+  }
+  /* the table lookup: x's or y's alone, or both, in a register pair */
+  memset(best, 0, sizeof *best);
+  if (from == 3) { best->kind = SHK_TBL2; best->cost = 7; }
+  else { best->kind = SHK_TBL1; best->st[0].a = from == 2; best->cost = 5; }
+  best->n = 1;
+
+  static _Thread_local ShCand c1[512], c2[512];
+  uint32_t n1 = sh_gen((const uint8_t (*)[16])m, id, nsrc, -1, c1);
+  /* a base with lanes put in -- x or y copied, or a step's result -- or
+     with none, x or y as it is or one step */
+  for (uint32_t i = 0; i < nsrc + n1; i++) {
+    ShPlan p;
+    const uint8_t *base = i < nsrc ? m[i] : c1[i - nsrc].m;
+    p.n = 0;
+    if (!sh_ins(want, base, nsrc, &p) || 2u * p.n >= best->cost) continue;
+    p.kind = SHK_INS;
+    p.cost = (uint8_t)(2 * p.n);
+    if (i < nsrc) {
+      ShStep st = { SH_MOV, 0, (uint8_t)i, (uint8_t)i, 0, 0 };
+      p.st[0] = st;
+    } else {
+      p.st[0] = c1[i - nsrc].st;
+    }
+    *best = p;
+  }
+  if (best->cost <= 4) return;
+  /* two steps */
+  for (uint32_t i = 0; i < n1; i++) {
+    memcpy(m[2], c1[i].m, 16);
+    uint8_t ids[3] = { 2, 0, 1 };
+    uint32_t n2 = sh_gen((const uint8_t (*)[16])m, ids, nsrc + 1, 2, c2);
+    for (uint32_t j = 0; j < n2; j++)
+      if (!memcmp(want, c2[j].m, 16)) {
+        best->kind = SHK_PERM; best->n = 2; best->cost = 4;
+        best->st[0] = c1[i].st; best->st[1] = c2[j].st;
+        return;
+      }
+  }
+}
+
+/* sh_plan of shuffle v, kept by its places: a module's shuffles are few
+   and alike, and the plan is asked for twice */
+static void sh_plan_of(IrFunc *f, Ref v, ShPlan *p) {
+  const Inst *in = &f->insts[v];
+  const Ref *a = ir_args(f, v);
+  uint8_t want[16];
+  uint32_t from = 0;
+  for (uint32_t i = 0; i < 16; i++) {
+    want[i] = (uint8_t)((i < 8 ? in->imm >> (8 * i) : in->imm2 >> (8 * (i - 8))) & 0x1f);
+    from |= want[i] < 16 ? 1u : 2u;
+  }
+  bool one = a[0] == a[1];
+  static _Thread_local struct { uint64_t lo, hi; uint32_t key; ShPlan p; } memo[64];
+  uint32_t key = 1u | (one ? 2u : 0u) | from << 2;
+  uint32_t h = (uint32_t)((in->imm * 0x9e3779b97f4a7c15ull ^ in->imm2) >> 58);
+  if (memo[h].key == key && memo[h].lo == in->imm && memo[h].hi == in->imm2) {
+    *p = memo[h].p;
+    return;
+  }
+  sh_plan(want, one, from, p);
+  memo[h].lo = in->imm; memo[h].hi = in->imm2; memo[h].key = key; memo[h].p = *p;
+}
+
+/* Full adders.  A limb of GMP's generic mpn_add_n,
+     s = u + v, r = s + cin, cout = (s <u u) | (r <u s), cin 0 or 1,
+   is adcs r, u, v once the carry flag holds cin, then cset cout, hs -- and
+   the next limb's cin, this cout, is still in the flag: a chain of adcs, a
+   cycle a limb, where add, cmp, cset and orr made four (hsbench/integer).
+   mpn_sub_n's, s = u - v, r = s - bin, bout = (u <u v) | (s <u bin), is
+   sbcs, the flag holding not bin.  s and the compares are folded, and the
+   compares and the or moved to just after r: nothing is emitted between
+   the adcs and the cset, so nothing writes the flags there.  A compare may
+   take any of its equivalent forms, and the or may be an add or a xor: the
+   two carries are never both set. */
+#define FA_R   1   /* the add or sub taking the carry in */
+#define FA_OUT 2   /* the carry out */
+#define FA_SUB 4   /* a borrow */
+#define FA_S1  8   /* s is the add's second operand */
+
+/* c as x <u y */
+static bool fa_lt(IrFunc *f, Ref c, Ref *x, Ref *y) {
+  const Inst *in = &f->insts[c];
+  if (in->nargs != 2 || (in->op != I_LTU && in->op != I_GTU)) return false;
+  Ref *a = ir_args(f, c);
+  *x = a[in->op == I_GTU];
+  *y = a[in->op != I_GTU];
+  return true;
+}
+
+/* v is computed where it stands, by nothing else's instruction */
+static bool fa_own(Isel *s, Ref v) {
+  return !s->folded[v] && !s->fused[v] && !s->imm_fold[v] && !s->addr_fuse[v] &&
+         !s->ptr_fuse[v] && !s->zx_fuse[v] && !s->bfx[v].ok && !s->csinc[v] && !s->fa[v];
+}
+
+/* v is in a register or a constant where it is read */
+static bool fa_operand(Isel *s, Ref v) {
+  return !s->folded[v] && !s->fused[v] && !s->addr_fuse[v] && !s->ptr_fuse[v];
+}
+
+/* The limb whose carry out is o, from its compares c1 (of u and v) and c2
+   (of the carry in): its r, s, carry in and kind, or false. */
+static bool fa_match(Isel *s, uint32_t bi, Ref c1, Ref c2, Ref *pr, Ref *ps, uint8_t *kind) {
+  IrFunc *f = s->f;
+  Ref x, y, r = REF_NONE, sv = REF_NONE, cin = REF_NONE;
+  if (!fa_lt(f, c2, &x, &y)) return false;
+  const Inst *xi = &f->insts[x];
+  uint8_t k = 0;
+  if (xi->op == I_ADD && xi->nargs == 2) {
+    /* r <u s or r <u cin, r = s + cin */
+    r = x;
+    for (int j = 0; j < 2 && sv == REF_NONE; j++) {
+      Ref t = ir_args(f, r)[j], o = ir_args(f, r)[1 - j];
+      if (f->insts[t].op != I_ADD || f->insts[t].nargs != 2 || (y != t && y != o)) continue;
+      sv = t; cin = o; k = j ? FA_S1 : 0;
+    }
+  } else if (xi->op == I_SUB && xi->nargs == 2) {
+    /* s <u bin or s <u r, r = s - bin */
+    sv = x;
+    const Inst *yi = &f->insts[y];
+    if (yi->op == I_SUB && yi->nargs == 2 && ir_args(f, y)[0] == sv) { r = y; cin = ir_args(f, y)[1]; }
+    else {
+      Block *b = &f->blocks[bi];
+      for (uint32_t i = 0; i < b->ninsts && r == REF_NONE; i++) {
+        Ref t = b->insts[i];
+        if (f->insts[t].op == I_SUB && f->insts[t].nargs == 2 &&
+            ir_args(f, t)[0] == sv && ir_args(f, t)[1] == y)
+          r = t;
+      }
+      cin = y;
+    }
+    k = FA_SUB;
+  }
+  if (r == REF_NONE || sv == REF_NONE) return false;
+  Ref *ua = ir_args(f, sv);
+  /* c1: s <u u or s <u v; u <u v or u <u s */
+  if (!fa_lt(f, c1, &x, &y)) return false;
+  if (k & FA_SUB ? !(x == ua[0] && (y == ua[1] || y == sv))
+                 : !(x == sv && (y == ua[0] || y == ua[1])))
+    return false;
+  if (ir_known_bits(f, cin, 4) & ~1ull) return false;
+  *pr = r; *ps = sv; *kind = k;
+  return true;
+}
+
+static void find_full_adders(Isel *s, const uint32_t *uses) {
+  IrFunc *f = s->f;
+  uint32_t n = f->ninsts;
+  s->fa = xcalloc(n ? n : 1, 1);
+  s->fa_flag = REF_NONE;
+  uint32_t *pos = xmalloc((n ? n : 1) * sizeof *pos);
+  uint8_t *moved = NULL;
+  struct { Ref r, c1, c2, o; } *lim = NULL;
+  uint32_t cap = 0;
+  for (uint32_t oi = 0; oi < f->norder; oi++) {
+    uint32_t bi = f->order[oi];
+    Block *b = &f->blocks[bi];
+    uint32_t nl = 0;
+    for (uint32_t i = 0; i < b->ninsts; i++) pos[b->insts[i]] = i;
+    for (uint32_t i = 0; i < b->ninsts; i++) {
+      Ref o = b->insts[i];
+      const Inst *oin = &f->insts[o];
+      if ((oin->op != I_OR && oin->op != I_XOR && oin->op != I_ADD) || oin->nargs != 2 ||
+          !fa_own(s, o))
+        continue;
+      Ref *oa = ir_args(f, o);
+      for (int j = 0; j < 2; j++) {
+        Ref c1 = oa[j], c2 = oa[1 - j], r, sv;
+        uint8_t k;
+        if (!fa_match(s, bi, c1, c2, &r, &sv, &k)) continue;
+        Ref cin = ir_args(f, r)[k & FA_S1 ? 0 : 1];
+        /* a widened carry the add took in as uxtw: its source is read */
+        if (s->folded[cin] && f->insts[cin].op == I_EXTENDU && f->insts[cin].nargs == 1)
+          cin = ir_args(f, cin)[0];
+        Ref *ua = ir_args(f, sv);
+        uint32_t refs = 1;
+        for (uint32_t m = 0; m < 2; m++) refs += (ir_args(f, c1)[m] == sv) + (ir_args(f, c2)[m] == sv);
+        Ref own[5] = { sv, c1, c2, r, o };
+        bool ok = uses[c1] == 1 && uses[c2] == 1 && uses[sv] == refs &&
+                  fa_operand(s, ua[0]) && fa_operand(s, ua[1]) && fa_operand(s, cin);
+        for (int m = 0; m < 5 && ok; m++)
+          ok = f->insts[own[m]].block == bi && fa_own(s, own[m]);
+        if (!ok || pos[r] > i) continue;
+        s->folded[sv] = s->folded[c1] = s->folded[c2] = 1;
+        s->fa[r] = FA_R | k;
+        s->fa[o] = FA_OUT | (k & FA_SUB);
+        if (nl == cap) { cap = cap ? 2 * cap : 8; lim = xrealloc(lim, cap * sizeof *lim); }
+        lim[nl].r = r; lim[nl].c1 = c1; lim[nl].c2 = c2; lim[nl].o = o;
+        nl++;
+        break;
+      }
+    }
+    if (!nl) continue;
+    /* each carry out, and the compares it is made of, to just after its r */
+    if (!moved) moved = xcalloc(n ? n : 1, 1);
+    for (uint32_t l = 0; l < nl; l++) moved[lim[l].c1] = moved[lim[l].c2] = moved[lim[l].o] = 1;
+    Ref *out = xmalloc(b->ninsts * sizeof *out);
+    uint32_t m = 0;
+    for (uint32_t i = 0; i < b->ninsts; i++) {
+      Ref t = b->insts[i];
+      if (moved[t]) continue;
+      out[m++] = t;
+      if (s->fa[t] & FA_R)
+        for (uint32_t l = 0; l < nl; l++)
+          if (lim[l].r == t) { out[m++] = lim[l].c1; out[m++] = lim[l].c2; out[m++] = lim[l].o; }
+    }
+    if (m != b->ninsts) warmc_fatal("internal: full adders lost an instruction");
+    memcpy(b->insts, out, m * sizeof *out);
+    xfree(out);
+    for (uint32_t l = 0; l < nl; l++) moved[lim[l].c1] = moved[lim[l].c2] = moved[lim[l].o] = 0;
+  }
+  xfree(lim);
+  xfree(moved);
+  xfree(pos);
+}
+
 static void analyse_immediates(Isel *s) {
   IrFunc *f = s->f;
   uint32_t n = f->ninsts;
@@ -2267,6 +2632,34 @@ static void analyse_immediates(Isel *s) {
     xfree(by);
   }
 
+  /* A shuffle planned without a table lookup reads none of the index
+     vectors the IR gives it: those only such shuffles read are not made. */
+  {
+    uint32_t *seen = xcalloc(n ? n : 1, sizeof(uint32_t));
+    uint8_t *needed = xcalloc(n ? n : 1, 1);
+    for (int pass = 0; pass < 2; pass++)
+      for (uint32_t oi = 0; oi < f->norder; oi++) {
+        Block *b = &f->blocks[f->order[oi]];
+        for (uint32_t i = 0; i < b->ninsts; i++) {
+          Ref u = b->insts[i];
+          if (f->insts[u].op != I_VSHUFFLE) continue;
+          ShPlan p;
+          sh_plan_of(f, u, &p);
+          Ref *a = ir_args(f, u);
+          for (uint32_t j = 2; j < f->insts[u].nargs; j++) {
+            if (pass == 0) {
+              seen[a[j]]++;
+              if (j == 2 && (p.kind == SHK_TBL1 || p.kind == SHK_TBL2)) needed[a[j]] = 1;
+            } else if (!needed[a[j]] && seen[a[j]] == uses[a[j]] && !blocked[a[j]]) {
+              s->folded[a[j]] = 1;
+            }
+          }
+        }
+      }
+    xfree(seen);
+    xfree(needed);
+  }
+
   if (!warmc_getenv("WARMC_NO_FUSE"))
   for (uint32_t oi = 0; oi < f->norder; oi++) {
     uint32_t bi = f->order[oi];
@@ -2444,6 +2837,7 @@ static void analyse_immediates(Isel *s) {
     }
   }
 
+  find_full_adders(s, uses);
   xfree(blocked);
 }
 
@@ -3888,6 +4282,7 @@ give_up:
   buf_free(&s->body);
   xfree(s->relocs); xfree(s->loc); xfree(s->cls); xfree(s->block_off);
   xfree(s->mem_valid_in); xfree(s->prof_site); xfree(s->prof_start);
+  xfree(s->fa); s->fa = NULL;
   xfree(s->imm_fold); xfree(s->fused); xfree(s->addr_fuse); xfree(s->ptr_fuse);
   xfree(s->zx_fuse); xfree(s->no_remat); xfree(s->paired); xfree(s->nl); xfree(s->pool);
   xfree(s->folded); xfree(s->uses); xfree(s->bfx); xfree(s->pinned); xfree(s->csinc);

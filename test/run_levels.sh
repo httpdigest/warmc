@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # The -O levels.  Each -O sets everything a level decides, so the last one
 # given is the level whatever came before it, and -O3 is -O2 with the
-# passes that change what a program can see, fma and dead-frames.  So two
-# spellings of one level compile a module to the same bytes -- -O0 -O2 and
-# -O2, -O3 and -O2 -ffma -fdead-frames -- and -O3 is not -O2 where those
-# passes have something to do.  The modules are ones each level-decided
-# pass changes: Go's stack pointer (go-sp), a trampoline, C frames, fusable
-# floats.  And the -fno- form of a flag that turns another on as well, and
+# passes that change what a program can see, fma, dead-frames and acc-tail.
+# So two spellings of one level compile a module to the same bytes -- -O0
+# -O2 and -O2, -O3 and -O2 -ffma -fdead-frames -facc-tail -- and -O3 is not
+# -O2 where those passes have something to do.  The modules are ones each
+# level-decided pass changes: Go's stack pointer (go-sp), a trampoline, C
+# frames, fusable floats, recursions that sum.  And the -fno- form of a flag that turns another on as well, and
 # -fexact-trap, which turns others off.
 
 set -uo pipefail
@@ -43,18 +43,19 @@ check() {
 }
 
 for src in test/cases/gosp.wat test/cases/trampoline.wat test/cases/deadframes.wat \
-           test/cases_fma/fma.wat; do
+           test/cases_fma/fma.wat test/cases_opt/acc_tail.wat; do
   check same "$src" "-O0 -O1" "-O1"
   check same "$src" "-O0 -O2" "-O2"
   check same "$src" "-O1 -O2" "-O2"
   check same "$src" "-O3 -O2" "-O2"
   check same "$src" "-O3 -O1" "-O1"
   check same "$src" "-O0 -O3" "-O3"
-  check same "$src" "-O3" "-O2 -ffma -fdead-frames"
+  check same "$src" "-O3" "-O2 -ffma -fdead-frames -facc-tail"
   check differ "$src" "-O0" "-O1"
 done
 check differ test/cases_fma/fma.wat "-O2" "-O3"
 check differ test/cases/deadframes.wat "-O2" "-O3"
+check differ test/cases_opt/acc_tail.wat "-O2" "-O3"
 
 # A flag's -fno- form turns that flag off and nothing else: -fgssa-all
 # turns gssa on as well, and -fno-gssa-all leaves it on.
@@ -74,6 +75,8 @@ check differ test/cases_trapstate/gloop_global_at_trap.wat "-O2" "-O2 -fexact-tr
 check same test/cases_trapstate/gloop_global_at_trap.wat "-O3 -fexact-trap -fno-exact-trap" "-O3"
 check same test/cases/deadframes.wat "-O3 -fexact-trap -fdead-frames" "-O3 -fexact-trap"
 check same test/cases/deadframes.wat "-O3 -fdead-frames -fexact-trap" "-O3 -fexact-trap"
+check same test/cases_opt/acc_tail.wat "-O3 -fexact-trap -facc-tail" "-O3 -fexact-trap"
+check differ test/cases_opt/acc_tail.wat "-O3 -fexact-trap" "-O3"
 check same test/cases/gosp.wat "-O2 -fexact-trap -fgo-sp" "-O2 -fexact-trap"
 check same test/cases/trampoline.wat "-O2 -fexact-trap -ftrampoline" "-O2 -fexact-trap"
 

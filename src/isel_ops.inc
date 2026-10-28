@@ -473,6 +473,67 @@ static CompType *call_sig(Isel *s, Inst *in) {
   return &m->types[in->imm];
 }
 
+/* One step of a shuffle's plan into d, its operands in reg[] */
+static void sh_step(Isel *s, const ShStep *st, int d, const int *reg) {
+  int x = reg[st->a], y = reg[st->b];
+  switch (st->op) {
+    case SH_MOV: if (d != x) a64_vmov(B, d, x); break;
+    case SH_DUP: a64_vdup_lane(B, st->e, d, x, st->k); break;
+    case SH_REV:
+      if (st->k == 1) a64_vrev16(B, d, x);
+      else if (st->k == 2) a64_vrev32(B, st->e, d, x);
+      else a64_vrev64(B, st->e, d, x);
+      break;
+    case SH_EXT: a64_vext(B, d, x, y, st->k); break;
+    case SH_ZIP1: a64_vzip1(B, st->e, d, x, y); break;
+    case SH_ZIP2: a64_vzip2(B, st->e, d, x, y); break;
+    case SH_UZP1: a64_vuzp1(B, st->e, d, x, y); break;
+    case SH_UZP2: a64_vuzp2(B, st->e, d, x, y); break;
+    case SH_TRN1: a64_vtrn1(B, st->e, d, x, y); break;
+    case SH_TRN2: a64_vtrn2(B, st->e, d, x, y); break;
+    default: break;
+  }
+}
+
+/* A full adder's limb (find_full_adders): at r, the carry in to the flag
+   unless it is there still, and adcs (sbcs); at the carry out, just after,
+   the flag to a register. */
+static void emit_full_adder(Isel *s, Ref v) {
+  IrFunc *f = s->f;
+  uint8_t k = s->fa[v];
+  bool sub = k & FA_SUB;
+  if (k & FA_OUT) {
+    if (s->fa_epoch != B->flags_epoch) warmc_fatal("internal: a carry's flag written before it was read");
+    int d = wr(s, v, S2);
+    a64_cset(B, SF32, d, sub ? CC_LO : CC_HS);
+    commit(s, v, d);
+    s->fa_flag = v;
+    return;
+  }
+  int sf = is64(f, v) ? SF64 : SF32;
+  Ref *a = ir_args(f, v);
+  Ref sv = a[k & FA_S1 ? 1 : 0], cin = a[k & FA_S1 ? 0 : 1];
+  /* a widened carry is its source's 0 or 1, folded or not */
+  if (f->insts[cin].op == I_EXTENDU && f->insts[cin].nargs == 1) cin = ir_args(f, cin)[0];
+  if (s->fa_flag != cin || s->fa_epoch != B->flags_epoch || s->fa_sub != sub) {
+    int c = rd(s, cin, S0);
+    /* C = cin, or C = not bin: 0 - bin borrows when bin is 1.  Its low
+       half, which is all of it, whatever its type: an i32's register may
+       hold more above. */
+    if (sub) a64_cmp_reg(B, SF32, RZR, c);
+    else a64_cmp_imm(B, SF32, c, 1);
+  }
+  Ref *ua = ir_args(f, sv);
+  int x = rd_zr(s, ua[0], S0), y = rd_zr(s, ua[1], S1);
+  int d = wr(s, v, S2);
+  if (sub) a64_sbcs(B, sf, d, x, y);
+  else a64_adcs(B, sf, d, x, y);
+  commit(s, v, d);
+  s->fa_flag = REF_NONE;
+  s->fa_epoch = B->flags_epoch;
+  s->fa_sub = sub;
+}
+
 static void emit_inst(Isel *s, Ref v) {
   IrFunc *f = s->f;
   Inst *in = &f->insts[v];
@@ -499,6 +560,8 @@ static void emit_inst(Isel *s, Ref v) {
 
   s->t1_was = s->t1_ok && !s->no_ldpair;
   s->t1_ok = false;
+
+  if (s->fa && s->fa[v]) { emit_full_adder(s, v); return; }
 
   switch (in->op) {
     case I_NOP: case I_PARAM: break;
@@ -1673,27 +1736,54 @@ static void emit_inst(Isel *s, Ref v) {
     }
 
     case I_VSHUFFLE: {
-      uint64_t lo = in->imm, hi = in->imm2;
-      bool from_x = false, from_y = false;
-      for (int i = 0; i < 16; i++) {
-        uint32_t idx = (uint32_t)((i < 8 ? (lo >> (8 * i)) : (hi >> (8 * (i - 8)))) & 0xff);
-        if (idx < 16) from_x = true; else from_y = true;
-      }
-
-      int x = rd(s, a[0], F0), y = rd(s, a[1], F1);
+      ShPlan p;
+      sh_plan_of(f, v, &p);
+      bool one = a[0] == a[1];
+      /* the sources the plan reads */
+      bool need[2] = { false, false };
+      if (p.kind == SHK_TBL2) { need[0] = true; need[1] = true; }
+      else if (p.kind == SHK_TBL1) need[p.st[0].a] = true;
+      else
+        for (uint32_t i = 0; i < p.n; i++) {
+          const ShStep *st = &p.st[i];
+          if (st->a < 2) need[st->a] = true;
+          if (st->op >= SH_EXT && st->op <= SH_TRN2 && st->b < 2) need[st->b] = true;
+        }
+      int reg[3] = { -1, -1, FTMP };
+      if (need[0] || (one && need[1])) reg[0] = rd(s, a[0], F0);
+      if (need[1]) reg[1] = one ? reg[0] : rd(s, a[1], F1);
       int d = wr(s, v, F2);
-      if (!from_y) {
-        int t1 = rd(s, a[2], F3);
-        a64_vtbl1(B, d, x, t1);
-      } else if (!from_x) {
-        int t1 = rd(s, a[2], F3);
-        a64_vtbl1(B, d, y, t1);
-      } else {
-        int t1 = rd(s, a[2], F3);
-        a64_vtbl1(B, FTMP, x, t1);
-        int t2 = rd(s, a[3], F4);
-        a64_vtbl1(B, F4, y, t2);
-        a64_vorr(B, d, FTMP, F4);
+      switch (p.kind) {
+        case SHK_TBL1:
+          a64_vtbl1(B, d, reg[p.st[0].a], rd(s, a[2], FTMP));
+          break;
+        case SHK_TBL2:
+          /* the table is a register pair: x and y as they are where y is
+             the register after x's */
+          if (reg[1] == reg[0] + 1) {
+            a64_vtbl2(B, d, reg[0], rd(s, a[2], FTMP));
+            break;
+          }
+          a64_vmov(B, F3, reg[0]);
+          a64_vmov(B, F4, reg[1]);
+          a64_vtbl2(B, d, F3, rd(s, a[2], FTMP));
+          break;
+        case SHK_PERM:
+          if (p.n == 2) sh_step(s, &p.st[0], FTMP, reg);
+          sh_step(s, &p.st[p.n - 1], d, reg);
+          break;
+        default: {
+          /* the lanes go into the base where it is made, apart from d where
+             d holds a source they are taken from */
+          int work = d;
+          for (uint32_t i = 1; i < p.n; i++)
+            if (reg[p.st[i].a] == d) work = FTMP;
+          sh_step(s, &p.st[0], work, reg);
+          for (uint32_t i = 1; i < p.n; i++)
+            a64_vins_elem(B, p.st[i].e, work, p.st[i].k, reg[p.st[i].a], p.st[i].l);
+          if (work != d) a64_vmov(B, d, work);
+          break;
+        }
       }
       commit(s, v, d);
       break;
@@ -3045,6 +3135,7 @@ static void emit_block(Isel *s, uint32_t bi, uint32_t next_bi) {
      key is no second cmp.  The epoch still says whether anything since has
      written them. */
   if (b->npreds != 1 || b->preds[0] != s->prev_bi || b->is_pad) s->fl_kind = 0;
+  s->fa_flag = REF_NONE;
   uint32_t pck = s->pc_bn ? s->pc_bfirst[bi] : 0;
   uint32_t pce = s->pc_bn ? pck + s->pc_bn[bi] : 0;
   for (uint32_t i = 0; i < b->ninsts; i++) {
