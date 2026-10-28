@@ -9,6 +9,17 @@ LOGS="$BUILD/checklogs"
 rm -rf "$LOGS"
 mkdir -p "$LOGS"
 
+# The last run's trim of the caches, still unlinking (see the end): a change
+# to warmc leaves gigabytes of programs it no longer makes, and taking them
+# away while the rows compile starved those of the disk -- a module that
+# compiles in a fraction of a second timed out at thirty, in four rows at
+# once, when three runs followed one another within minutes.
+TRIM_PID="$BUILD/.cache-trim.pid"
+if [ -f "$TRIM_PID" ] && kill -0 "$(cat "$TRIM_PID")" 2>/dev/null; then
+  echo "waiting for the last run's cache trim to finish"
+  while kill -0 "$(cat "$TRIM_PID")" 2>/dev/null; do sleep 1; done
+fi
+
 # A compile's limit (test/hostenv.sh's wtimeout): six seconds alone, where
 # the slowest of the suites' modules takes a fifth of one, but every row
 # starts at once here, and in that first half minute a compile of a tenth of
@@ -421,12 +432,14 @@ fi
 
 # Each cache cut to its size where a run took it past, the least recently
 # used first: after the rows, and on its own, since taking away tens of
-# thousands of entries is seconds of unlinking no row should wait on -- a
-# run that starts meanwhile reads an entry whole or not at all (warmc and
-# test/testcache.py hold one open before using it).  Its output goes
+# thousands of entries -- gigabytes after a change to warmc -- is minutes
+# of unlinking make check need not wait on; the next run does, at its start.
+# A suite run meanwhile on its own reads an entry whole or not at all (warmc
+# and test/testcache.py hold one open before using it).  Its output goes
 # nowhere, so a pipe from make check ends with make check.
 ( python3 test/testcache.py trim
   python3 test/testcache.py trim "$WARMC_CACHE" "${WARMC_CACHE_MB:-20000}" 2
 ) </dev/null >/dev/null 2>&1 &
+echo $! >"$TRIM_PID"
 
 exit $fail
