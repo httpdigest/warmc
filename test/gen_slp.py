@@ -631,6 +631,28 @@ case('sharesplat', '(param $p i32) (param $q i32) (param $k f64) (result f64)',
      lambda m, p, q, k: ([st(m, p + 8 * j, ld(m, p + 688 + 8 * j) + k) for j in range(4)], fsum(m, q, 4))[-1],
      [(0, 0, 0.25)], [(r'\sfadd\.2d\s', 2), (r'\sdup\.2d\s', 1)])
 
+# two groups of one round with the same lanes, loaded in the block before:
+# one vector load for both, and the scalar loads, read by the two groups
+# alone, gone after them
+case('sharedlanes', '(param $p i32) (param $q i32) (param $c i32) (param $k f64) (result f64)',
+     '\n    (local $m0 f64) (local $m1 f64) (local $y f64)'
+     '\n    (local.set $m0 (f64.load offset=704 (local.get $p)))'
+     '\n    (local.set $m1 (f64.load offset=712 (local.get $p)))'
+     '\n    (local.set $y (f64.load offset=1040 (local.get $q)))'
+     '\n    (if (local.get $c) (then (f64.store offset=1024 (local.get $q) (f64.const 1))))'
+     '\n    (f64.store offset=0 (local.get $p) (f64.add (f64.mul (local.get $m0) (local.get $k)) (local.get $k)))'
+     '\n    (f64.store offset=8 (local.get $p) (f64.add (f64.mul (local.get $m1) (local.get $k)) (local.get $k)))'
+     '\n    (f64.store offset=16 (local.get $p) (f64.sub (f64.mul (local.get $m0) (local.get $y)) (local.get $y)))'
+     '\n    (f64.store offset=24 (local.get $p) (f64.sub (f64.mul (local.get $m1) (local.get $y)) (local.get $y)))'
+     '\n    (f64.add (f64.load offset=1024 (local.get $q)) (call $fs (local.get $q) (i32.const 4)))',
+     lambda m, p, q, c, k: (lambda m0, m1, y: ((st(m, q + 1024, 1.0) if c else None),
+                                               st(m, p, m0 * k + k), st(m, p + 8, m1 * k + k),
+                                               st(m, p + 16, m0 * y - y), st(m, p + 24, m1 * y - y),
+                                               ld(m, q + 1024) + fsum(m, q, 4))[-1])(
+         ld(m, p + 704), ld(m, p + 712), ld(m, q + 1040)),
+     [(0, 0, 0, 1.5), (0, 0, 1, 1.5)],
+     [(r'\sldr\s+q\d+', 1), (r'\sldr\s+d\d+, \[x\d+, #0x2c[08]\]', 0)])
+
 # -- a splat multiplied in by lane (isel.c's vbyel) ---------------------------
 
 # four floats times k: fmul.4s by element, k lane 0 of its register, the

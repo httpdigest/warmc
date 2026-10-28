@@ -306,8 +306,7 @@ static void seal_tests(IrFunc *f) {
           in->imm = (in->imm & ~(uint64_t)RTK_NULLABLE) | RTK_NULLTRAP;
           g_stats.slot_nullchks++;
           if (ui->op == I_TRAP_IF) {
-            ui->op = I_NOP;
-            ui->nargs = 0;
+            ir_make_nop(ui);
           } else {
             ui->imm2 &= ~(uint64_t)GCF_NULLCHK;
           }

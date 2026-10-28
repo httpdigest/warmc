@@ -228,6 +228,10 @@ typedef struct {
   uint32_t block;
 } Inst;
 
+/* An instruction made nothing: no op, and no operands either, which every
+   count of a value's uses would otherwise take for readers */
+static inline void ir_make_nop(Inst *in) { in->op = I_NOP; in->nargs = 0; }
+
 /* a direct call pass_devirt made, which a later inline round looks at */
 #define IRF_DEVIRT 1u
 /* a call through a class initializer's global in the copy of a loop that

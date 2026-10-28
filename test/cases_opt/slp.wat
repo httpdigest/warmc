@@ -103,6 +103,8 @@
 ;; shape: outer2 \sfmul\.2d\s=1
 ;; shape: sharesplat \sfadd\.2d\s=2
 ;; shape: sharesplat \sdup\.2d\s=1
+;; shape: sharedlanes \sldr\s+q\d+=1
+;; shape: sharedlanes \sldr\s+d\d+, \[x\d+, #0x2c[08]\]=0
 ;; shape: byelem4 \sfmul\.4s\s+v\d+, v\d+, v\d+\[0\]=1
 ;; shape: byelem4 \sdup\.4s\s=0
 ;; shape: byelemadd \sdup\.2d\s=1
@@ -206,6 +208,8 @@
 ;; run: outer2 0 0 0 8 => f64:0x4061240000000000
 ;; run: outer2 0 0 1 8 => f64:0x4061680000000000
 ;; run: sharesplat 0 0 1 => f64:0x4050680000000000
+;; run: sharedlanes 0 0 0 6 => f64:0x4068718000000000
+;; run: sharedlanes 0 0 1 6 => f64:0x4068b58000000000
 ;; run: byelem4 0 0 3 => i32:-2112847872
 ;; run: byelem4 16 16 -5 => i32:679878656
 ;; run: byelemadd 0 0 5 => f64:0xbffb800000000000
@@ -616,6 +620,19 @@
     (f64.store offset=16 (local.get $p) (f64.add (f64.load offset=704 (local.get $p)) (local.get $k)))
     (f64.store offset=24 (local.get $p) (f64.add (f64.load offset=712 (local.get $p)) (local.get $k)))
     (call $fs (local.get $q) (i32.const 4)))
+  (func $sharedlanes (export "sharedlanes") (param $p i32) (param $q i32) (param $c i32) (param $ki i32) (result f64)
+    (local $m0 f64) (local $m1 f64) (local $y f64)
+    (local $k f64)
+    (local.set $k (f64.div (f64.convert_i32_s (local.get $ki)) (f64.const 4)))
+    (local.set $m0 (f64.load offset=704 (local.get $p)))
+    (local.set $m1 (f64.load offset=712 (local.get $p)))
+    (local.set $y (f64.load offset=1040 (local.get $q)))
+    (if (local.get $c) (then (f64.store offset=1024 (local.get $q) (f64.const 1))))
+    (f64.store offset=0 (local.get $p) (f64.add (f64.mul (local.get $m0) (local.get $k)) (local.get $k)))
+    (f64.store offset=8 (local.get $p) (f64.add (f64.mul (local.get $m1) (local.get $k)) (local.get $k)))
+    (f64.store offset=16 (local.get $p) (f64.sub (f64.mul (local.get $m0) (local.get $y)) (local.get $y)))
+    (f64.store offset=24 (local.get $p) (f64.sub (f64.mul (local.get $m1) (local.get $y)) (local.get $y)))
+    (f64.add (f64.load offset=1024 (local.get $q)) (call $fs (local.get $q) (i32.const 4))))
   (func $byelem4 (export "byelem4") (param $p i32) (param $q i32) (param $n i32) (result i32)
     (local $k f32)
     (local.set $k (f32.convert_i32_s (local.get $n)))

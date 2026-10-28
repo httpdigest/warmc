@@ -123,8 +123,8 @@ M = {
  'x_vload': m('    if ((in->op == I_VLOAD || in->op == I_VLDN) && store) return false;\n', ''),
  # emitting
  'e_const_hi': m('      f->insts[nd->val].imm2 = w[1];\n      return nd->val;', '      return nd->val;'),
- 'e_nop_loads': m('    if (uses[nd->lane[j]] == 1) { f->insts[nd->lane[j]].op = I_NOP; continue; }',
-                  '    { f->insts[nd->lane[j]].op = I_NOP; continue; }'),
+ 'e_nop_loads': m('    if (uses[nd->lane[j]] == 1) { ir_make_nop(&f->insts[nd->lane[j]]); continue; }',
+                  '    { ir_make_nop(&f->insts[nd->lane[j]]); continue; }'),
  'e_order': m('    for (uint32_t y = x; y > 0 && n[ord[y]].first > n[ord[y - 1]].first; y--) {',
               '    for (uint32_t y = x; y > 0 && n[ord[y]].first < n[ord[y - 1]].first; y--) {'),
  'e_outer_order': m('  return a->first < b->first ? 1 : a->first > b->first ? -1 : 0;',
@@ -132,9 +132,9 @@ M = {
  'e_share': m('    if (made) slp_share(f, bi, new0);\n', ''),
  'e_share_outer': m('          slp_share(f, out[x].blk, new0);\n', ''),
  'e_share_writes': m('    if (in->op != I_LOAD && !ir_has_no_effect(in)) writes++;\n', ''),
- 'e_kept': m('      if (!uses[kept.r[x]]) f->insts[kept.r[x]].op = I_NOP;', '      (void)kept.r[x];'),
- 'e_kept_nops': m('        if (in->op == I_NOP) continue;\n        for (uint32_t j = 0; j < in->nargs; j++) uses[',
-                  '        for (uint32_t j = 0; j < in->nargs; j++) uses['),
+ 'e_nop_args': m('static inline void ir_make_nop(Inst *in) { in->op = I_NOP; in->nargs = 0; }',
+                 'static inline void ir_make_nop(Inst *in) { in->op = I_NOP; }', 'src/ir.h'),
+ 'e_kept': m('      if (!uses[kept.r[x]]) ir_make_nop(&f->insts[kept.r[x]]);', '      (void)kept.r[x];'),
  # isel: a splat multiplied in by lane
  'be_off': m('      if (in->op == I_VFMUL && s->vbyel && s->vbyel[v]) {', '      if (0) {', IO),
  'be_count': m('            else if (by[a[slot]] == uses[a[slot]]) {', '            else if (by[a[slot]]) {', I),

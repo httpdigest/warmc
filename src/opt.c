@@ -185,8 +185,7 @@ static bool pass_reassoc(IrFunc *f) {
         b->ninsts -= nmade;
         for (uint32_t k = wide; k < n; k++) f->insts[chain[k]].type = VT_I32;
         ir_args(f, chain[wide - 1])[0] = chain[wide];
-        f->insts[wrap].op = I_NOP;
-        f->insts[wrap].nargs = 0;
+        ir_make_nop(&f->insts[wrap]);
         if (f->ninsts > cap) {
           uint32_t nc = f->ninsts * 2;
           memo = xrealloc(memo, nc * sizeof(uint32_t));
@@ -2246,7 +2245,7 @@ static bool fold_trunc_exact(IrFunc *f, uint32_t bi, uint32_t *idx, Ref v) {
   if (sgn ? lo < -half || hi >= half : lo < 0 || hi >= 2 * half) return false;
   Ref r = fx_emit(f, bi, idx, x, t);
   ir_replace(f, v, r);
-  f->insts[v].op = I_NOP;
+  ir_make_nop(&f->insts[v]);
   return true;
 }
 
@@ -2429,7 +2428,7 @@ static bool fold_order_cmp(IrFunc *f, uint32_t bi, uint32_t *idx, Ref v) {
   Ref ca[2] = { x, y };
   Ref nv = emit_before(f, bi, idx, op, VT_I32, ca, 2, 0);
   ir_replace(f, v, nv);
-  f->insts[v].op = I_NOP;
+  ir_make_nop(&f->insts[v]);
   return true;
 }
 
@@ -2445,7 +2444,7 @@ static bool fold_bool_cmp(IrFunc *f, Ref v) {
   if (same) {
     if (f->insts[a[0]].type != VT_I32) return false;
     ir_replace(f, v, a[0]);
-    in->op = I_NOP;
+    ir_make_nop(in);
   } else {
     in->op = I_EQZ;
     in->nargs = 1;
@@ -2467,7 +2466,7 @@ static bool fold_ext_cmp(IrFunc *f, uint32_t bi, uint32_t *idx, Ref v) {
   Inst *in = &f->insts[v];
   if (c == 0 && in->op == I_NE && (ir_known_bits(f, x, KB_DEPTH) & ~1ull) == 0) {
     ir_replace(f, v, x);
-    in->op = I_NOP;
+    ir_make_nop(in);
     return true;
   }
   if (c == 0 && in->op == I_EQ) {
@@ -2523,7 +2522,7 @@ static bool fold_narrow(IrFunc *f, uint32_t bi, uint32_t *idx, Ref v) {
   Ref na[2] = { nx, ny };
   Ref r = emit_before(f, bi, idx, (IrOp)op, VT_I32, na, 2, 0);
   ir_replace(f, v, r);
-  f->insts[v].op = I_NOP;
+  ir_make_nop(&f->insts[v]);
   return true;
 }
 
@@ -2792,7 +2791,7 @@ static bool fold_mulwide(IrFunc *f, uint32_t bi, uint32_t *idx, Ref v) {
       Ref ma[2] = { x, y };
       Ref m = emit_before(f, bi, idx, I_MUL, VT_I64, ma, 2, 0);
       ir_replace(f, v, m);
-      f->insts[v].op = I_NOP;
+      ir_make_nop(&f->insts[v]);
       return true;
     }
   }
@@ -2865,7 +2864,7 @@ static bool fold_mulwide(IrFunc *f, uint32_t bi, uint32_t *idx, Ref v) {
     s = emit_before(f, bi, idx, I_ADD, VT_I64, aa, 2, 0);
   }
   ir_replace(f, v, s);
-  f->insts[v].op = I_NOP;
+  ir_make_nop(&f->insts[v]);
   return true;
 }
 
@@ -3103,7 +3102,7 @@ static bool fold_block(IrFunc *f, uint32_t bi, const OptOpts *o, const uint32_t 
         Ref x0 = ir_resolve(f, ir_args(f, s)[0]);
         if (f->insts[x0].type == in->type) {
           ir_replace(f, v, x0);
-          in->op = I_NOP;
+          ir_make_nop(in);
           g_stats.folded++;
           changed = true;
           continue;
@@ -3225,7 +3224,7 @@ static bool fold_block(IrFunc *f, uint32_t bi, const OptOpts *o, const uint32_t 
       Ref *ia = ir_args(f, a[0]);
       if (is_const(f, ia[1], &c1)) {
         if (trunc_to(t, c1) == trunc_to(t, y)) {
-          ir_replace(f, v, ia[0]); in->op = I_NOP;
+          ir_replace(f, v, ia[0]); ir_make_nop(in);
           g_stats.folded++; changed = true; continue;
         }
         if (uses && uses[a[0]] == 1) {
@@ -3243,14 +3242,14 @@ static bool fold_block(IrFunc *f, uint32_t bi, const OptOpts *o, const uint32_t 
     bool has_c0 = in->nargs == 2 && is_const(f, a[0], &x);
     switch (in->op) {
       case I_ADD: case I_SUB: case I_OR: case I_XOR:
-        if (has_c1 && y == 0) { ir_replace(f, v, a[0]); in->op = I_NOP; changed = true; g_stats.folded++; }
-        else if (in->op != I_SUB && has_c0 && x == 0) { ir_replace(f, v, a[1]); in->op = I_NOP; changed = true; g_stats.folded++; }
+        if (has_c1 && y == 0) { ir_replace(f, v, a[0]); ir_make_nop(in); changed = true; g_stats.folded++; }
+        else if (in->op != I_SUB && has_c0 && x == 0) { ir_replace(f, v, a[1]); ir_make_nop(in); changed = true; g_stats.folded++; }
         else if ((in->op == I_SUB || in->op == I_ADD) && in->nargs == 2 &&
                  sub_cancels(f, in->op, a) != REF_NONE) {
           /* x - (x - y) and x + (y - x) are y: Go writes LeadingZeros64 as
              64 - Len64, and Len64 as 64 - clz. */
           ir_replace(f, v, sub_cancels(f, in->op, a));
-          in->op = I_NOP;
+          ir_make_nop(in);
           changed = true;
           g_stats.folded++;
         }
@@ -3260,7 +3259,7 @@ static bool fold_block(IrFunc *f, uint32_t bi, const OptOpts *o, const uint32_t 
         }
         else if (in->op == I_XOR && xorshift_undone(f, v) != REF_NONE) {
           ir_replace(f, v, xorshift_undone(f, v));
-          in->op = I_NOP;
+          ir_make_nop(in);
           changed = true;
           g_stats.folded++;
         }
@@ -3326,7 +3325,7 @@ static bool fold_block(IrFunc *f, uint32_t bi, const OptOpts *o, const uint32_t 
         }
         break;
       case I_MUL:
-        if (has_c1 && y == 1) { ir_replace(f, v, a[0]); in->op = I_NOP; changed = true; g_stats.folded++; }
+        if (has_c1 && y == 1) { ir_replace(f, v, a[0]); ir_make_nop(in); changed = true; g_stats.folded++; }
         else if (has_c1 && trunc_to(t, y) == trunc_to(t, ~0ull)) {
           Ref x0 = a[0];
           Ref z = emit_before(f, bi, &i, I_CONST, t, NULL, 0, 0);
@@ -3337,7 +3336,7 @@ static bool fold_block(IrFunc *f, uint32_t bi, const OptOpts *o, const uint32_t 
           g_stats.folded++;
         }
         else if (has_c1 && y == 0) { replace_with_const(f, v, 0); changed = true; g_stats.folded++; }
-        else if (has_c0 && x == 1) { ir_replace(f, v, a[1]); in->op = I_NOP; changed = true; g_stats.folded++; }
+        else if (has_c0 && x == 1) { ir_replace(f, v, a[1]); ir_make_nop(in); changed = true; g_stats.folded++; }
         else if (has_c0 && x == 0) { replace_with_const(f, v, 0); changed = true; g_stats.folded++; }
         else if (o->strength && has_c1) {
           int k;
@@ -3366,12 +3365,12 @@ static bool fold_block(IrFunc *f, uint32_t bi, const OptOpts *o, const uint32_t 
       case I_AND:
         if (has_c1 && y == 0) { replace_with_const(f, v, 0); changed = true; g_stats.folded++; }
         else if (has_c1 && trunc_to(t, y) == trunc_to(t, ~0ull)) {
-          ir_replace(f, v, a[0]); in->op = I_NOP; changed = true; g_stats.folded++;
+          ir_replace(f, v, a[0]); ir_make_nop(in); changed = true; g_stats.folded++;
         } else if (has_c1 &&
                    (ir_known_bits(f, a[0], KB_DEPTH) & ~trunc_to(t, y)) == 0) {
 
           ir_replace(f, v, a[0]);
-          in->op = I_NOP;
+          ir_make_nop(in);
           changed = true;
           g_stats.folded++;
         }
@@ -3397,7 +3396,7 @@ static bool fold_block(IrFunc *f, uint32_t bi, const OptOpts *o, const uint32_t 
           changed = true;
           g_stats.folded++;
         } else if (has_c1 && (y % (uint64_t)(t == VT_I64 ? 64 : 32)) == 0) {
-          ir_replace(f, v, a[0]); in->op = I_NOP; changed = true; g_stats.folded++;
+          ir_replace(f, v, a[0]); ir_make_nop(in); changed = true; g_stats.folded++;
         } else if (in->op == I_SHRU && has_c1 &&
                    (ir_known_bits(f, a[0], KB_DEPTH) >> (y % (vt_is_64(t) ? 64u : 32u))) == 0) {
           replace_with_const(f, v, 0); changed = true; g_stats.folded++;
@@ -3461,13 +3460,13 @@ static bool fold_block(IrFunc *f, uint32_t bi, const OptOpts *o, const uint32_t 
                         : emit_magic_udiv(f, bi, &i, a[0], t, dc);
             in = &f->insts[v]; a = ir_args(f, v);
             ir_replace(f, v, q);
-            in->op = I_NOP;
+            ir_make_nop(in);
             g_stats.strength_reduced++;
             changed = true;
             break;
           }
           if (is_pow2(trunc_to(t, y), &k)) {
-            if (k == 0) { ir_replace(f, v, a[0]); in->op = I_NOP; }
+            if (k == 0) { ir_replace(f, v, a[0]); ir_make_nop(in); }
             else {
               Ref sh = ir_emit(f, bi, I_CONST, t, NULL, 0, (uint64_t)k, 0);
               b->ninsts--;
@@ -3488,7 +3487,7 @@ static bool fold_block(IrFunc *f, uint32_t bi, const OptOpts *o, const uint32_t 
         if (o->strength && has_c1) {
           int k;
           uint64_t c = trunc_to(t, y);
-          if (c == 1) { ir_replace(f, v, a[0]); in->op = I_NOP; changed = true; g_stats.strength_reduced++; }
+          if (c == 1) { ir_replace(f, v, a[0]); ir_make_nop(in); changed = true; g_stats.strength_reduced++; }
 
           else if (is_pow2(c, &k) && k <= (vt_is_64(t) ? 62 : 30)) {
             strength_divs_pow2(f, bi, &i, v, k);
@@ -3530,7 +3529,7 @@ static bool fold_block(IrFunc *f, uint32_t bi, const OptOpts *o, const uint32_t 
             }
             in = &f->insts[v]; a = ir_args(f, v);
             ir_replace(f, v, q);
-            in->op = I_NOP;
+            ir_make_nop(in);
             g_stats.strength_reduced++;
             changed = true;
           }
@@ -3581,7 +3580,7 @@ static bool fold_block(IrFunc *f, uint32_t bi, const OptOpts *o, const uint32_t 
           }
           in = &f->insts[v]; a = ir_args(f, v);
           ir_replace(f, v, r);
-          in->op = I_NOP;
+          ir_make_nop(in);
           g_stats.strength_reduced++;
           changed = true;
         }
@@ -3590,7 +3589,7 @@ static bool fold_block(IrFunc *f, uint32_t bi, const OptOpts *o, const uint32_t 
         /* a value already the sign extension of its low 32 bits */
         if (in->op == I_EXT32S && in->type == VT_I64 && ir_sext32(f, a[0])) {
           ir_replace(f, v, a[0]);
-          in->op = I_NOP;
+          ir_make_nop(in);
           changed = true;
           g_stats.folded++;
           break;
@@ -3603,7 +3602,7 @@ static bool fold_block(IrFunc *f, uint32_t bi, const OptOpts *o, const uint32_t 
             MEMF_SIZE(li->imm2) == want && !(li->imm2 & MEMF_SIGNED)) {
           li->imm2 |= MEMF_SIGNED;
           ir_replace(f, v, a[0]);
-          in->op = I_NOP;
+          ir_make_nop(in);
           changed = true;
           g_stats.folded++;
         }
@@ -3623,7 +3622,7 @@ static bool fold_block(IrFunc *f, uint32_t bi, const OptOpts *o, const uint32_t 
                                 (in->op == I_EXTENDS ? MEMF_SIGNED : 0);
             li->type = VT_I64;
             ir_replace(f, v, a[0]);
-            in->op = I_NOP;
+            ir_make_nop(in);
             changed = true;
             g_stats.folded++;
             break;
@@ -3635,7 +3634,7 @@ static bool fold_block(IrFunc *f, uint32_t bi, const OptOpts *o, const uint32_t 
           if (f->insts[a[0]].op == I_WRAP && f->insts[a[0]].nargs == 1 &&
               ir_sext32(f, ir_args(f, a[0])[0])) {
             ir_replace(f, v, ir_args(f, a[0])[0]);
-            in->op = I_NOP;
+            ir_make_nop(in);
             changed = true;
             g_stats.folded++;
           }
@@ -3647,7 +3646,7 @@ static bool fold_block(IrFunc *f, uint32_t bi, const OptOpts *o, const uint32_t 
           if (f->insts[x0].type == VT_I64 &&
               (ir_known_bits(f, x0, KB_DEPTH) >> 32) == 0) {
             ir_replace(f, v, x0);
-            in->op = I_NOP;
+            ir_make_nop(in);
             changed = true;
             g_stats.folded++;
           }
@@ -3661,7 +3660,7 @@ static bool fold_block(IrFunc *f, uint32_t bi, const OptOpts *o, const uint32_t 
         uint64_t m;
         if ((si->op == I_EXTENDU || si->op == I_EXTENDS) && si->nargs == 1) {
           ir_replace(f, v, s0);
-          in->op = I_NOP;
+          ir_make_nop(in);
           changed = true;
           g_stats.folded++;
         } else if ((si->op == I_EXT32S && si->nargs == 1) ||
@@ -3708,7 +3707,7 @@ static bool fold_block(IrFunc *f, uint32_t bi, const OptOpts *o, const uint32_t 
             Ref nv = emit_before(f, bi, &i, I_EQ, VT_I32, ea, 2, 0);
             ir_replace(f, v, nv);
             in = &f->insts[v]; a = ir_args(f, v);
-            in->op = I_NOP;
+            ir_make_nop(in);
             changed = true;
             g_stats.folded++;
             break;
@@ -3719,7 +3718,7 @@ static bool fold_block(IrFunc *f, uint32_t bi, const OptOpts *o, const uint32_t 
           if (f->insts[inner].type == VT_I32 &&
               (ir_known_bits(f, inner, KB_DEPTH) & ~1ull) == 0) {
             ir_replace(f, v, inner);
-            in->op = I_NOP;
+            ir_make_nop(in);
             changed = true;
             g_stats.folded++;
             break;
@@ -3742,7 +3741,7 @@ static bool fold_block(IrFunc *f, uint32_t bi, const OptOpts *o, const uint32_t 
         }
         ir_replace(f, v, nv);
         in = &f->insts[v]; a = ir_args(f, v);
-        in->op = I_NOP;
+        ir_make_nop(in);
         changed = true;
         g_stats.folded++;
         break;
@@ -3764,7 +3763,7 @@ static bool fold_block(IrFunc *f, uint32_t bi, const OptOpts *o, const uint32_t 
             Ref rem = emit_before(f, bi, &i, I_SUB, t, suba, 2, 0);
             in = &f->insts[v];
             ir_replace(f, v, rem);
-            in->op = I_NOP;
+            ir_make_nop(in);
             g_stats.strength_reduced++;
             changed = true;
             break;
@@ -3798,19 +3797,19 @@ static bool fold_block(IrFunc *f, uint32_t bi, const OptOpts *o, const uint32_t 
         uint64_t c;
         if (is_const(f, a[2], &c)) {
           ir_replace(f, v, c ? a[0] : a[1]);
-          in->op = I_NOP;
+          ir_make_nop(in);
           changed = true;
           g_stats.folded++;
         } else if (a[0] == a[1]) {
           ir_replace(f, v, a[0]);
-          in->op = I_NOP;
+          ir_make_nop(in);
           changed = true;
           g_stats.folded++;
         } else {
           Ref t = select_trunc_sat(f, v);
           if (t != REF_NONE) {
             ir_replace(f, v, t);
-            in->op = I_NOP;
+            ir_make_nop(in);
             changed = true;
             g_stats.folded++;
           }
@@ -3896,7 +3895,7 @@ static bool fold_block(IrFunc *f, uint32_t bi, const OptOpts *o, const uint32_t 
       if (x == REF_NONE) x = repacked(f, a[1], a[0]);
       if (x != REF_NONE) {
         ir_replace(f, v, x);
-        in->op = I_NOP;
+        ir_make_nop(in);
         changed = true;
         g_stats.folded++;
         continue;
@@ -3906,7 +3905,7 @@ static bool fold_block(IrFunc *f, uint32_t bi, const OptOpts *o, const uint32_t 
       replace_with_const(f, v, 0); changed = true; g_stats.folded++;
     }
     if ((in->op == I_AND || in->op == I_OR) && in->nargs == 2 && a[0] == a[1]) {
-      ir_replace(f, v, a[0]); in->op = I_NOP; changed = true; g_stats.folded++;
+      ir_replace(f, v, a[0]); ir_make_nop(in); changed = true; g_stats.folded++;
     }
   }
   return changed;
@@ -3979,7 +3978,7 @@ static bool retype_bit_loads(IrFunc *f) {
       f->insts[r].type = in->type;
       f->insts[r].imm2 &= ~(uint64_t)MEMF_SIGNED;
       ir_replace(f, u, r);
-      in->op = I_NOP;
+      ir_make_nop(in);
       g_stats.folded++;
       changed = true;
     }
@@ -4273,8 +4272,7 @@ static bool pass_local_throw(IrFunc *f) {
       out[n++] = lt_value(f, pad, past[k], vals, nvals, in);
     }
 
-    f->insts[t].op = I_NOP;
-    f->insts[t].nargs = 0;
+    ir_make_nop(&f->insts[t]);
     b->ninsts--;
     b->nsuccs = 0;
     if (jump) {
@@ -5329,8 +5327,7 @@ restart:;
           i++; \
           in = &f->insts[v]; \
           ir_replace(f, v, z_); \
-          in->op = I_NOP; \
-          in->nargs = 0; } while (0)
+          ir_make_nop(in); } while (0)
         switch (in->op) {
           case I_FIELD_GET: case I_ARRAY_GET: {
             uint32_t k = in->op == I_FIELD_GET
@@ -5357,8 +5354,7 @@ restart:;
             }
             in = &f->insts[v];
             ir_replace(f, v, val);
-            in->op = I_NOP;
-            in->nargs = 0;
+            ir_make_nop(in);
             forwarded++;
             break;
           }
@@ -5367,8 +5363,7 @@ restart:;
                        ? gc_field_of_offset(m, vt_ref(false, (HeapType)o->ti), in->imm)
                        : es_elem_index(f, o, a[1]);
             cur[o->var0 + k] = ir_resolve(f, a[in->op == I_FIELD_SET ? 1 : 2]);
-            in->op = I_NOP;
-            in->nargs = 0;
+            ir_make_nop(in);
             break;
           }
           case I_ARRAY_LEN: replace_with_const(f, v, o->len); break;
@@ -5381,13 +5376,13 @@ restart:;
             int r1 = es_ref_test(m, o->ti, in->imm, in->imm2);
             int r0 = (RTEST_KIND(in->imm) & RTK_NULLABLE) ? 1 : 0;
             if (!o->nullable || r1 == r0) replace_with_const(f, v, (uint64_t)r1);
-            else if (r1) { ir_replace(f, v, flag); in->op = I_NOP; in->nargs = 0; }
+            else if (r1) { ir_replace(f, v, flag); ir_make_nop(in); }
             else ES_IS_NULL_OF_FLAG();
             break;
           }
           case I_TRAP_IF:
             if (o->nullable) a[0] = flag;
-            else { in->op = I_NOP; in->nargs = 0; }
+            else { ir_make_nop(in); }
             break;
           default: break;
         }
@@ -5469,8 +5464,7 @@ restart:;
           for (uint32_t j = p; j + 1 < e->nargs; j++) e->args[j] = e->args[j + 1];
           if (e->nargs > p) e->nargs--;
         }
-        f->insts[P].op = I_NOP;
-        f->insts[P].nargs = 0;
+        ir_make_nop(&f->insts[P]);
       }
     }
 
@@ -5510,7 +5504,7 @@ restart:;
       if (own[v] < 0 || obj[own[v]].escaped) continue;
       Inst *in = &f->insts[v];
       if (in->op == I_STRUCT_NEW || in->op == I_ARRAY_NEW) removed++;
-      if (in->op != I_PARAM) { in->op = I_NOP; in->nargs = 0; in->type = 0; }
+      if (in->op != I_PARAM) { ir_make_nop(in); in->type = 0; }
     }
     ir_apply_subst(f);
     if (split) { ir_recompute_preds(f); ir_order(f); }
@@ -5645,7 +5639,7 @@ static bool pass_cse(IrFunc *f, const OptOpts *o) {
                   dominates(f, f->insts[e->value].block, bi);
         if (ok) {
           ir_replace(f, v, e->value);
-          in->op = I_NOP;
+          ir_make_nop(in);
           g_stats.cse_removed++;
           changed = reused = true;
           break;
@@ -8925,8 +8919,7 @@ static bool pass_dead_frames(IrFunc *f) {
       }
       if (r == 0) {
         Inst *in = &f->insts[c->v];
-        in->op = I_NOP;
-        in->nargs = 0;
+        ir_make_nop(in);
         removed++;
       }
     }
@@ -9905,8 +9898,7 @@ static bool gc_fold_known(IrFunc *f, Ref v) {
       Ref init = gc_init_value(f, v);
       if (init != REF_NONE) {
         ir_replace(f, v, init);
-        in->op = I_NOP;
-        in->nargs = 0;
+        ir_make_nop(in);
         g_stats.loads_forwarded++;
         return true;
       }
@@ -9975,8 +9967,7 @@ static bool gc_fold_known(IrFunc *f, Ref v) {
                    (in->imm == TRAP_NULL_REF &&
                     gc_exact_type(f, ir_args(f, v)[0], &ti));
       if (!never) return false;
-      in->op = I_NOP;
-      in->nargs = 0;
+      ir_make_nop(in);
       return true;
     }
     default:
@@ -10521,8 +10512,7 @@ static uint32_t once_done_by(IrFunc *f, Ref v) {
 static void once_drop(IrFunc *f, uint32_t bi, uint32_t k) {
   Block *b = &f->blocks[bi];
   Inst *in = &f->insts[b->insts[k]];
-  in->op = I_NOP;
-  in->nargs = 0;
+  ir_make_nop(in);
   if (k + 1 != b->ninsts) return;
   uint32_t n = 0;
   for (uint32_t s = 0; s < b->nsuccs; s++)
@@ -11042,7 +11032,7 @@ static bool global_dse(IrFunc *f) {
       uint32_t g = (uint32_t)in->imm;
       if (in->op == I_GLOBAL_SET && g < MAX_TRACKED_GLOBALS) {
         if ((live >> g) & 1) {
-          f->insts[last[g]].op = I_NOP;
+          ir_make_nop(&f->insts[last[g]]);
           g_stats.stores_removed++;
           changed = true;
         }
@@ -11231,7 +11221,7 @@ static bool pass_memopt(IrFunc *f, const OptOpts *o) {
             if (pun == 2) nv = mem_pun_emit(f, bi, &i, nv, (ValType)in->type, size, sgn);
             in = &f->insts[v];
             ir_replace(f, v, nv);
-            in->op = I_NOP;
+            ir_make_nop(in);
             g_stats.loads_forwarded++;
             changed = true;
           }
@@ -11256,7 +11246,7 @@ static bool pass_memopt(IrFunc *f, const OptOpts *o) {
                               a[0], in->imm, size, mem, &ran);
         if (holds) {
           if (apply) {
-            in->op = I_NOP;
+            ir_make_nop(in);
             g_stats.stores_removed++;
             changed = true;
           }
@@ -11268,7 +11258,7 @@ static bool pass_memopt(IrFunc *f, const OptOpts *o) {
                            a[0], in->imm, size, mem, &ran))
             continue;
           if (apply) {
-            f->insts[pend[k].inst].op = I_NOP;
+            ir_make_nop(&f->insts[pend[k].inst]);
             g_stats.stores_removed++;
             changed = true;
           }
@@ -11338,7 +11328,7 @@ static bool pass_memopt(IrFunc *f, const OptOpts *o) {
           }
           if (apply) {
             ir_replace(f, v, ent[k].value);
-            in->op = I_NOP;
+            ir_make_nop(in);
             g_stats.loads_forwarded++;
             changed = true;
           }
@@ -11382,7 +11372,7 @@ static bool pass_memopt(IrFunc *f, const OptOpts *o) {
           if ((gok >> g) & 1 && f->insts[gval[g]].type == in->type) {
             if (apply) {
               ir_replace(f, v, gval[g]);
-              in->op = I_NOP;
+              ir_make_nop(in);
               g_stats.loads_forwarded++;
               changed = true;
             }
@@ -12148,7 +12138,7 @@ static bool pass_bce(IrFunc *f, Module *m) {
       uint64_t mx = ir_value_max(f, base, 6);
       uint64_t floor_ = mem_guaranteed_bytes(m, mem);
       if (mx <= UINT64_MAX - need && mx + need <= floor_) {
-        in->op = I_NOP;
+        ir_make_nop(in);
         g_stats.checks_removed++;
         changed = true;
         continue;
@@ -12158,7 +12148,7 @@ static bool pass_bce(IrFunc *f, Module *m) {
         if (sets[bi][k].addr == base && sets[bi][k].mem == mem &&
             sets[bi][k].covered >= need) { covered = true; break; }
       if (covered) {
-        in->op = I_NOP;
+        ir_make_nop(in);
         g_stats.checks_removed++;
         changed = true;
         continue;
@@ -13107,10 +13097,10 @@ static bool gs_promote_one(IrFunc *f, const OptOpts *o, uint32_t gidx,
         if (cur == REF_NONE) { cur = r; mv = r; continue; }
         if (dry) continue;
         ir_replace(f, r, cur);
-        f->insts[r].op = I_NOP;
+        ir_make_nop(&f->insts[r]);
       } else if (op == I_GLOBAL_SET && (uint32_t)f->insts[r].imm == gidx) {
         cur = ir_args(f, r)[0];
-        if (!dry) f->insts[r].op = I_NOP;
+        if (!dry) ir_make_nop(&f->insts[r]);
       } else if (gl_opaque(op)) {
         bool tail = false;
         if (!gs_observes(f, o, r, gidx, &tail)) {
@@ -13545,7 +13535,7 @@ static bool pass_invdiv(IrFunc *f) {
         }
         in = &f->insts[v];
         ir_replace(f, v, r);
-        in->op = I_NOP;
+        ir_make_nop(in);
         i = at;
         changed = true;
         g_stats.strength_reduced++;
@@ -13838,11 +13828,10 @@ static void gl_apply(IrFunc *f, const uint8_t *inloop, uint32_t gidx,
       if ((uint32_t)in->imm != gidx) continue;
       if (in->op == I_GLOBAL_GET) {
         ir_replace(f, r, v);
-        in->op = I_NOP;
+        ir_make_nop(in);
       } else if (in->op == I_GLOBAL_SET) {
         v = ir_args(f, r)[0];
-        in->op = I_NOP;
-        in->nargs = 0;
+        ir_make_nop(in);
       }
     }
   }
@@ -13896,7 +13885,7 @@ static bool gl_promote_one(IrFunc *f, uint32_t hb, uint32_t pre,
       /* the read made for the promotion goes with it */
       Block *pb = &f->blocks[pre];
       if (pb->ninsts && pb->insts[pb->ninsts - 1] == entry) pb->ninsts--;
-      f->insts[entry].op = I_NOP;
+      ir_make_nop(&f->insts[entry]);
       xfree(cur); xfree(subst); return false;
     }
 
@@ -14515,8 +14504,7 @@ static bool lh_kill_redundant(IrFunc *f, uint32_t hb, uint32_t pre,
       }
       if (warmc_getenv("WARMC_LH_DEBUG"))
         fprintf(stderr, "lh   store v%u already made in b%u\n", r, pre);
-      in->op = I_NOP;
-      in->nargs = 0;
+      ir_make_nop(in);
       g_stats.stores_removed++;
       changed = true;
     }
@@ -14998,26 +14986,17 @@ static bool rotate_one(IrFunc *f, uint32_t hb) {
   for (uint32_t s = 0; s < h->nsuccs; s++)
     if (inl[h->succs[s].target]) nstay++;
   if (nstay != 1) { xfree(inl); RJ("header test does not leave the loop"); }
-  bool body_calls = false, body_mem = false;
+  bool body_calls = false;
   for (uint32_t bi = 0; bi < nb; bi++) {
     if (!inl[bi] || !f->blocks[bi].reachable) continue;
     Block *b = &f->blocks[bi];
-    for (uint32_t i = 0; i < b->ninsts; i++) {
-      uint32_t op = f->insts[b->insts[i]].op;
-      if (op == I_CALL || op == I_CALL_INDIRECT || op == I_CALL_REF ||
-          op == I_RETURN_CALL || op == I_RETURN_CALL_INDIRECT ||
-          op == I_RETURN_CALL_REF) body_calls = true;
-      else if (op == I_LOAD || op == I_STORE || op == I_VLOAD || op == I_VSTORE ||
-               op == I_VLDN)
-        body_mem = true;
-    }
+    for (uint32_t i = 0; i < b->ninsts; i++)
+      if (is_call_op(f->insts[b->insts[i]].op)) body_calls = true;
   }
   xfree(inl);
 
   bool rot_all = warmc_getenv("WARMC_ROT_ALL") != NULL;
   if (body_calls && !rot_all) RJ("body makes a call");
-
-  if (!body_mem && !rot_all) RJ("body touches no memory");
 
   /* What rotation saves is the jump back to the header: the latch ends in
      the header's test instead, one conditional branch where there were two.
@@ -16026,6 +16005,13 @@ typedef struct {
   bool wide;
   int half;
   uint32_t awidth, alane;
+  /* The counters whose values a lane may hold, one element an iteration:
+     each copy's vector of the values a counter takes in the iterations its
+     lanes stand for. */
+  uint32_t niv;
+  Ref ivpar[16];
+  Ref ivvec[16][VEC_MAX_COPY];
+  bool ivused[16];
 } VecCtx;
 
 /* Whether loads a and b of the scalar body read one address the same way.
@@ -16857,6 +16843,14 @@ static Ref v_build(VecCtx *c, const Ref *tuple, uint32_t k, uint32_t st, int dep
     out = vemit(f, c->vguard, I_VSPLAT, VT_V128, tuple[0], REF_NONE, 0, c->lane);
     goto done;
   }
+  /* a counter, the lanes one iteration each */
+  if (op0 == I_PARAM)
+    for (uint32_t q = 0; q < c->niv; q++)
+      if (c->ivpar[q] == tuple[0]) {
+        c->ivused[q] = true;
+        out = c->ivvec[q][c->copy];
+        goto done;
+      }
 
   if (op0 == I_PARAM && v_sel_of(c, tuple[0])) {
     Ref ct[VEC_MAX_MEMB], tt[VEC_MAX_MEMB], ft[VEC_MAX_MEMB];
@@ -17425,6 +17419,7 @@ typedef struct {
   Ref ppay[VEC_MAX_PAY], ppos;
   Ref nptr[VEC_MAX_GRP], ncnt, more;
   Ref nextacc[VEC_MAX_RED][VEC_MAX_COPY], nextpay[VEC_MAX_PAY], nextpos;
+  Ref piv[16], nextiv[16];
 } VBody;
 
 /* What a value read past a loop is to the vector loop's exit: np for one
@@ -17826,17 +17821,30 @@ static bool vectorize_one(IrFunc *f, uint32_t hb, uint8_t *reach, uint8_t *inloo
     acc[nacc].lane = ln;
     nacc++;
   }
-  if (!nacc) VREJ("no memory access");
+  /* A loop that touches no memory vectorises for what it carries round, in
+     its lanes, one element an iteration: gobench/bigstruct sums (r & 3) +
+     14 over its counter, which clang -O2 does four lanes at a time. */
+  bool nomem = nacc == 0;
+  uint32_t lane = 0, width = 0;
+  for (uint32_t p = 0; p < np && nomem && !width; p++) {
+    if (isiv[p]) continue;
+    ValType pt = (ValType)f->insts[hparam[p]].type;
+    lane = v_lane_of(pt);
+    width = v_natural_width(pt);
+  }
+  if (nomem && !width) VREJ("no memory access");
 
-  bool idx64 = ACC_IDX64(acc[0].mem);
+  bool idx64 = !nomem && ACC_IDX64(acc[0].mem);
   for (uint32_t i = 1; i < nacc; i++)
     if (ACC_IDX64(acc[i].mem) != idx64) VREJ("mixed index spaces");
   const uint64_t amask = idx64 ? ~0ull : 0xffffffffu;
   const uint64_t asign = idx64 ? (1ull << 63) : (1ull << 31);
   const ValType at = idx64 ? VT_I64 : VT_I32;
 
-  uint32_t lane = acc[0].lane;
-  uint32_t width = acc[0].width;
+  if (!nomem) {
+    lane = acc[0].lane;
+    width = acc[0].width;
+  }
   /* Accesses as wide as one another with an integer lane beside a float
      one -- an i32 array converted into an f32 one -- hold as many elements
      to a vector, and each value is built in its own type's lane.  Only the
@@ -17864,13 +17872,13 @@ static bool vectorize_one(IrFunc *f, uint32_t hb, uint8_t *reach, uint8_t *inloo
     if (!found) VREJ("address is not affine in any counter");
   }
 
-  uint64_t S = 0;
+  uint64_t S = nomem ? width : 0;
   for (uint32_t i = 0; i < nacc; i++) {
     uint64_t sa = (acc[i].stride & asign) ? ANEG(acc[i].stride) : acc[i].stride;
     if (sa == 0) VREJ("stride is zero");
     if (i == 0 || sa < S) S = sa;
   }
-  bool dir0 = (acc[0].stride & asign) != 0;
+  bool dir0 = !nomem && (acc[0].stride & asign) != 0;
   for (uint32_t i = 0; i < nacc; i++) {
     if (((acc[i].stride & asign) != 0) != dir0)
       VREJ("counters march in opposite directions");
@@ -17909,6 +17917,12 @@ static bool vectorize_one(IrFunc *f, uint32_t hb, uint8_t *reach, uint8_t *inloo
   ctx.mpv = mpv; ctx.nvec = nvec; ctx.gran = gran;
   ctx.acc = acc; ctx.nacc = nacc;
   ctx.half = -1; ctx.awidth = width; ctx.alane = lane;
+  /* the counters a lane may hold: of the lanes' width, one element an
+     iteration, forward (backward, the lanes run against the iterations) */
+  if (k == 1 && !backward)
+    for (uint32_t p = 0; p < np; p++)
+      if (isiv[p] && v_natural_width((ValType)f->insts[hparam[p]].type) == width)
+        ctx.ivpar[ctx.niv++] = hparam[p];
 
   uint8_t used[VEC_MAX_ACC];
   memset(used, 0, sizeof used);
@@ -18136,7 +18150,8 @@ static bool vectorize_one(IrFunc *f, uint32_t hb, uint8_t *reach, uint8_t *inloo
       uint8_t got[VEC_MAX_MEMB];
       memset(got, 0, sizeof got);
       for (uint32_t t = 0; t < k; t++) {
-        int l = v_lane_of_term(&ctx, redterm[nred][t], VEC_DEPTH);
+        /* one element an iteration is lane 0, whatever it reads */
+        int l = k == 1 ? 0 : v_lane_of_term(&ctx, redterm[nred][t], VEC_DEPTH);
         if (l < 0 || (uint32_t)l >= k || got[l]) VREJ("reduction terms do not line up");
         ord[l] = redterm[nred][t];
         if (is_mm) { redcmp[nred][l] = mmcmp[t]; redtt[nred][l] = tsd[t]; }
@@ -18654,6 +18669,28 @@ static bool vectorize_one(IrFunc *f, uint32_t hb, uint8_t *reach, uint8_t *inloo
   for (uint32_t g = 0; g < ctx.ngrp; g++)
     if (ctx.grp[g].store && ctx.grp[g].spec) can_widen = false;
 
+  /* Each such counter's vector: its first values on entry, a lane a step
+     apart; a copy's, U steps on; the next iteration's, R copies' on. */
+  Ref vivinit[16], vivstep[16][VEC_MAX_COPY + 1];
+  for (uint32_t q = 0; q < ctx.niv; q++) {
+    uint32_t p = 0;
+    while (hparam[p] != ctx.ivpar[q]) p++;
+    ValType pt = (ValType)f->insts[hparam[p]].type;
+    uint32_t il = v_lane_of(pt), bits = width * 8;
+    uint64_t m = bits == 64 ? ~0ull : (1ull << bits) - 1;
+    uint64_t sp = ivadd[p] ? ivstep[p] : (uint64_t)0 - ivstep[p];
+    uint64_t w[2] = { 0, 0 };
+    for (uint32_t j = 0; j < VEC_BYTES / width; j++)
+      w[(j * bits) / 64] |= ((uint64_t)j * sp & m) << ((j * bits) % 64);
+    Ref iota = ir_emit(f, vguard, I_CONST, VT_V128, NULL, 0, w[0], w[1]);
+    Ref e = vemit(f, vguard, I_VSPLAT, VT_V128, iventry[p], REF_NONE, 0, il);
+    vivinit[q] = vemit(f, vguard, I_VADD, VT_V128, e, iota, 0, il);
+    for (uint32_t c = 1; c <= R; c++) {
+      Ref sc = ir_emit(f, vguard, I_CONST, pt, NULL, 0, (uint64_t)c * U * sp & m, 0);
+      vivstep[q][c] = vemit(f, vguard, I_VSPLAT, VT_V128, sc, REF_NONE, 0, il);
+    }
+  }
+
   /* The bodies: the loop of R copies, and with more than one the loop of
      one copy after it. */
   uint32_t vbody1 = R > 1 ? ir_new_block(f) : REF_NONE;
@@ -18678,6 +18715,14 @@ static bool vectorize_one(IrFunc *f, uint32_t hb, uint8_t *reach, uint8_t *inloo
     B->ppos = REF_NONE;
     for (uint32_t i = 0; i < npay; i++) B->ppay[i] = ir_add_param(f, vb, VT_V128);
     if (npay) B->ppos = ir_add_param(f, vb, VT_V128);
+    for (uint32_t q = 0; q < ctx.niv; q++) {
+      uint32_t il = v_lane_of((ValType)f->insts[ctx.ivpar[q]].type);
+      B->piv[q] = ir_add_param(f, vb, VT_V128);
+      ctx.ivvec[q][0] = B->piv[q];
+      for (uint32_t c = 1; c < RC; c++)
+        ctx.ivvec[q][c] = vemit(f, vb, I_VADD, VT_V128, B->piv[q], vivstep[q][c], 0, il);
+      B->nextiv[q] = vemit(f, vb, I_VADD, VT_V128, B->piv[q], vivstep[q][RC], 0, il);
+    }
 
     /* every copy's loads first, a group's side by side, which the back end
        pairs */
@@ -18896,6 +18941,12 @@ static bool vectorize_one(IrFunc *f, uint32_t hb, uint8_t *reach, uint8_t *inloo
     B->more = vemit(f, vb, I_NE, VT_I32, B->ncnt, vzero, 0, 0);
   }
 
+  /* a counter no lane read: its vector passes itself round, which
+     prune_params takes for the value it enters with, unread */
+  for (uint32_t q = 0; q < ctx.niv; q++)
+    if (!ctx.ivused[q])
+      for (uint32_t bi = 0; bi < (R > 1 ? 2u : 1u); bi++) bod[bi].nextiv[q] = bod[bi].piv[q];
+
   Ref eacc[VEC_MAX_RED], epay[VEC_MAX_PAY];
   for (uint32_t r = 0; r < nred; r++)
     eacc[r] = ir_add_param(f, vexit, VT_V128);
@@ -18908,7 +18959,7 @@ static bool vectorize_one(IrFunc *f, uint32_t hb, uint8_t *reach, uint8_t *inloo
       f->blocks[pre].succs[s].nargs = 0;
     }
 
-  Ref vb_args[VEC_MAX_GRP + 1 + VEC_MAX_RED * VEC_MAX_COPY + VEC_MAX_PAY + 1];
+  Ref vb_args[VEC_MAX_GRP + 1 + VEC_MAX_RED * VEC_MAX_COPY + VEC_MAX_PAY + 1 + 16];
   Ref ident[VEC_MAX_RED];
   uint32_t nvb = 0;
   for (uint32_t g = 0; g < ctx.ngrp; g++)
@@ -18942,6 +18993,7 @@ static bool vectorize_one(IrFunc *f, uint32_t hb, uint8_t *reach, uint8_t *inloo
     vb_args[nvb++] = ir_emit(f, vguard, I_CONST, VT_V128, NULL, 0,
                              0x0000000100000000ull, 0x0000000300000002ull);
   }
+  for (uint32_t q = 0; q < ctx.niv; q++) vb_args[nvb++] = vivinit[q];
   f->blocks[vguard].term = T_BRIF;
   f->blocks[vguard].term_arg = ok;
   if (R == 1) {
@@ -18969,12 +19021,14 @@ static bool vectorize_one(IrFunc *f, uint32_t hb, uint8_t *reach, uint8_t *inloo
     vb_args[nvb++] = cntR;
     for (uint32_t r = 0; r < nred; r++)
       for (uint32_t c = 0; c < R; c++) vb_args[nvb++] = ident[r];
+    for (uint32_t q = 0; q < ctx.niv; q++) vb_args[nvb++] = vivinit[q];
     ir_add_edge(f, vsel, vbody, vb_args, nvb);
     nvb = 0;
     for (uint32_t g = 0; g < ctx.ngrp; g++)
       if (gown[g] == g) vb_args[nvb++] = ctx.grp[g].ptr;
     vb_args[nvb++] = cnt;
     for (uint32_t r = 0; r < nred; r++) vb_args[nvb++] = ident[r];
+    for (uint32_t q = 0; q < ctx.niv; q++) vb_args[nvb++] = vivinit[q];
     ir_add_edge(f, vsel, vbody1, vb_args, nvb);
   }
 
@@ -18988,6 +19042,7 @@ static bool vectorize_one(IrFunc *f, uint32_t hb, uint8_t *reach, uint8_t *inloo
       for (uint32_t c = 0; c < B->R; c++) vb_args[nvb++] = B->nextacc[r][c];
     for (uint32_t i = 0; i < npay; i++) vb_args[nvb++] = B->nextpay[i];
     if (npay) vb_args[nvb++] = B->nextpos;
+    for (uint32_t q = 0; q < ctx.niv; q++) vb_args[nvb++] = B->nextiv[q];
     f->blocks[B->blk].term = T_BRIF;
     f->blocks[B->blk].term_arg = B->more;
     ir_add_edge(f, B->blk, B->blk, vb_args, nvb);
@@ -19002,16 +19057,18 @@ static bool vectorize_one(IrFunc *f, uint32_t hb, uint8_t *reach, uint8_t *inloo
     /* the copies' accumulators, combined pairwise; then the vectors the
        copies left, if any */
     uint32_t vmid = ir_new_block(f);
-    Ref mptr[VEC_MAX_GRP], macc[VEC_MAX_RED][VEC_MAX_COPY];
+    Ref mptr[VEC_MAX_GRP], macc[VEC_MAX_RED][VEC_MAX_COPY], miv[16];
     for (uint32_t g = 0; g < ctx.ngrp; g++)
       mptr[g] = gown[g] == g ? ir_add_param(f, vmid, VT_I64) : mptr[gown[g]];
     for (uint32_t r = 0; r < nred; r++)
       for (uint32_t c = 0; c < R; c++) macc[r][c] = ir_add_param(f, vmid, VT_V128);
+    for (uint32_t q = 0; q < ctx.niv; q++) miv[q] = ir_add_param(f, vmid, VT_V128);
     nvb = 0;
     for (uint32_t g = 0; g < ctx.ngrp; g++)
       if (gown[g] == g) vb_args[nvb++] = bod[0].nptr[g];
     for (uint32_t r = 0; r < nred; r++)
       for (uint32_t c = 0; c < R; c++) vb_args[nvb++] = bod[0].nextacc[r][c];
+    for (uint32_t q = 0; q < ctx.niv; q++) vb_args[nvb++] = bod[0].nextiv[q];
     ir_add_edge(f, vbody, vmid, vb_args, nvb);
 
     for (uint32_t r = 0; r < nred; r++)
@@ -19033,6 +19090,7 @@ static bool vectorize_one(IrFunc *f, uint32_t hb, uint8_t *reach, uint8_t *inloo
                           (uint64_t)(R - 1) * W * ctx.grp[g].m, 0), 0, 0);
     vb_args[nvb++] = rem;
     for (uint32_t r = 0; r < nred; r++) vb_args[nvb++] = macc[r][0];
+    for (uint32_t q = 0; q < ctx.niv; q++) vb_args[nvb++] = miv[q];
     ir_add_edge(f, vmid, vbody1, vb_args, nvb);
     for (uint32_t r = 0; r < nred; r++) vb_args[r] = macc[r][0];
     ir_add_edge(f, vmid, vexit, vb_args, nred);
@@ -19950,7 +20008,7 @@ static void slp_load(IrFunc *f, SlpNode *nd, uint32_t k, const uint32_t *uses, S
   nd->val = emit_before(f, nd->blk, &at, I_LOAD, VT_V128, &la, 1, im);
   f->insts[nd->val].imm2 = MEMF_MK_AT(4, 0, MEMF_MEM(m2)) | (m2 & MEMF_NOCHECK);
   for (uint32_t j = 0; j < k; j++) {
-    if (uses[nd->lane[j]] == 1) { f->insts[nd->lane[j]].op = I_NOP; continue; }
+    if (uses[nd->lane[j]] == 1) { ir_make_nop(&f->insts[nd->lane[j]]); continue; }
     if (kept->n == kept->cap) {
       kept->cap = kept->cap ? kept->cap * 2 : 16;
       kept->r = xrealloc(kept->r, kept->cap * sizeof(Ref));
@@ -20140,10 +20198,10 @@ static void slp_make(IrFunc *f, uint32_t bi, const SlpGroup *G, SlpNode *n,
   uint64_t im = f->insts[G->st[0]].imm, m2 = f->insts[G->st[0]].imm2;
   Ref vs = emit_before(f, bi, &at, I_STORE, (ValType)0, sa, 2, im);
   f->insts[vs].imm2 = MEMF_MK_AT(4, 0, MEMF_MEM(m2)) | (m2 & MEMF_NOCHECK);
-  for (uint32_t j = 0; j < k; j++) f->insts[G->st[j]].op = I_NOP;
+  for (uint32_t j = 0; j < k; j++) ir_make_nop(&f->insts[G->st[j]]);
   for (uint32_t x = 0; x < G->nn; x++)
     if (n[x].kind == SLP_OP)
-      for (uint32_t j = 0; j < k; j++) f->insts[n[x].lane[j]].op = I_NOP;
+      for (uint32_t j = 0; j < k; j++) ir_make_nop(&f->insts[n[x].lane[j]]);
   g_stats.slp_groups++;
 }
 
@@ -20277,21 +20335,9 @@ static bool pass_slp(IrFunc *f) {
     /* a lane load read only by what the groups took away, the vector load
        before it reading its bytes: it cannot trap where that did not */
     xfree(uses);
-    uses = xcalloc(f->ninsts ? f->ninsts : 1, sizeof(uint32_t));
-    for (uint32_t oi = 0; oi < f->norder; oi++) {
-      const Block *b = &f->blocks[f->order[oi]];
-      for (uint32_t i = 0; i < b->ninsts; i++) {
-        const Inst *in = &f->insts[b->insts[i]];
-        if (in->op == I_NOP) continue;
-        for (uint32_t j = 0; j < in->nargs; j++) uses[ir_args(f, b->insts[i])[j]]++;
-      }
-      if (b->term == T_BRIF || b->term == T_BRTABLE) uses[b->term_arg]++;
-      for (uint32_t i = 0; i < b->nret; i++) uses[b->ret_args[i]]++;
-      for (uint32_t s = 0; s < b->nsuccs; s++)
-        for (uint32_t j = 0; j < b->succs[s].nargs; j++) uses[b->succs[s].args[j]]++;
-    }
+    uses = count_uses(f);
     for (uint32_t x = 0; x < kept.n; x++)
-      if (!uses[kept.r[x]]) f->insts[kept.r[x]].op = I_NOP;
+      if (!uses[kept.r[x]]) ir_make_nop(&f->insts[kept.r[x]]);
   }
   xfree(kept.r);
   xfree(R.g);
@@ -20471,7 +20517,7 @@ static bool unroll_one(IrFunc *f, uint32_t hb, Ref *fixmap, uint32_t *cycleid,
 
   /* Stage 1 cycles: the self-loop, the rotated two-block loop (test after
      the body, in the latch), and the top-tested two-block loop the rotate
-     pass leaves alone when the body touches no memory. */
+     pass leaves alone when the body calls. */
   uint32_t cyc[2], ncyc;
   uint32_t test_b;
   const char *shape;
@@ -21758,7 +21804,7 @@ static bool ldc_block(IrFunc *f, uint32_t bi, const uint32_t *uses,
     }
     ir_replace(f, root, result);
 
-    for (uint32_t k = 0; k < n; k++) f->insts[lane[k].load].op = I_NOP;
+    for (uint32_t k = 0; k < n; k++) ir_make_nop(&f->insts[lane[k].load]);
     g_stats.loads_combined++;
     changed = true;
     i += at - hi;
@@ -21879,7 +21925,7 @@ static bool pass_self_tail(IrFunc *f) {
       b->term = T_JUMP;
       ir_add_edge(f, bi, hb, ca, np);
       xfree(ca);
-      in->op = I_NOP;
+      ir_make_nop(in);
       break;
     }
   }
@@ -22068,7 +22114,7 @@ static bool pass_fma(IrFunc *f) {
                             (ValType)in->type, ma, 3, form);
         f->insts[r].imm2 = vec ? lane : 0;
         ir_replace(f, v, r);
-        f->insts[v].op = I_NOP;
+        ir_make_nop(&f->insts[v]);
         g_stats.fma_fused++;
         changed = true;
         break;
