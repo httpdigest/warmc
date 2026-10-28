@@ -366,6 +366,7 @@ start traps-exacttrap env WARMC_FLAGS="-O2 -fexact-trap" ./test/run_traps.sh
 start gc-exacttrap    env WARMC_FLAGS="-O2 -fexact-trap" ./test/run_gc.sh
 
 start magic    python3 test/magic.py
+start testcache python3 test/testcache.py selftest
 start optcases python3 test/run_optcases.py
 # random shapes of the optimiser's folds and their near misses -- bit
 # reversals, float computations of integers truncated and compared,
