@@ -43,7 +43,7 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-PASSES = """fold dce cse licm branch thread nodesplit mem bce strength inline reassoc
+PASSES = """fold dce cse licm branch thread nodesplit key-split mem bce strength inline reassoc
 rotate addroff memptr align guard-pages regalloc split vectorize edge-tests
 selftail ldcomb escape partial-escape gloop loopclose cpool ictab trampoline
 go-sp go-resume go-noret wrap-params gssa small-loop-align labcache barelide merge reach

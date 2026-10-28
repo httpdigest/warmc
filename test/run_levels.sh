@@ -63,6 +63,8 @@ check differ test/cases_opt/float_reassoc.wat "-O2" "-O3"
 check differ test/cases_opt/float_reassoc.wat "-O3" "-O3 -fno-float-reassoc"
 check differ test/cases_opt/addr_nowrap.wat "-O2" "-O3"
 check differ test/cases_opt/addr_nowrap.wat "-O3" "-O3 -fno-addr-nowrap"
+# -fno-key-split turns off a pass every level from -O1 runs
+check differ test/cases_opt/key_split.wat "-O2" "-O2 -fno-key-split"
 
 # count MODULE "FLAGS" NAME=N: what warmc --stats counts for a module
 count() {

@@ -67,15 +67,16 @@ static const char *usage_text =
   "                measurements that decided both.  Options apply in order,\n"
   "                so a -f flag goes after the -O it amends\n"
   "  -f[no-]PASS   enable or disable one pass: fold, dce, cse, licm, branch,\n"
-  "                thread, nodesplit, mem, bce, strength, inline, reassoc,\n"
-  "                rotate, addroff, memptr, align, regalloc, guard-pages,\n"
-  "                vectorize, edge-tests, unroll, selftail, ldcomb, escape,\n"
-  "                partial-escape, gloop, gssa, loopclose, cpool, ictab, reach,\n"
-  "                prune, merge, devirt, reinline, throw-jump, closed-world,\n"
-  "                sealed, once, gcpure, split, labcache, ifconv, mulwide,\n"
-  "                barelide, small-loop-align, trampoline, go-sp, go-resume,\n"
-  "                go-noret, wrap-params, fma, dead-frames, acc-tail,\n"
-  "                float-reassoc, addr-nowrap, exact-trap\n"
+  "                thread, nodesplit, key-split, mem, bce, strength, inline,\n"
+  "                reassoc, rotate, addroff, memptr, align, regalloc,\n"
+  "                guard-pages, vectorize, edge-tests, unroll, selftail,\n"
+  "                ldcomb, escape, partial-escape, gloop, gssa, loopclose,\n"
+  "                cpool, ictab, reach, prune, merge, devirt, reinline,\n"
+  "                throw-jump, closed-world, sealed, once, gcpure, split,\n"
+  "                labcache, ifconv, mulwide, barelide, small-loop-align,\n"
+  "                trampoline, go-sp, go-resume, go-noret, wrap-params, fma,\n"
+  "                dead-frames, acc-tail, float-reassoc, addr-nowrap,\n"
+  "                exact-trap\n"
   "                fma is off below -O3: it fuses a float multiply\n"
   "                into the add that reads it, rounded once, which is not\n"
   "                wasm's arithmetic and can change a result's last bit\n"
@@ -434,7 +435,7 @@ static void print_stats(void) {
           " loop_pieces=%llu recomputes=%llu dead_frame_stores=%llu tramp_funcs=%llu gosp_funcs=%llu"
           " go_resume_pruned=%llu go_resume_split=%llu go_noret_calls=%llu wrap_params=%llu\n"
           "             escape_removed=%llu escape_forwarded=%llu escape_made=%llu gloop=%llu\n"
-          "             loop_closed=%llu reassoc=%llu cmp_reused=%llu csel_fused=%llu mul_wide=%llu fma=%llu gssa=%llu bitrevs=%llu common_factors=%llu threaded_known=%llu param_compares=%llu small_loops=%llu slp_groups=%llu\n"
+          "             loop_closed=%llu reassoc=%llu cmp_reused=%llu csel_fused=%llu mul_wide=%llu fma=%llu gssa=%llu bitrevs=%llu common_factors=%llu threaded_known=%llu param_compares=%llu key_splits=%llu small_loops=%llu slp_groups=%llu\n"
           "             bar_masks=%llu bar_elided=%llu\n"
           "             devirt_ref=%llu devirt_indirect=%llu"
           " devirt_null_kept=%llu const_reads=%llu throw_jumps=%llu"
@@ -504,6 +505,7 @@ static void print_stats(void) {
           (unsigned long long)g_stats.common_factors,
           (unsigned long long)g_stats.threaded_known,
           (unsigned long long)g_stats.param_compares,
+          (unsigned long long)g_stats.key_splits,
           (unsigned long long)g_stats.small_loops,
           (unsigned long long)g_stats.slp_groups,
           (unsigned long long)g_stats.bar_masks,
@@ -1065,7 +1067,7 @@ static int warmc_main(int argc, char **argv) {
   memset(&opt, 0, sizeof opt);
   set_level(&opt, 2);
   opt.fold = opt.dce = opt.cse = opt.licm = opt.branch = true;
-  opt.thread = opt.nodesplit = true;
+  opt.thread = opt.nodesplit = opt.keysplit = true;
   opt.gssa = true;
   opt.small_loop_align = true;
   opt.memopt = opt.bce = opt.strength = true;
@@ -1207,6 +1209,7 @@ static int warmc_main(int argc, char **argv) {
       else if (!strcmp(name, "branch")) opt.branch = on;
       else if (!strcmp(name, "thread")) opt.thread = on;
       else if (!strcmp(name, "nodesplit")) opt.nodesplit = on;
+      else if (!strcmp(name, "key-split")) opt.keysplit = on;
       else if (!strcmp(name, "mem")) opt.memopt = on;
       else if (!strcmp(name, "bce")) opt.bce = on;
       else if (!strcmp(name, "strength")) opt.strength = on;
