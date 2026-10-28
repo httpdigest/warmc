@@ -12,13 +12,13 @@ MEM = 4096
 
 
 def data():
-    """The data segment: doubles at 256.., words at 64.. and 1024.."""
+    """The data segment: doubles at 256.., words at 64.. and 1792.."""
     m = bytearray(MEM)
     for i in range(64):
         struct.pack_into('<i', m, 64 + 4 * i, (i * 2654435761 + 12345) & 0x7fffffff)
     for i in range(160):
         struct.pack_into('<d', m, 256 + 8 * i, (i * 37 % 101) / 8.0 - 3.25)
-    for i in range(64):
+    for i in range(520):
         struct.pack_into('<i', m, 1792 + 4 * i, (i * 40503 + 7) & 0x7fffffff)
     return m
 
@@ -28,6 +28,24 @@ def st(m, a, v): struct.pack_into('<d', m, a, v)
 def ld32(m, a): return struct.unpack_from('<I', m, a)[0]
 def st32(m, a, v): struct.pack_into('<I', m, a, v & M32)
 def s32(v): v &= M32; return v - (1 << 32) if v >> 31 else v
+def f32(v): return struct.unpack('<f', struct.pack('<f', v))[0]
+def ldf(m, a): return struct.unpack_from('<f', m, a)[0]
+def stf(m, a, v): struct.pack_into('<f', m, a, v)
+def bits_f64(b): return struct.unpack('<d', struct.pack('<Q', b))[0]
+
+
+class Trap(Exception):
+    pass
+
+
+def ea(x, c, d, n):
+    """the address of an n-byte access at (x + c) + d, as wasm makes it: the
+    add wraps in 32 bits, the offset does not; past the memory's one page
+    it traps"""
+    a = ((x + c) & M32) + d
+    if a + n > 65536:
+        raise Trap
+    return a
 
 
 def h32(m, a, n):
@@ -176,10 +194,11 @@ def lanes_of(fmt, n, *offs):
     return ''.join('\n    ' + fmt % tuple(o(j) for o in offs) for j in range(n))
 
 
-# five adds deep, the limit's depth less one: a vector; six: past it
-case('deep5', '(param $p i32) (param $q i32) (result i32)', deep(5), deep_model(5),
-     [(0, 0)], [(r'\sadd\.4s\s', 5)])
-case('deep6', '(param $p i32) (param $q i32) (result i32)', deep(6), deep_model(6),
+# 31 adds of 32 loads, 63 nodes, within the limit of 64: a vector; 32 adds
+# of 33 loads, 65: past it
+case('deep31', '(param $p i32) (param $q i32) (result i32)', deep(31), deep_model(31),
+     [(0, 0)], [(r'\sadd\.4s\s', 31)])
+case('deep32', '(param $p i32) (param $q i32) (result i32)', deep(32), deep_model(32),
      [(0, 0)], [(r'\sadd\.4s\s', 0)])
 
 case('isub4', '(param $p i32) (param $q i32) (result i32)',
@@ -280,7 +299,7 @@ case('crossblock', '(param $p i32) (param $q i32) (param $c i32) (result f64)',
      lambda m, p, q, c: (lambda a, b: ((st(m, q + 1024, 1.0) if c else None), st(m, p, a + ld(m, p + 512)),
                                        st(m, p + 8, b + ld(m, p + 520)), ld(m, q + 1024) + fsum(m, q, 2))[-1])(
          ld(m, p + 256), ld(m, p + 264)),
-     [(0, 0, 0), (0, 0, 1)], [])
+     [(0, 0, 0), (0, 0, 1)], [(r'\sfadd\.2d\s', 1)])
 
 case('copyshared', '(param $p i32) (param $q i32) (result f64)',
      '\n    (local $a f64) (local $b f64)'
@@ -501,6 +520,172 @@ case('clash', '(param $p i32) (param $q i32) (param $k f64) (result f64)',
          ld(m, p + 256)),
      [(0, 0, 1.5)], [])
 
+# addresses as x + c, i32 adds the accesses do not fold, which wrap: at
+# p = -8 both lanes' adds wrap, to 0 and 8, as the vector's does
+case('addrc2', '(param $p i32) (param $q i32) (param $k f64) (result f64)', '''
+    (f64.store (i32.add (local.get $p) (i32.const 8)) (f64.mul (local.get $k) (f64.load (i32.add (local.get $p) (i32.const 392)))))
+    (f64.store (i32.add (local.get $p) (i32.const 16)) (f64.mul (local.get $k) (f64.load (i32.add (local.get $p) (i32.const 400)))))
+    (call $fs (i32.add (local.get $q) (i32.const 8)) (i32.const 2))''',
+     lambda m, p, q, k: ([st(m, ea(p, 8 + 8 * j, 0, 8), k * ld(m, ea(p, 392 + 8 * j, 0, 8))) for j in range(2)],
+                         fsum(m, ea(q, 8, 0, 8), 2))[-1],
+     [(0, 0, 2.5), (40, 40, -1.0), (-8, -8, 0.5)], [(r'\sfmul\.2d\s', 1)])
+
+# lane 0 at p offset 4, the others at adds: (p, 0, 4), (p, 8, 0), ..  At
+# p = -8 lane 0 is past the memory, where the vector's address is too, and
+# the other lanes' adds wrap to 0..
+case('addrmix', '(param $p i32) (param $q i32) (result i32)', '''
+    (i32.store offset=4 (local.get $p) (i32.const 21))
+    (i32.store (i32.add (local.get $p) (i32.const 8)) (i32.const -3))
+    (i32.store (i32.add (local.get $p) (i32.const 12)) (i32.const 77777))
+    (i32.store (i32.add (local.get $p) (i32.const 16)) (i32.const 5))
+    (call $h (i32.add (local.get $q) (i32.const 4)) (i32.const 4))''',
+     lambda m, p, q: ([st32(m, ea(p, c, d, 4), v) for c, d, v in ((0, 4, 21), (8, 0, -3), (12, 0, 77777), (16, 0, 5))],
+                      h32(m, q + 4, 4))[-1],
+     [(0, 0), (-8, 0)], [(r'\sstu?r\s+q\d+', 1)])
+
+# a 2x4 product's rows, in a loop: each row's four entries two vectors,
+# a sum of the row's two elements times rows of the matrix, loaded as
+# vectors before the loop, where their scalars were, which go; each
+# element splatted once for both halves, and that splat read by lane in
+# the multiplies (isel.c's vbyel), no dup.  The loop is unrolled by four,
+# and the loop for the rest is a fifth copy: ten groups, twenty multiplies
+def rowmat_model(m, p, q, n):
+    mm = [[ld(m, q + 256 + 32 * k + 8 * j) for j in range(4)] for k in range(2)]
+    for r in range(n):
+        x0, x1 = ld(m, q + 512 + 16 * r), ld(m, q + 520 + 16 * r)
+        for j in range(4):
+            st(m, p + 32 * r + 8 * j, x0 * mm[0][j] + x1 * mm[1][j])
+    return fsum(m, q, 4 * n)
+
+
+def rowmat():
+    ms = ''.join('(local $m%d%d f64) ' % (k, j) for k in range(2) for j in range(4))
+    loads = ''.join('\n    (local.set $m%d%d (f64.load offset=%d (local.get $q)))' % (k, j, 256 + 32 * k + 8 * j)
+                    for k in range(2) for j in range(4))
+    stores = ''.join('\n        (f64.store %s (f64.add (f64.mul (local.get $x0) (local.get $m0%d)) '
+                     '(f64.mul (local.get $x1) (local.get $m1%d))))'
+                     % ('(local.get $o)' if j == 0 else '(i32.add (local.get $o) (i32.const %d))' % (8 * j), j, j)
+                     for j in range(4))
+    return ('\n    ' + ms + '(local $x0 f64) (local $x1 f64) (local $o i32) (local $r i32)' + loads + '''
+    (block $done
+      (loop $l
+        (br_if $done (i32.ge_u (local.get $r) (local.get $n)))
+        (local.set $x0 (f64.load offset=512 (i32.add (local.get $q) (i32.shl (local.get $r) (i32.const 4)))))
+        (local.set $x1 (f64.load offset=520 (i32.add (local.get $q) (i32.shl (local.get $r) (i32.const 4)))))
+        (local.set $o (i32.add (local.get $p) (i32.shl (local.get $r) (i32.const 5))))''' + stores + '''
+        (local.set $r (i32.add (local.get $r) (i32.const 1)))
+        (br $l)))
+    (call $fs (local.get $q) (i32.shl (local.get $n) (i32.const 2)))''')
+
+
+case('rowmat', '(param $p i32) (param $q i32) (param $n i32) (result f64)', rowmat(), rowmat_model,
+     [(0, 0, 4), (64, 64, 3)],
+     [(r'\sldr\s+q\d+', 4), (r'\sfmul\.2d\s', 20), (r'\sdup\.2d\s', 0), (r'\sfmul\.2d\s+v\d+, v\d+, v\d+\[0\]', 20),
+      (r'\sfmul\s+d\d+', 0),
+      (r'\sldr\s+d\d+, \[x\d+, #0x1[0-3]', 0)])
+
+# lane 0 through mem_ptr(p), lane 1 through p + 8: one x
+case('ptrmix', '(param $p i32) (param $q i32) (param $k f64) (result f64)', '''
+    (f64.store offset=0 (local.get $p) (f64.mul (local.get $k) (f64.load offset=504 (local.get $p))))
+    (f64.store (i32.add (local.get $p) (i32.const 8)) (f64.mul (local.get $k) (f64.load offset=512 (local.get $p))))
+    (call $fs (local.get $q) (i32.const 2))''',
+     lambda m, p, q, k: ([st(m, p + 8 * j, k * ld(m, p + 504 + 8 * j)) for j in range(2)], fsum(m, q, 2))[-1],
+     [(0, 0, 1.75)], [(r'\sfmul\.2d\s', 1)])
+
+# operands in two memories, lane 1's turned round: its first is the second
+# memory's, j lanes on from lane 0's first but not in its memory
+case('swapmem', '(param $p i32) (param $q i32) (result f64)', '''
+    (f64.store offset=0 (local.get $p) (f64.add (f64.load offset=488 (local.get $p)) (f64.load $b offset=488 (local.get $p))))
+    (f64.store offset=8 (local.get $p) (f64.add (f64.load $b offset=496 (local.get $p)) (f64.load offset=496 (local.get $p))))
+    (call $fs (local.get $q) (i32.const 2))''',
+     lambda m, p, q: ([st(m, p + 8 * j, ld(m, p + 488 + 8 * j) + 0.0) for j in range(2)], fsum(m, q, 2))[-1],
+     [(0, 0)], [(r'\sfadd\.2d\s', 1)])
+
+# two groups' loads in the block before the stores', a store to the
+# second's between: each vector load where its first lane's was, the later
+# made first, so that the earlier's place holds
+case('outer2', '(param $p i32) (param $q i32) (param $c i32) (param $k f64) (result f64)',
+     '\n    (local $a1 f64) (local $b1 f64) (local $a2 f64) (local $b2 f64)'
+     '\n    (local.set $a1 (f64.load offset=536 (local.get $p)))'
+     '\n    (local.set $b1 (f64.load offset=544 (local.get $p)))'
+     '\n    (f64.store offset=552 (local.get $q) (f64.const 11))'
+     '\n    (local.set $a2 (f64.load offset=552 (local.get $p)))'
+     '\n    (local.set $b2 (f64.load offset=560 (local.get $p)))'
+     '\n    (if (local.get $c) (then (f64.store offset=1024 (local.get $q) (f64.const 1))))'
+     '\n    (f64.store offset=0 (local.get $p) (f64.add (local.get $a1) (local.get $k)))'
+     '\n    (f64.store offset=8 (local.get $p) (f64.add (local.get $b1) (local.get $k)))'
+     '\n    (f64.store offset=16 (local.get $p) (f64.mul (local.get $a2) (local.get $k)))'
+     '\n    (f64.store offset=24 (local.get $p) (f64.mul (local.get $b2) (local.get $k)))'
+     '\n    (f64.add (f64.load offset=1024 (local.get $q)) (call $fs (local.get $q) (i32.const 4)))',
+     lambda m, p, q, c, k: (lambda a1, b1: (st(m, q + 552, 11.0), (lambda a2, b2: (
+         (st(m, q + 1024, 1.0) if c else None), st(m, p, a1 + k), st(m, p + 8, b1 + k),
+         st(m, p + 16, a2 * k), st(m, p + 24, b2 * k), ld(m, q + 1024) + fsum(m, q, 4))[-1])(
+         ld(m, p + 552), ld(m, p + 560)))[-1])(ld(m, p + 536), ld(m, p + 544)),
+     [(0, 0, 0, 2.0), (0, 0, 1, 2.0)], [(r'\sfadd\.2d\s', 1), (r'\sfmul\.2d\s', 1)])
+
+# two groups of a block adding k: one splat for both
+case('sharesplat', '(param $p i32) (param $q i32) (param $k f64) (result f64)',
+     lanes_of('(f64.store offset=%d (local.get $p) (f64.add (f64.load offset=%d (local.get $p)) (local.get $k)))',
+              4, lambda j: 8 * j, lambda j: 688 + 8 * j)
+     + '\n    (call $fs (local.get $q) (i32.const 4))',
+     lambda m, p, q, k: ([st(m, p + 8 * j, ld(m, p + 688 + 8 * j) + k) for j in range(4)], fsum(m, q, 4))[-1],
+     [(0, 0, 0.25)], [(r'\sfadd\.2d\s', 2), (r'\sdup\.2d\s', 1)])
+
+# -- a splat multiplied in by lane (isel.c's vbyel) ---------------------------
+
+# four floats times k: fmul.4s by element, k lane 0 of its register, the
+# splat the second operand (rowmat's are the first)
+case('byelem4', '(param $p i32) (param $q i32) (param $n i32) (result i32)',
+     '\n    (local $k f32)'
+     '\n    (local.set $k (f32.convert_i32_s (local.get $n)))'
+     + lanes_of('(f32.store offset=%d (local.get $p) (f32.mul (f32.load offset=%d (local.get $p)) (local.get $k)))',
+                4, lambda j: 4 * j, lambda j: 1300 + 4 * j)
+     + '\n    (call $h (local.get $q) (i32.const 4))',
+     lambda m, p, q, n: ([stf(m, p + 4 * j, f32(ldf(m, p + 1300 + 4 * j) * float(n))) for j in range(4)],
+                         h32(m, q, 4))[-1],
+     [(0, 0, 3), (16, 16, -5)],
+     [(r'\sfmul\.4s\s+v\d+, v\d+, v\d+\[0\]', 1), (r'\sdup\.4s\s', 0)])
+
+# k splatted for the product and added too: the add reads the splat, which
+# stays
+case('byelemadd', '(param $p i32) (param $q i32) (param $k f64) (result f64)',
+     lanes_of('(f64.store offset=%d (local.get $p) (f64.add (f64.mul (local.get $k) (f64.load offset=%d (local.get $p))) '
+              '(local.get $k)))', 2, lambda j: 8 * j, lambda j: 584 + 8 * j)
+     + '\n    (call $fs (local.get $q) (i32.const 2))',
+     lambda m, p, q, k: ([st(m, p + 8 * j, k * ld(m, p + 584 + 8 * j) + k) for j in range(2)], fsum(m, q, 2))[-1],
+     [(0, 0, 1.25)], [(r'\sdup\.2d\s', 1), (r'\sfmul\.2d\s+v\d+, v\d+, v\d+\[0\]', 0)])
+
+# the splat in the block before the product's: a dup there
+case('byelemblock', '(param $p i32) (param $q i32) (param $c i32) (param $k f64) (result f64)',
+     '\n    (local $s v128)'
+     '\n    (local.set $s (f64x2.splat (local.get $k)))'
+     '\n    (if (local.get $c) (then (f64.store offset=1024 (local.get $q) (f64.const 1))))'
+     '\n    (v128.store (local.get $p) (f64x2.mul (local.get $s) (v128.load offset=600 (local.get $p))))'
+     '\n    (f64.add (f64.load offset=1024 (local.get $q)) (call $fs (local.get $q) (i32.const 2)))',
+     lambda m, p, q, c, k: ((st(m, q + 1024, 1.0) if c else None),
+                            [st(m, p + 8 * j, k * ld(m, p + 600 + 8 * j)) for j in range(2)],
+                            ld(m, q + 1024) + fsum(m, q, 2))[-1],
+     [(0, 0, 0, 0.75), (0, 0, 1, 0.75)], [(r'\sdup\.2d\s', 1)])
+
+# a product of two splats: neither read by lane, the other being no vector
+case('byelemtwo', '(param $p i32) (param $q i32) (param $x i32) (result f64)', '''
+    (v128.store (local.get $p) (f64x2.mul (f64x2.splat (f64.load offset=616 (local.get $p)))
+                                          (f64x2.splat (f64.convert_i32_s (local.get $x)))))
+    (call $fs (local.get $q) (i32.const 2))''',
+     lambda m, p, q, x: (lambda v: ([st(m, p + 8 * j, v) for j in range(2)], fsum(m, q, 2))[-1])(
+         ld(m, p + 616) * float(x)),
+     [(0, 0, 7)], [])
+
+# a float's four lanes multiplied as two doubles: lane 0 of its register
+# is no double
+case('byelemlanes', '(param $p i32) (param $q i32) (result f64)', '''
+    (v128.store (local.get $p) (f64x2.mul (f32x4.splat (f32.load offset=1300 (local.get $p)))
+                                          (v128.load offset=624 (local.get $p))))
+    (call $fs (local.get $q) (i32.const 2))''',
+     lambda m, p, q: (lambda b: ([st(m, p + 8 * j, bits_f64(b << 32 | b) * ld(m, p + 624 + 8 * j))
+                                  for j in range(2)], fsum(m, q, 2))[-1])(ld32(m, p + 1300)),
+     [(0, 0)], [])
+
 # -- left alone --------------------------------------------------------------
 
 case('raw', '(param $p i32) (param $q i32) (param $k f64) (result f64)', '''
@@ -617,6 +802,164 @@ case('mixed', '(param $p i32) (param $q i32) (param $k f64) (result f64)', '''
      [(0, 0, 1.5)], [(r'\sf(mul|add)\.2d\s', 0)])
 
 
+# a lane's add below lane 0's: lane 0 at p + 8, the others at p offset
+# 12..  At p = -8 lane 0's add wraps to 0 and the others' are past the
+# memory, where the scalars trap and a vector at 0 would not
+case('wrapdown', '(param $p i32) (param $q i32) (result i32)', '''
+    (i32.store (i32.add (local.get $p) (i32.const 8)) (i32.const 31))
+    (i32.store offset=12 (local.get $p) (i32.const 32))
+    (i32.store offset=16 (local.get $p) (i32.const 33))
+    (i32.store offset=20 (local.get $p) (i32.const 34))
+    (call $h (i32.add (local.get $q) (i32.const 8)) (i32.const 4))''',
+     lambda m, p, q: ([st32(m, ea(p, c, d, 4), v) for c, d, v in ((8, 0, 31), (0, 12, 32), (0, 16, 33), (0, 20, 34))],
+                      h32(m, q + 8, 4))[-1],
+     [(0, 0), (-8, 0)], [(r'\sstu?r\s+q\d+', 0)])
+
+# a store through q, which may be p, between the lanes' loads in the block
+# before the stores': lane 1's load may not move up past it
+case('outerstore', '(param $p i32) (param $q i32) (param $c i32) (result f64)',
+     '\n    (local $a f64) (local $b f64)'
+     '\n    (local.set $a (f64.load offset=408 (local.get $p)))'
+     '\n    (f64.store offset=416 (local.get $q) (f64.const 5))'
+     '\n    (local.set $b (f64.load offset=416 (local.get $p)))'
+     '\n    (if (local.get $c) (then (f64.store offset=1024 (local.get $q) (f64.const 1))))'
+     '\n    (f64.store offset=0 (local.get $p) (f64.add (local.get $a) (f64.load offset=512 (local.get $p))))'
+     '\n    (f64.store offset=8 (local.get $p) (f64.add (local.get $b) (f64.load offset=520 (local.get $p))))'
+     '\n    (f64.add (f64.load offset=1024 (local.get $q)) (call $fs (local.get $q) (i32.const 2)))',
+     lambda m, p, q, c: (lambda a: (st(m, q + 416, 5.0), (lambda b: (
+         (st(m, q + 1024, 1.0) if c else None), st(m, p, a + ld(m, p + 512)), st(m, p + 8, b + ld(m, p + 520)),
+         ld(m, q + 1024) + fsum(m, q, 2))[-1])(ld(m, p + 416)))[-1])(ld(m, p + 408)),
+     [(0, 0, 0), (0, 0, 1)], [(r'\sfadd\.2d\s', 0)])
+
+# the lanes' products made in the block before the stores': their vector
+# would be made where the stores are, which a loop may run more often
+case('opblock', '(param $p i32) (param $q i32) (param $c i32) (param $k f64) (result f64)',
+     '\n    (local $a f64) (local $b f64)'
+     '\n    (local.set $a (f64.mul (local.get $k) (f64.load offset=424 (local.get $p))))'
+     '\n    (local.set $b (f64.mul (local.get $k) (f64.load offset=432 (local.get $p))))'
+     '\n    (if (local.get $c) (then (f64.store offset=1024 (local.get $q) (f64.const 1))))'
+     '\n    (f64.store offset=0 (local.get $p) (f64.add (local.get $a) (f64.load offset=512 (local.get $p))))'
+     '\n    (f64.store offset=8 (local.get $p) (f64.add (local.get $b) (f64.load offset=520 (local.get $p))))'
+     '\n    (f64.add (f64.load offset=1024 (local.get $q)) (call $fs (local.get $q) (i32.const 2)))',
+     lambda m, p, q, c, k: (lambda a, b: ((st(m, q + 1024, 1.0) if c else None), st(m, p, a + ld(m, p + 512)),
+                                          st(m, p + 8, b + ld(m, p + 520)), ld(m, q + 1024) + fsum(m, q, 2))[-1])(
+         k * ld(m, p + 424), k * ld(m, p + 432)),
+     [(0, 0, 1, 1.5)], [(r'\sf(mul|add)\.2d\s', 0)])
+
+# lane 1 loaded first, through an add, and lane 0's add, the vector's
+# address, made after it
+case('lateaddr', '(param $p i32) (param $q i32) (param $k f64) (result f64)',
+     '\n    (local $a f64) (local $b f64)'
+     '\n    (local.set $b (f64.load (i32.add (local.get $p) (i32.const 448))))'
+     '\n    (local.set $a (f64.load (i32.add (local.get $p) (i32.const 440))))'
+     '\n    (f64.store offset=0 (local.get $p) (f64.mul (local.get $k) (local.get $a)))'
+     '\n    (f64.store offset=8 (local.get $p) (f64.mul (local.get $k) (local.get $b)))'
+     '\n    (call $fs (local.get $q) (i32.const 2))',
+     lambda m, p, q, k: (lambda b, a: (st(m, p, k * a), st(m, p + 8, k * b), fsum(m, q, 2))[-1])(
+         ld(m, p + 448), ld(m, p + 440)),
+     [(0, 0, 0.75)], [(r'\sfmul\.2d\s', 0)])
+
+# four words, two in each of two memories, at one x: one vector store would
+# write all four to the first
+case('twomem', '(param $p i32) (param $q i32) (result i32)', '''
+    (i32.store offset=0 (local.get $p) (i32.const 41))
+    (i32.store offset=4 (local.get $p) (i32.const 42))
+    (i32.store $b offset=8 (local.get $p) (i32.const 43))
+    (i32.store $b offset=12 (local.get $p) (i32.const 44))
+    (i32.add (i32.mul (call $h (local.get $q) (i32.const 2)) (i32.const 961))
+      (i32.add (i32.mul (i32.load $b offset=8 (local.get $q)) (i32.const 31)) (i32.load $b offset=12 (local.get $q))))''',
+     lambda m, p, q: (st32(m, p, 41), st32(m, p + 4, 42), h32(m, q, 2) * 961 + 43 * 31 + 44)[-1],
+     [(0, 0)], [(r'\sstu?r\s+q\d+', 0)])
+
+# an i64 lane loaded as a sign-extended word, at the next lane's address
+case('narrowlane', '(param $p i32) (param $q i32) (param $x i64) (result i32)', '''
+    (i64.store offset=0 (local.get $p) (i64.add (local.get $x) (i64.load offset=456 (local.get $p))))
+    (i64.store offset=8 (local.get $p) (i64.add (local.get $x) (i64.load32_s offset=464 (local.get $p))))
+    (call $h (local.get $q) (i32.const 4))''',
+     lambda m, p, q, x: (struct.pack_into('<Q', m, p, (x + struct.unpack_from('<Q', m, p + 456)[0]) & ((1 << 64) - 1)),
+                         struct.pack_into('<Q', m, p + 8, (x + struct.unpack_from('<i', m, p + 464)[0]) & ((1 << 64) - 1)),
+                         h32(m, q, 4))[-1],
+     [(0, 0, 0x100000005)], [(r'\sadd\.2d\s', 0)])
+
+# the lanes' loads in two blocks, lane 1's before a store to its address
+# and lane 0's after: one vector load in lane 0's block would read lane 1
+# after the store
+case('splitload', '(param $p i32) (param $q i32) (param $c i32) (param $k f64) (result f64)',
+     '\n    (local $a f64) (local $b f64)'
+     '\n    (local.set $b (f64.load offset=480 (local.get $p)))'
+     '\n    (if (local.get $c) (then (f64.store offset=480 (local.get $q) (f64.const 7))))'
+     '\n    (local.set $a (f64.load offset=472 (local.get $p)))'
+     '\n    (f64.store offset=0 (local.get $p) (f64.mul (local.get $k) (local.get $a)))'
+     '\n    (f64.store offset=8 (local.get $p) (f64.mul (local.get $k) (local.get $b)))'
+     '\n    (call $fs (local.get $q) (i32.const 2))',
+     lambda m, p, q, c, k: (lambda b: ((st(m, q + 480, 7.0) if c else None), (lambda a: (
+         st(m, p, k * a), st(m, p + 8, k * b), fsum(m, q, 2))[-1])(ld(m, p + 472)))[-1])(ld(m, p + 480)),
+     [(0, 0, 0, 1.5), (0, 0, 1, 1.5)], [(r'\sfmul\.2d\s', 0)])
+
+# two groups' loads of one address, a store to it between: two vector loads,
+# not one
+case('sharestore', '(param $p i32) (param $q i32) (param $k f64) (result f64)',
+     '\n    (local $a1 f64) (local $b1 f64) (local $a2 f64) (local $b2 f64)'
+     '\n    (local.set $a1 (f64.load offset=520 (local.get $p)))'
+     '\n    (local.set $b1 (f64.load offset=528 (local.get $p)))'
+     '\n    (f64.store offset=520 (local.get $q) (f64.const 9))'
+     '\n    (local.set $a2 (f64.load offset=520 (local.get $p)))'
+     '\n    (local.set $b2 (f64.load offset=528 (local.get $p)))'
+     '\n    (f64.store offset=0 (local.get $p) (f64.add (local.get $a1) (local.get $k)))'
+     '\n    (f64.store offset=8 (local.get $p) (f64.add (local.get $b1) (local.get $k)))'
+     '\n    (f64.store offset=16 (local.get $p) (f64.mul (local.get $a2) (local.get $k)))'
+     '\n    (f64.store offset=24 (local.get $p) (f64.mul (local.get $b2) (local.get $k)))'
+     '\n    (call $fs (local.get $q) (i32.const 4))',
+     lambda m, p, q, k: (lambda a1, b1: (st(m, q + 520, 9.0), (lambda a2, b2: (
+         st(m, p, a1 + k), st(m, p + 8, b1 + k), st(m, p + 16, a2 * k), st(m, p + 24, b2 * k),
+         fsum(m, q, 4))[-1])(ld(m, p + 520), ld(m, p + 528)))[-1])(ld(m, p + 520), ld(m, p + 528)),
+     [(0, 0, 2.0), (0, 64, 2.0)], [(r'\sfadd\.2d\s', 1), (r'\sfmul\.2d\s', 1), (r'\sldr\s+q\d+', 2)])
+
+# a 64-bit memory's stores, each after its bounds check, which a store may
+# not move past; lane 3's add of a constant past 2^32 is no add in 32 bits
+# either, so not 12 bytes on from lane 0 but past the memory, where the
+# scalars trap
+def traps(*args):
+    raise Trap
+
+
+case('wide64', '(param $x i64) (result i32)', '''
+    (i32.store $w offset=0 (local.get $x) (i32.const 51))
+    (i32.store $w offset=4 (local.get $x) (i32.const 52))
+    (i32.store $w offset=8 (local.get $x) (i32.const 53))
+    (i32.store $w (i64.add (local.get $x) (i64.const 0x10000000c)) (i32.const 54))
+    (i32.load $w offset=4 (local.get $x))''',
+     traps, [(0,)], [(r'\sstu?r\s+q\d+', 0)])
+
+# lanes loaded just after a call that was handed their address, and so
+# wrote them one at a time: each scalar load has its store forwarded, where
+# a vector load would wait for both stores (rsbench/wide128).  The helper is
+# called through the table, by an index the caller is given, so that it
+# stays a call: through the address itself, and through p + 640, the lanes
+# being at p offset 640
+def wr2(m, a, x):
+    st(m, a, x)
+    st(m, a + 8, x + 1.0)
+
+
+case('aftercall', '(param $p i32) (param $q i32) (param $s i32) (param $i i32) (param $k f64) (result f64)', '''
+    (call_indirect (type $wr) (local.get $s) (local.get $k) (local.get $i))
+    (f64.store offset=0 (local.get $p) (f64.load offset=0 (local.get $s)))
+    (f64.store offset=8 (local.get $p) (f64.load offset=8 (local.get $s)))
+    (call $fs (local.get $q) (i32.const 2))''',
+     lambda m, p, q, s, i, k: (wr2(m, s, k), st(m, p, ld(m, s)), st(m, p + 8, ld(m, s + 8)), fsum(m, q, 2))[-1],
+     [(0, 0, 640, 0, 1.5)], [(r'\sldu?r\s+q\d+', 0)])
+
+case('aftercall2', '(param $p i32) (param $q i32) (param $i i32) (param $k f64) (result f64)', '''
+    (call_indirect (type $wr) (i32.add (local.get $p) (i32.const 640)) (local.get $k) (local.get $i))
+    (f64.store offset=0 (local.get $p) (f64.load offset=640 (local.get $p)))
+    (f64.store offset=8 (local.get $p) (f64.load offset=648 (local.get $p)))
+    (call $fs (local.get $q) (i32.const 2))''',
+     lambda m, p, q, i, k: (wr2(m, p + 640, k), st(m, p, ld(m, p + 640)), st(m, p + 8, ld(m, p + 648)),
+                            fsum(m, q, 2))[-1],
+     [(0, 0, 0, -2.5)], [(r'\sldu?r\s+q\d+', 0)])
+
+
 def main():
     m0 = data()
     seg = ''.join('\\%02x' % b for b in m0)
@@ -636,12 +979,14 @@ def main():
                              + lines[n:])
         for args in rs:
             m = bytearray(m0)
+            try:
+                v = model(m, *args)
+            except Trap:
+                v = None
             if quarter:
                 args = args[:-1] + (int(args[-1] * 4),)
-                v = model(m, *(args[:-1] + (args[-1] / 4.0,)))
-            else:
-                v = model(m, *args)
-            out = fmt_f64(v) if res == 'f64' else 'i32:%d' % s32(v)
+            out = ('trap: out of bounds memory access' if v is None else
+                   fmt_f64(v) if res == 'f64' else 'i32:%d' % s32(v))
             a = ' '.join(repr(float(x)) if isinstance(x, float) else str(x) for x in args)
             runs.append(';; run: %s %s => %s' % (name, a, out))
         for pat, n in sh:
@@ -655,31 +1000,52 @@ def main():
 ;; of doubles scaled by k, four words added, subtracted, and'ed, or'd,
 ;; xor'd, copied or set to constants, a scalar added to four words, a
 ;; difference, quotient, minimum and maximum of doubles, a sum times k, k
-;; times x plus a constant, a sum five adds deep, offsets past what ldr q
+;; times x plus a constant, a sum 31 adds deep, offsets past what ldr q
 ;; encodes, stores in either order, a load of a lane's address between, a
-;; store into a lane's source after it is read; and a commutative
-;; operation's operands turned round in a lane, found by which of them fits
-;; lane 0's first -- a factor, a loaded scalar, a load through either of two
-;; pointers, a product, a sum of products.  Not a sum six adds deep, nor
-;; where a lane reads what another lane stored, nor a lane's value or load
-;; is read elsewhere, nor where a memory.fill, a store or a load that may
-;; touch a lane stands between, nor across a gap, a misaligned offset or two
-;; pointers, nor for loads narrower than their lanes, from two pointers, a
-;; stride apart or in another block, nor for stores narrower than their
-;; values or of two widths, nor two constants a store pair writes as
-;; cheaply, nor lanes of different operations or a difference turned round
-;; in one, nor a 64-bit multiply, which has no vector instruction.  At -O2
-;; -fno-mem too, where a lane's load of what another lane stored is not
-;; forwarded the value but read, after the store.  Each function stores
-;; through $p and reads back through $q, the same address, which forwarding
-;; cannot see.  Made by test/gen_slp.py, which works the answers out on a
-;; model of the memory.
+;; store into a lane's source after it is read; addresses as i32 adds, which
+;; may wrap, and an offset, a pointer made once and adds in one group, past
+;; the memory or wrapping to 0; loads in the block before the stores', also
+;; two groups' with a store between, and a 2x4 product's rows in a loop, the
+;; matrix loaded as vectors before it and each row's elements splatted once;
+;; and a commutative operation's operands turned round in a lane, found by
+;; which of them fits lane 0's first -- a factor, a loaded scalar, a load
+;; through either of two pointers or from either of two memories, a product,
+;; a sum of products.  A float splat only multiplies read, in its block and
+;; beside a vector, is read by lane, an fmul by element (isel.c's vbyel);
+;; not one an add reads too, one in another block, one beside another splat,
+;; nor a float's four lanes taken as two doubles.  Not a sum 32 adds deep,
+;; nor where a lane reads what another lane stored, nor a lane's value or
+;; load is read elsewhere, nor where a memory.fill, a store or a load that
+;; may touch a lane stands between, in the stores' block or the loads', nor
+;; for lanes loaded in two blocks, nor one vector load for two loads of an
+;; address with a store to it between, nor across a gap, a misaligned
+;; offset, two pointers or two memories, nor a 64-bit add of a constant past
+;; 2^32, nor a lane's add below lane 0's, which only the scalars trap at
+;; where lane 0's wraps, nor where lane 0's address is made after another
+;; lane's load, nor lanes loaded just after a call handed their address, or
+;; it plus a constant, which wrote them one at a time, nor for loads
+;; narrower than their lanes, one lane's alone, from two pointers or a
+;; stride apart, nor products made in the block before, nor for stores
+;; narrower than their values or of two widths, nor two constants a store
+;; pair writes as cheaply, nor lanes of different operations or a difference
+;; turned round in one, nor a 64-bit multiply, which has no vector
+;; instruction.  At -O2 -fno-mem too, where a lane's load of what another
+;; lane stored is not forwarded the value but read, after the store.  Each
+;; function stores through $p and reads back through $q, the same address,
+;; which forwarding cannot see.  Made by test/gen_slp.py, which works the
+;; answers out on a model of the memory.
 ;;
 '''
     out = (head + '\n'.join(shapes) + '\n;;\n;; flags: -O2 -fno-mem\n;;\n' + '\n'.join(runs) +
            '\n\n(module\n')
-    out += '  (memory 1)\n  (data (i32.const 0) "%s")\n' % seg
+    out += '  (memory 1)\n  (memory $b 1)\n  (memory $w i64 1)\n  (data (i32.const 0) "%s")\n' % seg
     out += '''\
+  (type $wr (func (param i32 f64)))
+  (table 1 funcref)
+  (elem (i32.const 0) $wr2)
+  (func $wr2 (param $a i32) (param $x f64)
+    (f64.store offset=0 (local.get $a) (local.get $x))
+    (f64.store offset=8 (local.get $a) (f64.add (local.get $x) (f64.const 1))))
   (func $h (param $a i32) (param $n i32) (result i32)
     (local $r i32)
     (block $done

@@ -537,6 +537,12 @@ int main(int argc, char **argv) {
   CASE("fsub v9.2d, v10.2d, v11.2d", a64_vfsub(b, 1, 9, 10, 11));
   CASE("fmul v12.4s, v13.4s, v14.4s", a64_vfmul(b, 0, 12, 13, 14));
   CASE("fmul v15.2d, v16.2d, v17.2d", a64_vfmul(b, 1, 15, 16, 17));
+  CASE("fmul v0.2d, v1.2d, v2.d[1]", a64_vfmul_elem(b, 1, 0, 1, 2, 1));
+  CASE("fmul v3.2d, v4.2d, v31.d[0]", a64_vfmul_elem(b, 1, 3, 4, 31, 0));
+  CASE("fmul v0.4s, v1.4s, v2.s[3]", a64_vfmul_elem(b, 0, 0, 1, 2, 3));
+  CASE("fmul v5.4s, v6.4s, v17.s[0]", a64_vfmul_elem(b, 0, 5, 6, 17, 0));
+  CASE("fmul v7.4s, v8.4s, v9.s[2]", a64_vfmul_elem(b, 0, 7, 8, 9, 2));
+  CASE("fmul v10.4s, v11.4s, v12.s[1]", a64_vfmul_elem(b, 0, 10, 11, 12, 1));
   CASE("fdiv v18.4s, v19.4s, v20.4s", a64_vfdiv(b, 0, 18, 19, 20));
   CASE("fdiv v21.2d, v22.2d, v23.2d", a64_vfdiv(b, 1, 21, 22, 23));
   CASE("fmax v24.4s, v25.4s, v26.4s", a64_vfmax(b, 0, 24, 25, 26));

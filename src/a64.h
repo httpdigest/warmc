@@ -309,6 +309,7 @@ void a64_vxtn(Buf *b, int q, int size, int rd, int rn);
 void a64_vfadd(Buf *b, int sz, int rd, int rn, int rm);
 void a64_vfsub(Buf *b, int sz, int rd, int rn, int rm);
 void a64_vfmul(Buf *b, int sz, int rd, int rn, int rm);
+void a64_vfmul_elem(Buf *b, int sz, int rd, int rn, int rm, int idx);
 void a64_vfdiv(Buf *b, int sz, int rd, int rn, int rm);
 void a64_vfmax(Buf *b, int sz, int rd, int rn, int rm);
 
