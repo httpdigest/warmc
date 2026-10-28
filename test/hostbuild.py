@@ -6,6 +6,7 @@ match what the runtime archive was built with.  One copy, so they cannot drift.
 """
 import os
 import platform
+import re
 import subprocess
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -101,11 +102,6 @@ def link(objs, out, build):
         # Windows caps a command line at 32K characters.  MSYS2 converts
         # /c/-style paths only on a command line, so the file's contents
         # must already be Windows-shaped.
-        import re
-        def winpath(p):
-            p = p.replace("\\", "/")
-            m = re.match(r"^/([A-Za-z])/(.*)$", p)
-            return m.group(1) + ":/" + m.group(2) if m else p
         rsp = out + ".rsp"
         with open(rsp, "w") as f:
             f.write("\n".join('"%s"' % winpath(o) for o in objs))
@@ -119,6 +115,25 @@ def link(objs, out, build):
         cmd = ["ld.lld", "-static", "-e", "_start", "-o", out] + list(objs) + \
               [os.path.join(build, "warmrt.a")]
     return sh(cmd)
+
+def winpath(p):
+    """p as a native Windows program reads it, D:/a/x for MSYS2's /d/a/x:
+    MSYS2 converts such paths on a command line, but not inside a file, nor
+    one with a wildcard in it -- javac's -cp DIR/* went as it was, and a
+    Windows JVM read it as D:/d/a/....  Elsewhere p as it is."""
+    if not WINDOWS:
+        return p
+    p = p.replace("\\", "/")
+    m = re.match(r"^/([A-Za-z])/(.*)$", p)
+    return m.group(1) + ":/" + m.group(2) if m else p
+
+
+def classpath(*parts):
+    """a Java class path of parts, as the JVM on this host reads one"""
+    if WINDOWS:
+        return ";".join(winpath(p) for p in parts)
+    return os.pathsep.join(parts)
+
 
 def exe(path):
     """The on-disk name link() actually produced for `path`."""

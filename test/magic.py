@@ -48,14 +48,19 @@ def limit(seconds):
     return max(seconds, float(os.environ.get("WARMC_TIMEOUT", "0")))
 
 def magics(ds, wide):
-    """What warmc chooses for each of these divisors: one process for all
-    of them (--magic= takes a list), where a process each was thousands"""
-    arg = "--magic=" + ",".join("%d%s" % (d, ":64" if wide else "") for d in ds)
-    r = subprocess.run([WARMC, arg], capture_output=True, text=True)
-    lines = r.stdout.split("\n")
-    if r.returncode != 0 or len([l for l in lines if l]) != len(ds):
-        raise SystemExit("warmc --magic failed: %s" % r.stderr.strip()[:200])
-    return {d: tuple(int(x) for x in l.split()) for d, l in zip(ds, lines)}
+    """What warmc chooses for each of these divisors: a process for many of
+    them (--magic= takes a list), where a process each was thousands -- but
+    not all in one, whose argument Windows refuses past 32767 characters"""
+    out = {}
+    for i in range(0, len(ds), 500):
+        part = ds[i:i + 500]
+        arg = "--magic=" + ",".join("%d%s" % (d, ":64" if wide else "") for d in part)
+        r = subprocess.run([WARMC, arg], capture_output=True, text=True)
+        lines = r.stdout.split("\n")
+        if r.returncode != 0 or len([l for l in lines if l]) != len(part):
+            raise SystemExit("warmc --magic failed: %s" % r.stderr.strip()[:200])
+        out.update({d: tuple(int(x) for x in l.split()) for d, l in zip(part, lines)})
+    return out
 
 def bound_holds(d, m, add, sh, W):
     """The Granlund-Montgomery condition, in exact integers."""

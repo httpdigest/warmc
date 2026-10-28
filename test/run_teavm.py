@@ -36,6 +36,7 @@ CASES = os.path.join(ROOT, "test", "teavm", "cases")
 sys.path.insert(0, os.path.join(ROOT, "test", "teavm"))
 import wasi  # noqa: E402
 sys.path.insert(0, os.path.join(ROOT, "test"))
+import hostbuild  # noqa: E402
 import testcache  # noqa: E402
 
 TOOLS = wasi.wasm_tools()
@@ -581,7 +582,7 @@ def run_patched(work, flags):
         todo = [n for n in names if n not in built]
         if todo and not driven:
             r = subprocess.run(["javac", "--release", "17", "-nowarn", "-cp",
-                                os.path.join(TEAVM, "*"), "-d", driver,
+                                hostbuild.classpath(os.path.join(TEAVM, "*")), "-d", driver,
                                 os.path.join(teavm_src, "TeaVMBuild.java")],
                                capture_output=True, text=True)
             if r.returncode != 0:
@@ -589,12 +590,14 @@ def run_patched(work, flags):
                 return 0
             driven = True
         if todo:
-            cp = os.pathsep.join([os.path.join(TEAVM, "patched"), os.path.join(TEAVM, "*"), driver])
+            cp = hostbuild.classpath(os.path.join(TEAVM, "patched"), os.path.join(TEAVM, "*"), driver)
             cmd = ["java", "-cp", cp, "warmc.teavm.TeaVMBuild", "--teavm", TEAVM]
             if mode == "strict":
                 cmd.append("--strict")
             cmd += ["--support", os.path.join(teavm_src, "FdLibm.java")]
-            r = subprocess.run(cmd + ["%s=%s" % (os.path.join(FIXES, n), out[n]) for n in todo],
+            # SRC=DST, of which MSYS2 converts only DST for a Windows JVM
+            r = subprocess.run(cmd + ["%s=%s" % (hostbuild.winpath(os.path.join(FIXES, n)),
+                                                 hostbuild.winpath(out[n])) for n in todo],
                                capture_output=True, text=True)
             if r.returncode != 0:
                 fail("TeaVM, %s: %s" % (mode, r.stderr[:1500]))
@@ -602,7 +605,7 @@ def run_patched(work, flags):
                 wasm = os.path.join(out[n], "main.wasm")
                 if not os.path.isdir(os.path.join(out[n], "classes")) or not os.path.exists(wasm):
                     continue
-                ref = subprocess.run(["java", "-cp", os.path.join(out[n], "classes"), "Main"],
+                ref = subprocess.run(["java", "-cp", hostbuild.classpath(os.path.join(out[n], "classes")), "Main"],
                                      capture_output=True)
                 built[n] = ref
                 testcache.put_file("teavm", keys[n], wasm)
@@ -614,6 +617,12 @@ def run_patched(work, flags):
                 continue
             if n not in refs:
                 refs[n] = built[n]
+                if hostbuild.WINDOWS:
+                    # println ends a line with Windows' \r\n there, where
+                    # TeaVM's module, under wasmtime and warmc, writes \n
+                    refs[n] = subprocess.CompletedProcess(
+                        [], refs[n].returncode, refs[n].stdout.replace(b"\r\n", b"\n"),
+                        refs[n].stderr.replace(b"\r\n", b"\n"))
             ref = refs[n]
             wasm = os.path.join(out[n], "main.wasm")
             if not os.path.exists(wasm):
@@ -668,7 +677,7 @@ def run_fdlibm(work):
     if r.returncode != 0:
         fail("fdlibm: javac: %s" % r.stderr[:400])
         return
-    r = subprocess.run(["java", "-cp", classes + os.pathsep + interop, "warmc.teavm.FdLibmCheck",
+    r = subprocess.run(["java", "-cp", hostbuild.classpath(classes, interop), "warmc.teavm.FdLibmCheck",
                         os.environ.get("FDLIBM_COUNT", "100000")], capture_output=True, text=True)
     sys.stdout.write(r.stdout)
     if r.returncode != 0:
