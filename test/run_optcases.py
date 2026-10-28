@@ -29,6 +29,12 @@ emitted after the rest of the function (ir.c ir_emit_order's late ones):
 
     ;; late: FUNCTION REGEX=N
 
+and with what flags besides the levels the module is compiled -- on its own,
+every call checked against that too -- for a pass a flag the levels never
+give would expose:
+
+    ;; flags: -O2 -fno-mem
+
 The answer is worked out by hand from the module, so it holds whichever
 level is wrong, -O0 included; the module is compiled at -O0, -O1, -O2 and
 -O3 and each call's output must be it.  A pass the module was written for
@@ -56,6 +62,7 @@ RUN_TIMEOUT = float(os.environ.get("WARMC_RUN_TIMEOUT", "30"))
 RUN_LINE = re.compile(r"^;; run: (\S+)((?: \S+)*) => (.*)$")
 STATS_LINE = re.compile(r"^;; stats(?: (-O[0-3]))?( a64)?: (.*)$")
 SHAPE_LINE = re.compile(r"^;; (shape|late): (\S+) (.*)=(\d+)$")
+FLAGS_LINE = re.compile(r"^;; flags: (.+)$")
 OBJDUMP = shutil.which("llvm-objdump") or shutil.which("objdump")
 AARCH64 = platform.machine() in ("arm64", "aarch64")
 
@@ -76,6 +83,15 @@ def stats(path):
         m = STATS_LINE.match(line.rstrip("\n"))
         if m and not (m.group(2) and hostbuild.WINDOWS):
             out.setdefault(m.group(1) or "-O0", []).extend(m.group(3).split())
+    return out
+
+
+def flag_sets(path):
+    out = []
+    for line in open(path):
+        m = FLAGS_LINE.match(line.rstrip("\n"))
+        if m:
+            out.append(m.group(1).split())
     return out
 
 
@@ -173,11 +189,12 @@ def check_all(cases, build, warmc, target, run, tmp):
             return None, "", ""
 
     def ran(job):
-        exe, level, name, export, args, expect = job
+        exe, level, name, export, args, expect, alone = job
+        # a program of one module is asked for its export alone
+        argv = ([] if alone else [name]) + [export] + args
         # kept under the program's bytes (test/testcache.py): a program warmc
         # made again the same answers the same
-        rc, out, err = testcache.run(exe, run + [name, export] + args,
-                                     lambda: launch([exe, name, export] + args))
+        rc, out, err = testcache.run(exe, run + argv, lambda: launch([exe] + argv))
         if rc is None:
             return ["%s %s: %s %s runs past %g s, not %s"
                     % (name, level, export, " ".join(args), RUN_TIMEOUT, expect)]
@@ -205,7 +222,18 @@ def check_all(cases, build, warmc, target, run, tmp):
             if exe is None:
                 continue
             for name, c in names:
-                runs += [(exe, level, name, e, a, x) for e, a, x in calls(c)]
+                runs += [(exe, level, name, e, a, x, False) for e, a, x in calls(c)]
+        # a module's own flag sets, each a program of the module alone
+        for (name, c), wasm in zip(names, wasms):
+            for n, flags in enumerate(flag_sets(c)):
+                exe = hostbuild.exe(os.path.join(tmp, "%s.flags%d" % (name, n)))
+                r = subprocess.run([warmc] + flags + target + ["-o", exe, wasm],
+                                   capture_output=True, text=True, timeout=120)
+                label = " ".join(flags)
+                if r.returncode:
+                    fails.append("%s %s: warmc: %s" % (name, label, r.stderr.strip()[:300]))
+                    continue
+                runs += [(exe, label, name, e, a, x, True) for e, a, x in calls(c)]
         for f in ex.map(ran, runs):
             fails += f
     exe = progs["-O2"][0]
