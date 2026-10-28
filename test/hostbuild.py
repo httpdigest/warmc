@@ -203,3 +203,23 @@ if __name__ == "__main__":
     if r.returncode != 0:
         sys.stderr.write(r.stdout + r.stderr)
     sys.exit(r.returncode)
+
+
+def stack_of(pid, path):
+    """Where a process past its time is, as macOS's sample sees it for a
+    second: its call graph's first lines, the rest in PATH ("" where sample
+    is not there).  Under make check's load, twice a compile that takes a
+    tenth of a second (test/cases/vector.wat) ran past thirty in two rows at
+    once, and a program that answers in milliseconds (dispatchloop, all
+    passes off) answered nothing for thirty; none of them again alone."""
+    try:
+        subprocess.run(["sample", str(pid), "1", "-mayDie", "-file", path],
+                       capture_output=True, timeout=30)
+        with open(path) as f:
+            lines = f.read().splitlines()
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    at = next((i for i, l in enumerate(lines) if l.startswith("Call graph:")), None)
+    if at is None:
+        return ""
+    return "\n    " + "\n    ".join(lines[at:at + 30]) + "\n    (all of it: %s)" % path
