@@ -20692,7 +20692,7 @@ static bool pass_slp(IrFunc *f) {
           if (no == ocap) { ocap = ocap ? ocap * 2 : 16; out = xrealloc(out, ocap * sizeof *out); }
           out[no++] = (SlpOuter){ R.n[x].blk, R.n[x].first, x, R.g[g].k };
         }
-      qsort(out, no, sizeof *out, slp_outer_cmp);
+      if (no) qsort(out, no, sizeof *out, slp_outer_cmp);
       for (uint32_t x = 0; x < no; x++) slp_load(f, &R.n[out[x].node], out[x].k, uses, &kept);
       for (uint32_t g = 0; g < R.ng; g++)
         slp_make(f, bi, &R.g[g], R.n + R.g[g].node0, uses, &kept);
@@ -22253,7 +22253,7 @@ static bool pass_self_tail(IrFunc *f) {
 
   uint32_t entry = f->entry;
   Ref *eparam = xmalloc((np ? np : 1) * sizeof(Ref));
-  memcpy(eparam, f->blocks[entry].params, np * sizeof(Ref));
+  if (np) memcpy(eparam, f->blocks[entry].params, np * sizeof(Ref));
 
   uint32_t hb = ir_new_block(f);
   Ref *hparam = xmalloc((np ? np : 1) * sizeof(Ref));
@@ -22423,7 +22423,7 @@ static bool pass_acc_tail(IrFunc *f) {
   /* the entry's work to a header of the parameters and the accumulator */
   uint32_t entry = f->entry;
   Ref *eparam = xmalloc((np ? np : 1) * sizeof(Ref));
-  memcpy(eparam, f->blocks[entry].params, np * sizeof(Ref));
+  if (np) memcpy(eparam, f->blocks[entry].params, np * sizeof(Ref));
   uint32_t hb = ir_new_block(f);
   Ref *hparam = xmalloc((np + 1) * sizeof(Ref));
   for (uint32_t i = 0; i < np; i++) hparam[i] = ir_add_param(f, hb, f->sig->params[i]);
