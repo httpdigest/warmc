@@ -1151,6 +1151,7 @@ and `ldcomb` need `guard-pages`; `small-loop-align` needs `align`; and
 | `rotate` | loop rotation, of call-free loops that touch memory, whose latch ends in an unconditional jump and whose header is at most 8 pure instructions |
 | `unroll` | unrolling by up to 4: a constant trip count by its largest divisor up to that, a run-time one behind a guard, the original loop kept for the rest; complete unrolling of short loops, and of a nest, at a depth of 2 or more and at most 1200 instructions, whose outer loop runs at most 8 times; a loop that runs once loses its back edge |
 | `vectorize` | auto-vectoriser: contiguous accesses, loads interleaved two, three or four ways (`ld3` and `ld4` on arm64) and stores two, if-converted bodies, bytes and halfwords computed in lanes twice as wide where their values need it (widening multiply-adds, a rounding shift as an add-high-narrow), integer, widening and float min/max reductions, argmin and argmax (an index kept beside a min or max), search loops, saturating arithmetic, high-half multiplies, byte reversal and int/float conversions; several copies of the body per iteration, each with its own accumulator; a loop a producer unrolled by three, unrolled again until it spans whole vectors; with runtime alias checks and a scalar fallback |
+| `slp` | straight-line vectors: a block's stores to adjacent addresses, as many as fill a vector, whose values are alike lane by lane -- one integer or float operation of operands themselves alike, loads of adjacent addresses, one value in every lane or constants -- as one vector computation and one vector store, where that is fewer instructions and no load or store moves past what it may touch: C++'s `w *= k; h *= k` as one `fmul.2d`, four words copied as one `ldr q` and `str q`; with guard pages, not under `-fexact-trap` |
 | `addroff`, `memptr` | fold address arithmetic into displacements; compute a native pointer once per base, and for constant addresses too large for a displacement one per block, to the 4 KiB page below them where that reaches them (one add to the memory base), also for an access alone in its block |
 | `ldcomb` | merge byte-assembling loads into one wide load |
 | `selftail` | turn self `return_call` into a loop |
@@ -1848,8 +1849,10 @@ Most of the suite is **differential**. warmc's output is compared with:
   `--stats` counts for it at each level, and how many of a function's AArch64
   instructions at `-O2` match a pattern, in the whole function or after its
   `ret`, where the blocks emitted after the rest go, for what changes the code
-  and not what it computes; `test/cases_opt/trunc_exact.wat` is made by
-  `test/gen_fexact.py`, `addchain.wat` by `test/gen_addchain.py`
+  and not what it computes, and what other flags it is compiled with besides,
+  alone, every call checked again (`;; flags:`);
+  `test/cases_opt/trunc_exact.wat` is made by `test/gen_fexact.py`,
+  `addchain.wat` by `test/gen_addchain.py`, `slp.wat` by `test/gen_slp.py`
 - mutants of a transform -- a test it makes dropped or loosened, a bound
   moved, an operand swapped -- each of which some test must tell from the
   transform, or the spec names it equivalent and why (`make
