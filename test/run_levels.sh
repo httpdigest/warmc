@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 # The -O levels.  Each -O sets everything a level decides, so the last one
 # given is the level whatever came before it, and -O3 is -O2 with the
-# passes that change what a program can see, fma, dead-frames and acc-tail.
-# So two spellings of one level compile a module to the same bytes -- -O0
-# -O2 and -O2, -O3 and -O2 -ffma -fdead-frames -facc-tail -- and -O3 is not
+# passes that change what a program can see, fma, dead-frames, acc-tail,
+# float-reassoc and addr-nowrap.  So two spellings of one level compile a
+# module to the same bytes -- -O0 -O2 and -O2, -O3 and -O2 -ffma
+# -fdead-frames -facc-tail -ffloat-reassoc -faddr-nowrap -- and -O3 is not
 # -O2 where those passes have something to do.  The modules are ones each
 # level-decided pass changes: Go's stack pointer (go-sp), a trampoline, C
-# frames, fusable floats, recursions that sum.  And the -fno- form of a flag that turns another on as well, and
+# frames, fusable floats, recursions that sum, float reductions, frame
+# addresses made by adds.  And the -fno- form of a flag that turns another on as well, and
 # -fexact-trap, which turns others off.
 
 set -uo pipefail
@@ -43,19 +45,40 @@ check() {
 }
 
 for src in test/cases/gosp.wat test/cases/trampoline.wat test/cases/deadframes.wat \
-           test/cases_fma/fma.wat test/cases_opt/acc_tail.wat; do
+           test/cases_fma/fma.wat test/cases_opt/acc_tail.wat \
+           test/cases_opt/float_reassoc.wat test/cases_opt/addr_nowrap.wat; do
   check same "$src" "-O0 -O1" "-O1"
   check same "$src" "-O0 -O2" "-O2"
   check same "$src" "-O1 -O2" "-O2"
   check same "$src" "-O3 -O2" "-O2"
   check same "$src" "-O3 -O1" "-O1"
   check same "$src" "-O0 -O3" "-O3"
-  check same "$src" "-O3" "-O2 -ffma -fdead-frames -facc-tail"
+  check same "$src" "-O3" "-O2 -ffma -fdead-frames -facc-tail -ffloat-reassoc -faddr-nowrap"
   check differ "$src" "-O0" "-O1"
 done
 check differ test/cases_fma/fma.wat "-O2" "-O3"
 check differ test/cases/deadframes.wat "-O2" "-O3"
 check differ test/cases_opt/acc_tail.wat "-O2" "-O3"
+check differ test/cases_opt/float_reassoc.wat "-O2" "-O3"
+check differ test/cases_opt/float_reassoc.wat "-O3" "-O3 -fno-float-reassoc"
+check differ test/cases_opt/addr_nowrap.wat "-O2" "-O3"
+check differ test/cases_opt/addr_nowrap.wat "-O3" "-O3 -fno-addr-nowrap"
+
+# count MODULE "FLAGS" NAME=N: what warmc --stats counts for a module
+count() {
+  local src=$1 flags=$2 want=$3
+  local name; name=$(basename "$src" .wat)
+  n=$((n + 1))
+  local got
+  got=$("$BUILD/warmc" $flags --stats -c -o "$WORK/$name.n.o" "$src" 2>&1 |
+        grep -oE "(^| )${want%%=*}=[0-9]+" | tr -d ' ')
+  [ "$got" = "$want" ] && return
+  echo "FAIL[levels]: $name: $flags counts ${got:-nothing}, not $want"
+  fail=$((fail + 1))
+}
+# addr-nowrap finds the C stack pointer by dead-frames' scan, which runs
+# for either
+count test/cases_opt/addr_nowrap.wat "-O2 -faddr-nowrap" addr_nowrap=5
 
 # A flag's -fno- form turns that flag off and nothing else: -fgssa-all
 # turns gssa on as well, and -fno-gssa-all leaves it on.

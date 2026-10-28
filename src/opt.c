@@ -41,6 +41,7 @@ static uint32_t rd_latency(uint16_t op) {
     case I_DIVS: case I_DIVU: case I_REMS: case I_REMU: return 10;
     case I_MUL: return 3;
     case I_LOAD: return 4;
+    case I_FADD: case I_FSUB: case I_FMUL: return 3;
 
     case I_TRUNCS: case I_TRUNCU: case I_CONVERTS: case I_CONVERTU:
     case I_REINTERPRET: return 4;
@@ -68,9 +69,10 @@ static uint32_t rd_depth(IrFunc *f, Ref v, uint32_t bi, uint32_t *memo,
   return memo[v];
 }
 
-static bool rd_assoc_op(IrFunc *f, Ref v) {
+/* -ffloat-reassoc lets a float sum or product be one too */
+static bool rd_assoc_op(IrFunc *f, Ref v, bool fre) {
   Inst *in = &f->insts[v];
-  if (vt_is_float((ValType)in->type)) return false;
+  if (vt_is_float((ValType)in->type)) return fre && (in->op == I_FADD || in->op == I_FMUL);
   switch (in->op) {
     case I_XOR: case I_OR: case I_AND: case I_ADD: case I_MUL: return true;
     default: return false;
@@ -83,7 +85,7 @@ static bool rd_assoc_op(IrFunc *f, Ref v) {
    and an i32 one, and its deepest term F first.  Each of these ops gives the
    same low half whether done in 64 bits or 32, so the rebuilt chain is all
    i32, its i64 terms wrapped where it starts. */
-static bool pass_reassoc(IrFunc *f) {
+static bool pass_reassoc(IrFunc *f, bool fre) {
   uint32_t *uses = count_uses(f);
   uint32_t cap = f->ninsts ? f->ninsts : 1;
   uint32_t *memo = xcalloc(cap, sizeof(uint32_t));
@@ -110,7 +112,7 @@ static bool pass_reassoc(IrFunc *f) {
       tmp = xrealloc(tmp, tmpcap * sizeof(uint32_t)); }
     for (uint32_t i = 0; i < b->ninsts; i++) {
       Ref v = b->insts[i];
-      if (!rd_assoc_op(f, v)) continue;
+      if (!rd_assoc_op(f, v, fre)) continue;
       Ref l = ir_args(f, v)[0];
       if (l < f->ninsts && f->insts[l].block == bi && uses[l] == 1 &&
           f->insts[l].op == f->insts[v].op &&
@@ -120,7 +122,7 @@ static bool pass_reassoc(IrFunc *f) {
 
     for (uint32_t i = 0; i < b->ninsts; i++) {
       Ref root = b->insts[i];
-      if (!rd_assoc_op(f, root) || inner[root]) continue;
+      if (!rd_assoc_op(f, root, fre) || inner[root]) continue;
       uint16_t op = f->insts[root].op;
       uint8_t ty = f->insts[root].type;
       uint32_t n = 0, wide = UINT32_MAX;
@@ -877,7 +879,7 @@ static uint32_t rc_path(IrFunc *f, Ref v, Ref p, uint16_t op, uint8_t ty,
   return 0;
 }
 
-static bool pass_reassoc_carried(IrFunc *f) {
+static bool pass_reassoc_carried(IrFunc *f, bool fre) {
   uint32_t *uses = count_uses(f);
   bool changed = false;
   for (uint32_t oi = 0; oi < f->norder; oi++) {
@@ -891,12 +893,17 @@ static bool pass_reassoc_carried(IrFunc *f) {
         uint16_t op = ri->op;
         ValType ty = (ValType)ri->type;
         bool vec = ty == VT_V128;
-        if (vec ? op != I_VADD && op != I_VMUL && op != I_VAND && op != I_VOR && op != I_VXOR
-                : op != I_ADD && op != I_MUL && op != I_AND && op != I_OR && op != I_XOR)
+        /* -ffloat-reassoc: float sums and products too, their constants
+           terms like any other, which no integer fold joins */
+        bool flt = fre && (vec ? op == I_VFADD || op == I_VFMUL
+                               : (ty == VT_F32 || ty == VT_F64) && (op == I_FADD || op == I_FMUL));
+        if (!flt && (vec ? op != I_VADD && op != I_VMUL && op != I_VAND && op != I_VOR && op != I_VXOR
+                         : op != I_ADD && op != I_MUL && op != I_AND && op != I_OR && op != I_XOR))
           continue;
-        if (ri->nargs != 2 || (ty != VT_I32 && ty != VT_I64 && !vec)) continue;
+        if (ri->nargs != 2 || (ty != VT_I32 && ty != VT_I64 && !vec && !flt)) continue;
         uint64_t lane = ri->imm2;
-        if (vec && VLANE_IS_FLOAT(lane)) continue;
+        if (vec && VLANE_IS_FLOAT(lane) && !flt) continue;
+        bool nk = vec || flt;
         /* link[0] is r, link[n - 1] the one that reads p */
         Ref link[RC_LINKS], term[RC_LINKS];
         uint32_t n = rc_path(f, r, p, op, ty, lane, uses, f->blocks[h].rpo, link, 0);
@@ -914,7 +921,7 @@ static bool pass_reassoc_carried(IrFunc *f) {
            counter's steps are */
         uint64_t kv = 0, c;
         bool have_k = false;
-        for (uint32_t k = 0; k < n && !vec; k++)
+        for (uint32_t k = 0; k < n && !nk; k++)
           if (is_const(f, term[k], &c)) {
             if (!have_k) kv = c;
             else fold_int_binop(op, ty, kv, c, &kv);
@@ -924,7 +931,7 @@ static bool pass_reassoc_carried(IrFunc *f) {
 
         Ref acc = REF_NONE;
         for (uint32_t k = n; k-- > 1;) {
-          if (!vec && is_const(f, term[k], &c)) continue;
+          if (!nk && is_const(f, term[k], &c)) continue;
           if (acc == REF_NONE) { acc = term[k]; continue; }
           Ref *a = ir_args(f, link[k]);
           a[0] = acc;
@@ -935,7 +942,7 @@ static bool pass_reassoc_carried(IrFunc *f) {
         Block *b = &f->blocks[rb];
         while (at < b->ninsts && b->insts[at] != r) at++;
         if (at == b->ninsts) continue;
-        if (vec || !is_const(f, term[0], &c)) {
+        if (nk || !is_const(f, term[0], &c)) {
           Ref pr[2] = { acc, term[0] };
           if (acc == REF_NONE) acc = term[0];
           else {
@@ -949,7 +956,7 @@ static bool pass_reassoc_carried(IrFunc *f) {
           acc = acc == REF_NONE ? kc : emit_before(f, rb, &at, (IrOp)op, ty, pr, 2, 0);
         }
         Ref *ra = ir_args(f, r);
-        bool kl = !vec && is_const(f, acc, &c);
+        bool kl = !nk && is_const(f, acc, &c);
         ra[0] = kl ? p : acc;
         ra[1] = kl ? acc : p;
         changed = true;
@@ -7148,7 +7155,14 @@ typedef struct {
 typedef struct {
   const MemEnt *ent; uint32_t nent;
   const PendStore *pend; uint32_t npend;
+  /* -faddr-nowrap: no witness needed, adds of small positive constants
+     taken as if they did not wrap */
+  bool nowrap;
 } MemRan;
+
+/* the offsets -faddr-nowrap takes as if their adds did not wrap: well
+   inside the guard region past a 32-bit memory's top */
+#define ADDR_NOWRAP_MAX 0x10000
 
 #define MEMOPT_ENTS 64
 
@@ -7387,6 +7401,12 @@ static bool same_access_after(IrFunc *f, Ref addr_a, uint64_t imm_a, uint32_t si
   access_parts(f, addr_b, &rb, &cb, &ib, &wb);
   if (ra == REF_NONE || ra != rb || wa || wb) return false;
   uint64_t is = ia + imm_a, il = ib + imm_b;
+  /* -faddr-nowrap: x + c at offset k and x at offset k + c are one
+     address, which no witness need show: an out-param an inlined callee
+     wrote through its pointer, read back at the caller's offset */
+  if (ran && ran->nowrap && (ca & 0xffffffffull) < ADDR_NOWRAP_MAX &&
+      (cb & 0xffffffffull) < ADDR_NOWRAP_MAX)
+    return (ca & 0xffffffffull) + is == (cb & 0xffffffffull) + il;
   uint64_t d = (cb - ca) & 0xffffffffull;
   if (d <= is) return is - d == il;
   uint64_t e = (ca - cb) & 0xffffffffull;
@@ -7633,7 +7653,10 @@ void opt_effects_begin(Module *m, const OptOpts *o) {
   if (df_func)
     for (uint32_t i = 0; i < fx_nfuncs; i++) xfree(df_func[i].args);
   xfree(df_func);
-  df_func = o->dead_frames ? xcalloc(m->nfuncs ? m->nfuncs : 1, sizeof(DfFunc)) : NULL;
+  /* the scan that finds the C stack pointer, which addr-nowrap folds
+     addresses on as well */
+  df_func = o->dead_frames || o->addr_nowrap
+                ? xcalloc(m->nfuncs ? m->nfuncs : 1, sizeof(DfFunc)) : NULL;
   df_sp = UINT32_MAX;
   if (nr_sum)
     for (uint32_t i = 0; i < fx_nfuncs; i++) {
@@ -10967,7 +10990,9 @@ static Ref materialise_param(IrFunc *f, MemState *st, const MemEnt *e) {
     for (uint32_t k = 0; k < st[x].nent; k++) {
       const MemEnt *pe = &st[x].ent[k];
       if (!pe->valid || pe->pending) continue;
-      MemRan ran = { st[x].ent, st[x].nent, st[x].pend, st[x].npend };
+      /* no -faddr-nowrap here: the join took the entry only where every
+         predecessor holds it at the same address as same_access has it */
+      MemRan ran = { st[x].ent, st[x].nent, st[x].pend, st[x].npend, false };
       if (!same_access_after(f, pe->addr, pe->off, pe->size, pe->mem,
                              e->addr, e->off, e->size, e->mem, &ran))
         continue;
@@ -11225,7 +11250,7 @@ static bool pass_memopt(IrFunc *f, const OptOpts *o) {
          that something after it can trap before -- a load, a division, a
          check, a GC access.  A store has its own test, below. */
       if (o->exact_trap && in->op != I_STORE && lh_can_trap(f, v)) npend = 0;
-      MemRan ran = { ent, nent, pend, npend };
+      MemRan ran = { ent, nent, pend, npend, o->addr_nowrap };
       if (in->op == I_LOAD) {
         uint32_t size = (uint32_t)MEMF_SIZE(in->imm2);
         uint32_t mem = MEMF_MEM(in->imm2);
@@ -17618,7 +17643,7 @@ static int v_window(const VAcc *acc, uint32_t nacc, const uint8_t *used,
    faults: a guard page would take a whole vector's trap ahead of the scalar
    iterations before it. */
 static bool vectorize_one(IrFunc *f, uint32_t hb, uint8_t *reach, uint8_t *inloop,
-                          uint32_t *want, bool exact) {
+                          uint32_t *want, bool exact, bool fre) {
 #define VREJ(w) do { if (warmc_getenv("WARMC_VEC_DEBUG")) \
     fprintf(stderr, "vec %s b%u reject: %s\n", \
             f->m->funcs[f->func_index].sym, hb, w); return false; } while (0)
@@ -18116,7 +18141,10 @@ static bool vectorize_one(IrFunc *f, uint32_t hb, uint8_t *reach, uint8_t *inloo
        is the min of them all.  Only the NaN's payload may differ, and wasm
        leaves that open. */
     bool is_fmm = vt_is_float(pt) && (n->op == I_FMIN || n->op == I_FMAX);
-    if (vt_is_float(pt) && !is_fmm) VREJ("carried value is not a lane");
+    /* -ffloat-reassoc: a sum or a product too, each lane its own partial
+       result, the lanes added (multiplied) together at the end */
+    bool is_fsum = fre && vt_is_float(pt) && (n->op == I_FADD || n->op == I_FMUL);
+    if (vt_is_float(pt) && !is_fmm && !is_fsum) VREJ("carried value is not a lane");
     IrOp mmop = (IrOp)0;
     bool is_mm = !is_fmm && inloop[n->block] && v_minmax_form(f, nx, &mmop);
     if (!is_mm && !is_fmm && inloop[n->block] && n->op == I_SELECT && pt == VT_I32) {
@@ -18126,7 +18154,7 @@ static bool vectorize_one(IrFunc *f, uint32_t hb, uint8_t *reach, uint8_t *inloo
       continue;
     }
     if (!inloop[n->block] ||
-        (!is_mm && !is_fmm && n->op != I_ADD && n->op != I_AND &&
+        (!is_mm && !is_fmm && !is_fsum && n->op != I_ADD && n->op != I_AND &&
          n->op != I_OR && n->op != I_XOR))
       VREJ("carried value is not a reduction");
 
@@ -18681,6 +18709,8 @@ static bool vectorize_one(IrFunc *f, uint32_t hb, uint8_t *reach, uint8_t *inloo
     redvop[r] = v_is_minmax_op(redop[r]) ? redop[r]
               : redop[r] == I_FMIN ? I_VFMIN
               : redop[r] == I_FMAX ? I_VFMAX
+              : redop[r] == I_FADD ? I_VFADD
+              : redop[r] == I_FMUL ? I_VFMUL
               : redop[r] == I_ADD ? I_VADD
               : redop[r] == I_AND ? I_VAND
               : redop[r] == I_OR  ? I_VOR : I_VXOR;
@@ -19012,6 +19042,9 @@ static bool vectorize_one(IrFunc *f, uint32_t hb, uint8_t *reach, uint8_t *inloo
        min(+inf, -0) is -0 */
     uint64_t idv = redop[r] == I_FMIN ? (w32 ? 0x7f800000u : 0x7ff0000000000000ull)
                  : redop[r] == I_FMAX ? (w32 ? 0xff800000u : 0xfff0000000000000ull)
+                 /* -0 for a sum: -0 + -0 is -0, as a sum of none would be */
+                 : redop[r] == I_FADD ? (w32 ? 0x80000000u : 0x8000000000000000ull)
+                 : redop[r] == I_FMUL ? (w32 ? 0x3f800000u : 0x3ff0000000000000ull)
                  : redop[r] == I_AND ? (w32 ? 0xffffffffu : ~0ull)
                  : redop[r] == I_VSMIN ? (w32 ? 0x7fffffffu : 0x7fffffffffffffffull)
                  : redop[r] == I_VSMAX ? (w32 ? 0x80000000u : 0x8000000000000000ull)
@@ -19190,7 +19223,8 @@ static bool vectorize_one(IrFunc *f, uint32_t hb, uint8_t *reach, uint8_t *inloo
       Ref better = vemit(f, vexit, bop, VT_I32, m, entry_args[rp], 0, 0);
       Ref sa3[3] = { idx, entry_args[p], better };
       exit_args[p] = ir_emit(f, vexit, I_SELECT, VT_I32, sa3, 3, 0, 0);
-    } else if (redop[ri] == I_FMIN || redop[ri] == I_FMAX) {
+    } else if (redop[ri] == I_FMIN || redop[ri] == I_FMAX || redop[ri] == I_FADD ||
+               redop[ri] == I_FMUL) {
       /* The lanes one by one, onto the value the loop came in with: the
          loop leaves once, and both back ends extract a float lane already. */
       Ref acc = entry_args[p];
@@ -19746,7 +19780,7 @@ static bool pass_vec_search(IrFunc *f) {
 
 static bool unroll_by(IrFunc *f, uint32_t hb, uint32_t want, uint32_t *newh);
 
-static bool pass_vectorize(IrFunc *f, bool exact) {
+static bool pass_vectorize(IrFunc *f, bool exact, bool fre) {
   bool changed = false;
   uint32_t norig = f->nblocks;
   uint8_t *reach = NULL, *inloop = NULL;
@@ -19761,7 +19795,7 @@ static bool pass_vectorize(IrFunc *f, bool exact) {
     if (f->ninsts > rcap) { rcap = f->ninsts; reach = xrealloc(reach, rcap); }
     if (f->nblocks > lcap) { lcap = f->nblocks; inloop = xrealloc(inloop, lcap); }
     uint32_t want = 0, nh = hb;
-    if (vectorize_one(f, hb, reach, inloop, &want, exact)) {
+    if (vectorize_one(f, hb, reach, inloop, &want, exact, fre)) {
       done[hb] = 1;
       changed = true;
       ir_order(f);
@@ -19774,7 +19808,7 @@ static bool pass_vectorize(IrFunc *f, bool exact) {
       if (f->ninsts > rcap) { rcap = f->ninsts; reach = xrealloc(reach, rcap); }
       if (f->nblocks > lcap) { lcap = f->nblocks; inloop = xrealloc(inloop, lcap); }
       uint32_t w2 = 0;
-      if (vectorize_one(f, nh, reach, inloop, &w2, exact)) ir_order(f);
+      if (vectorize_one(f, nh, reach, inloop, &w2, exact, fre)) ir_order(f);
       oi = 0;
     }
   }
@@ -22152,6 +22186,53 @@ static bool pass_acc_tail(IrFunc *f) {
   return true;
 }
 
+/* -faddr-nowrap: an access at x + c and offset k, x the C stack pointer
+   or an address made from it, is the access at x and offset k + c, as if
+   the 32-bit add did not wrap: wasm's address would wrap round to the
+   bottom of memory, this one runs past its top into the guard region, or
+   past the bounds an explicit check takes, and traps.  c positive and
+   k + c small, so that no address goes below the memory's base or past its
+   guard.  A frame's slots and the out-params an inlined callee writes
+   through the pointer it was handed, sp + 16, are then the slots its caller
+   reads at sp offset 16, which the memory passes forward and drop:
+   rsbench/wide128 0.76, cbench/int128 0.80, cbench/structval 0.88.  Not
+   other addresses: an array's or a loop's x + c taken apart cost the
+   vectoriser and the unroller the adds they read them by, and made a base
+   register several accesses share and spill (vecbench/search 2.8 times as
+   slow, vecbench/condsum 1.27); the stack pointer is the one the module's
+   C stack is known to have (df_sp, the scan -fdead-frames takes its
+   frames from). */
+static bool pass_addr_nowrap(IrFunc *f) {
+  bool changed = false;
+  for (uint32_t oi = 0; oi < f->norder; oi++) {
+    Block *b = &f->blocks[f->order[oi]];
+    for (uint32_t i = 0; i < b->ninsts; i++) {
+      Ref v = b->insts[i];
+      Inst *in = &f->insts[v];
+      if (in->op != I_MEM_ADDR || in->nargs != 1) continue;
+      Ref r;
+      int64_t ro;
+      access_root(f, ir_args(f, v)[0], &r, &ro);
+      if (r == REF_NONE || f->insts[r].op != I_GLOBAL_GET || f->insts[r].imm != df_sp) continue;
+      /* the adds access_root walked, each its constant second */
+      for (;;) {
+        Ref x = ir_args(f, v)[0];
+        const Inst *xi = &f->insts[x];
+        uint64_t c;
+        if (xi->op != I_ADD || xi->nargs != 2 || xi->type != VT_I32 ||
+            !is_const(f, ir_args(f, x)[1], &c) ||
+            (c & 0xffffffffu) + in->imm >= ADDR_NOWRAP_MAX)
+          break;
+        in->imm += c & 0xffffffffu;
+        ir_args(f, v)[0] = ir_args(f, x)[0];
+        g_stats.addr_nowrap++;
+        changed = true;
+      }
+    }
+  }
+  return changed;
+}
+
 static double pt_now(void) {
   struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
   return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
@@ -22198,6 +22279,8 @@ static void pt_init(void) {
    holds the change each pass last ran clean at.  The round that confirms a
    cleanup is finished used to run every pass once more. */
 static void opt_cleanup(IrFunc *f, const OptOpts *o) {
+  if (o->addr_nowrap && df_sp != UINT32_MAX && fx_mod == f->m)
+    TP("addr_nowrap", pass_addr_nowrap(f));
   uint32_t ver = 1, done[16] = {0};
 #define RUN(i, nm, call) \
   (done[i] != ver && (TP(nm, call) ? (ver++, true) : (done[i] = ver, false)))
@@ -22525,7 +22608,7 @@ void ir_optimize(IrFunc *f, const OptOpts *o) {
   if (o->vectorize && o->guard_pages && TP("vec_search", pass_vec_search(f))) {
     ir_order(f);
   }
-  if (o->vectorize && o->guard_pages && TP("vectorize", pass_vectorize(f, o->exact_trap))) {
+  if (o->vectorize && o->guard_pages && TP("vectorize", pass_vectorize(f, o->exact_trap, o->float_reassoc))) {
     ir_order(f);
     /* the guards a vector loop is entered by are often constants */
     if (o->fold) pass_fold(f, o);
@@ -22574,8 +22657,8 @@ void ir_optimize(IrFunc *f, const OptOpts *o) {
   if (o->loopclose && TP("loop_close", pass_loop_close(f))) ir_order(f);
   /* A chain rebuilt through a wrap leaves the wrap, and an extend under it,
      unread. */
-  bool reassoced = o->reassoc && TP("reassoc", pass_reassoc(f));
-  if (o->reassoc && TP("reassoc_carried", pass_reassoc_carried(f))) reassoced = true;
+  bool reassoced = o->reassoc && TP("reassoc", pass_reassoc(f, o->float_reassoc));
+  if (o->reassoc && TP("reassoc_carried", pass_reassoc_carried(f, o->float_reassoc))) reassoced = true;
   if (reassoced && o->dce) pass_dce(f);
   /* after the dead links of the old chain are gone, which read its terms */
   if (reassoced && o->fold && TP("common_factor", pass_common_factor(f)) && o->dce)

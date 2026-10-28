@@ -60,8 +60,9 @@ static const char *usage_text =
   "                O1 the optimising pipeline, O2 adds guard pages,\n"
   "                inlining, devirtualisation, unrolling and gcpure.\n"
   "                O3 adds the passes that change what a program can see,\n"
-  "                fma, dead-frames and acc-tail, described below: every\n"
-  "                optimisation warmc has, where O2 keeps wasm's semantics.\n"
+  "                fma, dead-frames, acc-tail, float-reassoc and\n"
+  "                addr-nowrap, described below: every optimisation warmc\n"
+  "                has, where O2 keeps wasm's semantics.\n"
   "                -fno-inline turns inlining off, and src/inline.c has the\n"
   "                measurements that decided both.  Options apply in order,\n"
   "                so a -f flag goes after the -O it amends\n"
@@ -74,7 +75,7 @@ static const char *usage_text =
   "                sealed, once, gcpure, split, labcache, ifconv, mulwide,\n"
   "                barelide, small-loop-align, trampoline, go-sp, go-resume,\n"
   "                go-noret, wrap-params, fma, dead-frames, acc-tail,\n"
-  "                exact-trap\n"
+  "                float-reassoc, addr-nowrap, exact-trap\n"
   "                fma is off below -O3: it fuses a float multiply\n"
   "                into the add that reads it, rounded once, which is not\n"
   "                wasm's arithmetic and can change a result's last bit\n"
@@ -90,6 +91,17 @@ static const char *usage_text =
   "                loops with an accumulator, one call a level fewer; so a\n"
   "                recursion that never ends loops for ever, where wasm\n"
   "                runs out of stack and traps\n"
+  "                float-reassoc is off below -O3: a float sum or product a\n"
+  "                loop carries round is taken in vector lanes, each lane's\n"
+  "                partial result added at the end, in another order than\n"
+  "                wasm's, so a result can differ in its last bits\n"
+  "                addr-nowrap is off below -O3: an address x + c, x the C\n"
+  "                stack pointer or one made from it, c a positive constant\n"
+  "                under 64 KiB, is x at offset c, the add done in 64 bits,\n"
+  "                and any x + c at offset k is x at offset k + c; where\n"
+  "                wasm's 32-bit add would wrap round to the bottom of\n"
+  "                memory, an access traps past its top, or reads what a\n"
+  "                store to the wrapped address wrote where wasm's traps\n"
   "                exact-trap is off at every level: with it, memory,\n"
   "                tables and globals hold what wasm says when a trap\n"
   "                happens -- every write before the trapping instruction\n"
@@ -406,7 +418,7 @@ static void set_level(OptOpts *o, int level) {
   o->align = o->split = o->trampoline = o->go_sp = level >= 1;
   o->guard_pages = o->inl = o->devirt = o->unroll = o->gcpure = level >= 2;
   /* -O3: also the passes that change what a program can see */
-  o->fma = o->dead_frames = o->acc_tail = level >= 3;
+  o->fma = o->dead_frames = o->acc_tail = o->float_reassoc = o->addr_nowrap = level >= 3;
 }
 
 static void print_stats(void) {
@@ -414,7 +426,7 @@ static void print_stats(void) {
           "warmc stats: folded=%llu dce=%llu cse=%llu licm=%llu branch=%llu\n"
           "             loads_fwd=%llu dead_stores=%llu checks_removed=%llu params=%llu\n"
           "             strength=%llu inlined=%llu rotated=%llu vectorised=%llu\n"
-          "             self_tail=%llu acc_tail=%llu ldcomb=%llu spills=%llu insts=%llu\n"
+          "             self_tail=%llu acc_tail=%llu addr_nowrap=%llu ldcomb=%llu spills=%llu insts=%llu\n"
           "             ldpairs=%llu stpairs=%llu cold_frames=%llu early_rets=%llu entry_checks=%llu loop_phases=%llu"
           " exact_store_checks=%llu exact_memop_checks=%llu\n"
           "             reloads=%llu caller_saves=%llu csa_restores=%llu"
@@ -448,6 +460,7 @@ static void print_stats(void) {
           (unsigned long long)g_stats.vectorized,
           (unsigned long long)g_stats.self_tail,
           (unsigned long long)g_stats.acc_tail,
+          (unsigned long long)g_stats.addr_nowrap,
           (unsigned long long)g_stats.loads_combined,
           (unsigned long long)g_stats.spills,
           (unsigned long long)g_stats.insts_emitted,
@@ -1239,6 +1252,8 @@ static int warmc_main(int argc, char **argv) {
       else if (!strcmp(name, "fma")) opt.fma = on;
       else if (!strcmp(name, "dead-frames")) opt.dead_frames = on;
       else if (!strcmp(name, "acc-tail")) opt.acc_tail = on;
+      else if (!strcmp(name, "float-reassoc")) opt.float_reassoc = on;
+      else if (!strcmp(name, "addr-nowrap")) opt.addr_nowrap = on;
       else if (!strcmp(name, "exact-trap")) opt.exact_trap = on;
       else if (!strcmp(name, "gcpure")) opt.gcpure = on;
       else if (!strcmp(name, "closed-world")) opt.closed_world = on;
