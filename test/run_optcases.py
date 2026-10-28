@@ -74,6 +74,11 @@ STATS_LINE = re.compile(r"^;; stats(?: (-O[0-3]))?( a64)?: (.*)$")
 SHAPE_LINE = re.compile(r"^;; (shape|late): (\S+) (.*)=(\d+)$")
 FLAGS_LINE = re.compile(r"^;; flags: (.+)$")
 OBJDUMP = shutil.which("llvm-objdump") or shutil.which("objdump")
+# the shapes are in Apple's syntax for vectors, add.4s v0, v1, v2, which an
+# LLVM disassembler prints for a Darwin triple whatever the object: Linux's
+# ELF program, by its own, prints add v0.4s, v1.4s, v2.4s, and every shape
+# of a vector instruction found none there
+OBJDUMP_SYNTAX = ["--triple=arm64-apple-darwin"]
 AARCH64 = platform.machine() in ("arm64", "aarch64")
 
 
@@ -264,8 +269,8 @@ def check_all(cases, build, warmc, target, run, tmp):
             fails += f
     exe = progs["-O2"][0]
     if exe and AARCH64 and OBJDUMP:
-        dump = subprocess.run([OBJDUMP, "-d", "--no-show-raw-insn", exe], capture_output=True,
-                              text=True).stdout
+        dump = subprocess.run([OBJDUMP, "-d", "--no-show-raw-insn"] + OBJDUMP_SYNTAX + [exe],
+                              capture_output=True, text=True).stdout
         for name, c in names:
             want = shapes(c)
             if want:
