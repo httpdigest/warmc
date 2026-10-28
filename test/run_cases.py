@@ -147,14 +147,18 @@ def compile_case(idx, name, wasm, outdir):
     # core for its own threads, beside the rest of make check starting,
     # could miss its timeout on a module it compiles in milliseconds
     # (test/run_jobs.sh shows the thread count never reaches the output)
+    p = subprocess.Popen([os.path.join(BUILD, "warmc"), "-j1"] + WARMC_FLAGS + target +
+                         ["--symbol-prefix=c%d" % idx, "-c", "-o", obj, wasm],
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     try:
-        r = sh([os.path.join(BUILD, "warmc"), "-j1"] + WARMC_FLAGS + target +
-               ["--symbol-prefix=c%d" % idx, "-c", "-o", obj, wasm],
-               timeout=TIMEOUT)
+        _out, err = p.communicate(timeout=TIMEOUT)
     except subprocess.TimeoutExpired:
-        return None, "FAIL[%s]: warmc timed out after %gs" % (name, TIMEOUT)
-    if r.returncode != 0:
-        return None, "FAIL[%s]: warmc: %s" % (name, r.stderr.strip()[:200])
+        where = hostbuild.stack_of(p.pid, os.path.join(outdir, name + ".sample.txt"))
+        p.kill()
+        p.communicate()
+        return None, "FAIL[%s]: warmc timed out after %gs%s" % (name, TIMEOUT, where)
+    if p.returncode != 0:
+        return None, "FAIL[%s]: warmc: %s" % (name, err.strip()[:200])
     return obj, None
 
 def write_index(entries, path):

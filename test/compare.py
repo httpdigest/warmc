@@ -12,6 +12,8 @@ import re
 import subprocess
 import sys
 
+import hostbuild
+
 MASK = {"i32": (1 << 32) - 1, "f32": (1 << 32) - 1,
         "i64": (1 << 64) - 1, "f64": (1 << 64) - 1}
 
@@ -169,16 +171,20 @@ def compare(ref_path, binary, label, run=None, timeout=None, prefix=()):
             if argv:
                 argv.append("--")
             argv.append(n)
+        p = subprocess.Popen(run + [binary] + list(prefix) + argv,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         try:
-            p = subprocess.run(run + [binary] + list(prefix) + argv,
-                               capture_output=True, timeout=timeout)
+            out, err = p.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
-            return None, "TIMEOUT after %gs" % timeout
-        lines = p.stdout.decode().split("\n")
+            where = hostbuild.stack_of(p.pid, binary + ".sample.txt")
+            p.kill()
+            p.communicate()
+            return None, "TIMEOUT after %gs%s" % (timeout, where)
+        lines = out.decode().split("\n")
         if lines and lines[-1] == "":
             lines.pop()
         if len(lines) != len(names):
-            return None, p.stderr.decode().strip().replace("\n", " ")
+            return None, err.decode().strip().replace("\n", " ")
         return lines, ""
 
     expected = read_reference(ref_path)
