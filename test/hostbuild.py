@@ -207,19 +207,24 @@ if __name__ == "__main__":
 
 def stack_of(pid, path):
     """Where a process past its time is, as macOS's sample sees it for a
-    second: its call graph's first lines, the rest in PATH ("" where sample
-    is not there).  Under make check's load, twice a compile that takes a
+    second: its call graph's first lines, the rest in PATH, or why there is
+    none.  Under make check's load, twice a compile that takes a
     tenth of a second (test/cases/vector.wat) ran past thirty in two rows at
     once, and a program that answers in milliseconds (dispatchloop, all
     passes off) answered nothing for thirty; none of them again alone."""
     try:
-        subprocess.run(["sample", str(pid), "1", "-mayDie", "-file", path],
-                       capture_output=True, timeout=30)
+        r = subprocess.run(["sample", str(pid), "1", "-mayDie", "-file", path],
+                           capture_output=True, text=True, timeout=30)
+    except subprocess.TimeoutExpired:
+        return "\n    (sample itself took more than 30 s)"
+    except OSError as e:
+        return "\n    (no sample: %s)" % e
+    try:
         with open(path) as f:
             lines = f.read().splitlines()
-    except (OSError, subprocess.TimeoutExpired):
-        return ""
+    except OSError:
+        lines = []
     at = next((i for i, l in enumerate(lines) if l.startswith("Call graph:")), None)
     if at is None:
-        return ""
+        return "\n    (sample gave no call graph: %s)" % (r.stderr.strip()[:300] or "nothing said")
     return "\n    " + "\n    ".join(lines[at:at + 30]) + "\n    (all of it: %s)" % path

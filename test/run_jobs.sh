@@ -68,7 +68,13 @@ for w in "${mods[@]}"; do
     if [ -z "$ref" ]; then
       ref="$WORK/j$j.o"
     elif ! cmp -s "$ref" "$WORK/j$j.o"; then
-      echo "FAIL[jobs]: $(basename "$w") differs at -j$j from -j$first"
+      # both kept, to be told apart function by function: once, under make
+      # check's load, a module differed at every -j from 3 up and never again
+      keep="$BUILD/checklogs/jobs"
+      mkdir -p "$keep"
+      cp "$ref" "$keep/$(basename "$w" .wasm)-j$first.o"
+      cp "$WORK/j$j.o" "$keep/$(basename "$w" .wasm)-j$j.o"
+      echo "FAIL[jobs]: $(basename "$w") differs at -j$j from -j$first (both in $keep)"
       fail=$((fail + 1))
       ok=0
     fi
