@@ -21,19 +21,26 @@ or where an old no longer occurs once in the source as it is now.
 Without rebuilding the world: each of J workers (4 by default) is a
 directory under build/mut with a copy of src/ of its own beside symlinks to
 the rest of the repository and of build/ -- corpora, tools, runtimes, the
-test cache, whose results are keyed by contents and so are as good for a
-mutant's programs as for any -- and builds only warmc there, without LTO,
+test cache, whose references are keyed by contents and so are as good for
+a mutant's programs as for any -- and builds only warmc there, without LTO,
 so that a mutant costs one object's compile and a link.  A worker's warmc,
 built, must compile the optimiser's cases (test/cases_opt) to the bytes the
 tree's build/warmc does -- once more after building it all anew -- or the
 run stops: a mutant tried on some other warmc tells nothing.  What a suite
 writes into build/ is the worker's own (OWN): two mutants' programs must
 never meet under one name.  Workers run mutants side by side.
+
+A mutant's programs are its own: their runs and rows, kept in the test
+cache, nothing would ask for again, so the suites keep references alone
+(WARMC_TESTCACHE_REFS_ONLY).  The compiles still fill warmc's cache, which,
+with the test cache, is cut to its size after the mutants as run_all.sh
+cuts it after the rows: in the background, which a later run waits for.
 """
 import concurrent.futures
 import glob
 import hashlib
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -45,6 +52,7 @@ ROOT = os.path.dirname(HERE)
 WS = os.path.join(ROOT, "build", "mut")
 CFLAGS = ("-std=c11 -O2 -fvisibility=hidden -fno-exceptions -g0 "
           "-Wall -Wextra -Wno-unused-parameter")
+TRIM_PID = os.path.join(ROOT, "build", ".cache-trim.pid")
 OWN = {"obj", "warmc", "testrun", "checklogs", "obj-asan", "obj-tsan", "warmc.dSYM", "mut",
        "gobench", "rsbench", "cbench", "zigbench", "hsbench", "asbench", "cppbench",
        "vecbench", "stdgo", "ktbench", "javabench"}
@@ -152,6 +160,40 @@ def setup(k, ref):
              "was built" % k)
 
 
+def trim_wait():
+    """the last run's trim of the caches, still unlinking: taking entries
+    away while compiles run starves them of the disk (run_all.sh)"""
+    try:
+        with open(TRIM_PID) as f:
+            pid = int(f.read())
+    except (OSError, ValueError):
+        return
+    said = False
+    while True:
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return
+        if not said:
+            print("waiting for the last run's cache trim to finish", flush=True)
+            said = True
+        time.sleep(1)
+
+
+def trim_start():
+    """the test cache and warmc's cut to their sizes, in the background"""
+    cache = os.environ.get("WARMC_CACHE") or os.path.join(ROOT, "build", "warmc-cache")
+    tc = os.path.join(HERE, "testcache.py")
+    py, tc, cache = (shlex.quote(x) for x in (sys.executable, tc, cache))
+    script = "%s %s trim; %s %s trim %s %s 2" % (
+        py, tc, py, tc, cache, shlex.quote(os.environ.get("WARMC_CACHE_MB", "20000")))
+    p = subprocess.Popen(["sh", "-c", script], cwd=ROOT, stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+    with open(TRIM_PID, "w") as f:
+        f.write(str(p.pid))
+
+
 def main():
     args = sys.argv[1:]
     if not args or args[0].startswith("-"):
@@ -180,6 +222,7 @@ def main():
     if stale:
         sys.exit("mutate: the spec no longer fits the source\n  " + "\n  ".join(stale))
     t0 = time.time()
+    trim_wait()
     os.makedirs(WS, exist_ok=True)
     ref = reference()
     with concurrent.futures.ThreadPoolExecutor(jobs) as ex:
@@ -206,7 +249,7 @@ def main():
             else:
                 res, killed = [], False
                 for label, cmd, env in SUITES:
-                    rc, out = sh(cmd, w, dict(env, BUILD="build"))
+                    rc, out = sh(cmd, w, dict(env, BUILD="build", WARMC_TESTCACHE_REFS_ONLY="1"))
                     res.append("%s:%s" % (label, "KILL" if rc else "pass"))
                     if rc:
                         killed = True
@@ -223,6 +266,7 @@ def main():
 
     with concurrent.futures.ThreadPoolExecutor(jobs) as ex:
         results = list(ex.map(one, names))
+    trim_start()
     survivors = [n for n, killed in results if not killed]
     bad = [n for n in survivors if n not in EQUIV]
     print("--- %d mutants in %.0fs: %d killed, %d equivalent, %d survive"
