@@ -830,6 +830,13 @@ void a64_vfmul(Buf *b, int sz, int rd, int rn, int rm) { V3(0x6E20DC00u | VSZ(sz
 void a64_vfdiv(Buf *b, int sz, int rd, int rn, int rm) { V3(0x6E20FC00u | VSZ(sz), rd, rn, rm); }
 void a64_vfmax(Buf *b, int sz, int rd, int rn, int rm) { V3(0x4E20F400u | VSZ(sz), rd, rn, rm); }
 
+/* fmul by element: rm's lane idx in every lane, .d[H] or .s[H:L] */
+void a64_vfmul_elem(Buf *b, int sz, int rd, int rn, int rm, int idx) {
+  uint32_t hl = sz ? (uint32_t)(idx & 1) << 11
+                   : ((uint32_t)(idx & 2) << 10) | ((uint32_t)(idx & 1) << 21);
+  V3(0x4F809000u | ((uint32_t)sz << 22) | hl, rd, rn, rm);
+}
+
 void a64_vfmla(Buf *b, int sz, int rd, int rn, int rm) { V3(0x4E20CC00u | VSZ(sz), rd, rn, rm); }
 void a64_vfmls(Buf *b, int sz, int rd, int rn, int rm) { V3(0x4EA0CC00u | VSZ(sz), rd, rn, rm); }
 void a64_vfmin(Buf *b, int sz, int rd, int rn, int rm) { V3(0x4EA0F400u | VSZ(sz), rd, rn, rm); }

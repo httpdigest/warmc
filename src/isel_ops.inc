@@ -1359,6 +1359,14 @@ static void emit_inst(Isel *s, Ref v) {
         commit(s, v, d);
         break;
       }
+      if (in->op == I_VFMUL && s->vbyel && s->vbyel[v]) {
+        int slot = s->vbyel[v] - 1;
+        int x = rd(s, a[slot ^ 1], F0), y = rd(s, ir_args(f, a[slot])[0], F1);
+        int d = wr(s, v, F2);
+        a64_vfmul_elem(B, in->imm2 == VLANE_F64, d, x, y, 0);
+        commit(s, v, d);
+        break;
+      }
       int x = rd(s, a[0], F0), y = rd(s, a[1], F1);
       int d = wr(s, v, F2);
       int sz = VLANE_SIZE(in->imm2);

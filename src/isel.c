@@ -2233,6 +2233,40 @@ static void analyse_immediates(Isel *s) {
     }
   }
 
+  /* A float splat that only vector multiplies of its block read, each with
+     a vector beside it, is its scalar read by lane: an fmul by element, the
+     scalar lane 0 of its register, and no dup.  The SLP pass splats each
+     element of a matrix row for the row's products (rsbench/constmat),
+     which clang multiplies by element.  (A use by a terminator or an edge
+     is a use no multiply makes up.) */
+  s->vbyel = xcalloc(n ? n : 1, 1);
+  {
+    uint32_t *by = xcalloc(n ? n : 1, sizeof(uint32_t));
+    for (int pass = 0; pass < 2; pass++)
+      for (uint32_t oi = 0; oi < f->norder; oi++) {
+        uint32_t bi = f->order[oi];
+        Block *b = &f->blocks[bi];
+        for (uint32_t i = 0; i < b->ninsts; i++) {
+          Ref u = b->insts[i];
+          Inst *in = &f->insts[u];
+          if (in->op != I_VFMUL || in->nargs != 2 || s->folded[u]) continue;
+          Ref *a = ir_args(f, u);
+          for (int slot = 0; slot < 2; slot++) {
+            const Inst *ei = &f->insts[a[slot]];
+            if (ei->op != I_VSPLAT || ei->imm2 != in->imm2 || ei->block != bi ||
+                f->insts[a[slot ^ 1]].op == I_VSPLAT)
+              continue;
+            if (pass == 0) by[a[slot]]++;
+            else if (by[a[slot]] == uses[a[slot]]) {
+              s->folded[a[slot]] = 1;
+              s->vbyel[u] = (uint8_t)(slot + 1);
+            }
+          }
+        }
+      }
+    xfree(by);
+  }
+
   if (!warmc_getenv("WARMC_NO_FUSE"))
   for (uint32_t oi = 0; oi < f->norder; oi++) {
     uint32_t bi = f->order[oi];
@@ -3858,7 +3892,7 @@ give_up:
   xfree(s->zx_fuse); xfree(s->no_remat); xfree(s->paired); xfree(s->nl); xfree(s->pool);
   xfree(s->folded); xfree(s->uses); xfree(s->bfx); xfree(s->pinned); xfree(s->csinc);
   xfree(s->bfi);
-  xfree(s->vrot); xfree(s->vadal); xfree(s->vmla);
+  xfree(s->vrot); xfree(s->vadal); xfree(s->vmla); xfree(s->vbyel);
   xfree(s->extr);
   xfree(s->pc); xfree(s->pc_bfirst); xfree(s->pc_bn); xfree(s->pc_head);
   xfree(s->recomp);
