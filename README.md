@@ -78,11 +78,15 @@ Hello world!
     turned back into `mul` and `umulh`/`smulh`
   - a linear-scan register allocator that runs under several spill rules and
     keeps the cheapest, with rematerialisation, a second-chance pass and
-    live-range splitting at loop boundaries
+    live-range splitting at loop boundaries; a loop parameter shares its
+    register with the step its back edge hands it wherever the two are never
+    live at once, though a value read on an exit laid out after the loop
+    makes their intervals overlap, so the back edge carries no move
   - rewrites of what particular producers emit: GHC's trampoline becomes tail
     calls, and Go's stack pointer travels in registers
-  - at `-O3`, also fused multiply-adds and the removal of stores into C
-    frames that nothing reads again, which wasm's semantics do not allow
+  - at `-O3`, also fused multiply-adds, the removal of stores into C
+    frames that nothing reads again, and small recursions that accumulate
+    their calls' results made loops, which wasm's semantics do not allow
 
   Functions compile in parallel and are laid out in a deterministic order.
 - **Fast code.** Across 364 benchmark kernels compiled from Go, TinyGo, Rust,
@@ -1115,7 +1119,7 @@ are parsed but not enforced.
 
 | Level | What it does |
 |---|---|
-| `-O3` | everything `-O2` does, and the passes that change what a program can see: `fma` and `dead-frames` (below). Every optimisation warmc has, for code that does not depend on wasm's exact float rounding or on reading stack memory it never wrote |
+| `-O3` | everything `-O2` does, and the passes that change what a program can see: `fma`, `dead-frames` and `acc-tail` (below). Every optimisation warmc has, for code that does not depend on wasm's exact float rounding, on reading stack memory it never wrote, or on a recursion that never ends running out of stack |
 | `-O2` (default) | the full pipeline: what `-O1` does, plus inlining, devirtualisation, unrolling, `gcpure`, and guard-page memory (which also enables the vectoriser, native-pointer caching and load combining) |
 | `-O1` | the optimising pipeline without guard pages, inlining, devirtualisation, unrolling or `gcpure` |
 | `-O0` | skips the IR optimiser. Register allocation, module reachability (`reach`), `prune`, `merge`, the `call_indirect` code tables (`ictab`) and constant pools (`cpool`) still run. |
@@ -1131,7 +1135,7 @@ and `ldcomb` need `guard-pages`; `small-loop-align` needs `align`; and
 
 | Pass | What it does |
 |---|---|
-| `fold` | constant folding and algebraic simplification, including a constant reinterpreted between integer and float and two xor-shifts that cancel, a test of an `Ordering` -- Rust's `(a > b) - (a < b)`, alone or masked to its byte -- as the compare of `a` and `b` it stands for, a branch on the high half of a call's i64 result, Go's unwind flag once `go-sp` packs it, as a `tst` of the result, and an i64 put back together from its halves, `x & 0xffffffff00000000` or'd with `x`'s low half extended, as `x`; `x*c + y*c` as `(x + y)*c`, and `x*c - y*c` as `(x - y)*c`, an integer's or lane by lane, where each product is read there alone; the sign extension of an i64 that already is the sign extension of its low 32 bits -- a signed load, an extension, a constant in range, an and, or, xor or select of such, a block parameter every edge hands one, a loop's too -- as that i64, as Go's int32 kept in an i64 and extended again at each use is; the value a loop hands its parameter `x` on a back edge, `x op c1 op c2 ...` with each `c` a constant and `op` an add, multiply, and, or or xor, as `x op c`, the constants folded into one, also where the links are read elsewhere, which keep them, so that the next iteration waits on one instruction, not on each link -- a loop unrolled four times, each copy its counter plus one -- though not where nothing else reads `x`, which would then be live to the chain's end; a reinterpret undone, a store of reinterpreted bits, and an integer load read only as float bits, as the C ABI copies a struct's doubles, move the bits in the float registers |
+| `fold` | constant folding and algebraic simplification, including a constant reinterpreted between integer and float and two xor-shifts that cancel, an `eq` or `ne` against a constant with a bit the value cannot have, a test of an `Ordering` -- Rust's `(a > b) - (a < b)`, alone or masked to its byte -- as the compare of `a` and `b` it stands for, a branch on the high half of a call's i64 result, Go's unwind flag once `go-sp` packs it, as a `tst` of the result, and an i64 put back together from its halves, `x & 0xffffffff00000000` or'd with `x`'s low half extended, as `x`; `x*c + y*c` as `(x + y)*c`, and `x*c - y*c` as `(x - y)*c`, an integer's or lane by lane, where each product is read there alone; the sign extension of an i64 that already is the sign extension of its low 32 bits -- a signed load, an extension, a constant in range, an and, or, xor or select of such, a block parameter every edge hands one, a loop's too -- as that i64, as Go's int32 kept in an i64 and extended again at each use is; the value a loop hands its parameter `x` on a back edge, `x op c1 op c2 ...` with each `c` a constant and `op` an add, multiply, and, or or xor, as `x op c`, the constants folded into one, also where the links are read elsewhere, which keep them, so that the next iteration waits on one instruction, not on each link -- a loop unrolled four times, each copy its counter plus one -- though not where nothing else reads `x`, which would then be live to the chain's end; a reinterpret undone, a store of reinterpreted bits, and an integer load read only as float bits, as the C ABI copies a struct's doubles, move the bits in the float registers |
 | `dce` | dead-code elimination |
 | `cse` | common-subexpression elimination over dominators |
 | `licm` | loop-invariant code motion, including hoisting invariant stores and trap guards; a value is taken out of the innermost loop that reads it and no further, and a native address stays by the access it serves, which folds it |
@@ -1139,8 +1143,9 @@ and `ldcomb` need `guard-pages`; `small-loop-align` needs `align`; and
 | `edge-tests` | in loops, fold a test or branch that a dominating branch on the same value has already decided, such as an inlined bounds check behind a loop's own exit test |
 | `fma` | off below `-O3`: a float multiply whose one reader is an add or a subtract becomes one fused multiply-add (`fmadd`, `fmla`; `vfmadd` on x86-64), rounded once. Not where the add is what a loop carries round and the multiply is not, as in a dot product, which runs a third slower fused, nor for a vector `a*b - c`. wasm rounds the multiply and the add each, so a result can differ in its last bit; `-ffma` is for code that does not depend on that, as native C compilers assume by default |
 | `dead-frames` | off below `-O3`: assumes C's stack, where nothing reads a function's frame once it returns, and while it runs only the function and the callees it passes pointers into it; a store into the frame that nothing can read before the function returns, or before the frame an inlined callee took is popped, is removed, such as the copies the C ABI makes of struct arguments and results once inlining has forwarded them (`cbench/structval` takes 0.54× its `-O2` time at `-O3`). wasm keeps those stores, so a program that reads stack memory it never wrote can see other bytes. A module whose stack is not C's -- Go's, an asyncify one, or one where a function reads above the stack pointer it was entered with -- is left as it is, and a call that may reach a function scanning its callers' frames, as a collector does, reads the whole frame |
+| `acc-tail` | off below `-O3`: a function of at most 64 instructions whose result is, one way, its own call's result added, multiplied, and'ed, or'ed or xor'ed with something else, with nothing but pure work after the call, loops with an accumulator, as LLVM's tail-call elimination does: a tree walk's `walk(left) + walk(right)` makes one call a level, a sum or a factorial none (`ktbench/bintree` takes 0.93× its time without it). A recursion that never ends then loops for ever, where wasm runs out of stack and traps -- the spec's `fac.wast` asserts that trap, and Java's `StackOverflowError` is one programs catch -- so it is not at `-O2`, and `-fexact-trap` turns it off |
 | `mulwide` | a 64-by-64 multiply that wasm spells in 32-bit halves -- `__multi3` from Rust, C and Zig, Go's `bits.Mul64` -- becomes one `mul` for the low half and `umulh`, or `smulh` for sign-extended operands, for the high |
-| `ifconv` | if-conversion: a diamond or triangle whose arms are cheap and cannot trap becomes selects (`csel`), as do the leaves of the compare tree a small `br_table` becomes. (That tree, its default dropped where the index is provably in range, is made from `-O1` whatever the flags.) |
+| `ifconv` | if-conversion: a diamond or triangle whose arms are cheap and cannot trap becomes selects (`csel`), as do the leaves of the compare tree a small `br_table` becomes, unless a select would wait on its condition much longer than on the values it picks, as a guessed branch would not -- except, in a loop, a test of one bit of a value the loop computes, which a branch guesses wrong half the time when the bits are hashed (hsbench/bits). (That tree, its default dropped where the index is provably in range, is made from `-O1` whatever the flags.) |
 | `thread` | jump threading through a block that only switches on a parameter, such as the dispatch Go's compiler puts around every function, or only compares one with a constant, when an edge passes that parameter a constant; and through a block that only tests a value against constants -- a branch on it, on its compare with one, or on the value plus or minus one, or a `br_table` on it -- when the branches an edge took on its way there, up through blocks each entered from one edge, have decided the test: equal or not, unsigned and signed ranges, a `br_table`'s case or default, also for a parameter the edge passes a compare the way decides, and through a block that only passes its parameters on. Not into a loop's header. A parameter every edge passes one compare -- itself, or a constant its way shows it to be -- is that compare, made again. TinyGo's switch on strings (`gobench/strswitch`) tests in every case a length an earlier case's test has already fixed, and keeps those tests in the locals LLVM's wasm back end adds when it lays control flow out as nested blocks |
 | `nodesplit` | copy the part of a loop that a switch outside it enters in the middle, so that the loop has one way in again and the loop passes can take it |
 | `mem` | store-to-load forwarding, also of bytes stored as one type and loaded as another, and dead-store removal, also of a store of the value the slot already holds and of a `global.set` a later one in the block overwrites, using per-function effect summaries |
@@ -1377,7 +1382,18 @@ one, is an `mla` or `mls` into it, in lanes of 8, 16 or 32 bits, but not
 into a value a loop carries round, where the multiply would join the chain
 each iteration waits on. A float splat only vector multiplies in its block
 read is no `dup`: each multiply reads the scalar's register by lane, `fmul`
-by element. From `-O1` a `br_table` of at most eight distinct
+by element. An `i8x16.shuffle` is the cheapest sequence found for its
+lanes: on arm64 one permute (`dup`, `rev`, `ext`, `zip`, `uzp`, `trn`), a
+base with up to four lanes put in by `ins`, or two permutes, else a table
+lookup (`tbl` of one register or two); on x86-64 one or two of `pshufd`,
+`pshuflw`/`pshufhw`, `shufps`, `unpck`, `palignr`, `pblendw`/`pblendd` and
+`insertps`, else `pshufb` -- and an index vector only a lookup would read is
+not made. A limb of a multi-word add as GMP's generic C writes it, `s = u +
+v`, `r = s + cin`, carry out `(s < u) | (r < s)`, is one `adcs` on arm64,
+and a subtract's one `sbcs`; the next limb finds its carry in the flag
+still, so a chain of limbs is a chain of `adcs`, a cycle each, with a
+`cset` beside each for the carry's register (hsbench/integer).
+From `-O1` a `br_table` of at most eight distinct
 edges becomes a tree of compares, and any other a jump table, whose entries
 on arm64 are halfwords, each its target's distance in instructions; a
 function too large for that reach, 128 KB, is made again with its tables of
@@ -1651,13 +1667,16 @@ count).
 
 At `-O3` warmc's code takes **0.44×** wasmtime's time (0.443) and **1.01×**
 the native time, 0.991 of its time at `-O2`, over the same 364 and 300
-kernels. The gains are where the two passes `-O3` adds have something to do:
+kernels. The gains are where the passes `-O3` adds have something to do:
 - `dead-frames` removes the stores into C frames that nothing reads again:
   `cbench/structval` takes 0.54× its `-O2` time.
 - `fma` fuses float multiplies into the adds that read them:
   `vecbench/horner` takes 0.63×, `rsbench/f32ops` 0.66×, `asbench/mathfn`
   0.77×, `asbench/stencil` 0.78×, `javabench/alloc` 0.80× and `cbench/nbody`
   0.84×.
+- `acc-tail`, which these figures predate, makes accumulating recursions
+  loops: `ktbench/bintree` takes 0.93× its time without it,
+  `asbench/recurse` 0.96×.
 
 167 of the 364 kernels compile to the same code at both levels, most of
 `gobench`, `vecbench`, `rsbench`, `zigbench`, `ktbench` and `javabench`.
