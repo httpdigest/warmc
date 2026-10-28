@@ -85,8 +85,10 @@ Hello world!
   - rewrites of what particular producers emit: GHC's trampoline becomes tail
     calls, and Go's stack pointer travels in registers
   - at `-O3`, also fused multiply-adds, the removal of stores into C
-    frames that nothing reads again, and small recursions that accumulate
-    their calls' results made loops, which wasm's semantics do not allow
+    frames that nothing reads again, small recursions that accumulate
+    their calls' results made loops, float sums and products taken in
+    vector lanes, and address adds taken as if they did not wrap, which
+    wasm's semantics do not allow
 
   Functions compile in parallel and are laid out in a deterministic order.
 - **Fast code.** Across 364 benchmark kernels compiled from Go, TinyGo, Rust,
@@ -1119,7 +1121,7 @@ are parsed but not enforced.
 
 | Level | What it does |
 |---|---|
-| `-O3` | everything `-O2` does, and the passes that change what a program can see: `fma`, `dead-frames` and `acc-tail` (below). Every optimisation warmc has, for code that does not depend on wasm's exact float rounding, on reading stack memory it never wrote, or on a recursion that never ends running out of stack |
+| `-O3` | everything `-O2` does, and the passes that change what a program can see: `fma`, `dead-frames`, `acc-tail`, `float-reassoc` and `addr-nowrap` (below). Every optimisation warmc has, for code that does not depend on wasm's exact float rounding and order, on reading stack memory it never wrote, on a recursion that never ends running out of stack, or on an address that wraps round the top of its memory |
 | `-O2` (default) | the full pipeline: what `-O1` does, plus inlining, devirtualisation, unrolling, `gcpure`, and guard-page memory (which also enables the vectoriser, native-pointer caching and load combining) |
 | `-O1` | the optimising pipeline without guard pages, inlining, devirtualisation, unrolling or `gcpure` |
 | `-O0` | skips the IR optimiser. Register allocation, module reachability (`reach`), `prune`, `merge`, the `call_indirect` code tables (`ictab`) and constant pools (`cpool`) still run. |
@@ -1144,6 +1146,8 @@ and `ldcomb` need `guard-pages`; `small-loop-align` needs `align`; and
 | `fma` | off below `-O3`: a float multiply whose one reader is an add or a subtract becomes one fused multiply-add (`fmadd`, `fmla`; `vfmadd` on x86-64), rounded once. Not where the add is what a loop carries round and the multiply is not, as in a dot product, which runs a third slower fused, nor for a vector `a*b - c`. wasm rounds the multiply and the add each, so a result can differ in its last bit; `-ffma` is for code that does not depend on that, as native C compilers assume by default |
 | `dead-frames` | off below `-O3`: assumes C's stack, where nothing reads a function's frame once it returns, and while it runs only the function and the callees it passes pointers into it; a store into the frame that nothing can read before the function returns, or before the frame an inlined callee took is popped, is removed, such as the copies the C ABI makes of struct arguments and results once inlining has forwarded them (`cbench/structval` takes 0.54× its `-O2` time at `-O3`). wasm keeps those stores, so a program that reads stack memory it never wrote can see other bytes. A module whose stack is not C's -- Go's, an asyncify one, or one where a function reads above the stack pointer it was entered with -- is left as it is, and a call that may reach a function scanning its callers' frames, as a collector does, reads the whole frame |
 | `acc-tail` | off below `-O3`: a function of at most 64 instructions whose result is, one way, its own call's result added, multiplied, and'ed, or'ed or xor'ed with something else, with nothing but pure work after the call, loops with an accumulator, as LLVM's tail-call elimination does: a tree walk's `walk(left) + walk(right)` makes one call a level, a sum or a factorial none (`ktbench/bintree` takes 0.93× its time without it). A recursion that never ends then loops for ever, where wasm runs out of stack and traps -- the spec's `fac.wast` asserts that trap, and Java's `StackOverflowError` is one programs catch -- so it is not at `-O2`, and `-fexact-trap` turns it off |
+| `float-reassoc` | off below `-O3`: a float sum or product a loop carries round is taken in another order than wasm's -- in vector lanes, each a partial result from -0 (a product's from 1), the lanes added (multiplied) onto the value the loop came in with at its end; several such accumulators where the vectoriser makes copies of the body -- and float add and multiply chains are rebalanced as integer ones are, the carried value added last. Each step is still rounded, but in another order, so a result can differ in its last bits. At `-O3` against `-O3` without it, the 51 kernels whose code it changes take 0.92× the time: `vecbench/f32red` 0.10×, `gobench/dot` 0.28×, `cppbench/crtp` 0.83×, `zigbench/matrix` 0.91×, `stdgo/generics` 0.91×, `asbench/mathf` 0.93×; `cbench/nbody` 1.02×, a value more spilled where its velocity sums, unrolled, became two terms' sum and then the carried add |
+| `addr-nowrap` | off below `-O3`: an access at `x + c`, `x` the C stack pointer or an address made from it, `c` a positive constant whose sum with the access's offset is under 64 KiB, is the access at `x` with `c` in its offset, the add taken in 64 bits where wasm's wraps in 32; and to the memory pass any `x + c` at offset `k` is `x` at offset `k + c`, with no access at `x` before to show that the add did not wrap. An out-param an inlined callee writes through the pointer its caller handed it, `sp + 16`, is then the slot the caller reads at `sp` offset 16, forwarded and dropped: at `-O3` against `-O3` without it, the 193 kernels whose code it changes take 0.996× the time, `rsbench/wide128` 0.76×, `cbench/int128` 0.81×, `cbench/structval` 0.89×, `gobench/arrays` 0.89×. Where wasm's address would wrap round to the bottom of memory, a frame's access runs past the top, into the guard region or past an explicit check's bound, and traps, never below the memory's base or past its guard; and a load can read what a store to the wrapped address wrote where wasm's load traps. The stack pointer is the global `dead-frames`' scan finds frames taken from. Other addresses keep their adds, which the vectoriser and the unroller read them by: taken apart, an array's or a loop's make `vecbench/search` 2.8× as slow |
 | `mulwide` | a 64-by-64 multiply that wasm spells in 32-bit halves -- `__multi3` from Rust, C and Zig, Go's `bits.Mul64` -- becomes one `mul` for the low half and `umulh`, or `smulh` for sign-extended operands, for the high |
 | `ifconv` | if-conversion: a diamond or triangle whose arms are cheap and cannot trap becomes selects (`csel`), as do the leaves of the compare tree a small `br_table` becomes, unless a select would wait on its condition much longer than on the values it picks, as a guessed branch would not -- except, in a loop, a test of one bit of a value the loop computes, which a branch guesses wrong half the time when the bits are hashed (hsbench/bits). (That tree, its default dropped where the index is provably in range, is made from `-O1` whatever the flags.) |
 | `thread` | jump threading through a block that only switches on a parameter, such as the dispatch Go's compiler puts around every function, or only compares one with a constant, when an edge passes that parameter a constant; and through a block that only tests a value against constants -- a branch on it, on its compare with one, or on the value plus or minus one, or a `br_table` on it -- when the branches an edge took on its way there, up through blocks each entered from one edge, have decided the test: equal or not, unsigned and signed ranges, a `br_table`'s case or default, also for a parameter the edge passes a compare the way decides, and through a block that only passes its parameters on. Not into a loop's header. A parameter every edge passes one compare -- itself, or a constant its way shows it to be -- is that compare, made again. TinyGo's switch on strings (`gobench/strswitch`) tests in every case a length an earlier case's test has already fixed, and keeps those tests in the locals LLVM's wasm back end adds when it lays control flow out as nested blocks |
@@ -1674,9 +1678,12 @@ kernels. The gains are where the passes `-O3` adds have something to do:
   `vecbench/horner` takes 0.63×, `rsbench/f32ops` 0.66×, `asbench/mathfn`
   0.77×, `asbench/stencil` 0.78×, `javabench/alloc` 0.80× and `cbench/nbody`
   0.84×.
-- `acc-tail`, which these figures predate, makes accumulating recursions
-  loops: `ktbench/bintree` takes 0.93× its time without it,
-  `asbench/recurse` 0.96×.
+- `acc-tail`, `float-reassoc` and `addr-nowrap`, which these figures
+  predate: an accumulating recursion a loop (`ktbench/bintree` takes 0.93×
+  its time without it, `asbench/recurse` 0.96×), float reductions in vector
+  lanes (`vecbench/f32red` 0.10×, `gobench/dot` 0.28×), and out-params read
+  back from the frame forwarded (`rsbench/wide128` 0.76×, `cbench/int128`
+  0.81×).
 
 167 of the 364 kernels compile to the same code at both levels, most of
 `gobench`, `vecbench`, `rsbench`, `zigbench`, `ktbench` and `javabench`.
