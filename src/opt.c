@@ -19686,6 +19686,440 @@ static bool pass_vectorize(IrFunc *f, bool exact) {
   return changed;
 }
 
+/* ---- straight-line vectors -----------------------------------------------
+
+   A block's stores to adjacent addresses, as many as fill a vector, whose
+   values are alike lane by lane -- one operation of operands themselves
+   alike: loads of adjacent addresses, one value in every lane, constants
+   -- are one vector computation and one vector store.  C++'s
+   Rect::scale(k), w *= k; h *= k, is a vector load, a multiply by k in
+   both lanes and a vector store, where it was two of each (cppbench/virtual,
+   which clang -O2 compiles so); Rust's const-generic matrices fill and copy
+   their rows two doubles at a time.
+
+   The vector loads go where the first of their lanes' loads was, the
+   computation and the store where the last store was: no store between a
+   load's old place and its new may write what it reads, nor any load or
+   store between a store's old place and its new read or write what it
+   writes, and nothing else with an effect may stand in either span.  Only
+   where the vector takes fewer instructions than the scalars it replaces,
+   and, as the loop vectoriser, only with guard pages and not under
+   -fexact-trap, where a vector's trap would come before stores the scalars
+   made first. */
+#define SLP_MAX_NODES 24
+#define SLP_DEPTH 6
+enum { SLP_LOAD, SLP_SPLAT, SLP_CONST, SLP_OP };
+
+typedef struct {
+  uint8_t kind;
+  uint16_t vop;
+  int arg[2];
+  Ref lane[4];
+  Ref val;
+} SlpNode;
+
+typedef struct {
+  IrFunc *f;
+  const uint32_t *uses;
+  const uint32_t *pos;
+  uint32_t k, vlane;
+  ValType t;
+  SlpNode n[SLP_MAX_NODES];
+  uint32_t nn;
+  int saved;
+} Slp;
+
+static uint16_t slp_vop(uint16_t op, ValType t, bool *comm) {
+  bool fl = vt_is_float(t);
+  *comm = true;
+  switch (op) {
+    case I_ADD: return fl ? 0 : I_VADD;
+    case I_AND: return fl ? 0 : I_VAND;
+    case I_OR:  return fl ? 0 : I_VOR;
+    case I_XOR: return fl ? 0 : I_VXOR;
+    case I_MUL: return t == VT_I32 ? I_VMUL : 0;
+    case I_FADD: return fl ? I_VFADD : 0;
+    case I_FMUL: return fl ? I_VFMUL : 0;
+    case I_FMIN: return fl ? I_VFMIN : 0;
+    case I_FMAX: return fl ? I_VFMAX : 0;
+    default: break;
+  }
+  *comm = false;
+  switch (op) {
+    case I_SUB: return fl ? 0 : I_VSUB;
+    case I_FSUB: return fl ? I_VFSUB : 0;
+    case I_FDIV: return fl ? I_VFDIV : 0;
+    default: return 0;
+  }
+}
+
+/* Whether x could stand in lane j beside x0 in lane 0: the same value, the
+   load j lanes on from x0's, or the same operation with an operand that
+   fits x0's first, depth levels down */
+static bool slp_fits(const Slp *S, Ref x, Ref x0, uint32_t j, int depth) {
+  IrFunc *f = S->f;
+  const Inst *a = &f->insts[x], *b = &f->insts[x0];
+  if (x == x0) return true;
+  if (a->op != b->op) return false;
+  if (a->op == I_LOAD)
+    return ir_args(f, x)[0] == ir_args(f, x0)[0] && a->imm2 == b->imm2 &&
+           a->imm == b->imm + ((uint64_t)j << MEMF_SIZE(b->imm2));
+  if (depth == 0 || !a->nargs) return true;
+  for (uint32_t i = 0; i < a->nargs; i++)
+    if (slp_fits(S, ir_args(f, x)[i], ir_args(f, x0)[0], j, depth - 1)) return true;
+  return false;
+}
+
+/* The node for lanes l, built and counted; -1 where they are not alike */
+static int slp_tree(Slp *S, const Ref *l, int depth) {
+  IrFunc *f = S->f;
+  uint32_t k = S->k;
+  for (uint32_t i = 0; i < S->nn; i++) {
+    bool same = true;
+    for (uint32_t j = 0; j < k && same; j++) same = S->n[i].lane[j] == l[j];
+    if (same) return (int)i;
+  }
+  if (depth == 0 || S->nn == SLP_MAX_NODES) return -1;
+  SlpNode *nd = &S->n[S->nn];
+  memset(nd, 0, sizeof *nd);
+  memcpy(nd->lane, l, k * sizeof(Ref));
+  nd->val = REF_NONE;
+  bool uniform = true, consts = true;
+  for (uint32_t j = 0; j < k; j++) {
+    if (l[j] != l[0]) uniform = false;
+    if (f->insts[l[j]].op != I_CONST) consts = false;
+  }
+  if (uniform || consts) {
+    nd->kind = consts ? SLP_CONST : SLP_SPLAT;
+    S->saved -= 1;
+    return (int)S->nn++;
+  }
+  const Inst *i0 = &f->insts[l[0]];
+  bool same_op = true;
+  for (uint32_t j = 1; j < k; j++)
+    if (f->insts[l[j]].op != i0->op) same_op = false;
+  if (!same_op) return -1;
+  if (i0->op == I_LOAD) {
+    uint32_t sz = MEMF_SIZE(i0->imm2);
+    if ((1u << sz) * k != 16) return -1;
+    Ref ptr = ir_args(f, l[0])[0];
+    for (uint32_t j = 0; j < k; j++) {
+      const Inst *ij = &f->insts[l[j]];
+      if (ir_args(f, l[j])[0] != ptr || ij->imm2 != i0->imm2 ||
+          ij->imm != i0->imm + ((uint64_t)j << sz) || S->pos[l[j]] == UINT32_MAX)
+        return -1;
+      if (S->uses[l[j]] == 1) S->saved += 1;
+    }
+    nd->kind = SLP_LOAD;
+    S->saved -= 1;
+    return (int)S->nn++;
+  }
+  bool comm;
+  uint16_t vop = slp_vop(i0->op, S->t, &comm);
+  if (!vop) return -1;
+  /* the scalar ops go, so nothing else may read them */
+  for (uint32_t j = 0; j < k; j++)
+    if (S->uses[l[j]] != 1) return -1;
+  uint32_t me = S->nn++;
+  int saved0 = S->saved;
+  S->saved += (int)k - 1;
+  Ref a[2][4];
+  for (int swap = 0; swap < (comm ? 2 : 1); swap++) {
+    for (uint32_t j = 0; j < k; j++) {
+      Ref *aj = ir_args(f, l[j]);
+      /* swapped: a lane whose first operand does not fit lane 0's */
+      bool sw = swap && j > 0 && !slp_fits(S, aj[0], a[0][0], j, 1);
+      a[0][j] = aj[sw ? 1 : 0];
+      a[1][j] = aj[sw ? 0 : 1];
+    }
+    uint32_t nn0 = S->nn;
+    int x = slp_tree(S, a[0], depth - 1);
+    int y = x < 0 ? -1 : slp_tree(S, a[1], depth - 1);
+    if (x >= 0 && y >= 0) {
+      S->n[me].kind = SLP_OP;
+      S->n[me].vop = vop;
+      S->n[me].arg[0] = x;
+      S->n[me].arg[1] = y;
+      return (int)me;
+    }
+    S->nn = nn0;
+    S->saved = saved0 + (int)k - 1;
+  }
+  S->nn = me;
+  S->saved = saved0;
+  return -1;
+}
+
+/* What crosses from one place in block b to another: nothing with an
+   effect but loads and stores, and those only where they cannot touch
+   [addr + imm, + 1 << size) the way that matters -- a store moving down
+   past a load or a store, a load moving up past a store. */
+static bool slp_cross(IrFunc *f, const Block *b, uint32_t from, uint32_t to, Ref addr,
+                      uint64_t imm, uint32_t size, uint32_t mem, bool store,
+                      const uint8_t *skip) {
+  for (uint32_t q = from; q < to; q++) {
+    Ref r = b->insts[q];
+    const Inst *in = &f->insts[r];
+    if (skip[q]) continue;
+    if (in->op == I_LOAD || in->op == I_STORE) {
+      if (in->op == I_LOAD && !store) continue;
+      Ref *a = ir_args(f, r);
+      if (may_alias(f, addr, imm, size, mem, a[0], in->imm, MEMF_SIZE(in->imm2),
+                    MEMF_MEM(in->imm2)))
+        return false;
+      continue;
+    }
+    /* a vector loop's loads, which ir_has_no_effect passes */
+    if ((in->op == I_VLOAD || in->op == I_VLDN) && store) return false;
+    if (!ir_has_no_effect(in)) return false;
+  }
+  return true;
+}
+
+static Ref slp_emit(Slp *S, uint32_t bi, uint32_t *at, int i) {
+  IrFunc *f = S->f;
+  SlpNode *nd = &S->n[i];
+  if (nd->val != REF_NONE) return nd->val;
+  switch (nd->kind) {
+    case SLP_SPLAT:
+      nd->val = emit_before(f, bi, at, I_VSPLAT, VT_V128, &nd->lane[0], 1, 0);
+      break;
+    case SLP_CONST: {
+      uint64_t w[2] = { 0, 0 };
+      uint32_t bits = 128 / S->k;
+      for (uint32_t j = 0; j < S->k; j++) {
+        uint64_t v = f->insts[nd->lane[j]].imm;
+        if (bits < 64) v &= ((uint64_t)1 << bits) - 1;
+        w[(j * bits) / 64] |= v << ((j * bits) % 64);
+      }
+      nd->val = emit_before(f, bi, at, I_CONST, VT_V128, NULL, 0, w[0]);
+      f->insts[nd->val].imm2 = w[1];
+      return nd->val;
+    }
+    case SLP_OP: {
+      Ref x = slp_emit(S, bi, at, nd->arg[0]);
+      Ref y = slp_emit(S, bi, at, nd->arg[1]);
+      Ref a[2] = { x, y };
+      nd->val = emit_before(f, bi, at, nd->vop, VT_V128, a, 2, 0);
+      break;
+    }
+    default: return REF_NONE;
+  }
+  f->insts[nd->val].imm2 = S->vlane;
+  return nd->val;
+}
+
+/* A store a group can take a lane of, in the block's index of them */
+typedef struct { Ref ptr, st; uint64_t imm; uint32_t sz, pos; } SlpStore;
+
+static int slp_store_cmp(const void *x, const void *y) {
+  const SlpStore *a = x, *b = y;
+  if (a->ptr != b->ptr) return a->ptr < b->ptr ? -1 : 1;
+  if (a->sz != b->sz) return a->sz < b->sz ? -1 : 1;
+  if (a->imm != b->imm) return a->imm < b->imm ? -1 : 1;
+  return a->pos < b->pos ? -1 : a->pos > b->pos;
+}
+
+/* A group found able to go, and where its code is: from its first vector
+   load or store to its last store */
+typedef struct {
+  Slp S;
+  int root;
+  Ref st[4], ptr;
+  uint32_t lo, last;
+  uint32_t lfirst[SLP_MAX_NODES];
+} SlpGroup;
+
+#define SLPREJ(w) do { if (dbg) fprintf(stderr, "slp %s b%u v%u reject: %s\n", \
+    f->m->funcs[f->func_index].sym, bi, s0, w); } while (0)
+
+/* The groups of block bi with the block as it is: a group each, where its
+   lanes' stores are found by the index, in the order of their addresses;
+   *again where one was left for its code crossing another's */
+static uint32_t slp_find(IrFunc *f, uint32_t bi, const uint32_t *uses, const uint32_t *pos,
+                         uint8_t *skip, SlpGroup **out, uint32_t *cap, bool *again, bool dbg) {
+  Block *b = &f->blocks[bi];
+  SlpStore *ix = xmalloc((b->ninsts ? b->ninsts : 1) * sizeof(SlpStore));
+  uint32_t nix = 0, ng = 0;
+  for (uint32_t i = 0; i < b->ninsts; i++) {
+    Ref r = b->insts[i];
+    const Inst *in = &f->insts[r];
+    if (in->op != I_STORE) continue;
+    ValType t = (ValType)f->insts[ir_args(f, r)[1]].type;
+    uint32_t sz = MEMF_SIZE(in->imm2);
+    if ((t != VT_I32 && t != VT_I64 && t != VT_F32 && t != VT_F64) ||
+        (1u << sz) != (vt_is_64(t) ? 8u : 4u))
+      continue;
+    ix[nix++] = (SlpStore){ ir_args(f, r)[0], r, in->imm, sz, i };
+  }
+  qsort(ix, nix, sizeof *ix, slp_store_cmp);
+  for (uint32_t e = 0; e < nix; e++) {
+    Ref s0 = ix[e].st, ptr = ix[e].ptr;
+    uint32_t sz = ix[e].sz, k = 16u >> sz;
+    /* lane 0 the lowest address: lanes 1.. the stores after it in the
+       index, one at each of the addresses after its */
+    if (e + k > nix) continue;
+    uint32_t found = 1;
+    for (uint32_t j = 1; j < k && found == j; j++)
+      if (ix[e + j].ptr == ptr && ix[e + j].sz == sz &&
+          ix[e + j].imm == ix[e].imm + ((uint64_t)j << sz))
+        found++;
+    /* two stores to one address leave one of them crossing the other, which
+       the store's check below refuses */
+    if (found != k) {
+      if (found > 1) SLPREJ("stores do not fill a vector");
+      continue;
+    }
+    ValType t = (ValType)f->insts[ir_args(f, s0)[1]].type;
+    Slp S = { .f = f, .uses = uses, .pos = pos, .k = k, .t = t,
+              .vlane = vt_is_float(t) ? (t == VT_F32 ? VLANE_F32 : VLANE_F64)
+                                      : (t == VT_I32 ? VLANE_I32 : VLANE_I64) };
+    Ref st[4], vals[4];
+    uint32_t last = 0, lo = UINT32_MAX;
+    for (uint32_t j = 0; j < k; j++) {
+      st[j] = ix[e + j].st;
+      vals[j] = ir_args(f, st[j])[1];
+      if (pos[st[j]] > last) last = pos[st[j]];
+      if (pos[st[j]] < lo) lo = pos[st[j]];
+    }
+    S.saved = (int)k - 1;
+    int root = slp_tree(&S, vals, SLP_DEPTH);
+    if (root < 0) { SLPREJ("lanes are not alike"); continue; }
+    if (S.saved <= 0) { SLPREJ("no fewer instructions"); continue; }
+    /* the group's own stores skipped in the checks: a lane's load after
+       one of them is a pair the store's check meets, moving down past it
+       to the last */
+    for (uint32_t j = 0; j < k; j++) skip[pos[st[j]]] = 1;
+    bool ok = true;
+    uint32_t lfirst[SLP_MAX_NODES];
+    for (uint32_t n = 0; n < S.nn && ok; n++) {
+      if (S.n[n].kind != SLP_LOAD) continue;
+      uint32_t l0 = UINT32_MAX;
+      for (uint32_t j = 0; j < k; j++) if (pos[S.n[n].lane[j]] < l0) l0 = pos[S.n[n].lane[j]];
+      lfirst[n] = l0;
+      if (l0 < lo) lo = l0;
+      Ref la = ir_args(f, S.n[n].lane[0])[0];
+      /* a load up past a store: no store between may write it */
+      for (uint32_t j = 0; j < k && ok; j++) {
+        const Inst *lj = &f->insts[S.n[n].lane[j]];
+        ok = slp_cross(f, b, l0 + 1, pos[S.n[n].lane[j]], la, lj->imm, MEMF_SIZE(lj->imm2),
+                       MEMF_MEM(lj->imm2), false, skip);
+      }
+    }
+    /* a store down past what reads or writes it; every vector load comes
+       before it, as each of its lanes' loads came before that lane's store */
+    for (uint32_t j = 0; j < k && ok; j++) {
+      const Inst *sj = &f->insts[st[j]];
+      ok = slp_cross(f, b, pos[st[j]] + 1, last, ptr, sj->imm, sz, MEMF_MEM(sj->imm2),
+                     true, skip);
+    }
+    for (uint32_t j = 0; j < k; j++) skip[pos[st[j]]] = 0;
+    if (!ok) { SLPREJ("a load or store would move past what it may touch"); continue; }
+    /* one whose code crosses another's waits for the next round, where the
+       block is as that one left it */
+    bool clash = false;
+    for (uint32_t g = 0; g < ng && !clash; g++)
+      clash = lo <= (*out)[g].last && (*out)[g].lo <= last;
+    if (clash) { *again = true; continue; }
+    if (ng == *cap) { *cap = *cap ? *cap * 2 : 8; *out = xrealloc(*out, *cap * sizeof **out); }
+    SlpGroup *G = &(*out)[ng++];
+    G->S = S;
+    G->root = root;
+    memcpy(G->st, st, sizeof st);
+    G->ptr = ptr;
+    G->lo = lo;
+    G->last = last;
+    memcpy(G->lfirst, lfirst, sizeof lfirst);
+    /* the group's stores are no other group's lane 0 */
+    e += k - 1;
+  }
+  xfree(ix);
+  return ng;
+}
+
+/* Group G made: its vector loads where their first lanes' loads were, latest
+   first so that the places of the others hold, its computation and store
+   where its last store was */
+static void slp_make(IrFunc *f, uint32_t bi, SlpGroup *G, const uint32_t *uses) {
+  Slp *S = &G->S;
+  uint32_t k = S->k;
+  uint32_t ord[SLP_MAX_NODES], nl = 0;
+  for (uint32_t n = 0; n < S->nn; n++) if (S->n[n].kind == SLP_LOAD) ord[nl++] = n;
+  for (uint32_t x = 1; x < nl; x++)
+    for (uint32_t y = x; y > 0 && G->lfirst[ord[y]] > G->lfirst[ord[y - 1]]; y--) {
+      uint32_t tmp = ord[y]; ord[y] = ord[y - 1]; ord[y - 1] = tmp;
+    }
+  uint32_t lastp = G->last;
+  for (uint32_t x = 0; x < nl; x++) {
+    SlpNode *nd = &S->n[ord[x]];
+    const Inst *l0 = &f->insts[nd->lane[0]];
+    uint32_t at = G->lfirst[ord[x]];
+    Ref la = ir_args(f, nd->lane[0])[0];
+    uint64_t im = l0->imm, m2 = l0->imm2;
+    nd->val = emit_before(f, bi, &at, I_LOAD, VT_V128, &la, 1, im);
+    f->insts[nd->val].imm2 = MEMF_MK_AT(4, 0, MEMF_MEM(m2)) | (m2 & MEMF_NOCHECK);
+    lastp++;
+    for (uint32_t j = 0; j < k; j++)
+      if (uses[nd->lane[j]] == 1) f->insts[nd->lane[j]].op = I_NOP;
+  }
+  uint32_t at = lastp;
+  Ref v = slp_emit(S, bi, &at, G->root);
+  Ref sa[2] = { G->ptr, v };
+  uint64_t im = f->insts[G->st[0]].imm, m2 = f->insts[G->st[0]].imm2;
+  Ref vs = emit_before(f, bi, &at, I_STORE, (ValType)0, sa, 2, im);
+  f->insts[vs].imm2 = MEMF_MK_AT(4, 0, MEMF_MEM(m2)) | (m2 & MEMF_NOCHECK);
+  for (uint32_t j = 0; j < k; j++) f->insts[G->st[j]].op = I_NOP;
+  for (uint32_t n = 0; n < S->nn; n++)
+    if (S->n[n].kind == SLP_OP)
+      for (uint32_t j = 0; j < k; j++) f->insts[S->n[n].lane[j]].op = I_NOP;
+  g_stats.slp_groups++;
+}
+
+static int slp_group_cmp(const void *x, const void *y) {
+  const SlpGroup *a = x, *b = y;
+  return a->lo < b->lo ? 1 : a->lo > b->lo ? -1 : 0;
+}
+
+static bool pass_slp(IrFunc *f) {
+  bool changed = false;
+  bool dbg = warmc_getenv("WARMC_SLP_DEBUG") != NULL;
+  uint32_t *uses = count_uses(f);
+  uint32_t *pos = xmalloc((f->ninsts ? f->ninsts : 1) * sizeof(uint32_t));
+  for (uint32_t i = 0; i < f->ninsts; i++) pos[i] = UINT32_MAX;
+  SlpGroup *gs = NULL;
+  uint32_t cap = 0;
+  for (uint32_t oi = 0; oi < f->norder; oi++) {
+    uint32_t bi = f->order[oi];
+    for (bool again = true; again;) {
+      again = false;
+      Block *b = &f->blocks[bi];
+      for (uint32_t i = 0; i < b->ninsts; i++) pos[b->insts[i]] = i;
+      uint8_t *skip = xcalloc(b->ninsts ? b->ninsts : 1, 1);
+      uint32_t ng = slp_find(f, bi, uses, pos, skip, &gs, &cap, &again, dbg);
+      xfree(skip);
+      /* latest first: a group's code lies before every later one's */
+      qsort(gs, ng, sizeof *gs, slp_group_cmp);
+      for (uint32_t g = 0; g < ng; g++) slp_make(f, bi, &gs[g], uses);
+      b = &f->blocks[bi];
+      if (!ng) {
+        again = false;
+        for (uint32_t i = 0; i < b->ninsts; i++) pos[b->insts[i]] = UINT32_MAX;
+        continue;
+      }
+      changed = true;
+      /* the counts and places moved: count again */
+      xfree(uses);
+      uses = count_uses(f);
+      if (f->ninsts) pos = xrealloc(pos, f->ninsts * sizeof(uint32_t));
+      for (uint32_t i = 0; i < f->ninsts; i++) pos[i] = UINT32_MAX;
+    }
+  }
+  xfree(gs);
+  xfree(uses);
+  xfree(pos);
+  return changed;
+}
+
 /* ---- scalar loop unroller ------------------------------------------------
 
    Serial-dependence loops the vectorizer rightly refuses (an f32 reduction
@@ -21677,6 +22111,12 @@ void ir_optimize(IrFunc *f, const OptOpts *o) {
     ir_order(f);
     opt_cleanup(f, o);
     ir_verify(f, "post-once-loops");
+  }
+
+  if (o->vectorize && o->guard_pages && !o->exact_trap && TP("slp", pass_slp(f))) {
+    if (o->dce) pass_dce(f);
+    ir_order(f);
+    ir_verify(f, "post-slp");
   }
 
   if (o->strength && TP("postdec_test", pass_postdec_test(f)) && o->dce)

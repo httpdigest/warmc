@@ -40,7 +40,11 @@ static int cc_for(uint16_t op) {
 }
 
 static int vec_base(Isel *s, int p, uint64_t off, uint32_t *disp) {
-  if ((off & 15u) == 0 && (off >> 4) <= 0xfffu) { *disp = (uint32_t)off; return p; }
+  /* ldr q takes a multiple of 16 to 65520, ldur q anything below 256 */
+  if (((off & 15u) == 0 && (off >> 4) <= 0xfffu) || off <= 0xffu) {
+    *disp = (uint32_t)off;
+    return p;
+  }
   if (off <= 0xfffu) a64_add_imm(B, SF64, TMP0, p, (uint32_t)off, 0);
   else { a64_load_imm(B, SF64, TMP0, off); a64_add_reg(B, SF64, TMP0, p, TMP0); }
   *disp = 0;
@@ -1153,7 +1157,10 @@ static void emit_inst(Isel *s, Ref v) {
       if (f->insts[a[0]].op == I_MEM_PTR) {
 
         int p = rd(s, a[0], TMP1);
-        if (fp) a64_fldr_imm(B, size, d, p, (uint32_t)in->imm);
+        uint32_t disp = (uint32_t)in->imm;
+        /* a vector's offset, from straight-line vectors, need not fit ldr q */
+        if (size == 4) p = vec_base(s, p, in->imm, &disp);
+        if (fp) a64_fldr_imm(B, size, d, p, disp);
         else if (sgn) a64_ldrs_imm(B, size, wide, d, p, (uint32_t)in->imm);
         else a64_ldr_imm(B, size, d, p, (uint32_t)in->imm);
         commit(s, v, d);
@@ -1215,7 +1222,9 @@ static void emit_inst(Isel *s, Ref v) {
       }
       if (f->insts[a[0]].op == I_MEM_PTR) {
         int p = rd(s, a[0], TMP1);
-        if (fp) a64_fstr_imm(B, size, val, p, (uint32_t)in->imm);
+        uint32_t disp = (uint32_t)in->imm;
+        if (size == 4) p = vec_base(s, p, in->imm, &disp);
+        if (fp) a64_fstr_imm(B, size, val, p, disp);
         else a64_str_imm(B, size, val, p, (uint32_t)in->imm);
         break;
       }
