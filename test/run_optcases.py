@@ -58,6 +58,10 @@ import sys
 import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+# every compile checks the IR is in SSA form where it verifies it (ir.c
+# ir_verify): a pass that leaves a value read where its definition does not
+# reach can still give every answer right, by the register it happens to get
+VERIFY = dict(os.environ, WARMC_VERIFY_SSA="1")
 sys.path.insert(0, HERE)
 import gen_gosp
 import hostbuild
@@ -174,14 +178,14 @@ def check_all(cases, build, warmc, target, run, tmp):
     def program(level):
         exe = hostbuild.exe(os.path.join(tmp, "all" + level))
         r = subprocess.run([warmc, level] + target + ["-o", exe] + wasms,
-                           capture_output=True, text=True, timeout=600)
+                           capture_output=True, text=True, timeout=600, env=VERIFY)
         if r.returncode == 0:
             return exe, []
         # which case: each alone
         out = []
         for (name, _), wasm in zip(names, wasms):
             r = subprocess.run([warmc, level] + target + ["-c", "-o", exe + ".o", wasm],
-                               capture_output=True, text=True, timeout=120)
+                               capture_output=True, text=True, timeout=120, env=VERIFY)
             if r.returncode:
                 out.append("%s %s: warmc: %s" % (name, level, r.stderr.strip()[:300]))
         return None, out or ["%s: warmc: %s" % (level, r.stderr.strip()[:300])]
@@ -192,7 +196,7 @@ def check_all(cases, build, warmc, target, run, tmp):
         # only instance, which some counts depend on), but never run
         r = subprocess.run([warmc, level] + target + ["--stats", "-o",
                             hostbuild.exe(os.path.join(tmp, "%s%s" % (name, level))), wasm],
-                           capture_output=True, text=True, timeout=120)
+                           capture_output=True, text=True, timeout=120, env=VERIFY)
         got = r.stderr.split()
         out = []
         for w in want:
@@ -249,7 +253,7 @@ def check_all(cases, build, warmc, target, run, tmp):
             for n, flags in enumerate(flag_sets(c)):
                 exe = hostbuild.exe(os.path.join(tmp, "%s.flags%d" % (name, n)))
                 r = subprocess.run([warmc] + flags + target + ["-o", exe, wasm],
-                                   capture_output=True, text=True, timeout=120)
+                                   capture_output=True, text=True, timeout=120, env=VERIFY)
                 label = " ".join(flags)
                 if r.returncode:
                     fails.append("%s %s: warmc: %s" % (name, label, r.stderr.strip()[:300]))

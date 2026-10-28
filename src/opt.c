@@ -6887,15 +6887,17 @@ static void clone_blocks(IrFunc *f, const uint8_t *in, uint32_t nb0, uint32_t ni
 
 /* Values defined in the blocks in[] marks and read anywhere else
    reachable: esc[v] set, slot[v] its index into use[], which lists the
-   blocks reading it.  Returns how many. */
+   blocks reading it.  Returns how many.  With inside, a read in another
+   of the marked blocks counts too, for a copy whose ways out can come back
+   into the original's blocks. */
 static uint32_t escaping_values(IrFunc *f, const uint8_t *in, uint32_t nb0, uint32_t ni0,
-                                uint8_t *esc, uint32_t *slot, TdVec **use) {
+                                bool inside, uint8_t *esc, uint32_t *slot, TdVec **use) {
   uint32_t n = 0;
   TdVec *u = NULL;
 #define EV_READ(r) do {                                                       \
     Ref r_ = (r);                                                             \
     if (r_ != REF_NONE && r_ < ni0 && f->insts[r_].block < nb0 &&             \
-        in[f->insts[r_].block]) {                                             \
+        in[f->insts[r_].block] && f->insts[r_].block != x) {                  \
       if (!esc[r_]) {                                                         \
         esc[r_] = 1; slot[r_] = n++;                                          \
         u = xrealloc(u, n * sizeof(TdVec));                                   \
@@ -6907,7 +6909,7 @@ static uint32_t escaping_values(IrFunc *f, const uint8_t *in, uint32_t nb0, uint
   } while (0)
   for (uint32_t x = 0; x < nb0; x++) {
     Block *xb = &f->blocks[x];
-    if (in[x] || !xb->reachable) continue;
+    if ((in[x] && !inside) || !xb->reachable) continue;
     for (uint32_t i = 0; i < xb->ninsts; i++) {
       const Ref *a = ir_args(f, xb->insts[i]);
       for (uint32_t q = 0; q < f->insts[xb->insts[i]].nargs; q++) EV_READ(a[q]);
@@ -7099,7 +7101,7 @@ static bool pass_nodesplit(IrFunc *f) {
   if (any) {
     esc = xcalloc(ni0 ? ni0 : 1, 1);
     eslot = xmalloc((ni0 ? ni0 : 1) * sizeof(uint32_t));
-    nesc = escaping_values(f, inR, nb0, ni0, esc, eslot, &euse);
+    nesc = escaping_values(f, inR, nb0, ni0, false, esc, eslot, &euse);
     for (uint32_t v = 0; v < ni0 && any; v++)
       if (esc[v] && !td_numeric((ValType)f->insts[v].type)) any = false;
   }
@@ -7136,6 +7138,318 @@ static bool pass_nodesplit(IrFunc *f) {
   prune_params(f);
   ir_order(f);
   return true;
+}
+
+/* ---- a region split on a value the way in fixes ------------------------
+
+   Below an edge along whose way the branches taken fix a value -- the
+   length a switch on strings dispatched on, a case of a switch -- the code
+   that tests that value again gets a copy of its own, in which the value is
+   the constant: every later test of it is decided, and so is every flag a
+   merge hands on that those tests made, which the threading above, one
+   block past one merge at a time, cannot see through.  TinyGo's switch on
+   strings tests the length once to pick the first case of each length;
+   every case whose bytes differ falls through to the next case's test of a
+   length the first test fixed, and to tests of the flags its earlier tests
+   left in locals (gobench/strswitch).  Each length's copy keeps only that
+   length's cases, as LLVM's jump threading leaves them.
+
+   The copy is what a walk from the edge reaches with the value fixed,
+   following only the way each test of it goes, forward, along no back edge
+   and into no loop, and only the blocks that go on to another test of it: a
+   block that tests nothing more is where the copy rejoins the original.
+   Not unless the walk decides KS_DECIDED tests or more and keeps at most
+   KS_COPY instructions, nor once the function, its copies folded, is
+   KS_GROW times the size it was.  The value is one KS_TESTS tests or more
+   branch on. */
+#define KS_TESTS 4
+#define KS_DECIDED 2
+#define KS_COPY 1024
+#define KS_CONSTS 16
+#define KS_SAME 2
+#define KS_GROW 2
+
+static bool is_call_op(uint16_t op);
+
+/* the value B's branch tests, less what is added to it, or REF_NONE: a
+   compare with a constant, or a switch */
+static Ref ks_key_of(IrFunc *f, uint32_t B) {
+  const Block *b = &f->blocks[B];
+  Ref y;
+  uint64_t k;
+  if (b->term == T_BRIF && b->nsuccs == 2) {
+    const Inst *ci = &f->insts[b->term_arg];
+    if (ci->op == I_EQZ && ci->nargs == 1) y = ir_args(f, b->term_arg)[0];
+    else if (ci->op >= I_EQ && ci->op <= I_GEU && ci->nargs == 2 &&
+             is_const(f, ir_args(f, b->term_arg)[1], &k))
+      y = ir_args(f, b->term_arg)[0];
+    else return REF_NONE;
+  } else if (b->term == T_BRTABLE) {
+    y = b->term_arg;
+  } else {
+    return REF_NONE;
+  }
+  const Inst *yi = &f->insts[y];
+  Ref x = (yi->op == I_ADD || yi->op == I_SUB) && yi->nargs == 2 &&
+          is_const(f, ir_args(f, y)[1], &k) ? ir_args(f, y)[0] : y;
+  ValType t = (ValType)f->insts[x].type;
+  return t == VT_I32 || t == VT_I64 ? x : REF_NONE;
+}
+
+/* what r is where x is k: x plus a constant, or a compare of that with
+   one -- 1 or 0 -- as the constant *c of type *t; false for anything else */
+static bool ks_const_of(IrFunc *f, Ref r, Ref x, uint64_t k, uint64_t mask, uint64_t *c,
+                        ValType *t) {
+  uint64_t d;
+  ValType rt = (ValType)f->insts[r].type;
+  if (rt == (ValType)f->insts[x].type && kt_offset(f, r, x, &d)) {
+    *c = (k + d) & mask;
+    *t = rt;
+    return true;
+  }
+  const Inst *ri = &f->insts[r];
+  bool cmp = (ri->op == I_EQZ && ri->nargs == 1) ||
+             (ri->op >= I_EQ && ri->op <= I_GEU && ri->nargs == 2);
+  KSet yes;
+  if (!cmp || !kt_test(f, r, x, true, mask, &yes)) return false;
+  *c = 0;
+  for (uint32_t i = 0; i < yes.n; i++)
+    if (yes.lo[i] <= k && k <= yes.hi[i]) *c = 1;
+  *t = VT_I32;
+  return true;
+}
+
+/* the way B's test of x goes where x is k */
+static uint32_t ks_way(IrFunc *f, uint32_t B, Ref x, uint64_t k, uint64_t mask) {
+  const Block *b = &f->blocks[B];
+  if (b->term == T_BRIF) {
+    KSet yes;
+    if (!kt_test(f, b->term_arg, x, true, mask, &yes)) return UINT32_MAX;
+    for (uint32_t i = 0; i < yes.n; i++)
+      if (yes.lo[i] <= k && k <= yes.hi[i]) return 0;
+    return 1;
+  }
+  uint64_t d;
+  if (!kt_offset(f, b->term_arg, x, &d)) return UINT32_MAX;
+  uint64_t idx = (k + d) & mask;
+  uint32_t n = b->nsuccs - 1;
+  /* the index is an i32 */
+  return mask == 0xffffffffu && idx < n ? (uint32_t)idx : n;
+}
+
+/* a block a copy can start or go on in: entered by forward edges only --
+   so no loop's header, and the walk below takes no back edge -- neither a
+   landing pad nor one with a call, a throw or an exception's way, which no
+   copy is made of */
+static bool ks_copyable(IrFunc *f, uint32_t y) {
+  const Block *b = &f->blocks[y];
+  if (!b->reachable || b->is_pad || y == f->entry || ir_block_has_eh(f, y)) return false;
+  for (uint32_t p = 0; p < b->npreds; p++)
+    if (f->blocks[b->preds[p]].rpo >= b->rpo) return false;
+  for (uint32_t i = 0; i < b->ninsts; i++) {
+    uint16_t op = f->insts[b->insts[i]].op;
+    if (is_call_op(op) || op == I_RETURN_CALL || op == I_RETURN_CALL_INDIRECT ||
+        op == I_RETURN_CALL_REF || op == I_RESULT || op == I_THROW || op == I_THROW_REF)
+      return false;
+  }
+  for (uint32_t s = 0; s < b->nsuccs; s++)
+    if (b->succs[s].eh) return false;
+  return true;
+}
+
+/* The blocks the copy for x == k below S is made of, marked in keep[],
+   and the way each test of x there goes, in way[]: false where it decides
+   too few tests or keeps too many instructions.  reach[], way[] and
+   stack[] are the function's length, reach[] cleared. */
+static bool ks_region(IrFunc *f, uint32_t S, Ref x, uint64_t k, uint64_t mask,
+                      uint8_t *reach, uint8_t *keep, uint32_t *way, uint32_t *stack,
+                      uint32_t *ninsts) {
+  uint32_t nb = f->nblocks, sp = 0, decided = 0;
+  /* the walk: the blocks reached, at most KS_COPY * 4 instructions of them */
+  uint32_t walked = 0;
+  reach[S] = 2;
+  stack[sp++] = S;
+  bool ok = true;
+  while (sp && ok) {
+    uint32_t y = stack[--sp];
+    const Block *yb = &f->blocks[y];
+    walked += yb->ninsts + 1;
+    if (walked > KS_COPY * 4) { ok = false; break; }
+    uint32_t only = UINT32_MAX;
+    if (ks_key_of(f, y) == x) {
+      only = ks_way(f, y, x, k, mask);
+      if (only == UINT32_MAX) { ok = false; break; }
+      decided++;
+      reach[y] = 3;
+      way[y] = only;
+    }
+    for (uint32_t s = 0; s < yb->nsuccs; s++) {
+      if (only != UINT32_MAX && s != only) continue;
+      uint32_t t = yb->succs[s].target;
+      if (t >= nb || reach[t] || !ks_copyable(f, t)) continue;
+      reach[t] = 2;
+      stack[sp++] = t;
+    }
+  }
+  /* kept: the tests, and what the walk reached that goes on to one */
+  bool changed = true;
+  for (uint32_t x2 = 0; x2 < nb; x2++) if (reach[x2] == 3) keep[x2] = 1;
+  while (changed) {
+    changed = false;
+    for (uint32_t oi = f->norder; oi-- > 0;) {
+      uint32_t y = f->order[oi];
+      if (!reach[y] || keep[y]) continue;
+      const Block *yb = &f->blocks[y];
+      for (uint32_t s = 0; s < yb->nsuccs; s++)
+        if (keep[yb->succs[s].target] && reach[yb->succs[s].target]) {
+          keep[y] = 1; changed = true; break;
+        }
+    }
+  }
+  uint32_t n = 0;
+  for (uint32_t y = 0; y < nb; y++)
+    if (keep[y]) n += f->blocks[y].ninsts + f->blocks[y].nparams;
+  *ninsts = n;
+  return ok && keep[S] && decided >= KS_DECIDED && n <= KS_COPY;
+}
+
+static bool pass_key_split(IrFunc *f) {
+  if (f->npads) return false;
+  ir_order(f);
+  /* the function's size: what is folded away after a copy is not counted */
+  uint32_t live = 0;
+  for (uint32_t oi = 0; oi < f->norder; oi++) live += f->blocks[f->order[oi]].ninsts;
+  if (!f->ks_base) f->ks_base = live;
+  bool any = false;
+  for (int round = 0; round < 64; round++) {
+    uint32_t nb0 = f->nblocks, ni0 = f->ninsts;
+    /* how many branches test each value */
+    uint32_t *tests = xcalloc(ni0 ? ni0 : 1, sizeof(uint32_t));
+    for (uint32_t oi = 0; oi < f->norder; oi++) {
+      Ref x = ks_key_of(f, f->order[oi]);
+      if (x != REF_NONE) tests[x]++;
+    }
+    uint8_t *reach = xcalloc(nb0 ? nb0 : 1, 1), *keep = xcalloc(nb0 ? nb0 : 1, 1);
+    uint32_t *stack = xmalloc((nb0 ? nb0 : 1) * sizeof(uint32_t));
+    uint32_t *way = xmalloc((nb0 ? nb0 : 1) * sizeof(uint32_t));
+    uint32_t P = UINT32_MAX, ps = 0, ncopy = 0;
+    Ref key = REF_NONE;
+    uint64_t kval = 0;
+    for (uint32_t oi = 0; oi < f->norder && P == UINT32_MAX; oi++) {
+      uint32_t pb = f->order[oi];
+      Ref x = ks_key_of(f, pb);
+      if (x == REF_NONE || tests[x] < KS_TESTS) continue;
+      uint64_t mask = f->insts[x].type == VT_I64 ? ~0ull : 0xffffffffu;
+      const Block *b = &f->blocks[pb];
+      for (uint32_t s = 0; s < b->nsuccs; s++) {
+        uint32_t S = b->succs[s].target;
+        /* x made above S, a block that can be copied, and only one value
+           of x on the way in */
+        if (!ks_copyable(f, S) || f->insts[x].block == S ||
+            !dominates(f, f->insts[x].block, S))
+          continue;
+        /* nor where the switch sends many cases to S, each of which would
+           get its copy of the same code: cbench/lexer's switch on a
+           character, 30 of whose cases take one way, ran 3% slower */
+        uint32_t same = 0;
+        for (uint32_t s2 = 0; s2 < b->nsuccs; s2++) same += b->succs[s2].target == S;
+        if (same > KS_SAME) continue;
+        KSet kway;
+        kt_way(f, pb, s, x, mask, &kway);
+        if (kway.n != 1 || kway.lo[0] != kway.hi[0]) continue;
+        memset(reach, 0, nb0);
+        memset(keep, 0, nb0);
+        uint32_t n;
+        if (!ks_region(f, S, x, kway.lo[0], mask, reach, keep, way, stack, &n) ||
+            live + n > KS_GROW * f->ks_base)
+          continue;
+        P = pb; ps = s; key = x; kval = kway.lo[0]; ncopy = n;
+        break;
+      }
+    }
+    xfree(tests); xfree(stack);
+    if (P == UINT32_MAX) { xfree(keep); xfree(reach); xfree(way); break; }
+
+    /* the values the copy defines again that something past it reads */
+    uint8_t *esc = xcalloc(ni0 ? ni0 : 1, 1);
+    uint32_t *eslot = xmalloc((ni0 ? ni0 : 1) * sizeof(uint32_t));
+    TdVec *euse = NULL;
+    uint32_t nesc = escaping_values(f, keep, nb0, ni0, true, esc, eslot, &euse);
+    bool ok = true;
+    for (uint32_t v = 0; v < ni0 && ok; v++)
+      if (esc[v] && !td_numeric((ValType)f->insts[v].type)) ok = false;
+    if (!ok) {
+      for (uint32_t i = 0; i < nesc; i++) xfree(euse[i].v);
+      xfree(esc); xfree(eslot); xfree(euse); xfree(keep); xfree(reach); xfree(way);
+      break;
+    }
+    uint32_t S = f->blocks[P].succs[ps].target;
+    Ref *map = xmalloc(ni0 * sizeof(Ref));
+    uint32_t *bcopy = xmalloc(nb0 * sizeof(uint32_t));
+    clone_blocks(f, keep, nb0, ni0, bcopy, map);
+    /* the key is the constant in the copy, and so is what the copy reads
+       from above it that is made of the key: the key plus a constant, a
+       switch on the length less 4, and a compare of it, a flag the
+       function made at its start */
+    uint32_t at = 0;
+    ValType kt = (ValType)f->insts[key].type;
+    uint64_t kmask = kt == VT_I64 ? ~0ull : 0xffffffffu;
+    Ref kfrom[KS_CONSTS], kto[KS_CONSTS];
+    uint32_t nk = 0;
+#define KS_SUB(r) do {                                                        \
+      Ref r_ = (r);                                                           \
+      uint64_t c_;                                                            \
+      ValType t_;                                                             \
+      if (r_ >= ni0 || !ks_const_of(f, r_, key, kval, kmask, &c_, &t_))      \
+        break;                                                                \
+      uint32_t j_ = 0;                                                        \
+      while (j_ < nk && kfrom[j_] != r_) j_++;                                \
+      if (j_ == nk) {                                                         \
+        if (nk == KS_CONSTS) break;                                           \
+        kfrom[nk] = r_;                                                       \
+        kto[nk++] = emit_before(f, bcopy[S], &at, I_CONST, t_, NULL, 0, c_);  \
+      }                                                                       \
+      (r) = kto[j_];                                                          \
+    } while (0)
+    for (uint32_t y = 0; y < nb0; y++) {
+      if (!keep[y]) continue;
+      Block *cb = &f->blocks[bcopy[y]];
+      for (uint32_t i = 0; i < cb->ninsts; i++) {
+        Ref *a = ir_args(f, cb->insts[i]);
+        for (uint32_t q = 0; q < f->insts[cb->insts[i]].nargs; q++) KS_SUB(a[q]);
+      }
+      if (cb->term == T_BRIF || cb->term == T_BRTABLE) KS_SUB(cb->term_arg);
+      for (uint32_t q = 0; q < cb->nret; q++) KS_SUB(cb->ret_args[q]);
+      for (uint32_t s = 0; s < cb->nsuccs; s++)
+        for (uint32_t q = 0; q < cb->succs[s].nargs; q++) KS_SUB(cb->succs[s].args[q]);
+    }
+#undef KS_SUB
+    /* each test of the key a jump in the copy, the way the walk took */
+    for (uint32_t y = 0; y < nb0; y++) {
+      if (!keep[y] || reach[y] != 3) continue;
+      Block *cb = &f->blocks[bcopy[y]];
+      cb->succs[0] = cb->succs[way[y]];
+      cb->nsuccs = 1;
+      cb->term = T_JUMP;
+      cb->term_arg = REF_NONE;
+    }
+    f->blocks[P].succs[ps].target = bcopy[S];
+    ir_order(f);
+    repair_copies(f, ni0, esc, eslot, euse, bcopy, map);
+    for (uint32_t i = 0; i < nesc; i++) xfree(euse[i].v);
+    xfree(esc); xfree(eslot); xfree(euse); xfree(map); xfree(bcopy);
+    if (warmc_getenv("WARMC_KEYSPLIT_DEBUG"))
+      fprintf(stderr, "keysplit %s b%u->b%u: v%u == %llu, %u instructions\n",
+              f->m->funcs[f->func_index].sym ? f->m->funcs[f->func_index].sym : "?",
+              P, S, key, (unsigned long long)kval, ncopy);
+    xfree(keep); xfree(reach); xfree(way);
+    live += ncopy;
+    g_stats.key_splits++;
+    any = true;
+    ir_order(f);
+  }
+  if (any) prune_params(f);
+  return any;
 }
 
 typedef struct {
@@ -10629,7 +10943,7 @@ static bool once_split_loop(IrFunc *f, uint32_t hb, uint8_t *inloop, uint32_t *s
   uint8_t *esc = xcalloc(ni0 ? ni0 : 1, 1);
   uint32_t *eslot = xmalloc((ni0 ? ni0 : 1) * sizeof(uint32_t));
   TdVec *euse = NULL;
-  uint32_t nesc = escaping_values(f, inloop, nb0, ni0, esc, eslot, &euse);
+  uint32_t nesc = escaping_values(f, inloop, nb0, ni0, false, esc, eslot, &euse);
   bool ok = true;
   for (uint32_t v = 0; v < ni0 && ok; v++)
     if (esc[v] && !td_numeric((ValType)f->insts[v].type)) ok = false;
@@ -22289,6 +22603,7 @@ static void opt_cleanup(IrFunc *f, const OptOpts *o) {
     if (o->throwjump && RUN(0, "throwjump", pass_local_throw(f))) changed = true;
     if (o->fold && RUN(1, "fold", pass_fold(f, o))) changed = true;
     if (o->branch && RUN(2, "branch", pass_branch(f))) changed = true;
+    if (o->keysplit && RUN(14, "keysplit", pass_key_split(f))) changed = true;
     if (o->thread && RUN(3, "thread", pass_thread(f))) changed = true;
     if (o->thread && o->nodesplit && RUN(4, "nodesplit", pass_nodesplit(f))) changed = true;
     if (o->cse && RUN(5, "cse", pass_cse(f, o))) changed = true;

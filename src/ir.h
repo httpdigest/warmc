@@ -339,6 +339,10 @@ typedef struct {
      false when the function was not compacted. */
   uint32_t made_insts, made_maxargs;
   bool ghost_safepoint, ghost_ref;
+  /* opt.c pass_key_split: the instructions the function's reachable
+     blocks held when it first ran, twice which its copies may not take it
+     past */
+  uint32_t ks_base;
 
   struct IrChunk *chunks;
   char *bump;
@@ -440,7 +444,7 @@ bool ir_has_result(const Inst *in);
 typedef struct {
   int level;
   bool fold, dce, cse, licm, branch, memopt, bce, inl, strength;
-  bool thread, nodesplit;
+  bool thread, nodesplit, keysplit;
   bool gssa_all;
   bool small_loop_align;
 
@@ -622,6 +626,7 @@ typedef struct {
   uint64_t common_factors; /* x * c + y * c made (x + y) * c */
   uint64_t threaded_known; /* edges past a test their way in decided */
   uint64_t param_compares; /* parameters found to be a compare, made again */
+  uint64_t key_splits;   /* regions copied below an edge that fixes a value */
   uint64_t small_loops;  /* loops aligned to 64 bytes as small, in code emitted */
   uint64_t slp_groups;   /* stores of alike lanes made one vector store */
 
