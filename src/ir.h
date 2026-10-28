@@ -601,6 +601,7 @@ typedef struct {
   uint64_t threaded_known; /* edges past a test their way in decided */
   uint64_t param_compares; /* parameters found to be a compare, made again */
   uint64_t small_loops;  /* loops aligned to 64 bytes as small, in code emitted */
+  uint64_t slp_groups;   /* stores of alike lanes made one vector store */
 
   uint64_t bar_masks, bar_elided;
   uint64_t caller_saves, csa_restores, spills_v128_xcall, range_budget_trips;
