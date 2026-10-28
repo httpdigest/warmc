@@ -7,6 +7,12 @@ call:
     ;; run: EXPORT ARGS... => i32:42
     ;; run: EXPORT ARGS... => trap: out of bounds memory access
 
+or, for one level, where -O3 takes a liberty with what wasm says (an
+address that wraps, a float sum's order), the answer there in place of the
+other's:
+
+    ;; run -O3: EXPORT ARGS... => trap: out of bounds memory access
+
 and a module can say what warmc's --stats counts for it, at -O0, where no
 pass changes what there is to count, or at a level it names:
 
@@ -59,7 +65,7 @@ import testcache
 
 LEVELS = ["-O0", "-O1", "-O2", "-O3"]
 RUN_TIMEOUT = float(os.environ.get("WARMC_RUN_TIMEOUT", "30"))
-RUN_LINE = re.compile(r"^;; run: (\S+)((?: \S+)*) => (.*)$")
+RUN_LINE = re.compile(r"^;; run(?: (-O[0-3]))?: (\S+)((?: \S+)*) => (.*)$")
 STATS_LINE = re.compile(r"^;; stats(?: (-O[0-3]))?( a64)?: (.*)$")
 SHAPE_LINE = re.compile(r"^;; (shape|late): (\S+) (.*)=(\d+)$")
 FLAGS_LINE = re.compile(r"^;; flags: (.+)$")
@@ -67,13 +73,28 @@ OBJDUMP = shutil.which("llvm-objdump") or shutil.which("objdump")
 AARCH64 = platform.machine() in ("arm64", "aarch64")
 
 
-def calls(path):
-    out = []
+def calls(path, level=None):
+    """(export, args, answer) of a module's run lines at level: a line that
+    names a level gives the answer there in place of the one for every
+    level"""
+    out, over = [], {}
     for line in open(path):
         m = RUN_LINE.match(line.rstrip("\n"))
-        if m:
-            out.append((m.group(1), m.group(2).split(), m.group(3).strip()))
-    return out
+        if not m:
+            continue
+        key = (m.group(2), tuple(m.group(3).split()))
+        if m.group(1):
+            if m.group(1) == level:
+                over[key] = m.group(4).strip()
+        else:
+            out.append((m.group(2), m.group(3).split(), m.group(4).strip()))
+    return [(e, a, over.get((e, tuple(a)), x)) for e, a, x in out]
+
+
+def level_of(flags):
+    """the -O level a flag set compiles at, the last one given"""
+    lv = [f for f in flags if re.match(r"^-O[0-3]$", f)]
+    return lv[-1] if lv else "-O2"
 
 
 def stats(path):
@@ -222,7 +243,7 @@ def check_all(cases, build, warmc, target, run, tmp):
             if exe is None:
                 continue
             for name, c in names:
-                runs += [(exe, level, name, e, a, x, False) for e, a, x in calls(c)]
+                runs += [(exe, level, name, e, a, x, False) for e, a, x in calls(c, level)]
         # a module's own flag sets, each a program of the module alone
         for (name, c), wasm in zip(names, wasms):
             for n, flags in enumerate(flag_sets(c)):
@@ -233,7 +254,8 @@ def check_all(cases, build, warmc, target, run, tmp):
                 if r.returncode:
                     fails.append("%s %s: warmc: %s" % (name, label, r.stderr.strip()[:300]))
                     continue
-                runs += [(exe, label, name, e, a, x, True) for e, a, x in calls(c)]
+                runs += [(exe, label, name, e, a, x, True)
+                         for e, a, x in calls(c, level_of(flags))]
         for f in ex.map(ran, runs):
             fails += f
     exe = progs["-O2"][0]

@@ -506,6 +506,18 @@ typedef struct {
      then; off by default */
   bool dead_frames;
 
+  /* -ffloat-reassoc: float sums and products may be taken in another order
+     than wasm's, each step rounded, so a result can differ in its last bits
+     -- a reduction kept in vector lanes, several partial sums; off by
+     default */
+  bool float_reassoc;
+
+  /* -faddr-nowrap: a 32-bit address x + c, c a small positive constant, is
+     taken as x at offset c, as if the add did not wrap -- folded where x is
+     the C stack pointer or made from it, one address to the memory pass
+     everywhere; off by default */
+  bool addr_nowrap;
+
   /* -facc-tail: a small recursion that sums, multiplies, ands, ors or xors
      its own call's result with something else loops with an accumulator,
      and so one that never ends loops for ever rather than running out of
@@ -597,7 +609,7 @@ typedef struct {
   uint64_t folded, dce_removed, cse_removed, licm_hoisted, branch_simplified;
   uint64_t loads_forwarded, stores_removed, checks_removed, inlined;
   uint64_t params_removed, strength_reduced, moves_coalesced, sunk, rotated;
-  uint64_t insts_emitted, spills, reloads, vectorized, self_tail, acc_tail;
+  uint64_t insts_emitted, spills, reloads, vectorized, self_tail, acc_tail, addr_nowrap;
   uint64_t escape_removed, escape_forwarded, escape_made;
   uint64_t loads_combined;
   uint64_t globals_promoted, loops_closed, globals_ssa;
