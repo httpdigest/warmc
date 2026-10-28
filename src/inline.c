@@ -348,10 +348,10 @@ static bool inline_flat(IrFunc *f, IrFunc *g, uint32_t bi, uint32_t at,
       if (ir_args(f, r)[0] != call) continue;
       uint32_t slot = (uint32_t)f->insts[r].imm;
       ir_replace(f, r, vmap[gb->ret_args[slot]]);
-      f->insts[r].op = I_NOP;
+      ir_make_nop(&f->insts[r]);
     }
   }
-  f->insts[call].op = I_NOP;
+  ir_make_nop(&f->insts[call]);
   xfree(vmap);
   return true;
 }
@@ -1247,7 +1247,7 @@ static bool inl_apply(IrFunc *f, const OptOpts *o, InlMemos *memo,
       if (ir_args(f, r)[0] != call) continue;
       uint32_t slot = (uint32_t)f->insts[r].imm;
       ir_replace(f, r, contp[slot]);
-      f->insts[r].op = I_NOP;
+      ir_make_nop(&f->insts[r]);
     }
   }
 

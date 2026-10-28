@@ -7,8 +7,9 @@
 ;; arm two branches reach, one whose way on goes to another place than the
 ;; branch's other edge, or one that goes on through a block another way
 ;; reaches.  And a loop that calls, in its header too, is not aligned to 64
-;; bytes as small (isel.c small_loop), one that does not is.  Answers
-;; worked out in Python.
+;; bytes as small (isel.c small_loop), one that does not is: small's, which
+;; is two once vectorised, its vector loop and the scalar one after it.
+;; Answers worked out in Python.
 ;;
 ;; shape: push \sb\s=1
 ;; shape: noloop \sb\s=0
@@ -17,7 +18,7 @@
 ;; late: armnotother \sbl\s=1
 ;; late: twoarm \sbl\s=1
 ;; late: armchain \sbl\s=1
-;; stats -O2 a64: small_loops=1
+;; stats -O2 a64: small_loops=2
 ;;
 ;; run: push 0 => i32:100
 ;; run: callloop 0 => i32:0
