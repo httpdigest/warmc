@@ -59,9 +59,15 @@ run_case() {
   env -i WARMC_WASI_PROBE=secret "$WASMTIME" --dir "$dr::/d" "$wasm" "${ARGS[@]}" \
     >"$WORK/$name.ref.out" 2>"$WORK/$name.ref.err" <"$WORK/stdin.txt"
   local rc_ref=$?
-  # wasmtime sleeps in whole Windows timer ticks, so it rounds nap's 100us up
-  # and says `slow`; there warmc is held to what nap.wat promises instead.
-  if [ "$WIN" = 1 ] && [ "$name" = nap ]; then printf 'ok\n' > "$WORK/$name.ref.out"; fi
+  # nap times the host's timers, wasmtime's as much as warmc's: wasmtime
+  # sleeps in whole Windows timer ticks, so it rounds nap's 100us up and says
+  # `slow`, and on CI's macOS arm64 machine its naps were once all that late
+  # where warmc's were not.  So where warmc says `ok` it has honoured the nap,
+  # whatever wasmtime says, and on Windows it is held to that; elsewhere both
+  # saying `slow` is a machine too busy to wake either on time.
+  if [ "$name" = nap ] && { [ "$WIN" = 1 ] || grep -qx ok "$WORK/$name.warmc.out"; }; then
+    printf 'ok\n' > "$WORK/$name.ref.out"
+  fi
   # wasmtime on Windows answers paths that end in a slash by rules of its own:
   # EACCES for every directory removed or unlinked through one, readlink
   # through one reading the link, a link to nothing refused with ENOENT, and
