@@ -485,6 +485,16 @@ int main(int argc, char **argv) {
   CASE("vpshufb xmm1, xmm2, xmm3", x64_vpshufb(b, X_XMM1, X_XMM2, X_XMM3));
   CASE("vpshufb xmm9, xmm10, xmm11", x64_vpshufb(b, X_XMM9, X_XMM10, X_XMM11));
   CASE("vpblendw xmm1, xmm2, xmm3, 85", x64_vpblendw(b, X_XMM1, X_XMM2, X_XMM3, 0x55));
+  CASE("vpblendd xmm1, xmm2, xmm3, 5", x64_vpblendd(b, X_XMM1, X_XMM2, X_XMM3, 0x5));
+  CASE("vinsertps xmm1, xmm2, xmm3, 112", x64_vinsertps(b, X_XMM1, X_XMM2, X_XMM3, 0x70));
+  CASE("vinsertps xmm9, xmm12, xmm14, 128", x64_vinsertps(b, X_XMM9, X_XMM12, X_XMM14, 0x80));
+  CASE("vpblendd xmm9, xmm12, xmm14, 10", x64_vpblendd(b, X_XMM9, X_XMM12, X_XMM14, 0xa));
+  CASE("vpshuflw xmm1, xmm2, 27", x64_vpshuflw(b, X_XMM1, X_XMM2, 0x1b));
+  CASE("vpshuflw xmm11, xmm14, 177", x64_vpshuflw(b, X_XMM11, X_XMM14, 0xb1));
+  CASE("vpshufhw xmm1, xmm2, 27", x64_vpshufhw(b, X_XMM1, X_XMM2, 0x1b));
+  CASE("vpshufhw xmm11, xmm14, 177", x64_vpshufhw(b, X_XMM11, X_XMM14, 0xb1));
+  CASE("vpalignr xmm1, xmm2, xmm3, 8", x64_vpalignr(b, X_XMM1, X_XMM2, X_XMM3, 8));
+  CASE("vpalignr xmm9, xmm12, xmm14, 3", x64_vpalignr(b, X_XMM9, X_XMM12, X_XMM14, 3));
   CASE("vpblendw xmm9, xmm10, xmm11, 170",
        x64_vpblendw(b, X_XMM9, X_XMM10, X_XMM11, 0xaa));
   CASE("vpblendvb xmm1, xmm2, xmm3, xmm4",

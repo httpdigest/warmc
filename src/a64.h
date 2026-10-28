@@ -53,6 +53,8 @@ void a64_add_reg(Buf *b, int sf, int rd, int rn, int rm);
 void a64_sub_reg(Buf *b, int sf, int rd, int rn, int rm);
 void a64_adds_reg(Buf *b, int sf, int rd, int rn, int rm);
 void a64_subs_reg(Buf *b, int sf, int rd, int rn, int rm);
+void a64_adcs(Buf *b, int sf, int rd, int rn, int rm);
+void a64_sbcs(Buf *b, int sf, int rd, int rn, int rm);
 void a64_add_reg_lsl(Buf *b, int sf, int rd, int rn, int rm, int shift);
 void a64_sub_reg_lsl(Buf *b, int sf, int rd, int rn, int rm, int shift);
 /* kind SH_LSL, SH_LSR or SH_ASR */
@@ -236,6 +238,8 @@ void a64_vuzp1(Buf *b, int size, int rd, int rn, int rm);
 void a64_vuzp2(Buf *b, int size, int rd, int rn, int rm);
 void a64_vzip1(Buf *b, int size, int rd, int rn, int rm);
 void a64_vzip2(Buf *b, int size, int rd, int rn, int rm);
+void a64_vtrn1(Buf *b, int size, int rd, int rn, int rm);
+void a64_vtrn2(Buf *b, int size, int rd, int rn, int rm);
 void a64_vcmgt(Buf *b, int size, int rd, int rn, int rm);
 void a64_vcmge(Buf *b, int size, int rd, int rn, int rm);
 void a64_vcmeq(Buf *b, int size, int rd, int rn, int rm);

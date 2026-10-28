@@ -760,6 +760,27 @@ static CompType *call_sig(Isel *s, Inst *in) {
 
 /* ---- one instruction ------------------------------------------------- */
 
+/* One step of a shuffle's plan into d, its operands in reg[] */
+static void xs_step(Isel *s, const XsStep *st, int d, const int *reg) {
+  int x = reg[st->a], y = reg[st->b];
+  switch (st->op) {
+    case XS_MOV: if (d != x) x64_vmovdqa_rr(B, d, x); break;
+    case XS_PSHUFD: x64_vpshufd(B, d, x, st->imm); break;
+    case XS_PSHUFLW: x64_vpshuflw(B, d, x, st->imm); break;
+    case XS_PSHUFHW: x64_vpshufhw(B, d, x, st->imm); break;
+    case XS_BCAST: x64_vpbroadcast(B, st->e, d, x); break;
+    case XS_SHUFPS: x64_vshufps(B, d, x, y, st->imm); break;
+    case XS_UNPCKL: x64_vpunpckl(B, st->e, d, x, y); break;
+    case XS_UNPCKH: x64_vpunpckh(B, st->e, d, x, y); break;
+    /* (a:b) >> 8 * imm: b's bytes from imm on, then a's */
+    case XS_PALIGNR: x64_vpalignr(B, d, x, y, st->imm); break;
+    case XS_PBLENDW: x64_vpblendw(B, d, x, y, st->imm); break;
+    case XS_PBLENDD: x64_vpblendd(B, d, x, y, st->imm); break;
+    case XS_INSERTPS: x64_vinsertps(B, d, x, y, st->imm); break;
+    default: break;
+  }
+}
+
 static void emit_inst(Isel *s, Ref v) {
   IrFunc *f = s->f;
   Inst *in = &f->insts[v];
@@ -1989,35 +2010,52 @@ static void emit_inst(Isel *s, Ref v) {
     }
 
     case I_VSHUFFLE: {
-      /* The a64 lowering takes its two index vectors from the IR; vpshufb
-         zeroes on the high bit instead of on out-of-range, so build the
-         masks here and leave the IR's own operands alone. */
+      XsPlan p;
+      xs_plan_of(f, v, &p);
+      bool one = a[0] == a[1];
+      bool need[2] = { false, false };
+      if (p.kind == XSK_PSHUFB) {
+        need[p.n == 2 ? 0 : p.st[0].a] = true;
+        if (p.n == 2) need[1] = true;
+      } else {
+        for (uint32_t i = 0; i < p.n; i++) {
+          if (p.st[i].a < 2) need[p.st[i].a] = true;
+          if (p.st[i].b < 2) need[p.st[i].b] = true;
+        }
+      }
+      int reg[3] = { -1, -1, FTMP };
+      if (need[0] || (one && need[1])) reg[0] = rd(s, a[0], F0);
+      if (need[1]) reg[1] = one ? reg[0] : rd(s, a[1], F1);
+      if (p.kind == XSK_PERM) {
+        int d = wr(s, v, F2);
+        if (p.n == 2) xs_step(s, &p.st[0], FTMP, reg);
+        xs_step(s, &p.st[p.n - 1], d, reg);
+        commit(s, v, d);
+        break;
+      }
+      /* vpshufb zeroes a byte whose place has its high bit set: each
+         source's places, the other's bytes zeroed (taken mod 16 where x and
+         y are one) */
       uint64_t sel[2] = { in->imm, in->imm2 };
       uint64_t mx[2] = { 0, 0 }, my[2] = { 0, 0 };
-      bool from_x = false, from_y = false;
       for (int i = 0; i < 16; i++) {
-        uint32_t idx = (uint32_t)((sel[i >> 3] >> (8 * (i & 7))) & 0xff);
+        uint32_t idx = (uint32_t)((sel[i >> 3] >> (8 * (i & 7))) & 0x1f);
         int h = i >> 3, sh = 8 * (i & 7);
-        if (idx < 16) { from_x = true; mx[h] |= (uint64_t)idx << sh; }
-        else mx[h] |= 0x80ull << sh;
-        if (idx >= 16 && idx < 32) { from_y = true; my[h] |= (uint64_t)(idx - 16) << sh; }
-        else my[h] |= 0x80ull << sh;
+        if (one) idx &= 15;
+        mx[h] |= (idx < 16 ? (uint64_t)idx : 0x80ull) << sh;
+        my[h] |= (idx >= 16 ? (uint64_t)(idx - 16) : 0x80ull) << sh;
       }
-      int x = rd(s, a[0], F0), y = rd(s, a[1], F1);
       int res;
-      if (!from_y) {
-        vconst(s, FTMP, mx[0], mx[1]);
+      if (p.n == 1) {
+        bool fy = p.st[0].a == 1;
+        vconst(s, FTMP, fy ? my[0] : mx[0], fy ? my[1] : mx[1]);
         res = wr(s, v, F2);
-        x64_vpshufb(B, res, x, FTMP);
-      } else if (!from_x) {
-        vconst(s, FTMP, my[0], my[1]);
-        res = wr(s, v, F2);
-        x64_vpshufb(B, res, y, FTMP);
+        x64_vpshufb(B, res, reg[fy ? 1 : 0], FTMP);
       } else {
         vconst(s, FTMP, mx[0], mx[1]);
-        x64_vpshufb(B, F2, x, FTMP);
+        x64_vpshufb(B, F2, reg[0], FTMP);
         vconst(s, FTMP, my[0], my[1]);
-        x64_vpshufb(B, FTMP, y, FTMP);
+        x64_vpshufb(B, FTMP, reg[1], FTMP);
         x64_vpor(B, F2, F2, FTMP);
         res = F2;
       }

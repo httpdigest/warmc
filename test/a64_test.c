@@ -172,6 +172,10 @@ int main(int argc, char **argv) {
   CASE("add x8, x9, x10", a64_add_reg(b, SF64, R8, R9, R10));
   CASE("sub w11, w12, w13", a64_sub_reg(b, SF32, R11, R12, R13));
   CASE("adds x14, x15, x16", a64_adds_reg(b, SF64, R14, R15, R16));
+  CASE("adcs w1, w2, w3", a64_adcs(b, SF32, R1, R2, R3));
+  CASE("adcs x14, x15, xzr", a64_adcs(b, SF64, R14, R15, RZR));
+  CASE("sbcs w4, wzr, w6", a64_sbcs(b, SF32, R4, RZR, R6));
+  CASE("sbcs x7, x8, x9", a64_sbcs(b, SF64, R7, R8, R9));
   CASE("subs w17, w18, w19", a64_subs_reg(b, SF32, R17, R18, R19));
   CASE("add x20, x21, x22, lsl #3", a64_add_reg_lsl(b, SF64, R20, R21, R22, 3));
   CASE("sub w0, w1, w2, lsl #5", a64_sub_reg_lsl(b, SF32, R0, R1, R2, 5));
@@ -491,6 +495,14 @@ int main(int argc, char **argv) {
   CASE("zip1 v3.8h, v4.8h, v5.8h", a64_vzip1(b, 1, 3, 4, 5));
   CASE("zip1 v6.4s, v7.4s, v8.4s", a64_vzip1(b, 2, 6, 7, 8));
   CASE("zip1 v9.2d, v10.2d, v11.2d", a64_vzip1(b, 3, 9, 10, 11));
+  CASE("trn1 v0.16b, v1.16b, v2.16b", a64_vtrn1(b, 0, 0, 1, 2));
+  CASE("trn1 v3.8h, v4.8h, v5.8h", a64_vtrn1(b, 1, 3, 4, 5));
+  CASE("trn1 v6.4s, v7.4s, v8.4s", a64_vtrn1(b, 2, 6, 7, 8));
+  CASE("trn1 v9.2d, v10.2d, v11.2d", a64_vtrn1(b, 3, 9, 10, 11));
+  CASE("trn2 v12.16b, v13.16b, v14.16b", a64_vtrn2(b, 0, 12, 13, 14));
+  CASE("trn2 v15.8h, v16.8h, v17.8h", a64_vtrn2(b, 1, 15, 16, 17));
+  CASE("trn2 v18.4s, v19.4s, v20.4s", a64_vtrn2(b, 2, 18, 19, 20));
+  CASE("trn2 v21.2d, v22.2d, v23.2d", a64_vtrn2(b, 3, 21, 22, 23));
   CASE("zip2 v0.16b, v1.16b, v2.16b", a64_vzip2(b, 0, 0, 1, 2));
   CASE("zip2 v3.8h, v4.8h, v5.8h", a64_vzip2(b, 1, 3, 4, 5));
   CASE("zip2 v6.4s, v7.4s, v8.4s", a64_vzip2(b, 2, 6, 7, 8));

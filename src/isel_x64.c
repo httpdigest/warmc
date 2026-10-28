@@ -939,6 +939,244 @@ static bool sext32_ok(uint64_t m, int sf) {
   return (uint64_t)(int64_t)(int32_t)m == m;
 }
 
+/* ---- byte shuffles ---------------------------------------------------------
+
+   i8x16.shuffle names each of the 16 bytes of its result by its place in x
+   (0-15) or y (16-31).  pshufb makes any of one vector's, its places in a
+   register (a constant loaded), and two vectors' takes two of them and an
+   or.  x86 has one instruction for each of the shapes that occur, most
+   with the places in an immediate: dwords of one vector in any order
+   (pshufd), its low or high four words (pshuflw, pshufhw), two dwords of
+   each of two (shufps), a lane of one repeated (vpbroadcast), two
+   vectors' low or high lanes interleaved at any size (punpckl, punpckh),
+   16 bytes of them at an offset (palignr), and words or dwords of each in
+   place (pblendw, pblendd), a dword of one into another (insertps).
+   xs_plan takes one of those, else two, the
+   second of the first's result, and only else pshufb. */
+enum { XS_MOV, XS_PSHUFD, XS_PSHUFLW, XS_PSHUFHW, XS_BCAST, XS_SHUFPS, XS_UNPCKL,
+       XS_UNPCKH, XS_PALIGNR, XS_PBLENDW, XS_PBLENDD, XS_INSERTPS };
+enum { XSK_PERM, XSK_PSHUFB };
+
+/* op, on lanes of 1 << e bytes where it has lanes; a and b its operands: 0
+   x, 1 y, 2 the first step's result; imm its immediate */
+typedef struct { uint8_t op, e, a, b, imm; } XsStep;
+
+/* XSK_PERM: st[0..n) in turn, the first of two into a scratch register;
+   XSK_PSHUFB: of x, of y or (n == 2) of both.  cost: instructions, twice */
+typedef struct { uint8_t kind, n, cost; XsStep st[2]; } XsPlan;
+
+static void xs_apply(const XsStep *st, const uint8_t *A, const uint8_t *Bm, uint8_t *out) {
+  uint32_t E = 1u << st->e, imm = st->imm;
+  switch (st->op) {
+    case XS_MOV: memcpy(out, A, 16); break;
+    case XS_PSHUFD:
+      for (uint32_t i = 0; i < 4; i++) memcpy(out + 4 * i, A + 4 * (imm >> (2 * i) & 3), 4);
+      break;
+    case XS_PSHUFLW:
+      for (uint32_t i = 0; i < 4; i++) memcpy(out + 2 * i, A + 2 * (imm >> (2 * i) & 3), 2);
+      memcpy(out + 8, A + 8, 8);
+      break;
+    case XS_PSHUFHW:
+      memcpy(out, A, 8);
+      for (uint32_t i = 0; i < 4; i++) memcpy(out + 8 + 2 * i, A + 8 + 2 * (imm >> (2 * i) & 3), 2);
+      break;
+    case XS_BCAST:
+      for (uint32_t i = 0; i < 16; i++) out[i] = A[i % E];
+      break;
+    case XS_SHUFPS:
+      for (uint32_t i = 0; i < 4; i++)
+        memcpy(out + 4 * i, (i < 2 ? A : Bm) + 4 * (imm >> (2 * i) & 3), 4);
+      break;
+    case XS_UNPCKL: case XS_UNPCKH: {
+      uint32_t half = st->op == XS_UNPCKH ? 8 : 0;
+      for (uint32_t L = 0; L < 16 / E; L++)
+        memcpy(out + L * E, (L & 1 ? Bm : A) + half + L / 2 * E, E);
+      break;
+    }
+    case XS_PALIGNR:
+      for (uint32_t i = 0; i < 16; i++) {
+        uint32_t j = i + imm;
+        out[i] = j < 16 ? Bm[j] : A[j - 16];
+      }
+      break;
+    case XS_INSERTPS:
+      memcpy(out, A, 16);
+      memcpy(out + 4 * (imm >> 4 & 3), Bm + 4 * (imm >> 6 & 3), 4);
+      break;
+    case XS_PBLENDW: case XS_PBLENDD: {
+      uint32_t W = st->op == XS_PBLENDW ? 2 : 4;
+      for (uint32_t i = 0; i < 16 / W; i++)
+        memcpy(out + W * i, (imm >> i & 1 ? Bm : A) + W * i, W);
+      break;
+    }
+  }
+}
+
+/* Whether T's lanes of W bytes are each some lane of P (pick: the
+   immediate's two bits a lane) -- of lanes lo..hi of T from P's lanes lo..
+   (each four lanes at most) */
+static bool xs_lanes(const uint8_t *T, const uint8_t *P, uint32_t W, uint32_t lo, uint32_t n,
+                     uint32_t *pick) {
+  *pick = 0;
+  for (uint32_t i = 0; i < n; i++) {
+    uint32_t j = 0;
+    while (j < 4 && memcmp(T + W * (lo + i), P + W * lo + W * j, W)) j++;
+    if (j == 4) return false;
+    *pick |= j << (2 * i);
+  }
+  return true;
+}
+
+/* One step that makes T of the operands id[0..nid) (their bytes M[id]),
+   reading need where need >= 0 */
+static bool xs_one(const uint8_t *T, const uint8_t (*M)[16], const uint8_t *id, uint32_t nid,
+                   int need, XsStep *out) {
+  uint8_t r[16];
+  uint32_t pick;
+  for (uint32_t p = 0; p < nid; p++) {
+    uint8_t a = id[p];
+    const uint8_t *P = M[a];
+    if (need < 0 || a == need) {
+      XsStep st = { XS_MOV, 0, a, a, 0 };
+      if (!memcmp(T, P, 16)) { *out = st; return true; }
+      if (xs_lanes(T, P, 4, 0, 4, &pick)) { XsStep s1 = { XS_PSHUFD, 2, a, a, (uint8_t)pick }; *out = s1; return true; }
+      if (!memcmp(T + 8, P + 8, 8) && xs_lanes(T, P, 2, 0, 4, &pick)) {
+        XsStep s1 = { XS_PSHUFLW, 1, a, a, (uint8_t)pick }; *out = s1; return true;
+      }
+      if (!memcmp(T, P, 8) && xs_lanes(T, P, 2, 4, 4, &pick)) {
+        XsStep s1 = { XS_PSHUFHW, 1, a, a, (uint8_t)pick }; *out = s1; return true;
+      }
+      for (uint32_t e = 0; e < 4; e++) {
+        XsStep s1 = { XS_BCAST, (uint8_t)e, a, a, 0 };
+        xs_apply(&s1, P, P, r);
+        if (!memcmp(T, r, 16)) { *out = s1; return true; }
+      }
+    }
+    for (uint32_t q = 0; q < nid; q++) {
+      uint8_t b = id[q];
+      const uint8_t *Q = M[b];
+      if (need >= 0 && a != need && b != need) continue;
+      uint32_t p2;
+      if (xs_lanes(T, P, 4, 0, 2, &pick) && xs_lanes(T + 8, Q, 4, 0, 2, &p2)) {
+        XsStep s1 = { XS_SHUFPS, 2, a, b, (uint8_t)(pick | p2 << 4) }; *out = s1; return true;
+      }
+      for (uint32_t e = 0; e < 4; e++)
+        for (uint8_t op = XS_UNPCKL; op <= XS_UNPCKH; op++) {
+          XsStep s1 = { op, (uint8_t)e, a, b, 0 };
+          xs_apply(&s1, P, Q, r);
+          if (!memcmp(T, r, 16)) { *out = s1; return true; }
+        }
+      for (uint32_t k = 1; k < 16; k++) {
+        XsStep s1 = { XS_PALIGNR, 0, a, b, (uint8_t)k };
+        xs_apply(&s1, P, Q, r);
+        if (!memcmp(T, r, 16)) { *out = s1; return true; }
+      }
+      /* P but for one dword, which is one of Q's */
+      uint32_t diff = 0, at = 0;
+      for (uint32_t i = 0; i < 4; i++)
+        if (memcmp(T + 4 * i, P + 4 * i, 4)) { diff++; at = i; }
+      if (diff == 1)
+        for (uint32_t j = 0; j < 4; j++)
+          if (!memcmp(T + 4 * at, Q + 4 * j, 4)) {
+            XsStep s1 = { XS_INSERTPS, 2, a, b, (uint8_t)(j << 6 | at << 4) };
+            *out = s1;
+            return true;
+          }
+      for (uint32_t W = 4; W >= 2; W -= 2) {
+        uint32_t imm = 0;
+        bool ok = true;
+        for (uint32_t i = 0; i < 16 / W && ok; i++) {
+          if (!memcmp(T + W * i, P + W * i, W)) continue;
+          if (!memcmp(T + W * i, Q + W * i, W)) imm |= 1u << i;
+          else ok = false;
+        }
+        if (ok) {
+          XsStep s1 = { W == 4 ? XS_PBLENDD : XS_PBLENDW, (uint8_t)(W == 4 ? 2 : 1), a, b, (uint8_t)imm };
+          *out = s1;
+          return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+/* The first steps a two-step plan may start from, of x and y */
+static uint32_t xs_firsts(const uint8_t (*M)[16], uint32_t nsrc, XsStep *out) {
+  uint32_t n = 0;
+  for (uint8_t a = 0; a < nsrc; a++) {
+    for (uint32_t imm = 0; imm < 256; imm++) {
+      XsStep s1 = { XS_PSHUFD, 2, a, a, (uint8_t)imm }, s2 = { XS_PSHUFLW, 1, a, a, (uint8_t)imm },
+             s3 = { XS_PSHUFHW, 1, a, a, (uint8_t)imm };
+      out[n++] = s1; out[n++] = s2; out[n++] = s3;
+    }
+    for (uint8_t e = 0; e < 4; e++) { XsStep s1 = { XS_BCAST, e, a, a, 0 }; out[n++] = s1; }
+    for (uint8_t b = 0; b < nsrc; b++) {
+      for (uint32_t imm = 0; imm < 256; imm++) { XsStep s1 = { XS_SHUFPS, 2, a, b, (uint8_t)imm }; out[n++] = s1; }
+      for (uint8_t e = 0; e < 4; e++)
+        for (uint8_t op = XS_UNPCKL; op <= XS_UNPCKH; op++) { XsStep s1 = { op, e, a, b, 0 }; out[n++] = s1; }
+      for (uint8_t k = 1; k < 16; k++) { XsStep s1 = { XS_PALIGNR, 0, a, b, k }; out[n++] = s1; }
+      if (a == b) continue;
+      for (uint32_t imm = 1; imm < 255; imm++) { XsStep s1 = { XS_PBLENDW, 1, a, b, (uint8_t)imm }; out[n++] = s1; }
+      for (uint32_t imm = 1; imm < 15; imm++) { XsStep s1 = { XS_PBLENDD, 2, a, b, (uint8_t)imm }; out[n++] = s1; }
+    }
+  }
+  return n;
+}
+
+/* The cheapest plan for want (one: x and y one value, places mod 16) */
+static void xs_plan(const uint8_t *want0, bool one, XsPlan *best) {
+  uint8_t want[16], M[3][16];
+  uint32_t nsrc = one ? 1 : 2, from = 0;
+  for (uint32_t i = 0; i < 16; i++) {
+    want[i] = one ? want0[i] & 15 : want0[i];
+    from |= want[i] < 16 ? 1u : 2u;
+    M[0][i] = (uint8_t)i;
+    M[1][i] = (uint8_t)(16 + i);
+  }
+  memset(best, 0, sizeof *best);
+  /* pshufb: of one (its places loaded), or of each and an or */
+  best->kind = XSK_PSHUFB;
+  best->n = from == 3 ? 2 : 1;
+  best->st[0].a = from == 2;
+  best->cost = from == 3 ? 10 : 5;
+  uint8_t id[3] = { 0, 1, 2 };
+  XsStep st;
+  if (xs_one(want, (const uint8_t (*)[16])M, id, nsrc, -1, &st)) {
+    best->kind = XSK_PERM; best->n = 1; best->cost = 2; best->st[0] = st;
+    return;
+  }
+  static _Thread_local XsStep first[2 * (3 * 256 + 4 + 2 * (256 + 8 + 15 + 254 + 14))];
+  uint32_t nf = xs_firsts((const uint8_t (*)[16])M, nsrc, first);
+  uint8_t ids[3] = { 2, 0, 1 };
+  for (uint32_t i = 0; i < nf; i++) {
+    xs_apply(&first[i], M[first[i].a], M[first[i].b], M[2]);
+    if (xs_one(want, (const uint8_t (*)[16])M, ids, nsrc + 1, 2, &st)) {
+      best->kind = XSK_PERM; best->n = 2; best->cost = 4;
+      best->st[0] = first[i]; best->st[1] = st;
+      return;
+    }
+  }
+}
+
+/* xs_plan of shuffle v, kept by its places */
+static void xs_plan_of(IrFunc *f, Ref v, XsPlan *p) {
+  const Inst *in = &f->insts[v];
+  uint8_t want[16];
+  for (uint32_t i = 0; i < 16; i++)
+    want[i] = (uint8_t)((i < 8 ? in->imm >> (8 * i) : in->imm2 >> (8 * (i - 8))) & 0x1f);
+  bool one = ir_args(f, v)[0] == ir_args(f, v)[1];
+  static _Thread_local struct { uint64_t lo, hi; uint32_t key; XsPlan p; } memo[64];
+  uint32_t key = one ? 3u : 1u;
+  uint32_t h = (uint32_t)((in->imm * 0x9e3779b97f4a7c15ull ^ in->imm2) >> 58);
+  if (memo[h].key == key && memo[h].lo == in->imm && memo[h].hi == in->imm2) {
+    *p = memo[h].p;
+    return;
+  }
+  xs_plan(want, one, p);
+  memo[h].lo = in->imm; memo[h].hi = in->imm2; memo[h].key = key; memo[h].p = *p;
+}
+
 static void analyse_immediates(Isel *s) {
   IrFunc *f = s->f;
   uint32_t n = f->ninsts;
@@ -1015,6 +1253,26 @@ static void analyse_immediates(Isel *s) {
       }
   }
   for (uint32_t i = 0; i < n; i++) if (blocked[i]) s->imm_fold[i] = 0;
+
+  /* The index vectors the IR gives a shuffle, for a64's tbl: x86 makes
+     pshufb's own, so those only shuffles read are not made. */
+  {
+    uint32_t *seen = xcalloc(n ? n : 1, sizeof(uint32_t));
+    for (int pass = 0; pass < 2; pass++)
+      for (uint32_t oi = 0; oi < f->norder; oi++) {
+        Block *b = &f->blocks[f->order[oi]];
+        for (uint32_t i = 0; i < b->ninsts; i++) {
+          Ref u = b->insts[i];
+          if (f->insts[u].op != I_VSHUFFLE) continue;
+          Ref *a = ir_args(f, u);
+          for (uint32_t j = 2; j < f->insts[u].nargs; j++) {
+            if (pass == 0) seen[a[j]]++;
+            else if (seen[a[j]] == uses[a[j]] && !blocked[a[j]]) s->folded[a[j]] = 1;
+          }
+        }
+      }
+    xfree(seen);
+  }
 
   /* [membase + index*1 + disp32] folds a single-use MEM_ADDR directly. */
   s->addr_fuse = xcalloc(n ? n : 1, 1);

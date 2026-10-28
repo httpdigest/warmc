@@ -93,6 +93,15 @@ void a64_add_reg(Buf *b, int sf, int rd, int rn, int rm)  { addsub_reg(b, sf, 0,
 void a64_sub_reg(Buf *b, int sf, int rd, int rn, int rm)  { addsub_reg(b, sf, 1, 0, rd, rn, rm, 0, 0); }
 void a64_adds_reg(Buf *b, int sf, int rd, int rn, int rm) { addsub_reg(b, sf, 0, 1, rd, rn, rm, 0, 0); }
 void a64_subs_reg(Buf *b, int sf, int rd, int rn, int rm) { addsub_reg(b, sf, 1, 1, rd, rn, rm, 0, 0); }
+
+/* adcs and sbcs: rn + rm + C, rn - rm - !C, setting the flags */
+static void addsub_carry(Buf *b, int sf, int op, int rd, int rn, int rm) {
+  b->flags_epoch++;
+  W(((uint32_t)sf << 31) | ((uint32_t)op << 30) | (1u << 29) | (0xD0u << 21) |
+    (M5(rm) << 16) | (M5(rn) << 5) | M5(rd));
+}
+void a64_adcs(Buf *b, int sf, int rd, int rn, int rm) { addsub_carry(b, sf, 0, rd, rn, rm); }
+void a64_sbcs(Buf *b, int sf, int rd, int rn, int rm) { addsub_carry(b, sf, 1, rd, rn, rm); }
 void a64_add_reg_lsl(Buf *b, int sf, int rd, int rn, int rm, int sh) {
   addsub_reg(b, sf, 0, 0, rd, rn, rm, 0, sh);
 }
@@ -660,6 +669,8 @@ void a64_vuzp1(Buf *b, int size, int rd, int rn, int rm) { V3(0x4E001800u | VSZ(
 void a64_vuzp2(Buf *b, int size, int rd, int rn, int rm) { V3(0x4E005800u | VSZ(size), rd, rn, rm); }
 void a64_vzip1(Buf *b, int size, int rd, int rn, int rm) { V3(0x4E003800u | VSZ(size), rd, rn, rm); }
 void a64_vzip2(Buf *b, int size, int rd, int rn, int rm) { V3(0x4E007800u | VSZ(size), rd, rn, rm); }
+void a64_vtrn1(Buf *b, int size, int rd, int rn, int rm) { V3(0x4E002800u | VSZ(size), rd, rn, rm); }
+void a64_vtrn2(Buf *b, int size, int rd, int rn, int rm) { V3(0x4E006800u | VSZ(size), rd, rn, rm); }
 
 void a64_vcmgt(Buf *b, int size, int rd, int rn, int rm) { V3(0x4E203400u | VSZ(size), rd, rn, rm); }
 void a64_vcmge(Buf *b, int size, int rd, int rn, int rm) { V3(0x4E203C00u | VSZ(size), rd, rn, rm); }

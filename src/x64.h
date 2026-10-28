@@ -173,6 +173,11 @@ void x64_vxorps(Buf *b, int dst, int a, int c);
 void x64_vpbroadcast(Buf *b, int sz, int dst, int src);   /* AVX2, xmm<-xmm */
 void x64_vbroadcastss(Buf *b, int dst, int src);          /* AVX2, xmm<-xmm */
 void x64_vpshufd(Buf *b, int dst, int src, int imm);
+void x64_vpshuflw(Buf *b, int dst, int src, int imm);
+void x64_vpshufhw(Buf *b, int dst, int src, int imm);
+void x64_vpalignr(Buf *b, int dst, int a, int c, int imm);
+void x64_vpblendd(Buf *b, int dst, int a, int c, int imm);
+void x64_vinsertps(Buf *b, int dst, int a, int c, int imm);
 void x64_vpunpcklqdq(Buf *b, int dst, int a, int c);
 void x64_vpextr(Buf *b, int sz, int dst_gpr, int src_xmm, int imm);
 void x64_vpinsr(Buf *b, int sz, int dst, int a, int src_gpr, int imm);

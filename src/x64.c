@@ -538,6 +538,19 @@ void x64_vpshufd(Buf *b, int dst, int src, int imm) {
   vex_rr(b, 1, 0, 1, 0, 0x70, dst, 0, src);
   u8(b, (uint8_t)imm);
 }
+void x64_vpshuflw(Buf *b, int dst, int src, int imm) {
+  vex_rr(b, 1, 0, 3, 0, 0x70, dst, 0, src);
+  u8(b, (uint8_t)imm);
+}
+void x64_vpshufhw(Buf *b, int dst, int src, int imm) {
+  vex_rr(b, 1, 0, 2, 0, 0x70, dst, 0, src);
+  u8(b, (uint8_t)imm);
+}
+/* (a:c) >> 8 * imm: c's bytes from imm up, then a's */
+void x64_vpalignr(Buf *b, int dst, int a, int c, int imm) {
+  vex_rr(b, 3, 0, 1, 0, 0x0f, dst, a, c);
+  u8(b, (uint8_t)imm);
+}
 void x64_vpunpcklqdq(Buf *b, int dst, int a, int c) {
   vex_rr(b, 1, 0, 1, 0, 0x6c, dst, a, c);
 }
@@ -617,6 +630,16 @@ void x64_vpackusdw(Buf *b, int dst, int a, int c) { pv(b, M38 | 0x2b, dst, a, c)
 
 void x64_vpblendw(Buf *b, int dst, int a, int c, int imm) {
   vex_rr(b, 3, 0, 1, 0, 0x0e, dst, a, c);
+  u8(b, (uint8_t)imm);
+}
+/* a with its dword imm[5:4] c's dword imm[7:6], the dwords in imm[3:0]
+   zeroed */
+void x64_vinsertps(Buf *b, int dst, int a, int c, int imm) {
+  vex_rr(b, 3, 0, 1, 0, 0x21, dst, a, c);
+  u8(b, (uint8_t)imm);
+}
+void x64_vpblendd(Buf *b, int dst, int a, int c, int imm) {
+  vex_rr(b, 3, 0, 1, 0, 0x02, dst, a, c);
   u8(b, (uint8_t)imm);
 }
 

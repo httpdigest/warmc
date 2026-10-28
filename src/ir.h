@@ -506,6 +506,12 @@ typedef struct {
      then; off by default */
   bool dead_frames;
 
+  /* -facc-tail: a small recursion that sums, multiplies, ands, ors or xors
+     its own call's result with something else loops with an accumulator,
+     and so one that never ends loops for ever rather than running out of
+     stack; off by default */
+  bool acc_tail;
+
   /* -fexact-trap: memory, tables and globals hold, when a trap happens,
      exactly what they would without optimisation -- every write before the
      trapping instruction made and none after -- for an embedder that goes
@@ -591,7 +597,7 @@ typedef struct {
   uint64_t folded, dce_removed, cse_removed, licm_hoisted, branch_simplified;
   uint64_t loads_forwarded, stores_removed, checks_removed, inlined;
   uint64_t params_removed, strength_reduced, moves_coalesced, sunk, rotated;
-  uint64_t insts_emitted, spills, reloads, vectorized, self_tail;
+  uint64_t insts_emitted, spills, reloads, vectorized, self_tail, acc_tail;
   uint64_t escape_removed, escape_forwarded, escape_made;
   uint64_t loads_combined;
   uint64_t globals_promoted, loops_closed, globals_ssa;

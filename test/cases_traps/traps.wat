@@ -366,8 +366,10 @@
              (call $early_ld (local.get $p) (i32.sub (local.get $n) (i32.const 1)))))
   (func (export "early_load_oob") (result i32) (call $early_ld (i32.const 70000) (i32.const 0)))
 
+  ;; a difference, not a sum, which -O3 would carry round as a loop (opt.c
+  ;; pass_acc_tail) that never runs out of stack
   (func $recurse (param i32) (result i32)
-    (i32.add (i32.const 1) (call $recurse (local.get 0))))
+    (i32.sub (call $recurse (local.get 0)) (i32.const 1)))
   (func (export "stack_overflow") (result i32) (call $recurse (i32.const 1)))
 
   ;; Hoisting out of a loop may not move a faulting instruction above anything
