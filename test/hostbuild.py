@@ -210,8 +210,7 @@ def stack_of(pid, path):
     second: its call graph's first lines, the rest in PATH, or why there is
     none.  Under make check's load, twice a compile that takes a
     tenth of a second (test/cases/vector.wat) ran past thirty in two rows at
-    once, and a program that answers in milliseconds (dispatchloop, all
-    passes off) answered nothing for thirty; none of them again alone."""
+    once, and neither did again alone."""
     try:
         r = subprocess.run(["sample", str(pid), "1", "-mayDie", "-file", path],
                            capture_output=True, text=True, timeout=30)
