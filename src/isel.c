@@ -2070,6 +2070,46 @@ static bool fa_match(Isel *s, uint32_t bi, Ref c1, Ref c2, Ref *pr, Ref *ps, uin
   return true;
 }
 
+/* An add of a compare's 0 or 1 is cinc of the other operand on the
+   compare's flags, where cset and add made the 0 or 1 first: a branchless
+   count, Rust's partition's lt += (v < pivot), whose loop carries the count
+   from one element's address to the next.  The compare is the add's alone
+   and in its block, as a select's is; through the extension, an i64's,
+   which the add would otherwise read as its uxtw operand. */
+static void find_cincs(Isel *s, const uint32_t *uses) {
+  IrFunc *f = s->f;
+  uint32_t n = f->ninsts;
+  s->cinc = xcalloc(n ? n : 1, 1);
+  if (warmc_getenv("WARMC_NO_CINC")) return;
+  for (uint32_t oi = 0; oi < f->norder; oi++) {
+    uint32_t bi = f->order[oi];
+    Block *b = &f->blocks[bi];
+    for (uint32_t i = 0; i < b->ninsts; i++) {
+      Ref u = b->insts[i];
+      Inst *in = &f->insts[u];
+      if (in->op != I_ADD || in->nargs != 2 || s->folded[u] || s->fa[u]) continue;
+      Ref *a = ir_args(f, u);
+      for (int slot = 1; slot >= 0; slot--) {
+        Ref c = a[slot], x = a[slot ^ 1], e = REF_NONE;
+        if (f->insts[c].op == I_EXTENDU && in->type == VT_I64) {
+          e = c;
+          c = ir_args(f, e)[0];
+          if (uses[e] != 1) continue;
+        }
+        uint16_t op = f->insts[c].op;
+        if (!(op == I_EQZ || (op >= I_EQ && op <= I_GEU) || (op >= I_FEQ && op <= I_FGE)))
+          continue;
+        if (uses[c] != 1 || f->insts[c].block != bi) continue;
+        if (f->insts[x].op == I_CONST || s->folded[x]) continue;
+        s->folded[c] = 1;
+        if (e != REF_NONE) s->folded[e] = 1;
+        s->cinc[u] = (uint8_t)(slot + 1);
+        break;
+      }
+    }
+  }
+}
+
 static void find_full_adders(Isel *s, const uint32_t *uses) {
   IrFunc *f = s->f;
   uint32_t n = f->ninsts;
@@ -3029,6 +3069,7 @@ static void analyse_immediates(Isel *s) {
   find_full_adders(s, uses);
   find_cmp_chains(s, uses, blocked);
   find_tst_conds(s, uses);
+  find_cincs(s, uses);
   xfree(blocked);
 }
 
@@ -4487,6 +4528,7 @@ give_up:
   xfree(s->imm_fold); xfree(s->fused); xfree(s->addr_fuse); xfree(s->ptr_fuse);
   xfree(s->zx_fuse); xfree(s->no_remat); xfree(s->paired); xfree(s->nl); xfree(s->pool);
   xfree(s->folded); xfree(s->uses); xfree(s->bfx); xfree(s->pinned); xfree(s->csinc);
+  xfree(s->cinc); s->cinc = NULL;
   xfree(s->bfi);
   xfree(s->vrot); xfree(s->vadal); xfree(s->vmla); xfree(s->vbyel);
   xfree(s->extr);

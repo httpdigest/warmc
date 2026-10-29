@@ -262,21 +262,21 @@ SPECIAL = [
      % wat(T),
      T, lambda env, r: (env["a"] if r else 7) + ((env["b"] - 9) if r else 11),
      ["\\sccmp\\s=1", "\\scset\\s=0"]),
-    ("clob", "two selects on one chain, a compare between them: the second tests the cset",
+    ("clob", "two selects on one chain, a compare between them -- subtracted, which no cinc takes: the second tests the cset",
      "    (local $t i32)\n"
      "    (local.set $t %s)\n"
      "    (i32.add (select (local.get $a) (i32.const 7) (local.get $t))\n"
-     "             (i32.add (i32.lt_s (local.get $b) (local.get $d))\n"
+     "             (i32.sub (i32.lt_s (local.get $b) (local.get $d))\n"
      "                      (select (local.get $d) (i32.const 11) (local.get $t))))" % wat(T),
-     T, lambda env, r: ((env["a"] if r else 7) + int(signed(env["b"], 32) < signed(env["d"], 32)) +
+     T, lambda env, r: ((env["a"] if r else 7) + int(signed(env["b"], 32) < signed(env["d"], 32)) -
                         (env["d"] if r else 11)),
      ["\\sccmp\\s=1", "\\scset\\s=2"]),
-    ("apart", "a compare between a chain and the select on it: the chain is made at the csel",
+    ("apart", "a compare between a chain and the select on it -- subtracted, which no cinc takes: the chain is made at the csel",
      "    (local $t i32)\n"
      "    (local.set $t %s)\n"
-     "    (i32.add (i32.lt_s (local.get $b) (local.get $d))\n"
+     "    (i32.sub (i32.lt_s (local.get $b) (local.get $d))\n"
      "             (select (i32.const 7) (i32.const 9) (local.get $t)))" % wat(T),
-     T, lambda env, r: int(signed(env["b"], 32) < signed(env["d"], 32)) + (7 if r else 9),
+     T, lambda env, r: int(signed(env["b"], 32) < signed(env["d"], 32)) - (7 if r else 9),
      ["\\sccmp\\s=1", "\\scset\\s=1"]),
     ("armsel", "a chain that is a select's arm as well as its condition: the csel reads the flags",
      "    (local $t i32)\n"

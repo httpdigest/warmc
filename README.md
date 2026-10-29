@@ -1408,7 +1408,12 @@ flags read by the `csel` or `b.cond` where `cset`s, an `and` and a test of
 it would each take a cycle: musl's `strtod` carries its first limb round a
 loop by `k == a && !x[k]` (`cbench/strtod` takes 0.85 the time). The
 selects on a compare read its flags, not a `cset` of them, when only
-instructions that leave the flags as they are come between. A branch on one
+instructions that leave the flags as they are come between. An add of a
+compare's 0 or 1 -- for an i64, of its zero extension -- is the compare and
+a `cinc` of the other operand, where a `cset` made the 0 or 1 and an `add`
+added it: a branchless count such as Rust's partition, whose count gives
+the next element's address (`hsbench/integer` takes 0.97 the time,
+`rsbench/tokenize` 0.98). A branch on one
 bit of a value is a `tbz` or `tbnz`, its mask in no register -- made again
 as a `tst` and a `b.cond` in a function where one does not reach its target,
 32 KB -- and a select or branch on a wider mask is a `tst` the `csel` or

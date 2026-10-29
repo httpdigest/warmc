@@ -633,6 +633,7 @@ typedef struct {
   uint64_t reassoc;
   uint64_t cmp_reused;
   uint64_t csel_fused;
+  uint64_t cincs;        /* adds of a compare made cinc on its flags */
   uint64_t mul_wide;     /* 64x64 multiplies in halves made mul, mulhu or mulhs */
   uint64_t fma_fused;    /* -ffma: multiplies fused into the add reading them */
   uint64_t bitrevs;      /* bit reversals written as swaps made one (I_BITREV) */
