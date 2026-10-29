@@ -643,6 +643,7 @@ typedef struct {
   uint64_t bfi_apart;    /* bfi results kept from the parameter of their field */
   uint64_t ccmp_chains;  /* ands and ors of compares made as cmp and ccmp */
   uint64_t loop_tops;    /* loops laid out with their latch above the header */
+  uint64_t loop_consts;  /* constants a loop reads from a copy made over it */
   uint64_t small_loops;  /* loops aligned to 64 bytes as small, in code emitted */
   uint64_t slp_groups;   /* stores of alike lanes made one vector store */
 
