@@ -640,14 +640,14 @@
 ;; run: two 0 1 0 100 0 0 0x0000000000000000 0x0000000000000000 => i32:18
 ;; run: two 0 1 1 4294967295 0 0 0x0000000000000000 0x0000000000000000 => i32:18
 ;; run: two 0 0 0 5 0 0 0x0000000000000000 0x0000000000000000 => i32:-9
-;; run: clob 0 0 1 3 0 0 0x0000000000000000 0x0000000000000000 => i32:19
-;; run: clob 0 1 0 100 0 0 0x0000000000000000 0x0000000000000000 => i32:19
-;; run: clob 0 1 1 4294967295 0 0 0x0000000000000000 0x0000000000000000 => i32:18
-;; run: clob 0 0 0 5 0 0 0x0000000000000000 0x0000000000000000 => i32:6
-;; run: apart 0 0 1 3 0 0 0x0000000000000000 0x0000000000000000 => i32:10
-;; run: apart 0 1 0 100 0 0 0x0000000000000000 0x0000000000000000 => i32:10
-;; run: apart 0 1 1 4294967295 0 0 0x0000000000000000 0x0000000000000000 => i32:9
-;; run: apart 0 0 0 5 0 0 0x0000000000000000 0x0000000000000000 => i32:8
+;; run: clob 0 0 1 3 0 0 0x0000000000000000 0x0000000000000000 => i32:-3
+;; run: clob 0 1 0 100 0 0 0x0000000000000000 0x0000000000000000 => i32:-3
+;; run: clob 0 1 1 4294967295 0 0 0x0000000000000000 0x0000000000000000 => i32:-4
+;; run: clob 0 0 0 5 0 0 0x0000000000000000 0x0000000000000000 => i32:-4
+;; run: apart 0 0 1 3 0 0 0x0000000000000000 0x0000000000000000 => i32:-8
+;; run: apart 0 1 0 100 0 0 0x0000000000000000 0x0000000000000000 => i32:-8
+;; run: apart 0 1 1 4294967295 0 0 0x0000000000000000 0x0000000000000000 => i32:-9
+;; run: apart 0 0 0 5 0 0 0x0000000000000000 0x0000000000000000 => i32:-6
 ;; run: armsel 0 0 1 3 0 0 0x0000000000000000 0x0000000000000000 => i32:0
 ;; run: armsel 0 1 0 100 0 0 0x0000000000000000 0x0000000000000000 => i32:1
 ;; run: armsel 0 1 1 4294967295 0 0 0x0000000000000000 0x0000000000000000 => i32:1
@@ -923,18 +923,18 @@
     (local.set $t (i32.and (i32.eq (local.get $a) (local.get $b)) (i32.eqz (local.get $c))))
     (i32.add (select (local.get $a) (i32.const 7) (local.get $t))
              (select (i32.sub (local.get $b) (i32.const 9)) (i32.const 11) (local.get $t))))
-  ;; two selects on one chain, a compare between them: the second tests the cset
+  ;; two selects on one chain, a compare between them -- subtracted, which no cinc takes: the second tests the cset
   (func $clob (export "clob") (param $a i32) (param $b i32) (param $c i32) (param $d i32) (param $x i64) (param $y i64) (param $p f64) (param $q f64) (result i32)
     (local $t i32)
     (local.set $t (i32.and (i32.eq (local.get $a) (local.get $b)) (i32.eqz (local.get $c))))
     (i32.add (select (local.get $a) (i32.const 7) (local.get $t))
-             (i32.add (i32.lt_s (local.get $b) (local.get $d))
+             (i32.sub (i32.lt_s (local.get $b) (local.get $d))
                       (select (local.get $d) (i32.const 11) (local.get $t)))))
-  ;; a compare between a chain and the select on it: the chain is made at the csel
+  ;; a compare between a chain and the select on it -- subtracted, which no cinc takes: the chain is made at the csel
   (func $apart (export "apart") (param $a i32) (param $b i32) (param $c i32) (param $d i32) (param $x i64) (param $y i64) (param $p f64) (param $q f64) (result i32)
     (local $t i32)
     (local.set $t (i32.and (i32.eq (local.get $a) (local.get $b)) (i32.eqz (local.get $c))))
-    (i32.add (i32.lt_s (local.get $b) (local.get $d))
+    (i32.sub (i32.lt_s (local.get $b) (local.get $d))
              (select (i32.const 7) (i32.const 9) (local.get $t))))
   ;; a chain that is a select's arm as well as its condition: the csel reads the flags
   (func $armsel (export "armsel") (param $a i32) (param $b i32) (param $c i32) (param $d i32) (param $x i64) (param $y i64) (param $p f64) (param $q f64) (result i32)

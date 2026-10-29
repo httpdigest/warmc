@@ -121,11 +121,13 @@ static bool describe_compare(Isel *s, Ref v, int *kind, Ref *ra, Ref *rb,
 static void emit_compare_raw(Isel *s, Ref v);
 
 /* Whether u, between a compare and the selects on it, leaves the flags as
-   they are: integer arithmetic none of whose forms writes them, or nothing
-   emitted where it stands. */
+   they are: integer arithmetic none of whose forms writes them -- not an
+   add that makes its compare for a cinc -- or nothing emitted where it
+   stands. */
 static bool keeps_flags(Isel *s, Ref u) {
   if (s->folded[u]) return true;
   if (s->fa && s->fa[u]) return false;
+  if (s->cinc && s->cinc[u]) return false;
   switch (s->f->insts[u].op) {
     case I_ADD: case I_SUB: case I_MUL: case I_AND: case I_OR: case I_XOR:
     case I_SHL: case I_SHRS: case I_SHRU: case I_CONST:
@@ -694,6 +696,18 @@ static void emit_inst(Isel *s, Ref v) {
 
     case I_ADD: case I_SUB: {
 
+      if (s->cinc && s->cinc[v]) {
+        Ref c = a[s->cinc[v] - 1];
+        if (f->insts[c].op == I_EXTENDU) c = ir_args(f, c)[0];
+        emit_compare(s, c);
+        int cc = cond_of(s, c);
+        int x = rd(s, a[2 - s->cinc[v]], S0);
+        int d = wr(s, v, S2);
+        a64_csinc(B, sf, d, x, x, cc_invert(cc));
+        commit(s, v, d);
+        g_stats.cincs++;
+        break;
+      }
       if (s->folded && s->folded[a[1]]) {
         Inst *ci = &f->insts[a[1]];
         Ref *ca = ir_args(f, a[1]);

@@ -145,6 +145,9 @@ typedef struct {
   uint8_t *csinc;
 #define CS_NEG 4u
 #define CS_INV 8u
+  /* x + c, c a compare -- or, for an i64, c's extension -- the add makes:
+     1 + c's slot (find_cincs) */
+  uint8_t *cinc;
   /* an or or xor of x << k and y >> (width - k), both folded: one extr */
   uint8_t *extr;
   /* an or of a bitfield of x (a bfx, folded) and a value with zeros where
