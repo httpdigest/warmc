@@ -81,7 +81,11 @@ Hello world!
     live-range splitting at loop boundaries; a loop parameter shares its
     register with the step its back edge hands it wherever the two are never
     live at once, though a value read on an exit laid out after the loop
-    makes their intervals overlap, so the back edge carries no move
+    makes their intervals overlap, so the back edge carries no move -- but
+    not a `bfi` that inserts the parameter's own field, `hw << 8 & 0xff00
+    | c`, which in the parameter's register would be made through a
+    scratch register and copies on the chain the loop carries
+    (`cbench/strings`' two-byte `strstr` takes 0.85 the time apart)
   - rewrites of what particular producers emit: GHC's trampoline becomes tail
     calls, and Go's stack pointer travels in registers
   - at `-O3`, also fused multiply-adds, the removal of stores into C

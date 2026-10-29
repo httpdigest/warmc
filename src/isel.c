@@ -165,6 +165,9 @@ static IrOp recomp_shape(IrFunc *f, Ref v, Ref *x, Ref *y, uint64_t *c);
 /* memory.copy and memory.fill of memory 0 save nothing round them
    (regalloc.inc memop_preserves) */
 #define RA_MEMOP_PRESERVES 1
+/* an or the selection made a bfi (s->bfi) inserts a field into the other
+   operand in place (regalloc.inc ra_bfi_field) */
+#define RA_BFI 1
 /* a value live across a call in a loop takes callee-saved registers from
    x28 down (regalloc_linear's cs_top) */
 #define RA_CS_TOP 1
@@ -3071,6 +3074,12 @@ static void emit_cold_frame(Isel *s) {
 
 static void regalloc_naive(Isel *s);
 static void regalloc_linear(Isel *s);
+
+/* Of an or the selection made a bfi, the value its field is taken from;
+   REF_NONE for anything else. */
+static Ref ra_bfi_field(Isel *s, Ref v) {
+  return s->bfi && s->bfi[v] ? s->bfx[ir_args(s->f, v)[s->bfi[v] - 1]].src : REF_NONE;
+}
 
 /* Instructions the prologue and epilogue spend on the callee-saved
    registers used so far: one stp and one ldp a pair. */
