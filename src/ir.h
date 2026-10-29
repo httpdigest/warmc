@@ -628,6 +628,7 @@ typedef struct {
   uint64_t param_compares; /* parameters found to be a compare, made again */
   uint64_t key_splits;   /* regions copied below an edge that fixes a value */
   uint64_t bfi_apart;    /* bfi results kept from the parameter of their field */
+  uint64_t ccmp_chains;  /* ands and ors of compares made as cmp and ccmp */
   uint64_t small_loops;  /* loops aligned to 64 bytes as small, in code emitted */
   uint64_t slp_groups;   /* stores of alike lanes made one vector store */
 

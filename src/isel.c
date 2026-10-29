@@ -1620,7 +1620,7 @@ static uint32_t loop_span(Isel *s, uint32_t h, const uint32_t *eo, uint32_t neo,
   uint32_t last = h;
   for (uint32_t j = oi; j < neo && in[eo[j]]; j++) last = eo[j];
   xfree(in); xfree(stk);
-  return blk_end[last] - s->block_off[h];
+  return blk_end[last] - s->block_off[eo[oi]];
 }
 
 static void emit_teardown(Isel *s);
@@ -2114,6 +2114,87 @@ static void find_full_adders(Isel *s, const uint32_t *uses) {
   xfree(lim);
   xfree(moved);
   xfree(pos);
+}
+
+/* A compare a chain takes in: read only there, in its block, and not some
+   other fold's.  An integer compare or eqz, which a ccmp makes -- not one
+   that tests an and, a tst -- or, as the chain's first, which a plain
+   compare makes, any compare. */
+static bool cch_leaf(Isel *s, const uint32_t *uses, const uint8_t *blocked, Ref c,
+                     uint32_t bi, bool first) {
+  IrFunc *f = s->f;
+  uint16_t op = f->insts[c].op;
+  bool icmp = (op >= I_EQ && op <= I_GEU) || op == I_EQZ;
+  if (!icmp && !(first && op >= I_FEQ && op <= I_FGE)) return false;
+  if (uses[c] != 1 || blocked[c] || !fa_own(s, c) || f->insts[c].block != bi) return false;
+  Ref x = ir_args(f, c)[0];
+  return first || !(s->folded[x] && f->insts[x].op == I_AND);
+}
+
+/* What the ccmp of compare c costs beyond itself: 1 where its constant takes
+   a register, being no 5-bit one either way. */
+static int cch_cost(IrFunc *f, Ref c) {
+  if (f->insts[c].op == I_EQZ) return 0;
+  Ref y = ir_args(f, c)[1];
+  if (f->insts[y].op != I_CONST) return 0;
+  uint64_t m = vt_is_64((ValType)f->insts[y].type) ? ~0ull : 0xffffffffu;
+  uint64_t k = f->insts[y].imm & m;
+  return k <= 31 || ((0 - k) & m) <= 31 ? 0 : 1;
+}
+
+/* An and or or of two compares, which a select or a branch tests, as a cmp
+   and a ccmp: the second compare is made where the first leaves the answer
+   open, and where it closes it the ccmp sets flags that say so.  musl's
+   decfloat carries its first limb round a loop by k == a && !x[k]: cmp,
+   ccmp, csel, where two csets, an and and a test of it took five in a row
+   (cbench/strtod).  The first side may itself be a chain, the second is a
+   compare, CCH_MAX compares at most: each is a cycle after the one before.
+   Selects and branches on a chain read its flags; anything else, the 0 or 1
+   a cset makes of them. */
+#define CCH_MAX 4
+static void find_cmp_chains(Isel *s, const uint32_t *uses, const uint8_t *blocked) {
+  IrFunc *f = s->f;
+  uint32_t n = f->ninsts;
+  s->cchain = xcalloc(n ? n : 1, 1);
+  if (warmc_getenv("WARMC_NO_CCMP")) return;
+  uint8_t *len = xcalloc(n ? n : 1, 1);
+  for (uint32_t oi = 0; oi < f->norder; oi++) {
+    uint32_t bi = f->order[oi];
+    Block *b = &f->blocks[bi];
+    for (uint32_t i = 0; i < b->ninsts; i++) {
+      Ref v = b->insts[i];
+      Inst *in = &f->insts[v];
+      if ((in->op != I_AND && in->op != I_OR) || in->nargs != 2 || in->type != VT_I32) continue;
+      if (!fa_own(s, v)) continue;
+      Ref *a = ir_args(f, v);
+      int best = -1;
+      for (int r = 1; r >= 0; r--) {
+        Ref l = a[1 - r];
+        if (!cch_leaf(s, uses, blocked, a[r], bi, false)) continue;
+        bool chain = len[l] && uses[l] == 1 && !blocked[l] && f->insts[l].block == bi &&
+                     len[l] < CCH_MAX;
+        if (!chain && !cch_leaf(s, uses, blocked, l, bi, true)) continue;
+        if (best < 0 || cch_cost(f, a[r]) < cch_cost(f, a[best])) best = r;
+      }
+      if (best < 0) continue;
+      Ref l = a[1 - best];
+      len[v] = (uint8_t)((len[l] ? len[l] : 1) + 1);
+      s->cchain[v] = (uint8_t)(best + 1);
+      s->folded[a[best]] = s->folded[l] = 1;
+    }
+    /* the selects and the branch that test a chain made in the block */
+    for (uint32_t i = 0; i < b->ninsts; i++) {
+      Ref u = b->insts[i];
+      if (f->insts[u].op != I_SELECT || f->insts[u].nargs != 3) continue;
+      Ref c = ir_args(f, u)[2];
+      if (len[c] && !s->folded[c] && uses[c] == 1 && !blocked[c] && f->insts[c].block == bi)
+        s->folded[c] = 1;
+    }
+    if (b->term == T_BRIF && len[b->term_arg] && uses[b->term_arg] == 1 &&
+        !s->folded[b->term_arg] && f->insts[b->term_arg].block == bi)
+      s->fused[b->term_arg] = 1;
+  }
+  xfree(len);
 }
 
 static void analyse_immediates(Isel *s) {
@@ -2841,6 +2922,7 @@ static void analyse_immediates(Isel *s) {
   }
 
   find_full_adders(s, uses);
+  find_cmp_chains(s, uses, blocked);
   xfree(blocked);
 }
 
@@ -4180,6 +4262,7 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
   if (s->cold_frame) g_stats.cold_frames++;
   if (early) g_stats.early_rets++;
   g_stats.small_loops += nsmall;
+  for (uint32_t i = 0; i < f->ninsts; i++) g_stats.ccmp_chains += s->cchain[i] != 0;
   Buf lead;
   memset(&lead, 0, sizeof lead);
   Reloc lead_rel;
@@ -4292,6 +4375,7 @@ give_up:
   xfree(s->relocs); xfree(s->loc); xfree(s->cls); xfree(s->block_off);
   xfree(s->mem_valid_in); xfree(s->prof_site); xfree(s->prof_start);
   xfree(s->fa); s->fa = NULL;
+  xfree(s->cchain); s->cchain = NULL;
   xfree(s->imm_fold); xfree(s->fused); xfree(s->addr_fuse); xfree(s->ptr_fuse);
   xfree(s->zx_fuse); xfree(s->no_remat); xfree(s->paired); xfree(s->nl); xfree(s->pool);
   xfree(s->folded); xfree(s->uses); xfree(s->bfx); xfree(s->pinned); xfree(s->csinc);

@@ -1401,7 +1401,14 @@ not made. A limb of a multi-word add as GMP's generic C writes it, `s = u +
 v`, `r = s + cin`, carry out `(s < u) | (r < s)`, is one `adcs` on arm64,
 and a subtract's one `sbcs`; the next limb finds its carry in the flag
 still, so a chain of limbs is a chain of `adcs`, a cycle each, with a
-`cset` beside each for the carry's register (hsbench/integer).
+`cset` beside each for the carry's register (hsbench/integer). On arm64 an
+and or or of compares that a select or branch tests, up to four compares, is
+a `cmp` and a `ccmp` (or `ccmn`) for each compare after the first, its
+flags read by the `csel` or `b.cond` where `cset`s, an `and` and a test of
+it would each take a cycle: musl's `strtod` carries its first limb round a
+loop by `k == a && !x[k]` (`cbench/strtod` takes 0.85 the time). The
+selects on a compare read its flags, not a `cset` of them, when only
+instructions that leave the flags as they are come between.
 From `-O1` a `br_table` of at most eight distinct
 edges becomes a tree of compares, and any other a jump table, whose entries
 on arm64 are halfwords, each its target's distance in instructions; a
