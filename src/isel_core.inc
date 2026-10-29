@@ -255,6 +255,12 @@ typedef struct {
      compare.  NULL on x86-64. */
   uint8_t *cchain;
 
+  /* Branches on one bit of a value, tbz and tbnz (find_tst_conds): at the
+     condition, one more than the bit; and whether one of them did not reach
+     its target. */
+  uint8_t *tbit;
+  bool tbz_far;
+
   int fl_kind;
   Ref fl_a, fl_b;
   uint64_t fl_imm;

@@ -373,6 +373,46 @@ def far_branch():
     return bin_, [("far_ok", "i32:250"),
                   ("far_trap", "trap:integer divide by zero")]
 
+def tbz_far():
+    """A test of one bit whose branch cannot reach past what it guards.
+
+    A branch on one bit is tbz or tbnz on arm64 (isel.c find_tbits), whose
+    14-bit displacement reaches 32 KB; ten thousand stores, the arm a set
+    bit runs, are well past that, and the function is made again with that
+    branch a tst and a b.cond (f->no_tbz).  Both ways out of each test are
+    taken: `set` and `clear` call the function whose arm runs where bit 2 of
+    five times its argument is set, `zset` and `zclear` the one whose arm
+    runs where it is clear (an eqz of the and) -- a product, which no early
+    return ahead of the prologue makes, so that the test is the branch's.
+    Each answers 100 where its arm ran, 0 where it did not -- from a local,
+    as the calls share one memory.
+    """
+    def body(code, locals_=b"\x00"):
+        return leb(len(locals_ + code)) + locals_ + code
+
+    fill = b"".join(i32c(i * 4) + i32c(i) + b"\x36\x02\x00" for i in range(10000))
+    ran = b"\x20\x01"                                          # local.get 1
+    bit = b"\x20\x00" + i32c(5) + b"\x6c" + i32c(4) + b"\x71"   # x * 5 & 4
+    arm = b"\x04\x40" + fill + i32c(100) + b"\x21\x01\x0b"     # if ... local 1 = 100 end
+    one = b"\x01\x01\x7f"                                      # an i32 local
+    bin_ = module([
+        section(1, vec([functype([I32], [I32]), functype([], [I32])])),
+        section(3, vec([leb(0), leb(0), leb(1), leb(1), leb(1), leb(1)])),
+        section(5, vec([bytes([0]) + leb(1)])),
+        section(7, vec([name("set") + b"\x00" + leb(2), name("clear") + b"\x00" + leb(3),
+                        name("zset") + b"\x00" + leb(4), name("zclear") + b"\x00" + leb(5)])),
+        section(10, vec([
+            body(bit + arm + ran + END, one),
+            body(bit + b"\x45" + arm + ran + END, one),
+            body(i32c(4) + b"\x10" + leb(0) + END),
+            body(i32c(2) + b"\x10" + leb(0) + END),
+            body(i32c(2) + b"\x10" + leb(1) + END),
+            body(i32c(4) + b"\x10" + leb(1) + END),
+        ])),
+    ])
+    return bin_, [("set", "i32:100"), ("clear", "i32:0"),
+                  ("zset", "i32:100"), ("zclear", "i32:0")]
+
 def deep_cfg():
     """A control-flow graph deeper than a C stack can recurse over.
 
@@ -476,7 +516,7 @@ def wasi_compact_imports():
 CASES = {"initexpr": initexpr, "subtyping": subtyping,
          "exception_bt": exception_bt, "table64_limits": table64_limits,
          "table64_small": table64_small, "seg64_offsets": seg64_offsets,
-         "seg64_offsets_ok": seg64_offsets_ok, "deep_cfg": deep_cfg, "far_branch": far_branch,
+         "seg64_offsets_ok": seg64_offsets_ok, "deep_cfg": deep_cfg, "far_branch": far_branch, "tbz_far": tbz_far,
          "wasi_compact_imports": wasi_compact_imports}
 
 def main():

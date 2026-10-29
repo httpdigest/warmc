@@ -79,6 +79,12 @@ static bool describe_compare(Isel *s, Ref v, int *kind, Ref *ra, Ref *rb,
   *rb = REF_NONE;
   *imm = 0;
 
+  if (in->op == I_AND) {
+    *kind = 1; *ra = a[0]; *rb = a[1];
+    *sf = is64(f, v) ? SF64 : SF32;
+    return cmp_operand_stable(s, a[0]) &&
+           (f->insts[a[1]].op == I_CONST || cmp_operand_stable(s, a[1]));
+  }
   if (s->folded && s->folded[a[0]] && f->insts[a[0]].op == I_AND) {
     Ref *ca = ir_args(f, a[0]);
     *kind = 1; *ra = ca[0]; *rb = ca[1];
@@ -101,9 +107,10 @@ static bool describe_compare(Isel *s, Ref v, int *kind, Ref *ra, Ref *rb,
   if (is_imm_at(s, v, 1, a[1])) {
     uint64_t c = imm_of(s, a[1]);
     uint64_t m = *sf ? c : (c & 0xffffffffu);
-    uint64_t neg = (uint64_t)(-(int64_t)(*sf ? (int64_t)m : (int64_t)(int32_t)m));
-
-    if (m > 0xfff && neg > 0xfff) return false;
+    uint32_t i12;
+    int lsl;
+    bool neg;
+    if (!recomp_addsub_imm(m, *sf, &i12, &lsl, &neg)) return false;
     *kind = 2; *ra = a[0]; *imm = m;
     return cmp_operand_stable(s, a[0]);
   }
@@ -184,9 +191,12 @@ static void emit_compare_raw(Isel *s, Ref v) {
   Inst *in = &f->insts[v];
   Ref *a = ir_args(f, v);
 
-  if (s->folded && s->folded[a[0]] && f->insts[a[0]].op == I_AND) {
-    Ref *ca = ir_args(f, a[0]);
-    int csf = is64(f, a[0]) ? SF64 : SF32;
+  /* an and a select or branch tests (find_tst_conds): its tst */
+  Ref and = in->op == I_AND ? v
+          : s->folded && s->folded[a[0]] && f->insts[a[0]].op == I_AND ? a[0] : REF_NONE;
+  if (and != REF_NONE) {
+    Ref *ca = ir_args(f, and);
+    int csf = is64(f, and) ? SF64 : SF32;
     int x = rd(s, ca[0], S0);
     uint32_t enc;
     if (f->insts[ca[1]].op == I_CONST &&
@@ -211,10 +221,14 @@ static void emit_compare_raw(Isel *s, Ref v) {
     /* an immediate compare's register 31 is sp: a zero is made */
     int x = rd(s, a[0], S0);
     uint64_t c = imm_of(s, a[1]);
-    uint64_t m = sf ? c : (c & 0xffffffffu);
-    if (m <= 0xfff) { a64_cmp_imm(B, sf, x, (uint32_t)m); return; }
-    uint64_t neg = (uint64_t)(-(int64_t)(sf ? (int64_t)m : (int64_t)(int32_t)m));
-    if (neg <= 0xfff) { a64_adds_imm(B, sf, RZR, x, (uint32_t)neg, 0); return; }
+    uint32_t i12;
+    int lsl;
+    bool neg;
+    if (recomp_addsub_imm(sf ? c : (c & 0xffffffffu), sf, &i12, &lsl, &neg)) {
+      if (neg) a64_adds_imm(B, sf, RZR, x, i12, lsl);
+      else a64_subs_imm(B, sf, RZR, x, i12, lsl);
+      return;
+    }
     a64_cmp_reg(B, sf, x, rd_zr(s, a[1], S1));
     return;
   }
@@ -267,8 +281,10 @@ static bool sel_fuses(Isel *s, Ref v, uint64_t *imm) {
   if (value || ci->op == I_EQZ) *imm = 0;
   else if (is_imm_at(s, c, 1, ca[1])) {
     uint64_t k = imm_of(s, ca[1]) & m;
-    uint64_t neg = (uint64_t)(-(int64_t)(int32_t)k) & m;
-    if (k <= 0xfff || neg <= 0xfff) *imm = k;
+    uint32_t i12;
+    int lsl;
+    bool neg;
+    if (recomp_addsub_imm(k, SF32, &i12, &lsl, &neg)) *imm = k;
   }
   if (*imm == UINT64_MAX) SF_ADD(ca[1]);
   /* a zero operand is wzr, a register of its own */
@@ -288,13 +304,14 @@ static int cond_of(Isel *s, Ref v) {
   Inst *in = &s->f->insts[v];
   if (s->cchain && s->cchain[v]) return cond_of(s, ir_args(s->f, v)[s->cchain[v] - 1]);
   if (in->op == I_EQZ) return CC_EQ;
+  if (in->op == I_AND) return CC_NE;
   return cc_for(in->op);
 }
 
 static bool is_condition(Isel *s, Ref v) {
   Inst *in = &s->f->insts[v];
   return in->op == I_EQZ || is_int_cmp(in->op) || is_flt_cmp(in->op) ||
-         (s->cchain && s->cchain[v]);
+         (s->cchain && s->cchain[v]) || (in->op == I_AND && s->fused && s->fused[v]);
 }
 
 /* Whether condition cc holds on flags nzcv */
@@ -708,16 +725,12 @@ static void emit_inst(Isel *s, Ref v) {
       int d = wr(s, v, S2);
       if (imm) {
         uint64_t c = imm_of(s, a[1]);
-        uint64_t m = sf ? c : (c & 0xffffffffu);
-        uint64_t neg = (uint64_t)(-(int64_t)(sf ? (int64_t)m : (int64_t)(int32_t)m));
-        bool add = (in->op == I_ADD);
-        if (m <= 0xfff) {
-          if (add) a64_add_imm(B, sf, d, x, (uint32_t)m, 0);
-          else a64_sub_imm(B, sf, d, x, (uint32_t)m, 0);
-        } else {
-          if (add) a64_sub_imm(B, sf, d, x, (uint32_t)neg, 0);
-          else a64_add_imm(B, sf, d, x, (uint32_t)neg, 0);
-        }
+        uint32_t i12;
+        int lsl;
+        bool neg;
+        recomp_addsub_imm(sf ? c : (c & 0xffffffffu), sf, &i12, &lsl, &neg);
+        if ((in->op == I_ADD) != neg) a64_add_imm(B, sf, d, x, i12, lsl);
+        else a64_sub_imm(B, sf, d, x, i12, lsl);
         commit(s, v, d);
         break;
       }
@@ -1049,10 +1062,13 @@ static void emit_inst(Isel *s, Ref v) {
           else if (k == 1 && a[1] == a[0]) ro[k] = ro[0];
           else ro[k] = rd(s, x, S1);
         }
+        uint32_t i12;
+        int lsl;
+        bool neg;
         if (fimm == UINT64_MAX) a64_cmp_reg(B, SF32, r0, r1);
-        else if (fimm <= 0xfff) a64_cmp_imm(B, SF32, r0, (uint32_t)fimm);
-        else a64_adds_imm(B, SF32, RZR, r0,
-                          (uint32_t)((uint64_t)(-(int64_t)(int32_t)fimm) & 0xffffffffu), 0);
+        else if (recomp_addsub_imm(fimm, SF32, &i12, &lsl, &neg) && neg)
+          a64_adds_imm(B, SF32, RZR, r0, i12, lsl);
+        else a64_subs_imm(B, SF32, RZR, r0, i12, lsl);
         int cc = value ? CC_NE : cond_of(s, c);
         a64_csel(B, SF32, d, ro[0], ro[1], cc);
         commit(s, v, d);
@@ -3276,7 +3292,12 @@ static void emit_block(Isel *s, uint32_t bi, uint32_t next_bi) {
       Ref c = b->term_arg;
 
       int kind = 0, cc = CC_NE, zreg = 0, zsf = SF32;
-      if (s->fused && s->fused[c] && is_condition(s, c)) {
+      if (s->tbit && s->tbit[c]) {
+        Ref and = f->insts[c].op == I_AND ? c : ir_args(f, c)[0];
+        kind = (s->tbit[c] & TBIT_SET) ? 4 : 3;
+        cc = (s->tbit[c] & ~TBIT_SET) - 1;
+        zreg = rd(s, ir_args(f, and)[0], S0);
+      } else if (s->fused && s->fused[c] && is_condition(s, c)) {
         Inst *ci = &f->insts[c];
         Ref *ca = ir_args(f, c);
         bool tst = s->folded[ca[0]] && f->insts[ca[0]].op == I_AND;
@@ -3358,7 +3379,7 @@ static void emit_block(Isel *s, uint32_t bi, uint32_t next_bi) {
       if (invert) {
         Edge *tmp = t; t = e; e = tmp;
         if (kind == 0) cc = cc_invert(cc);
-        else kind = (kind == 1) ? 2 : 1;
+        else kind = br_kind_invert(kind);
         Move *mtmp = tm; tm = em; em = mtmp;
         int ntmp = tn; tn = en; en = ntmp;
       }
@@ -3370,7 +3391,7 @@ static void emit_block(Isel *s, uint32_t bi, uint32_t next_bi) {
         Edge *cold = NULL; Move *cmv = NULL; int cn = 0;
         if (t_next && !e_next && !tmoves && emoves && s0 >= s1) {
           cold = e; cmv = em; cn = en;
-          if (kind == 0) cc = cc_invert(cc); else kind = (kind == 1) ? 2 : 1;
+          if (kind == 0) cc = cc_invert(cc); else kind = br_kind_invert(kind);
         } else if (e_next && !t_next && !emoves && tmoves && s1 >= s0) {
           cold = t; cmv = tm; cn = tn;
         }
@@ -3397,7 +3418,7 @@ static void emit_block(Isel *s, uint32_t bi, uint32_t next_bi) {
       } else if (!emoves) {
 
         if (kind == 0) cc = cc_invert(cc);
-        else kind = (kind == 1) ? 2 : 1;
+        else kind = br_kind_invert(kind);
         size_t bsite = br_cc(s, kind, cc, zsf, zreg);
         add_fix(s, bsite, !s->far_br, e->target);
         parallel_copy(s, tm, tn);

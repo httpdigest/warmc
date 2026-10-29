@@ -180,6 +180,7 @@ bool a64_patch_ldr_lit(Buf *b, size_t site, size_t target);
 bool a64_patch_b19_ok(Buf *b, size_t site, size_t target);
 bool a64_patch_b26_ok(Buf *b, size_t site, size_t target);
 void a64_patch_b14(Buf *b, size_t site, size_t target);
+bool a64_patch_b14_ok(Buf *b, size_t site, size_t target);
 void a64_patch_adr(Buf *b, size_t site, size_t target);
 
 void a64_fadd(Buf *b, int ft, int rd, int rn, int rm);

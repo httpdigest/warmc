@@ -327,10 +327,13 @@ static int produce_once(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
                         uint32_t out_bytes, FuncOut *fout, bool far,
                         SplitCtl *sc, bool collect) {
   int r = g_target->produce_body(f, obj, opt, out_bytes, fout, far, sc, collect);
-  if (r == 4)
+  /* again with the loops measured, and once more where a test-bit branch
+     that reached before the loops moved no longer does */
+  for (int k = 0; r == 4 && k < 2; k++)
     r = g_target->produce_body(f, obj, opt, out_bytes, fout, far, sc, collect);
   f->loop_bytes = NULL;
   f->loop_phase = 0;
+  f->no_tbz = false;
   if (f->ra_keep) {
     f->ra_keep_drop(f->ra_keep);
     f->ra_keep = NULL;

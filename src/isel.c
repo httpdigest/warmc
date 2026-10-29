@@ -431,12 +431,24 @@ static void emit_trap(Isel *s, int code) {
   a64_brk(B, 0);
 }
 
+/* The branch where cc holds (kind 0), where zreg is zero (1) or not (2),
+   or where its bit cc is clear (3) or set (4): tbz and tbnz, or, where one
+   did not reach (f->no_tbz), a tst of the bit and a b.eq or b.ne. */
 static size_t br_cc(Isel *s, int kind, int cc, int zsf, int zreg) {
+  if (kind >= 3 && (s->f->no_tbz || s->far_br)) {
+    uint32_t enc;
+    a64_logical_imm(1ull << cc, SF64, &enc);
+    a64_tst_imm(B, SF64, zreg, enc);
+    cc = kind == 3 ? CC_EQ : CC_NE;
+    kind = 0;
+  }
   if (!s->far_br) {
     size_t at = B->len;
     if (kind == 0) a64_bcond(B, cc, 0);
     else if (kind == 1) a64_cbz(B, zsf, zreg, 0);
-    else a64_cbnz(B, zsf, zreg, 0);
+    else if (kind == 2) a64_cbnz(B, zsf, zreg, 0);
+    else if (kind == 3) a64_tbz(B, zreg, cc, 0);
+    else a64_tbnz(B, zreg, cc, 0);
     return at;
   }
 
@@ -446,6 +458,12 @@ static size_t br_cc(Isel *s, int kind, int cc, int zsf, int zreg) {
   size_t at = B->len;
   a64_b(B, 0);
   return at;
+}
+
+/* The kind of branch br_cc makes where the condition fails */
+static int br_kind_invert(int kind) {
+  static const int inv[] = { 0, 2, 1, 4, 3 };
+  return inv[kind];
 }
 
 /* A label bound right after a spill store is a join: the paths arriving
@@ -464,6 +482,12 @@ static void patch_b26_checked(Isel *s, size_t site, size_t target) {
 static void br_patch(Isel *s, size_t site, size_t target) {
   label_at(s, target);
   if (s->far_br) { patch_b26_checked(s, site, target); return; }
+  uint32_t w;
+  memcpy(&w, B->data + site, 4);
+  if ((w & 0x7e000000u) == 0x36000000u) {
+    if (!a64_patch_b14_ok(B, site, target)) s->tbz_far = true;
+    return;
+  }
   if (!a64_patch_b19_ok(B, site, target)) s->far_br_needed = true;
 }
 
@@ -2198,6 +2222,86 @@ static void find_cmp_chains(Isel *s, const uint32_t *uses, const uint8_t *blocke
   xfree(len);
 }
 
+/* An and that only a select or the branch of its block tests, as a value
+   against zero: a tst whose flags the csel or b.ne reads, where the and's
+   result in a register and a compare of it took two (cbench/bitfield's
+   masked field tests).  Not one another fold has taken -- a compare chain,
+   whose ands find_cmp_chains folds first -- nor one whose constant no
+   logical immediate is. */
+/* The bit an and with constant c tests, or -1 where c is not one bit */
+static int one_bit(IrFunc *f, Ref c, int sf) {
+  if (f->insts[c].op != I_CONST) return -1;
+  uint64_t k = sf ? f->insts[c].imm : (f->insts[c].imm & 0xffffffffu);
+  return k && !(k & (k - 1)) ? __builtin_ctzll(k) : -1;
+}
+
+/* A branch on one bit of a value -- the and of it with that bit, or eqz,
+   eq 0 or ne 0 of such an and -- is tbz or tbnz on the value, the and no
+   instruction and its constant in no register: s->tbit at the condition
+   is one more than the bit, with TBIT_SET where the branch is taken on a
+   set bit. */
+#define TBIT_SET 0x80
+static void find_tbits(Isel *s, const uint32_t *uses, uint32_t bi) {
+  IrFunc *f = s->f;
+  Block *b = &f->blocks[bi];
+  if (b->term != T_BRIF || warmc_getenv("WARMC_NO_TBZ")) return;
+  Ref c = b->term_arg, and = c;
+  Inst *ci = &f->insts[c];
+  bool set = true;
+  if (ci->op == I_EQZ || ((ci->op == I_EQ || ci->op == I_NE) && ci->nargs == 2 &&
+                          f->insts[ir_args(f, c)[1]].op == I_CONST &&
+                          (f->insts[ir_args(f, c)[1]].imm &
+                           (vt_is_64((ValType)f->insts[ir_args(f, c)[0]].type) ? ~0ull : 0xffffffffu)) == 0)) {
+    if (!s->fused[c]) return;
+    and = ir_args(f, c)[0];
+    set = ci->op == I_NE;
+  } else if (ci->op != I_AND || !s->fused[c]) {
+    return;
+  }
+  Inst *ai = &f->insts[and];
+  if (ai->op != I_AND || ai->nargs != 2 || ai->block != bi) return;
+  Ref *aa = ir_args(f, and);
+  int bit = one_bit(f, aa[1], vt_is_64((ValType)ai->type) ? SF64 : SF32);
+  if (bit < 0 || s->folded[aa[0]] || f->insts[aa[0]].op == I_CONST) return;
+  if (and != c) {
+    /* the and is the compare's alone, made by nothing else */
+    if (!s->folded[and] && (uses[and] != 1 || !fa_own(s, and))) return;
+    s->folded[and] = 1;
+  }
+  s->tbit[c] = (uint8_t)((bit + 1) | (set ? TBIT_SET : 0));
+}
+
+static void find_tst_conds(Isel *s, const uint32_t *uses) {
+  IrFunc *f = s->f;
+  s->tbit = xcalloc(f->ninsts ? f->ninsts : 1, 1);
+  if (warmc_getenv("WARMC_NO_TSTCOND")) goto bits;
+  for (uint32_t oi = 0; oi < f->norder; oi++) {
+    uint32_t bi = f->order[oi];
+    Block *b = &f->blocks[bi];
+    for (uint32_t i = 0; i <= b->ninsts; i++) {
+      bool term = i == b->ninsts;
+      if (term && b->term != T_BRIF) break;
+      Ref u = term ? REF_NONE : b->insts[i];
+      if (!term && (f->insts[u].op != I_SELECT || f->insts[u].nargs != 3)) continue;
+      Ref c = term ? b->term_arg : ir_args(f, u)[2];
+      Inst *ci = &f->insts[c];
+      if (ci->op != I_AND || ci->nargs != 2 || uses[c] != 1 || ci->block != bi) continue;
+      if (!fa_own(s, c)) continue;
+      Ref *ca = ir_args(f, c);
+      if (s->folded[ca[0]] || s->folded[ca[1]]) continue;
+      int sf = vt_is_64((ValType)ci->type) ? SF64 : SF32;
+      uint32_t enc;
+      if (f->insts[ca[1]].op == I_CONST &&
+          !a64_logical_imm(sf ? f->insts[ca[1]].imm : (f->insts[ca[1]].imm & 0xffffffffu), sf, &enc))
+        continue;
+      if (term) s->fused[c] = 1;
+      else s->folded[c] = 1;
+    }
+  }
+bits:
+  for (uint32_t oi = 0; oi < f->norder; oi++) find_tbits(s, uses, f->order[oi]);
+}
+
 static void analyse_immediates(Isel *s) {
   IrFunc *f = s->f;
   uint32_t n = f->ninsts;
@@ -2924,6 +3028,7 @@ static void analyse_immediates(Isel *s) {
 
   find_full_adders(s, uses);
   find_cmp_chains(s, uses, blocked);
+  find_tst_conds(s, uses);
   xfree(blocked);
 }
 
@@ -3520,15 +3625,14 @@ static bool early_make(IrFunc *f, const EarlyRet *er, const Edge *ed, Ref v, int
         uint64_t k = sf ? yi->imm : (yi->imm & 0xffffffffu);
         if (k == 0 && in->op != I_AND) return early_make(f, er, ed, x, d, b, depth + 1);
         if (in->op == I_ADD || in->op == I_SUB) {
-          bool sub = in->op == I_SUB;
-          uint64_t neg = sf ? 0 - k : (uint32_t)(0 - (uint32_t)k);
+          bool sub = in->op == I_SUB, neg;
           uint32_t imm;
-          if (k <= 0xfff) imm = (uint32_t)k;
-          else if (neg <= 0xfff) { imm = (uint32_t)neg; sub = !sub; }
-          else return false;
+          int lsl;
+          if (!recomp_addsub_imm(k, sf, &imm, &lsl, &neg)) return false;
+          if (neg) sub = !sub;
           if (!early_make(f, er, ed, x, d, b, depth + 1)) return false;
-          if (b && sub) a64_sub_imm(b, sf, d, d, imm, 0);
-          else if (b) a64_add_imm(b, sf, d, d, imm, 0);
+          if (b && sub) a64_sub_imm(b, sf, d, d, imm, lsl);
+          else if (b) a64_add_imm(b, sf, d, d, imm, lsl);
           return true;
         }
         uint32_t enc;
@@ -4254,7 +4358,8 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
                 s->ncsa_vals, s->csa_consumed, f->m->funcs[f->func_index].sym);
 
   if (s->far_br_needed) goto give_up;
-  if (refit) {
+  if (refit || s->tbz_far) {
+    if (s->tbz_far) f->no_tbz = true;
     if (!s->naive) ra_keep_save(s, &ra_added);
     split_ret = 4;
     goto give_up;
@@ -4378,6 +4483,7 @@ give_up:
   xfree(s->mem_valid_in); xfree(s->prof_site); xfree(s->prof_start);
   xfree(s->fa); s->fa = NULL;
   xfree(s->cchain); s->cchain = NULL;
+  xfree(s->tbit); s->tbit = NULL;
   xfree(s->imm_fold); xfree(s->fused); xfree(s->addr_fuse); xfree(s->ptr_fuse);
   xfree(s->zx_fuse); xfree(s->no_remat); xfree(s->paired); xfree(s->nl); xfree(s->pool);
   xfree(s->folded); xfree(s->uses); xfree(s->bfx); xfree(s->pinned); xfree(s->csinc);
@@ -4405,16 +4511,22 @@ static bool imm_ok_a64(IrFunc *f, Ref user, uint32_t idx, uint64_t cval, ValType
   int sf = vt_is_64(ct) ? SF64 : SF32;
   uint64_t masked = sf ? cval : (cval & 0xffffffffu);
   switch (in->op) {
+    /* 12 bits of the constant or its negation, or for an add or sub 12
+       shifted by 12 (0x400000 in cbench/bitfield's kill count): a compare
+       of a shifted immediate is not fused with the b.cond after it on
+       Apple's cores, as the plain one is -- 1.2 cycles a test and branch
+       became 2, and gobench/typeswitch ran 6% longer -- so it takes its
+       constant from a register */
     case I_ADD: case I_SUB:
-      if (idx != 1) return false;
-      if (masked <= 0xfff) return true;
-
-      return (0 - (uint64_t)(sf ? (int64_t)masked : (int64_t)(int32_t)masked)) <= 0xfff;
     case I_EQ: case I_NE: case I_LTS: case I_LTU: case I_GTS: case I_GTU:
-    case I_LES: case I_LEU: case I_GES: case I_GEU:
+    case I_LES: case I_LEU: case I_GES: case I_GEU: {
       if (idx != 1) return false;
-      if (masked <= 0xfff) return true;
-      return (0 - (uint64_t)(sf ? (int64_t)masked : (int64_t)(int32_t)masked)) <= 0xfff;
+      uint32_t i12;
+      int lsl;
+      bool neg;
+      if (!recomp_addsub_imm(masked, sf, &i12, &lsl, &neg)) return false;
+      return !lsl || in->op == I_ADD || in->op == I_SUB;
+    }
     case I_SHL: case I_SHRS: case I_SHRU: case I_ROTR: case I_ROTL:
       return idx == 1;
     /* A constant lane shift is an immediate of ushr/shl/sshr; the register
