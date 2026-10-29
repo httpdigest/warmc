@@ -922,10 +922,11 @@ static void mark_crosses_call(Isel *s, IrFunc *f, Ref site,
 
 #define SPLIT_BUDGET ((uint64_t)8 * 1024 * 1024)
 
-/* Is this register free across every one of the loop's block spans?  The
-   heap holds every range assigned above (dead owners excluded); the spans
-   are disjoint block extents sorted by position, so one binary search per
-   held range answers it. */
+/* Does the heap show this register free across every one of the loop's
+   block spans?  It holds the ranges the scan has not shed (dead owners
+   excluded) -- not all of them; see the split planner.  The spans are
+   disjoint block extents sorted by position, so one binary search per held
+   range answers it. */
 static bool split_reg_free(const OccHeap *h, const uint8_t *gone,
                            const Range *spans, uint32_t nspans,
                            uint64_t *work) {
@@ -3042,8 +3043,15 @@ static void regalloc_linear(Isel *s) {
      A spilled web reloads once per block per iteration inside a loop; a
      register over just the loop segment costs one move at the boundary
      instead.  Find each natural loop, ask which spilled webs live in it,
-     and check a register is genuinely free there -- the occupancy heaps
-     hold every assignment the scan just made.  Two shapes go in the plan:
+     and count the registers free there by the occupancy heaps.  The count
+     is optimistic: the scan sheds from the heaps every range that ended
+     before the interval it was placing, so but in the function's last
+     stretch they show registers free that the allocation holds, two to
+     four times as many as there are.  That is wanted -- the retry
+     allocates again and frees registers the first allocation did not, and
+     checked against every interval each register holds the planner asked
+     half as often and gobench/arrays lost 3.6% for a grant it no longer
+     made.  Two shapes go in the plan:
      a header param of a spilled web is cut from its entry edges (veto),
      and from the params outside the loop that what it carries flows into,
      and a slot-resident value defined outside the loop but used inside is
