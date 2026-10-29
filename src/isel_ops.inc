@@ -113,31 +113,56 @@ static bool describe_compare(Isel *s, Ref v, int *kind, Ref *ra, Ref *rb,
 
 static void emit_compare_raw(Isel *s, Ref v);
 
+/* Whether u, between a compare and the selects on it, leaves the flags as
+   they are: integer arithmetic none of whose forms writes them, or nothing
+   emitted where it stands. */
+static bool keeps_flags(Isel *s, Ref u) {
+  if (s->folded[u]) return true;
+  if (s->fa && s->fa[u]) return false;
+  switch (s->f->insts[u].op) {
+    case I_ADD: case I_SUB: case I_MUL: case I_AND: case I_OR: case I_XOR:
+    case I_SHL: case I_SHRS: case I_SHRU: case I_CONST:
+    case I_EXTENDU: case I_EXTENDS: case I_WRAP:
+      return true;
+    default:
+      return false;
+  }
+}
+
 /* Whether a compare's 0/1 is never read: every use of it is a select on it,
-   and those selects are the instructions right after it.  Each then reads the
-   flags the compare set -- a select and the operand reads before it emit
-   loads, moves and csel-family instructions, none of which write the flags --
-   so the cset would be dead, and it is what argmin's loop would spend an
-   issue slot on per element. */
+   and those selects follow it with only instructions that keep the flags
+   between (one that read it would be a use no select is).  Each then reads the flags the compare set -- a select and the
+   operand reads before it emit loads, moves and csel-family instructions,
+   none of which write the flags -- so the cset would be dead, and it is what
+   argmin's loop would spend an issue slot on per element. */
 static bool flags_only(Isel *s, Ref v) {
   IrFunc *f = s->f;
   Block *b = &f->blocks[s->cur_block];
-  uint32_t n = s->uses[v], at = s->cur_pos;
-  if (n == 0 || at + n >= b->ninsts || b->insts[at] != v) return false;
-  for (uint32_t k = 1; k <= n; k++) {
-    Ref u = b->insts[at + k];
+  uint32_t n = s->uses[v], at = s->cur_pos, seen = 0;
+  if (n == 0 || b->insts[at] != v) return false;
+  for (uint32_t k = at + 1; k < b->ninsts && seen < n; k++) {
+    Ref u = b->insts[k];
     Ref *a = ir_args(f, u);
-    if (f->insts[u].op != I_SELECT || a[2] != v || a[0] == v || a[1] == v ||
-        s->paired[u])
+    if (f->insts[u].op == I_SELECT && a[2] == v) {
+      if (a[0] == v || a[1] == v || s->paired[u]) return false;
+      seen++;
+    } else if (!keeps_flags(s, u)) {
       return false;
+    }
   }
-  return true;
+  return seen == n;
 }
+
+static void emit_cmp_chain(Isel *s, Ref v);
 
 static void emit_compare(Isel *s, Ref v) {
   int kind, sf;
   Ref ra, rb;
   uint64_t imm;
+  if (s->cchain && s->cchain[v]) {
+    emit_cmp_chain(s, v);
+    return;
+  }
   bool known = describe_compare(s, v, &kind, &ra, &rb, &imm, &sf);
   if (known && s->fl_kind && s->fl_epoch == B->flags_epoch &&
       kind == s->fl_kind && ra == s->fl_a && rb == s->fl_b &&
@@ -220,6 +245,7 @@ static bool sel_fuses(Isel *s, Ref v, uint64_t *imm) {
   bool icmp = (ci->op >= I_EQ && ci->op <= I_GEU) || ci->op == I_EQZ;
   bool value = !icmp && !is_flt_cmp(ci->op);
   if (!icmp && !value) return false;
+  if (s->cchain && s->cchain[c]) return false;
   if (value && s->folded && s->folded[c]) return false;
   Ref *ca = value ? &a[2] : ir_args(f, c);
   if (is64(f, ca[0]) || is_fp_value(f, ca[0])) return false;
@@ -260,13 +286,61 @@ static bool sel_fuses(Isel *s, Ref v, uint64_t *imm) {
 
 static int cond_of(Isel *s, Ref v) {
   Inst *in = &s->f->insts[v];
+  if (s->cchain && s->cchain[v]) return cond_of(s, ir_args(s->f, v)[s->cchain[v] - 1]);
   if (in->op == I_EQZ) return CC_EQ;
   return cc_for(in->op);
 }
 
 static bool is_condition(Isel *s, Ref v) {
   Inst *in = &s->f->insts[v];
-  return in->op == I_EQZ || is_int_cmp(in->op) || is_flt_cmp(in->op);
+  return in->op == I_EQZ || is_int_cmp(in->op) || is_flt_cmp(in->op) ||
+         (s->cchain && s->cchain[v]);
+}
+
+/* Whether condition cc holds on flags nzcv */
+static bool cc_holds(int cc, int nzcv) {
+  bool n = nzcv & 8, z = nzcv & 4, c = nzcv & 2, v = nzcv & 1, r;
+  switch (cc >> 1) {
+    case 0: r = z; break;
+    case 1: r = c; break;
+    case 2: r = n; break;
+    case 3: r = v; break;
+    case 4: r = c && !z; break;
+    case 5: r = n == v; break;
+    case 6: r = !z && n == v; break;
+    default: return true;
+  }
+  return (cc & 1) ? !r : r;
+}
+
+/* The flags of chain v (find_cmp_chains), on which cond_of(s, v) holds
+   where v is 1: its first side's, then its compare as a ccmp where that
+   side leaves v open -- holds for an and, fails for an or -- and elsewhere
+   the flags on which the compare's condition says what the side did. */
+static void emit_cmp_chain(Isel *s, Ref v) {
+  IrFunc *f = s->f;
+  Ref *a = ir_args(f, v);
+  int r = s->cchain[v] - 1;
+  Ref l = a[1 - r], c = a[r];
+  if (s->cchain[l]) emit_cmp_chain(s, l);
+  else emit_compare_raw(s, l);
+  bool and = f->insts[v].op == I_AND;
+  int lcc = cond_of(s, l), ccc = cond_of(s, c);
+  int nzcv = 0;
+  while (nzcv < 15 && cc_holds(ccc, nzcv) == and) nzcv++;
+  int open = and ? lcc : cc_invert(lcc);
+  Ref *ca = ir_args(f, c);
+  int sf = is64(f, ca[0]) ? SF64 : SF32;
+  /* an immediate form's register 31 is the zero register, as in the other */
+  int x = rd_zr(s, ca[0], S0);
+  if (f->insts[c].op == I_EQZ) { a64_ccmp_imm(B, sf, x, 0, nzcv, open); return; }
+  if (f->insts[ca[1]].op == I_CONST) {
+    uint64_t m = sf ? ~0ull : 0xffffffffu;
+    uint64_t k = f->insts[ca[1]].imm & m;
+    if (k <= 31) { a64_ccmp_imm(B, sf, x, (uint32_t)k, nzcv, open); return; }
+    if (((0 - k) & m) <= 31) { a64_ccmn_imm(B, sf, x, (uint32_t)((0 - k) & m), nzcv, open); return; }
+  }
+  a64_ccmp_reg(B, sf, x, rd_zr(s, ca[1], S1), nzcv, open);
 }
 
 static bool divisor_nonzero(IrFunc *f, Ref v) {
@@ -563,6 +637,19 @@ static void emit_inst(Isel *s, Ref v) {
 
   if (s->fa && s->fa[v]) { emit_full_adder(s, v); return; }
 
+  /* a chain no select or branch takes in: its flags, for the selects on it
+     that follow, and the 0 or 1 of them unless only those read it */
+  if (s->cchain && s->cchain[v]) {
+    bool bare = flags_only(s, v);
+    emit_compare(s, v);
+    int d = wr(s, v, S0), cc = cond_of(s, v);
+    if (!bare) a64_cset(B, SF32, d, cc);
+    commit(s, v, d);
+    s->cmp_ref = v; s->cmp_cc = cc; s->cmp_epoch = B->flags_epoch;
+    s->cmp_bare = bare ? v : REF_NONE;
+    return;
+  }
+
   switch (in->op) {
     case I_NOP: case I_PARAM: break;
 
@@ -815,10 +902,12 @@ static void emit_inst(Isel *s, Ref v) {
     case I_FEQ: case I_FNE: case I_FLT: case I_FGT: case I_FLE: case I_FGE: {
       bool bare = flags_only(s, v);
       uint64_t fimm;
-      /* Read only by selects, the first of which makes the compare itself,
-         right before its csel: this one would be a second copy. */
-      if (bare && !s->no_csel_fuse &&
-          sel_fuses(s, f->blocks[s->cur_block].insts[s->cur_pos + 1], &fimm)) {
+      /* Read only by selects, the first of which, right after it, makes the
+         compare itself before its csel: this one would be a second copy. */
+      Ref nx = s->cur_pos + 1 < f->blocks[s->cur_block].ninsts
+                   ? f->blocks[s->cur_block].insts[s->cur_pos + 1] : REF_NONE;
+      if (bare && !s->no_csel_fuse && f->insts[nx].op == I_SELECT &&
+          ir_args(f, nx)[2] == v && sel_fuses(s, nx, &fimm)) {
         commit(s, v, wr(s, v, S0));
         s->cmp_ref = REF_NONE;
         s->cmp_bare = v;

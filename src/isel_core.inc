@@ -250,6 +250,11 @@ typedef struct {
   uint32_t fa_epoch;
   bool fa_sub;
 
+  /* Compare chains (arm64, find_cmp_chains): at an and or or of compares
+     made as cmp and ccmp, one more than the operand that is the ccmp's
+     compare.  NULL on x86-64. */
+  uint8_t *cchain;
+
   int fl_kind;
   Ref fl_a, fl_b;
   uint64_t fl_imm;

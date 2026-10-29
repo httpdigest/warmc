@@ -70,6 +70,8 @@ void a64_cmp_sp(Buf *b, int rm);
 void a64_neg(Buf *b, int sf, int rd, int rm);
 void a64_cmp_reg(Buf *b, int sf, int rn, int rm);
 void a64_ccmp_imm(Buf *b, int sf, int rn, uint32_t imm5, int nzcv, int cond);
+void a64_ccmn_imm(Buf *b, int sf, int rn, uint32_t imm5, int nzcv, int cond);
+void a64_ccmp_reg(Buf *b, int sf, int rn, int rm, int nzcv, int cond);
 void a64_cmp_imm(Buf *b, int sf, int rn, uint32_t imm12);
 void a64_mul(Buf *b, int sf, int rd, int rn, int rm);
 void a64_madd(Buf *b, int sf, int rd, int rn, int rm, int ra);

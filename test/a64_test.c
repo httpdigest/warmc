@@ -265,6 +265,13 @@ int main(int argc, char **argv) {
 
   /* conditional */
   CASE("csel x0, x1, x2, eq", a64_csel(b, SF64, R0, R1, R2, CC_EQ));
+  CASE("ccmp w3, #5, #4, ne", a64_ccmp_imm(b, SF32, R3, 5, 4, CC_NE));
+  CASE("ccmp x27, #31, #8, ge", a64_ccmp_imm(b, SF64, R27, 31, 8, CC_GE));
+  CASE("ccmn w9, #1, #0, lo", a64_ccmn_imm(b, SF32, R9, 1, 0, CC_CC));
+  CASE("ccmn x2, #17, #2, hi", a64_ccmn_imm(b, SF64, R2, 17, 2, CC_HI));
+  CASE("ccmp wzr, #3, #1, gt", a64_ccmp_imm(b, SF32, RZR, 3, 1, CC_GT));
+  CASE("ccmp w1, w2, #0, eq", a64_ccmp_reg(b, SF32, R1, R2, 0, CC_EQ));
+  CASE("ccmp x28, xzr, #15, le", a64_ccmp_reg(b, SF64, R28, RZR, 15, CC_LE));
   CASE("csinc w3, w4, w5, lt", a64_csinc(b, SF32, R3, R4, R5, CC_LT));
   CASE("cset w6, ne", a64_cset(b, SF32, R6, CC_NE));
   CASE("cset x7, ge", a64_cset(b, SF64, R7, CC_GE));

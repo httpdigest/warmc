@@ -150,11 +150,22 @@ void a64_neg(Buf *b, int sf, int rd, int rm) { a64_sub_reg(b, sf, rd, RZR, rm); 
 void a64_cmp_reg(Buf *b, int sf, int rn, int rm) { a64_subs_reg(b, sf, RZR, rn, rm); }
 void a64_cmp_imm(Buf *b, int sf, int rn, uint32_t imm12) { a64_subs_imm(b, sf, RZR, rn, imm12, 0); }
 
-void a64_ccmp_imm(Buf *b, int sf, int rn, uint32_t imm5, int nzcv, int cond) {
+/* ccmp and ccmn: where cond holds, the flags of rn - x (rn + x), x the
+   5-bit immediate or rm; elsewhere nzcv. */
+static void condcmp(Buf *b, int sf, int op, int rn, uint32_t x, int imm, int nzcv, int cond) {
   b->flags_epoch++;
-  W(((uint32_t)sf << 31) | (1u << 30) | (1u << 29) | (0xD2u << 21) |
-    ((imm5 & 0x1fu) << 16) | ((uint32_t)(cond & 0xf) << 12) | (1u << 11) |
+  W(((uint32_t)sf << 31) | ((uint32_t)op << 30) | (1u << 29) | (0xD2u << 21) |
+    ((x & 0x1fu) << 16) | ((uint32_t)(cond & 0xf) << 12) | ((uint32_t)imm << 11) |
     (M5(rn) << 5) | (uint32_t)(nzcv & 0xf));
+}
+void a64_ccmp_imm(Buf *b, int sf, int rn, uint32_t imm5, int nzcv, int cond) {
+  condcmp(b, sf, 1, rn, imm5, 1, nzcv, cond);
+}
+void a64_ccmn_imm(Buf *b, int sf, int rn, uint32_t imm5, int nzcv, int cond) {
+  condcmp(b, sf, 0, rn, imm5, 1, nzcv, cond);
+}
+void a64_ccmp_reg(Buf *b, int sf, int rn, int rm, int nzcv, int cond) {
+  condcmp(b, sf, 1, rn, (uint32_t)rm, 0, nzcv, cond);
 }
 
 static void dp3(Buf *b, int sf, int op31, int rd, int rn, int rm, int o0, int ra) {
