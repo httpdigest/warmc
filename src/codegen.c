@@ -323,6 +323,126 @@ static void seal_tests(IrFunc *f) {
    it aligns and wants to place them again knowing their sizes (4).  The
    sizes are for that code only, so they go once the second run has used
    them. */
+/* The copies loop_consts makes, by header and constant: an open-addressed
+   table, never more than half full. */
+typedef struct { uint64_t *key; Ref *val; uint32_t cap, n; } LcMap;
+
+static uint32_t lc_slot(const LcMap *m, uint64_t k) {
+  uint32_t i = (uint32_t)(k * 0x9e3779b97f4a7c15ull >> 40) & (m->cap - 1);
+  while (m->key[i] && m->key[i] != k) i = (i + 1) & (m->cap - 1);
+  return i;
+}
+
+/* the copy of constant c over the loop headed by h, made the first time */
+static Ref lc_copy(IrFunc *f, LcMap *m, uint32_t h, Ref c) {
+  if (2 * (m->n + 1) > m->cap) {
+    LcMap o = *m;
+    m->cap = o.cap ? 2 * o.cap : 64;
+    m->key = xcalloc(m->cap, sizeof(uint64_t));
+    m->val = xmalloc(m->cap * sizeof(Ref));
+    for (uint32_t t = 0; t < o.cap; t++)
+      if (o.key[t]) {
+        uint32_t i = lc_slot(m, o.key[t]);
+        m->key[i] = o.key[t];
+        m->val[i] = o.val[t];
+      }
+    xfree(o.key); xfree(o.val);
+  }
+  uint64_t k = ((uint64_t)h << 32 | c) + 1;
+  uint32_t i = lc_slot(m, k);
+  if (!m->key[i]) {
+    Inst c0 = f->insts[c];
+    m->key[i] = k;
+    m->val[i] = ir_emit(f, f->blocks[h].idom, I_CONST, (ValType)c0.type, NULL, 0, c0.imm, c0.imm2);
+    m->n++;
+  }
+  return m->val[i];
+}
+
+static bool lc_wants(IrFunc *f, Ref c) {
+  const Inst *ci = &f->insts[c];
+  return ci->op == I_CONST && (ci->type == VT_I32 || ci->type == VT_I64) &&
+         ir_const_cost(ci->imm, ci->type == VT_I64) >= 2;
+}
+
+/* On arm64, a constant two or more instructions make that a loop reads is
+   read there from a copy made in the block over the loop, its header's
+   immediate dominator: made once a run of the loop, the copy lives only
+   where the loop does and gets a register where the loop has one free.
+   The constant itself, defined at the entry and read all over a function
+   too big for one register to hold it from end to end, is made again at
+   each read: zigbench/wordfreq's tokenizer built the text's base, mov and
+   movk, for every byte it scanned.  A copy no register takes is made
+   again at its reads as the constant was. */
+static void loop_consts(IrFunc *f) {
+  if (g_target != &warmc_target_a64 || warmc_getenv("WARMC_NO_LOOP_CONSTS")) return;
+  uint32_t nb = f->nblocks;
+  uint32_t *inner = xmalloc((nb ? nb : 1) * sizeof(uint32_t));
+  uint32_t *stk = xmalloc((nb ? nb : 1) * sizeof(uint32_t));
+  uint32_t *seen = xcalloc(nb ? nb : 1, sizeof(uint32_t));
+  for (uint32_t i = 0; i < nb; i++) inner[i] = UINT32_MAX;
+  bool any = false;
+  /* each block's innermost loop, by its header: the deepest of the natural
+     loops, found back from their latches, that hold it -- each dominated by
+     its header, so by the header's immediate dominator too */
+  for (uint32_t oi = 0; oi < f->norder; oi++) {
+    uint32_t h = f->order[oi];
+    Block *hb = &f->blocks[h];
+    uint32_t sp = 0;
+    bool loop = false, natural = true;
+    seen[h] = h + 1;
+    for (uint32_t p = 0; p < hb->npreds; p++) {
+      uint32_t l = hb->preds[p];
+      if (!f->blocks[l].reachable || f->blocks[l].rpo < hb->rpo) continue;
+      loop = true;
+      natural &= ir_dominates_checked(f, h, l);
+      if (seen[l] != h + 1) { seen[l] = h + 1; stk[sp++] = l; }
+    }
+    /* an irreducible region's entry does not dominate the blocks round it,
+       nor does what dominates it (cbench/lexer's comment states) */
+    if (!loop || !natural) continue;
+    any = true;
+    for (stk[sp++] = h; sp;) {
+      uint32_t x = stk[--sp];
+      if (inner[x] == UINT32_MAX || f->blocks[inner[x]].loop_depth < hb->loop_depth) inner[x] = h;
+      if (x == h) continue;
+      Block *xb = &f->blocks[x];
+      for (uint32_t p = 0; p < xb->npreds; p++) {
+        uint32_t q = xb->preds[p];
+        if (seen[q] != h + 1 && f->blocks[q].reachable) { seen[q] = h + 1; stk[sp++] = q; }
+      }
+    }
+  }
+  xfree(stk); xfree(seen);
+  LcMap m = { NULL, NULL, 0, 0 };
+  for (uint32_t oi = 0; any && oi < f->norder; oi++) {
+    uint32_t x = f->order[oi], h = inner[x];
+    if (h == UINT32_MAX) continue;
+    uint32_t d = f->blocks[h].idom;
+    if (d == UINT32_MAX || d == h) continue;
+    for (uint32_t k = 0; k < f->blocks[x].ninsts; k++) {
+      Ref u = f->blocks[x].insts[k];
+      for (uint32_t j = 0; j < f->insts[u].nargs; j++) {
+        Ref c = ir_args(f, u)[j];
+        if (lc_wants(f, c)) {
+          Ref cp = lc_copy(f, &m, h, c);
+          ir_args(f, u)[j] = cp;
+        }
+      }
+    }
+    for (uint32_t e = 0; e < f->blocks[x].nsuccs; e++)
+      for (uint32_t j = 0; j < f->blocks[x].succs[e].nargs; j++) {
+        Ref c = f->blocks[x].succs[e].args[j];
+        if (lc_wants(f, c)) {
+          Ref cp = lc_copy(f, &m, h, c);
+          f->blocks[x].succs[e].args[j] = cp;
+        }
+      }
+  }
+  g_stats.loop_consts += m.n;
+  xfree(m.key); xfree(m.val); xfree(inner);
+}
+
 static int produce_once(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
                         uint32_t out_bytes, FuncOut *fout, bool far,
                         SplitCtl *sc, bool collect) {
@@ -364,6 +484,7 @@ void ir_produce_function(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
      for a register and its loads now issue early. */
   if (opt->regalloc) ir_compact(f);
   seal_tests(f);
+  if (opt->regalloc) loop_consts(f);
   sc.full = warmc_getenv("WARMC_SPLIT") != NULL;
   bool collect = opt->regalloc && (opt->split || sc.full);
   int r = produce_once(f, obj, opt, out_bytes, fout, false, &sc, collect);

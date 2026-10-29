@@ -1414,7 +1414,11 @@ as a `tst` and a `b.cond` in a function where one does not reach its target,
 32 KB -- and a select or branch on a wider mask is a `tst` the `csel` or
 `b.ne` reads. An add or sub of a constant shifted by 12 bits is an
 immediate; a compare of one is not, as Apple's cores fuse only the
-unshifted compare with the branch after it.
+unshifted compare with the branch after it. A constant of two or more
+instructions that a loop reads is read there from a copy made over the
+loop, which can have a register where the loop has one free, where the
+constant itself, live across a whole function too big to hold it in one,
+was made again at each read (zigbench/wordfreq takes 0.97 the time).
 From `-O1` a `br_table` of at most eight distinct
 edges becomes a tree of compares, and any other a jump table, whose entries
 on arm64 are halfwords, each its target's distance in instructions; a
