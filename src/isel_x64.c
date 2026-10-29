@@ -1812,11 +1812,7 @@ static int produce_body_x64(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
   for (uint32_t oi = 0; oi < neo; oi++) {
     uint32_t bi = eo[oi];
     if (lalign && opt->align && f->blocks[bi].loop_depth) {
-      Block *lb = &f->blocks[bi];
-      bool header = false;
-      for (uint32_t p = 0; p < lb->npreds && !header; p++)
-        if (f->blocks[lb->preds[p]].rpo >= lb->rpo) header = true;
-      if (header) {
+      if (ir_loop_header_at(f, bi) != UINT32_MAX) {
         uint32_t pad = (uint32_t)(-(pro.len + B->len) & (lalign - 1));
         while (pad) {
           uint32_t k = pad > 15 ? 15 : pad;
@@ -1922,6 +1918,7 @@ static int produce_body_x64(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
     warmc_fatal("internal: %u caller-save entries built but %u emitted in %s",
                 s->ncsa_vals, s->csa_consumed, f->m->funcs[f->func_index].sym);
 
+  for (uint32_t i = 0; i < f->nblocks; i++) g_stats.loop_tops += f->loop_top[i] != UINT32_MAX;
   memset(fout, 0, sizeof *fout);
   fout->want_align = opt->align && has_loop;
   fout->code_len = (uint32_t)(pro.len + s->body.len);
