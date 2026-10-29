@@ -514,6 +514,13 @@ bool a64_patch_ldr_lit(Buf *b, size_t site, size_t target) {
        (w & ~(0x7ffffu << 5)) | (((uint32_t)(int32_t)delta & 0x7ffffu) << 5));
   return true;
 }
+bool a64_patch_b14_ok(Buf *b, size_t site, size_t target) {
+  int64_t delta = ((int64_t)target - (int64_t)site) >> 2;
+  if (delta < B14_LO || delta > B14_HI) return false;
+  uint32_t w = rd32(b->data + site);
+  wr32(b->data + site, (w & ~(0x3fffu << 5)) | (((uint32_t)(int32_t)delta & 0x3fffu) << 5));
+  return true;
+}
 void a64_patch_b14(Buf *b, size_t site, size_t target) {
   int64_t delta = ((int64_t)target - (int64_t)site) >> 2;
   uint32_t f = FITS("test-and-branch displacement", delta, B14_LO, B14_HI);

@@ -1408,7 +1408,13 @@ flags read by the `csel` or `b.cond` where `cset`s, an `and` and a test of
 it would each take a cycle: musl's `strtod` carries its first limb round a
 loop by `k == a && !x[k]` (`cbench/strtod` takes 0.85 the time). The
 selects on a compare read its flags, not a `cset` of them, when only
-instructions that leave the flags as they are come between.
+instructions that leave the flags as they are come between. A branch on one
+bit of a value is a `tbz` or `tbnz`, its mask in no register -- made again
+as a `tst` and a `b.cond` in a function where one does not reach its target,
+32 KB -- and a select or branch on a wider mask is a `tst` the `csel` or
+`b.ne` reads. An add or sub of a constant shifted by 12 bits is an
+immediate; a compare of one is not, as Apple's cores fuse only the
+unshifted compare with the branch after it.
 From `-O1` a `br_table` of at most eight distinct
 edges becomes a tree of compares, and any other a jump table, whose entries
 on arm64 are halfwords, each its target's distance in instructions; a

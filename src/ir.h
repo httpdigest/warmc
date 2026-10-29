@@ -331,6 +331,10 @@ typedef struct {
      latch, the loop's first block; UINT32_MAX for every other block.  Set
      by each ir_emit_order. */
   uint32_t *loop_top;
+  /* The arm64 back end's test-bit branches, which reach 32 KiB, made as a
+     tst and a b.cond: set by an emission one of whose did not reach, for the
+     next (isel.c br_patch); cleared after each function. */
+  bool no_tbz;
   /* The register allocation a first emission made, kept for the second when
      only the loops' padding differs between them (isel.c); ra_keep_drop
      frees it if the second does not take it. */
