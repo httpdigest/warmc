@@ -1420,7 +1420,11 @@ pointer -- makes that test, and that return with the block's stores, ahead
 of its prologue; a function with a loop small enough for one 64-byte fetch
 block starts at the offset in its block that lets such loops fit with the
 least padding run on their entry, the rest of the block left ahead of it,
-where nothing runs; a wrap whose readers take the low half only -- an indirect
+where nothing runs; a loop's one latch, the jump or test back to its
+header, is laid out above the header where no block falls into it or three
+or more reach it, so that a way round which branched to the latch falls
+from it into the header, one taken branch where it took two
+(`rsbench/utf8scan` takes 0.66 the time, `rsbench/chunks` 0.75); a wrap whose readers take the low half only -- an indirect
 call's table index among them -- is no instruction, they read the i64's
 register; and an i32 extended to i64 where a w-register write made it, its
 high half zero already, is no instruction either, as in the return of every

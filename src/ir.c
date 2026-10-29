@@ -779,6 +779,66 @@ static bool call_arm(const IrFunc *f, uint32_t bi) {
   return false;
 }
 
+/* A loop's latch -- a jump back to its header, or a test that branches
+   back -- is laid out above the header where that saves a branch: a way
+   round the loop that branched to the latch and from there back to the
+   header falls from the latch into the header instead, one taken branch
+   where it took two, and a latch that tests makes its exit the branch.  The
+   block laid out before the latch, where it falls into it, branches to it
+   now, a branch more on its way round; what enters the loop branches over
+   the latch to the header, once.  So the latch goes up where no block falls
+   into it -- musl's fmodf, whose other way round returns (rsbench/chunks
+   takes 0.76 the time) -- or where three or more reach it, the ones that
+   branch to it more than the one that falls in, each taken as likely as
+   another: rsbench/tokenize's split_whitespace takes each of its nine ways
+   round a character to the test of the string's end, which LLVM lays out
+   the same way.  With two, one of which falls in, the branch that one
+   gains cost asbench/smallint's saturating loop 2% and cbench/half's 4%. */
+static void rotate_loops(IrFunc *f, uint32_t *eo, uint32_t n, const uint8_t *late) {
+  f->loop_top = ir_alloc(f, (f->nblocks ? f->nblocks : 1) * sizeof(uint32_t));
+  for (uint32_t i = 0; i < f->nblocks; i++) f->loop_top[i] = UINT32_MAX;
+  if (warmc_getenv("WARMC_NO_LOOP_TOP")) return;
+  uint32_t *pos = xmalloc((f->nblocks ? f->nblocks : 1) * sizeof(uint32_t));
+  for (uint32_t i = 0; i < f->nblocks; i++) pos[i] = UINT32_MAX;
+  for (uint32_t i = 0; i < n; i++) pos[eo[i]] = i;
+  for (uint32_t i = 0; i < n; i++) {
+    uint32_t h = eo[i];
+    const Block *hb = &f->blocks[h];
+    uint32_t l = UINT32_MAX, nl = 0;
+    for (uint32_t p = 0; p < hb->npreds; p++)
+      if (f->blocks[hb->preds[p]].rpo >= hb->rpo) { l = hb->preds[p]; nl++; }
+    /* one latch, emitted after the header with the same late blocks or not */
+    if (nl != 1 || pos[l] == UINT32_MAX || pos[l] < i || late[l] != late[h]) continue;
+    /* a jump back, or a test whose other way leaves */
+    const Block *lb = &f->blocks[l];
+    if (lb->term != T_JUMP && lb->term != T_BRIF) continue;
+    /* not a loop's header itself, a one-block loop's among them */
+    bool header = false;
+    for (uint32_t p = 0; p < lb->npreds; p++)
+      header |= f->blocks[lb->preds[p]].rpo >= lb->rpo;
+    if (header) continue;
+    bool falls = false;
+    for (uint32_t p = 0; p < lb->npreds; p++) falls |= lb->preds[p] == eo[pos[l] - 1];
+    if (falls && lb->npreds < 3) continue;
+    /* l from its place to just above h */
+    for (uint32_t j = pos[l]; j > i; j--) { eo[j] = eo[j - 1]; pos[eo[j]] = j; }
+    eo[i] = l; pos[l] = i;
+    f->loop_top[h] = l;
+    i++;
+  }
+  xfree(pos);
+}
+
+uint32_t ir_loop_header_at(const IrFunc *f, uint32_t t) {
+  const Block *b = &f->blocks[t];
+  if (!b->loop_depth || f->loop_top[t] != UINT32_MAX) return UINT32_MAX;
+  for (uint32_t p = 0; p < b->npreds; p++)
+    if (f->blocks[b->preds[p]].rpo >= b->rpo) return t;
+  for (uint32_t k = 0; k < b->nsuccs; k++)
+    if (f->loop_top[b->succs[k].target] == t) return b->succs[k].target;
+  return UINT32_MAX;
+}
+
 const uint32_t *ir_emit_order(IrFunc *f, uint32_t skip, uint32_t *n) {
   uint32_t *eo = ir_alloc(f, (f->norder ? f->norder : 1) * sizeof(uint32_t));
   /* late: the outline blocks and the call arms, and what only they lead
@@ -804,6 +864,7 @@ const uint32_t *ir_emit_order(IrFunc *f, uint32_t skip, uint32_t *n) {
       if (bi != skip && late[bi] == pass) eo[k++] = bi;
     }
   *n = k;
+  rotate_loops(f, eo, k, late);
   return eo;
 }
 

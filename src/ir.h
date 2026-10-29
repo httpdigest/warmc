@@ -327,6 +327,10 @@ typedef struct {
      padding run on their entry (isel.c loop_phase), from the same emission
      for the next; 0 when not measured. */
   uint8_t loop_phase;
+  /* Of a loop's header whose latch ir_emit_order lays out above it, that
+     latch, the loop's first block; UINT32_MAX for every other block.  Set
+     by each ir_emit_order. */
+  uint32_t *loop_top;
   /* The register allocation a first emission made, kept for the second when
      only the loops' padding differs between them (isel.c); ra_keep_drop
      frees it if the second does not take it. */
@@ -386,9 +390,14 @@ IrEdgeIdx ir_edge_index(IrFunc *f);
 void ir_edge_index_free(IrEdgeIdx *x);
 void ir_order(IrFunc *f);
 /* f->order with the outline blocks and the call arms of loops moved after
-   the rest, but for skip: the order the back ends emit the blocks in.  Sets
-   *n to its length. */
+   the rest, but for skip, and a loop's latch above its header where that
+   saves a branch (f->loop_top): the order the back ends emit the blocks in.
+   Sets *n to its length. */
 const uint32_t *ir_emit_order(IrFunc *f, uint32_t skip, uint32_t *n);
+/* The header of the loop block t is the first of in that order: t, or the
+   header whose latch it laid out above it; UINT32_MAX where t starts no
+   loop. */
+uint32_t ir_loop_header_at(const IrFunc *f, uint32_t t);
 /* ir_order, saying whether the graph had changed since the last. */
 bool ir_order_changed(IrFunc *f);
 void ir_compact(IrFunc *f);
@@ -629,6 +638,7 @@ typedef struct {
   uint64_t key_splits;   /* regions copied below an edge that fixes a value */
   uint64_t bfi_apart;    /* bfi results kept from the parameter of their field */
   uint64_t ccmp_chains;  /* ands and ors of compares made as cmp and ccmp */
+  uint64_t loop_tops;    /* loops laid out with their latch above the header */
   uint64_t small_loops;  /* loops aligned to 64 bytes as small, in code emitted */
   uint64_t slp_groups;   /* stores of alike lanes made one vector store */
 

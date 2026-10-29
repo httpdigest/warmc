@@ -1598,8 +1598,9 @@ static uint32_t loop_phase(IrFunc *f, const uint32_t *rec, uint32_t nrec,
   return best;
 }
 
-/* The bytes the loop headed by h took, h at order index oi: its blocks laid
-   out in a row from h on, up to the end of the last of them. */
+/* The bytes the loop headed by h took, its first block at order index oi:
+   its blocks laid out in a row from there on, up to the end of the last of
+   them. */
 static uint32_t loop_span(Isel *s, uint32_t h, const uint32_t *eo, uint32_t neo,
                           uint32_t oi, const uint32_t *blk_end) {
   IrFunc *f = s->f;
@@ -4089,11 +4090,9 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
   for (uint32_t oi = 0; oi < neo; oi++) {
     uint32_t bi = eo[oi];
     if (lalign && opt->align && f->blocks[bi].loop_depth) {
-      Block *lb = &f->blocks[bi];
-      bool header = false;
-      for (uint32_t p = 0; p < lb->npreds && !header; p++)
-        if (f->blocks[lb->preds[p]].rpo >= lb->rpo) header = true;
-      bool small = header && small_align && small_loop(f, bi);
+      uint32_t lh = ir_loop_header_at(f, bi);
+      bool header = lh != UINT32_MAX;
+      bool small = header && small_align && small_loop(f, lh);
       if (small) nsmall++;
       uint32_t want = small ? 64 : lalign;
       if (header) {
@@ -4149,7 +4148,8 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
     uint16_t *spans = ir_alloc(f, f->nblocks * sizeof(uint16_t));
     memset(spans, 0, f->nblocks * sizeof(uint16_t));
     for (uint32_t k = 0; k < nrec; k++) {
-      uint32_t span = loop_span(s, rec[4 * k], eo, neo, rec[4 * k + 1], blk_end);
+      uint32_t span = loop_span(s, ir_loop_header_at(f, rec[4 * k]), eo, neo, rec[4 * k + 1],
+                                blk_end);
       if (span && span <= 0xffff) spans[rec[4 * k]] = (uint16_t)span;
     }
     uint32_t ph = 0;
@@ -4159,7 +4159,8 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
         Block *lb = &f->blocks[b];
         if (!lb->reachable || !lb->loop_depth) continue;
         for (uint32_t p = 0; p < lb->npreds; p++)
-          if (f->blocks[lb->preds[p]].rpo >= lb->rpo) hdr[b] = 1;
+          if (f->blocks[lb->preds[p]].rpo >= lb->rpo)
+            hdr[f->loop_top[b] != UINT32_MAX ? f->loop_top[b] : b] = 1;
       }
       ph = loop_phase(f, rec, nrec, spans, lalign, hdr);
       xfree(hdr);
@@ -4262,6 +4263,7 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
   if (s->cold_frame) g_stats.cold_frames++;
   if (early) g_stats.early_rets++;
   g_stats.small_loops += nsmall;
+  for (uint32_t i = 0; i < f->nblocks; i++) g_stats.loop_tops += f->loop_top[i] != UINT32_MAX;
   for (uint32_t i = 0; i < f->ninsts; i++) g_stats.ccmp_chains += s->cchain[i] != 0;
   Buf lead;
   memset(&lead, 0, sizeof lead);
