@@ -435,7 +435,7 @@ static void print_stats(void) {
           " loop_pieces=%llu recomputes=%llu dead_frame_stores=%llu tramp_funcs=%llu gosp_funcs=%llu"
           " go_resume_pruned=%llu go_resume_split=%llu go_noret_calls=%llu wrap_params=%llu\n"
           "             escape_removed=%llu escape_forwarded=%llu escape_made=%llu gloop=%llu\n"
-          "             loop_closed=%llu reassoc=%llu cmp_reused=%llu csel_fused=%llu mul_wide=%llu fma=%llu gssa=%llu bitrevs=%llu common_factors=%llu threaded_known=%llu param_compares=%llu key_splits=%llu small_loops=%llu slp_groups=%llu\n"
+          "             loop_closed=%llu reassoc=%llu cmp_reused=%llu csel_fused=%llu mul_wide=%llu fma=%llu gssa=%llu bitrevs=%llu common_factors=%llu threaded_known=%llu param_compares=%llu key_splits=%llu bfi_apart=%llu small_loops=%llu slp_groups=%llu\n"
           "             bar_masks=%llu bar_elided=%llu\n"
           "             devirt_ref=%llu devirt_indirect=%llu"
           " devirt_null_kept=%llu const_reads=%llu throw_jumps=%llu"
@@ -506,6 +506,7 @@ static void print_stats(void) {
           (unsigned long long)g_stats.threaded_known,
           (unsigned long long)g_stats.param_compares,
           (unsigned long long)g_stats.key_splits,
+          (unsigned long long)g_stats.bfi_apart,
           (unsigned long long)g_stats.small_loops,
           (unsigned long long)g_stats.slp_groups,
           (unsigned long long)g_stats.bar_masks,

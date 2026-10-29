@@ -1929,6 +1929,19 @@ static void regalloc_linear(Isel *s) {
              loop, made one web with the parameter, was spilled whole where
              the two had kept registers: rsbench/tokenize's outer loop,
              1.044. */
+#if RA_BFI
+          /* Not a bfi whose field is the parameter's own value, hw << 8 | b
+             carried round a loop: in the parameter's register it would
+             write the register its field comes from, so a64 makes it in a
+             scratch register from a copy of b and copies it back, the
+             copies on the chain the loop carries; apart, it is made in a
+             register of its own and the back edge's move costs nothing.
+             musl's twobyte_strstr (cbench/strings) took 0.85 the time. */
+          if (ra_bfi_field(s, arg) != REF_NONE && FIND(ra_bfi_field(s, arg)) == rp) {
+            g_stats.bfi_apart++;
+            continue;
+          }
+#endif
           bool by_exact = web_conflict(iv, mem_head[ra], mem_head[rp], mem_next);
           if (by_exact && (!exact || sb->rpo < b->rpo ||
                            web_interferes(&la, iv, mem_head[ra], mem_head[rp], mem_next)))
