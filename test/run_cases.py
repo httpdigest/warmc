@@ -41,6 +41,13 @@ TIMEOUT = float(os.environ.get("WARMC_TIMEOUT", "3"))
 
 RUN_TIMEOUT = float(os.environ.get("WARMC_RUN_TIMEOUT", "30"))
 
+# Cases left out by name, CHECK_SKIP_CASES="vector ...": where a runner is
+# too slow for one -- GitHub's macOS runner, three cores beside make check's
+# Java rows, starves vector.wat's compile, about a second of CPU, past its timeout
+# -- it is skipped and said so.  A CHECK_ setting is in a cached row's key
+# and reaches no compile.
+SKIP = set(os.environ.get("CHECK_SKIP_CASES", "").split())
+
 def sh(cmd, timeout=None):
     return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
 
@@ -211,6 +218,8 @@ def main():
 
     versions = {t: tool_version(t) for t in ("wat2wasm", "wasm-interp")}
     cases = sorted(glob.glob("test/cases/*.wat"))
+    skipped = [c for c in cases if os.path.splitext(os.path.basename(c))[0] in SKIP]
+    cases = [c for c in cases if c not in skipped]
     jobs = int(os.environ.get("CASE_JOBS", 0)) or (os.cpu_count() or 4)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as pool:
@@ -267,6 +276,9 @@ def main():
 
     for m in msgs:
         print(m)
+    if skipped:
+        print("skipped (CHECK_SKIP_CASES): %s"
+              % " ".join(os.path.splitext(os.path.basename(c))[0] for c in skipped))
     print("---")
     print("%d export comparisons across %d modules, %d failure(s)"
           % (total, files, failed + broken))

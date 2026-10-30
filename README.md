@@ -1766,8 +1766,11 @@ make check-mutants  # every mutant of the transforms under test/mutants killed b
 Before its rows, `make check` runs `check-encoder` and, except on Windows,
 builds the sanitiser compilers; on Windows it checks that the Win32 offsets
 the runtime hard-codes match `windows.h` instead. CI runs the whole of it
-nightly. `CHECK_BENCH=0` leaves out the benchmark corpora, as CI does, and
-`CHECK_TIMING=1` lists each row's wall and CPU time at the end.
+nightly. `CHECK_BENCH=0` leaves out the benchmark corpora, as CI does,
+`CHECK_SKIP_CASES="vector ..."` the cases it names from the case rows and
+the sanitiser's, as CI does on macOS, where `vector.wat`'s compile waits out
+its timeout beside the other rows, and `CHECK_TIMING=1` lists each row's
+wall and CPU time at the end.
 
 `make check` keeps what it can, each thing under exactly what it depends
 on. warmc's compiles go to `WARMC_CACHE=build/warmc-cache`.
