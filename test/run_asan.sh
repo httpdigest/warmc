@@ -75,12 +75,22 @@ if [ "${1:-}" = --one ]; then
   exit 0
 fi
 
+# the cases CHECK_SKIP_CASES leaves out (see test/run_cases.py), as text
+# and as the binary build/testrun has of each
+skip=" ${CHECK_SKIP_CASES:-} " skipped=""
+left_out() {
+  local b
+  b=$(basename "$1"); b=${b%.*}
+  case "$1" in test/cases/*.wat|"$BUILD"/testrun/*.wasm) ;; *) return 1 ;; esac
+  [[ "$skip" == *" $b "* ]] || return 1
+  [[ " $skipped " == *" $b "* ]] || skipped="${skipped:+$skipped }$b"
+}
 inputs=()
 for d in test/cases test/cases_gc test/cases_traps test/cases_relaxed test/wasi; do
   [ -d "$d" ] || continue
-  for f in "$d"/*.wat; do [ -e "$f" ] && inputs+=("$f"); done
+  for f in "$d"/*.wat; do [ -e "$f" ] && ! left_out "$f" && inputs+=("$f"); done
 done
-for f in "$BUILD"/testrun/*.wasm; do [ -e "$f" ] && inputs+=("$f"); done
+for f in "$BUILD"/testrun/*.wasm; do [ -e "$f" ] && ! left_out "$f" && inputs+=("$f"); done
 # Components, which nothing else here puts through the sanitizers: the
 # mutation sweep in run_components.py probes with --validate-only, and that
 # returns before the link plan and before any compiling.  A component's core
@@ -131,5 +141,6 @@ xargs -0 -n 3 -P "$JOBS" "$0" --one <"$WORK/todo" >>"$results"
 pass=$(grep -c '^ok$' "$results")
 fail=$(grep -c '^FAIL' "$results")
 grep -v '^ok$' "$results"
+[ -n "$skipped" ] && echo "asan: skipped (CHECK_SKIP_CASES): $skipped"
 echo "asan: $pass compiled clean, $fail failed (${#inputs[@]} inputs)"
 [ "$fail" -eq 0 ] && [ "$pass" -eq "$want" ]
