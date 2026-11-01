@@ -1505,9 +1505,8 @@ def main():
     rc.modern_python("adapter")
     if not rc.ensure_spec():
         return 0
-    sys.path.insert(0, rc.SPEC_DIR)
     try:
-        import definitions as d
+        d = rc.load_reference()
     except Exception as e:
         print("FAIL[adapter]: the reference does not import (%s)" % e)
         return 1

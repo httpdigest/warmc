@@ -83,6 +83,29 @@ def modern_python(row):
               % (row, sys.executable, sys.version.split()[0]))
         sys.exit(1)
 
+def load_reference():
+    """The pinned reference, as the module `definitions`.
+
+    It is compiled with postponed annotations, as `from __future__ import
+    annotations` would have it: it annotates fields with classes defined
+    further down, which as written only Python 3.14's deferred annotations
+    accept -- MSYS2's Python, which the Windows job runs, is 3.12 -- and
+    nothing in it reads an annotation back.  Raises what the import would."""
+    import __future__
+    import types
+    with open(SPEC, encoding="utf-8") as f:
+        src = f.read()
+    mod = types.ModuleType("definitions")
+    mod.__file__ = SPEC
+    sys.modules["definitions"] = mod   # where dataclasses looks its module up
+    try:
+        exec(compile(src, SPEC, "exec", flags=__future__.annotations.compiler_flag,
+                     dont_inherit=True), mod.__dict__)
+    except BaseException:
+        del sys.modules["definitions"]
+        raise
+    return mod
+
 def ensure_spec():
     """Whether the pinned reference is in SPEC_DIR, fetching it if not.
 
@@ -475,9 +498,8 @@ def main():
     modern_python("canon")
     if not ensure_spec():
         return 0
-    sys.path.insert(0, SPEC_DIR)
     try:
-        import definitions as d
+        d = load_reference()
     except Exception as e:
         print("FAIL[canon]: the reference does not import (%s)" % e)
         return 1
