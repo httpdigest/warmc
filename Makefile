@@ -260,8 +260,9 @@ check-encoder: $(BUILD)/a64_test$(EXE) $(BUILD)/x64_test$(EXE)
 # The testsuite checkout, wasm-tools and the Kotlin stdlib are cached under
 # $(BUILD), and a cached copy is only good while it is the pinned version.
 # Each rule leaves a stamp naming the version it fetched, so bumping a pin
-# (or upgrading kotlinc) fetches again instead of testing against whatever
-# an older pin left behind.
+# fetches again instead of testing against whatever an older pin left behind.
+# Every file downloaded here goes through test/fetch.sh, which checks it
+# against the SHA-256 test/fetch.sha256 records for its URL.
 TESTSUITE_COMMIT := 63908677d00585fdab4c4eccbf01f781d3a454d5
 TESTSUITE_STAMP  := $(BUILD)/testsuite/.commit-$(TESTSUITE_COMMIT)
 
@@ -291,7 +292,12 @@ $(WASM_TOOLS_STAMP):
 
 wasm-tools: $(WASM_TOOLS_STAMP)
 
-KOTLIN_VERSION := $(shell kotlinc -version 2>&1 | sed -n 's/.*kotlinc-jvm \([0-9.]*\).*/\1/p')
+# The Kotlin the corpora are built with, which CI installs too
+# (.github/scripts/install-language-tools.sh, whose KOTLIN_VERSION must match):
+# the klib is the compiler's own stdlib, so a kotlinc of another version is
+# refused rather than given this one's.
+KOTLIN_VERSION   := 2.4.21
+KOTLINC_VERSION  := $(shell kotlinc -version 2>&1 | sed -n 's/.*kotlinc-jvm \([0-9.]*\).*/\1/p')
 KOTLIN_WASI_KLIB := $(BUILD)/tools/kotlin-stdlib-wasm-wasi.klib
 # test/gobench.py looks for this stamp to tell a stale klib from a missing one.
 KOTLIN_STAMP     := $(BUILD)/tools/.kotlin-stdlib-$(KOTLIN_VERSION)
@@ -300,11 +306,13 @@ $(KOTLIN_STAMP):
 	@command -v kotlinc-wasm >/dev/null 2>&1 || { \
 	  echo "make kotlin-stdlib: kotlinc-wasm not found (brew install kotlin)"; \
 	  exit 1; }
-	@test -n "$(KOTLIN_VERSION)" || { \
-	  echo "make kotlin-stdlib: cannot read the compiler version"; exit 1; }
+	@test "$(KOTLINC_VERSION)" = "$(KOTLIN_VERSION)" || { \
+	  echo "make kotlin-stdlib: kotlinc is $(or $(KOTLINC_VERSION),of no version it says), the pin is $(KOTLIN_VERSION)"; \
+	  exit 1; }
 	@mkdir -p $(BUILD)/tools
-	curl -sSLf -o $(KOTLIN_WASI_KLIB) \
-	  "https://repo1.maven.org/maven2/org/jetbrains/kotlin/kotlin-stdlib-wasm-wasi/$(KOTLIN_VERSION)/kotlin-stdlib-wasm-wasi-$(KOTLIN_VERSION).klib"
+	test/fetch.sh \
+	  "https://repo1.maven.org/maven2/org/jetbrains/kotlin/kotlin-stdlib-wasm-wasi/$(KOTLIN_VERSION)/kotlin-stdlib-wasm-wasi-$(KOTLIN_VERSION).klib" \
+	  $(KOTLIN_WASI_KLIB)
 	@rm -f $(BUILD)/tools/.kotlin-stdlib-*
 	@touch $@
 
@@ -318,8 +326,12 @@ kotlin-stdlib: $(KOTLIN_STAMP)
 # release in the sources of the artifacts they name, which are fetched too,
 # and are compiled into $(TEAVM_DIR)/patched, ahead of the jars.
 TEAVM_VERSION := 0.16.0
+# What teavm-classlib loads, at their newest releases (its pom names joda-time
+# 2.12.2).  The stamp names them, so that raising one fetches again.
+JODA_TIME_VERSION := 2.15.1
+JZLIB_VERSION     := 1.1.3
 TEAVM_DIR     := $(BUILD)/tools/teavm-$(TEAVM_VERSION)
-TEAVM_STAMP   := $(TEAVM_DIR)/.complete
+TEAVM_STAMP   := $(TEAVM_DIR)/.complete-joda-$(JODA_TIME_VERSION)-jzlib-$(JZLIB_VERSION)
 TEAVM_JARS := \
   $(foreach a,tooling core classlib interop platform jso jso-apis jso-impl \
       metaprogramming-api metaprogramming-impl extension-apis extension-spi \
@@ -327,8 +339,8 @@ TEAVM_JARS := \
       relocated-libs-asm-commons relocated-libs-asm-tree relocated-libs-asm-util \
       relocated-libs-hppc relocated-libs-rhino,\
     org/teavm/teavm-$(a)/$(TEAVM_VERSION)/teavm-$(a)-$(TEAVM_VERSION).jar) \
-  joda-time/joda-time/2.12.2/joda-time-2.12.2.jar \
-  com/jcraft/jzlib/1.1.3/jzlib-1.1.3.jar
+  joda-time/joda-time/$(JODA_TIME_VERSION)/joda-time-$(JODA_TIME_VERSION).jar \
+  com/jcraft/jzlib/$(JZLIB_VERSION)/jzlib-$(JZLIB_VERSION).jar
 TEAVM_SOURCES := core classlib
 TEAVM_SOURCES_STAMP := $(TEAVM_DIR)/sources/.complete
 TEAVM_PATCHED := $(TEAVM_DIR)/patched/.complete
@@ -340,7 +352,7 @@ $(TEAVM_STAMP):
 	@rm -rf $(BUILD)/tools/teavm-*
 	@mkdir -p $(TEAVM_DIR)
 	@for j in $(TEAVM_JARS); do \
-	  curl -sSLf -o $(TEAVM_DIR)/$$(basename $$j) "https://repo1.maven.org/maven2/$$j" || \
+	  test/fetch.sh "https://repo1.maven.org/maven2/$$j" $(TEAVM_DIR)/$$(basename $$j) || \
 	    { echo "make teavm: cannot fetch $$j"; exit 1; }; \
 	done
 	@touch $@
@@ -351,7 +363,7 @@ $(TEAVM_SOURCES_STAMP): $(TEAVM_STAMP)
 	@mkdir -p $(TEAVM_DIR)/sources
 	@for a in $(TEAVM_SOURCES); do \
 	  j=org/teavm/teavm-$$a/$(TEAVM_VERSION)/teavm-$$a-$(TEAVM_VERSION)-sources.jar; \
-	  curl -sSLf -o $(TEAVM_DIR)/sources/$$(basename $$j) "https://repo1.maven.org/maven2/$$j" || \
+	  test/fetch.sh "https://repo1.maven.org/maven2/$$j" $(TEAVM_DIR)/sources/$$(basename $$j) || \
 	    { echo "make teavm: cannot fetch $$j"; exit 1; }; \
 	done
 	@touch $@
@@ -366,11 +378,11 @@ teavm: $(TEAVM_PATCHED)
 # Temurin, the JDK the Java corpora's native column runs: the same classes
 # TeaVM compiles, on the JVM and its JIT.  Only a native record needs it
 # (`make bench-record`, `gobench.py --native`), so `make check` does not fetch
-# it.  Adoptium's release for this host, versioned like TeaVM's directory.
+# it.  Adoptium's release for this host, versioned like TeaVM's directory;
+# Temurin 27 has no build for x64 macOS.
 TEMURIN_VERSION := 27.0.1.0.2+1
 TEMURIN_HOST    := $(strip \
   $(if $(filter Darwin-arm64,$(UNAME_S)-$(UNAME_M)),aarch64_mac) \
-  $(if $(filter Darwin-x86_64,$(UNAME_S)-$(UNAME_M)),x64_mac) \
   $(if $(filter Linux-aarch64 Linux-arm64,$(UNAME_S)-$(UNAME_M)),aarch64_linux) \
   $(if $(filter Linux-x86_64,$(UNAME_S)-$(UNAME_M)),x64_linux))
 TEMURIN_DIR     := $(BUILD)/tools/temurin-$(TEMURIN_VERSION)
@@ -382,8 +394,9 @@ $(TEMURIN_STAMP):
 	  echo "make temurin: Adoptium publishes no Temurin tarball for this host"; exit 1; }
 	@rm -rf $(BUILD)/tools/temurin-*
 	@mkdir -p $(TEMURIN_DIR)
-	curl -sSLf -o $(TEMURIN_DIR).tar.gz \
-	  "https://github.com/adoptium/temurin$(TEMURIN_FEATURE)-binaries/releases/download/jdk-$(subst +,%2B,$(TEMURIN_VERSION))/OpenJDK$(TEMURIN_FEATURE)U-jdk_$(TEMURIN_HOST)_hotspot_$(subst +,_,$(TEMURIN_VERSION)).tar.gz"
+	test/fetch.sh \
+	  "https://github.com/adoptium/temurin$(TEMURIN_FEATURE)-binaries/releases/download/jdk-$(subst +,%2B,$(TEMURIN_VERSION))/OpenJDK$(TEMURIN_FEATURE)U-jdk_$(TEMURIN_HOST)_hotspot_$(subst +,_,$(TEMURIN_VERSION)).tar.gz" \
+	  $(TEMURIN_DIR).tar.gz
 	@tar xzf $(TEMURIN_DIR).tar.gz -C $(TEMURIN_DIR) --strip-components=1
 	@rm -f $(TEMURIN_DIR).tar.gz
 	@touch $@
@@ -400,8 +413,9 @@ $(GLFW_STAMP):
 	@test "$(UNAME_S)" = Darwin || { echo "make glfw: lwjgl/ is macOS's alone so far"; exit 1; }
 	@rm -rf $(BUILD)/tools/glfw-*
 	@mkdir -p $(BUILD)/tools
-	curl -sSLf -o $(GLFW_DIR).zip \
-	  "https://github.com/glfw/glfw/releases/download/$(GLFW_VERSION)/glfw-$(GLFW_VERSION).bin.MACOS.zip"
+	test/fetch.sh \
+	  "https://github.com/glfw/glfw/releases/download/$(GLFW_VERSION)/glfw-$(GLFW_VERSION).bin.MACOS.zip" \
+	  $(GLFW_DIR).zip
 	@cd $(BUILD)/tools && unzip -q glfw-$(GLFW_VERSION).zip && mv glfw-$(GLFW_VERSION).bin.MACOS glfw-$(GLFW_VERSION)
 	@rm -f $(GLFW_DIR).zip
 	@touch $@
@@ -420,7 +434,7 @@ $(LWJGL_STAMP):
 	@mkdir -p $(LWJGL_DIR)
 	@for a in $(LWJGL_ARTIFACTS); do \
 	  j=org/lwjgl/$$a/$(LWJGL_VERSION)/$$a-$(LWJGL_VERSION).jar; \
-	  curl -sSLf -o $(LWJGL_DIR)/$$(basename $$j) "https://repo1.maven.org/maven2/$$j" || \
+	  test/fetch.sh "https://repo1.maven.org/maven2/$$j" $(LWJGL_DIR)/$$(basename $$j) || \
 	    { echo "make lwjgl: cannot fetch $$j"; exit 1; }; \
 	done
 	@touch $@
@@ -444,8 +458,9 @@ $(WASI_SDK_STAMP):
 	  echo "make wasi-sdk: wasi-sdk publishes no release for this host"; exit 1; }
 	@mkdir -p $(BUILD)/tools
 	@rm -rf $(BUILD)/tools/wasi-sdk
-	curl -sSLf -o $(BUILD)/tools/wasi-sdk.tar.gz \
-	  "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-$(WASI_SDK_VERSION)/wasi-sdk-$(WASI_SDK_VERSION).0-$(WASI_SDK_HOST).tar.gz"
+	test/fetch.sh \
+	  "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-$(WASI_SDK_VERSION)/wasi-sdk-$(WASI_SDK_VERSION).0-$(WASI_SDK_HOST).tar.gz" \
+	  $(BUILD)/tools/wasi-sdk.tar.gz
 	@mkdir -p $(BUILD)/tools/wasi-sdk
 	@tar xzf $(BUILD)/tools/wasi-sdk.tar.gz -C $(BUILD)/tools/wasi-sdk --strip-components=1
 	@rm -f $(BUILD)/tools/wasi-sdk.tar.gz $(BUILD)/tools/.wasi-sdk-*
@@ -461,8 +476,9 @@ SIMDE_STAMP   := $(BUILD)/tools/simde-$(SIMDE_VERSION)/.fetched
 $(SIMDE_STAMP):
 	@mkdir -p $(BUILD)/tools
 	@rm -rf $(BUILD)/tools/simde-*
-	curl -sSLf -o $(BUILD)/tools/simde.tar.gz \
-	  "https://github.com/simd-everywhere/simde/archive/refs/tags/v$(SIMDE_VERSION).tar.gz"
+	test/fetch.sh \
+	  "https://github.com/simd-everywhere/simde/archive/refs/tags/v$(SIMDE_VERSION).tar.gz" \
+	  $(BUILD)/tools/simde.tar.gz
 	@mkdir -p $(BUILD)/tools/simde-$(SIMDE_VERSION)
 	@tar xzf $(BUILD)/tools/simde.tar.gz -C $(BUILD)/tools/simde-$(SIMDE_VERSION) --strip-components=1
 	@rm -f $(BUILD)/tools/simde.tar.gz
@@ -476,7 +492,7 @@ simde: $(SIMDE_STAMP)
 # a JDK to run it, and wasi-sdk only where it publishes a release.
 # hsbench's GHC is not fetched: ghc-wasm-meta installs it, and the corpus
 # skips itself without.
-CHECK_TOOLS := wasm-tools testsuite $(if $(KOTLIN_VERSION),kotlin-stdlib) \
+CHECK_TOOLS := wasm-tools testsuite $(if $(KOTLINC_VERSION),kotlin-stdlib) \
                $(if $(JAVAC_VERSION),teavm) $(if $(WASI_SDK_HOST),wasi-sdk)
 
 SPEC_LEVELS ?= -O1,-O2,-O2 --profile=deterministic

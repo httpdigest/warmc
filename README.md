@@ -1997,20 +1997,26 @@ against other wasm engines), `test/sizes.py` (output sizes) and
 `test/scale.py` (whether compile time grows linearly).
 
 Requirements:
-- `make check` needs `python3`, `perl` and wabt (`wat2wasm`, `wasm-interp`).
-  It also needs clang's `wasm32` target with `wasm-ld`.
-- Four dependencies are pinned in the Makefile and cached under `build/`:
+- `make check` needs `python3` (3.10 or later: the canonical ABI rows run the
+  specification's own Python, which needs it, and fail on an older one),
+  `perl` and wabt (`wat2wasm`, `wasm-interp`). It also needs clang's `wasm32`
+  target with `wasm-ld`.
+- Five dependencies are pinned in the Makefile and cached under `build/`:
   `wasm-tools` (built with `cargo` by `make wasm-tools`), the spec testsuite
   (`make testsuite`), wasi-sdk, the clang and sysroot the C and C++ corpora
-  are built with (`make wasi-sdk`), and TeaVM, the compiler and class library
+  are built with (`make wasi-sdk`), TeaVM, the compiler and class library
   the Java corpora are built with (`make teavm`, which needs a JDK, and
-  applies `test/teavm/patches`). A fifth,
-  the Kotlin/Wasm stdlib (`make kotlin-stdlib`), is cached there too, in the
-  version your `kotlinc` reports. Each cached copy is stamped with its
-  version, so bumping a pin or upgrading `kotlinc` fetches it again.
-  `make check` brings all five up to date by itself, and `make check-spec`
-  the testsuite. A sixth, Temurin, the JDK the Java corpus's native column
-  runs (`make temurin`), only `make bench-record` fetches.
+  applies `test/teavm/patches`), and the Kotlin/Wasm stdlib of the Kotlin the
+  corpora are built with (`make kotlin-stdlib`, which refuses a `kotlinc` of
+  another version). Every file the Makefile downloads goes through
+  `test/fetch.sh`, which checks it against the SHA-256 `test/fetch.sha256`
+  records for its URL, and each cached copy is stamped with its version, so
+  bumping a pin fetches it again. `make check` brings all five up to date by
+  itself, and `make check-spec` the testsuite. A sixth, Temurin, the JDK the
+  Java corpus's native column runs (`make temurin`; Temurin 27 has no build
+  for x64 macOS), only `make bench-record` fetches. The canonical ABI rows
+  fetch the component model's reference implementation at a pinned commit,
+  checked against its SHA-256, and skip themselves only without a network.
 - Rows that need wasmtime, TinyGo, Go, Rust (`wasm32-wasip1` / `wasm32-wasip2`),
   Zig, `asc`, `kotlinc-wasm`, `wasm32-wasi-ghc` or a JDK (`javac` 21 or later,
   for the Java corpora) skip themselves when the tool is missing. GHC's wasm backend is not fetched by the Makefile: install it

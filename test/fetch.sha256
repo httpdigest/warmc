@@ -1,0 +1,56 @@
+# The SHA-256 of every file the Makefile downloads, by URL, which
+# test/fetch.sh checks each download against.  The Maven artifacts were
+# checked against Maven Central's .sha1 files when recorded, and the GitHub
+# release assets against the digests GitHub lists for them; GitHub publishes
+# none for a tag's source archive (SIMDe).
+
+# make kotlin-stdlib
+abd951acd75aeef2a08f01b3b0437afa04ba05a3b7eecf44748ab2f80a2e6bf8  https://repo1.maven.org/maven2/org/jetbrains/kotlin/kotlin-stdlib-wasm-wasi/2.4.21/kotlin-stdlib-wasm-wasi-2.4.21.klib
+
+# make teavm
+8335feb227d299bf51ba3862e84eb3a2723ff2e9840a885a7537f6454d44ee31  https://repo1.maven.org/maven2/org/teavm/teavm-tooling/0.16.0/teavm-tooling-0.16.0.jar
+c94539912c1b951fa741aecfcb6b4acad75c2e2360dc8859b1edd0c44175608a  https://repo1.maven.org/maven2/org/teavm/teavm-core/0.16.0/teavm-core-0.16.0.jar
+329fd2a9cfb3afb453070cb97c12adb5c0ee7b0d943b357188d7dbf9c6bf3dd5  https://repo1.maven.org/maven2/org/teavm/teavm-classlib/0.16.0/teavm-classlib-0.16.0.jar
+5c8511d71ae6f6d2ca913130393b64a959303e521727b2d9c1a9b1e14519216f  https://repo1.maven.org/maven2/org/teavm/teavm-interop/0.16.0/teavm-interop-0.16.0.jar
+999d369ab15aa83c17987d048ba59560759169891de7e13a5a1c2bd93dd060a8  https://repo1.maven.org/maven2/org/teavm/teavm-platform/0.16.0/teavm-platform-0.16.0.jar
+58b337b93924106bf819c45890c7c231a0c740145afe77795f1e0f099f621d71  https://repo1.maven.org/maven2/org/teavm/teavm-jso/0.16.0/teavm-jso-0.16.0.jar
+32d28e39957a41404f53a14c2447d980c7b5074a92414d0972014f448a46fcb2  https://repo1.maven.org/maven2/org/teavm/teavm-jso-apis/0.16.0/teavm-jso-apis-0.16.0.jar
+12688d04e7d2d73036adacd72b74fd8fb44f10283004075fbe68706ccb223b75  https://repo1.maven.org/maven2/org/teavm/teavm-jso-impl/0.16.0/teavm-jso-impl-0.16.0.jar
+00f053ad35ff78312e48eebbf4e1c6cf5f7a1e759b2432ba0b60d6f111bb3bdd  https://repo1.maven.org/maven2/org/teavm/teavm-metaprogramming-api/0.16.0/teavm-metaprogramming-api-0.16.0.jar
+616d30aa28f7b0180a61c2289b11c77bf84c715bd79f255e1e42400edb5b6d70  https://repo1.maven.org/maven2/org/teavm/teavm-metaprogramming-impl/0.16.0/teavm-metaprogramming-impl-0.16.0.jar
+9e867f3760b1c8d86cdb18ec70e429c23fd933021c8c3bb0cc0b727eac3202c0  https://repo1.maven.org/maven2/org/teavm/teavm-extension-apis/0.16.0/teavm-extension-apis-0.16.0.jar
+e280bbc31e8d26de2915954990e260871462c146418c7b901249502a1994dde5  https://repo1.maven.org/maven2/org/teavm/teavm-extension-spi/0.16.0/teavm-extension-spi-0.16.0.jar
+d94e8d4478c4186d18b657cb67654851d38b9f51d372dc7e7e54e0f3a24347c9  https://repo1.maven.org/maven2/org/teavm/teavm-extension-spi-util/0.16.0/teavm-extension-spi-util-0.16.0.jar
+59deba713805038fb9ceb76f002e3ae0e9660ec9815875917f08e0a235b7b1a2  https://repo1.maven.org/maven2/org/teavm/teavm-relocated-libs-asm/0.16.0/teavm-relocated-libs-asm-0.16.0.jar
+8ce092f26dc44cffbfd6a23067b0ae43e32f9ddb29efd6e4eed93095a454b04a  https://repo1.maven.org/maven2/org/teavm/teavm-relocated-libs-asm-analysis/0.16.0/teavm-relocated-libs-asm-analysis-0.16.0.jar
+b877abd3af4f9ae2650aa0cb3577fcbdd66a9a1a1181d545d5f1f20070ea5924  https://repo1.maven.org/maven2/org/teavm/teavm-relocated-libs-asm-commons/0.16.0/teavm-relocated-libs-asm-commons-0.16.0.jar
+e0bd21e6734b1f060c0553c66fe20292f49d146858aec1f1ecfe21f6417885f6  https://repo1.maven.org/maven2/org/teavm/teavm-relocated-libs-asm-tree/0.16.0/teavm-relocated-libs-asm-tree-0.16.0.jar
+c69ce1813eaa66643361b70b3f07c13ca924185280c237c832774a2f85eaf431  https://repo1.maven.org/maven2/org/teavm/teavm-relocated-libs-asm-util/0.16.0/teavm-relocated-libs-asm-util-0.16.0.jar
+7b82fedf747e0bf5d7a50acece86a8a684901e469165a3c5621c653128df4cd6  https://repo1.maven.org/maven2/org/teavm/teavm-relocated-libs-hppc/0.16.0/teavm-relocated-libs-hppc-0.16.0.jar
+ea776a11f0233ba9e3fd12faf81cca2101b42443d0d22084e2627898fd7ee76e  https://repo1.maven.org/maven2/org/teavm/teavm-relocated-libs-rhino/0.16.0/teavm-relocated-libs-rhino-0.16.0.jar
+035f145e2f7a47e6eee02e4ff488c1a9a28c0d61dadd69861662039b9e88ca2a  https://repo1.maven.org/maven2/joda-time/joda-time/2.15.1/joda-time-2.15.1.jar
+89b1360f407381bf61fde411019d8cbd009ebb10cff715f3669017a031027560  https://repo1.maven.org/maven2/com/jcraft/jzlib/1.1.3/jzlib-1.1.3.jar
+687cabf23e0d17a15be30fbc070809c2931714340aca224120fe31579f95519b  https://repo1.maven.org/maven2/org/teavm/teavm-core/0.16.0/teavm-core-0.16.0-sources.jar
+da6f83c1436c87a9ad683b6143aaa9c172b08c3974c9a7d5741a479d0d60092e  https://repo1.maven.org/maven2/org/teavm/teavm-classlib/0.16.0/teavm-classlib-0.16.0-sources.jar
+
+# make lwjgl
+46eeca5471833c3cf5da3c1da015b41e3bb3eb16dd3da03f366886da10096751  https://repo1.maven.org/maven2/org/lwjgl/lwjgl/3.4.3/lwjgl-3.4.3.jar
+2a60dbe93711632129a2ce6aa7e073aa58fa5450a88cde48a6af0a4dfeed606d  https://repo1.maven.org/maven2/org/lwjgl/lwjgl-glfw/3.4.3/lwjgl-glfw-3.4.3.jar
+a92cf30f25b6fb6066f3508511f83c5c4fe2a0cff14fc2e7373bc1f6c726374f  https://repo1.maven.org/maven2/org/lwjgl/lwjgl-opengl/3.4.3/lwjgl-opengl-3.4.3.jar
+
+# make glfw
+c927b1bb63bfbe97322d8ee2556aae8b7ec5b173bd9bcfd2b15c618bc4a3eaca  https://github.com/glfw/glfw/releases/download/3.5.1/glfw-3.5.1.bin.MACOS.zip
+
+# make temurin
+c2619cb73ff1d296edd0644d92ae8ed94039bc1bdd43282398835b7f88134fb6  https://github.com/adoptium/temurin27-binaries/releases/download/jdk-27.0.1.0.2%2B1/OpenJDK27U-jdk_aarch64_mac_hotspot_27.0.1.0.2_1.tar.gz
+5ddacf925244a00b60cac828b61ff2f67a68cd32b8dfe5cee1405e333b4589e5  https://github.com/adoptium/temurin27-binaries/releases/download/jdk-27.0.1.0.2%2B1/OpenJDK27U-jdk_aarch64_linux_hotspot_27.0.1.0.2_1.tar.gz
+30cb129f6cf299c852cec0feca9ea2a596d2ee9f26d8605d3a253951f6c8b20f  https://github.com/adoptium/temurin27-binaries/releases/download/jdk-27.0.1.0.2%2B1/OpenJDK27U-jdk_x64_linux_hotspot_27.0.1.0.2_1.tar.gz
+
+# make wasi-sdk
+9c59398106b417f8f14913380fdf0097a8cc0ff4af9eb3ce0065a859e88d49e9  https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-34/wasi-sdk-34.0-arm64-macos.tar.gz
+87d27fa8adc68dee59bfbf2e22a6d34ef717c34d6bf1d8af2a56fc929d9ce0eb  https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-34/wasi-sdk-34.0-x86_64-macos.tar.gz
+f7e243dff54d60bcc576e94d6166b69f410f2500ae4a9ceef34315be10e77971  https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-34/wasi-sdk-34.0-arm64-linux.tar.gz
+b761e3a0721dbae9c09a0059e5fdb2bf917d1b4a8a7b430fb3b5aafb0984b2c4  https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-34/wasi-sdk-34.0-x86_64-linux.tar.gz
+
+# make simde
+ed2a3268658f2f2a9b5367628a85ccd4cf9516460ed8604eed369653d49b25fb  https://github.com/simd-everywhere/simde/archive/refs/tags/v0.8.2.tar.gz
