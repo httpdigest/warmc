@@ -198,7 +198,10 @@ else
   echo "FAIL[traps] a memory of 65536 pages does not compile: $(head -1 "$BIG.err")"
   fail=$((fail+1))
 fi
-# and a 64-bit one past 2^26 pages, 4 TiB
+# and a 64-bit one past 2^26 pages, 4 TiB -- a program of its own name:
+# Windows can hold the one just run open a while after it exits, and then
+# no link may write over it
+BIG="$WORK/bigmem64$FTAG"
 printf '(module (memory i64 67108865) (func (export "f")))\n' > "$BIG.wat"
 if wtimeout ./$BUILD/warmc $WARMC_TARGET_FLAGS -o "$BIG" "$BIG.wat" 2>"$BIG.err"; then
   out=$(wruntimeout $WARMC_RUN "$BIG" f 2>&1); rc=$?
