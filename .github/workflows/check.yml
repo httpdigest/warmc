@@ -328,13 +328,12 @@ jobs:
 
       # `make check` starts every row at once, which a workstation takes in
       # its stride; on a runner's three or four virtual cores a compile of a
-      # tenth of a second can wait half a minute for its turn.  The limits
-      # are there for a compile or a run that wedges, not for one that queues.
+      # tenth of a second can wait minutes for its turn.  The limits are there
+      # for a compile or a run that wedges, not for one that queues: a
+      # compile's is CPU time (test/hostenv.sh, test/hostbuild.py), and the
+      # clock stops one only at ten times it; a run's is the clock's.
       # The step has a limit of its own, short of the job's, so that a run
       # that wedges anyway fails here and its logs are still kept below.
-      # On macOS the cases leave out vector.wat, whose compile, about a
-      # second of CPU, waited past two minutes on the runner's three cores
-      # beside the Java rows every night from 2026-10-26.
       - name: Test
         timeout-minutes: ${{ inputs.full && 120 || 10 }}
         env: &test-env
@@ -342,7 +341,6 @@ jobs:
           WARMC_TIMEOUT: 120
           WARMC_RUN_TIMEOUT: 600
           CHECK_BENCH: 0
-          CHECK_SKIP_CASES: ${{ runner.os == 'macOS' && 'vector' || '' }}
         run: make -j"$(sysctl -n hw.ncpu)" "$SUITE" HOST_TUNE=-mcpu=apple-m1
 
       - name: Save the test references

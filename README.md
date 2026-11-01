@@ -1769,9 +1769,10 @@ builds the sanitiser compilers; on Windows it checks that the Win32 offsets
 the runtime hard-codes match `windows.h` instead. CI runs the whole of it
 nightly. `CHECK_BENCH=0` leaves out the benchmark corpora, as CI does,
 `CHECK_SKIP_CASES="vector ..."` the cases it names from the case rows and
-the sanitiser's, as CI does on macOS, where `vector.wat`'s compile waits out
-its timeout beside the other rows, and `CHECK_TIMING=1` lists each row's
-wall and CPU time at the end.
+the sanitiser's, and `CHECK_TIMING=1` lists each row's wall and CPU time at
+the end. A compile's limit, `WARMC_TIMEOUT`, is CPU time: a compile that has
+not had that much CPU yet is waiting its turn rather than wedged, and goes on
+until it has, or until the clock reaches ten times the limit.
 
 `make check` keeps what it can, each thing under exactly what it depends
 on. warmc's compiles go to `WARMC_CACHE=build/warmc-cache`.

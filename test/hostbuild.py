@@ -8,6 +8,7 @@ import os
 import platform
 import re
 import subprocess
+import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DARWIN = platform.system() == "Darwin"
@@ -219,6 +220,54 @@ if __name__ == "__main__":
         sys.stderr.write(r.stdout + r.stderr)
     sys.exit(r.returncode)
 
+
+# How many times its limit a process that has not used up its CPU may still
+# take on the clock, in communicate_limited.
+WALL_FACTOR = 10
+
+def cpu_seconds(pid):
+    """The CPU time a running process has had, from ps, or None where there is
+    no reading it: a Windows program, which MSYS2's ps does not see, or one
+    that has just exited."""
+    if WINDOWS:
+        return None
+    try:
+        r = subprocess.run(["ps", "-o", "time=", "-p", str(pid)],
+                           capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    t = r.stdout.strip()
+    if r.returncode != 0 or not t:
+        return None
+    # [[dd-]hh:]mm:ss[.cc]: macOS prints 0:01.23, Linux 00:00:01
+    days, _, t = t.rpartition("-")
+    secs = 0.0
+    for part in t.split(":"):
+        secs = secs * 60 + float(part)
+    return secs + (int(days) * 86400 if days else 0)
+
+def communicate_limited(p, limit):
+    """p.communicate(), with LIMIT seconds of CPU rather than of the clock.
+
+    A compile that wedges spends CPU; one that only waits its turn, on a
+    machine running every row of make check at once, does not -- on CI's
+    three macOS cores a compile of half a second of CPU (test/cases/vector.wat)
+    waited past two minutes in nine rows at once.  So when LIMIT is up and
+    the process has had less CPU than that, it is let go on, until it has
+    had LIMIT or the clock reaches WALL_FACTOR times it.  Where the CPU time
+    cannot be read (Windows) the clock alone decides, as before.  Raises
+    subprocess.TimeoutExpired as communicate does, with the process running
+    still; its `cpu` attribute is the CPU time it had, or None."""
+    start = time.monotonic()
+    while True:
+        try:
+            return p.communicate(timeout=limit)
+        except subprocess.TimeoutExpired as e:
+            cpu = cpu_seconds(p.pid)
+            e.cpu = cpu
+            if cpu is None or cpu >= limit or \
+               time.monotonic() - start >= WALL_FACTOR * limit:
+                raise
 
 def stack_of(pid, path):
     """Where a process past its time is, as macOS's sample sees it for a

@@ -70,8 +70,27 @@ export WARMC_TARGET_FLAGS WARMC_RUN WARMC_HOST
 
 : "${WARMC_TIMEOUT:=6}"
 : "${WARMC_RUN_TIMEOUT:=30}"
+# A compile's limit is CPU time rather than time: one that wedges spends CPU,
+# and one that only waits its turn, with every row of make check started at
+# once, does not (test/hostbuild.py's communicate_limited is the same for the
+# Python suites).  The clock stops it too, at ten times the limit, for one
+# that blocks without spending any.  A native Windows program has no limit on
+# its CPU time that MSYS2 can set, so there the clock's is the only one.
+case "$(uname -s)" in
+  MINGW*|CLANG*|MSYS*) WTIMEOUT_CPU= ;;
+  *)                   WTIMEOUT_CPU=1 ;;
+esac
+# exported, for the suites that run wtimeout in a child shell (export -f)
+export WTIMEOUT_CPU
 wtimeout() {
-  perl -e 'my $t = shift; alarm $t; exec @ARGV or exit 127' "$WARMC_TIMEOUT" "$@"
+  local t=${WARMC_TIMEOUT%.*}
+  [ "${t:-0}" -ge 1 ] 2>/dev/null || t=1
+  if [ -n "$WTIMEOUT_CPU" ]; then
+    ( ulimit -t "$t" &&
+      exec perl -e 'my $t = shift; alarm $t; exec @ARGV or exit 127' "$((t * 10))" "$@" )
+  else
+    perl -e 'my $t = shift; alarm $t; exec @ARGV or exit 127' "$WARMC_TIMEOUT" "$@"
+  fi
 }
 wruntimeout() {
   perl -e 'my $t = shift; alarm $t; exec @ARGV or exit 127' "$WARMC_RUN_TIMEOUT" "$@"

@@ -158,12 +158,15 @@ def compile_case(idx, name, wasm, outdir):
                          ["--symbol-prefix=c%d" % idx, "-c", "-o", obj, wasm],
                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     try:
-        _out, err = p.communicate(timeout=TIMEOUT)
-    except subprocess.TimeoutExpired:
+        _out, err = hostbuild.communicate_limited(p, TIMEOUT)
+    except subprocess.TimeoutExpired as e:
         where = hostbuild.stack_of(p.pid, os.path.join(outdir, name + ".sample.txt"))
         p.kill()
         p.communicate()
-        return None, "FAIL[%s]: warmc timed out after %gs%s" % (name, TIMEOUT, where)
+        spent = ("after %gs of CPU" % TIMEOUT if e.cpu is not None and e.cpu >= TIMEOUT
+                 else "after %gs" % TIMEOUT if e.cpu is None
+                 else "after %gs, %.1fs of them on a CPU" % (TIMEOUT * hostbuild.WALL_FACTOR, e.cpu))
+        return None, "FAIL[%s]: warmc timed out %s%s" % (name, spent, where)
     if p.returncode != 0:
         return None, "FAIL[%s]: warmc: %s" % (name, err.strip()[:200])
     return obj, None
