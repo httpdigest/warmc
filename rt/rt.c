@@ -4728,6 +4728,10 @@ static void gcth_round_driver(void) {
 }
 
 static u64 gcth_stop_late;
+/* How long an exit waits for the collector's thread to stop, 50 ms unless
+   WARMC_GC_STOP_WAIT_MS says otherwise: a test of whether it hears the
+   stop at all gives it longer than a loaded machine may take to run it. */
+static u64 gcth_stop_wait_ns = 50000000ull;
 
 static void gcth_stop(void) {
   if (!__atomic_load_n(&gcth_started, __ATOMIC_ACQUIRE)) return;
@@ -4736,7 +4740,7 @@ static void gcth_stop(void) {
   gc_answer_outstanding(0);
   gcth_nudge();
 
-  u64 deadline = sys_nanos() + 50000000ull;
+  u64 deadline = sys_nanos() + gcth_stop_wait_ns;
   while (!__atomic_load_n(&gcth_stopped.v, __ATOMIC_ACQUIRE)) {
     if (sys_nanos() >= deadline) { gcth_stop_late++; return; }
     gcth_park_timeout(&gcth_stopped, 0, GC_ROUND_POLL_NS);
@@ -4812,6 +4816,7 @@ static void gc_read_options(void) {
   gc_opt_stress   = (u32)rt_getenv_u64("WARMC_GC_STRESS", 0);
   gc_opt_verify   = (u32)rt_getenv_u64("WARMC_GC_VERIFY", 0);
   gc_opt_stats    = (u32)rt_getenv_u64("WARMC_GC_STATS", 0);
+  gcth_stop_wait_ns = rt_getenv_u64("WARMC_GC_STOP_WAIT_MS", 50) * 1000000ull;
   gc_opt_growth   = (u32)rt_getenv_u64("WARMC_GC_GROWTH", gc_opt_growth);
   gc_opt_min_kb   = rt_getenv_u64("WARMC_GC_MIN_KB", gc_opt_min_kb);
   gc_opt_lab      = (u32)rt_getenv_u64("WARMC_GC_LAB", 1);

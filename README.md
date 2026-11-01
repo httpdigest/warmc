@@ -1396,6 +1396,7 @@ as in `--target=macos`.
 | `WARMC_GC_MIN_KB`, `WARMC_GC_GROWTH` | program | collection trigger: minimum size (default 16384, or a quarter of the heap if that is less), and growth as a percentage of live data (default 200) |
 | `WARMC_GC_CONC` | program | `0` disables the background collector thread |
 | `WARMC_GC_STATS` | program | print a GC report at exit |
+| `WARMC_GC_STOP_WAIT_MS` | program | how long an exit waits for the collector's thread to stop (default 50) |
 | `WARMC_GC_VERIFY`, `WARMC_GC_STRESS` | program | heap verification after each cycle; collect on every allocation |
 | `WARMC_GC_RELEASE` | program | return a freed run of at least this many bytes to the system (`madvise`); 0, the default, keeps them |
 | `WARMC_RANDOM_SEED` | program | make WASI preview 1 `random_get` deterministic |
