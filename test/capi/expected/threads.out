@@ -1,0 +1,50 @@
+> Thread 0 running
+> Thread 0 running
+> Thread 0 running
+> Thread 1 running
+> Thread 1 running
+> Thread 1 running
+> Thread 2 running
+> Thread 2 running
+> Thread 2 running
+> Thread 3 running
+> Thread 3 running
+> Thread 3 running
+> Thread 4 running
+> Thread 4 running
+> Thread 4 running
+> Thread 5 running
+> Thread 5 running
+> Thread 5 running
+> Thread 6 running
+> Thread 6 running
+> Thread 6 running
+> Thread 7 running
+> Thread 7 running
+> Thread 7 running
+> Thread 8 running
+> Thread 8 running
+> Thread 8 running
+> Thread 9 running
+> Thread 9 running
+> Thread 9 running
+Initializing thread 0...
+Initializing thread 1...
+Initializing thread 2...
+Initializing thread 3...
+Initializing thread 4...
+Initializing thread 5...
+Initializing thread 6...
+Initializing thread 7...
+Initializing thread 8...
+Initializing thread 9...
+Waiting for thread: 0
+Waiting for thread: 1
+Waiting for thread: 2
+Waiting for thread: 3
+Waiting for thread: 4
+Waiting for thread: 5
+Waiting for thread: 6
+Waiting for thread: 7
+Waiting for thread: 8
+Waiting for thread: 9

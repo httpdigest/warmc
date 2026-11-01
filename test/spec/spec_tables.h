@@ -85,6 +85,9 @@ typedef struct {
   const char *const *module_names;        /* "" unless registered up front */
   const SpecCmd *cmds;
   unsigned ncmds;
+  /* The JIT's driver (jitdriver.c) compiles each module from its binary,
+   * which this names, slot for slot as `modules` would; 0 for driver.c */
+  const char *const *paths;
 } SpecFile;
 
 extern const SpecFile spec_files[];

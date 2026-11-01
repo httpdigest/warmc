@@ -54,3 +54,33 @@ b761e3a0721dbae9c09a0059e5fdb2bf917d1b4a8a7b430fb3b5aafb0984b2c4  https://github
 
 # make simde
 ed2a3268658f2f2a9b5367628a85ccd4cf9516460ed8604eed369653d49b25fb  https://github.com/simd-everywhere/simde/archive/refs/tags/v0.8.2.tar.gz
+
+# test/capi/run.py: the WebAssembly C API's examples, and the wasm.h of the
+# same commit, which include/wasm.h must be a copy of
+fc8be66062dabd1ba4508734a4349d930701bf2289a7046e1f58710824477ac4  https://raw.githubusercontent.com/WebAssembly/wasm-c-api/9d6b93764ac96cdd9db51081c363e09d2d488b4d/example/callback.c
+ac98bdfb1b4b84c7c06644c8c53b98b14790cf3ae87aec63953043bfb0f4aef4  https://raw.githubusercontent.com/WebAssembly/wasm-c-api/9d6b93764ac96cdd9db51081c363e09d2d488b4d/example/callback.wat
+8466b8f5b77acae050a4181c28dee4fb6ec8a1d506169acbd5c754ac1f94978e  https://raw.githubusercontent.com/WebAssembly/wasm-c-api/9d6b93764ac96cdd9db51081c363e09d2d488b4d/example/finalize.c
+86e6c8e6274a42cf488b84ec3653ba1cd404aa790127fc6f74b85e3c4728812f  https://raw.githubusercontent.com/WebAssembly/wasm-c-api/9d6b93764ac96cdd9db51081c363e09d2d488b4d/example/finalize.wat
+b49fcab8159928818de1462d454fa07ef106da01db5b8ea74cc2e2f4b12847cd  https://raw.githubusercontent.com/WebAssembly/wasm-c-api/9d6b93764ac96cdd9db51081c363e09d2d488b4d/example/global.c
+c88949fe9d57466bb7b5a0a8d0a3ee3df7537c822bfde5718c1669c3c1909eaf  https://raw.githubusercontent.com/WebAssembly/wasm-c-api/9d6b93764ac96cdd9db51081c363e09d2d488b4d/example/global.wat
+635476ecaf626d434ba4ca634da7e9809dffa33de4fa5cd8cdb2e9cbe0f01f70  https://raw.githubusercontent.com/WebAssembly/wasm-c-api/9d6b93764ac96cdd9db51081c363e09d2d488b4d/example/hello.c
+782bb3e70e3151fa2aca476fe08a4227c7c44994d33c46804612a9fefa92c2bf  https://raw.githubusercontent.com/WebAssembly/wasm-c-api/9d6b93764ac96cdd9db51081c363e09d2d488b4d/example/hello.wat
+37f77752c132b87a8d6d91cbe55b4b7bcbbadc4a6f5c2ab39af2bf198ec61b42  https://raw.githubusercontent.com/WebAssembly/wasm-c-api/9d6b93764ac96cdd9db51081c363e09d2d488b4d/example/hostref.c
+bdf5ac090c99af01cc9bf934cff3f1ce9d01ba2bb841a47c000c1592cc5cb751  https://raw.githubusercontent.com/WebAssembly/wasm-c-api/9d6b93764ac96cdd9db51081c363e09d2d488b4d/example/hostref.wat
+f8079e6f3d364736d8c309f817259f52173e603dcd93adfbb64ada2d13d25ba2  https://raw.githubusercontent.com/WebAssembly/wasm-c-api/9d6b93764ac96cdd9db51081c363e09d2d488b4d/example/memory.c
+6fe75644ada5dff3b54b46e0ba1380e27766b7fc9d280f5031738c61a494a1b7  https://raw.githubusercontent.com/WebAssembly/wasm-c-api/9d6b93764ac96cdd9db51081c363e09d2d488b4d/example/memory.wat
+5918ddbdd8f9055ca5f34c4249b1415d1cbad1ee16917c1f746205783274e65c  https://raw.githubusercontent.com/WebAssembly/wasm-c-api/9d6b93764ac96cdd9db51081c363e09d2d488b4d/example/multi.c
+4641372ca6ec7b0a9b5304ed051d02d02a3a3619fc3cd8aab366a0d91c979061  https://raw.githubusercontent.com/WebAssembly/wasm-c-api/9d6b93764ac96cdd9db51081c363e09d2d488b4d/example/multi.wat
+84e55491b557c9d26b4b4d0fc73eee504d4e9fb8230406989aa74cd446de379e  https://raw.githubusercontent.com/WebAssembly/wasm-c-api/9d6b93764ac96cdd9db51081c363e09d2d488b4d/example/reflect.c
+8d5c0624c0ad2ab52cb740426d1d336190a85d4fa660736a4312fb428b18bab8  https://raw.githubusercontent.com/WebAssembly/wasm-c-api/9d6b93764ac96cdd9db51081c363e09d2d488b4d/example/reflect.wat
+a49fa3460ad0b74ffc2b913d326790838b7e7fccc1762ec2b65be4b79b8bf46d  https://raw.githubusercontent.com/WebAssembly/wasm-c-api/9d6b93764ac96cdd9db51081c363e09d2d488b4d/example/serialize.c
+782bb3e70e3151fa2aca476fe08a4227c7c44994d33c46804612a9fefa92c2bf  https://raw.githubusercontent.com/WebAssembly/wasm-c-api/9d6b93764ac96cdd9db51081c363e09d2d488b4d/example/serialize.wat
+3a14ba949c7621e73aa86d6fa6d72208cf64292778c5fdebacdca1e55b8bd566  https://raw.githubusercontent.com/WebAssembly/wasm-c-api/9d6b93764ac96cdd9db51081c363e09d2d488b4d/example/start.c
+86e0234c67cce9991549ed9fd0cc4f7ef9ca08d6075357b065a1b2b780764e26  https://raw.githubusercontent.com/WebAssembly/wasm-c-api/9d6b93764ac96cdd9db51081c363e09d2d488b4d/example/start.wat
+9f2037ace6a6aa57369a9e2a38400a06123a5ba11d8dab4e9689cdcd8a72e0e6  https://raw.githubusercontent.com/WebAssembly/wasm-c-api/9d6b93764ac96cdd9db51081c363e09d2d488b4d/example/table.c
+cfd11fbe9d4fe0074a31d1fdf9ca324a55f4c8466c1ca6d93af8a5ed8cf07bff  https://raw.githubusercontent.com/WebAssembly/wasm-c-api/9d6b93764ac96cdd9db51081c363e09d2d488b4d/example/table.wat
+1a75f743e05f9db1ea775d83f64426efb096fea6c59b3c15b08ce41432fe5fa5  https://raw.githubusercontent.com/WebAssembly/wasm-c-api/9d6b93764ac96cdd9db51081c363e09d2d488b4d/example/threads.c
+2abf7608ff5a1516f4a74fa1bd45c70b9dc785964db514d4538d46e01463917b  https://raw.githubusercontent.com/WebAssembly/wasm-c-api/9d6b93764ac96cdd9db51081c363e09d2d488b4d/example/threads.wat
+8babe8abdbe836ea5dc79353dbd4db7ae3e26c807641dbaa233864adb4548394  https://raw.githubusercontent.com/WebAssembly/wasm-c-api/9d6b93764ac96cdd9db51081c363e09d2d488b4d/example/trap.c
+c7f80b746cd7c6b068072a2c98261d073577390a1e0d12ca5e393fa37f0af3fc  https://raw.githubusercontent.com/WebAssembly/wasm-c-api/9d6b93764ac96cdd9db51081c363e09d2d488b4d/example/trap.wat
+7b6414f525d503a27609f0dfc3a33fa135f5cdf22d8b03f9e20a948ee8e62301  https://raw.githubusercontent.com/WebAssembly/wasm-c-api/9d6b93764ac96cdd9db51081c363e09d2d488b4d/include/wasm.h

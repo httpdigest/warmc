@@ -168,11 +168,15 @@ def c_string(s):
             out += "\\%03o" % ch
     return out + '"'
 
-def generate(spec, module_files, stem, idx):
+def generate(spec, module_files, stem, idx, paths=None):
     """spec: the parsed json.  module_files: [(index, filename)] in order.
 
     `idx` is the file's slot in the one executable; every emitted symbol is
     suffixed with it, and the modules are `f<idx>m<i>_module`.
+
+    With `paths` -- the spectest module's binary, then each module's, as
+    module_files names them -- the table is the JIT driver's (jitdriver.c):
+    it names the binaries, slot for slot, and no compiled module.
 
     Returns (C source, number of commands, [skipped reasons]).
     """
@@ -290,18 +294,27 @@ def generate(spec, module_files, stem, idx):
     lines.append('#include "spec_tables.h"')
     lines.append("")
 
-    lines.append("extern const ModuleDesc spectest_module;")
-    for i, fn in module_files:
-        lines.append("extern const ModuleDesc f%dm%d_module;" % (idx, i))
-    lines.append("const ModuleDesc *const spec_modules%s[] = {" % sfx)
-    lines.append("  &spectest_module,")
-    for i, fn in module_files:
-        lines.append("  &f%dm%d_module," % (idx, i))
+    if paths is not None:
+        lines.append("const char *const spec_paths%s[] = {" % sfx)
+        for p in paths:
+            lines.append("  %s," % c_string(p))
+        for mod in extra:
+            lines.append("  %s,   /* another instance */" % c_string(paths[mod]))
+        lines.append("  0")
+        lines.append("};")
+    else:
+        lines.append("extern const ModuleDesc spectest_module;")
+        for i, fn in module_files:
+            lines.append("extern const ModuleDesc f%dm%d_module;" % (idx, i))
+        lines.append("const ModuleDesc *const spec_modules%s[] = {" % sfx)
+        lines.append("  &spectest_module,")
+        for i, fn in module_files:
+            lines.append("  &f%dm%d_module," % (idx, i))
 
-    for mod in extra:
-        lines.append("  &f%dm%d_module,   /* another instance */" % (idx, mod))
-    lines.append("  0")
-    lines.append("};")
+        for mod in extra:
+            lines.append("  &f%dm%d_module,   /* another instance */" % (idx, mod))
+        lines.append("  0")
+        lines.append("};")
     lines.append('const char *const spec_module_names%s[] = {' % sfx)
     for _ in range(nslots + len(extra)):
         lines.append('  "",')
@@ -336,23 +349,31 @@ def generate(spec, module_files, stem, idx):
     lines.append("")
     return "\n".join(lines) + "\n", len(cmds), skipped
 
-def generate_index(entries):
+def generate_index(entries, jit=False):
     """entries: [(idx, wast_name, ncmds)] for the files that built.
 
     The command counts are baked in here rather than exported as
     `const unsigned` from each table: a `const` object is not a constant
     expression in C, so it cannot initialise the static array below.
+    With `jit`, the tables are generate()'s with paths, the JIT driver's.
     """
     lines = ['/* Generated -- do not edit. */', '#include "spec_tables.h"', ""]
     for idx, _name, _n in entries:
-        lines.append("extern const ModuleDesc *const spec_modules_%d[];" % idx)
+        if jit:
+            lines.append("extern const char *const spec_paths_%d[];" % idx)
+        else:
+            lines.append("extern const ModuleDesc *const spec_modules_%d[];" % idx)
         lines.append("extern const char *const spec_module_names_%d[];" % idx)
         lines.append("extern const SpecCmd spec_cmds_%d[];" % idx)
     lines.append("")
     lines.append("const SpecFile spec_files[] = {")
     for idx, name, n in entries:
-        lines.append("  { %s, spec_modules_%d, spec_module_names_%d, spec_cmds_%d, %d },"
-                     % (c_string(name), idx, idx, idx, n))
+        if jit:
+            lines.append("  { %s, 0, spec_module_names_%d, spec_cmds_%d, %d, spec_paths_%d },"
+                         % (c_string(name), idx, idx, n, idx))
+        else:
+            lines.append("  { %s, spec_modules_%d, spec_module_names_%d, spec_cmds_%d, %d },"
+                         % (c_string(name), idx, idx, idx, n))
     lines.append("};")
     lines.append("const unsigned spec_nfiles = %d;" % len(entries))
     lines.append("")

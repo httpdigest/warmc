@@ -18,6 +18,10 @@ test/cases/*.wat, at a row per flag setting:
     of a second of signature validation whatever is in it, which with an
     executable per module would be paid per module per setting; it is paid
     once per setting, and each further launch costs milliseconds.
+
+With WARMC_JIT=1 the modules are compiled by the JIT instead (libwarmc, run
+by build/warmrun, which takes the CLI harness's arguments after the module):
+nothing is linked, and WARMC_FLAGS are the JIT's options, -O<n> and -f.
 """
 import concurrent.futures
 import glob
@@ -40,6 +44,7 @@ RUN = os.environ.get("WARMC_RUN", "").split()
 TIMEOUT = float(os.environ.get("WARMC_TIMEOUT", "3"))
 
 RUN_TIMEOUT = float(os.environ.get("WARMC_RUN_TIMEOUT", "30"))
+JIT = os.environ.get("WARMC_JIT") == "1"
 
 # Cases left out by name, CHECK_SKIP_CASES="vector ...": where a runner is
 # too slow for one -- GitHub's macOS runner, three cores beside make check's
@@ -229,12 +234,34 @@ def main():
         prepared = list(pool.map(lambda w: prepare_case(w, versions), cases))
     msgs = [p[3] for p in prepared if p[3]]
     broken = len(msgs)
+    total = failed = files = 0
     ready = [p for p in prepared if not p[3]]
 
     if "--prepare" in sys.argv:
         for m in msgs:
             print(m)
         return 1 if msgs else 0
+
+    if JIT:
+        warmrun = hostbuild.exe(os.path.join(BUILD, "warmrun"))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as pool:
+            results = list(pool.map(
+                lambda p: cmp_mod.compare(p[2], warmrun, p[0], run=[],
+                                          timeout=RUN_TIMEOUT,
+                                          prefix=WARMC_FLAGS + [p[1]]),
+                ready))
+        for (name, _w, _r, _e), (n, f, m) in sorted(zip(ready, results)):
+            total += n
+            failed += f
+            if n:
+                files += 1
+            msgs += m
+        for m in msgs:
+            print(m)
+        print("---")
+        print("%d export comparisons across %d modules (JIT), %d failure(s)"
+              % (total, files, failed + broken))
+        return 1 if (failed or broken) else 0
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as pool:
         built = list(pool.map(
@@ -246,7 +273,6 @@ def main():
     live = [(i, p[0], p[2], obj)
             for i, (p, (obj, _e)) in enumerate(zip(ready, built)) if obj]
 
-    total = failed = files = 0
     if live:
 
         idx_c = os.path.join(outdir, "index.c")

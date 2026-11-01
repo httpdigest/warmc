@@ -25,6 +25,12 @@ it, wasm-tools having made no binary of it.  A command the generator cannot
 express -- one naming a module that did not compile -- is counted as
 `skipped` rather than dropped, so the totals do not silently shrink.
 
+A level spelled `jit FLAGS...` (--levels="jit -O2") runs the same commands
+with every module compiled by the JIT through the C API instead: the tables
+name each module's binary, test/spec/jitdriver.c resolves imports and
+registrations as an embedder of wasm.h does, and libwarmc compiles with
+FLAGS.  It is held to the same counts as any other level.
+
 Every file's result is compared against test/spec/expected.json, which records
 what warmc fails today.  A file that starts passing is as much of a mismatch
 as one that starts failing: the point of the file is that the number moves
@@ -268,6 +274,12 @@ def run_file(wast, idx, levels, verbose=False):
     return {"pass": npass, "fail": nfail, "skip": nskip, "failures": failures,
             "text_pass": tpass, "text_fail": tfail, "build": build}
 
+def is_jit(level):
+    return bool(level) and level[0] == "jit"
+
+def jit_driver_obj():
+    return os.path.join(WORK, "jitdriver.o")
+
 def cc_host(src, obj):
 
     return hostbuild.cc_host(src, obj, [os.path.join(ROOT, "test", "spec")])
@@ -284,6 +296,9 @@ def compile_module(wasm, obj, prefix, level):
     return sh([WARMC] + level + target +
               ["--symbol-prefix=" + prefix, "-c", "-o", obj] + wasms,
               timeout=WARMC_TIMEOUT * len(wasms))
+
+def spectest_wasm():
+    return os.path.join(WORK, "spectest.wasm")
 
 def spectest_obj(level):
     return os.path.join(WORK, "spectest%s.o" % level_tag(level))
@@ -312,9 +327,17 @@ def prebuild(levels):
     if r.returncode != 0:
         return "spectest: " + r.stderr.strip()[:80]
     for lv in levels:
+        if is_jit(lv):
+            continue
         r = compile_module(wasm, spectest_obj(lv), "spectest", lv)
         if r.returncode != 0:
             return "spectest: " + r.stderr.strip()[:80]
+    if any(is_jit(lv) for lv in levels):
+        r = sh(["clang", "-O1", "-c", "-I" + os.path.join(ROOT, "include"),
+                "-I" + os.path.join(ROOT, "test", "spec"), "-I" + os.path.join(ROOT, "rt"),
+                "-o", jit_driver_obj(), os.path.join(ROOT, "test", "spec", "jitdriver.c")])
+        if r.returncode != 0:
+            return "cannot build the JIT driver: " + r.stderr.strip()[:200]
     return None
 
 def build_file(stem, outdir, spec, level, idx):
@@ -339,6 +362,23 @@ def build_file(stem, outdir, spec, level, idx):
     os.makedirs(objdir, exist_ok=True)
 
     module_files = [(i + 1, fn) for i, fn in enumerate(wanted)]
+    if is_jit(level):
+        # nothing to compile ahead: the driver compiles each binary
+        paths = [spectest_wasm()] + [os.path.join(outdir, fn) for fn in wanted]
+        try:
+            src, ncmds, skipped = gen.generate(spec, module_files, stem, idx, paths=paths)
+        except Exception as e:
+            return {"status": "cannot generate: %s" % e}
+        if not ncmds:
+            return {"status": "nothing to run"}
+        cfile = os.path.join(objdir, "cmds.c")
+        with open(cfile, "w") as f:
+            f.write(src)
+        cobj = os.path.join(objdir, "cmds.o")
+        r = cc_host(cfile, cobj)
+        if r.returncode != 0:
+            return {"status": "cannot build the table: " + r.stderr.strip()[:120]}
+        return {"objs": [cobj], "ncmds": ncmds + 2, "skipped": len(skipped)}
     # one object for the file's modules: a process each was most of the
     # suite's time; one alone each where that does not compile, which
     # finds the module that does not
@@ -384,7 +424,7 @@ def try_link(level, group, prog):
     """Link one set of files into `prog`.  group: [(idx, name, ncmds, objs)]."""
     if not group:
         return "no file built"
-    src = gen.generate_index([(i, n, c) for i, n, c, _ in group])
+    src = gen.generate_index([(i, n, c) for i, n, c, _ in group], jit=is_jit(level))
     cfile = prog + ".index.c"
     with open(cfile, "w") as f:
         f.write(src)
@@ -393,6 +433,13 @@ def try_link(level, group, prog):
     if r.returncode != 0:
         return "cannot build the index: " + r.stderr.strip()[:200]
     objs = [o for _, _, _, group_objs in group for o in group_objs]
+    if is_jit(level):
+        rpath = ["-Wl,-rpath," + BUILD] if not hostbuild.WINDOWS else []
+        r = sh(["clang", "-o", prog, jit_driver_obj(), cobj] + objs +
+               ["-L" + BUILD, "-lwarmc"] + rpath)
+        if r.returncode != 0:
+            return "cannot link: " + r.stderr.strip()[:200]
+        return None
     r = link([driver_obj(), cobj, spectest_obj(level)] + objs, prog)
     if r.returncode != 0:
         return "cannot link: " + r.stderr.strip()[:200]
@@ -449,14 +496,16 @@ def _bisect_link(level, group, scratch):
         merged = kept
     return merged, elo
 
-def execute_file(prog, wast_name):
+def execute_file(prog, wast_name, level=()):
     """Run one file out of the shared executable.
 
     Its own process, so a module that faults ends its own run and every other
     file still reports.  The image was validated by the
-    first of these invocations, so the rest cost a few milliseconds.
+    first of these invocations, so the rest cost a few milliseconds.  The
+    JIT's driver takes the level's flags after the file's name.
     """
-    r = sh([prog, wast_name], timeout=RUN_TIMEOUT)
+    flags = list(level[1:]) if is_jit(level) else []
+    r = sh([prog, wast_name] + flags, timeout=RUN_TIMEOUT)
     npass = nfail = 0
     for ln in r.stderr.splitlines():
         if ln.startswith("spec-run: ") and " passed," in ln:
@@ -583,7 +632,7 @@ def main():
                 results[name]["run"][key] = {
                     "status": dropped.get(name, "cannot link"), "pass": 0, "fail": 0}
             else:
-                results[name]["run"][key] = execute_file(prog, name)
+                results[name]["run"][key] = execute_file(prog, name, lv)
 
     tot_pass = tot_fail = tot_skip = 0
     tot_tpass = tot_tfail = 0
