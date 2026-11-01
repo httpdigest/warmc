@@ -244,11 +244,13 @@ def main():
 
     if JIT:
         warmrun = hostbuild.exe(os.path.join(BUILD, "warmrun"))
+        # each on one compile thread: the modules run side by side, and a
+        # thread per core for each was every core's several times over
         with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as pool:
             results = list(pool.map(
                 lambda p: cmp_mod.compare(p[2], warmrun, p[0], run=[],
                                           timeout=RUN_TIMEOUT,
-                                          prefix=WARMC_FLAGS + [p[1]]),
+                                          prefix=["-j1"] + WARMC_FLAGS + [p[1]]),
                 ready))
         for (name, _w, _r, _e), (n, f, m) in sorted(zip(ready, results)):
             total += n
