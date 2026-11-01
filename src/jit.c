@@ -786,9 +786,11 @@ static void *reserve_within(uintptr_t lo, uintptr_t hi, size_t len, bool text,
 #endif
 
 /* The runtime's span: where its functions, which text calls, and its data
-   are */
-static void rt_span(void) {
-  if (g_rt_hi) return;
+   are.  False when the library has no table of them to say (a build that
+   made it empty fails, see the Makefile): nothing can be placed then. */
+static bool rt_span(void) {
+  if (!warmc_jit_nrtsyms) return false;
+  if (g_rt_hi) return true;
   uintptr_t lo = UINTPTR_MAX, hi = 0;
   for (unsigned i = 0; i < warmc_jit_nrtsyms; i++) {
     uintptr_t a = (uintptr_t)warmc_jit_rtsyms[i].addr;
@@ -797,6 +799,7 @@ static void rt_span(void) {
   }
   g_rt_lo = lo;
   g_rt_hi = hi;
+  return true;
 }
 
 static void arena_init(Arena *a, uint8_t *base, size_t len, bool text) {
@@ -813,7 +816,7 @@ static void arena_init(Arena *a, uint8_t *base, size_t len, bool text) {
 /* Another pair, as near the runtime as there is room; NULL when there is
    none within reach.  Under g_map_lock. */
 static ArenaPair *pair_new(size_t want_text, size_t want_data) {
-  rt_span();
+  if (!rt_span()) return NULL;
   uintptr_t lo = g_rt_hi > CALL_REACH - REACH_SLACK ? g_rt_hi - (CALL_REACH - REACH_SLACK) : 0;
   uintptr_t hi = g_rt_lo + (CALL_REACH - REACH_SLACK);
   uint8_t *t = NULL;

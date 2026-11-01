@@ -3,7 +3,7 @@
 # build/ci/llvm with only what the build and the test suite run: clang and
 # its resource directory (headers and the sanitizer runtimes), lld under the
 # names the tests call it by, the binary tools the encoder and Mach-O checks
-# use, and on macOS the libLTO that ld64 links clang's ThinLTO objects with.
+# use, llvm-nm, which lists the runtime's symbols for the JIT, and on macOS the libLTO that ld64 links clang's ThinLTO objects with.
 # The release is 1.6-1.8 GB, almost all of it static libraries and tools
 # nothing here runs; this is about a third of that, and a restored cache
 # holding this version is not downloaded again.  Windows takes MSYS2's LLVM.
@@ -47,7 +47,7 @@ if [ ! -e "$dest/.version-$LLVM_VERSION" ]; then
   # it whole, and then reports each file in it named as well as not found.
   top=${asset%.tar.xz}
   tar -tJf "$work/$asset" | grep -v '/$' |
-    grep -E "^$top/(bin/(clang|clang-[0-9]+|lld|ld\\.lld|ld64\\.lld|wasm-ld|llvm-ar|llvm-ranlib|llvm-mc|llvm-objcopy|llvm-objdump|llvm-size|llvm-symbolizer)|lib/clang/.*|lib/lib(LTO|Remarks|LLVM|clang-cpp)[-.0-9A-Za-z]*\\.(dylib|so[.0-9]*))$" \
+    grep -E "^$top/(bin/(clang|clang-[0-9]+|lld|ld\\.lld|ld64\\.lld|wasm-ld|llvm-ar|llvm-ranlib|llvm-mc|llvm-nm|llvm-objcopy|llvm-objdump|llvm-size|llvm-symbolizer)|lib/clang/.*|lib/lib(LTO|Remarks|LLVM|clang-cpp)[-.0-9A-Za-z]*\\.(dylib|so[.0-9]*))$" \
       > "$work/members"
   xargs tar -xJf "$work/$asset" -C "$work" < "$work/members"
   rm -rf "$dest"
