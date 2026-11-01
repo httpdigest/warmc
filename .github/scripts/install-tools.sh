@@ -12,43 +12,43 @@
 
 set -euo pipefail
 
-WASMTIME_VERSION=50.0.0
+WASMTIME_VERSION=50.0.1
 WABT_VERSION=1.0.42
 CCACHE_VERSION=4.14.2
 # Must match the Makefile's WASM_TOOLS_VERSION; where it does not, make builds
 # the Makefile's version with cargo as it would anywhere else.
-WASM_TOOLS_VERSION=1.262.0
+WASM_TOOLS_VERSION=1.263.0
 
 case "$(uname -s)/$(uname -m)" in
   Darwin/arm64)
     wasmtime_asset=wasmtime-v$WASMTIME_VERSION-aarch64-macos.tar.xz
-    wasmtime_sha=323dc098dc0455d60f396c404627e967b7033ffcfa29abfffb243126cf82c9d6
+    wasmtime_sha=960e5216c7ebd7e9b45e6561d15821b8b801b7d54aee28c7b91921aeb30c65c8
     wabt_asset=wabt-$WABT_VERSION-macos-arm64.tar.gz
     wabt_sha=3f654779b436c628db3ca4323c51538815f5fbc887a6d5f3bb1c18d36281e240
     ccache_asset=ccache-$CCACHE_VERSION-darwin.tar.gz
     ccache_sha=cf240009630b605b775c7c5c7b7105a3b196c79f31af322c1557969aa28003fc
     wasm_tools_asset=wasm-tools-$WASM_TOOLS_VERSION-aarch64-macos.tar.gz
-    wasm_tools_sha=801b237643cc0f4ab27ebd1745e7863e23bf194a038bc6ca8ce5618212e43669
+    wasm_tools_sha=b568f04746a699c4068b8d751779b60b501cf2cab6d259a3bc973eb5eeb1f62b
     ;;
   Linux/aarch64)
     wasmtime_asset=wasmtime-v$WASMTIME_VERSION-aarch64-linux.tar.xz
-    wasmtime_sha=10f9ad1f8539d2e04e041cc622de6a270109ab1e43a6be1f69843c2082166832
+    wasmtime_sha=d737e077416d78fbfb0a008229ec27d6a0fd5a4924874b8c38b293c850cf4094
     wabt_asset=wabt-$WABT_VERSION-linux-arm64.tar.gz
     wabt_sha=a7632c1cc66f70886441842ecf5a2ffa91a98c79e026059458451234ad013ea8
     ccache_asset=ccache-$CCACHE_VERSION-linux-aarch64-glibc.tar.gz
     ccache_sha=bc537a1f29232be50be3219ffe80c7c1955bc80a99c75311d7fb839828c80dd0
     wasm_tools_asset=wasm-tools-$WASM_TOOLS_VERSION-aarch64-linux.tar.gz
-    wasm_tools_sha=729dc47a114305ed60873ce6199d403eed1da89c3aa2367eef292da358b1e8d3
+    wasm_tools_sha=773b5e6bf957f0d93a9a337c9c5fc4c35509706301a80799f57a76fa367fd1ca
     ;;
   MINGW64_NT*/x86_64|CLANG64_NT*/x86_64|MSYS_NT*/x86_64)
     wasmtime_asset=wasmtime-v$WASMTIME_VERSION-x86_64-windows.zip
-    wasmtime_sha=cea9ccc700aaccb2b5507e96ac990ba60104bd7ab39284fb2e67cb64d58efcc4
+    wasmtime_sha=c3646ee2de8cfcefe532e75852e1fd2728d78c3fcc43251794803a698d1c30ca
     wabt_asset=wabt-$WABT_VERSION-windows-x64.tar.gz
     wabt_sha=62f1eb2b51aa57cf0f0b8ba333bf2c72a049930aa9c5de01dcad271c4fe48c88
     ccache_asset=ccache-$CCACHE_VERSION-windows-x86_64.zip
     ccache_sha=6993ce645e53192cec592ee23186200b574ac4c59097ecde8d9cfd681b47ae84
     wasm_tools_asset=wasm-tools-$WASM_TOOLS_VERSION-x86_64-windows.zip
-    wasm_tools_sha=a39100cadac426e174e449a80db669f191b6a2e14f27c369553580ca6e9ea7e3
+    wasm_tools_sha=0803df158b4dbea6b029d11f4206c414f432f0447af91542817061e4f0bd912e
     ;;
   *)
     echo "install-tools: no pinned binaries for $(uname -s)/$(uname -m)" >&2

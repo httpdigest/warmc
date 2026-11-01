@@ -277,7 +277,7 @@ $(TESTSUITE_STAMP):
 testsuite: $(TESTSUITE_STAMP)
 
 # test/spec/run.py reads this line to know which version to insist on.
-WASM_TOOLS_VERSION := 1.262.0
+WASM_TOOLS_VERSION := 1.263.0
 WASM_TOOLS_STAMP   := $(BUILD)/tools/.wasm-tools-$(WASM_TOOLS_VERSION)
 
 $(WASM_TOOLS_STAMP):
@@ -367,7 +367,7 @@ teavm: $(TEAVM_PATCHED)
 # TeaVM compiles, on the JVM and its JIT.  Only a native record needs it
 # (`make bench-record`, `gobench.py --native`), so `make check` does not fetch
 # it.  Adoptium's release for this host, versioned like TeaVM's directory.
-TEMURIN_VERSION := 25.0.5+8
+TEMURIN_VERSION := 27.0.1.0.2+1
 TEMURIN_HOST    := $(strip \
   $(if $(filter Darwin-arm64,$(UNAME_S)-$(UNAME_M)),aarch64_mac) \
   $(if $(filter Darwin-x86_64,$(UNAME_S)-$(UNAME_M)),x64_mac) \
