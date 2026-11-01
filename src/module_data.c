@@ -94,6 +94,23 @@ static bool module_tail_calls(Module *m) {
 static FuncUnwind *g_unwind;
 static uint32_t g_nunwind, g_cap_unwind;
 
+static void rodata_pool_reset(void);
+static void root_pool_reset(void);
+static void const_pool_reset(void);
+
+/* What emitting the last module kept -- its unwind notes, the bodies it
+   merged, the pools its rodata, roots and constant programs were interned
+   in -- given back, as a JIT's compiles one after another in a process that
+   lives on want (src/jit.c); the next module starts from them empty either
+   way. */
+void codegen_release(void) {
+  codegen_reset_unwind();
+  codegen_reset_merge();
+  rodata_pool_reset();
+  root_pool_reset();
+  const_pool_reset();
+}
+
 void codegen_reset_unwind(void) {
   for (uint32_t i = 0; i < g_nunwind; i++) {
     xfree(g_unwind[i].sites);

@@ -411,17 +411,6 @@ static uint8_t *read_file(const char *path, size_t *len_out) {
   return buf;
 }
 
-/* What an -O level decides; every other pass is on at every level but -O0,
-   which skips the IR optimiser, and is the -f flags' to change.  Each -O
-   sets all of these, so the last one given is the level. */
-static void set_level(OptOpts *o, int level) {
-  o->level = level;
-  o->align = o->split = o->trampoline = o->go_sp = level >= 1;
-  o->guard_pages = o->inl = o->devirt = o->unroll = o->gcpure = level >= 2;
-  /* -O3: also the passes that change what a program can see */
-  o->fma = o->dead_frames = o->acc_tail = o->float_reassoc = o->addr_nowrap = level >= 3;
-}
-
 static void print_stats(void) {
   fprintf(stderr,
           "warmc stats: folded=%llu dce=%llu cse=%llu licm=%llu branch=%llu\n"
@@ -1069,42 +1058,7 @@ static int warmc_main(int argc, char **argv) {
   bool dump_adapter = false, dump_cwit = false, dump_link = false;
 
   OptOpts opt;
-  memset(&opt, 0, sizeof opt);
-  set_level(&opt, 2);
-  opt.fold = opt.dce = opt.cse = opt.licm = opt.branch = true;
-  opt.thread = opt.nodesplit = opt.keysplit = true;
-  opt.gssa = true;
-  opt.small_loop_align = true;
-  opt.memopt = opt.bce = opt.strength = true;
-
-  opt.rotate = true;
-  opt.addroff = true;
-  opt.memptr = true;
-  opt.regalloc = true;
-  opt.vectorize = true;
-  opt.edgetests = true;
-  opt.selftail = true;
-  opt.ldcomb = true;
-  opt.escape = true;
-  opt.pescape = true;
-  opt.gloop = true;
-  opt.loopclose = true;
-  opt.cpool = true;
-  opt.ictab = true;
-  opt.reassoc = true;
-  opt.labcache = true;
-  opt.barelide = true;
-  opt.reach = true;
-  opt.prune = true;
-  opt.reinline = true;
-  opt.throwjump = true;
-  opt.ifconv = true;
-  opt.mulwide = true;
-  opt.closed_world = true;
-  opt.sealed = true;
-  opt.once = true;
-  opt.go_resume = opt.go_noret = true;
-  opt.wrap_params = true;
+  compile_default_opts(&opt);
 
   for (int i = 1; i < argc; i++) {
     const char *a = argv[i];
@@ -1177,8 +1131,6 @@ static int warmc_main(int argc, char **argv) {
       }
       return 0;
     }
-    else if (a[0] == '-' && a[1] == 'O' && a[2] >= '0' && a[2] <= '3' && !a[3])
-      set_level(&opt, a[2] - '0');
     else if (!strcmp(a, "--validate-only")) validate_only = true;
     else if (!strcmp(a, "--dump-component")) dump_component = true;
     else if (!strcmp(a, "--dump-canon")) dump_canon = true;
@@ -1203,79 +1155,14 @@ static int warmc_main(int argc, char **argv) {
         return 1;
       }
     }
-    else if (!strncmp(a, "-f", 2)) {
-      const char *name = a + 2;
-      bool on = true;
-      if (!strncmp(name, "no-", 3)) { on = false; name += 3; }
-      if (!strcmp(name, "fold")) opt.fold = on;
-      else if (!strcmp(name, "dce")) opt.dce = on;
-      else if (!strcmp(name, "cse")) opt.cse = on;
-      else if (!strcmp(name, "licm")) opt.licm = on;
-      else if (!strcmp(name, "branch")) opt.branch = on;
-      else if (!strcmp(name, "thread")) opt.thread = on;
-      else if (!strcmp(name, "nodesplit")) opt.nodesplit = on;
-      else if (!strcmp(name, "key-split")) opt.keysplit = on;
-      else if (!strcmp(name, "mem")) opt.memopt = on;
-      else if (!strcmp(name, "bce")) opt.bce = on;
-      else if (!strcmp(name, "strength")) opt.strength = on;
-      else if (!strcmp(name, "inline")) opt.inl = on;
-      else if (!strcmp(name, "reassoc")) opt.reassoc = on;
-      else if (!strcmp(name, "rotate")) opt.rotate = on;
-      else if (!strcmp(name, "addroff")) opt.addroff = on;
-      else if (!strcmp(name, "memptr")) opt.memptr = on;
-      else if (!strcmp(name, "align")) opt.align = on;
-      else if (!strcmp(name, "guard-pages")) opt.guard_pages = on;
-      else if (!strcmp(name, "regalloc")) opt.regalloc = on;
-      else if (!strcmp(name, "split")) opt.split = on;
-      else if (!strcmp(name, "vectorize")) opt.vectorize = on;
-      else if (!strcmp(name, "edge-tests")) opt.edgetests = on;
-      else if (!strcmp(name, "selftail")) opt.selftail = on;
-      else if (!strcmp(name, "ldcomb")) opt.ldcomb = on;
-      else if (!strcmp(name, "escape")) opt.escape = on;
-      else if (!strcmp(name, "partial-escape")) opt.pescape = on;
-      else if (!strcmp(name, "gloop")) opt.gloop = on;
-      else if (!strcmp(name, "loopclose")) opt.loopclose = on;
-      else if (!strcmp(name, "cpool")) opt.cpool = on;
-      else if (!strcmp(name, "ictab")) opt.ictab = on;
-      else if (!strcmp(name, "trampoline")) opt.trampoline = on;
-      else if (!strcmp(name, "go-sp")) opt.go_sp = on;
-      else if (!strcmp(name, "go-resume")) opt.go_resume = on;
-      else if (!strcmp(name, "go-noret")) opt.go_noret = on;
-      else if (!strcmp(name, "wrap-params")) opt.wrap_params = on;
-      else if (!strcmp(name, "gssa")) opt.gssa = on;
-      else if (!strcmp(name, "gssa-all")) { opt.gssa_all = on; if (on) opt.gssa = true; }
-      else if (!strcmp(name, "small-loop-align")) opt.small_loop_align = on;
-      else if (!strcmp(name, "labcache")) opt.labcache = on;
-      else if (!strcmp(name, "barelide")) opt.barelide = on;
-      else if (!strcmp(name, "merge")) codegen_set_merge(on);
-      else if (!strcmp(name, "compress-data")) codegen_set_compress_data(on);
-      else if (!strcmp(name, "reach")) opt.reach = on;
-      else if (!strcmp(name, "prune")) opt.prune = on;
-      else if (!strcmp(name, "devirt")) opt.devirt = on;
-      else if (!strcmp(name, "reinline")) opt.reinline = on;
-      else if (!strcmp(name, "throw-jump")) opt.throwjump = on;
-      else if (!strcmp(name, "unroll")) opt.unroll = on;
-      else if (!strcmp(name, "ifconv")) opt.ifconv = on;
-      else if (!strcmp(name, "mulwide")) opt.mulwide = on;
-      else if (!strcmp(name, "fma")) opt.fma = on;
-      else if (!strcmp(name, "dead-frames")) opt.dead_frames = on;
-      else if (!strcmp(name, "acc-tail")) opt.acc_tail = on;
-      else if (!strcmp(name, "float-reassoc")) opt.float_reassoc = on;
-      else if (!strcmp(name, "addr-nowrap")) opt.addr_nowrap = on;
-      else if (!strcmp(name, "exact-trap")) opt.exact_trap = on;
-      else if (!strcmp(name, "gcpure")) opt.gcpure = on;
-      else if (!strcmp(name, "closed-world")) opt.closed_world = on;
-      else if (!strcmp(name, "sealed")) opt.sealed = on;
-      else if (!strcmp(name, "once")) opt.once = on;
-      else warmc_fatal("unknown pass %s", name);
-    }
+    else if (compile_parse_flag(&opt, a)) {}
     else if (a[0] == '-') warmc_fatal("unknown option %s (try --help)", a);
     else input = inputs[ninputs++] = a;
   }
   /* -fexact-trap: these keep what a trap would see where it cannot see it,
      a global in an argument or a frame's stores left out, whatever their
      own flags and their order say */
-  if (opt.exact_trap) opt.trampoline = opt.go_sp = opt.dead_frames = opt.acc_tail = false;
+  compile_finish_opts(&opt);
   if (!input) { fputs(usage_text, stderr); return 2; }
   /* A library's runtime finds its module as warmc_module; the prefix names
      the library's C helpers instead. */

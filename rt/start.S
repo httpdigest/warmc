@@ -33,7 +33,7 @@
 
     .text
 
-#if !defined(WARMC_DARWIN)
+#if !defined(WARMC_DARWIN) && !defined(WARMC_JIT)
     .globl _start
     FUNC_DIRECTIVES(_start)
 _start:

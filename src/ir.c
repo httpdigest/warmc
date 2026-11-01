@@ -41,20 +41,39 @@ struct IrChunk { struct IrChunk *next; size_t cap; };
 #define IR_CHUNK_MAX ((size_t)1 << 20)
 #define IR_ALIGN(n) (((n) + 15u) & ~(size_t)15u)
 
+/* What does not fit the chunk being filled goes in a new one, the next
+   size up, and the old one's rest is left -- unless it is more than a
+   quarter of that size: then it gets a chunk of its own, its size, and the
+   one being filled goes on being filled, or the rest of the new one is
+   filled where that is more.  Starting a chunk of twice the size for every
+   large array, a function's instructions or a grown block list, left half
+   of the arena unused: 4 GB of chunks for 2 GB asked for over the compile
+   of Go's net/http server, and one function of zig's divmod 37 MB. */
 void *ir_alloc(IrFunc *f, size_t n) {
   n = IR_ALIGN(n);
   if (n > f->bump_left) {
     size_t want = IR_CHUNK_FIRST;
-    if (f->chunks) want = f->chunks->cap * 2 > IR_CHUNK_MAX ? IR_CHUNK_MAX : f->chunks->cap * 2;
+    if (f->bump_cap) want = f->bump_cap * 2 > IR_CHUNK_MAX ? IR_CHUNK_MAX : f->bump_cap * 2;
     size_t cap = n + sizeof(struct IrChunk);
-    if (cap < want) cap = want;
+    bool own = cap > want / 4;
+    if (!own) cap = want;
     cap = xmalloc_fit(cap);
     struct IrChunk *c = xmalloc(cap);
     c->next = f->chunks;
     c->cap = cap;
     f->chunks = c;
-    f->bump = (char *)c + sizeof(struct IrChunk);
-    f->bump_left = cap - sizeof(struct IrChunk);
+    char *p = (char *)c + sizeof(struct IrChunk);
+    size_t left = cap - sizeof(struct IrChunk);
+    if (own) {
+      if (left - n > f->bump_left) {
+        f->bump = p + n;
+        f->bump_left = left - n;
+      }
+      return p;
+    }
+    f->bump = p;
+    f->bump_left = left;
+    f->bump_cap = cap;
   }
   void *p = f->bump;
   f->bump += n;

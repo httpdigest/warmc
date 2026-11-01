@@ -612,50 +612,98 @@ typedef struct {
   uint32_t npass;
 } InlMemo;
 
-/* The memo every inline run on a thread uses: an entry per function of the
-   module, cleared when a run first touches it and released through the list
-   of the ones it touched.  A fresh array per run, zeroed and then walked to
+/* The memo every inline run on a thread uses: an entry per callee the run
+   looks at, found through a table of their indices.  The entries sit in
+   pages that stay where they are while more are made, since a caller holds
+   one across the making of another, and the run's end frees what they hold
+   and empties the table.  An entry for every function of the module, kept
+   by each thread from one run to the next, came to most of the module's
+   functions times two hundred bytes per thread once a worker had compiled
+   enough callers: a quarter of the memory Go's net/http server's compile
+   needed at its peak.  A fresh array per run, zeroed and then walked to
    free, was the module's size again for every function compiled: 3.4 GB
    zeroed compiling a Go program of 3,700 functions. */
+#define INL_MEMO_PAGE 64u
 typedef struct {
-  InlMemo *e;
-  uint32_t *gen, *touched;
-  uint32_t n, ntouched, cur;
+  InlMemo **page;
+  uint32_t npage;
+  /* open addressing: a callee's index, UINT32_MAX where none, and its
+     entry's number in the pages */
+  uint32_t *key, *at;
+  uint32_t cap, n;
 } InlMemos;
 
 static _Thread_local InlMemos g_memos;
 
 static InlMemos *inl_memos_begin(const Module *m) {
+  (void)m;
   InlMemos *ms = &g_memos;
-  uint32_t n = m->nfuncs ? m->nfuncs : 1;
-  if (ms->n < n) {
-    xfree(ms->e); xfree(ms->gen); xfree(ms->touched);
-    ms->e = xmalloc(n * sizeof(InlMemo));
-    ms->gen = xcalloc(n, sizeof(uint32_t));
-    ms->touched = xmalloc(n * sizeof(uint32_t));
-    ms->n = n;
-    ms->cur = 0;
+  if (!ms->cap) {
+    ms->cap = 64;
+    ms->key = xmalloc(ms->cap * sizeof(uint32_t));
+    ms->at = xmalloc(ms->cap * sizeof(uint32_t));
+    memset(ms->key, 0xff, ms->cap * sizeof(uint32_t));
   }
-  if (++ms->cur == 0) {
-    memset(ms->gen, 0, ms->n * sizeof(uint32_t));
-    ms->cur = 1;
-  }
-  ms->ntouched = 0;
+  ms->n = 0;
   return ms;
 }
 
+static InlMemo *memo_entry(InlMemos *ms, uint32_t k) {
+  return &ms->page[k / INL_MEMO_PAGE][k % INL_MEMO_PAGE];
+}
+
+static uint32_t memo_slot(const InlMemos *ms, uint32_t fidx) {
+  uint32_t mask = ms->cap - 1, s = (fidx * 0x9E3779B1u) & mask;
+  while (ms->key[s] != UINT32_MAX && ms->key[s] != fidx) s = (s + 1) & mask;
+  return s;
+}
+
 static InlMemo *memo_at(InlMemos *ms, uint32_t fidx) {
-  if (ms->gen[fidx] != ms->cur) {
-    ms->gen[fidx] = ms->cur;
-    memset(&ms->e[fidx], 0, sizeof(InlMemo));
-    ms->touched[ms->ntouched++] = fidx;
+  uint32_t s = memo_slot(ms, fidx);
+  if (ms->key[s] == fidx) return memo_entry(ms, ms->at[s]);
+  if ((ms->n + 1) * 2 > ms->cap) {
+    uint32_t oc = ms->cap, *ok = ms->key, *oa = ms->at;
+    ms->cap = oc * 2;
+    ms->key = xmalloc(ms->cap * sizeof(uint32_t));
+    ms->at = xmalloc(ms->cap * sizeof(uint32_t));
+    memset(ms->key, 0xff, ms->cap * sizeof(uint32_t));
+    for (uint32_t i = 0; i < oc; i++)
+      if (ok[i] != UINT32_MAX) {
+        uint32_t t = memo_slot(ms, ok[i]);
+        ms->key[t] = ok[i];
+        ms->at[t] = oa[i];
+      }
+    xfree(ok); xfree(oa);
+    s = memo_slot(ms, fidx);
   }
-  return &ms->e[fidx];
+  uint32_t k = ms->n++;
+  if (k / INL_MEMO_PAGE >= ms->npage) {
+    ms->page = xrealloc(ms->page, (ms->npage + 1) * sizeof(InlMemo *));
+    ms->page[ms->npage++] = xmalloc(INL_MEMO_PAGE * sizeof(InlMemo));
+  }
+  ms->key[s] = fidx;
+  ms->at[s] = k;
+  InlMemo *e = memo_entry(ms, k);
+  memset(e, 0, sizeof *e);
+  return e;
+}
+
+/* the run's end: what its entries hold freed, the table emptied */
+static void memo_end_run(InlMemos *ms) {
+  for (uint32_t k = 0; k < ms->n; k++) {
+    InlMemo *e = memo_entry(ms, k);
+    if (e->plain) ir_free(e->plain);
+    if (e->split) ir_free(e->split);
+    xfree(e->pass);
+  }
+  if (ms->n) memset(ms->key, 0xff, ms->cap * sizeof(uint32_t));
+  ms->n = 0;
 }
 
 void inl_memos_release(void) {
   InlMemos *ms = &g_memos;
-  xfree(ms->e); xfree(ms->gen); xfree(ms->touched);
+  for (uint32_t i = 0; i < ms->npage; i++) xfree(ms->page[i]);
+  xfree(ms->page); xfree(ms->key); xfree(ms->at);
   memset(ms, 0, sizeof *ms);
 }
 
@@ -1314,13 +1362,7 @@ static bool inl_run(IrFunc *f, const OptOpts *o, uint32_t budget0, bool more) {
   if (stale) { ir_apply_subst(f); ir_order(f); }
   xfree(sites.v);
   xfree(ev);
-  for (uint32_t k = 0; k < memo->ntouched; k++) {
-    InlMemo *e = &memo->e[memo->touched[k]];
-    if (e->plain) ir_free(e->plain);
-    if (e->split) ir_free(e->split);
-    xfree(e->pass);
-  }
-  memo->ntouched = 0;
+  memo_end_run(memo);
   return any;
 }
 

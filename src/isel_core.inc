@@ -1074,6 +1074,6 @@ static void collect_refs(IrFunc *f, FuncOut *fout) {
       if (n == cap) { cap = cap ? cap * 2 : 8; v = xrealloc(v, cap * sizeof *v); }
       v[n++] = (uint32_t)in->imm;
     }
-  fout->refs = v;
+  fout->refs = xkeep(v, (size_t)n * sizeof *v);
   fout->nrefs = n;
 }

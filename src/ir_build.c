@@ -357,7 +357,7 @@ static void branch_if(Bld *b, uint32_t d, Ref cond, Ref extra) {
     Block *rb = &f->blocks[retb];
     rb->term = T_RETURN;
     rb->nret = arity;
-    rb->ret_args = xmalloc((arity ? arity : 1) * sizeof(Ref));
+    rb->ret_args = ir_alloc(f, (arity ? arity : 1) * sizeof(Ref));
     memcpy(rb->ret_args, args, arity * sizeof(Ref));
     rb->sealed = true;
   } else {
@@ -435,7 +435,7 @@ static void build_pad(Bld *b, uint8_t kind, uint32_t tag, uint32_t d) {
     Block *pb = &f->blocks[pad];
     pb->term = T_RETURN;
     pb->nret = n;
-    pb->ret_args = xmalloc((n ? n : 1) * sizeof(Ref));
+    pb->ret_args = ir_alloc(f, (n ? n : 1) * sizeof(Ref));
     memcpy(pb->ret_args, args, n * sizeof(Ref));
   } else {
     jump_to(b, pad, t->target, args, n);
@@ -1241,7 +1241,7 @@ static void gc_build(Bld *b, uint32_t sub, const char *sym) {
           Block *blk = &f->blocks[edge];
           set_term(b, edge, T_RETURN);
           blk->nret = arity;
-          blk->ret_args = xmalloc((arity ? arity : 1) * sizeof(Ref));
+          blk->ret_args = ir_alloc(f, (arity ? arity : 1) * sizeof(Ref));
           memcpy(blk->ret_args, &b->stack[b->sp - arity], arity * sizeof(Ref));
         } else {
           jump_to(b, edge, tc->target, &b->stack[b->sp - arity], arity);
@@ -1441,7 +1441,7 @@ IrFunc *ir_build_unordered(Module *m, uint32_t fi, const OptOpts *opt) {
             Block *blk = &f->blocks[b->cur];
             set_term(b, b->cur, T_RETURN);
             blk->nret = c->nresults;
-            blk->ret_args = xmalloc((c->nresults ? c->nresults : 1) * sizeof(Ref));
+            blk->ret_args = ir_alloc(f, (c->nresults ? c->nresults : 1) * sizeof(Ref));
             if (c->nresults)
               memcpy(blk->ret_args, &b->stack[base], c->nresults * sizeof(Ref));
           }
@@ -1487,7 +1487,7 @@ IrFunc *ir_build_unordered(Module *m, uint32_t fi, const OptOpts *opt) {
           Block *blk = &f->blocks[b->cur];
           set_term(b, b->cur, T_RETURN);
           blk->nret = t->nresults;
-          blk->ret_args = xmalloc((t->nresults ? t->nresults : 1) * sizeof(Ref));
+          blk->ret_args = ir_alloc(f, (t->nresults ? t->nresults : 1) * sizeof(Ref));
           memcpy(blk->ret_args, &b->stack[base], t->nresults * sizeof(Ref));
         } else {
           uint32_t arity = t->kind == C_LOOP ? t->nparams : t->nresults;
@@ -1526,7 +1526,7 @@ IrFunc *ir_build_unordered(Module *m, uint32_t fi, const OptOpts *opt) {
             Block *rb = &f->blocks[retb];
             rb->term = T_RETURN;
             rb->nret = t->nresults;
-            rb->ret_args = xmalloc((t->nresults ? t->nresults : 1) * sizeof(Ref));
+            rb->ret_args = ir_alloc(f, (t->nresults ? t->nresults : 1) * sizeof(Ref));
             memcpy(rb->ret_args, &b->stack[base], t->nresults * sizeof(Ref));
             rb->sealed = true;
             ir_add_edge(f, b->cur, retb, NULL, 0);
@@ -1546,7 +1546,7 @@ IrFunc *ir_build_unordered(Module *m, uint32_t fi, const OptOpts *opt) {
         Block *blk = &f->blocks[b->cur];
         set_term(b, b->cur, T_RETURN);
         blk->nret = t->nresults;
-        blk->ret_args = xmalloc((t->nresults ? t->nresults : 1) * sizeof(Ref));
+        blk->ret_args = ir_alloc(f, (t->nresults ? t->nresults : 1) * sizeof(Ref));
         memcpy(blk->ret_args, &b->stack[base], t->nresults * sizeof(Ref));
         b->dead = true;
         break;
@@ -1619,7 +1619,7 @@ IrFunc *ir_build_unordered(Module *m, uint32_t fi, const OptOpts *opt) {
             Block *blk = &f->blocks[b->cur];
             set_term(b, b->cur, T_RETURN);
             blk->nret = sig->nresults;
-            blk->ret_args = xmalloc(sizeof(Ref));
+            blk->ret_args = ir_alloc(f, sizeof(Ref));
             blk->ret_args[0] = call;
             b->dead = true;
             break;

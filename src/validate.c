@@ -1426,6 +1426,12 @@ void wasm_validate(Module *m) {
 /* Bodies a module transform rewrote, validated as wasm_validate validates
    every body (tramp.c, gosp.c): what it writes must be wasm a validator
    accepts. */
+/* what a validation that a diagnostic ended kept */
+void validate_release(void) {
+  xfree(g_declared);
+  g_declared = NULL;
+}
+
 void wasm_validate_funcs(Module *m, const uint32_t *fns, uint32_t n) {
   collect_declared(m);
   validate_bodies(m, fns, n);

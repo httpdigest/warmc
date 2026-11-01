@@ -199,9 +199,10 @@ static bool gs_rewrite(const Gs *g, uint32_t fi, bool s, uint8_t **body) {
   }
   /* the module keeps every body to the end */
   if (b.cap > b.len + b.len / 8) b.data = xrealloc(b.data, b.len);
+  b.data = xkeep(b.data, b.len);
 
   uint32_t add = s ? 3 : 2;
-  ValType *lt = xmalloc((old + add) * sizeof(ValType));
+  ValType *lt = xmalloc_long((old + add) * sizeof(ValType));
   if (s) {
     lt[0] = f->local_types[0];
     lt[1] = VT_I32;

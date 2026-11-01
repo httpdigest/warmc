@@ -116,6 +116,10 @@ static u64 iov_walk_fd(WarmInstance *vm, int hostfd, int writing, u64 iovs_,
    carry -- it keeps 8 bits, so 256 would read as success -- or that a shell
    takes for its own (126 and up) is a trap, as wasmtime makes it. */
 __attribute__((noreturn))
+/* A JIT's host (src/capi.c) ends the call that ran the program, which a
+   process of the program's own ends the process for. */
+void (*warmc_wasi_exit_hook)(int code);
+
 static u64 wasi_proc_exit(WarmInstance *vm, u64 code) {
   if ((u32)code >= 126) {
     err("warmc-wasi: proc_exit(");
@@ -124,6 +128,7 @@ static u64 wasi_proc_exit(WarmInstance *vm, u64 code) {
     warmc_trap(TRAP_UNREACHABLE);
   }
   warmc_report_run(vm);
+  if (warmc_wasi_exit_hook) warmc_wasi_exit_hook((int)(u32)code);
   warmc_rt_exit((int)(u32)code);
 }
 
@@ -477,6 +482,8 @@ static u32 copy_path(WarmInstance *vm, u64 p_, u64 len_, char *out) {
   return WASI_ESUCCESS;
 }
 
+/* the CLI's flags' (drive): a JIT's host has none */
+__attribute__((unused))
 static int str_eq(const char *a, const char *b) { return wasifs_str_eq(a, b); }
 
 static u32 walk(int root, const char *path, int *out_dir, char *leaf) {
@@ -1667,6 +1674,53 @@ static const struct { const char *name; void *fn; } BINDINGS[] = {
 };
 #define NBINDINGS ((u32)(sizeof BINDINGS / sizeof BINDINGS[0]))
 
+#if defined(WARMC_JIT)
+/* For a JIT's host (src/capi.c, warm_wasi_imports): the world the program
+   sees, set up afresh -- every descriptor the last one opened closed, the
+   standard three the host's again, then the directories, each "HOST" or
+   "HOST::GUEST" as --dir takes them, the TCP listeners, "[ADDR:]PORT" as
+   --tcplisten takes them and numbered after the directories, the arguments
+   and the environment.  The strings stay the caller's, alive until it sets
+   up the next.  0, with *bad the directory or listener, when one cannot be
+   opened. */
+int warmc_wasi_jit_setup(int argc, char **argv, char **env, int nenv,
+                         const char *const *dirs, int ndirs,
+                         const char *const *listen, int nlisten, const char **bad) {
+  for (u32 i = 0; i < g_nfds; i++)
+    if (g_fds[i].host >= 0) {
+      if (!g_fds[i].keep_host) close(g_fds[i].host);
+      fd_clear(&g_fds[i]);
+    }
+  if (!fds_init()) return 0;
+  for (int i = 0; i < ndirs; i++)
+    if (!add_preopen(dirs[i])) { if (bad) *bad = dirs[i]; return 0; }
+  for (int i = 0; i < nlisten; i++)
+    if (!add_listener(listen[i])) { if (bad) *bad = listen[i]; return 0; }
+  g_nenv = 0;
+  g_env_inherit = 0;
+  for (int i = 0; i < nenv; i++)
+    if (!add_env(env[i])) return 0;
+  if (!add_env(0)) return 0;
+  g_nenv--;
+  g_argc = argc;
+  g_argv = argv;
+  static int seeded;
+  if (!seeded) { seed_init(); seeded = 1; }
+  return 1;
+}
+
+/* The C function behind the wasi_snapshot_preview1 function of the given
+   name, called with the instance that imports it first; 0 when preview1
+   has no function of that name. */
+void *warmc_wasi_jit_fn(const char *name, u32 len) {
+  for (u32 k = 0; k < NBINDINGS; k++)
+    if (len == cstrlen(BINDINGS[k].name) && bytes_eq(name, BINDINGS[k].name, len))
+      return BINDINGS[k].fn;
+  return 0;
+}
+
+WarmInstance *warmc_wasi_instance;
+#else
 extern void (*signal(int, void (*)(int)))(int);
 
 static int drive(int argc, char **argv) {
@@ -1820,3 +1874,4 @@ static int drive(int argc, char **argv) {
 WarmInstance *warmc_wasi_instance;
 
 int (*warmc_driver_hook)(int argc, char **argv) = drive;
+#endif

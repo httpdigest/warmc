@@ -495,6 +495,12 @@ WarmInstance *warmc_instantiate_bound(const ModuleDesc *md, const WarmBinding *b
 WarmInstance *warmc_instantiate_bound_catching(const ModuleDesc *md,
                                                const WarmBinding *binds,
                                                u32 *err);
+/* the same, and on failure the instance left registered, linked as far as
+   it got, in *partial (0 when there is none) */
+WarmInstance *warmc_instantiate_bound_catching_p(const ModuleDesc *md,
+                                                 const WarmBinding *binds,
+                                                 u32 *err,
+                                                 WarmInstance **partial);
 
 /* What the library face (rt/lib.c) needs of the platform layer in rt.c. */
 int warmc_rt_library_mode(void);
@@ -602,7 +608,11 @@ enum {
 
   TRAP_CAST = 16,
 
-  TRAP_LINK = 100
+  TRAP_LINK = 100,
+
+  /* a host function's: the C API (src/capi.c) raised it, and keeps what it
+     says */
+  TRAP_HOST = 101
 };
 
 typedef struct {

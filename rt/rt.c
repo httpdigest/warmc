@@ -207,6 +207,17 @@ static void *sys_mmap_lazy(usz len) {
   return p;
 }
 
+/* A lazy mapping given back: it leaves the table before it is unmapped,
+   on the one thread that runs wasm, whose faults are the ones it serves. */
+static void lazy_forget(u8 *p) {
+  for (u32 i = 0; i < nlazy; i++) {
+    if (lazy_maps[i].base != p) continue;
+    lazy_maps[i] = lazy_maps[nlazy - 1];
+    __atomic_store_n(&nlazy, nlazy - 1, __ATOMIC_RELEASE);
+    return;
+  }
+}
+
 /* From the fault handler: 1 when addr lies in a lazy mapping, which now
    has memory under it.  Out of commit, the program stops, as one the
    kernel refused a page would. */
@@ -262,19 +273,32 @@ static void put_hex_raw(u64 v, int digits) {
 }
 
 #define MAX_TABLE_ENTRIES (1u << 20)
+/* A JIT's host makes and frees instances as it goes (rt/jit.c): as many as
+   this may live at once, their slots reused. */
+#if defined(WARMC_JIT)
+#define MAX_INSTANCES (1u << 16)
+#else
 #define MAX_INSTANCES 4096
+#endif
 #define ARENA_WORDS (1u << 21)
 
 /* max_pages is what it may grow to here; decl_max what the module said,
    which an import's type is checked against */
+/* map and map_len are the reservation the memory is in, which base is
+   aligned within; guarded, whether it is one of guards[] */
 typedef struct {
   u8 *base; u64 size; u64 pages; u64 max_pages; u32 has_max; u32 index64;
   u64 decl_max;
+  u8 *map; u64 map_len; u32 guarded;
 } WarmMemory;
 
+/* map_len: the bytes mapped for entries, and lazy whether sys_mmap_lazy
+   made them */
 typedef struct {
   TableEntry *entries; u64 len; u64 cap; u64 max_len; u32 has_max; u32 index64;
   u32 dirty;
+  u32 lazy;
+  u64 map_len;
 } WarmTable;
 
 static int limits_match(u64 have_now, u64 have_max, u32 have_has_max,
@@ -306,6 +330,14 @@ typedef struct Instance {
 
   u32 exntype_base;
 
+  /* its place in instances[], and the next of those freed while the
+     collector was scanning them (warmc_instance_free) */
+  u32 slot;
+  struct Instance *dead_next;
+  /* the instance whose making this one's began inside, while this one is
+     being made (g_making) */
+  struct Instance *making_prev;
+
   _Alignas(16) WarmInstance vm;
 } Instance;
 
@@ -326,8 +358,28 @@ static void *arena_alloc(u64 bytes) {
 /* Zeroed memory that lives as long as the process, for rt/lib.c. */
 void *warmc_rt_zalloc(u64 bytes) { return arena_alloc(bytes); }
 
+/* What an instance's own blocks come from: the arena, which a program
+   never gives back, or the allocator a JIT's host sets (src/capi.c), which
+   warmc_instance_free returns them to. */
+void *(*warmc_rt_malloc_hook)(u64 bytes);
+void (*warmc_rt_free_hook)(void *p);
+
+static void *inst_alloc(u64 bytes) {
+  if (!warmc_rt_malloc_hook) return arena_alloc(bytes);
+  void *p = warmc_rt_malloc_hook(bytes ? bytes : 1);
+  if (!p) die("out of instance memory");
+  return p;
+}
+
+static void inst_free(void *p) {
+  if (p && warmc_rt_free_hook) warmc_rt_free_hook(p);
+}
+
 static Instance *instances[MAX_INSTANCES];
 static u32 ninstances;
+/* slots below ninstances that a freed instance left empty, and where the
+   first of them may be */
+static u32 nfree_slots, free_hint;
 
 static struct { const char *name; u32 name_len; WarmInstance *inst; }
   registry[MAX_INSTANCES];
@@ -573,6 +625,7 @@ static const char *trap_name(u32 code) {
     case TRAP_CAST: return "cast failure";
 
     case TRAP_LINK: return "link failure, or an internal error above";
+    case TRAP_HOST: return "host function trapped";
   }
   return "unknown trap";
 }
@@ -661,19 +714,46 @@ WarmInstance *warmc_instantiate_catching(const ModuleDesc *md, u32 *err) {
   return warmc_instantiate_bound_catching(md, 0, err);
 }
 
+/* The instances being made, innermost first: a start function may make
+   another.  An instance is registered before it is linked, so one whose
+   making a trap or a link error ends stays registered, linked as far as it
+   got -- and must, as what it wrote into another instance's table before
+   the trap still calls its functions. */
+static struct Instance *g_making;
+
 WarmInstance *warmc_instantiate_bound_catching(const ModuleDesc *md,
                                                const WarmBinding *binds,
                                                u32 *err) {
+  return warmc_instantiate_bound_catching_p(md, binds, err, 0);
+}
+
+/* The same, and when it fails, the instance it left behind in *partial
+   (0 when it failed before registering one), which only its host can say
+   when nothing reaches any more (warmc_instance_free). */
+WarmInstance *warmc_instantiate_bound_catching_p(const ModuleDesc *md,
+                                                 const WarmBinding *binds,
+                                                 u32 *err,
+                                                 WarmInstance **partial) {
   u64 depth = warmc_gc_invoke_depth;
   u64 outer[sizeof g_catch_buf / sizeof g_catch_buf[0]];
   int was;
   catch_save(outer, &was);
   GcCatch gcs;
   gc_catch_save(&gcs);
+  struct Instance *making = g_making;
+  if (partial) *partial = 0;
   if (warmc_setjmp(g_catch_buf)) {
     catch_restore(outer, was);
     warmc_gc_invoke_depth = depth;
     gc_after_trap(&gcs);
+    /* the outermost the trap ended the making of is this call's; any it
+       began inside were ended by the same trap */
+    struct Instance *mine = 0;
+    while (g_making && g_making != making) {
+      mine = g_making;
+      g_making = g_making->making_prev;
+    }
+    if (partial && mine) *partial = &mine->vm;
     *err = g_trap_code;
     return 0;
   }
@@ -728,7 +808,7 @@ u32 warmc_invoke_catching_s(void *fn, WarmInstance *v, const u64 *iargs,
 static void republish_memory(WarmMemory *M) {
   for (u32 i = 0; i < ninstances; i++) {
     Instance *in = instances[i];
-    if (!in->mems) continue;
+    if (!in || !in->mems) continue;
     MemSlot *slots = inst_mems(in);
     for (u32 k = 0; k < in->md->nmemories; k++) {
       if (in->mems[k] != M) continue;
@@ -747,7 +827,7 @@ static void republish_memory(WarmMemory *M) {
 static void republish_table(WarmTable *T) {
   for (u32 i = 0; i < ninstances; i++) {
     Instance *in = instances[i];
-    if (!in->tabs) continue;
+    if (!in || !in->tabs) continue;
     TableSlot *slots = inst_tables(in);
     for (u32 k = 0; k < in->md->ntables; k++) {
       if (in->tabs[k] != T) continue;
@@ -1726,6 +1806,55 @@ u32 warmc_bind_import(WarmInstance *v, const char *module, const char *name,
 
 u64 *warmc_global_cell(WarmInstance *inst, u32 index) {
   return global_cell(INST_OF(inst), index);
+}
+
+/* For a JIT's C API (src/capi.c), which reaches an instance's memories,
+   tables and functions by their indices.  Each says what it is -- the
+   address is its identity, which another instance importing it shares --
+   or returns 0 for an index the instance does not have. */
+FuncRef *warmc_funcref_cell(WarmInstance *inst, u32 func) {
+  Instance *in = INST_OF(inst);
+  return func < in->md->nfuncrefs ? &inst_funcrefs(in)[func] : 0;
+}
+
+void *warmc_memory_view(WarmInstance *inst, u32 idx, u8 **base, u64 *size,
+                        u64 *pages, u64 *max_pages, u64 *decl_max,
+                        u32 *flags) {
+  Instance *in = INST_OF(inst);
+  if (idx >= in->md->nmemories || !in->mems || !in->mems[idx]) return 0;
+  WarmMemory *M = in->mems[idx];
+  *base = M->base;
+  *size = M->size;
+  *pages = M->pages;
+  *max_pages = M->max_pages;
+  *decl_max = M->decl_max;
+  *flags = (M->has_max ? 1u : 0u) | (M->index64 ? 2u : 0u);
+  return M;
+}
+
+void *warmc_table_view(WarmInstance *inst, u32 idx, u64 *len, u64 *max_len,
+                       u32 *flags) {
+  Instance *in = INST_OF(inst);
+  if (idx >= in->md->ntables || !in->tabs || !in->tabs[idx]) return 0;
+  WarmTable *T = in->tabs[idx];
+  *len = T->len;
+  *max_len = T->has_max ? T->max_len : T->cap;
+  *flags = (T->has_max ? 1u : 0u) | (T->index64 ? 2u : 0u);
+  return T;
+}
+
+/* The stack limit a call from another thread runs to: every instance's,
+   which compiled code checks its frames against, and the one new
+   instances start with.  Called with the thread's limit as it enters
+   wasm; a thread that calls again finds them set. */
+static void inst_sweep(void);
+
+void warmc_rt_thread_enter(u64 limit) {
+  inst_sweep();
+  if (limit == g_stack_limit) return;
+  g_stack_limit = limit;
+  for (u32 i = 0; i < ninstances; i++)
+    if (instances[i]) instances[i]->vm.stack_limit = limit;
 }
 
 #define GC_HEAP_BYTES (1ull << 30)
@@ -3900,7 +4029,7 @@ __attribute__((noreturn)) static void refuse_instance(const char *why) {
 
 static WarmMemory *make_memory(u64 min_pages, u64 max_pages, u32 has_max,
                                u32 index64, u32 needs_guard) {
-  WarmMemory *M = arena_alloc(sizeof(WarmMemory));
+  WarmMemory *M = inst_alloc(sizeof(WarmMemory));
   u64 limit = index64 ? MEM64_MAX_PAGES : MEM32_MAX_PAGES;
   M->decl_max = max_pages;
   if (min_pages > limit)
@@ -3916,12 +4045,15 @@ static WarmMemory *make_memory(u64 min_pages, u64 max_pages, u32 has_max,
   u8 *base = !index64 && (needs_guard || !nguards)
                ? (u8 *)sys_mmap(0, reserve, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS)
                : 0;
+  M->map = base;
+  M->map_len = reserve;
   if (base) {
     if (nguards >= MAX_GUARDS) die("too many guarded memories");
     if (!nguards) install_fault_handler();
     guards[nguards].base = base;
     guards[nguards].len = GUARD_RESERVE;
     nguards++;
+    M->guarded = 1;
 
     usz align = 2u << 20;
     usz adjust = (usz)(-(long)(usz)base) & (align - 1);
@@ -3938,6 +4070,8 @@ static WarmMemory *make_memory(u64 min_pages, u64 max_pages, u32 has_max,
       if (base || reserve <= floor) break;
       reserve = reserve / 2 > floor ? reserve / 2 : floor;
     }
+    M->map = base;
+    M->map_len = reserve ? reserve : 4096;
   }
   if (!base) die("cannot reserve linear memory");
   usz initial = (usz)min_pages * WASM_PAGE_SIZE;
@@ -3955,17 +4089,19 @@ static WarmMemory *make_memory(u64 min_pages, u64 max_pages, u32 has_max,
    2^20 entries, and never moves: compiled code holds where it is.  Pages
    no entry has reached cost nothing until touched (sys_mmap_lazy). */
 static WarmTable *make_table(u64 min, u64 max, u32 has_max, u32 index64) {
-  WarmTable *T = arena_alloc(sizeof(WarmTable));
+  WarmTable *T = inst_alloc(sizeof(WarmTable));
   if (min > MAX_TABLE_ENTRIES) refuse_instance("a table of more than 2^20 entries");
   u64 cap = has_max ? max : MAX_TABLE_ENTRIES;
   if (cap > MAX_TABLE_ENTRIES) cap = MAX_TABLE_ENTRIES;
   if (cap < min) cap = min;
   usz bytes = ((usz)cap * sizeof(TableEntry) + 4095) & ~4095UL;
   if (bytes == 0) bytes = 4096;
-  T->entries = (TableEntry *)(bytes > (64u << 10)
+  T->lazy = bytes > (64u << 10);
+  T->entries = (TableEntry *)(T->lazy
       ? sys_mmap_lazy(bytes)
       : sys_mmap(0, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS));
   if (!T->entries) die("cannot allocate table");
+  T->map_len = bytes;
   T->cap = cap;
   T->len = min;
   T->max_len = max;
@@ -4049,26 +4185,39 @@ static void data_init(Instance *in, const u8 *p) {
 
 WarmInstance *warmc_instantiate_bound(const ModuleDesc *md,
                                       const WarmBinding *binds) {
-  if (ninstances >= MAX_INSTANCES) die("too many instances");
+  if (ninstances >= MAX_INSTANCES && !nfree_slots) die("too many instances");
   if (md->det_profile) set_default_nan_mode();
 
   u64 tail = (u64)INSTANCE_GLOBAL_SIZE * md->nglobals + 16ull * md->nimported_funcs +
              (u64)sizeof(FuncRef) * md->nfuncrefs +
              (u64)sizeof(TableSlot) * md->ntables +
              (u64)sizeof(MemSlot) * md->nmemories;
-  Instance *in = arena_alloc(sizeof(Instance) + tail);
+  Instance *in = inst_alloc(sizeof(Instance) + tail);
   in->md = md;
 
   in->gctype_base = gc_register_types(md);
   in->exntype_base = in->gctype_base + md->ngctypes;
-  in->data_dropped = md->data && md->ndata ? arena_alloc(md->ndata) : 0;
-  in->elem_dropped = arena_alloc(md->nelem ? md->nelem : 1);
-  in->tabs = md->ntables ? arena_alloc(sizeof(WarmTable *) * md->ntables) : 0;
-  in->mems = md->nmemories ? arena_alloc(sizeof(WarmMemory *) * md->nmemories) : 0;
-  in->tags = md->ntags ? arena_alloc(sizeof(void *) * md->ntags) : 0;
+  in->data_dropped = md->data && md->ndata ? inst_alloc(md->ndata) : 0;
+  in->elem_dropped = inst_alloc(md->nelem ? md->nelem : 1);
+  in->tabs = md->ntables ? inst_alloc(sizeof(WarmTable *) * md->ntables) : 0;
+  in->mems = md->nmemories ? inst_alloc(sizeof(WarmMemory *) * md->nmemories) : 0;
+  in->tags = md->ntags ? inst_alloc(sizeof(void *) * md->ntags) : 0;
 
-  instances[ninstances] = in;
-  __atomic_store_n(&ninstances, ninstances + 1, __ATOMIC_RELEASE);
+  in->making_prev = g_making;
+  g_making = in;
+
+  /* a freed instance's slot, or a new one: either is one a collection
+     under way does not visit, as it did not see it when it began */
+  if (nfree_slots) {
+    while (instances[free_hint]) free_hint++;
+    in->slot = free_hint++;
+    nfree_slots--;
+    __atomic_store_n(&instances[in->slot], in, __ATOMIC_RELEASE);
+  } else {
+    in->slot = ninstances;
+    instances[ninstances] = in;
+    __atomic_store_n(&ninstances, ninstances + 1, __ATOMIC_RELEASE);
+  }
 
   register_desc(md);
 
@@ -4183,7 +4332,7 @@ WarmInstance *warmc_instantiate_bound(const ModuleDesc *md,
                        __ATOMIC_RELEASE);
 
   for (u32 i = 0; i < md->ntags; i++)
-    if (!md->tags[i].imported) in->tags[i] = arena_alloc(8);
+    if (!md->tags[i].imported) in->tags[i] = inst_alloc(8);
 
   for (u32 i = 0; i < md->nmemories; i++)
     if (in->mems[i]) republish_memory(in->mems[i]);
@@ -4221,7 +4370,7 @@ WarmInstance *warmc_instantiate_bound(const ModuleDesc *md,
       if (end > total) total = end;
     }
     in->nelem_values = total;
-    in->elem_values = total ? arena_alloc(total * sizeof(void *)) : 0;
+    in->elem_values = total ? inst_alloc(total * sizeof(void *)) : 0;
     for (u64 k = 0; k < total; k++) {
       u32 at = md->elem_entries[k];
       if (at & 1) { in->elem_values[k] = &inst_funcrefs(in)[at >> 1]; continue; }
@@ -4254,6 +4403,7 @@ WarmInstance *warmc_instantiate_bound(const ModuleDesc *md,
     FuncRef fr = funcrefs[md->start_func];
     warmc_invoke(fr.code, (WarmInstance *)fr.instance, zero, zero, ret);
   }
+  g_making = in->making_prev;
   return v;
 }
 
@@ -5105,6 +5255,9 @@ void warmc_gcth_run_tests(void) {
     gcth_start_rounds(rt_getenv_u64("WARMC_GC_ROUNDS", 0));
 }
 
+/* A JIT (src/jit.c) is a library in its host's process, which owns the
+   entry point: the runtime it carries has none, and no program to run. */
+#if !defined(WARMC_JIT)
 __attribute__((noreturn)) static void warmc_run(int argc, char **argv) {
   gc_read_options();
 
@@ -5129,6 +5282,7 @@ __attribute__((noreturn)) static void warmc_run(int argc, char **argv) {
 
   sys_exit(warmc_driver_hook(argc, argv));
 }
+#endif
 
 int warmc_cli_main(int argc, char **argv) {
 
@@ -5200,7 +5354,8 @@ int warmc_cli_main(int argc, char **argv) {
   sys_exit(0);
 }
 
-#if defined(WARMC_DARWIN)
+#if defined(WARMC_JIT)
+#elif defined(WARMC_DARWIN)
 
 int main(int argc, char **argv, char **envp) {
   g_environ = envp;
@@ -5225,3 +5380,97 @@ __attribute__((noreturn)) void warmc_start_c(long *sp) {
   warmc_run(argc, (char **)&sp[1]);
 }
 #endif
+
+/* ---- instances given back -------------------------------------------------
+   A JIT's host (src/capi.c) frees an instance when nothing can reach it any
+   more: its store is deleted, or it never let anything out.  It leaves
+   instances[] at once; what it owns -- its memories, tables and tags, not
+   the ones it imports -- and its blocks go back when no collection is
+   scanning tables, which a collection under way may be doing with its
+   tables.  One that starts later waits for a round only the thread running
+   wasm answers, and finds the slot empty by then. */
+static Instance *inst_graveyard;
+
+static void memory_release(WarmMemory *M) {
+  if (M->guarded) {
+    for (u32 i = 0; i < nguards; i++)
+      if (guards[i].base == M->map) {
+        guards[i] = guards[nguards - 1];
+        nguards--;
+        break;
+      }
+  }
+  if (M->map) sys_munmap(M->map, (usz)M->map_len);
+  inst_free(M);
+}
+
+static void table_release(WarmTable *T) {
+#if !defined(WARMC_DARWIN)
+  if (T->lazy) lazy_forget((u8 *)T->entries);
+#endif
+  if (T->entries) sys_munmap(T->entries, (usz)T->map_len);
+  inst_free(T);
+}
+
+static void inst_release(Instance *in) {
+  const ModuleDesc *md = in->md;
+  for (u32 i = 0; i < md->nmemories; i++)
+    if (!md->memories[i].imported && in->mems && in->mems[i]) memory_release(in->mems[i]);
+  for (u32 i = 0; i < md->ntables; i++)
+    if (!md->tables[i].imported && in->tabs && in->tabs[i]) table_release(in->tabs[i]);
+  for (u32 i = 0; i < md->ntags; i++)
+    if (!md->tags[i].imported && in->tags) inst_free(in->tags[i]);
+  inst_free(in->tags);
+  inst_free(in->mems);
+  inst_free(in->tabs);
+  inst_free(in->data_dropped);
+  inst_free(in->elem_dropped);
+  inst_free(in->elem_values);
+  inst_free(in);
+}
+
+static void inst_sweep(void) {
+  if (!inst_graveyard || __atomic_load_n(&gc_cycle_running, __ATOMIC_ACQUIRE)) return;
+  while (inst_graveyard) {
+    Instance *in = inst_graveyard;
+    inst_graveyard = in->dead_next;
+    inst_release(in);
+  }
+}
+
+void warmc_instance_free(WarmInstance *v) {
+  Instance *in = INST_OF(v);
+  for (u32 i = 0; i < nregistry;)
+    if (registry[i].inst == v) registry[i] = registry[--nregistry];
+    else i++;
+  __atomic_store_n(&instances[in->slot], (Instance *)0, __ATOMIC_SEQ_CST);
+  if (in->slot + 1 == ninstances) {
+    u32 n = ninstances - 1;
+    while (n && !instances[n - 1]) { n--; nfree_slots--; }
+    __atomic_store_n(&ninstances, n, __ATOMIC_RELEASE);
+  } else {
+    nfree_slots++;
+    if (in->slot < free_hint) free_hint = in->slot;
+  }
+  if (free_hint > ninstances) free_hint = ninstances;
+  in->dead_next = inst_graveyard;
+  inst_graveyard = in;
+  inst_sweep();
+}
+
+/* The module's descriptor no longer looked at by the unwinder: no instance
+   of it is left.  0 when the collector still refers to it -- its heap
+   types are registered for objects that may outlive the instances -- and
+   its code and data must stay where they are. */
+int warmc_rt_forget_desc(const ModuleDesc *md) {
+  for (u32 i = 0; i < gc_ndesc_types; i++)
+    if (gc_desc_types[i].md == md) return 0;
+  for (u32 i = 0; i < ndescs; i++) {
+    if (descs[i] != md) continue;
+    descs[i] = descs[ndescs - 1];
+    desc_sorted[i] = desc_sorted[ndescs - 1];
+    ndescs--;
+    break;
+  }
+  return 1;
+}

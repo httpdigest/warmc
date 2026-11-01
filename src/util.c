@@ -11,6 +11,12 @@
 #include <sys/resource.h>
 #include <sys/mman.h>
 #endif
+#ifdef __APPLE__
+#include <malloc/malloc.h>
+#endif
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 static _Thread_local DiagCatch *g_catch;
 
@@ -184,6 +190,36 @@ typedef struct { size_t size; size_t bucket; } XHdr;
 #define XB_MAP 18
 #endif
 
+/* ---- a compile's own heap ------------------------------------------------
+   Between xheap_begin and xheap_end, what xmalloc takes from the system is
+   the compile's own, and xheap_end gives it all back at once: a JIT's
+   compile (src/jit.c) runs in a process that goes on, where malloc keeps
+   what is freed for the process to use again -- macOS's kept a hundred
+   megabytes of a large compile's, with or without a zone of its own, which
+   shares the default zone's memory.  The size classes malloc served are
+   carved from a buddy heap of chunks the compile maps (below), which gives
+   back what it no longer uses as it goes; xheap_end unmaps whatever is
+   left, a diagnostic's half-built module and all.  Windows has a heap of its own for it.  No block may outlive the
+   heap: the compiler frees what it allocates, its caches included
+   (compile_release).  Outside one, blocks are malloc's as they always were. */
+#if defined(_WIN32)
+static HANDLE g_xheap;
+#define SYS_MALLOC(n) (g_xheap ? HeapAlloc(g_xheap, 0, (n)) : malloc(n))
+#define SYS_CALLOC(n) (g_xheap ? HeapAlloc(g_xheap, HEAP_ZERO_MEMORY, (n)) : calloc(1, (n)))
+#define SYS_REALLOC(p, n) (g_xheap ? HeapReAlloc(g_xheap, 0, (p), (n)) : realloc((p), (n)))
+#define SYS_FREE(p) (g_xheap ? (void)HeapFree(g_xheap, 0, (p)) : free(p))
+#define XSCOPE 0
+#else
+#define SYS_MALLOC(n) malloc(n)
+#define SYS_CALLOC(n) calloc(1, (n))
+#define SYS_REALLOC(p, n) realloc((p), (n))
+#define SYS_FREE(p) free(p)
+#define XSCOPE g_xscope
+static int g_xscope;
+#endif
+/* which heap: a thread's lists and chunk of an older one are dropped */
+static unsigned g_xgen = 1;
+
 static void *xmap(size_t len) {
 #ifdef _WIN32
   (void)len;
@@ -206,9 +242,277 @@ static void xunmap(void *p, size_t len) {
 _Static_assert(sizeof(XHdr) <= XHDR, "allocation header must fit its padding");
 
 /* One thread-local for the cache and its count: on macOS each is reached
-   through a call, and every allocation and free touches both. */
-typedef struct { void *cache[XB_MAX + 1]; size_t held; } XCache;
+   through a call, and every allocation and free touches both.  gen is the
+   heap its blocks are of. */
+typedef struct { void *cache[XB_MAX + 1]; size_t held; unsigned gen; uint32_t count[XB_MAX + 1]; } XCache;
 static _Thread_local XCache g_xc;
+
+#if !defined(_WIN32)
+/* ---- the buddy heap a compile's blocks come from ---------------------------
+   Chunks of 1 MB, each aligned to its size, carved into blocks of the size
+   classes by halving; a block freed merges with its buddy, the other half
+   of the block it was split from, while that is free too, so that memory a
+   compile frees as one size serves the next of any other.  Lists kept per
+   class, as malloc's are, hold each class's own high-water: for Go's
+   net/http server they came to 94 MB of chunks where no more than 50 MB
+   were ever live at once.  A chunk nothing is allocated from goes back to
+   the system there and then, past the XSPARE kept for the next.  Its first
+   32 KB are a byte per 32-byte unit of it: a block's order where one
+   starts, XFREE added while it is free.  The threads' lists stay in front,
+   at most XHOLD_SCOPE each, and take from the heap and give back to it a
+   batch at a time, under its one lock. */
+#define XB_CHUNK 20
+#define XCHUNK ((size_t)1 << XB_CHUNK)
+#define XNUNITS (XCHUNK >> XB_MIN)
+#define XMETA_ORDER 15
+#define XFREE 0x80u
+/* what a thread holds of a heap's before it gives back half, the classes
+   holding most first -- once a megabyte, all of it, kept the lock busy, and
+   a quarter of a megabyte took the compile twice as long -- and what it
+   takes of a class at once */
+#define XHOLD_SCOPE ((size_t)512 << 10)
+#define XBATCH_BYTES ((size_t)64 << 10)
+#define XBATCH_MAX 16u
+_Static_assert(XNUNITS == ((size_t)1 << XMETA_ORDER), "the tags fill the chunk's first block");
+_Static_assert(XB_MAP <= XB_CHUNK, "a chunk holds a block of every class it serves");
+
+/* A heap: its free blocks by order, its chunks, and how many of them
+   nothing is allocated from.  There are two.  The second is for what
+   outlives the work around it -- a function's code and tables once made,
+   a body rewritten for the module, what the effects scan keeps of each
+   function (xmalloc_long, xkeep) -- which, made among a worker's
+   short-lived blocks, held their chunks long after the rest of them was
+   free: Go's net/http server's compile kept tens of megabytes of chunks for
+   a few megabytes of such blocks. */
+typedef struct XFreeBlk { struct XFreeBlk *prev, *next; } XFreeBlk;
+typedef struct XBHeap {
+  pthread_mutex_t lock;
+  XFreeBlk *bfree[XB_CHUNK];
+  char *chunks;
+  unsigned empty;
+} XBHeap;
+static XBHeap g_xh[2] = { { PTHREAD_MUTEX_INITIALIZER, { 0 }, 0, 0 },
+                          { PTHREAD_MUTEX_INITIALIZER, { 0 }, 0, 0 } };
+
+/* a chunk's own links, count and heap, in the tags of its first block,
+   whose own tag is the first byte and which no other block starts in */
+typedef struct XChunkHdr {
+  uint8_t tag0[8];
+  size_t used;
+  char *prev, *next;
+  XBHeap *heap;
+} XChunkHdr;
+_Static_assert(sizeof(XChunkHdr) <= ((size_t)1 << (XMETA_ORDER - XB_MIN)),
+               "a chunk's header is within its first block's tags");
+
+/* chunks nothing is allocated from, kept for the next ones: as many as
+   XSPARE, so that a chunk emptied and wanted again is not mapped again */
+#define XSPARE 8
+
+static void *xmap(size_t len);
+
+#define XNEXT(p) (*(void **)((char *)(p) + XHDR))
+
+static char *chunk_of(const void *p) { return (char *)((uintptr_t)p & ~(uintptr_t)(XCHUNK - 1)); }
+static size_t unit_of(const char *base, const void *p) { return (size_t)((const char *)p - base) >> XB_MIN; }
+
+static void bpush(XBHeap *H, void *p, unsigned k) {
+  XFreeBlk *b = p;
+  b->prev = NULL;
+  b->next = H->bfree[k];
+  if (b->next) b->next->prev = b;
+  H->bfree[k] = b;
+}
+
+static void bunlink(XBHeap *H, void *p, unsigned k) {
+  XFreeBlk *b = p;
+  if (b->prev) b->prev->next = b->next;
+  else H->bfree[k] = b->next;
+  if (b->next) b->next->prev = b->prev;
+}
+
+static void chunk_new(XBHeap *H) {
+  /* twice the size, then trimmed to the aligned chunk inside */
+  char *m = xmap(2 * XCHUNK);
+  char *base = (char *)(((uintptr_t)m + XCHUNK - 1) & ~(uintptr_t)(XCHUNK - 1));
+  if (base > m) munmap(m, (size_t)(base - m));
+  if (base + XCHUNK < m + 2 * XCHUNK) munmap(base + XCHUNK, (size_t)(m + 2 * XCHUNK - (base + XCHUNK)));
+  uint8_t *tag = (uint8_t *)base;
+  XChunkHdr *ch = (XChunkHdr *)base;
+  tag[0] = XMETA_ORDER;
+  ch->used = 0;
+  ch->heap = H;
+  H->empty++;
+  ch->prev = NULL;
+  ch->next = H->chunks;
+  if (H->chunks) ((XChunkHdr *)H->chunks)->prev = base;
+  H->chunks = base;
+  for (unsigned k = XMETA_ORDER; k < XB_CHUNK; k++) {
+    char *blk = base + ((size_t)1 << k);
+    tag[unit_of(base, blk)] = (uint8_t)(k | XFREE);
+    bpush(H, blk, k);
+  }
+}
+
+/* a chunk nothing is allocated from: its free blocks are the ones it
+   started with, which leave the lists, and it goes back to the system */
+static void chunk_release(XBHeap *H, char *base) {
+  for (unsigned k = XMETA_ORDER; k < XB_CHUNK; k++) bunlink(H, base + ((size_t)1 << k), k);
+  XChunkHdr *ch = (XChunkHdr *)base;
+  if (ch->prev) ((XChunkHdr *)ch->prev)->next = ch->next;
+  else H->chunks = ch->next;
+  if (ch->next) ((XChunkHdr *)ch->next)->prev = ch->prev;
+  munmap(base, XCHUNK);
+}
+
+static void *buddy_alloc(XBHeap *H, unsigned k) {
+  unsigned m = k;
+  while (m < XB_CHUNK && !H->bfree[m]) m++;
+  if (m == XB_CHUNK) {
+    chunk_new(H);
+    m = k;
+    while (!H->bfree[m]) m++;
+  }
+  XFreeBlk *blk = H->bfree[m];
+  bunlink(H, blk, m);
+  char *base = chunk_of(blk);
+  uint8_t *tag = (uint8_t *)base;
+  while (m > k) {
+    m--;
+    char *hi = (char *)blk + ((size_t)1 << m);
+    tag[unit_of(base, hi)] = (uint8_t)(m | XFREE);
+    bpush(H, hi, m);
+  }
+  tag[unit_of(base, blk)] = (uint8_t)k;
+  XChunkHdr *ch = (XChunkHdr *)base;
+  if (!ch->used) H->empty--;
+  ch->used += (size_t)1 << k;
+  return blk;
+}
+
+static void buddy_free(void *p, unsigned k) {
+  char *base = chunk_of(p);
+  uint8_t *tag = (uint8_t *)base;
+  XChunkHdr *ch = (XChunkHdr *)base;
+  XBHeap *H = ch->heap;
+  ch->used -= (size_t)1 << k;
+  size_t u = unit_of(base, p);
+  tag[u] = 0;
+  while (k < XB_CHUNK - 1) {
+    size_t bu = u ^ ((size_t)1 << (k - XB_MIN));
+    if (tag[bu] != (k | XFREE)) break;
+    bunlink(H, base + (bu << XB_MIN), k);
+    tag[bu] = 0;
+    if (bu < u) u = bu;
+    k++;
+  }
+  tag[u] = (uint8_t)(k | XFREE);
+  bpush(H, base + (u << XB_MIN), k);
+  if (!ch->used) {
+    if (H->empty < XSPARE) H->empty++;
+    else chunk_release(H, base);
+  }
+}
+
+/* a block of class b for the thread, and a batch more onto its list */
+static void *xbuddy_take(XCache *xc, unsigned b) {
+  unsigned n = (unsigned)(XBATCH_BYTES >> b);
+  if (n > XBATCH_MAX) n = XBATCH_MAX;
+  if (n < 1) n = 1;
+  XBHeap *H = &g_xh[0];
+  pthread_mutex_lock(&H->lock);
+  void *h = buddy_alloc(H, b);
+  for (unsigned i = 1; i < n; i++) {
+    void *q = buddy_alloc(H, b);
+    XNEXT(q) = xc->cache[b];
+    xc->cache[b] = q;
+    xc->held += (size_t)1 << b;
+    xc->count[b]++;
+  }
+  pthread_mutex_unlock(&H->lock);
+  return h;
+}
+
+/* the thread's lists back to the heap until it holds no more than keep,
+   the classes holding most first */
+static void xbuddy_give(XCache *xc, size_t keep) {
+  XBHeap *H = &g_xh[0];
+  pthread_mutex_lock(&H->lock);
+  while (xc->held > keep) {
+    unsigned big = 0;
+    size_t most = 0;
+    for (unsigned b = XB_MIN; b < XB_MAP; b++)
+      if (((size_t)xc->count[b] << b) > most) { most = (size_t)xc->count[b] << b; big = b; }
+    if (!most) break;
+    while (xc->cache[big] && xc->held > keep) {
+      void *p = xc->cache[big];
+      xc->cache[big] = XNEXT(p);
+      xc->count[big]--;
+      xc->held -= (size_t)1 << big;
+      buddy_free(p, big);
+    }
+  }
+  pthread_mutex_unlock(&H->lock);
+}
+
+/* a block of the second heap's, freed: at once, under its lock */
+static bool xbuddy_free_long(void *h, unsigned b) {
+  XBHeap *H = ((XChunkHdr *)chunk_of(h))->heap;
+  if (H != &g_xh[1]) return false;
+  pthread_mutex_lock(&H->lock);
+  buddy_free(h, b);
+  pthread_mutex_unlock(&H->lock);
+  return true;
+}
+#endif
+
+/* a thread's lists, emptied when they are of another heap than the one in
+   use: their blocks went with it */
+static XCache *xc_now(void) {
+  XCache *xc = &g_xc;
+  if (xc->gen != g_xgen) {
+    memset(xc->cache, 0, sizeof xc->cache);
+    memset(xc->count, 0, sizeof xc->count);
+    xc->held = 0;
+    xc->gen = g_xgen;
+  }
+  return xc;
+}
+
+void xheap_begin(void) {
+  xcache_release();
+  g_xgen++;
+#if defined(_WIN32)
+  if (!g_xheap) g_xheap = HeapCreate(0, 0, 0);
+#else
+  g_xscope = 1;
+#endif
+}
+
+void xheap_end(void) {
+  xcache_release();
+#if defined(_WIN32)
+  if (g_xheap) HeapDestroy(g_xheap);
+  g_xheap = NULL;
+#else
+  g_xscope = 0;
+  /* what is left -- a block a diagnostic's half-built module held -- goes
+     with its chunk */
+  for (int i = 0; i < 2; i++) {
+    XBHeap *H = &g_xh[i];
+    pthread_mutex_lock(&H->lock);
+    while (H->chunks) {
+      char *next = ((XChunkHdr *)H->chunks)->next;
+      munmap(H->chunks, XCHUNK);
+      H->chunks = next;
+    }
+    memset(H->bfree, 0, sizeof H->bfree);
+    H->empty = 0;
+    pthread_mutex_unlock(&H->lock);
+  }
+#endif
+  g_xgen++;
+}
 
 #define XHOLD_MAX ((size_t)1 << 20)
 
@@ -224,11 +528,16 @@ void *xmalloc(size_t n) {
   if (need < n) warmc_fatal("out of memory");
   unsigned b = xbucket(need);
   XHdr *h;
-  XCache *xc = &g_xc;
+  XCache *xc = xc_now();
   if (b && b < XB_MAP && xc->cache[b]) {
     h = xc->cache[b];
     xc->cache[b] = *(void **)((char *)h + XHDR);
     xc->held -= (size_t)1 << b;
+    xc->count[b]--;
+  } else if (XSCOPE && b && b < XB_MAP) {
+#if !defined(_WIN32)
+    h = xbuddy_take(xc, b);
+#endif
   } else if (b >= XB_MAP) {
     h = xmap((size_t)1 << b);
   } else if (!b && XB_MAP <= XB_MAX) {
@@ -237,7 +546,7 @@ void *xmalloc(size_t n) {
     h->bucket = need;
     return (char *)h + XHDR;
   } else {
-    h = malloc(b ? ((size_t)1 << b) : need);
+    h = SYS_MALLOC(b ? ((size_t)1 << b) : need);
     if (!h) warmc_fatal("out of memory");
   }
   h->size = n;
@@ -245,16 +554,62 @@ void *xmalloc(size_t n) {
   return (char *)h + XHDR;
 }
 
+/* xmalloc's, from the heap of what outlives the work around it, in a
+   compile's heap (above); xmalloc's own outside one */
+void *xmalloc_long(size_t n) {
+#if !defined(_WIN32)
+  if (XSCOPE) {
+    if (!n) n = 1;
+    size_t need = n + XHDR;
+    unsigned b = need > n ? xbucket(need) : 0;
+    if (b && b < XB_MAP) {
+      XBHeap *H = &g_xh[1];
+      pthread_mutex_lock(&H->lock);
+      XHdr *h = buddy_alloc(H, b);
+      pthread_mutex_unlock(&H->lock);
+      h->size = n;
+      h->bucket = b;
+      return (char *)h + XHDR;
+    }
+  }
+#endif
+  return xmalloc(n);
+}
+
+/* p, its first n bytes kept and the rest let go, moved to the heap of what
+   outlives the work around it: for a block grown to its final size among
+   short-lived ones.  Outside a compile's heap, p as it is. */
+void *xkeep(void *p, size_t n) {
+#if !defined(_WIN32)
+  if (XSCOPE && p) {
+    void *q = xmalloc_long(n);
+    if (n) memcpy(q, p, n);
+    xfree(p);
+    return q;
+  }
+#endif
+  return p;
+}
+
 void xfree(void *p) {
   if (!p) return;
   XHdr *h = (XHdr *)((char *)p - XHDR);
-  if (!h->bucket) { free(h); return; }
+  if (!h->bucket) { SYS_FREE(h); return; }
   if (h->bucket > XB_MAX) { xunmap(h, h->bucket); return; }
   size_t sz = (size_t)1 << h->bucket;
   if (h->bucket >= XB_MAP) { xunmap(h, sz); return; }
-  XCache *xc = &g_xc;
-  if (xc->held + sz > XHOLD_MAX) { free(h); return; }
+#if !defined(_WIN32)
+  if (XSCOPE && xbuddy_free_long(h, h->bucket)) return;
+#endif
+  XCache *xc = xc_now();
+#if !defined(_WIN32)
+  /* a heap's blocks go back to it, the thread's lists whole once they hold
+     more than a little */
+  if (XSCOPE && xc->held + sz > XHOLD_SCOPE) xbuddy_give(xc, XHOLD_SCOPE / 2);
+#endif
+  if (!XSCOPE && xc->held + sz > XHOLD_MAX) { SYS_FREE(h); return; }
   xc->held += sz;
+  xc->count[h->bucket]++;
   *(void **)((char *)h + XHDR) = xc->cache[h->bucket];
   xc->cache[h->bucket] = h;
 }
@@ -271,7 +626,7 @@ void *xcalloc(size_t n, size_t sz) {
   if (n > (size_t)-1 / sz) warmc_fatal("out of memory");
   size_t bytes = n * sz;
   if (bytes + XHDR > ((size_t)1 << XB_MAX) && XB_MAP > XB_MAX) {
-    XHdr *h = calloc(1, bytes + XHDR);
+    XHdr *h = SYS_CALLOC(bytes + XHDR);
     if (!h) warmc_fatal("out of memory");
     h->size = bytes;
     h->bucket = 0;
@@ -307,7 +662,7 @@ void *xrealloc(void *p, size_t n) {
   if (!h->bucket) {
     size_t need = n + XHDR;
     if (need < n) warmc_fatal("out of memory");
-    XHdr *g = realloc(h, need);
+    XHdr *g = SYS_REALLOC(h, need);
     if (!g) warmc_fatal("out of memory");
     g->size = n;
     return (char *)g + XHDR;
@@ -353,7 +708,11 @@ static atomic_bool warmc_read_runtime_setting;
 bool warmc_runtime_setting_read(void) { return atomic_load(&warmc_read_runtime_setting); }
 
 const char *warmc_getenv(const char *name) {
-  if (warmc_runtime_setting(name)) atomic_store(&warmc_read_runtime_setting, true);
+  /* only a name of the program's settings can be one: WARMC_ then G, R, T
+     or C -- the compiler asks for its own switches in its passes */
+  char c = name[0] && name[1] && name[2] && name[3] && name[4] && name[5] ? name[6] : 0;
+  if ((c == 'G' || c == 'R' || c == 'T' || c == 'C') && warmc_runtime_setting(name))
+    atomic_store(&warmc_read_runtime_setting, true);
   pthread_once(&g_wenv_once, wenv_init);
   if (!g_nwenv) return NULL;
   size_t len = strlen(name);
@@ -378,16 +737,23 @@ double peak_rss_mb(void) {
 }
 
 void xcache_release(void) {
+  XCache *xc = xc_now();
+#if !defined(_WIN32)
+  /* a heap's blocks back to it, for the threads still compiling */
+  if (XSCOPE) xbuddy_give(xc, 0);
+#endif
   for (unsigned b = 0; b <= XB_MAX; b++) {
-    void *p = g_xc.cache[b];
-    while (p) {
+    void *p = xc->cache[b];
+    /* in a heap of its own, a block is its chunk's, which goes with it */
+    while (p && !XSCOPE) {
       void *next = *(void **)((char *)p + XHDR);
-      free(p);
+      SYS_FREE(p);
       p = next;
     }
-    g_xc.cache[b] = NULL;
+    xc->cache[b] = NULL;
+    xc->count[b] = 0;
   }
-  g_xc.held = 0;
+  xc->held = 0;
 }
 char *xstrndup(const char *s, size_t n) {
   char *p = xmalloc(n + 1);

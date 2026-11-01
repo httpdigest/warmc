@@ -1,0 +1,4 @@
+{
+  global: wasm_*; warm_*;
+  local: *;
+};

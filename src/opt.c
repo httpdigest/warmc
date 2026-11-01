@@ -5655,45 +5655,87 @@ static uint32_t live_insts(const IrFunc *f) {
   return n;
 }
 
-/* The table is sized by what can go in it.  Entries of one hash lie along
-   its probe path in the order they went in, so a lookup finds the first
-   that matches and dominates whatever the table's size. */
+/* An instruction's twin is found among the ones in the blocks that
+   dominate its own: the blocks are taken in the dominator tree's preorder
+   (by dom_in), and the table holds only what the blocks from the entry
+   down to the current one put there, each block's entries leaving it, the
+   last in first, once the walk is past the block's subtree.  Twins that
+   stay -- an instruction no twin of dominates -- never dominate one
+   another, so at most one of them dominates a given block and which one is
+   found does not depend on the order: holding every block's twins, where
+   identical constants of a thousand sibling arms made one probe run the
+   length of all of them, was a tenth of the compile of zig's divmod.  An
+   entry's slot is cleared when it leaves, which with linear probing is
+   enough when they leave in the reverse of the order they went in: no
+   entry still there was placed past it. */
+static void cse_grow(CseEnt **tab, uint32_t *cap, uint32_t *log, uint32_t nlog) {
+  uint32_t nc = *cap * 2;
+  CseEnt *old = *tab, *t = xcalloc(nc, sizeof(CseEnt));
+  for (uint32_t i = 0; i < nlog; i++) {
+    CseEnt e = old[log[i]];
+    uint32_t s = (uint32_t)((e.key * 0x9E3779B97F4A7C15ull) >> 32) & (nc - 1);
+    while (t[s].key) s = (s + 1) & (nc - 1);
+    t[s] = e;
+    log[i] = s;
+  }
+  xfree(old);
+  *tab = t;
+  *cap = nc;
+}
+
 static bool pass_cse(IrFunc *f, const OptOpts *o) {
-  uint32_t cap = 1;
-  while (cap < live_insts(f) * 2 + 16) cap *= 2;
+  uint32_t n = f->norder;
+  if (!n) return false;
+  /* dom_in counts both ends of every subtree, so it is below 2n */
+  uint32_t *pre = xmalloc((size_t)2 * n * sizeof(uint32_t));
+  memset(pre, 0xff, (size_t)2 * n * sizeof(uint32_t));
+  for (uint32_t oi = 0; oi < n; oi++) {
+    uint32_t bi = f->order[oi];
+    uint32_t d = f->blocks[bi].dom_in;
+    if (d < 2 * n) pre[d] = bi;
+  }
+  uint32_t cap = 256, count = 0, nlog = 0, caplog = 256, sp = 0;
   CseEnt *tab = xcalloc(cap, sizeof(CseEnt));
+  uint32_t *log = xmalloc(caplog * sizeof(uint32_t));
+  uint32_t *open = xmalloc(n * sizeof(uint32_t)), *mark = xmalloc(n * sizeof(uint32_t));
   bool changed = false;
 
-  for (uint32_t oi = 0; oi < f->norder; oi++) {
-    uint32_t bi = f->order[oi];
+  for (uint32_t k = 0; k < 2 * n; k++) {
+    uint32_t bi = pre[k];
+    if (bi == UINT32_MAX) continue;
     Block *b = &f->blocks[bi];
+    while (sp && f->blocks[open[sp - 1]].dom_out < b->dom_in) {
+      sp--;
+      while (nlog > mark[sp]) { tab[log[--nlog]].key = 0; count--; }
+    }
+    open[sp] = bi;
+    mark[sp++] = nlog;
     for (uint32_t i = 0; i < b->ninsts; i++) {
       Ref v = b->insts[i];
       Inst *in = &f->insts[v];
       if (!cse_candidate(f, v, o->gcpure)) continue;
       uint64_t h = hash_inst(f, v);
-      uint32_t slot = (uint32_t)(h & (cap - 1));
-      bool reused = false;
-      for (uint32_t probe = 0; probe < cap; probe++) {
-        CseEnt *e = &tab[(slot + probe) & (cap - 1)];
-        if (e->key == 0) {
-          e->key = h; e->value = v;
-          break;
-        }
-        bool ok = e->key == h && same_inst(f, e->value, v) &&
-                  dominates(f, f->insts[e->value].block, bi);
-        if (ok) {
-          ir_replace(f, v, e->value);
-          ir_make_nop(in);
-          g_stats.cse_removed++;
-          changed = reused = true;
-          break;
-        }
+      uint32_t s = (uint32_t)((h * 0x9E3779B97F4A7C15ull) >> 32) & (cap - 1);
+      bool found = false;
+      while (tab[s].key) {
+        if (tab[s].key == h && same_inst(f, tab[s].value, v)) { found = true; break; }
+        s = (s + 1) & (cap - 1);
       }
-      (void)reused;
+      if (found) {
+        ir_replace(f, v, tab[s].value);
+        ir_make_nop(in);
+        g_stats.cse_removed++;
+        changed = true;
+        continue;
+      }
+      tab[s].key = h;
+      tab[s].value = v;
+      if (nlog == caplog) log = xrealloc(log, (caplog *= 2) * sizeof(uint32_t));
+      log[nlog++] = s;
+      if (++count * 2 > cap) cse_grow(&tab, &cap, log, nlog);
     }
   }
-  xfree(tab);
+  xfree(tab); xfree(log); xfree(open); xfree(mark); xfree(pre);
   if (changed) ir_apply_subst(f);
   return changed;
 }
@@ -6804,11 +6846,15 @@ static bool pass_thread(IrFunc *f) {
   bool changed = !warmc_getenv("WARMC_NO_PCMP") && param_compares(f);
   if (changed) prune_params(f);
   uint32_t *nread = count_uses(f), nnread = f->ninsts;
+  /* read once a pass: asked of every block, they were a percent of a
+     compile's time */
+  bool known = !warmc_getenv("WARMC_NO_TKNOWN");
+  bool debug = warmc_getenv("WARMC_THREAD_DEBUG") != NULL;
   for (uint32_t bi = 0, n = f->nblocks; bi < n; bi++)
     if (thread_dispatch(f, bi, nread, nnread) ||
-        (!warmc_getenv("WARMC_NO_TKNOWN") && thread_known(f, bi, nread, nnread))) {
+        (known && thread_known(f, bi, nread, nnread))) {
       changed = true;
-      if (warmc_getenv("WARMC_THREAD_DEBUG")) { ir_print(f, "thread"); ir_verify(f, "thread"); }
+      if (debug) { ir_print(f, "thread"); ir_verify(f, "thread"); }
     }
   xfree(nread);
   if (changed) {
@@ -7841,8 +7887,22 @@ static bool df_scanfree, df_imports_bal;
 static void df_scan(Module *m, IrFunc *g, uint32_t fi);
 static void df_resolve(Module *m);
 
+/* the module and options the facts below are of: the module by its serial
+   as well, as a module parsed after this one was freed (a JIT's, src/jit.c)
+   can sit where it did, and the options of a compile after this one where
+   these were */
 static Module *fx_mod;
+static uint64_t fx_serial;
 static const OptOpts *fx_opts;
+static OptOpts fx_opts_copy;
+
+static bool fx_is(const Module *m) {
+  return fx_mod == m && m && fx_serial == m->serial;
+}
+
+static bool fx_same(const Module *m, const OptOpts *o) {
+  return fx_is(m) && fx_opts == o && !memcmp(&fx_opts_copy, o, sizeof *o);
+}
 static CallFx *fx_func;
 static DirectFx *fx_direct;
 static bool fx_resolved;
@@ -7942,15 +8002,17 @@ typedef struct {
 static NrSum *nr_sum;
 static void nr_solve(Module *m);
 
-void opt_effects_begin(Module *m, const OptOpts *o) {
-  if (fx_mod == m && fx_opts == o) return;
+/* Every fact kept of the module the facts are of, freed */
+static void fx_free_all(void) {
   xfree(fx_func);
+  fx_func = NULL;
   if (fx_direct)
     for (uint32_t i = 0; i < fx_nfuncs; i++) {
       xfree(fx_direct[i].vtst); xfree(fx_direct[i].refs);
       xfree(fx_direct[i].ost); xfree(fx_direct[i].oobs);
     }
   xfree(fx_direct);
+  fx_direct = NULL;
   memset(&fx_table0, 0, sizeof(fx_table0));
   xfree(fx_vt); fx_vt = NULL;
   xfree(fx_vtbase); fx_vtbase = NULL;
@@ -7967,21 +8029,41 @@ void opt_effects_begin(Module *m, const OptOpts *o) {
   if (df_func)
     for (uint32_t i = 0; i < fx_nfuncs; i++) xfree(df_func[i].args);
   xfree(df_func);
-  /* the scan that finds the C stack pointer, which addr-nowrap folds
-     addresses on as well */
-  df_func = o->dead_frames || o->addr_nowrap
-                ? xcalloc(m->nfuncs ? m->nfuncs : 1, sizeof(DfFunc)) : NULL;
-  df_sp = UINT32_MAX;
+  df_func = NULL;
   if (nr_sum)
     for (uint32_t i = 0; i < fx_nfuncs; i++) {
       xfree(nr_sum[i].first); xfree(nr_sum[i].to); xfree(nr_sum[i].kill);
     }
   xfree(nr_sum);
+  nr_sum = NULL;
+}
+
+/* The facts of the last module compiled, given back: a JIT compiles one
+   module after another in a process that lives on (src/jit.c) */
+void opt_effects_release(void) {
+  fx_free_all();
+  fx_mod = NULL;
+  fx_serial = 0;
+  fx_opts = NULL;
+  fx_nfuncs = 0;
+  fx_resolved = false;
+}
+
+void opt_effects_begin(Module *m, const OptOpts *o) {
+  if (fx_same(m, o)) return;
+  fx_free_all();
+  /* the scan that finds the C stack pointer, which addr-nowrap folds
+     addresses on as well */
+  df_func = o->dead_frames || o->addr_nowrap
+                ? xcalloc(m->nfuncs ? m->nfuncs : 1, sizeof(DfFunc)) : NULL;
+  df_sp = UINT32_MAX;
   nr_sum = m->go_stack && o->go_noret && !m->go_noret
                ? xcalloc(m->nfuncs ? m->nfuncs : 1, sizeof(NrSum)) : NULL;
   df_scanfree = false;
   fx_mod = m;
+  fx_serial = m->serial;
   fx_opts = o;
+  fx_opts_copy = *o;
   fx_nfuncs = m->nfuncs;
   fx_func = xcalloc(m->nfuncs ? m->nfuncs : 1, sizeof(CallFx));
   fx_direct = xcalloc(m->nfuncs ? m->nfuncs : 1, sizeof(DirectFx));
@@ -7991,14 +8073,14 @@ void opt_effects_begin(Module *m, const OptOpts *o) {
 }
 
 void opt_effects_scan(Module *m, const OptOpts *o, uint32_t fi) {
-  if (fx_mod != m || fx_opts != o || fi >= m->nfuncs) return;
+  if (!fx_same(m, o) || fi >= m->nfuncs) return;
   if (!fx_direct[fi].scanned) fx_scan_direct(m, o, fi);
 }
 
 static void fx_facts_build(Module *m);
 
 void opt_effects_end(Module *m, const OptOpts *o) {
-  if (fx_mod != m || fx_opts != o || fx_resolved) return;
+  if (!fx_same(m, o) || fx_resolved) return;
   fx_warming = true;
   for (uint32_t fi = 0; fi < m->nfuncs; fi++) call_effects(m, o, fi, 0);
   indirect_effects(m, o);
@@ -8011,7 +8093,7 @@ void opt_effects_end(Module *m, const OptOpts *o) {
 }
 
 static void fx_need(Module *m, const OptOpts *o) {
-  if (fx_mod == m && fx_opts == o && (fx_resolved || fx_warming)) return;
+  if (fx_same(m, o) && (fx_resolved || fx_warming)) return;
   if (opt_effects_workers_running)
     warmc_fatal("internal: call effects for a module the workers were started "
                 "without warming");
@@ -8282,9 +8364,11 @@ static void nr_scan(Module *m, IrFunc *g, uint32_t fi) {
   NrSum *ns = &nr_sum[fi];
   ns->nnodes = b.nodes;
   ns->entry = g->entry;
-  ns->first = xcalloc(b.nodes + 2, sizeof(uint32_t));
-  ns->to = xmalloc((b.n ? b.n : 1) * sizeof(uint32_t));
-  ns->kill = xmalloc((b.n ? b.n : 1) * sizeof(uint32_t));
+  /* kept for the module's compile */
+  ns->first = xmalloc_long((b.nodes + 2) * sizeof(uint32_t));
+  memset(ns->first, 0, (b.nodes + 2) * sizeof(uint32_t));
+  ns->to = xmalloc_long((b.n ? b.n : 1) * sizeof(uint32_t));
+  ns->kill = xmalloc_long((b.n ? b.n : 1) * sizeof(uint32_t));
   for (uint32_t e = 0; e < b.n; e++) ns->first[b.from[e] + 1]++;
   for (uint32_t i = 0; i < b.nodes; i++) ns->first[i + 1] += ns->first[i];
   uint32_t *at = xmalloc((b.nodes + 1) * sizeof(uint32_t));
@@ -8509,6 +8593,17 @@ static void fx_scan_direct(Module *m, const OptOpts *o, uint32_t fi) {
       if (is_call_op(g->insts[b->insts[i]].op)) { d->makes_calls = true; break; }
   }
   ir_free(g);
+  /* What the scan keeps of a function lasts the module's compile; nothing
+     adds to it after the scan. */
+  if (d->vtst) { d->vtst = xkeep(d->vtst, d->nvtst * sizeof(VtStore)); d->capvtst = d->nvtst; }
+  if (d->refs) { d->refs = xkeep(d->refs, d->nrefs * sizeof(uint32_t)); d->caprefs = d->nrefs; }
+  if (d->ost) { d->ost = xkeep(d->ost, d->nost * sizeof(OnceStore)); d->capost = d->nost; }
+  if (d->oobs) { d->oobs = xkeep(d->oobs, d->noobs * sizeof(uint32_t)); d->capoobs = d->noobs; }
+  if (df_func && df_func[fi].args) {
+    DfFunc *df = &df_func[fi];
+    df->args = xkeep(df->args, df->nargs * sizeof(DfArg));
+    df->cap = df->nargs;
+  }
 
   d->writes_globals = writes_globals;
   d->gany = gany;
@@ -9012,7 +9107,7 @@ static int df_scan_block(const DfEvent *ev, uint32_t k, uint32_t end, int64_t lo
 
 static bool pass_dead_frames(IrFunc *f) {
   Module *m = f->m;
-  if (!df_func || df_sp == UINT32_MAX || fx_mod != m || !fx_resolved) return false;
+  if (!df_func || df_sp == UINT32_MAX || !fx_is(m) || !fx_resolved) return false;
   uint32_t n = f->ninsts, nb = f->nblocks;
   bool any = false;
   for (uint32_t oi = 0; oi < f->norder && !any; oi++) {
@@ -9967,20 +10062,20 @@ static void fx_count_callers(const Module *m) {
 }
 
 uint32_t opt_direct_callsite_count(const Module *m, uint32_t fi) {
-  if (fx_mod != m || !fx_resolved || !fx_ncallers || fi >= m->nfuncs)
+  if (!fx_is(m) || !fx_resolved || !fx_ncallers || fi >= m->nfuncs)
     return 0xffffffffu;
   return fx_ncallers[fi];
 }
 
 bool opt_call_frame_only(const Module *m, uint32_t fi) {
-  if (fx_mod != m || !fx_resolved || fi >= m->nfuncs) return false;
+  if (!fx_is(m) || !fx_resolved || fi >= m->nfuncs) return false;
   return fx_func[fi].state == 2 && fx_func[fi].frame_only;
 }
 
 /* Whether function fi has a body that makes no call, and how many
    instructions it holds as built. */
 bool opt_func_leaf(const Module *m, uint32_t fi, uint32_t *ninsts) {
-  if (fx_mod != m || !fx_resolved || fi >= m->nfuncs || !fx_direct[fi].has_body ||
+  if (!fx_is(m) || !fx_resolved || fi >= m->nfuncs || !fx_direct[fi].has_body ||
       fx_direct[fi].makes_calls)
     return false;
   *ninsts = fx_direct[fi].built_insts;
@@ -10144,7 +10239,7 @@ static bool cg_read(IrFunc *f, Ref v, uint32_t *g, uint32_t *n, bool *zero,
    or an immutable read off another constant object, through conversions. */
 static bool cg_obj_of(IrFunc *f, Ref r, uint32_t *g, uint32_t *n, int depth) {
   const Module *m = f->m;
-  if (fx_mod != m || !fx_resolved || !fx_cg_at || depth > 16) return false;
+  if (!fx_is(m) || !fx_resolved || !fx_cg_at || depth > 16) return false;
   for (int d = 0; d < 16; d++) {
     r = ir_resolve(f, r);
     Inst *in = &f->insts[r];
@@ -10683,7 +10778,7 @@ static bool devirt_abi_ok(const Module *m, uint32_t site_ti, uint32_t fi) {
 uint32_t opt_table0_target(const Module *m, uint32_t site_ti, uint64_t idx) {
   pthread_once(&g_dv_once, dv_init);
   if (g_dv.off || !(g_dv.rungs & DV_RUNG_INDIRECT)) return UINT32_MAX;
-  if (fx_mod != m || !fx_resolved || !fx_table0.computed || !fx_table0.frozen ||
+  if (!fx_is(m) || !fx_resolved || !fx_table0.computed || !fx_table0.frozen ||
       !fx_table0.entry || idx >= fx_table0.nentries || site_ti >= m->ntypes)
     return UINT32_MAX;
   uint32_t fi = fx_table0.entry[idx];
@@ -10784,7 +10879,7 @@ static bool pass_devirt(IrFunc *f, const OptOpts *o) {
   if (g_dv.only >= 0 && f->func_index != (uint32_t)g_dv.only) return false;
   if (g_dv.upto >= 0 && f->func_index > (uint32_t)g_dv.upto) return false;
   Module *m = f->m;
-  if (fx_mod != m || !fx_resolved) return false;
+  if (!fx_is(m) || !fx_resolved) return false;
 
   bool changed = false;
   for (uint32_t oi = 0; oi < f->norder; oi++) {
@@ -10865,7 +10960,7 @@ static uint32_t once_callee(IrFunc *f, Ref callee) {
 
 bool opt_once_call(IrFunc *g, Ref v) {
   const Inst *in = &g->insts[v];
-  return fx_opts && fx_opts->once && ox_init && fx_mod == g->m && in->op == I_CALL_REF &&
+  return fx_opts && fx_opts->once && ox_init && fx_is(g->m) && in->op == I_CALL_REF &&
          once_callee(g, ir_args(g, v)[in->nargs - 1]) != ONCE_UNK;
 }
 
@@ -11072,7 +11167,7 @@ static bool once_split_loops(IrFunc *f) {
 static bool pass_once(IrFunc *f, const OptOpts *o) {
   (void)o;
   Module *m = f->m;
-  if (fx_mod != m || !fx_resolved || !ox_init) return false;
+  if (!fx_is(m) || !fx_resolved || !ox_init) return false;
   bool changed = false;
   uint32_t gl[ONCE_BITS], ngl = 0;
   for (uint32_t oi = 0; oi < f->norder; oi++) {
@@ -22593,7 +22688,7 @@ static void pt_init(void) {
    holds the change each pass last ran clean at.  The round that confirms a
    cleanup is finished used to run every pass once more. */
 static void opt_cleanup(IrFunc *f, const OptOpts *o) {
-  if (o->addr_nowrap && df_sp != UINT32_MAX && fx_mod == f->m)
+  if (o->addr_nowrap && df_sp != UINT32_MAX && fx_is(f->m))
     TP("addr_nowrap", pass_addr_nowrap(f));
   uint32_t ver = 1, done[16] = {0};
 #define RUN(i, nm, call) \

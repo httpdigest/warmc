@@ -1922,11 +1922,11 @@ static int produce_body_x64(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
   memset(fout, 0, sizeof *fout);
   fout->want_align = opt->align && has_loop;
   fout->code_len = (uint32_t)(pro.len + s->body.len);
-  fout->code = xmalloc(fout->code_len ? fout->code_len : 1);
+  fout->code = xmalloc_long(fout->code_len ? fout->code_len : 1);
   memcpy(fout->code, pro.data, pro.len);
   memcpy(fout->code + pro.len, s->body.data, s->body.len);
   fout->nrelocs = s->nrelocs;
-  fout->relocs = xmalloc((s->nrelocs ? s->nrelocs : 1) * sizeof(Reloc));
+  fout->relocs = xmalloc_long((s->nrelocs ? s->nrelocs : 1) * sizeof(Reloc));
   for (uint32_t i = 0; i < s->nrelocs; i++) {
     Reloc *r = &s->relocs[i];
     uint64_t off = r->offset;
@@ -1984,19 +1984,19 @@ static int produce_body_x64(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
 
     fout->uw = u;
     if (u.nsites) {
-      fout->uw.sites = xmalloc(u.nsites * sizeof(UwSite));
+      fout->uw.sites = xmalloc_long(u.nsites * sizeof(UwSite));
       memcpy(fout->uw.sites, u.sites, u.nsites * sizeof(UwSite));
     }
     if (u.nclauses) {
-      fout->uw.clauses = xmalloc(u.nclauses * sizeof(UwClause));
+      fout->uw.clauses = xmalloc_long(u.nclauses * sizeof(UwClause));
       memcpy(fout->uw.clauses, u.clauses, u.nclauses * sizeof(UwClause));
     }
     if (u.ngcsites) {
-      fout->uw.gcsites = xmalloc(u.ngcsites * sizeof(GcSite));
+      fout->uw.gcsites = xmalloc_long(u.ngcsites * sizeof(GcSite));
       memcpy(fout->uw.gcsites, u.gcsites, u.ngcsites * sizeof(GcSite));
     }
     if (u.ngcroots) {
-      fout->uw.gcroots = xmalloc(u.ngcroots * sizeof(uint32_t));
+      fout->uw.gcroots = xmalloc_long(u.ngcroots * sizeof(uint32_t));
       memcpy(fout->uw.gcroots, u.gcroots, u.ngcroots * sizeof(uint32_t));
     }
   }

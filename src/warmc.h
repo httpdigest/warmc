@@ -50,6 +50,15 @@ void *xcalloc(size_t n, size_t sz);
 void *xrealloc(void *p, size_t n);
 void xfree(void *p);
 void xcache_release(void);
+/* what xmalloc takes from the system, from a heap of its own until
+   xheap_end destroys it, every block in it (util.c) */
+void xheap_begin(void);
+void xheap_end(void);
+/* xmalloc's from a compile heap's part for what outlives the work around
+   it, and p moved there with its first n bytes (util.c); outside a compile's
+   heap, xmalloc and p themselves */
+void *xmalloc_long(size_t n);
+void *xkeep(void *p, size_t n);
 /* The most an xmalloc of n bytes can hold without costing more memory: n
    rounded up to fill its size class. */
 size_t xmalloc_fit(size_t n);
@@ -365,6 +374,10 @@ typedef struct {
 typedef struct {
   const uint8_t *bin;
   size_t bin_len;
+  /* which module this is, different for every module the process parses:
+     what a cache of one module's facts knows it by, as the next module may
+     be allocated where a freed one was (wasm_parse) */
+  uint64_t serial;
 
   CompType *types; uint32_t ntypes;
   uint64_t total_locals;
@@ -624,6 +637,8 @@ typedef struct {
 void codegen_note_unwind(const FuncUnwind *u);
 
 void codegen_reset_unwind(void);
+void codegen_release(void);
+void validate_release(void);
 
 typedef enum {
   REL_CALL26,

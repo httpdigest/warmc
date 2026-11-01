@@ -47,6 +47,7 @@
 #include "opcodes.h"
 #include "reader.h"
 
+#include <stdatomic.h>
 #include <string.h>
 
 #define TR_NREG 3
@@ -151,6 +152,8 @@ static void tr_load(const Tr *t, Buf *b) {
 }
 
 static uint8_t *tr_own(Module *m, Buf *b) {
+  /* the module keeps every body to the end */
+  b->data = xkeep(b->data, b->len);
   m->owned_bodies = xrealloc(m->owned_bodies, (m->nowned_bodies + 1) * sizeof(uint8_t *));
   m->owned_bodies[m->nowned_bodies++] = b->data;
   return b->data;
@@ -304,6 +307,55 @@ static void tr_edge(TrScan *sc, uint32_t from, uint32_t to) {
     sc->edge = xrealloc(sc->edge, sc->capedge * sizeof(TrEdge));
   }
   sc->edge[sc->nedge++] = (TrEdge){ to, from };
+}
+
+/* What the scan below decides before any of its edges count, made of each
+   function on its own on every thread at once: whether some function hands
+   out a table's reference or tail-calls the loop's type (bad), and how many
+   call through the loop's type (nloop).  A module that is not GHC's has no
+   loop, or several such calls, and is done with here -- its every body
+   decoded once on one thread was a fifteenth of compiling Go's net/http
+   server to find that out. */
+typedef struct {
+  const Module *m;
+  uint64_t tid;
+  _Atomic uint32_t nloop;
+  _Atomic bool bad;
+} TrPre;
+
+static void tr_pre_one(void *ctx, uint32_t k, uint32_t w) {
+  (void)w;
+  TrPre *p = ctx;
+  const Module *m = p->m;
+  const Func *f = &m->funcs[m->nimported_funcs + k];
+  if (!f->body || atomic_load_explicit(&p->bad, memory_order_relaxed)) return;
+  uint32_t nloop = 0;
+  Rd r = rd_make(f->body, f->body_end, f->body);
+  while (!rd_eof(&r)) {
+    uint32_t op = wasm_read_op(&r);
+    switch (op) {
+      case 0x10: case 0x12: case 0xd2:
+        rd_u32(&r);
+        continue;
+      case 0x25:
+        atomic_store(&p->bad, true);
+        return;
+      case 0x11: case 0x13: {
+        uint32_t ti = rd_u32(&r);
+        rd_u32(&r);
+        if (tr_is_loop_type(m, ti, p->tid)) nloop++;
+        continue;
+      }
+      case 0x14: case 0x15: {
+        uint32_t ti = rd_u32(&r);
+        if (tr_is_loop_type(m, ti, p->tid)) { atomic_store(&p->bad, true); return; }
+        continue;
+      }
+      default: break;
+    }
+    if (!wasm_skip_imm(&r, op)) { atomic_store(&p->bad, true); return; }
+  }
+  if (nloop) atomic_fetch_add(&p->nloop, nloop);
 }
 
 static void tr_scan(const Module *m, uint64_t tid, TrScan *sc) {
@@ -488,6 +540,17 @@ uint32_t module_untrampoline(Module *m) {
   }
 
   uint32_t nf = m->nfuncs, ng = m->nglobals;
+  {
+    TrPre pre = { m, tid, 0, false };
+    uint32_t nd = nf - m->nimported_funcs;
+    warmc_par_for(nd, compile_want_threads(m, nd), tr_pre_one, &pre);
+    if (atomic_load(&pre.bad) || atomic_load(&pre.nloop) != 1) {
+      /* as `out` leaves it below */
+      xfree(m->t0->entry); xfree(m->t0->sites); xfree(m->t0);
+      m->t0 = NULL;
+      return 0;
+    }
+  }
   TrScan sc = { xcalloc(nf, 1), xcalloc(nf, 1), UINT32_MAX, 0, false, false,
                 module_type_canon(m), NULL, 0, 0 };
   tr_scan(m, tid, &sc);

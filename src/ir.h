@@ -355,6 +355,8 @@ typedef struct {
   struct IrChunk *chunks;
   char *bump;
   size_t bump_left;
+  /* the size of the last chunk started for filling, which the next doubles */
+  size_t bump_cap;
 } IrFunc;
 
 void *ir_alloc(IrFunc *f, size_t n);
@@ -611,6 +613,11 @@ void codegen_prewarm_symbols(Module *m, ObjBuilder *o);
 void codegen_plan_icall_tables(Module *m, ObjBuilder *o, bool on);
 void compile_module(Module *m, ObjBuilder *o, const OptOpts *opts);
 void compile_set_jobs(long n);
+void compile_set_level(OptOpts *o, int level);
+void compile_default_opts(OptOpts *o);
+bool compile_parse_flag(OptOpts *o, const char *a);
+void compile_finish_opts(OptOpts *o);
+void compile_release(void);
 bool pass_inline(IrFunc *f, const OptOpts *o);
 /* Frees the calling thread's inliner memo (inline.c). */
 void inl_memos_release(void);
@@ -697,6 +704,7 @@ bool opt_once_call(IrFunc *g, Ref v);
 void opt_effects_begin(Module *m, const OptOpts *o);
 void opt_effects_scan(Module *m, const OptOpts *o, uint32_t fi);
 void opt_effects_end(Module *m, const OptOpts *o);
+void opt_effects_release(void);
 extern bool opt_effects_workers_running;
 
 typedef struct { uint64_t m; int add; int sh; } Magic;

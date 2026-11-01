@@ -1,4 +1,6 @@
 #include "warmc.h"
+
+#include <stdatomic.h>
 #include "reader.h"
 #include "opcodes.h"
 #include "sort.h"
@@ -935,10 +937,13 @@ void wasm_decode_bodies(const Module *m) {
   xfree(warmc_hold_close(&h));
 }
 
+static _Atomic uint64_t g_module_serial;
+
 Module *wasm_parse(const uint8_t *bin, size_t len) {
   Module *m = xcalloc(1, sizeof(Module));
   m->bin = bin;
   m->bin_len = len;
+  m->serial = atomic_fetch_add(&g_module_serial, 1) + 1;
 
   g_type_limit = 0;
   DiagHold held;
@@ -1090,6 +1095,13 @@ void module_free(Module *m) {
   if (m->t0) { xfree(m->t0->entry); xfree(m->t0->sites); xfree(m->t0); }
   xfree(m->ict); xfree(m->ict_of);
   xfree(m->escapes);
+  /* what compile_module worked out of it: reach, the functions' new
+     numbering, and Go's facts */
+  xfree(m->reached);
+  xfree(m->type_slot); xfree(m->type_live); xfree(m->type_entry);
+  xfree(m->glob_read); xfree(m->data_read);
+  xfree(m->func_map);
+  xfree(m->go_pcf); xfree(m->go_noret);
   for (uint32_t i = 0; i < m->nowned_bodies; i++) xfree(m->owned_bodies[i]);
   xfree(m->owned_bodies);
   xfree(m);
