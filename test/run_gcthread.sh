@@ -81,14 +81,20 @@ fi
 # most 50 ms and counts an exit it outlasted, and that count is the measure
 # rather than the launch's wall time: on a Windows runner starting fifty rows
 # at once two launches of this module differ by more than 2 s with or without
-# the driver.
-if run_test exit 0 WARMC_GC_ROUNDS=0 WARMC_GC_STATS=1; then
+# the driver.  Even 50 ms is a time the system may not schedule the driver
+# in when every core has a row (Windows CI, 2026-11-01), so it has three
+# tries: a driver that does not hear the stop outlasts each of them.
+for try in 1 2 3; do
+  run_test exit 0 WARMC_GC_ROUNDS=0 WARMC_GC_STATS=1 || break
   if ! grep -q "  rounds: " "$WORK/exit.log"; then
     bad exit "the round driver never ran"
-  elif ! grep -q ", 0 exits the collector outlasted" "$WORK/exit.log"; then
-    bad exit "the collector outlasted the exit: $(grep '  rounds: ' "$WORK/exit.log")"
+    break
   fi
-fi
+  grep -q ", 0 exits the collector outlasted" "$WORK/exit.log" && break
+  if [ "$try" = 3 ]; then
+    bad exit "the collector outlasted the exit three times: $(grep '  rounds: ' "$WORK/exit.log")"
+  fi
+done
 
 if [ "$fail" -eq 0 ]; then say "5 passed, 0 failed"; else say "failed"; fi
 exit $fail
