@@ -78,6 +78,25 @@ prepare() {
   ( "$@" >"$LOGS/prepare-$label.log" 2>&1; echo $? >"$LOGS/prepare-$label.rc" ) &
 }
 
+# TinyGo builds its C libraries (wasi-libc, compiler-rt) into its own cache
+# the first time a target needs them, and two builds doing so at once collide:
+# on Windows the second one's rename onto the library the first one made
+# fails ("Access is denied").  So they are built here, before any row starts,
+# for each target the rows build for, one after the other -- by the real
+# tinygo, since a shim answering from the test cache would leave them unbuilt.
+# A build that fails here is the rows' to report.
+warm_tinygo() {
+  local tg
+  tg=$(PATH="${noshims:-$PATH}" command -v tinygo) || return 0
+  mkdir -p "$BUILD/tinygo-warm"
+  printf 'package main\n\nfunc main() {}\n' >"$BUILD/tinygo-warm/main.go"
+  for target in wasip1 wasip2; do
+    "$tg" build -o "$BUILD/tinygo-warm/$target.wasm" -target="$target" \
+      "$BUILD/tinygo-warm/main.go" || echo "tinygo-libs: the $target build failed"
+  done
+}
+
+prepare tinygo-libs warm_tinygo
 prepare cases   ./test/run_tests.sh --prepare
 prepare traps   ./test/run_traps.sh --prepare
 prepare gc      ./test/run_gc.sh --prepare
