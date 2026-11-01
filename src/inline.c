@@ -1078,10 +1078,12 @@ static bool inl_score_site(IrFunc *f, const OptOpts *o, InlMemos *memo,
     return false;
   }
 
+  /* each argument as substituted, which the caller's may not have been
+     yet since a splice */
   uint32_t nconst = 0;
   Ref *a = ir_args(f, call);
   for (uint32_t j = 0; j < cin->nargs; j++)
-    if (f->insts[a[j]].op == I_CONST) nconst++;
+    if (f->insts[ir_resolve(f, a[j])].op == I_CONST) nconst++;
   bool fonly = opt_call_frame_only(m, fidx);
   uint32_t sub = e->eparams + 2 * nconst;
   uint32_t charged = e->ninsts > sub + 4 ? e->ninsts - sub : 4;
@@ -1169,14 +1171,16 @@ static void inl_collect(IrFunc *f, const OptOpts *o, InlMemos *memo,
 
 /* Sets *stale when it leaves the caller's substitutions to apply and its
    block order to recompute.  Both are functions of the graph alone, so the
-   inliner does them once at the end, and before it scores calls a splice
-   copied in.  What it reads of them in between is local: the call's
-   arguments, resolved here; the call block's instruction list, brought up
-   to date here as applying would; and that block's reachability, which a
-   splice changes only when the callee never returns or takes over the
-   call's exception edges, and then both are done at once.  Doing them
-   after every inline was most of a compile that inlined two thousand calls
-   into 78,000 blocks. */
+   inliner does them once at the end.  What it reads of them in between is
+   local: the call's arguments, resolved here; the call block's instruction
+   list, brought up to date here as applying would; that block's
+   reachability, which a splice changes only when the callee never returns
+   or takes over the call's exception edges, and which is found again then;
+   and, to score the calls a splice copied in, their blocks' loop depths
+   and divergence (ir_order_depths).  Doing all of it after every inline
+   was most of a compile that inlined two thousand calls into 78,000
+   blocks, and redoing the order after each such splice, and before each
+   scoring, most of a Rust main that inlines three hundred panics. */
 static bool inl_apply(IrFunc *f, const OptOpts *o, InlMemos *memo,
                       const InlSite *site, uint32_t *budget,
                       uint32_t *retsum, bool *stale) {
@@ -1311,14 +1315,9 @@ static bool inl_apply(IrFunc *f, const OptOpts *o, InlMemos *memo,
   g_stats.inl_spliced++;
   inl_dbg(f, fidx, bi, "inlined spliced");
   xfree(callargs); xfree(contp);
-  if (nehe || !returns) {
-    ir_apply_subst(f);
-    ir_order(f);
-    *stale = false;
-  } else {
-    f->blocks[cont].reachable = true;
-    *stale = true;
-  }
+  if (nehe || !returns) ir_mark_reachable(f);
+  else f->blocks[cont].reachable = true;
+  *stale = true;
   return true;
 }
 
@@ -1333,13 +1332,17 @@ static bool inl_run(IrFunc *f, const OptOpts *o, uint32_t budget0, bool more) {
   uint32_t budget = budget0;
   uint32_t retsum = 0;
   long events = 0;
-  bool any = false, stale = false;
+  /* stale: the substitutions and the order are left to the end; depths:
+     the blocks' loop depths and divergence are the graph's as it is now */
+  bool any = false, stale = false, depths = true;
   for (uint32_t i = 0; i < sites.n && budget > 0; i++) {
     if (g_inl.max >= 0 && events >= g_inl.max) break;
     InlSite site = sites.v[i];
-    uint32_t before = f->ninsts;
+    uint32_t before = f->ninsts, nb_before = f->nblocks;
     if (!inl_apply(f, o, memo, &site, &budget, &retsum, &stale)) continue;
     any = true;
+    /* a flat inline leaves the graph as it was */
+    if (f->nblocks != nb_before) depths = false;
     events++;
     if (more) g_stats.inl_more++;
     if (site.idepth) g_stats.inl_transitive++;
@@ -1349,7 +1352,7 @@ static bool inl_run(IrFunc *f, const OptOpts *o, uint32_t budget0, bool more) {
     uint32_t had = sites.n;
     for (Ref v = (Ref)before; v < (Ref)f->ninsts; v++) {
       if (f->insts[v].op != I_CALL) continue;
-      if (stale) { ir_apply_subst(f); ir_order(f); stale = false; }
+      if (!depths) { ir_order_depths(f); depths = true; }
       InlSite ns;
       if (inl_score_site(f, o, memo, NULL, v, f->insts[v].block, v, &site, &ns))
         inl_push(&sites, &ns);

@@ -887,6 +887,47 @@ const uint32_t *ir_emit_order(IrFunc *f, uint32_t skip, uint32_t *n) {
   return eo;
 }
 
+/* What ir_order finds of each block's reachability, loop depth and
+   divergence, without the layout it then orders the blocks in: for a
+   reader of those alone, between changes to the graph -- the inliner,
+   scoring the calls a splice copied in.  When the graph is reducible
+   ir_order's second ordering keeps them as its first found them, and
+   otherwise finds them again in its own order, which this does too.  The
+   order and the dominator tree are left as that ordering made them, and
+   the next ir_order makes them again whatever the graph. */
+void ir_order_depths(IrFunc *f) {
+  pthread_once(&g_dom_check_once, dom_check_init);
+  bool reducible = order_once(f, false, false);
+  mark_diverging(f);
+  if (!reducible) order_once(f, true, false);
+  f->order_sig_valid = false;
+}
+
+/* Each block's reachability from the entry, as ir_order's search finds
+   it, and nothing else: for a reader of that alone after a change that
+   can only take blocks out of reach.  The next ir_order makes the rest. */
+void ir_mark_reachable(IrFunc *f) {
+  uint32_t nb = f->nblocks;
+  uint32_t *stk = xmalloc((nb ? nb : 1) * sizeof(uint32_t));
+  for (uint32_t i = 0; i < nb; i++) f->blocks[i].reachable = false;
+  uint32_t sp = 0;
+  if (f->entry < nb) {
+    f->blocks[f->entry].reachable = true;
+    stk[sp++] = f->entry;
+  }
+  while (sp) {
+    const Block *b = &f->blocks[stk[--sp]];
+    for (uint32_t s = 0; s < b->nsuccs; s++) {
+      uint32_t t = b->succs[s].target;
+      if (f->blocks[t].reachable) continue;
+      f->blocks[t].reachable = true;
+      stk[sp++] = t;
+    }
+  }
+  xfree(stk);
+  f->order_sig_valid = false;
+}
+
 bool ir_order_changed(IrFunc *f) {
   pthread_once(&g_dom_check_once, dom_check_init);
   size_t len = order_sig_len_of(f);

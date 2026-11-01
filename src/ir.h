@@ -395,6 +395,10 @@ typedef struct { uint32_t *off, *src, *si; } IrEdgeIdx;
 IrEdgeIdx ir_edge_index(IrFunc *f);
 void ir_edge_index_free(IrEdgeIdx *x);
 void ir_order(IrFunc *f);
+/* ir_order's reachability, loop depths and divergence alone; its
+   reachability alone (ir.c) */
+void ir_order_depths(IrFunc *f);
+void ir_mark_reachable(IrFunc *f);
 /* f->order with the outline blocks and the call arms of loops moved after
    the rest, but for skip, and a loop's latch above its header where that
    saves a branch (f->loop_top): the order the back ends emit the blocks in.
