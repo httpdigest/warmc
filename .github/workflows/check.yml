@@ -12,7 +12,7 @@ name: Check
 # cached, and each cache is saved as soon as what it holds is complete, so a
 # failing test does not lose it:
 #   build/ci/llvm               the trimmed LLVM release (macOS, Linux)
-#   build/ci/{wasmtime,wabt,ccache}, build/ci/{kotlinc,asc}
+#   build/ci/{wasmtime,wabt,ccache}, build/ci/{jdk,kotlinc,asc}
 #                               the pinned release binaries
 #   ~/.rustup, ~/.cargo/bin     the pinned Rust toolchain
 #   build/tools, build/testsuite  what the Makefile fetches: wasm-tools (a
@@ -26,6 +26,12 @@ name: Check
 #                               built them, keyed on their sources and every pin
 #   ~/.ghc-wasm, the tool cache GHC's wasm backend, Go, TinyGo, Node
 #   (Zig)                       setup-zig caches its own
+#
+# Everything is pinned: actions by commit, every tool to an exact version,
+# and every download the scripts and the Makefile make to its SHA-256
+# (test/fetch.sha256 for the Makefile's).  What the setup actions download is
+# pinned by its exact version.  The runner images cannot be pinned, so what
+# a job takes from one is chosen by name where it can be: Xcode on macOS.
 
 on:
   workflow_call:
@@ -53,11 +59,25 @@ jobs:
       CCACHE_BASEDIR: ${{ github.workspace }}
       CCACHE_MAXSIZE: 500M
       GOCACHE: ${{ github.workspace }}/build/ci-cache/go-build
+      # the Go of setup-go and no other, which go would otherwise fetch for a
+      # go.mod asking for a newer one
+      GOTOOLCHAIN: local
+      # The image's newest Xcode by name rather than its default, which moves:
+      # its SDK and ld64 are what the pinned LLVM links against.
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
     steps:
       - name: Check out
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      # The Python the build and every test script run, rather than the
+      # image's.  Windows runs MSYS2's own (see below).
+      - &setup-python
+        name: Install Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: 3.15.2
 
       # The caches are keyed on what they hold -- the pinned versions, and
       # for LLVM which members of the release -- rather than on the text of
@@ -71,11 +91,14 @@ jobs:
           s=.github/scripts
           sum() { cksum | cut -d' ' -f1; }
           {
-            echo "makefile=$(grep -E '^(WASM_TOOLS_VERSION|WASI_SDK_VERSION|TEAVM_VERSION|TEAVM_SOURCES) *:=' Makefile | sum)"
+            echo "makefile=$({ grep -E '^(WASM_TOOLS_VERSION|WASI_SDK_VERSION|TEAVM_VERSION|TEAVM_SOURCES|JODA_TIME_VERSION|JZLIB_VERSION|KOTLIN_VERSION) *:=' Makefile
+                               cat test/fetch.sha256; } | sum)"
             echo "rust=$(sed -n 's/^RUST_VERSION=//p' $s/install-rust.sh)"
+            echo "rustup=$(sed -n 's/^RUSTUP_VERSION=//p' $s/install-rust.sh)"
             echo "llvm=$(grep -E '^LLVM_VERSION=|lib/clang/' $s/install-llvm.sh | sum)"
             echo "tools=$(grep -E '^[A-Z_]+_VERSION=' $s/install-tools.sh | sum)"
-            echo "languages=$(grep -E '^[A-Z_]+_(VERSION|COMMIT|FLAVOUR)=' $s/install-language-tools.sh | sum)"
+            echo "languages=$({ grep -E '^[A-Z_]+_(VERSION|COMMIT|FLAVOUR)=' $s/install-language-tools.sh
+                                cat .github/asc/package-lock.json; } | sum)"
             echo "producers=$({ grep -hE '^[A-Z_]+_(VERSION|COMMIT|FLAVOUR)=' $s/*.sh
                                grep -E '(go|tinygo|binaryen|node|java)-version:|^ +version: ' .github/workflows/check.yml; } | sum)"
           } >> "$GITHUB_OUTPUT"
@@ -137,7 +160,7 @@ jobs:
           path: &rust |
             ~/.rustup/toolchains/${{ steps.pins.outputs.rust }}-*
             ~/.cargo/bin
-          key: rust-macos-arm64-${{ steps.pins.outputs.rust }}
+          key: rust-macos-arm64-${{ steps.pins.outputs.rust }}-rustup${{ steps.pins.outputs.rustup }}
 
       - name: Install Rust
         if: inputs.full
@@ -200,32 +223,25 @@ jobs:
           path: *toolcache
           key: *toolcache-key
 
-      # Temurin's newest release, for Kotlin and for the Java that calls a
-      # warmc shared library through the foreign function API.
-      - &setup-java
-        name: Install a JDK
-        if: inputs.full
-        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
-        with:
-          distribution: temurin
-          java-version: 27
-
-      - name: Restore Kotlin, GHC and AssemblyScript
+      # The JDK is Temurin's newest release, for Kotlin, TeaVM and the Java
+      # that calls a warmc shared library through the foreign function API.
+      - name: Restore the JDK, Kotlin, GHC and AssemblyScript
         if: inputs.full
         id: languages
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: &languages |
+            build/ci/jdk
             build/ci/kotlinc
             build/ci/asc
             ~/.ghc-wasm
           key: languages-macos-arm64-${{ steps.pins.outputs.languages }}
 
-      - name: Install Kotlin, GHC and AssemblyScript
+      - name: Install the JDK, Kotlin, GHC and AssemblyScript
         if: inputs.full
-        run: .github/scripts/install-language-tools.sh kotlin ghc asc
+        run: .github/scripts/install-language-tools.sh jdk kotlin ghc asc
 
-      - name: Save Kotlin, GHC and AssemblyScript
+      - name: Save the JDK, Kotlin, GHC and AssemblyScript
         if: inputs.full && steps.languages.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -366,6 +382,7 @@ jobs:
       CCACHE_BASEDIR: ${{ github.workspace }}
       CCACHE_MAXSIZE: 500M
       GOCACHE: ${{ github.workspace }}/build/ci-cache/go-build
+      GOTOOLCHAIN: local
       # where TinyGo keeps its cache on Linux
       XDG_CACHE_HOME: ${{ github.workspace }}/build/ci-cache/xdg
     steps:
@@ -373,6 +390,8 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      - *setup-python
 
       - *pins
 
@@ -428,7 +447,7 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: *rust
-          key: rust-linux-arm64-${{ steps.pins.outputs.rust }}
+          key: rust-linux-arm64-${{ steps.pins.outputs.rust }}-rustup${{ steps.pins.outputs.rustup }}
 
       - name: Install Rust
         if: inputs.full
@@ -454,9 +473,8 @@ jobs:
       - *setup-zig
       - *setup-node
       - *save-toolcache
-      - *setup-java
 
-      - name: Restore Kotlin, GHC and AssemblyScript
+      - name: Restore the JDK, Kotlin, GHC and AssemblyScript
         if: inputs.full
         id: languages
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -464,11 +482,11 @@ jobs:
           path: *languages
           key: languages-linux-arm64-${{ steps.pins.outputs.languages }}
 
-      - name: Install Kotlin, GHC and AssemblyScript
+      - name: Install the JDK, Kotlin, GHC and AssemblyScript
         if: inputs.full
-        run: .github/scripts/install-language-tools.sh kotlin ghc asc
+        run: .github/scripts/install-language-tools.sh jdk kotlin ghc asc
 
-      - name: Save Kotlin, GHC and AssemblyScript
+      - name: Save the JDK, Kotlin, GHC and AssemblyScript
         if: inputs.full && steps.languages.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -574,6 +592,7 @@ jobs:
       CCACHE_BASEDIR: ${{ github.workspace }}
       CCACHE_MAXSIZE: 500M
       GOCACHE: ${{ github.workspace }}/build/ci-cache/go-build
+      GOTOOLCHAIN: local
     steps:
       # The test scripts and their expected outputs must keep their LF line
       # endings, which a Windows checkout would otherwise turn into CRLF.
@@ -652,7 +671,7 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: *rust
-          key: rust-windows-x64-${{ steps.pins.outputs.rust }}
+          key: rust-windows-x64-${{ steps.pins.outputs.rust }}-rustup${{ steps.pins.outputs.rustup }}
 
       - name: Install Rust
         if: inputs.full
@@ -692,27 +711,27 @@ jobs:
           path: *toolcache-windows
           key: *toolcache-windows-key
 
-      - *setup-java
-
       # Kotlin/Wasm and GHC's wasm backend have no Windows builds here; their
       # corpora skip themselves.
-      - name: Restore AssemblyScript
+      - name: Restore the JDK and AssemblyScript
         if: inputs.full
         id: languages
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: build/ci/asc
+          path: &languages-windows |
+            build/ci/jdk
+            build/ci/asc
           key: languages-windows-x64-${{ steps.pins.outputs.languages }}
 
-      - name: Install AssemblyScript
+      - name: Install the JDK and AssemblyScript
         if: inputs.full
-        run: .github/scripts/install-language-tools.sh asc
+        run: .github/scripts/install-language-tools.sh jdk asc
 
-      - name: Save AssemblyScript
+      - name: Save the JDK and AssemblyScript
         if: inputs.full && steps.languages.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: build/ci/asc
+          path: *languages-windows
           key: ${{ steps.languages.outputs.cache-primary-key }}
 
       - name: Restore the build caches

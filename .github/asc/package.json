@@ -1,0 +1,7 @@
+{
+  "private": true,
+  "description": "AssemblyScript for test/asbench, installed by .github/scripts/install-language-tools.sh with npm ci",
+  "dependencies": {
+    "assemblyscript": "0.28.20"
+  }
+}
