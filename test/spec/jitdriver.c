@@ -148,7 +148,7 @@ static wasm_module_t *module_of(unsigned slot) {
   if (mods[slot]) return mods[slot];
   const char *path = cur_file->paths[slot];
   FILE *f = fopen(path, "rb");
-  if (!f) return NULL;
+  if (!f) { out("spec-run: cannot open "); out(path); out("\n"); return NULL; }
   fseek(f, 0, SEEK_END);
   long n = ftell(f);
   fseek(f, 0, SEEK_SET);

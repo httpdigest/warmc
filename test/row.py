@@ -1,8 +1,8 @@
 """One row of make check, answered from test/testcache.py where it passed
 before with nothing it depends on changed.
 
-What a row's answer depends on: warmc and its sanitiser builds, the
-runtimes and test programs make builds, the pinned tools (build/tools: the
+What a row's answer depends on: warmc and its sanitiser builds, the JIT
+library and build/warmrun, the runtimes and test programs make builds, the pinned tools (build/tools: the
 small programs by their contents, the installed toolchains by their files'
 names and sizes -- each is installed under its version and never changes in
 place), the spec suite's corpus as checked out (build/testsuite but its
@@ -51,7 +51,8 @@ def base():
     b = os.path.join(ROOT, BUILD)
     for f in sorted(os.listdir(b)):
         p = os.path.join(b, f)
-        if os.path.isfile(p) and (f.startswith("warmc") or f.endswith((".a", "_test"))):
+        if os.path.isfile(p) and (f.startswith(("warmc", "libwarmc", "warmrun")) or
+                                  f.endswith((".a", "_test"))):
             add("build", p)
     tools = os.path.join(b, "tools")
     for dp, dns, fns in os.walk(tools):

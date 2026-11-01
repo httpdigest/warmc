@@ -12,6 +12,24 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#ifdef _WIN32
+#include <direct.h>
+#include <io.h>
+#endif
+
+/* a fresh directory for a test's files: under TEMP on Windows, /tmp
+   elsewhere */
+static char *temp_dir(char *dir, size_t n) {
+#ifdef _WIN32
+  const char *t = getenv("TEMP");
+  snprintf(dir, n, "%s\\warm-capi-XXXXXX", t ? t : ".");
+  if (_mktemp_s(dir, strlen(dir) + 1) || _mkdir(dir)) return NULL;
+  return dir;
+#else
+  snprintf(dir, n, "/tmp/warm-capi-XXXXXX");
+  return mkdtemp(dir);
+#endif
+}
 
 static int nchecks, nfails;
 
@@ -855,8 +873,8 @@ static void test_threads(void) {
 /* ---- WASI ------------------------------------------------------------------------- */
 
 static void test_wasi(void) {
-  char dir[] = "/tmp/warm-capi-XXXXXX";
-  if (!mkdtemp(dir)) { CHECK(0); return; }
+  char dir[512];
+  if (!temp_dir(dir, sizeof dir)) { CHECK(0); return; }
   char path[256];
   snprintf(path, sizeof path, "%s/in.txt", dir);
   FILE *f = fopen(path, "w");

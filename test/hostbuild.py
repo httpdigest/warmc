@@ -136,6 +136,14 @@ def classpath(*parts):
     return os.pathsep.join(parts)
 
 
+def find_libwarmc(build):
+    """Where a program linked against libwarmc finds it: beside itself on
+    Windows only when it is there, so build/, the DLL's, goes first on the
+    PATH every program run from here inherits.  Elsewhere the program's
+    rpath names build/."""
+    if WINDOWS:
+        os.environ["PATH"] = os.path.abspath(build) + os.pathsep + os.environ.get("PATH", "")
+
 def exe(path):
     """The on-disk name link() actually produced for `path`."""
     return path + ".exe" if WINDOWS else path

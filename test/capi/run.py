@@ -4,7 +4,8 @@
     commit, every file checked against test/fetch.sha256): each built
     unchanged against libwarmc, run, and its output compared with
     test/capi/expected/NAME.out.  threads.c's threads print in no fixed
-    order, so its lines are compared sorted.  reflect.wat writes `anyfunc`,
+    order, so its lines are compared sorted, and the pointers hostref.c
+    prints as each C library spells them.  reflect.wat writes `anyfunc`,
     the name funcref had before the reference types proposal, which warmc's
     text front end, as the spec's grammar, does not read: it is assembled
     with funcref in its place.
@@ -17,12 +18,17 @@ Run by `make check` (test/run_all.sh) and on its own:
     python3 test/capi/run.py [-v]
 """
 import os
+import re
 import subprocess
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-BUILD = os.environ.get("BUILD", os.path.join(ROOT, "build"))
-WARMC = os.path.join(BUILD, "warmc") + (".exe" if os.name == "nt" else "")
+sys.path.insert(0, os.path.join(ROOT, "test"))
+import hostbuild  # noqa: E402
+# absolute: the examples run in their own directory, and find the library
+# by the rpath it names
+BUILD = os.path.abspath(os.environ.get("BUILD", os.path.join(ROOT, "build")))
+WARMC = hostbuild.exe(os.path.join(BUILD, "warmc"))
 COMMIT = "9d6b93764ac96cdd9db51081c363e09d2d488b4d"
 BASE = "https://raw.githubusercontent.com/WebAssembly/wasm-c-api/%s/" % COMMIT
 EXAMPLES = ["callback", "finalize", "global", "hello", "hostref", "memory", "multi",
@@ -30,6 +36,17 @@ EXAMPLES = ["callback", "finalize", "global", "hello", "hostref", "memory", "mul
 UNORDERED = {"threads"}
 WORK = os.path.join(BUILD, "capi")
 TIMEOUT = float(os.environ.get("WARMC_RUN_TIMEOUT", "120"))
+
+# hostref.c prints references with %p, which each C library spells its own
+# way: a null is 0x0 on macOS, (nil) with glibc and 0000000000000000 on
+# Windows.  Compared as the value, as macOS spells it.
+PTR = re.compile(r"^(> > )(\(nil\)|0x[0-9a-fA-F]+|[0-9A-Fa-f]{16})$", re.M)
+
+def canon_ptrs(text):
+    def one(m):
+        v = 0 if m.group(2) == "(nil)" else int(m.group(2), 16)
+        return m.group(1) + "0x%x" % v
+    return PTR.sub(one, text)
 
 def sh(cmd, **kw):
     return subprocess.run(cmd, capture_output=True, text=True, **kw)
@@ -42,12 +59,13 @@ def fetch(rel, out):
 
 def build_c(src, exe):
     """A program against the library in BUILD, found there when it runs."""
-    rpath = [] if os.name == "nt" else ["-Wl,-rpath," + BUILD]
+    rpath = [] if hostbuild.WINDOWS else ["-Wl,-rpath," + BUILD]
     return sh(["clang", "-O1", "-g", "-Wall", "-I" + os.path.join(ROOT, "include"),
                "-o", exe, src, "-L" + BUILD, "-lwarmc", "-lpthread"] + rpath)
 
 def main():
     verbose = "-v" in sys.argv
+    hostbuild.find_libwarmc(BUILD)
     up = os.path.join(WORK, "upstream-" + COMMIT[:12])
     os.makedirs(up, exist_ok=True)
     fails = []
@@ -81,7 +99,7 @@ def main():
         if r.returncode:
             fails.append("%s: warmc --emit-wasm: %s" % (name, r.stderr.strip()[:200]))
             continue
-        exe = os.path.join(up, name)
+        exe = hostbuild.exe(os.path.join(up, name))
         r = build_c(c, exe)
         if r.returncode:
             fails.append("%s: cannot build: %s" % (name, r.stderr.strip()[:300]))
@@ -92,7 +110,7 @@ def main():
             fails.append("%s: timed out after %gs" % (name, TIMEOUT))
             continue
         ran += 1
-        got = r.stdout
+        got = canon_ptrs(r.stdout)
         with open(os.path.join(ROOT, "test", "capi", "expected", name + ".out")) as f:
             want = f.read()
         if name in UNORDERED:
@@ -103,7 +121,7 @@ def main():
         elif verbose:
             print("ok  %s" % name)
 
-    exe = os.path.join(WORK, "api")
+    exe = hostbuild.exe(os.path.join(WORK, "api"))
     r = build_c(os.path.join(ROOT, "test", "capi", "api.c"), exe)
     if r.returncode:
         fails.append("api.c: cannot build: %s" % r.stderr.strip()[:300])

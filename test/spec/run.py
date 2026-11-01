@@ -363,8 +363,11 @@ def build_file(stem, outdir, spec, level, idx):
 
     module_files = [(i + 1, fn) for i, fn in enumerate(wanted)]
     if is_jit(level):
-        # nothing to compile ahead: the driver compiles each binary
-        paths = [spectest_wasm()] + [os.path.join(outdir, fn) for fn in wanted]
+        # nothing to compile ahead: the driver compiles each binary, which
+        # it opens by the path as a native program reads it (C:/... for
+        # MSYS2's /c/... on Windows)
+        paths = [hostbuild.winpath(p) for p in
+                 [spectest_wasm()] + [os.path.join(outdir, fn) for fn in wanted]]
         try:
             src, ncmds, skipped = gen.generate(spec, module_files, stem, idx, paths=paths)
         except Exception as e:
@@ -534,6 +537,7 @@ def _init_worker(version):
 
 def main():
     args = sys.argv[1:]
+    hostbuild.find_libwarmc(BUILD)
     verbose = "-v" in args
     if verbose:
         args.remove("-v")

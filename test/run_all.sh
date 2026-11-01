@@ -149,12 +149,13 @@ export GC_PAUSE_CHECK=0
 # pressure, far branches, the canonical ABI, component linking and shared
 # libraries -- most of warmc, in under 30 CPU-seconds of a workstation and
 # well under a minute of a CI runner, against the fifteen minutes the whole
-# of this takes there.  CI runs it on every push.  adapter and wit are left
+# of this takes there, and the JIT's C API and the cases through it.  CI runs
+# it on every push.  adapter and wit are left
 # out: their wasmtime runs and subprocesses cost a minute and more of a macOS
 # or Windows runner.
 SMOKE_ROWS="cases-O0 cases-O1 cases-O2 traps-O0 traps-O2 gc-O2 gcthread relaxed
   workload-O2 vecwork-O2 simd-O2 control-O2 addr32-O2 addrmulti-O2 addr64-O2
-  wasi link reject pressure bincases canon clink shared"
+  wasi link reject pressure bincases canon clink shared capi cases-jit"
 # Under MSYS2 every process costs a tenth of a second to start, and reject
 # starts warmc two hundred times to ask what no host can answer differently
 # -- whether the front end refuses a malformed module, and why -- so on
@@ -221,6 +222,13 @@ watch_rows() {
 start cases-O0 env WARMC_FLAGS=-O0 ./test/run_tests.sh
 start cases-O1 env WARMC_FLAGS=-O1 ./test/run_tests.sh
 start cases-O2 env WARMC_VERIFY_RA=1 WARMC_VERIFY_SSA=1 WARMC_FLAGS=-O2 ./test/run_tests.sh
+
+# The JIT (libwarmc, build/warmrun): the C API's own tests with the
+# upstream examples, the cases compiled through the library, and the
+# testsuite's assertions run against what it compiles.
+start capi python3 test/capi/run.py
+start cases-jit env WARMC_JIT=1 ./test/run_tests.sh
+start spec-jit python3 test/spec/run.py "--levels=jit -O2"
 
 # A second, independent engine over the same corpus; the row skips itself
 # politely where wasmtime is not installed.
