@@ -29,11 +29,16 @@ Nested scopes are resolved, which is where a real document keeps everything:
 a component or instance type declares types in an index space of its own, and
 `2.8` in the output means type 8 of the type at index 2.
 
-Needs the reference.  It is a single file fetched into $BUILD/spec; without it
-this skips rather than fails, since a checkout with no network is not a broken
-tree.
+Needs the reference.  It is a single file, pinned to one commit of the
+component model and checked against its SHA-256, fetched into
+$BUILD/canon-ref/<commit>; without it this skips rather than fails, since a
+checkout with no network is not a broken tree.  A fetched file that does not
+match the pin fails.  The file is the specification's executable form, and its
+API moves with the specification as much as its rules do, so raising the pin
+is a deliberate step that this file follows.
 """
 
+import hashlib
 import os
 import re
 import subprocess
@@ -46,10 +51,12 @@ WARMC = os.path.join(ROOT, BUILD, "warmc") + (".exe" if os.name == "nt" else "")
 WASM_TOOLS = os.path.join(ROOT, BUILD, "tools", "bin",
                           "wasm-tools.exe" if os.name == "nt" else "wasm-tools")
 WORK = os.path.join(ROOT, BUILD, "canon")
-SPEC_DIR = os.path.join(ROOT, BUILD, "spec")
+SPEC_COMMIT = "fed10b0b823b82553dd8363f16a640816f5eac65"
+SPEC_SHA256 = "27271503ddcb9c490fd518bd142088df19482d670e19c5e1ea9cff046dece576"
+SPEC_DIR = os.path.join(ROOT, BUILD, "canon-ref", SPEC_COMMIT)
 SPEC = os.path.join(SPEC_DIR, "definitions.py")
 SPEC_URL = ("https://raw.githubusercontent.com/WebAssembly/component-model/"
-            "main/design/mvp/canonical-abi/definitions.py")
+            "%s/design/mvp/canonical-abi/definitions.py" % SPEC_COMMIT)
 
 SMITH = int(os.environ.get("CANON_SMITH", "12"))
 
@@ -64,19 +71,43 @@ def run(cmd):
     p = subprocess.run(cmd, capture_output=True, text=True)
     return p.returncode, p.stdout, p.stderr
 
+def modern_python(row):
+    """Fail unless this Python can read the reference.
+
+    It is written with `match`, which Python 3.10 brought, and the python3 a
+    machine carries can be older (macOS's own is 3.9).  A reference that would
+    not import used to be a skip, so that on such a machine this compared
+    nothing and passed."""
+    if sys.version_info < (3, 10):
+        print("FAIL[%s]: the reference needs Python 3.10 or later, and %s is %s"
+              % (row, sys.executable, sys.version.split()[0]))
+        sys.exit(1)
+
 def ensure_spec():
+    """Whether the pinned reference is in SPEC_DIR, fetching it if not.
+
+    False means skip: there is no network.  A file whose SHA-256 is not the
+    pin's is a failure, fetched or found, and exits."""
     if os.path.exists(SPEC):
-        return True
-    os.makedirs(SPEC_DIR, exist_ok=True)
-    try:
-        with urllib.request.urlopen(SPEC_URL, timeout=20) as r:
-            data = r.read()
-        with open(SPEC, "wb") as f:
+        with open(SPEC, "rb") as f:
+            data = f.read()
+    else:
+        try:
+            with urllib.request.urlopen(SPEC_URL, timeout=20) as r:
+                data = r.read()
+        except Exception as e:
+            print("canon: skipping, could not fetch the reference (%s)" % e)
+            return False
+        os.makedirs(SPEC_DIR, exist_ok=True)
+        with open(SPEC + ".tmp", "wb") as f:
             f.write(data)
-        return True
-    except Exception as e:
-        print("canon: skipping, could not fetch the reference (%s)" % e)
-        return False
+        os.replace(SPEC + ".tmp", SPEC)
+    got = hashlib.sha256(data).hexdigest()
+    if got != SPEC_SHA256:
+        print("FAIL[canon]: %s has SHA-256 %s, the pin says %s"
+              % (SPEC, got, SPEC_SHA256))
+        sys.exit(1)
+    return True
 
 class P:
     """A recursive-descent reader for the structure --dump-canon prints."""
@@ -105,7 +136,7 @@ _RESOURCES = {}
 
 def resource_type(d, i):
     if i not in _RESOURCES:
-        _RESOURCES[i] = d.ResourceType(None, None)
+        _RESOURCES[i] = d.ResourceType(None, "i32")
     return _RESOURCES[i]
 
 def handle_index(p):
@@ -201,14 +232,33 @@ def parse_whole(s, d):
     return t
 
 class Opts:
-    """What flatten_* reads out of the canonical options: the pointer width."""
+    """What layout and flattening read out of the canonical options: the
+    pointer width, and for a function type whether it is async."""
     def __init__(self, ptr):
-        self.memory = type("M", (), {"ptr_type": staticmethod(lambda: ptr)})()
+        size = 4 if ptr == "i32" else 8
+        self.memory = type("M", (), {"ptr_type": staticmethod(lambda: ptr),
+                                     "ptr_size": staticmethod(lambda: size)})()
         self.async_ = False
         self.callback = None
 
+# The instance the reference's context names.  It implements none of the
+# resources here, so a borrow takes the handle form, an i32 in 4 bytes, which is
+# what --dump-canon prints: it has no instance to be relative to.
+NO_IMPL = object()
+
+def ref_cx(d, direction="lift", ptr="i32"):
+    """A context for the reference's layout and flattening rules, which read
+    the direction, the options and the instance doing the lifting or lowering."""
+    return d.LiftLowerContext(direction, Opts(ptr), NO_IMPL)
+
 def ref_flat(d, t, ptr="i32"):
-    return d.flatten_type(t, Opts(ptr))
+    return d.flatten_type(ref_cx(d, ptr=ptr), t)
+
+def ref_align(d, t):
+    return d.alignment(ref_cx(d), t)
+
+def ref_size(d, t):
+    return d.elem_size(ref_cx(d), t)
 
 LINE_T = re.compile(r"^canon ([\d.]+) (.*) align=(\d+) size=(\d+) flat=(.*)$")
 LINE_F = re.compile(r"^canon-func ([\d.]+) \((.*)\)->\((.*)\) "
@@ -295,8 +345,8 @@ def check_dump(name, dump, d):
             except ValueError as e:
                 fail("%s: %s" % (name, e))
                 continue
-            want_al = d.alignment(t, "i32")
-            want_sz = d.elem_size(t, "i32")
+            want_al = ref_align(d, t)
+            want_sz = ref_size(d, t)
             want_fl = ",".join(ref_flat(d, t))
             if int(al) != want_al:
                 fail("%s type %s (%s): align %s, the reference says %d"
@@ -326,7 +376,7 @@ def check_dump(name, dump, d):
                     fail("%s def %s: resolved %s core %s, the fixture declares "
                          "%s core %s" % (name, idx, got[0], got[1], pin[0], pin[1]))
             ft = d.FuncType(params, result)
-            sig = d.flatten_functype(Opts("i32"), ft, ctx)
+            sig = d.flatten_functype(ref_cx(d, ctx), ft)
             want = (",".join(sig.params), ",".join(sig.results))
             if (cp, cr) != want:
                 fail("%s def %s %s: core (%s)->(%s), the reference says (%s)->(%s)"
@@ -352,7 +402,7 @@ def check_dump(name, dump, d):
                 continue
             ft = d.FuncType(params, result)
             for ctx, gp, gr in (("lift", lp, lr), ("lower", wp, wr)):
-                sig = d.flatten_functype(Opts("i32"), ft, ctx)
+                sig = d.flatten_functype(ref_cx(d, ctx), ft)
                 want = (",".join(sig.params), ",".join(sig.results))
                 if (gp, gr) != want:
                     fail("%s func %s %s: (%s)->(%s), the reference says (%s)->(%s)"
@@ -422,14 +472,15 @@ def main():
     if not os.path.exists(WASM_TOOLS):
         print("canon: wasm-tools not built (run `make wasm-tools`)", file=sys.stderr)
         return 1
+    modern_python("canon")
     if not ensure_spec():
         return 0
     sys.path.insert(0, SPEC_DIR)
     try:
         import definitions as d
     except Exception as e:
-        print("canon: skipping, the reference does not import (%s)" % e)
-        return 0
+        print("FAIL[canon]: the reference does not import (%s)" % e)
+        return 1
 
     corpus = components()
     if not corpus:

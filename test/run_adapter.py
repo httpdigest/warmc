@@ -342,7 +342,7 @@ def handle_ops(d, rc, rng, n, src_at, dst_at):
     the other, and an implementation that used one table for both would pass
     every test that only ever looked at one.
     """
-    rts = [d.ResourceType(None, None), d.ResourceType(None, None)]
+    rts = [d.ResourceType(None, "i32"), d.ResourceType(None, "i32")]
     for i, rt in enumerate(rts):
         rc._RESOURCES[900 + i] = rt
     tables = {"src": d.Table(), "dst": d.Table()}
@@ -522,6 +522,10 @@ class RefCx:
     and nothing about the copy can be checked."""
 
     def __init__(self, mem, bump, inst=None):
+        # Layout reads the direction only for a borrow lowered into the
+        # instance implementing its resource, where it is the rep's width; a
+        # rep is an i32 here, as wide as the handle the other direction takes.
+        self.direction = "lower"
         self.opts = RefOpts(mem)
         self.inst = inst
         self.borrow_scope = None
@@ -633,7 +637,7 @@ def prim_members(d, t):
 
         if not isinstance(mdt, d.PrimValType) or isinstance(mdt, d.StringType):
             return None
-        a = d.alignment(mt, "i32")
+        a = rc.ref_align(d, mt)
         at = (at + a - 1) // a * a
         for cls, which in ((d.BoolType, "bool"), (d.CharType, "char"),
                            (d.U8Type, "u8"), (d.S8Type, "s8"),
@@ -641,7 +645,7 @@ def prim_members(d, t):
             if isinstance(mdt, cls):
                 out.append((slot, at, which))
                 break
-        at += d.elem_size(mt, "i32")
+        at += rc.ref_size(d, mt)
         slot += 1
     return out
 
@@ -1101,8 +1105,8 @@ def check_component(name, path, d, rng):
         except ValueError as e:
             fail("%s: %s" % (name, e))
             continue
-        size = d.elem_size(t, "i32")
-        align = d.alignment(t, "i32")
+        size = rc.ref_size(d, t)
+        align = rc.ref_align(d, t)
         dt = d.despecialize(t)
 
         if isinstance(dt, d.StringType):
@@ -1112,14 +1116,14 @@ def check_component(name, path, d, rng):
                         "nflat": len(flats), "size": size, "scratch": at})
             at += 16
         if (isinstance(dt, d.ListType) and dt.l is None
-                and d.alignment(dt.t, "i32") > 1):
+                and rc.ref_align(d, dt.t) > 1):
             at = (at + align - 1) // align * align
             bad.append({"name": key, "at": at, "kind": "misaligned",
                         "nflat": len(flats), "size": size, "scratch": at,
-                        "align": d.alignment(dt.t, "i32")})
+                        "align": rc.ref_align(d, dt.t)})
             at += max(size, 1)
         if isinstance(dt, d.VariantType):
-            ds = d.elem_size(d.discriminant_type(dt.cases), "i32")
+            ds = rc.ref_size(d, d.discriminant_type(dt.cases))
 
             if len(dt.cases) < 256 ** ds:
                 at = (at + align - 1) // align * align
@@ -1498,14 +1502,15 @@ def main():
     if subprocess.run(["which", WASMTIME], capture_output=True).returncode != 0:
         print("adapter: skipping, no wasmtime")
         return 0
+    rc.modern_python("adapter")
     if not rc.ensure_spec():
         return 0
     sys.path.insert(0, rc.SPEC_DIR)
     try:
         import definitions as d
     except Exception as e:
-        print("adapter: skipping, the reference does not import (%s)" % e)
-        return 0
+        print("FAIL[adapter]: the reference does not import (%s)" % e)
+        return 1
 
     rng = random.Random(20260807)
     total = skipped = comps = listy = utf8n = xn = 0
