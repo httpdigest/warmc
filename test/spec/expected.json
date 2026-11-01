@@ -82,12 +82,12 @@
  },
  "array_copy.wast": {
   "fail": 0,
-  "pass": 5,
+  "pass": 6,
   "run": "ok",
   "run_fail": 0,
-  "run_pass": 32,
+  "run_pass": 41,
   "text_fail": 0,
-  "text_pass": 5
+  "text_pass": 6
  },
  "array_fill.wast": {
   "fail": 0,
@@ -100,12 +100,12 @@
  },
  "array_init_data.wast": {
   "fail": 0,
-  "pass": 4,
+  "pass": 5,
   "run": "ok",
   "run_fail": 0,
-  "run_pass": 45,
+  "run_pass": 47,
   "text_fail": 0,
-  "text_pass": 4
+  "text_pass": 5
  },
  "array_init_elem.wast": {
   "fail": 0,
@@ -118,12 +118,12 @@
  },
  "array_new_data.wast": {
   "fail": 0,
-  "pass": 5,
+  "pass": 6,
   "run": "ok",
   "run_fail": 0,
-  "run_pass": 29,
+  "run_pass": 31,
   "text_fail": 0,
-  "text_pass": 5
+  "text_pass": 6
  },
  "array_new_elem.wast": {
   "fail": 0,

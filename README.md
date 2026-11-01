@@ -53,12 +53,12 @@ Hello world!
   [WebAssembly feature support](#webassembly-feature-support).
 - **Passes the official spec testsuite.** The 258 core `.wast` files of the
   pinned upstream testsuite (its top level; its `proposals/`, `legacy/` and
-  `custom/` directories are not run) pass with zero failures: 6,925
-  validation and 60,730 execution checks, counting each module that must
+  `custom/` directories are not run) pass with zero failures: 6,928
+  validation and 60,743 execution checks, counting each module that must
   compile and each instantiation as well as the assertions, at `-O1`, at
   `-O2`, and at `-O2 --profile=deterministic`. The text format is checked
   through warmc's own text front end: the quoted modules, malformed ones
-  among them, go to it directly, and the 5,118 modules the files write as
+  among them, go to it directly, and the 5,121 modules the files write as
   text are assembled by it to the bytes wasm-tools makes of them, except
   for two where wasm-tools gives a function a type that is not final and
   warmc follows the spec.

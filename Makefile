@@ -262,7 +262,7 @@ check-encoder: $(BUILD)/a64_test$(EXE) $(BUILD)/x64_test$(EXE)
 # Each rule leaves a stamp naming the version it fetched, so bumping a pin
 # (or upgrading kotlinc) fetches again instead of testing against whatever
 # an older pin left behind.
-TESTSUITE_COMMIT := 44f1503f98409fa3737437bf9449a37a5def4210
+TESTSUITE_COMMIT := 63908677d00585fdab4c4eccbf01f781d3a454d5
 TESTSUITE_STAMP  := $(BUILD)/testsuite/.commit-$(TESTSUITE_COMMIT)
 
 $(TESTSUITE_STAMP):
