@@ -197,6 +197,8 @@ static int warmc_win_isa_ok(void) {
   return ok;
 }
 
+/* what a program's entry does (rt.c), which a JIT's runtime has not */
+#if !defined(WARMC_JIT)
 static void warmc_win_check_isa(void) {
   if (!warmc_win_isa_ok()) {
     eputs("warmc-rt: this executable needs an x86-64-v3 CPU "
@@ -204,6 +206,7 @@ static void warmc_win_check_isa(void) {
     sys_exit(1);
   }
 }
+#endif
 
 static usz win_utf8_of(const u16 *w, usz wn, u8 *dst) {
   usz o = 0;
@@ -238,6 +241,7 @@ static usz win_utf8_of(const u16 *w, usz wn, u8 *dst) {
 /* CommandLineToArgvW rules (post-2008 msvcrt): 2n backslashes before a
    quote emit n and toggle, 2n+1 emit n and a literal quote; "" inside
    quotes is a literal quote. */
+#if !defined(WARMC_JIT)
 static void warmc_win_cmdline(int *argc_out, char ***argv_out) {
   const u16 *wcl = GetCommandLineW();
   usz wn = 0;
@@ -287,6 +291,7 @@ static void warmc_win_cmdline(int *argc_out, char ***argv_out) {
   *argc_out = argc;
   *argv_out = argv;
 }
+#endif
 
 static char **warmc_win_environ(void) {
   const u16 *blk = GetEnvironmentStringsW();
@@ -326,7 +331,9 @@ static char **warmc_win_environ(void) {
 /* ---- freestanding memory intrinsics ----
    clang lowers aggregate copies and large zero-inits to these even under
    -ffreestanding; -fno-builtin keeps the loops from folding back into
-   recursive libcalls. */
+   recursive libcalls.  A JIT's runtime (WARMC_JIT) is in a DLL with the C
+   library, whose are faster -- and the compiler beside it calls them. */
+#if !defined(WARMC_JIT)
 
 void *memcpy(void *d, const void *s, usz n) {
   u8 *dp = (u8 *)d;
@@ -358,3 +365,4 @@ int memcmp(const void *a, const void *b, usz n) {
     if (pa[i] != pb[i]) return pa[i] < pb[i] ? -1 : 1;
   return 0;
 }
+#endif

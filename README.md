@@ -692,6 +692,82 @@ component calls a
 `wasi:*` function this host does not implement, the program traps when the
 call happens and names the function. It is not refused at link time.
 
+### A JIT: libwarmc and the C API
+
+`make jit` builds warmc as a library that compiles modules in the process
+that uses them: `build/libwarmc.dylib` on macOS, `build/libwarmc.so` on
+Linux, and `build/libwarmc.dll` with its import library
+`build/libwarmc.dll.a` on Windows. It implements the standard WebAssembly C
+API, `include/wasm.h` (wasm-c-api at commit 9d6b937, byte for byte), and
+adds `include/warm.h`. That header covers what `wasm.h` has no word for: the
+optimisation level and `-f` flags, how many threads compile, why a module
+does not compile or an instance does not link, a module's custom sections,
+calls with `v128` values, a WASI program's exit status, and WASI preview 1.
+
+`wasm_module_new` compiles the whole module at once, at `-O2` unless the
+config says otherwise, on as many threads as the machine has. The code is
+byte for byte what `warmc -c` makes for the host, placed within branch range
+of the runtime inside the library. A compile gives back its working memory
+when it ends; a module's code and data are kept for as long as a module
+handle or an instance of it lives. `wasm_module_serialize` writes the
+compiled code, which `wasm_module_deserialize` loads without compiling
+again, in a build of libwarmc made from the same sources.
+
+```c
+/* host.c */
+#include <stdio.h>
+#include "wasm.h"
+#include "warm.h"
+
+int main(void) {
+  const char text[] = "(module (func (export \"add\") (param i32 i32) (result i32)"
+                      "  (i32.add (local.get 0) (local.get 1))))";
+  wasm_engine_t *engine = wasm_engine_new();
+  wasm_store_t *store = wasm_store_new(engine);
+  wasm_byte_vec_t bin;
+  warm_wat2wasm(text, sizeof text - 1, &bin, NULL);
+  wasm_module_t *module = wasm_module_new(store, &bin);
+  wasm_extern_vec_t imports = WASM_EMPTY_VEC, exports;
+  wasm_instance_t *instance = wasm_instance_new(store, module, &imports, NULL);
+  wasm_instance_exports(instance, &exports);
+  wasm_val_t args[2] = { WASM_I32_VAL(40), WASM_I32_VAL(2) }, results[1];
+  wasm_val_vec_t av = WASM_ARRAY_VEC(args), rv = WASM_ARRAY_VEC(results);
+  wasm_func_call(wasm_extern_as_func(exports.data[0]), &av, &rv);
+  printf("%d\n", results[0].of.i32);   /* 42 */
+  wasm_extern_vec_delete(&exports);
+  wasm_instance_delete(instance);
+  wasm_module_delete(module);
+  wasm_byte_vec_delete(&bin);
+  wasm_store_delete(store);
+  wasm_engine_delete(engine);
+}
+```
+
+```sh
+clang -Iinclude -o host host.c -Lbuild -lwarmc -Wl,-rpath,build   # macOS, Linux
+clang -Iinclude -o host.exe host.c build/libwarmc.dll.a           # Windows, with build/ on PATH
+```
+
+The runtime runs one thread's wasm at a time: every call into it takes one
+lock, which a host function that calls back in already holds. A host
+function is called with the arguments wasm passed; its trap ends the wasm
+call that made it. `warm_wasi_imports` binds a module's
+`wasi_snapshot_preview1` imports from a `warm_wasi_config_t`: arguments,
+environment, preopened directories and TCP listeners, as `warmc --wasi`
+takes them.
+
+`build/warmrun` runs a module through the library, written against the C
+API alone. A WASI command runs as with `warmc --wasi`, its arguments after
+the module; any other module runs as the CLI harness runs it, each export
+followed by its arguments. It takes `-O<n>`, `-f[no-]<pass>` and `-j<n>`
+(the compile's threads), and `--serialize=FILE` and `--precompiled` to
+write a compiled module and run one.
+
+```sh
+build/warmrun test/wasi/hello.wat
+build/warmrun module.wasm add 40 2 -- sub 7 1
+```
+
 ### Embedding compiled modules in C
 
 For a core module, `-c` produces an object that exports a single symbol, the
@@ -1825,6 +1901,12 @@ process for `--validate-only`, `--emit-wasm` and `-c`. `WARMC_NO_TESTCACHE=1`
 runs everything.
 
 Most of the suite is **differential**. warmc's output is compared with:
+- wabt's `wasm-interp`, for the hand-written cases compiled by the JIT
+  (`WARMC_JIT=1`, through `build/warmrun`); the testsuite's assertions,
+  against what the JIT compiles of each module (`test/spec/jitdriver.c`);
+  and wasm-c-api's thirteen examples, against their output, with
+  `test/capi/api.c`'s checks of every function `wasm.h` and `warm.h`
+  declare (`test/capi/run.py`)
 - wabt's `wasm-interp`, for the hand-written cases in `test/cases`: at `-O0`,
   `-O1` and `-O2`; with the register allocator and SSA verified; with
   `-fgssa-all`, with `-fdead-frames`, with `-fexact-trap`, and with far
@@ -2045,11 +2127,15 @@ src/            the compiler
   codegen.c compile.c module_data.c       per-function emission, parallel driver, module descriptor
   elf.c macho.c coff.c pe.c link.c        object writers and linker
   shlib.c                                 --shared: the C entry points, header and .def
+  jit.c capi.c                            the JIT: compiling and placing a module, and the C API over it
+  warmrun.c                               a module run through the JIT
+include/        wasm.h (the WebAssembly C API) and warm.h (libwarmc's additions)
 rt/             the runtime linked into every program and shared library
   rt.c            instantiation, traps, GC, exceptions, CLI harness
   start.S start_x64.S                     entry, invoke, throw and GC trampolines
   lib.c                                   a shared library's face: the C calls, its lock and its traps
   hook.c gcthook.c                        defaults that a driver, or the GC thread tests, replace
+  jit.c                                   what the JIT's runtime has in place of a program's modules
   gcthtest.c                              the GC thread tests' replacement
   modules.c component.c                   the descriptor tables of a program that is not a component
   wasi.c wasi.wat                         WASI preview 1 host

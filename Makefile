@@ -36,6 +36,7 @@ ifeq ($(origin CC),default)
 endif
 CFLAGS  ?= -std=c11 -O3 $(HOST_TUNE) $(HOST_DEFS) -flto=thin -fvisibility=hidden -fvisibility-inlines-hidden -fno-exceptions -fno-rtti -g -Wall -Wextra -Wno-unused-parameter
 BUILD   ?= build
+comma   := ,
 
 # What every object is built by and with, which no .d file names (-MMD leaves
 # the system's headers out): see TOOLCHAIN_ID below.
@@ -219,11 +220,12 @@ $(BUILD)/warmwasip2-macos.a: $(P2_MOBJS)
 # live in its host's process (WARMC_JIT: no entry point of its own), and
 # src/jit.c, which places what the compiler makes where the runtime's calls
 # reach.  build/jit/rtsyms.c is the runtime's symbols by name, which a
-# module's relocations name, generated from its objects.
+# module's relocations name, generated from its objects.  WASI is the
+# runtime's own, over the system's POSIX surface: libSystem's on macOS,
+# rt/linuxposix.c's system calls on Linux and rt/winposix.c's Win32 on
+# Windows, as a program warmc links has it.
 LIBWARMC_SRC  := src/jit.c src/capi.c
-LIBWARMC_OBJS := $(patsubst src/%.c,$(BUILD)/obj/%.o,$(LIBWARMC_SRC))
 JIT_RT_SRC    := rt/rt.c rt/gcthook.c rt/jit.c rt/wasi.c rt/wasifs.c
-JIT_RT_OBJS   := $(patsubst rt/%.c,$(BUILD)/jit/rt-%.o,$(JIT_RT_SRC)) $(BUILD)/jit/rt-start.o
 ifeq ($(HOST_OS),macos)
   JIT_RTFLAGS := $(MACFLAGS) -DWARMC_JIT=1
   JIT_ASFLAGS := --target=arm64-apple-macos11 -DWARMC_DARWIN=1 -DWARMC_JIT=1
@@ -231,22 +233,45 @@ ifeq ($(HOST_OS),macos)
   LIBWARMC    := $(BUILD)/libwarmc.dylib
   LIBWARMC_LD := -dynamiclib -install_name @rpath/libwarmc.dylib \
                  -Wl,-exported_symbols_list,src/libwarmc.exports -Wl,-dead_strip
+  LIBWARMC_LIBS :=
   JIT_SYM_US  := _
+  LIBOBJ      := $(BUILD)/obj
 else ifeq ($(HOST_OS),windows)
+  JIT_RT_SRC  += rt/winposix.c
   JIT_RTFLAGS := $(WINFLAGS) -DWARMC_JIT=1
   JIT_ASFLAGS := --target=x86_64-pc-windows-gnu -DWARMC_WINDOWS=1 -DWARMC_JIT=1
   JIT_START   := rt/start_x64.S
-  LIBWARMC    := $(BUILD)/warmc.dll
+  LIBWARMC    := $(BUILD)/libwarmc.dll
+  # what the runtime's Win32 calls are in, beside kernel32: WaitOnAddress
+  # and ProcessPrng; the API's functions are the DLL's only
+  # exports, wasm.h's WASM_API_EXTERN made dllexport where src/capi.c
+  # defines them
   LIBWARMC_LD := -shared -Wl,--out-implib,$(BUILD)/libwarmc.dll.a
+  LIBWARMC_LIBS := -lsynchronization -lbcryptprimitives
   JIT_SYM_US  :=
+  LIBOBJ      := $(BUILD)/obj
 else
+  JIT_RT_SRC  += rt/linuxposix.c
   JIT_RTFLAGS := $(XFLAGS) -DWARMC_JIT=1 -fPIC
   JIT_ASFLAGS := --target=aarch64-linux-gnu -DWARMC_JIT=1 -fPIC
   JIT_START   := rt/start.S
   LIBWARMC    := $(BUILD)/libwarmc.so
-  LIBWARMC_LD := -shared -Wl,--version-script=src/libwarmc.map -Wl,--gc-sections
+  LIBWARMC_LD := -shared -Wl,--version-script=src/libwarmc.map -Wl,--gc-sections \
+                 -Wl,-z,noexecstack
+  LIBWARMC_LIBS :=
   JIT_SYM_US  :=
+  # a shared object's code is position-independent and reaches its
+  # thread-locals through the dynamic linker, which the program warmc's
+  # objects are built for may not: the library has its own of them
+  LIBOBJ      := $(BUILD)/obj-pic
 endif
+JIT_RT_OBJS   := $(patsubst rt/%.c,$(BUILD)/jit/rt-%.o,$(JIT_RT_SRC)) $(BUILD)/jit/rt-start.o
+LIBWARMC_OBJS := $(patsubst src/%.c,$(LIBOBJ)/%.o,$(filter-out src/main.c,$(WARMC_SRC)) \
+                   $(LIBWARMC_SRC))
+
+$(BUILD)/obj-pic/%.o: src/%.c $(TOOLCHAIN_STAMP)
+	@mkdir -p $(BUILD)/obj-pic
+	$(CC) $(CFLAGS) -fPIC $(DEPFLAGS) -c -o $@ $<
 
 $(BUILD)/jit/rt-%.o: rt/%.c $(RT_HDRS) $(TOOLCHAIN_STAMP)
 	@mkdir -p $(BUILD)/jit
@@ -269,7 +294,7 @@ $(BUILD)/jit/rtsyms.c: $(JIT_RT_OBJS)
 	@mv $@.tmp $@ && rm -f $@.names
 
 $(BUILD)/jit/rtsyms.o: $(BUILD)/jit/rtsyms.c src/jit.h
-	$(CC) $(CFLAGS) -Isrc -c -o $@ $<
+	$(CC) $(CFLAGS) -fPIC -Isrc -c -o $@ $<
 
 # rt/wasi.wat as a string: the types preview1 gives its functions, which
 # warm_wasi_imports binds an import at only
@@ -281,7 +306,7 @@ $(BUILD)/jit/wasiwat.c: rt/wasi.wat
 	   echo ';'; } > $@.tmp && mv $@.tmp $@
 
 $(BUILD)/jit/wasiwat.o: $(BUILD)/jit/wasiwat.c
-	$(CC) $(CFLAGS) -c -o $@ $<
+	$(CC) $(CFLAGS) -fPIC -c -o $@ $<
 
 # What a serialised module must have been compiled by: this build's sources
 # and toolchain, which wasm_module_deserialize checks for.
@@ -293,20 +318,21 @@ $(BUILD)/jit/buildtag.h: $(JIT_TAG_INPUTS)
 	  echo "#define WARMC_JIT_BUILD_TAG 0x$${t}ull" > $@.tmp
 	@cmp -s $@.tmp $@ && rm -f $@.tmp || mv $@.tmp $@
 
-$(BUILD)/obj/jit.o: CFLAGS += -include $(BUILD)/jit/buildtag.h
-$(BUILD)/obj/jit.o: $(BUILD)/jit/buildtag.h
-$(BUILD)/obj/capi.o: CFLAGS += -Iinclude -Irt
+$(LIBOBJ)/jit.o: CFLAGS += -include $(BUILD)/jit/buildtag.h
+$(LIBOBJ)/jit.o: $(BUILD)/jit/buildtag.h
+$(LIBOBJ)/capi.o: CFLAGS += -Iinclude -Irt
 
-$(LIBWARMC): $(filter-out $(BUILD)/obj/main.o,$(WARMC_OBJS)) $(LIBWARMC_OBJS) \
-             $(BUILD)/jit/rtsyms.o $(BUILD)/jit/wasiwat.o $(JIT_RT_OBJS) \
+$(LIBWARMC): $(LIBWARMC_OBJS) $(BUILD)/jit/rtsyms.o $(BUILD)/jit/wasiwat.o $(JIT_RT_OBJS) \
              src/libwarmc.exports src/libwarmc.map
 	$(CC) $(CFLAGS) $(LIBWARMC_LD) -o $@ $(filter %.o,$^) \
-	  $(filter-out -static,$(HOST_LDLIBS)) $(EXTRA_LDFLAGS)
+	  $(filter-out -Wl$(comma)--stack$(comma)%,$(if $(filter linux,$(HOST_OS)),$(filter-out -static,$(HOST_LDLIBS)),$(HOST_LDLIBS))) \
+	  $(LIBWARMC_LIBS) $(EXTRA_LDFLAGS)
 
 libwarmc: $(LIBWARMC)
 
 # warmrun: a module run through the library, as `warmc --wasi` or the CLI
-# harness would run it, written against the C API alone
+# harness would run it, written against the C API alone.  On Windows it
+# links the DLL's import library, and finds the DLL beside itself.
 ifeq ($(HOST_OS),macos)
   LIBWARMC_RPATH := -Wl,-rpath,@loader_path
 else ifeq ($(HOST_OS),windows)
@@ -314,10 +340,17 @@ else ifeq ($(HOST_OS),windows)
 else
   LIBWARMC_RPATH := -Wl,-rpath,'$$ORIGIN'
 endif
+# the import library by name on Windows, where -static has -l look for
+# static archives alone
+ifeq ($(HOST_OS),windows)
+  LIBWARMC_LINK := $(BUILD)/libwarmc.dll.a
+else
+  LIBWARMC_LINK := -L$(BUILD) -lwarmc $(LIBWARMC_RPATH)
+endif
 
 $(BUILD)/warmrun$(EXE): src/warmrun.c include/wasm.h include/warm.h $(LIBWARMC)
-	$(CC) $(CFLAGS) -Iinclude -o $@ src/warmrun.c -L$(BUILD) -lwarmc $(LIBWARMC_RPATH) \
-	  $(EXTRA_LDFLAGS)
+	$(CC) $(CFLAGS) -Iinclude -o $@ src/warmrun.c $(LIBWARMC_LINK) \
+	  $(filter-out -Wl$(comma)--stack$(comma)%,$(HOST_LDLIBS)) $(EXTRA_LDFLAGS)
 
 jit: $(LIBWARMC) $(BUILD)/warmrun$(EXE)
 
@@ -657,13 +690,13 @@ check-win-fixture:
 	@$(CC) -o $(BUILD)/win_fixture$(EXE) test/win_fixture.c
 	@echo "win-fixture: OK (the Win32 offsets the runtime hard-codes match windows.h)"
 
-check: all $(SAN_TARGETS) $(WIN_CHECKS) check-encoder $(CHECK_TOOLS)
+check: all jit $(SAN_TARGETS) $(WIN_CHECKS) check-encoder $(CHECK_TOOLS)
 	@./test/run_all.sh
 
 # A few rows of `make check` that reach most of warmc in a minute of a small
 # machine (SMOKE_ROWS in test/run_all.sh), without the sanitizer builds or
 # the language corpora: what CI runs on every push.
-smoke: all $(WIN_CHECKS) check-encoder wasm-tools
+smoke: all jit $(WIN_CHECKS) check-encoder wasm-tools
 	@CHECK_SMOKE=1 ./test/run_all.sh
 
 # The pinned tools `make check` fetches, alone: CI fetches them before the
@@ -754,4 +787,4 @@ clean:
 .PHONY: all jit libwarmc asan tsan check smoke check-tools check-linux check-encoder check-spec conformance testsuite wasm-tools \
         kotlin-stdlib teavm temurin glfw lwjgl wasi-sdk fuzz check-combos clean bench-compare bench-record bench-record-o3 bench-record-warmc bench-ab bench-llvm simde check-mutants gc-jitter gc-jitter-full
 
--include $(WARMC_DEPS)
+-include $(WARMC_DEPS) $(wildcard $(BUILD)/obj-pic/*.d)

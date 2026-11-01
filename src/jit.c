@@ -8,11 +8,12 @@
    sections or a symbol of the runtime.
 
    Loading maps the text within branch range of the runtime: its calls of
-   warmc_trap, warmc_gc_load_stub and the rest are the BL a linked program
-   has, which a veneer could not stand in for, as several of them are
-   entered with every register live (warmc_gc_load_stub keeps x16 and x17).
-   The data goes within ADRP's reach of the text.  The code is then
-   byte for byte what the object `-c` writes holds, at its new address. */
+   warmc_trap, warmc_gc_load_stub and the rest are the BL (on x86-64, the
+   call rel32) a linked program has, which a veneer could not stand in for,
+   as several of them are entered with every register live
+   (warmc_gc_load_stub keeps x16 and x17).  The data goes within ADRP's
+   (RIP-relative addressing's) reach of the text.  The code is then byte for
+   byte what the object `-c` writes holds, at its new address. */
 
 #include "warmc.h"
 #include "ir.h"
@@ -29,7 +30,44 @@
 #include <string.h>
 
 #ifdef _WIN32
-#include <windows.h>
+#include <malloc.h>
+/* The Win32 memory calls, declared here: windows.h names types after
+   warmc.h's macros (VT_I8 among them).  The structures are x64's. */
+typedef struct {
+  void *BaseAddress, *AllocationBase;
+  unsigned long AllocationProtect;
+  unsigned short PartitionId;
+  size_t RegionSize;
+  unsigned long State, Protect, Type;
+} MEMORY_BASIC_INFORMATION;
+typedef struct {
+  unsigned long oem, dwPageSize;
+  void *lpMinimumApplicationAddress, *lpMaximumApplicationAddress;
+  uintptr_t dwActiveProcessorMask;
+  unsigned long dwNumberOfProcessors, dwProcessorType, dwAllocationGranularity;
+  unsigned short wProcessorLevel, wProcessorRevision;
+} SYSTEM_INFO;
+_Static_assert(sizeof(MEMORY_BASIC_INFORMATION) == 48, "x64's MEMORY_BASIC_INFORMATION");
+_Static_assert(sizeof(SYSTEM_INFO) == 48, "x64's SYSTEM_INFO");
+#define MEM_COMMIT 0x1000u
+#define MEM_RESERVE 0x2000u
+#define MEM_DECOMMIT 0x4000u
+#define MEM_RELEASE 0x8000u
+#define MEM_FREE 0x10000u
+#define PAGE_NOACCESS 0x01u
+#define PAGE_READONLY 0x02u
+#define PAGE_READWRITE 0x04u
+#define PAGE_EXECUTE_READ 0x20u
+__declspec(dllimport) void *__stdcall VirtualAlloc(void *p, size_t n, unsigned long type,
+                                                   unsigned long prot);
+__declspec(dllimport) int __stdcall VirtualFree(void *p, size_t n, unsigned long type);
+__declspec(dllimport) int __stdcall VirtualProtect(void *p, size_t n, unsigned long prot,
+                                                   unsigned long *was);
+__declspec(dllimport) size_t __stdcall VirtualQuery(const void *p, MEMORY_BASIC_INFORMATION *m,
+                                                    size_t n);
+__declspec(dllimport) int __stdcall FlushInstructionCache(void *proc, const void *p, size_t n);
+__declspec(dllimport) void *__stdcall GetCurrentProcess(void);
+__declspec(dllimport) void __stdcall GetSystemInfo(SYSTEM_INFO *si);
 #else
 #include <sys/mman.h>
 #include <unistd.h>
@@ -64,8 +102,6 @@ void jit_free(void *p) { free(p); }
 #ifdef __APPLE__
 #include <malloc/malloc.h>
 #elif defined(__GLIBC__)
-#include <malloc.h>
-#elif defined(_WIN32)
 #include <malloc.h>
 #endif
 
@@ -630,11 +666,8 @@ static size_t round_up(size_t v, size_t a) { return (v + a - 1) & ~(a - 1); }
 /* Address space at hint or the nearest the system gives above it: text
    executable (on macOS, MAP_JIT, writable by a thread that asks), data
    inaccessible until committed. */
+#ifndef _WIN32
 static void *reserve_at(uintptr_t hint, size_t len, bool text) {
-#ifdef _WIN32
-  (void)text;
-  return VirtualAlloc((void *)hint, len, MEM_RESERVE, PAGE_NOACCESS);
-#else
   int prot = PROT_NONE;
   int flags = MAP_PRIVATE | MAP_ANON;
 #ifdef __APPLE__
@@ -642,8 +675,8 @@ static void *reserve_at(uintptr_t hint, size_t len, bool text) {
 #endif
   void *p = mmap((void *)hint, len, prot, flags, -1, 0);
   return p == MAP_FAILED ? NULL : p;
-#endif
 }
+#endif
 
 static void release(void *p, size_t len) {
 #ifdef _WIN32
@@ -692,6 +725,42 @@ static void decommit(const Arena *a, void *p, size_t len) {
 /* len bytes of address space starting at or above lo and ending at or
    below hi, as near the runtime as the system gives: tried above it, then
    below; NULL when none lands there. */
+#ifdef _WIN32
+/* VirtualAlloc takes the address it is given or fails, so the room is
+   found first: the free regions VirtualQuery lists, up from above, then
+   down from below the runtime. */
+static void *reserve_within(uintptr_t lo, uintptr_t hi, size_t len, bool text,
+                            uintptr_t above) {
+  (void)text;
+  size_t gran = page_size();
+  if (hi < lo || hi - lo < len) return NULL;
+  MEMORY_BASIC_INFORMATION mi;
+  for (uintptr_t a = round_up(above < lo ? lo : above, gran); a <= hi - len;) {
+    if (!VirtualQuery((void *)a, &mi, sizeof mi)) break;
+    uintptr_t end = (uintptr_t)mi.BaseAddress + mi.RegionSize;
+    if (mi.State == MEM_FREE && end >= a + len) {
+      void *p = VirtualAlloc((void *)a, len, MEM_RESERVE, PAGE_NOACCESS);
+      if (p) return p;
+    }
+    if (end <= a) break;
+    a = round_up(end, gran);
+  }
+  for (uintptr_t top = g_rt_lo & ~(uintptr_t)(gran - 1); top >= lo + len;) {
+    if (!VirtualQuery((void *)(top - 1), &mi, sizeof mi)) break;
+    uintptr_t base = (uintptr_t)mi.BaseAddress;
+    if (mi.State == MEM_FREE) {
+      uintptr_t a = (top - len) & ~(uintptr_t)(gran - 1);
+      if (a >= base && a >= lo) {
+        void *p = VirtualAlloc((void *)a, len, MEM_RESERVE, PAGE_NOACCESS);
+        if (p) return p;
+      }
+    }
+    if (base >= top) break;
+    top = base & ~(uintptr_t)(gran - 1);
+  }
+  return NULL;
+}
+#else
 static void *reserve_within(uintptr_t lo, uintptr_t hi, size_t len, bool text,
                             uintptr_t above) {
   size_t gran = page_size();
@@ -714,6 +783,7 @@ static void *reserve_within(uintptr_t lo, uintptr_t hi, size_t len, bool text,
   }
   return NULL;
 }
+#endif
 
 /* The runtime's span: where its functions, which text calls, and its data
    are */
@@ -981,7 +1051,7 @@ static JitCode *load(const JitImage *im, const uint8_t *const sec[NSEC], char **
   pthread_jit_write_protect_np(1);
   sys_icache_invalidate(c->text, im->seclen[0]);
 #elif defined(_WIN32)
-  DWORD was;
+  unsigned long was;
   VirtualProtect(c->text, c->text_map, PAGE_EXECUTE_READ, &was);
   FlushInstructionCache(GetCurrentProcess(), c->text, im->seclen[0]);
 #else

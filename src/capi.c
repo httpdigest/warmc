@@ -25,7 +25,12 @@
    and a thread that takes it sets the stack limit wasm runs to from its
    own stack. */
 
+/* the library's exports: wasm.h's functions and warm.h's, and nothing else */
+#if defined(_WIN32)
+#define WASM_API_EXTERN __declspec(dllexport)
+#else
 #define WASM_API_EXTERN __attribute__((visibility("default")))
+#endif
 #include "wasm.h"
 #include "warm.h"
 #include "warm_rt.h"
@@ -1736,6 +1741,39 @@ __attribute__((naked)) void warm_host_thunk(void) {
     "ldp    x29, x30, [sp], #224\n"
     "ret\n");
 }
+#elif defined(__x86_64__) && defined(_WIN32)
+/* RCX the HostFunc, RDX, R8 and R9 the first integer arguments, XMM0-3 the
+   first floats, the rest in slots 32 bytes above the return address, R10
+   where several results go: RDX, R8, R9 and R10 to this frame as gpr[0..2]
+   and gpr[7], where the dispatch looks for them as AArch64's x1-x3 and x8,
+   XMM0-3 to it, the slots' address, and two words for the result, which
+   come back as RAX and XMM0.  Every register the internal convention has a
+   callee keep, Win64 has the dispatch keep too.  On entry RSP is 8 past a
+   multiple of sixteen, as at every call wasm makes. */
+__attribute__((naked)) void warm_host_thunk(void) {
+  __asm__ volatile(
+    "subq   $200, %rsp\n"
+    "movq   %rdx, 48(%rsp)\n"
+    "movq   %r8, 56(%rsp)\n"
+    "movq   %r9, 64(%rsp)\n"
+    "movq   %r10, 104(%rsp)\n"
+    "movups %xmm0, 112(%rsp)\n"
+    "movups %xmm1, 128(%rsp)\n"
+    "movups %xmm2, 144(%rsp)\n"
+    "movups %xmm3, 160(%rsp)\n"
+    "movq   $0, 176(%rsp)\n"
+    "movq   $0, 184(%rsp)\n"
+    "leaq   176(%rsp), %rax\n"
+    "movq   %rax, 32(%rsp)\n"
+    "leaq   48(%rsp), %rdx\n"
+    "leaq   112(%rsp), %r8\n"
+    "leaq   240(%rsp), %r9\n"
+    "callq  warm_host_dispatch\n"
+    "movq   176(%rsp), %rax\n"
+    "movq   184(%rsp), %xmm0\n"
+    "addq   $200, %rsp\n"
+    "retq\n");
+}
 #else
 #error "warm_host_thunk: no thunk for this architecture yet"
 #endif
@@ -2204,6 +2242,8 @@ extern void (*warmc_wasi_exit_hook)(int code);
 #ifdef __APPLE__
 #include <crt_externs.h>
 #define host_environ (*_NSGetEnviron())
+#elif defined(_WIN32)
+#define host_environ _environ
 #else
 extern char **environ;
 #define host_environ environ
