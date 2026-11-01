@@ -37,6 +37,10 @@ endif
 CFLAGS  ?= -std=c11 -O3 $(HOST_TUNE) $(HOST_DEFS) -flto=thin -fvisibility=hidden -fvisibility-inlines-hidden -fno-exceptions -fno-rtti -g -Wall -Wextra -Wno-unused-parameter
 BUILD   ?= build
 
+# What every object is built by and with, which no .d file names (-MMD leaves
+# the system's headers out): see TOOLCHAIN_ID below.
+TOOLCHAIN_STAMP := $(BUILD)/.toolchain
+
 XCC     ?= clang
 
 # Appended to every link of a host program, for flags a build wants without
@@ -102,38 +106,38 @@ all: $(BUILD)/warmc$(EXE) $(BUILD)/warmrt.a $(BUILD)/warmrt-macos.a \
      $(BUILD)/warmwasip2.a $(BUILD)/warmwasip2-macos.a $(BUILD)/a64_test$(EXE) \
      $(BUILD)/datapack_test$(EXE)
 
-$(BUILD)/obj/%.o: src/%.c
+$(BUILD)/obj/%.o: src/%.c $(TOOLCHAIN_STAMP)
 	@mkdir -p $(BUILD)/obj
 	$(CC) $(CFLAGS) $(DEPFLAGS) -c -o $@ $<
 
-$(BUILD)/warmc$(EXE): $(WARMC_OBJS)
+$(BUILD)/warmc$(EXE): $(WARMC_OBJS) $(TOOLCHAIN_STAMP)
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $(WARMC_OBJS) $(HOST_LDLIBS) $(EXTRA_LDFLAGS)
 
 # One pattern per runtime flavor; make picks the pattern with the shortest
 # stem, so the suffixed ones win for suffixed objects.  start*.o (assembly)
 # and wasi-stub*.o (built by warmc itself) keep explicit rules below.
-$(BUILD)/rt/%.o: rt/%.c $(RT_HDRS)
+$(BUILD)/rt/%.o: rt/%.c $(RT_HDRS) $(TOOLCHAIN_STAMP)
 	@mkdir -p $(BUILD)/rt
 	$(XCC) $(XFLAGS) -c -o $@ $<
 
-$(BUILD)/rt/%-macos.o: rt/%.c $(RT_HDRS)
+$(BUILD)/rt/%-macos.o: rt/%.c $(RT_HDRS) $(TOOLCHAIN_STAMP)
 	@mkdir -p $(BUILD)/rt
 	$(XCC) $(MACFLAGS) -c -o $@ $<
 
-$(BUILD)/rt/%-windows.o: rt/%.c $(RT_HDRS)
+$(BUILD)/rt/%-windows.o: rt/%.c $(RT_HDRS) $(TOOLCHAIN_STAMP)
 	@mkdir -p $(BUILD)/rt
 	$(XCC) $(WINFLAGS) -c -o $@ $<
 
-$(BUILD)/rt/start.o: rt/start.S
+$(BUILD)/rt/start.o: rt/start.S $(TOOLCHAIN_STAMP)
 	@mkdir -p $(BUILD)/rt
 	$(XCC) --target=aarch64-linux-gnu -c -o $@ rt/start.S
 
-$(BUILD)/rt/start-macos.o: rt/start.S
+$(BUILD)/rt/start-macos.o: rt/start.S $(TOOLCHAIN_STAMP)
 	@mkdir -p $(BUILD)/rt
 	$(XCC) --target=arm64-apple-macos11 -DWARMC_DARWIN=1 -c -o $@ rt/start.S
 
-$(BUILD)/rt/start-windows.o: rt/start_x64.S
+$(BUILD)/rt/start-windows.o: rt/start_x64.S $(TOOLCHAIN_STAMP)
 	@mkdir -p $(BUILD)/rt
 	$(XCC) --target=x86_64-pc-windows-gnu -DWARMC_WINDOWS=1 -c -o $@ rt/start_x64.S
 
@@ -217,21 +221,34 @@ ASAN_FLAGS ?= -fsanitize=address,undefined -fno-omit-frame-pointer \
               -fno-sanitize-recover=all
 TSAN_FLAGS ?= -fsanitize=thread -fno-omit-frame-pointer
 
-$(BUILD)/obj-asan/%.o: src/%.c
+# The compilers, their flags, the link's and macOS's SDK, which build every
+# object and program here and which no .d file names.  The stamp is written
+# only when they change, and every object and program depends on it, so a new
+# compiler or SDK, or a flag changed, rebuilds them all rather than linking
+# old objects with new: after an SDK update ThinLTO warned of objects from two
+# SDKs in one warmc.
+TOOLCHAIN_ID := $(shell { $(CC) --version; $(XCC) --version; $(ASAN_CC) --version; \
+                          xcrun --show-sdk-version; } 2>/dev/null | cksum | cut -d' ' -f1)-$(shell \
+                printf '%s' '$(CFLAGS)|$(XFLAGS)|$(MACFLAGS)|$(WINFLAGS)|$(ASAN_FLAGS)|$(TSAN_FLAGS)|$(HOST_LDLIBS)|$(EXTRA_LDFLAGS)' | \
+                cksum | cut -d' ' -f1)
+$(shell mkdir -p $(BUILD) && { [ "$$(cat $(TOOLCHAIN_STAMP) 2>/dev/null)" = "$(TOOLCHAIN_ID)" ] || \
+        echo "$(TOOLCHAIN_ID)" > $(TOOLCHAIN_STAMP); })
+
+$(BUILD)/obj-asan/%.o: src/%.c $(TOOLCHAIN_STAMP)
 	@mkdir -p $(BUILD)/obj-asan
 	$(ASAN_CC) $(CFLAGS) $(ASAN_FLAGS) $(DEPFLAGS) -c -o $@ $<
 
-$(BUILD)/warmc-asan$(EXE): $(ASAN_OBJS)
+$(BUILD)/warmc-asan$(EXE): $(ASAN_OBJS) $(TOOLCHAIN_STAMP)
 	@mkdir -p $(BUILD)
 	$(ASAN_CC) $(CFLAGS) $(ASAN_FLAGS) -o $@ $(ASAN_OBJS) $(HOST_LDLIBS) $(EXTRA_LDFLAGS)
 
 asan: $(BUILD)/warmc-asan$(EXE)
 
-$(BUILD)/obj-tsan/%.o: src/%.c
+$(BUILD)/obj-tsan/%.o: src/%.c $(TOOLCHAIN_STAMP)
 	@mkdir -p $(BUILD)/obj-tsan
 	$(ASAN_CC) $(CFLAGS) $(TSAN_FLAGS) $(DEPFLAGS) -c -o $@ $<
 
-$(BUILD)/warmc-tsan$(EXE): $(TSAN_OBJS)
+$(BUILD)/warmc-tsan$(EXE): $(TSAN_OBJS) $(TOOLCHAIN_STAMP)
 	@mkdir -p $(BUILD)
 	$(ASAN_CC) $(CFLAGS) $(TSAN_FLAGS) -o $@ $(TSAN_OBJS) $(HOST_LDLIBS) $(EXTRA_LDFLAGS)
 
