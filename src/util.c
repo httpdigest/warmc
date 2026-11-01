@@ -15,7 +15,17 @@
 #include <malloc/malloc.h>
 #endif
 #ifdef _WIN32
-#include <windows.h>
+/* The private heap a compile's blocks come from on Windows (xheap_begin),
+   its calls declared here: windows.h names types after warmc.h's macros
+   (VT_I8 among them). */
+#define HEAP_ZERO_MEMORY 0x00000008u
+__declspec(dllimport) void *__stdcall HeapCreate(unsigned long options, size_t initial,
+                                                 size_t max);
+__declspec(dllimport) int __stdcall HeapDestroy(void *heap);
+__declspec(dllimport) void *__stdcall HeapAlloc(void *heap, unsigned long flags, size_t n);
+__declspec(dllimport) void *__stdcall HeapReAlloc(void *heap, unsigned long flags, void *p,
+                                                  size_t n);
+__declspec(dllimport) int __stdcall HeapFree(void *heap, unsigned long flags, void *p);
 #endif
 
 static _Thread_local DiagCatch *g_catch;
@@ -203,7 +213,7 @@ typedef struct { size_t size; size_t bucket; } XHdr;
    heap: the compiler frees what it allocates, its caches included
    (compile_release).  Outside one, blocks are malloc's as they always were. */
 #if defined(_WIN32)
-static HANDLE g_xheap;
+static void *g_xheap;
 #define SYS_MALLOC(n) (g_xheap ? HeapAlloc(g_xheap, 0, (n)) : malloc(n))
 #define SYS_CALLOC(n) (g_xheap ? HeapAlloc(g_xheap, HEAP_ZERO_MEMORY, (n)) : calloc(1, (n)))
 #define SYS_REALLOC(p, n) (g_xheap ? HeapReAlloc(g_xheap, 0, (p), (n)) : realloc((p), (n)))
