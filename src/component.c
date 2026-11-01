@@ -353,7 +353,12 @@ static void rd_type(Rd *r, Component *c, CmType *t) {
     case 0x42: t->kind = CMT_INSTANCE; rd_decls(r, c, &t->decls, false); break;
     case 0x3f:
       t->kind = CMT_RESOURCE;
-      t->rep = rd_cm_valtype(r, c);
+      {
+        uint8_t rep = rd_u8(r);
+        if (rep == 0x7e) t->rep64 = true;
+        else if (rep != 0x7f)
+          warmc_malformed("a resource's representation is not i32 or i64");
+      }
       {
         uint8_t b = rd_u8(r);
         if (b == 0x01) { t->has_dtor = true; t->dtor = rd_u32(r); }

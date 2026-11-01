@@ -4966,10 +4966,34 @@ static u64 res_drop_abi(WarmInstance *vm, u64 rt, u64 h) {
   return (rep & 0xffffffffull) | ((u64)owned << 32);
 }
 
+/* The same for a resource whose representation is an i64, all of which they
+   keep: resource.drop's wrapper asks whether the handle is owned before it
+   drops it, since the flag no longer fits beside the representation. */
+static u64 res_new64_abi(WarmInstance *vm, u64 rt, u64 rep) {
+  return warmc_res_new((u32)rt, rep);
+}
+
+static u64 res_rep64_abi(WarmInstance *vm, u64 rt, u64 h) {
+  return warmc_res_rep((u32)rt, (u32)h);
+}
+
+static u64 res_owned_abi(WarmInstance *vm, u64 rt, u64 h) {
+  return res_get((u32)rt, (u32)h)->own;
+}
+
+static u64 res_drop64_abi(WarmInstance *vm, u64 rt, u64 h) {
+  u32 owned = 0;
+  return warmc_res_drop((u32)rt, (u32)h, &owned);
+}
+
 static void *builtin_host(const char *name) {
   if (streq(name, "warmc:resource#new")) return (void *)res_new_abi;
   if (streq(name, "warmc:resource#rep")) return (void *)res_rep_abi;
   if (streq(name, "warmc:resource#drop")) return (void *)res_drop_abi;
+  if (streq(name, "warmc:resource#new64")) return (void *)res_new64_abi;
+  if (streq(name, "warmc:resource#rep64")) return (void *)res_rep64_abi;
+  if (streq(name, "warmc:resource#owned")) return (void *)res_owned_abi;
+  if (streq(name, "warmc:resource#drop64")) return (void *)res_drop64_abi;
   return 0;
 }
 

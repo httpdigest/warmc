@@ -284,6 +284,17 @@ case("one_module", 0, "", comp(sec(1, EMPTY_MODULE)))
 case("alias_outer_self", 0, "",
      bytes.fromhex("0061736d0d00010007080142010203020000"))
 case("one_functype", 0, "", comp(sec(7, vec([FUNCTYPE_EMPTY]))))
+
+# A resource's representation is a core value type, i32 or, with the 64-bit
+# feature (cm64), i64.  It used to be read as a component value type, which
+# took i32's byte for bool and i64's for s8 and let any other primitive
+# through, f32's (0x7d, u8 there) among them.
+case("resource_rep_i32", 0, "", comp(sec(7, vec([b"\x3f\x7f\x00"]))))
+case("resource_rep_i64", 0, "", comp(sec(7, vec([b"\x3f\x7e\x00"]))))
+case("resource_rep_f32", 2, "representation is not i32 or i64",
+     comp(sec(7, vec([b"\x3f\x7d\x00"]))))
+case("resource_rep_index", 2, "representation is not i32 or i64",
+     comp(sec(7, vec([FUNCTYPE_EMPTY, b"\x3f\x00\x00"]))))
 case("custom_section_ignored", 0, "",
      comp(sec(0, name("greeting") + b"hello"), sec(7, vec([FUNCTYPE_EMPTY]))))
 

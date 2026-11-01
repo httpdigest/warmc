@@ -1065,7 +1065,8 @@ practice that means one of two cases:
 Inside such a component, warmc handles:
 - several core modules and instances, and nested components
 - outer aliases and exported instances (named `iface#fn`)
-- resources (`new`, `drop` and `rep`, with destructors)
+- resources (`new`, `drop` and `rep`, with destructors), represented by an
+  `i32` or, with the 64-bit feature (cm64), an `i64`
 - lift-to-lower calls between component instances. warmc generates *fused
   adapter* modules that copy UTF-8 strings, lists, records, tuples, variants,
   enums, flags, options and results between memories.

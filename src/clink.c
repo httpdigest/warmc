@@ -267,7 +267,37 @@ static LinkDef bind_resource(Builder *b, const LinkDef *d) {
   if (lc->adapter_inst == UINT32_MAX) {
     Text w = { 0 };
     textf(&w, "(module\n");
-    if (lc->res_op == 0) {
+    /* An i64 representation goes through helpers of its own, which keep all
+       of it: the i32 ones take and give 32 bits, and resource.drop's packs
+       the owned flag above them. */
+    const char *rep = lc->res_rep64 ? "i64" : "i32";
+    if (lc->res_rep64 && lc->res_op == 0) {
+      textf(&w, "  (import \"warmc\" \"h\" (func $h (param i32 i64) (result i32)))\n"
+                "  (func (export \"%s\") (param $rep i64) (result i32)\n"
+                "    (call $h (i32.const %u) (local.get $rep)))\n",
+            CANON_ADAPTER_EXPORT, lc->res_rt);
+    } else if (lc->res_rep64 && lc->res_op == 2) {
+      textf(&w, "  (import \"warmc\" \"h\" (func $h (param i32 i32) (result i64)))\n"
+                "  (func (export \"%s\") (param $i i32) (result i64)\n"
+                "    (call $h (i32.const %u) (local.get $i)))\n",
+            CANON_ADAPTER_EXPORT, lc->res_rt);
+    } else if (lc->res_rep64) {
+      /* Whether it is owned first, which also traps on a handle that is not
+         this resource's, then the removal, which traps on one out on loan. */
+      textf(&w, "  (import \"warmc\" \"o\" (func $o (param i32 i32) (result i32)))\n"
+                "  (import \"warmc\" \"h\" (func $h (param i32 i32) (result i64)))\n");
+      if (lc->has_dtor)
+        textf(&w, "  (import \"dtor\" \"f\" (func $d (param %s)))\n", rep);
+      textf(&w, "  (func (export \"%s\") (param $i i32) (local $own i32) (local $v i64)\n"
+                "    (local.set $own (call $o (i32.const %u) (local.get $i)))\n"
+                "    (local.set $v (call $h (i32.const %u) (local.get $i)))\n",
+            CANON_ADAPTER_EXPORT, lc->res_rt, lc->res_rt);
+      if (lc->has_dtor)
+        textf(&w, "    (if (local.get $own) (then (call $d (local.get $v))))\n");
+      else
+        textf(&w, "    (drop (local.get $own))\n    (drop (local.get $v))\n");
+      textf(&w, "  )\n");
+    } else if (lc->res_op == 0) {
       textf(&w, "  (import \"warmc\" \"h\" (func $h (param i32 i32) (result i32)))\n"
                 "  (func (export \"%s\") (param $rep i32) (result i32)\n"
                 "    (call $h (i32.const %u) (local.get $rep)))\n",
@@ -301,10 +331,18 @@ static LinkDef bind_resource(Builder *b, const LinkDef *d) {
     in->module = mi;
     in->nbinds = m->nimports;
     in->binds = xcalloc(in->nbinds ? in->nbinds : 1, sizeof *in->binds);
-    in->binds[0] = host_helper(lc->res_op == 0 ? "warmc:resource#new"
-                             : lc->res_op == 2 ? "warmc:resource#rep"
-                                               : "warmc:resource#drop");
-    if (in->nbinds > 1) in->binds[1] = lc->dtor;
+    uint32_t k = 0;
+    if (lc->res_rep64 && lc->res_op == 1)
+      in->binds[k++] = host_helper("warmc:resource#owned");
+    if (lc->res_rep64)
+      in->binds[k++] = host_helper(lc->res_op == 0 ? "warmc:resource#new64"
+                                 : lc->res_op == 2 ? "warmc:resource#rep64"
+                                                   : "warmc:resource#drop64");
+    else
+      in->binds[k++] = host_helper(lc->res_op == 0 ? "warmc:resource#new"
+                                 : lc->res_op == 2 ? "warmc:resource#rep"
+                                                   : "warmc:resource#drop");
+    if (in->nbinds > k) in->binds[k] = lc->dtor;
     lc->adapter_inst = p->ninsts++;
   }
 
@@ -544,6 +582,7 @@ static void do_canon(Builder *b, Env *e, uint32_t ci) {
       lc->res_op = cn->kind == CMC_RESOURCE_NEW  ? 0
                  : cn->kind == CMC_RESOURCE_REP  ? 2 : 1;
       lc->res_rt = res_rt_id(b, e->c, cn->type);
+      lc->res_rep64 = rt->rep64;
       if (lc->res_op == 1 && rt->has_dtor) {
         CmSortIdx si;
         memset(&si, 0, sizeof si);
@@ -557,9 +596,15 @@ static void do_canon(Builder *b, Env *e, uint32_t ci) {
         else
           lc->has_dtor = true;
       }
+      /* resource.new takes the representation and gives a handle,
+         resource.rep the other way round, and resource.drop takes a handle. */
+      CanonFlat repf = rt->rep64 ? CF_I64 : CF_I32;
       lc->sig.nparams = 1;
-      lc->sig.params[0] = CF_I32;
-      if (lc->res_op != 1) { lc->sig.nresults = 1; lc->sig.results[0] = CF_I32; }
+      lc->sig.params[0] = lc->res_op == 0 ? repf : CF_I32;
+      if (lc->res_op != 1) {
+        lc->sig.nresults = 1;
+        lc->sig.results[0] = lc->res_op == 2 ? repf : CF_I32;
+      }
 
       LinkDef d;
       memset(&d, 0, sizeof d);
@@ -1192,9 +1237,9 @@ void clink_dump(const LinkPlan *p, FILE *out) {
     const LinkCanon *lc = &p->canons[i];
     if (lc->builtin) { fprintf(out, "canon %u: %s\n", i, lc->builtin_name); continue; }
     if (lc->resource) {
-      fprintf(out, "canon %u: resource.%s table %u", i,
+      fprintf(out, "canon %u: resource.%s table %u%s", i,
               lc->res_op == 0 ? "new" : lc->res_op == 2 ? "rep" : "drop",
-              lc->res_rt);
+              lc->res_rt, lc->res_rep64 ? ", rep i64" : "");
       if (lc->res_op == 1) {
         fprintf(out, ", dtor ");
         if (lc->has_dtor) put_def(p, &lc->dtor, out);

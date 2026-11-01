@@ -144,7 +144,9 @@ typedef struct {
   CmDefVal defval;
   CmFuncType func;
   CmDeclList decls;
-  CmValType rep;
+  /* A resource's representation, a core value type: i32, or i64 with the
+     component model's 64-bit (cm64) feature. */
+  bool rep64;
   bool has_dtor; uint32_t dtor;
 } CmType;
 

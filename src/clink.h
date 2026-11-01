@@ -61,6 +61,7 @@ typedef struct {
   bool resource;
   uint32_t res_rt;
   uint8_t res_op;
+  bool res_rep64;    /* the resource's representation is an i64 */
   bool has_dtor;
   LinkDef dtor;
 

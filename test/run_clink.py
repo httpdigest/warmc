@@ -84,6 +84,7 @@ CASES = {
 
     "prims": [("id", ["7"])],
     "restable": [("run", []), ("stress", [])],
+    "restable64": [("run", [])],
     "nested": [("f", ["41"])],
 
     "composed": [("len", ["5"]), ("len", ["1"]), ("len", ["0"])],
@@ -98,6 +99,14 @@ CASES = {
         ("test:link/ops#step-b", ["9"]),
         ("split-flat", []),
     ],
+}
+
+# Calls wasmtime cannot make, with the answer their fixture is built to give:
+# wasmtime 50.0.1 panics compiling a resource whose representation is an i64
+# (cm64), on an assertion in its Cranelift trampolines that a representation
+# is an i32.
+FIXED = {
+    ("restable64", "run"): "111111",
 }
 
 def golden(stem, wasm):
@@ -153,18 +162,23 @@ def compiles(stem, wasm):
             fail("%s: %s failed (rc=%d): %s" % (stem, name, rc, err.strip()))
             continue
         got = got.strip()
-        if not have_wasmtime:
+        if (stem, name) in FIXED:
+            want = FIXED[(stem, name)]
+        elif not have_wasmtime:
             ok()
             continue
-        want, why = wasmtime_invoke(wasm, name, args)
+        else:
+            want, why = wasmtime_invoke(wasm, name, args)
         if want is None:
             fail("%s: wasmtime could not invoke %s: %s" % (stem, name, why))
             continue
 
         mine = got.split(":")[-1]
         if mine != want:
-            fail("%s: %s(%s) -- warmc %s, wasmtime %s"
-                 % (stem, name, ", ".join(args), mine, want))
+            fail("%s: %s(%s) -- warmc %s, %s %s"
+                 % (stem, name, ", ".join(args), mine,
+                    "the fixture's answer" if (stem, name) in FIXED else "wasmtime",
+                    want))
         else:
             ok()
 
@@ -244,8 +258,8 @@ def main():
             refuses(stem, wasm, dump)
 
     print("clink: %d passed, %d failed (%d component(s) linked and run against "
-          "wasmtime, %d refused with a reason)"
-          % (npass, nfail, ran, len(stems) - ran))
+          "wasmtime, %d call(s) against their fixture's answer, %d refused with "
+          "a reason)" % (npass, nfail, ran, len(FIXED), len(stems) - ran))
     return 1 if nfail else 0
 
 if __name__ == "__main__":
