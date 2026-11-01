@@ -608,31 +608,46 @@ jobs:
       # CLANG64 is one of the MSYS2 shells the Makefile and test/hostenv.sh
       # know, and its LLVM is the one the job builds with.  The Windows PATH
       # is inherited, so the toolchains the setup actions install are found
-      # from inside it.  setup-msys2 caches the packages it downloads, and
-      # installs on D:, which is faster than the image's own MSYS2 on C:.
-      # The installation is upgraded first, so that the packages are the
-      # newest MSYS2 has rather than its installer's; of LLVM only the tools
-      # (llvm-ar, llvm-mc, llvm-objcopy) are wanted, not the 440 MB of
-      # headers and libraries the llvm package is.  diffutils is for cmp,
-      # which a Git for Windows on the PATH would otherwise lend.  The
-      # Python is MSYS2's own, not CLANG64's native one: the test scripts run
-      # /bin/bash, call ld.lld by that name and write files for bash to read,
-      # and a native Python finds neither, nor writes them with bare newlines.
+      # from inside it.  setup-msys2 installs on D:, which is faster than the
+      # image's own MSYS2 on C:, from the installer its release pins, and is
+      # not let upgrade it: the upgrade and the job's packages are the files
+      # .github/msys2-packages.txt pins, each by its SHA-256, which
+      # install-msys2.sh installs in setup-msys2's two passes.  See
+      # .github/scripts/pin-msys2.sh for what they are and how to pin anew.
       - name: Set up MSYS2
         uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2.33.0
         with:
           msystem: CLANG64
-          update: true
+          update: false
           path-type: inherit
-          install: >-
-            make
-            diffutils
-            unzip
-            perl
-            mingw-w64-clang-x86_64-clang
-            mingw-w64-clang-x86_64-lld
-            mingw-w64-clang-x86_64-llvm-tools
-            python
+
+      - name: Restore the MSYS2 packages
+        id: msys2-pkgs
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: build/ci/msys2-pkgs
+          key: msys2-pkgs-${{ hashFiles('.github/msys2-packages.txt') }}
+
+      - name: Install the MSYS2 packages
+        run: .github/scripts/install-msys2.sh 1
+
+      # The first pass may have replaced the MSYS2 runtime under processes
+      # still running on the old one, as setup-msys2's own upgrade does.
+      - name: End the MSYS2 processes
+        shell: pwsh
+        run: |
+          taskkill /F /FI "MODULES eq msys-2.0.dll"
+          exit 0
+
+      - name: Install the MSYS2 packages, the second pass
+        run: .github/scripts/install-msys2.sh 2
+
+      - name: Save the MSYS2 packages
+        if: steps.msys2-pkgs.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: build/ci/msys2-pkgs
+          key: ${{ steps.msys2-pkgs.outputs.cache-primary-key }}
 
       - *pins
 
