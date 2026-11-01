@@ -3,9 +3,8 @@
 set -u
 BUILD=${BUILD:-build}
 WORK="$BUILD/gowasilinux"
-# tagged with the Debian release it is built on, so that a new one builds anew
-# rather than finding the old image under the name
-IMAGE=localhost/warmc-gowasi-linux:trixie
+. "$(dirname "$0")/linux_image.sh"
+IMAGE=localhost/warmc-gowasi-linux:$LINUX_TAG
 
 skip() { echo "gowasi-linux: SKIPPED ($1)"; exit 0; }
 
@@ -20,11 +19,7 @@ arch=$("$PODMAN" info --format '{{.Version.OsArch}}' 2>/dev/null) ||
 rm -rf "$WORK"; mkdir -p "$WORK"
 
 if ! "$PODMAN" image exists "$IMAGE" 2>/dev/null; then
-  cat > "$WORK/Dockerfile" <<'EOF'
-FROM docker.io/library/debian:trixie-slim
-RUN apt-get -qq update && apt-get -qq install -y --no-install-recommends \
-      gcc libc6-dev && rm -rf /var/lib/apt/lists/*
-EOF
+  linux_dockerfile gcc libc6-dev > "$WORK/Dockerfile"
   "$PODMAN" build -q -t "$IMAGE" -f "$WORK/Dockerfile" "$WORK" \
     >"$WORK/image.log" 2>&1 || skip "cannot build the $IMAGE image; see $WORK/image.log"
 fi

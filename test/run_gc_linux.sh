@@ -4,7 +4,8 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 BUILD=${BUILD:-build}
 WORK="$BUILD/gclinux"
-IMAGE=${WARMC_LINUX_IMAGE:-docker.io/library/debian:trixie-slim}
+. ./test/linux_image.sh
+IMAGE=${WARMC_LINUX_IMAGE:-$LINUX_BASE}
 
 skip() { echo "gc-linux: SKIPPED ($1)"; exit 0; }
 

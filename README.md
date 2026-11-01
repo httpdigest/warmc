@@ -1758,7 +1758,7 @@ make conformance    # write CONFORMANCE.md: spec results grouped by proposal
 make fuzz           # random modules vs wasm-interp (FUZZ_SEED, FUZZ_COUNT)
 make check-combos   # the cases, traps and GC tests with every triple of passes turned off and on in all combinations, the language corpora with every pair
 make gc-jitter      # GC schedule sweep with randomised collector delays (gc-jitter-full: every mode under every seed)
-make check-linux    # run the GC tests, the WASI host's sockets and stdio flags (test/run_wasi_linux.sh), and on a macOS host with tinygo the TinyGo WASI corpus, as real Linux binaries (podman/docker arm64)
+make check-linux    # run the GC tests, the WASI host's sockets and stdio flags (test/run_wasi_linux.sh), and on a macOS host with tinygo the TinyGo WASI corpus, as real Linux binaries in a pinned Debian (podman/docker arm64; `test/linux_image.sh` pins it)
 make check-tools    # fetch the pinned tools make check uses, alone
 make check-mutants  # every mutant of the transforms under test/mutants killed by the tests (test/mutate.py)
 ```
