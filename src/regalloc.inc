@@ -2362,7 +2362,11 @@ static void regalloc_linear(Isel *s) {
      differ only in how a victim is chosen.  The weight rule is the
      incumbent: another must price below RA_TRIAL_MARGIN of it to be taken,
      since the price rests on the same static frequency guess the weights
-     do.  An AOT compiler can afford the extra passes. */
+     do.  An AOT compiler can afford the extra passes, and a JIT need not pay
+     them where they cannot differ: the rules only rank an integer value's
+     victims (a float's rank by density under every rule), so a first pass
+     that never ranked one is what every other pass, and the last, would
+     make again -- most functions never run out of integer registers. */
   static const uint8_t trial_rule[][2] = {
     { EV_WEIGHT, EV_DENSITY }, { EV_UNIFORM, EV_DENSITY },
     { EV_WDENSITY, EV_DENSITY }, { EV_CONTESTED, EV_DENSITY },
@@ -2377,6 +2381,8 @@ static void regalloc_linear(Isel *s) {
            st_spv0 = g_stats.spills_v128_xcall;
   double best_cost = 1e300, base_cost = 1e300;
   int best_rule = 0;
+  /* whether this pass ranked an integer value's victims by its rule */
+  bool ranked = false;
   for (int trial = 0; trial <= ntrial; trial++) {
     bool final = trial == ntrial;
     int rule_i = final ? best_rule : trial;
@@ -2512,6 +2518,7 @@ static void regalloc_linear(Isel *s) {
           if (occ_conflicts(&heaps[rr], cur, R, gone, &ostack, &cand) != 1) continue;
           const Interval *V = &sorted[cand];
           double w = weight[V->value];
+          if (!no_evict && !cur->cls) ranked = true;
           double r = no_evict ? 0
                    : ev_ratio(rule, cur, cw, V, w, R, cumf, cumc[cur->cls ? 1 : 0]);
           if (r > best_r) {
@@ -2747,6 +2754,8 @@ static void regalloc_linear(Isel *s) {
         best_cost = cost; best_rule = trial;
       }
     }
+    /* no rule ranked anything: this is the last pass's assignment */
+    if (trial == 0 && !ranked) break;
   }
   if (trial_dbg && ntrial)
     fprintf(stderr, "ratrial[%u] chose %d\n", f->func_index, best_rule);
