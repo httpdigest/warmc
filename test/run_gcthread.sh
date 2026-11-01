@@ -77,23 +77,17 @@ if run_test nospin 0 WARMC_GC_THREADTEST="$M" WARMC_GC_THREAD_SPIN=0; then
     bad nospin "WARMC_GC_THREAD_SPIN=0 reached the kernel ${k:-no} times in $M"
 fi
 
-# How long leaving takes with the round driver running, against the same
-# launch without it: a launch on its own is no measure, since MSYS2 took 5s
-# and 8s over one on a Windows runner starting fifty rows at once, and a plain
-# one there is as slow.
-now() { perl -MTime::HiRes=time -e 'print time'; }
-t0=$(now)
-run_test exit_plain 0 WARMC_GC_STATS=1
-plain=$(perl -e "printf \"%.2f\", $(now)-$t0")
-t0=$(now)
+# Leaving with the round driver running.  gcth_stop waits for the driver at
+# most 50 ms and counts an exit it outlasted, and that count is the measure
+# rather than the launch's wall time: on a Windows runner starting fifty rows
+# at once two launches of this module differ by more than 2 s with or without
+# the driver.
 if run_test exit 0 WARMC_GC_ROUNDS=0 WARMC_GC_STATS=1; then
-  el=$(perl -e "printf \"%.2f\", $(now)-$t0")
-
-  if [ "$(perl -e "print(($el - $plain > 2.0) ? 1 : 0)")" = 1 ]; then
-    bad exit "a module that never allocates took ${el}s to leave, ${plain}s without the round driver"
-  fi
-  grep -q "  rounds: " "$WORK/exit.log" ||
+  if ! grep -q "  rounds: " "$WORK/exit.log"; then
     bad exit "the round driver never ran"
+  elif ! grep -q ", 0 exits the collector outlasted" "$WORK/exit.log"; then
+    bad exit "the collector outlasted the exit: $(grep '  rounds: ' "$WORK/exit.log")"
+  fi
 fi
 
 if [ "$fail" -eq 0 ]; then say "5 passed, 0 failed"; else say "failed"; fi

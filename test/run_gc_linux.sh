@@ -74,7 +74,7 @@ fi
 
 if inside rounds 0 WARMC_GC_ROUNDS=0 WARMC_GC_STATS=1; then
   grep -q "  rounds: " "$WORK/rounds.log" || bad rounds "the round driver never ran"
-  grep -q "0 exits the collector outlasted" "$WORK/rounds.log" ||
+  grep -q ", 0 exits the collector outlasted" "$WORK/rounds.log" ||
     bad rounds "the collector had to be left behind: $(grep '  rounds:' "$WORK/rounds.log")"
 fi
 
@@ -99,7 +99,7 @@ else
         bad "$label" "no cycle ran, so nothing was collected concurrently"
       grep -q '  rounds: ' "$WORK/$label.log" ||
         bad "$label" "the collector's thread never started"
-      grep -q '0 exits the collector outlasted' "$WORK/$label.log" ||
+      grep -q ', 0 exits the collector outlasted' "$WORK/$label.log" ||
         bad "$label" "the collector had to be left behind at exit"
       n=$((n + 1))
     fi
@@ -121,7 +121,7 @@ else
     [ "$(grep -c '^trap: allocation failed$' "$WORK/conc-oom.log")" = 2 ] &&
       grep -q '^i32:1$' "$WORK/conc-oom.log" ||
       bad conc-oom "a full heap did not recover after the trap"
-    grep -q '0 exits the collector outlasted' "$WORK/conc-oom.log" ||
+    grep -q ', 0 exits the collector outlasted' "$WORK/conc-oom.log" ||
       bad conc-oom "the collector had to be left behind at exit"
     n=$((n + 1))
   fi
