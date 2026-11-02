@@ -131,9 +131,7 @@ warmc_invoke:
     movq   16(%r8), %r9
     movq    8(%r8), %r8
     leaq   32(%rbx), %r10
-    incq   warmc_gc_invoke_depth(%rip)
     callq  *%r11
-    decq   warmc_gc_invoke_depth(%rip)
     movq   %rax,  (%rbx)
     movups %xmm0, 16(%rbx)
     movups 512(%rsp), %xmm6
@@ -229,9 +227,7 @@ warmc_invoke_s:
     movq   16(%r8), %r9
     movq    8(%r8), %r8
     leaq   32(%rbx), %r10
-    incq   warmc_gc_invoke_depth(%rip)
     callq  *%r11
-    decq   warmc_gc_invoke_depth(%rip)
     movq   %rax,  (%rbx)
     movups %xmm0, 16(%rbx)
     movups 512(%rsp), %xmm6
@@ -280,10 +276,20 @@ warmc_throw_ref:
    through untouched; the workers take up to five, so one caller stack-arg
    slot is forwarded (a second for headroom -- copying an unused slot of
    the caller's out-area is harmless). */
+/* The store's GcCtx (rt/store.h): in the JIT's library the store of the
+   instance in RCX, kept at 48(%rsp) across the call; in a program or
+   shared library its one store's. */
+#define VM_STORE     88
+#define STORE_GC_CTX 88
     .macro GC_TRAMPOLINE name
     .globl \name
 \name:
-    leaq   warmc_gc_ctx(%rip), %rax
+#if defined(WARMC_JIT)
+    movq   VM_STORE(%rcx), %rax
+    addq   $STORE_GC_CTX, %rax
+#else
+    leaq   warmc_store0+STORE_GC_CTX(%rip), %rax
+#endif
     movq   %rsi,  0(%rax)
     movq   %rdi,  8(%rax)
     movq   %rbx, 16(%rax)
@@ -301,9 +307,16 @@ warmc_throw_ref:
     movq   %r10, 32(%rsp)
     movq   104(%rsp), %r10
     movq   %r10, 40(%rsp)
+#if defined(WARMC_JIT)
+    movq   %rax, 48(%rsp)
+#endif
     callq  \name\()_w
+#if defined(WARMC_JIT)
+    movq   48(%rsp), %r10
+#else
+    leaq   warmc_store0+STORE_GC_CTX(%rip), %r10
+#endif
     addq   $56, %rsp
-    leaq   warmc_gc_ctx(%rip), %r10
     movq    0(%r10), %rsi
     movq    8(%r10), %rdi
     movq   16(%r10), %rbx

@@ -85,7 +85,13 @@ static long sc(long n, long a, long b, long c, long d, long e, long f) {
 
 /* ---- errno ---- */
 
+/* each thread's: in a JIT's library, the threads of several stores make
+   calls at once */
+#if defined(WARMC_JIT)
+static _Thread_local int g_errno;
+#else
 static int g_errno;
+#endif
 
 int *warmc_lx_errno(void) { return &g_errno; }
 
@@ -349,6 +355,15 @@ typedef struct { usz size; usz cls; } LxHdr;
 
 static void *g_free_list[LX_NCLASS];
 static u8 *g_arena, *g_arena_end;
+/* the lists and the arena, taken by the threads of several stores at once
+   in a JIT's library */
+static u8 g_alloc_lock;
+
+static void alloc_lock(void) {
+  while (__atomic_test_and_set(&g_alloc_lock, __ATOMIC_ACQUIRE))
+    while (__atomic_load_n(&g_alloc_lock, __ATOMIC_RELAXED)) __asm__ volatile("yield");
+}
+static void alloc_unlock(void) { __atomic_clear(&g_alloc_lock, __ATOMIC_RELEASE); }
 
 static void *lx_map(usz n) {
   long r = sc(NR_mmap, 0, (long)n, 3 /* PROT_READ|WRITE */,
@@ -370,6 +385,7 @@ void *malloc(usz n) {
   }
   usz cls = 0;
   while (((usz)1 << (cls + LX_MIN_SHIFT)) < n) cls++;
+  alloc_lock();
   LxHdr *h = g_free_list[cls];
   if (h) {
     g_free_list[cls] = *(void **)(h + 1);
@@ -377,12 +393,13 @@ void *malloc(usz n) {
     usz need = sizeof(LxHdr) + ((usz)1 << (cls + LX_MIN_SHIFT));
     if (!g_arena || (usz)(g_arena_end - g_arena) < need) {
       g_arena = lx_map(LX_ARENA);
-      if (!g_arena) return 0;
+      if (!g_arena) { alloc_unlock(); return 0; }
       g_arena_end = g_arena + LX_ARENA;
     }
     h = (LxHdr *)g_arena;
     g_arena += need;
   }
+  alloc_unlock();
   h->size = (usz)1 << (cls + LX_MIN_SHIFT);
   h->cls = cls;
   return h + 1;
@@ -392,8 +409,10 @@ void free(void *p) {
   if (!p) return;
   LxHdr *h = (LxHdr *)p - 1;
   if (h->cls == LX_BIG) { sc(NR_munmap, (long)h, (long)h->size, 0, 0, 0, 0); return; }
+  alloc_lock();
   *(void **)p = g_free_list[h->cls];
   g_free_list[h->cls] = h;
+  alloc_unlock();
 }
 
 void *realloc(void *p, usz n) {

@@ -35,7 +35,9 @@ typedef struct {
   u64 gc_lab;
   u64 gc_hdr_base;
 
-  u64 gc_reserved;
+  /* the store the instance is in (rt/store.h), where the stubs compiled
+     code calls find the collector's state */
+  void *store;
   u64 globals[];
 } WarmInstance;
 

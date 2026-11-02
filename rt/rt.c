@@ -1,4 +1,19 @@
 #include "warm_rt.h"
+#include "store.h"
+
+#if defined(WARMC_JIT)
+__attribute__((visibility("hidden"))) _Thread_local Store *warmc_store;
+#else
+__attribute__((visibility("hidden"))) Store warmc_store0;
+#endif
+
+/* Something done once whichever threads ask for it at once: once_begin is
+   1 for the one that is to do it, and the others wait in it until that one
+   has called once_end. */
+static int once_begin(u32 *state);
+static void once_end(u32 *state);
+/* the fault handler, installed (install_fault_handler) */
+static u32 fault_handler_once;
 
 #define PROT_NONE  0
 #define PROT_READ  1
@@ -156,6 +171,16 @@ static inline void warmc_cpu_relax(void) {
 #endif
 }
 
+static int once_begin(u32 *state) {
+  u32 none = 0;
+  if (__atomic_compare_exchange_n(state, &none, 1, 0, __ATOMIC_ACQ_REL,
+                                  __ATOMIC_ACQUIRE))
+    return 1;
+  while (__atomic_load_n(state, __ATOMIC_ACQUIRE) != 2) warmc_cpu_relax();
+  return 0;
+}
+static void once_end(u32 *state) { __atomic_store_n(state, 2, __ATOMIC_RELEASE); }
+
 static void out(const char *s, usz n) { sys_write(1, s, n); }
 
 long warmc_rt_write(int fd, const void *buf, usz n) {
@@ -171,6 +196,71 @@ int warmc_rt_random(void *buf, usz n) { return sys_random(buf, n); }
 static usz slen(const char *s) { const char *p = s; while (*p) p++; return (usz)(p - s); }
 static void puts_(const char *s) { out(s, slen(s)); }
 static void eputs(const char *s) { sys_write(2, s, slen(s)); }
+
+/* ---- address ranges the fault handler looks up ------------------------
+   The lazy mappings and the guarded memories, which the threads of
+   several stores add and give back while another thread's fault handler
+   reads them.  A writer takes the table's lock; a range given back
+   clears its slot, which a later one reuses, so that no slot moves under
+   a reader; and a slot's sequence number is odd while it is being
+   written, so that a reader -- which may not wait for a lock in a fault
+   handler -- reads a slot again when it changed under it. */
+typedef struct { u32 seq; u8 *base; usz len; } RangeSlot;
+typedef struct { u8 lock; u32 n, live, max; RangeSlot *slot; } Ranges;
+
+static void ranges_lock(Ranges *t) {
+  while (__atomic_test_and_set(&t->lock, __ATOMIC_ACQUIRE))
+    while (__atomic_load_n(&t->lock, __ATOMIC_RELAXED)) warmc_cpu_relax();
+}
+static void ranges_unlock(Ranges *t) { __atomic_clear(&t->lock, __ATOMIC_RELEASE); }
+
+static void range_write(RangeSlot *s, u8 *base, usz len) {
+  u32 q = s->seq;
+  __atomic_store_n(&s->seq, q + 1, __ATOMIC_RELAXED);
+  __atomic_thread_fence(__ATOMIC_RELEASE);
+  __atomic_store_n(&s->base, base, __ATOMIC_RELAXED);
+  __atomic_store_n(&s->len, len, __ATOMIC_RELAXED);
+  __atomic_store_n(&s->seq, q + 2, __ATOMIC_RELEASE);
+}
+
+/* 0 when every slot is taken */
+static int range_add(Ranges *t, u8 *base, usz len) {
+  ranges_lock(t);
+  u32 i = 0;
+  while (i < t->n && t->slot[i].base) i++;
+  if (i == t->max) { ranges_unlock(t); return 0; }
+  range_write(&t->slot[i], base, len);
+  t->live++;
+  if (i == t->n) __atomic_store_n(&t->n, i + 1, __ATOMIC_RELEASE);
+  ranges_unlock(t);
+  return 1;
+}
+
+static void range_remove(Ranges *t, const u8 *base) {
+  ranges_lock(t);
+  for (u32 i = 0; i < t->n; i++)
+    if (t->slot[i].base == base) { range_write(&t->slot[i], 0, 0); t->live--; break; }
+  ranges_unlock(t);
+}
+
+/* the range addr lies in, *base and *len; 0 when it lies in none */
+static int range_find(Ranges *t, const u8 *addr, u8 **base, usz *len) {
+  u32 n = __atomic_load_n(&t->n, __ATOMIC_ACQUIRE);
+  for (u32 i = 0; i < n; i++) {
+    RangeSlot *s = &t->slot[i];
+    for (;;) {
+      u32 q = __atomic_load_n(&s->seq, __ATOMIC_ACQUIRE);
+      if (q & 1) { warmc_cpu_relax(); continue; }
+      u8 *b = __atomic_load_n(&s->base, __ATOMIC_RELAXED);
+      usz l = __atomic_load_n(&s->len, __ATOMIC_RELAXED);
+      __atomic_thread_fence(__ATOMIC_ACQUIRE);
+      if (__atomic_load_n(&s->seq, __ATOMIC_RELAXED) != q) continue;
+      if (b && addr >= b && addr < b + l) { *base = b; *len = l; return 1; }
+      break;
+    }
+  }
+  return 0;
+}
 
 /* ---- memory committed where it is first touched ----
 
@@ -189,53 +279,45 @@ static void *sys_mmap_lazy(usz len) {
   return sys_mmap(0, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS);
 }
 #else
+/* each store's heap and side tables take five, and a table's entries one */
+#if defined(WARMC_JIT)
+#define LAZY_MAX   4096
+#else
 #define LAZY_MAX   8
+#endif
 #define LAZY_CHUNK (1ull << 20)
-static struct { u8 *base; usz len; } lazy_maps[LAZY_MAX];
-static u32 nlazy;
+static RangeSlot lazy_slots[LAZY_MAX];
+static Ranges lazy_maps = { 0, 0, 0, LAZY_MAX, lazy_slots };
 static void install_fault_handler(void);
 
 static void *sys_mmap_lazy(usz len) {
-  if (nlazy == LAZY_MAX)
-    return sys_mmap(0, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS);
   u8 *p = (u8 *)sys_mmap(0, len, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS);
   if (!p) return 0;
   install_fault_handler();
-  lazy_maps[nlazy].base = p;
-  lazy_maps[nlazy].len = len;
-  __atomic_store_n(&nlazy, nlazy + 1, __ATOMIC_RELEASE);
-  return p;
+  if (range_add(&lazy_maps, p, len)) return p;
+  /* no slot left: an ordinary mapping */
+  sys_munmap(p, len);
+  return sys_mmap(0, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS);
 }
 
 /* A lazy mapping given back: it leaves the table before it is unmapped,
-   on the one thread that runs wasm, whose faults are the ones it serves. */
-static void lazy_forget(u8 *p) {
-  for (u32 i = 0; i < nlazy; i++) {
-    if (lazy_maps[i].base != p) continue;
-    lazy_maps[i] = lazy_maps[nlazy - 1];
-    __atomic_store_n(&nlazy, nlazy - 1, __ATOMIC_RELEASE);
-    return;
-  }
-}
+   while no thread uses it, so no fault in it is still to come. */
+static void lazy_forget(u8 *p) { range_remove(&lazy_maps, p); }
 
 /* From the fault handler: 1 when addr lies in a lazy mapping, which now
    has memory under it.  Out of commit, the program stops, as one the
    kernel refused a page would. */
 static int lazy_commit(u8 *addr) {
-  u32 n = __atomic_load_n(&nlazy, __ATOMIC_ACQUIRE);
-  for (u32 i = 0; i < n; i++) {
-    u8 *b = lazy_maps[i].base;
-    usz len = lazy_maps[i].len;
-    if (addr < b || addr >= b + len) continue;
-    usz off = (usz)(addr - b) & ~(usz)(LAZY_CHUNK - 1);
-    usz bytes = len - off < LAZY_CHUNK ? len - off : LAZY_CHUNK;
-    if (sys_mprotect(b + off, bytes, PROT_READ | PROT_WRITE) != 0) {
-      eputs("warmc-rt: out of memory: the system will commit no more\n");
-      sys_exit(1);
-    }
-    return 1;
+  u8 *b;
+  usz len;
+  if (!range_find(&lazy_maps, addr, &b, &len)) return 0;
+  usz off = (usz)(addr - b) & ~(usz)(LAZY_CHUNK - 1);
+  usz bytes = len - off < LAZY_CHUNK ? len - off : LAZY_CHUNK;
+  if (sys_mprotect(b + off, bytes, PROT_READ | PROT_WRITE) != 0) {
+    eputs("warmc-rt: out of memory: the system will commit no more\n");
+    sys_exit(1);
   }
-  return 0;
+  return 1;
 }
 #endif
 
@@ -273,13 +355,6 @@ static void put_hex_raw(u64 v, int digits) {
 }
 
 #define MAX_TABLE_ENTRIES (1u << 20)
-/* A JIT's host makes and frees instances as it goes (rt/jit.c): as many as
-   this may live at once, their slots reused. */
-#if defined(WARMC_JIT)
-#define MAX_INSTANCES (1u << 16)
-#else
-#define MAX_INSTANCES 4096
-#endif
 #define ARENA_WORDS (1u << 21)
 
 /* max_pages is what it may grow to here; decl_max what the module said,
@@ -346,11 +421,16 @@ static u64 arena_used;
 
 static void die(const char *msg);
 
+/* the threads of several stores take from it */
+static u64 arena_take(u64 words) {
+  u64 at = __atomic_fetch_add(&arena_used, words, __ATOMIC_RELAXED);
+  if (at + words > ARENA_WORDS) die("out of instance memory");
+  return at;
+}
+
 static void *arena_alloc(u64 bytes) {
   u64 words = (bytes + 15) / 16 * 2;
-  if (arena_used + words > ARENA_WORDS) die("out of instance memory");
-  u64 *p = &arena[arena_used];
-  arena_used += words;
+  u64 *p = &arena[arena_take(words)];
   for (u64 i = 0; i < words; i++) p[i] = 0;
   return p;
 }
@@ -375,15 +455,7 @@ static void inst_free(void *p) {
   if (p && warmc_rt_free_hook) warmc_rt_free_hook(p);
 }
 
-static Instance *instances[MAX_INSTANCES];
-static u32 ninstances;
-/* slots below ninstances that a freed instance left empty, and where the
-   first of them may be */
-static u32 nfree_slots, free_hint;
 
-static struct { const char *name; u32 name_len; WarmInstance *inst; }
-  registry[MAX_INSTANCES];
-static u32 nregistry;
 
 #define INST_OF(v) ((Instance *)((u8 *)(v) - (u64)&((Instance *)0)->vm))
 
@@ -604,7 +676,6 @@ static void const_eval(Instance *in, u32 at, u64 *out) {
   if (mapped) sys_munmap(lo, mapped);
 }
 
-static WarmInstance *vm;
 
 static const char *trap_name(u32 code) {
   switch (code) {
@@ -633,14 +704,25 @@ static const char *trap_name(u32 code) {
 int warmc_setjmp(u64 *buf);
 __attribute__((noreturn)) void warmc_longjmp(u64 *buf, int val);
 
-#if defined(__x86_64__)
-/* the Win64 callee-saved set plus full-width xmm6-15 needs 240 bytes */
-static u64 g_catch_buf[32];
-#else
-static u64 g_catch_buf[24];
-#endif
-static int g_catching;
-static u32 g_trap_code;
+/* A call into wasm, counted while it runs: a collection from inside a call
+   that a host function made into wasm again may not walk the frames
+   beyond it (gc_may_collect).  A trap leaves it counted, for the catching
+   call to put back. */
+static void rt_invoke_s(void *fn, WarmInstance *v, const u64 *iargs,
+                        const u64 *fargs, u64 *retbuf, const u64 *stk,
+                        u64 stk_bytes) {
+  ST->gc_invoke_depth++;
+  warmc_invoke_s(fn, v, iargs, fargs, retbuf, stk, stk_bytes);
+  ST->gc_invoke_depth--;
+}
+
+static void rt_invoke(void *fn, WarmInstance *v, const u64 *iargs,
+                      const u64 *fargs, u64 *retbuf) {
+  ST->gc_invoke_depth++;
+  warmc_invoke(fn, v, iargs, fargs, retbuf);
+  ST->gc_invoke_depth--;
+}
+
 
 /* What a catching call finds of the collector's state when it starts, and
    puts back when a trap ends it: the roots the frames it unwound held go,
@@ -649,7 +731,6 @@ typedef struct { void *roots; u32 from_wasm, no_collect; } GcCatch;
 static void gc_catch_save(GcCatch *c);
 static void gc_after_trap(const GcCatch *c);
 static void gc_trap_round_arm(void);
-extern u64 warmc_gc_invoke_depth;
 
 void warmc_unreached(void) {
 
@@ -657,11 +738,11 @@ void warmc_unreached(void) {
 }
 
 __attribute__((noreturn)) void warmc_trap(u32 code) {
-  if (g_catching) {
-    g_catching = 0;
-    g_trap_code = code;
+  if (ST->g_catching) {
+    ST->g_catching = 0;
+    ST->g_trap_code = code;
     gc_trap_round_arm();
-    warmc_longjmp(g_catch_buf, 1);
+    warmc_longjmp(ST->g_catch_buf, 1);
   }
   eputs("trap: ");
   eputs(trap_name(code));
@@ -699,27 +780,21 @@ usz warmc_custom_section(const ModuleDesc *md, const char *name, usz index,
 }
 
 static void catch_save(u64 *buf, int *was) {
-  *was = g_catching;
-  for (u32 i = 0; i < sizeof g_catch_buf / sizeof g_catch_buf[0]; i++)
-    buf[i] = g_catch_buf[i];
+  *was = ST->g_catching;
+  for (u32 i = 0; i < sizeof ST->g_catch_buf / sizeof ST->g_catch_buf[0]; i++)
+    buf[i] = ST->g_catch_buf[i];
 }
 
 static void catch_restore(const u64 *buf, int was) {
-  for (u32 i = 0; i < sizeof g_catch_buf / sizeof g_catch_buf[0]; i++)
-    g_catch_buf[i] = buf[i];
-  g_catching = was;
+  for (u32 i = 0; i < sizeof ST->g_catch_buf / sizeof ST->g_catch_buf[0]; i++)
+    ST->g_catch_buf[i] = buf[i];
+  ST->g_catching = was;
 }
 
 WarmInstance *warmc_instantiate_catching(const ModuleDesc *md, u32 *err) {
   return warmc_instantiate_bound_catching(md, 0, err);
 }
 
-/* The instances being made, innermost first: a start function may make
-   another.  An instance is registered before it is linked, so one whose
-   making a trap or a link error ends stays registered, linked as far as it
-   got -- and must, as what it wrote into another instance's table before
-   the trap still calls its functions. */
-static struct Instance *g_making;
 
 WarmInstance *warmc_instantiate_bound_catching(const ModuleDesc *md,
                                                const WarmBinding *binds,
@@ -734,30 +809,30 @@ WarmInstance *warmc_instantiate_bound_catching_p(const ModuleDesc *md,
                                                  const WarmBinding *binds,
                                                  u32 *err,
                                                  WarmInstance **partial) {
-  u64 depth = warmc_gc_invoke_depth;
-  u64 outer[sizeof g_catch_buf / sizeof g_catch_buf[0]];
+  u64 depth = ST->gc_invoke_depth;
+  u64 outer[sizeof ST->g_catch_buf / sizeof ST->g_catch_buf[0]];
   int was;
   catch_save(outer, &was);
   GcCatch gcs;
   gc_catch_save(&gcs);
-  struct Instance *making = g_making;
+  struct Instance *making = ST->g_making;
   if (partial) *partial = 0;
-  if (warmc_setjmp(g_catch_buf)) {
+  if (warmc_setjmp(ST->g_catch_buf)) {
     catch_restore(outer, was);
-    warmc_gc_invoke_depth = depth;
+    ST->gc_invoke_depth = depth;
     gc_after_trap(&gcs);
     /* the outermost the trap ended the making of is this call's; any it
        began inside were ended by the same trap */
     struct Instance *mine = 0;
-    while (g_making && g_making != making) {
-      mine = g_making;
-      g_making = g_making->making_prev;
+    while (ST->g_making && ST->g_making != making) {
+      mine = ST->g_making;
+      ST->g_making = ST->g_making->making_prev;
     }
     if (partial && mine) *partial = &mine->vm;
-    *err = g_trap_code;
+    *err = ST->g_trap_code;
     return 0;
   }
-  g_catching = 1;
+  ST->g_catching = 1;
   WarmInstance *v = warmc_instantiate_bound(md, binds);
   catch_restore(outer, was);
   *err = 0;
@@ -766,20 +841,20 @@ WarmInstance *warmc_instantiate_bound_catching_p(const ModuleDesc *md,
 
 u32 warmc_invoke_catching(void *fn, WarmInstance *v, const u64 *iargs,
                           const u64 *fargs, u64 *retbuf) {
-  u64 depth = warmc_gc_invoke_depth;
-  u64 outer[sizeof g_catch_buf / sizeof g_catch_buf[0]];
+  u64 depth = ST->gc_invoke_depth;
+  u64 outer[sizeof ST->g_catch_buf / sizeof ST->g_catch_buf[0]];
   int was;
   catch_save(outer, &was);
   GcCatch gcs;
   gc_catch_save(&gcs);
-  if (warmc_setjmp(g_catch_buf)) {
+  if (warmc_setjmp(ST->g_catch_buf)) {
     catch_restore(outer, was);
-    warmc_gc_invoke_depth = depth;
+    ST->gc_invoke_depth = depth;
     gc_after_trap(&gcs);
-    return g_trap_code;
+    return ST->g_trap_code;
   }
-  g_catching = 1;
-  warmc_invoke(fn, v, iargs, fargs, retbuf);
+  ST->g_catching = 1;
+  rt_invoke(fn, v, iargs, fargs, retbuf);
   catch_restore(outer, was);
   return 0;
 }
@@ -787,27 +862,27 @@ u32 warmc_invoke_catching(void *fn, WarmInstance *v, const u64 *iargs,
 u32 warmc_invoke_catching_s(void *fn, WarmInstance *v, const u64 *iargs,
                             const u64 *fargs, u64 *retbuf,
                             const u64 *stk, u64 stk_bytes) {
-  u64 depth = warmc_gc_invoke_depth;
-  u64 outer[sizeof g_catch_buf / sizeof g_catch_buf[0]];
+  u64 depth = ST->gc_invoke_depth;
+  u64 outer[sizeof ST->g_catch_buf / sizeof ST->g_catch_buf[0]];
   int was;
   catch_save(outer, &was);
   GcCatch gcs;
   gc_catch_save(&gcs);
-  if (warmc_setjmp(g_catch_buf)) {
+  if (warmc_setjmp(ST->g_catch_buf)) {
     catch_restore(outer, was);
-    warmc_gc_invoke_depth = depth;
+    ST->gc_invoke_depth = depth;
     gc_after_trap(&gcs);
-    return g_trap_code;
+    return ST->g_trap_code;
   }
-  g_catching = 1;
-  warmc_invoke_s(fn, v, iargs, fargs, retbuf, stk, stk_bytes);
+  ST->g_catching = 1;
+  rt_invoke_s(fn, v, iargs, fargs, retbuf, stk, stk_bytes);
   catch_restore(outer, was);
   return 0;
 }
 
 static void republish_memory(WarmMemory *M) {
-  for (u32 i = 0; i < ninstances; i++) {
-    Instance *in = instances[i];
+  for (u32 i = 0; i < ST->ninstances; i++) {
+    Instance *in = ST->instances[i];
     if (!in || !in->mems) continue;
     MemSlot *slots = inst_mems(in);
     for (u32 k = 0; k < in->md->nmemories; k++) {
@@ -825,8 +900,8 @@ static void republish_memory(WarmMemory *M) {
 }
 
 static void republish_table(WarmTable *T) {
-  for (u32 i = 0; i < ninstances; i++) {
-    Instance *in = instances[i];
+  for (u32 i = 0; i < ST->ninstances; i++) {
+    Instance *in = ST->instances[i];
     if (!in || !in->tabs) continue;
     TableSlot *slots = inst_tables(in);
     for (u32 k = 0; k < in->md->ntables; k++) {
@@ -1127,24 +1202,30 @@ void warmc_elem_drop(WarmInstance *v, u32 seg) {
   if (seg < in->md->nelem) in->elem_dropped[seg] = 1;
 }
 
-#define MAX_MODULE_DESCS 4096
 static const ModuleDesc *descs[MAX_MODULE_DESCS];
 
 static u8 desc_sorted[MAX_MODULE_DESCS];
 static u32 ndescs;
 
 /* Who changes the list: an instantiation, a module's release, and a JIT's
-   tier-up (warmc_rt_add_desc), which runs beside wasm on another thread.
-   The unwinder, the collector's frame walk and the trap handler read it
-   without a lock, so an entry is written before the count that shows it
-   is. */
+   tier-up (warmc_rt_add_desc), which runs beside wasm on another thread --
+   and in a JIT's library, the threads of every store.  The unwinder, the
+   collector's frame walk and the trap handler read it without a lock, so
+   an entry is written before the count that shows it is; and a release,
+   which moves the last entry into the one it takes out, makes descs_gen
+   odd while it does, so that a reader that found nothing looks again (a
+   reader finds only a module whose code it is running, which no release
+   takes out). */
 static u8 descs_lock;
+static u32 descs_gen;
 
-static void descs_acquire(void) {
-  while (__atomic_test_and_set(&descs_lock, __ATOMIC_ACQUIRE))
-    while (__atomic_load_n(&descs_lock, __ATOMIC_RELAXED)) {}
+static void spin_acquire(u8 *lock) {
+  while (__atomic_test_and_set(lock, __ATOMIC_ACQUIRE))
+    while (__atomic_load_n(lock, __ATOMIC_RELAXED)) warmc_cpu_relax();
 }
-static void descs_release(void) { __atomic_clear(&descs_lock, __ATOMIC_RELEASE); }
+static void spin_release(u8 *lock) { __atomic_clear(lock, __ATOMIC_RELEASE); }
+static void descs_acquire(void) { spin_acquire(&descs_lock); }
+static void descs_release(void) { spin_release(&descs_lock); }
 
 static void register_desc(const ModuleDesc *md) {
   descs_acquire();
@@ -1166,11 +1247,10 @@ static void register_desc(const ModuleDesc *md) {
    trap by its descriptor's tables.  Never instantiated. */
 void warmc_rt_add_desc(const ModuleDesc *md) { register_desc(md); }
 
-static u32 gc_no_collect;
 static void *exn_alloc(Instance *in, u32 tag);
 static void *exn_safepoint(void *e, WarmRegs *regs, u64 sp, u64 pc);
 
-static const FuncUnwind *find_unwind_in(u64 pc, const ModuleDesc **owner) {
+static const FuncUnwind *find_unwind_once(u64 pc, const ModuleDesc **owner) {
   u32 n = __atomic_load_n(&ndescs, __ATOMIC_ACQUIRE);
   for (u32 i = 0; i < n; i++) {
     const ModuleDesc *md = descs[i];
@@ -1196,6 +1276,17 @@ static const FuncUnwind *find_unwind_in(u64 pc, const ModuleDesc **owner) {
     }
   }
   return 0;
+}
+
+static const FuncUnwind *find_unwind_in(u64 pc, const ModuleDesc **owner) {
+  for (;;) {
+    u32 g = __atomic_load_n(&descs_gen, __ATOMIC_ACQUIRE);
+    if (!(g & 1)) {
+      const FuncUnwind *u = find_unwind_once(pc, owner);
+      if (u || __atomic_load_n(&descs_gen, __ATOMIC_ACQUIRE) == g) return u;
+    }
+    warmc_cpu_relax();
+  }
 }
 
 static const FuncUnwind *find_unwind(u64 pc) { return find_unwind_in(pc, 0); }
@@ -1312,14 +1403,19 @@ static void report_icount(WarmInstance *inst) {
   eputs("\n");
 }
 
+/* the guarded memories' reservations, of every store */
+#if defined(WARMC_JIT)
+#define MAX_GUARDS 4096
+#else
 #define MAX_GUARDS 1024
-static struct { u8 *base; u64 len; } guards[MAX_GUARDS];
-static u32 nguards;
+#endif
+static RangeSlot guard_slots[MAX_GUARDS];
+static Ranges guards = { 0, 0, 0, MAX_GUARDS, guard_slots };
 
 static int addr_in_a_guard(const u8 *addr) {
-  for (u32 i = 0; i < nguards; i++)
-    if (addr >= guards[i].base && addr < guards[i].base + guards[i].len) return 1;
-  return 0;
+  u8 *b;
+  usz len;
+  return range_find(&guards, addr, &b, &len);
 }
 
 #if !defined(WARMC_DARWIN) && !defined(WARMC_WINDOWS)
@@ -1408,9 +1504,7 @@ static void fault_handler(int sig, void *info, void *uc) {
 }
 
 static void install_fault_handler(void) {
-  static int installed;
-  if (installed) return;
-  installed = 1;
+  if (!once_begin(&fault_handler_once)) return;
   SigAct act;
 #if defined(WARMC_DARWIN)
   act.h = (void *)fault_handler;
@@ -1424,24 +1518,23 @@ static void install_fault_handler(void) {
 #endif
   set_sigaction(11, &act, &g_prev_segv);
   set_sigaction(SIG_BUS, &act, &g_prev_bus);
+  once_end(&fault_handler_once);
 }
 
 #endif /* !WARMC_WINDOWS */
 
-typedef struct { u32 v; u32 sleepers; } GcthGate;
-
 #define GCTH_SPINS 8000u
 static u32 gcth_spin = GCTH_SPINS;
 
-static u64 gcth_nwaits;
 
 #if defined(WARMC_DARWIN)
 
+extern void *pthread_self(void);
+#if !defined(WARMC_JIT)
 static void (*gcth_entry_fn)(void);
-
 extern int pthread_create(void **, const void *, void *(*)(void *), void *);
 extern int pthread_detach(void *);
-extern void *pthread_self(void);
+#endif
 
 #define UL_COMPARE_AND_WAIT 1u
 #define ULF_NO_ERRNO 0x01000000u
@@ -1452,7 +1545,7 @@ extern int __ulock_wake(unsigned int op, void *addr, unsigned long long wake);
 static void gcth_wait(u32 *w, u32 expect, u64 ns) {
 
   unsigned int us = 0;
-  gcth_nwaits++;
+  ST->gcth_nwaits++;
   if (ns) { us = (unsigned int)(ns / 1000); if (!us) us = 1; }
   __ulock_wait(UL_COMPARE_AND_WAIT | ULF_NO_ERRNO, w, expect, us);
 }
@@ -1461,17 +1554,17 @@ static void gcth_wake(u32 *w) {
   __ulock_wake(UL_COMPARE_AND_WAIT | ULF_NO_ERRNO, w, 0);
 }
 
-static void *gcth_thread;
 
+#if !defined(WARMC_JIT)
 static int gcth_on_collector(void) {
-  void *t = __atomic_load_n(&gcth_thread, __ATOMIC_ACQUIRE);
+  void *t = __atomic_load_n(&ST->gcth_thread, __ATOMIC_ACQUIRE);
   return t != 0 && pthread_self() == t;
 }
 
 static void *gcth_trampoline(void *arg) {
   (void)arg;
 
-  __atomic_store_n(&gcth_thread, pthread_self(), __ATOMIC_RELEASE);
+  __atomic_store_n(&ST->gcth_thread, pthread_self(), __ATOMIC_RELEASE);
   gcth_entry_fn();
   return 0;
 }
@@ -1484,20 +1577,21 @@ static int gcth_spawn(void (*entry)(void)) {
   pthread_detach(th);
   return 1;
 }
+#endif
 
 #elif defined(WARMC_WINDOWS)
 
+#if !defined(WARMC_JIT)
 static void (*gcth_entry_fn)(void);
-static u32 gcth_tid;
 
 static int gcth_on_collector(void) {
-  u32 t = __atomic_load_n(&gcth_tid, __ATOMIC_ACQUIRE);
+  u32 t = __atomic_load_n(&ST->gcth_tid, __ATOMIC_ACQUIRE);
   return t != 0 && GetCurrentThreadId() == t;
 }
 
 static u32 gcth_trampoline(void *arg) {
   (void)arg;
-  __atomic_store_n(&gcth_tid, GetCurrentThreadId(), __ATOMIC_RELEASE);
+  __atomic_store_n(&ST->gcth_tid, GetCurrentThreadId(), __ATOMIC_RELEASE);
   gcth_entry_fn();
   return 0;
 }
@@ -1509,10 +1603,11 @@ static int gcth_spawn(void (*entry)(void)) {
   CloseHandle(h);
   return 1;
 }
+#endif
 
 static void gcth_wait(u32 *w, u32 expect, u64 ns) {
   u32 ms = 0xffffffffu;                     /* INFINITE */
-  gcth_nwaits++;
+  ST->gcth_nwaits++;
   if (ns) {
     u64 m = (ns + 999999) / 1000000;        /* round up: never early */
     ms = !m ? 1 : m > 0xfffffffeull ? 0xfffffffeu : (u32)m;
@@ -1525,14 +1620,9 @@ static void gcth_wake(u32 *w) { WakeByAddressSingle(w); }
 
 #define SYS_futex 98
 
-#define GCTH_CLONE_FLAGS 0x50f00ul
-
-extern long warmc_gcth_clone(usz flags, void *stacktop,
-                             void (*entry)(void));
-
 static void gcth_wait(u32 *w, u32 expect, u64 ns) {
   long ts[2], *tp = 0;
-  gcth_nwaits++;
+  ST->gcth_nwaits++;
   if (ns) { ts[0] = (long)(ns / 1000000000ull);
             ts[1] = (long)(ns % 1000000000ull); tp = ts; }
   sys(SYS_futex, (long)w, 128 , (long)expect, (long)tp, 0, 0);
@@ -1542,13 +1632,18 @@ static void gcth_wake(u32 *w) {
   sys(SYS_futex, (long)w, 129 , 1, 0, 0, 0);
 }
 
+#if !defined(WARMC_JIT)
+#define GCTH_CLONE_FLAGS 0x50f00ul
+
+extern long warmc_gcth_clone(usz flags, void *stacktop,
+                             void (*entry)(void));
+
 #define GCTH_STACK_BYTES (1u << 20)
-static u64 gcth_stack_lo, gcth_stack_hi;
 
 static int gcth_on_collector(void) {
   u64 sp;
   __asm__("mov %0, sp" : "=r"(sp));
-  return sp >= gcth_stack_lo && sp < gcth_stack_hi;
+  return sp >= ST->gcth_stack_lo && sp < ST->gcth_stack_hi;
 }
 
 static int gcth_spawn(void (*entry)(void)) {
@@ -1557,15 +1652,79 @@ static int gcth_spawn(void (*entry)(void)) {
   if (!st) return 0;
   if (sys_mprotect(st, 4096, PROT_NONE) != 0) return 0;
 
-  gcth_stack_lo = (u64)(uptr)st;
-  gcth_stack_hi = gcth_stack_lo + GCTH_STACK_BYTES;
+  ST->gcth_stack_lo = (u64)(uptr)st;
+  ST->gcth_stack_hi = ST->gcth_stack_lo + GCTH_STACK_BYTES;
   if (warmc_gcth_clone(GCTH_CLONE_FLAGS, st + GCTH_STACK_BYTES, entry) <= 0) {
-    gcth_stack_lo = gcth_stack_hi = 0;
+    ST->gcth_stack_lo = ST->gcth_stack_hi = 0;
     return 0;
   }
   return 1;
 }
+#endif
 
+#endif
+
+#if defined(WARMC_JIT)
+/* A JIT's library runs a store's collector on a thread of its own that
+   knows its store (warmc_store) and that it is a collector (gcth_here),
+   joined when the store is deleted (gcth_join).  As many run at once as
+   warmc_rt_set_collectors allows; a store that would start one more
+   collects on its own thread until one stops. */
+static _Thread_local u32 gcth_here;
+static u32 gcth_running, gcth_max = 1;
+
+static int gcth_on_collector(void) { return gcth_here; }
+
+static void gcth_body(Store *w) {
+  warmc_store = w;
+  gcth_here = 1;
+  w->gcth_entry();
+}
+
+#if defined(WARMC_WINDOWS)
+extern u32 WaitForSingleObject(void *h, u32 ms);
+static u32 gcth_trampoline(void *arg) { gcth_body((Store *)arg); return 0; }
+#else
+extern int pthread_create(void **, const void *, void *(*)(void *), void *);
+extern int pthread_join(void *, void **);
+static void *gcth_trampoline(void *arg) { gcth_body((Store *)arg); return 0; }
+#endif
+
+static int gcth_spawn(void (*entry)(void)) {
+  if (__atomic_add_fetch(&gcth_running, 1u, __ATOMIC_ACQ_REL) >
+      __atomic_load_n(&gcth_max, __ATOMIC_RELAXED)) {
+    __atomic_sub_fetch(&gcth_running, 1u, __ATOMIC_ACQ_REL);
+    return 0;
+  }
+  ST->gcth_entry = entry;
+#if defined(WARMC_WINDOWS)
+  void *th = CreateThread(0, 0, gcth_trampoline, ST, 0, 0);
+  if (!th) { __atomic_sub_fetch(&gcth_running, 1u, __ATOMIC_ACQ_REL); return 0; }
+#else
+  void *th = 0;
+  if (pthread_create(&th, 0, gcth_trampoline, ST) != 0) {
+    __atomic_sub_fetch(&gcth_running, 1u, __ATOMIC_ACQ_REL);
+    return 0;
+  }
+#endif
+  ST->gcth_thread = th;
+  return 1;
+}
+
+static void gcth_join(void) {
+  if (!ST->gcth_thread) return;
+#if defined(WARMC_WINDOWS)
+  WaitForSingleObject(ST->gcth_thread, 0xffffffffu);
+  CloseHandle(ST->gcth_thread);
+#else
+  pthread_join(ST->gcth_thread, 0);
+#endif
+  ST->gcth_thread = 0;
+  __atomic_sub_fetch(&gcth_running, 1u, __ATOMIC_ACQ_REL);
+}
+
+/* how many stores' collectors may run at once: the host's processors */
+void warmc_rt_set_collectors(u32 n) { gcth_max = n ? n : 1; }
 #endif
 
 static int gcth_spun_out(GcthGate *g, u32 expect) {
@@ -1606,14 +1765,13 @@ static void gcth_unpark(GcthGate *g, u32 v) {
 }
 
 static void die(const char *msg) {
-  if (g_catching && !gcth_on_collector()) {
+  if (ST->g_catching && !gcth_on_collector()) {
     eputs("warmc-rt: internal: "); eputs(msg); eputs("\n");
-    g_catching = 0; g_trap_code = TRAP_LINK; warmc_longjmp(g_catch_buf, 1);
+    ST->g_catching = 0; ST->g_trap_code = TRAP_LINK; warmc_longjmp(ST->g_catch_buf, 1);
   }
   eputs("warmc-rt: "); eputs(msg); eputs("\n"); sys_exit(1);
 }
 
-static u64 g_stack_limit;
 static char **g_environ;
 
 #if !defined(WARMC_DARWIN) && !defined(WARMC_WINDOWS)
@@ -1650,6 +1808,7 @@ static char **proc_environ(void) {
 extern char ***_NSGetEnviron(void);
 #endif
 static void gc_read_options(void);
+static void store_defaults(Store *w);
 
 /* For the library face (rt/lib.c, warmc --shared), which runs in a process
    the runtime does not own: it says so, reads the WARMC_* options from
@@ -1672,13 +1831,17 @@ int warmc_rt_library_mode(void) {
   g_environ = proc_environ();
 #endif
   gc_read_options();
+#if !defined(WARMC_JIT)
+  store_defaults(ST);
+#endif
   return 1;
 }
-void warmc_rt_set_stack_limit(u64 limit) { g_stack_limit = limit; }
+void warmc_rt_set_stack_limit(u64 limit) { ST->g_stack_limit = limit; }
 void warmc_rt_wait(u32 *w, u32 expect) { gcth_wait(w, expect, 0); }
 void warmc_rt_wake(u32 *w) { gcth_wake(w); }
 
 #if defined(WARMC_DARWIN)
+extern void *pthread_self(void);
 extern void *pthread_get_stackaddr_np(void *);
 extern usz pthread_get_stacksize_np(void *);
 u64 warmc_rt_thread_id(void) { return (u64)(uptr)pthread_self(); }
@@ -1766,11 +1929,11 @@ static u32 name_len(const char *s) {
 }
 
 void warmc_register_n(const char *name, u32 len, WarmInstance *inst) {
-  if (nregistry >= MAX_INSTANCES) die("too many registered modules");
-  registry[nregistry].name = name;
-  registry[nregistry].name_len = len;
-  registry[nregistry].inst = inst;
-  nregistry++;
+  if (ST->nregistry >= MAX_INSTANCES) die("too many registered modules");
+  ST->registry[ST->nregistry].name = name;
+  ST->registry[ST->nregistry].name_len = len;
+  ST->registry[ST->nregistry].inst = inst;
+  ST->nregistry++;
 }
 
 void warmc_register(const char *name, WarmInstance *inst) {
@@ -1778,9 +1941,9 @@ void warmc_register(const char *name, WarmInstance *inst) {
 }
 
 static WarmInstance *lookup_module(const char *name, u32 n) {
-  for (u32 i = nregistry; i > 0; i--)
-    if (name_eq(registry[i - 1].name, registry[i - 1].name_len, name, n))
-      return registry[i - 1].inst;
+  for (u32 i = ST->nregistry; i > 0; i--)
+    if (name_eq(ST->registry[i - 1].name, ST->registry[i - 1].name_len, name, n))
+      return ST->registry[i - 1].inst;
   return 0;
 }
 
@@ -1866,33 +2029,31 @@ void *warmc_table_view(WarmInstance *inst, u32 idx, u64 *len, u64 *max_len,
   return T;
 }
 
-/* The stack limit a call from another thread runs to: every instance's,
-   which compiled code checks its frames against, and the one new
-   instances start with.  Called with the thread's limit as it enters
-   wasm; a thread that calls again finds them set. */
+/* The stack limit a call from another thread runs to: every instance's of
+   the store, which compiled code checks its frames against, and the one
+   its new instances start with.  Called with the thread's limit as it
+   enters the store (warmc_rt_store_enter); a thread that calls again finds
+   them set. */
 static void inst_sweep(void);
 
 void warmc_rt_thread_enter(u64 limit) {
   inst_sweep();
-  if (limit == g_stack_limit) return;
-  g_stack_limit = limit;
-  for (u32 i = 0; i < ninstances; i++)
-    if (instances[i]) instances[i]->vm.stack_limit = limit;
+  if (limit == ST->g_stack_limit) return;
+  ST->g_stack_limit = limit;
+  for (u32 i = 0; i < ST->ninstances; i++)
+    if (ST->instances[i]) ST->instances[i]->vm.stack_limit = limit;
 }
 
 #define GC_HEAP_BYTES (1ull << 30)
 
-static u64 gc_heap_bytes = GC_HEAP_BYTES;
+/* WARMC_GC_HEAP_KB, or a gibibyte: what each store reserves for its heap */
+static u64 gc_opt_heap_bytes = GC_HEAP_BYTES;
 
-static u8 *gc_base;
+
 
 #define GC_MAX_TYPES (1u << 20)
 _Static_assert(GC_MAX_TYPES <= (1u << 27),
                "a type index has to stay below the mark colour's high bit");
-static const GcTypeInfo **gc_typetab;
-static u32 gc_ntypes;
-static struct { const ModuleDesc *md; u32 base; } gc_desc_types[MAX_MODULE_DESCS];
-static u32 gc_ndesc_types;
 
 static const GcTypeInfo gc_type_reserved;
 
@@ -1904,8 +2065,8 @@ static void gc_typeinfo_fail(u32 id) {
 static const GcTypeInfo *gc_typeinfo(u32 w) {
   u32 id = GCW_TYPE(w);
 
-  if (id - 1u >= gc_ntypes - 1u) gc_typeinfo_fail(id);
-  return gc_typetab[id];
+  if (id - 1u >= ST->gc_ntypes - 1u) gc_typeinfo_fail(id);
+  return ST->gc_typetab[id];
 }
 
 static u64 gc_object_bytes_ti(const GcHeader *h, const GcTypeInfo *ti) {
@@ -1932,36 +2093,10 @@ static u64 gc_opt_min_kb = 16384;
 static u32 gc_opt_reloc = 4;
 static u64 gc_opt_release;
 
-static u64 gc_live, gc_marked, gc_trigger;
 
-/* What the program writes on its allocation, barrier and mark-queue paths,
-   and what the collector thread writes for every object it marks, each in
-   cache lines of their own.  A line is 128 bytes on Apple silicon (and x86
-   fetches lines in adjacent pairs), so the 64-byte alignment these counters
-   had left a hot counter of one side beside the other side's; which ones met
-   moved with the size of the code linked in front of them, and ktbench/list
-   ran in 70 ms or 130 ms depending on it. */
-#define GC_LINE 128u
-static struct {
-  u64 alloc_since, bytes_alloc, fast_bytes, barrier_slow, barrier_shaded;
-} __attribute__((aligned(GC_LINE))) gc_mut;
-/* The program's end of the mark queue: head moves with every object a
-   barrier shades, and the collector polls pub while it waits for work, so
-   the pair is kept off the counters' line as well. */
-static struct {
-  u64 head, pub;
-} __attribute__((aligned(GC_LINE))) gc_mqp;
-static struct {
-  u64 ngrey, mark_conc_objs, mark_wait_took, mq_tail;
-} __attribute__((aligned(GC_LINE))) gc_col;
 
-static u64 gc_full_req, gc_full_done, gc_cycle_serves;
 
-static u64 gc_ncycles, gc_npages_opened, gc_npages_freed;
 
-static u64 gc_mark_end_took, gc_ncycles_stw;
-static u64 gc_released, gc_nreleases;
-static u64 gc_t_total, gc_pause_count, gc_pause_max, gc_pause_hist[5];
 
 #define GC_GRAN_SHIFT 16u
 #define GC_GRAN       (1ull << GC_GRAN_SHIFT)
@@ -1974,7 +2109,7 @@ enum { GCP_FREE = 0, GCP_SMALL, GCP_MEDIUM, GCP_LARGE, GCP_FWD };
 
 enum { GCP_TAIL = 0xffu };
 
-typedef struct {
+typedef struct GcPage {
   u8  kind;
   u8  dirty;
   u8  reloc;
@@ -1986,8 +2121,6 @@ typedef struct {
   u32 alloc_cycle;
 } GcPage;
 
-static GcPage *gc_pages;
-static u64 gc_ngran;
 
 /* Per granule, for the load barrier's fast path (rt/start.S,
    warmc_gc_load_stub) and the collector's mark (gc_head_of): GCM_MOVED, a
@@ -1999,29 +2132,7 @@ static u64 gc_ngran;
    head of a large page, whose later granules' distances, clipped to the
    byte, nothing reads. */
 #define GCM_MOVED 1u
-static u8 *gc_gran_map;
 
-/* What that fast path reads, at the offsets start.S names: the heap's
-   range, the map, each page's mark epoch and the mark bits, the colour that
-   is good, whether a mark is on and the epoch its pages' bits are valid in,
-   and the mark queue with the program's end of it (gc_mqp), where it puts
-   an object it shades.  The collector writes it where it writes what it
-   mirrors, at the rounds the program answers, and the program reads it
-   after them.  healed and shaded count the loads the fast path healed and
-   the objects it shaded. */
-typedef struct {
-  u64 base, heap_bytes;
-  u8 *map;
-  u32 *page_epoch;
-  u64 *markbits;
-  u64 good;
-  u32 marking, ready;
-  u64 healed;
-  u8 **mq;
-  u64 *mqp;
-  u64 shaded;
-} GcFast;
-__attribute__((visibility("hidden"))) GcFast warmc_gc_fast = { .good = GC_C_R };
 _Static_assert(__builtin_offsetof(GcFast, base) == 0 &&
                __builtin_offsetof(GcFast, heap_bytes) == 8 &&
                __builtin_offsetof(GcFast, map) == 16 &&
@@ -2036,39 +2147,27 @@ _Static_assert(__builtin_offsetof(GcFast, base) == 0 &&
                __builtin_offsetof(GcFast, shaded) == 80,
                "warmc_gc_load_stub reads GcFast at these offsets");
 
-static u64 *gc_granfree;
-static u64 gc_granfree_words;
-static u64 gc_gran_used;
-static u64 gc_gran_peak;
 
-static u64 gc_gran_hwm;
 
-/* The pages allocation bumps into: small and medium objects, and the
-   program's allocation buffers (gc_lab_refill), small pages of their own --
-   in a medium one, the small objects the program makes there would take
-   eight granules together to compact into.  None is relocated or freed
-   while allocation may still bump into it. */
-static u32 gc_small_page = (u32)-1, gc_medium_page = (u32)-1,
-           gc_lab_page = (u32)-1;
 
 static u32 gc_page_current(u32 h) {
-  return h == gc_small_page || h == gc_medium_page || h == gc_lab_page;
+  return h == ST->gc_small_page || h == ST->gc_medium_page || h == ST->gc_lab_page;
 }
 
 static u32 gc_page_of(const void *p) {
-  return (u32)((GC_ADDR(p) - (u64)(uptr)gc_base) >> GC_GRAN_SHIFT);
+  return (u32)((GC_ADDR(p) - (u64)(uptr)ST->gc_base) >> GC_GRAN_SHIFT);
 }
 static u32 gc_page_head(u32 g) {
-  return __atomic_load_n(&gc_pages[g].kind, __ATOMIC_ACQUIRE) == GCP_TAIL
-             ? gc_pages[g].head : g;
+  return __atomic_load_n(&ST->gc_pages[g].kind, __ATOMIC_ACQUIRE) == GCP_TAIL
+             ? ST->gc_pages[g].head : g;
 }
-static u8 *gc_gran_addr(u32 g) { return gc_base + (u64)g * GC_GRAN; }
+static u8 *gc_gran_addr(u32 g) { return ST->gc_base + (u64)g * GC_GRAN; }
 
 static u32 gc_in_heap(u64 v) {
   if (!GC_IS_OBJ(v)) return 0;
-  u64 off = GC_ADDR(v) - (u64)(uptr)gc_base;
-  if (off >= gc_heap_bytes) return 0;
-  return __atomic_load_n(&gc_pages[off >> GC_GRAN_SHIFT].kind,
+  u64 off = GC_ADDR(v) - (u64)(uptr)ST->gc_base;
+  if (off >= ST->gc_heap_bytes) return 0;
+  return __atomic_load_n(&ST->gc_pages[off >> GC_GRAN_SHIFT].kind,
                          __ATOMIC_ACQUIRE) != GCP_FREE;
 }
 
@@ -2079,7 +2178,7 @@ static u32 gc_in_heap(u64 v) {
    two bits clear, as a pointer to a C object does. */
 u64 warmc_any_of_extern(WarmInstance *vm, u64 e) {
   (void)vm;
-  if (!e || GC_IS_I31(e) || (gc_base && gc_in_heap(e))) return e;
+  if (!e || GC_IS_I31(e) || (ST->gc_base && gc_in_heap(e))) return e;
   return e | GC_HOST_TAG;
 }
 
@@ -2092,8 +2191,8 @@ static void gc_check_tbi(void);
 
 static void gc_gran_mark_free(u64 g, u64 n, u32 free) {
   for (u64 i = g; i < g + n; i++) {
-    if (free) gc_granfree[i >> 6] |= 1ull << (i & 63);
-    else gc_granfree[i >> 6] &= ~(1ull << (i & 63));
+    if (free) ST->gc_granfree[i >> 6] |= 1ull << (i & 63);
+    else ST->gc_granfree[i >> 6] &= ~(1ull << (i & 63));
   }
 }
 
@@ -2105,29 +2204,27 @@ static void gc_gran_mark_free(u64 g, u64 n, u32 free) {
    takes its pages, and gc_reserve_open for an allocation that two cycles
    have not made room for (gc_alloc), which takes it as a last resort: a
    heap whose live data fills it should hold as much as it did without. */
-static u64 gc_reserve_gran;
-static u32 gc_evacuating, gc_reserve_open;
 
 static u64 gc_gran_take(u32 n) {
-  if (!gc_evacuating && !gc_reserve_open &&
-      gc_gran_used + n + gc_reserve_gran > gc_ngran)
+  if (!ST->gc_evacuating && !ST->gc_reserve_open &&
+      ST->gc_gran_used + n + ST->gc_reserve_gran > ST->gc_ngran)
     return (u64)-1;
   u64 run = 0, start = 0;
-  u64 lim = (gc_gran_hwm + n + 64) / 64 + 1;
-  if (lim > gc_granfree_words) lim = gc_granfree_words;
+  u64 lim = (ST->gc_gran_hwm + n + 64) / 64 + 1;
+  if (lim > ST->gc_granfree_words) lim = ST->gc_granfree_words;
   for (u64 w = 0; w < lim; w++) {
-    u64 bits = gc_granfree[w];
+    u64 bits = ST->gc_granfree[w];
     if (!bits) { run = 0; continue; }
     for (u64 b = 0; b < 64; b++) {
       u64 g = w * 64 + b;
-      if (g >= gc_ngran) break;
+      if (g >= ST->gc_ngran) break;
       if (bits & (1ull << b)) {
         if (!run) start = g;
         if (++run == n) {
           gc_gran_mark_free(start, n, 0);
-          gc_gran_used += n;
-          if (start + n > gc_gran_hwm) gc_gran_hwm = start + n;
-          if (gc_gran_used > gc_gran_peak) gc_gran_peak = gc_gran_used;
+          ST->gc_gran_used += n;
+          if (start + n > ST->gc_gran_hwm) ST->gc_gran_hwm = start + n;
+          if (ST->gc_gran_used > ST->gc_gran_peak) ST->gc_gran_peak = ST->gc_gran_used;
           return start;
         }
       } else {
@@ -2138,14 +2235,8 @@ static u64 gc_gran_take(u32 n) {
   return (u64)-1;
 }
 
-static u64 *gc_markbits;
-static u32 *gc_page_epoch;
 
-static u8 **gc_grey;
-static u64 gc_capgrey;
-static u64 gc_cycle_no = 1;
 
-static u8 **gc_mq;
 
 #define GC_MQ_BATCH 32u
 _Static_assert(GC_GRAN_SHIFT == 16 && GC_UNIT == 16 && GC_COLOUR_SHIFT == 56 &&
@@ -2153,65 +2244,63 @@ _Static_assert(GC_GRAN_SHIFT == 16 && GC_UNIT == 16 && GC_COLOUR_SHIFT == 56 &&
                "warmc_gc_load_stub's shifts, colour mask, batch and header");
 
 enum { GCPH_IDLE = 0, GCPH_MARK = 1, GCPH_RELOC = 2 };
-__attribute__((aligned(GC_LINE))) static u32 gc_phase;
 
-static u32 gc_conc_on, gc_conc_tried, gc_opt_conc = 1;
+static u32 gc_opt_conc = 1;
 
-static u32 gc_cycle_running;
 
 #define GC_EPOCH_BUSY(c)  ((u32)((u32)(c) * 2u))
 #define GC_EPOCH_READY(c) ((u32)((u32)(c) * 2u + 1u))
 
 static void gc_bits_claim_page(u32 h) {
-  u32 ready = GC_EPOCH_READY(gc_cycle_no), busy = GC_EPOCH_BUSY(gc_cycle_no);
-  u32 e = __atomic_load_n(&gc_page_epoch[h], __ATOMIC_ACQUIRE);
+  u32 ready = GC_EPOCH_READY(ST->gc_cycle_no), busy = GC_EPOCH_BUSY(ST->gc_cycle_no);
+  u32 e = __atomic_load_n(&ST->gc_page_epoch[h], __ATOMIC_ACQUIRE);
   for (;;) {
     if (e == ready) return;
     if (e == busy) {
-      while (__atomic_load_n(&gc_page_epoch[h], __ATOMIC_ACQUIRE) != ready)
+      while (__atomic_load_n(&ST->gc_page_epoch[h], __ATOMIC_ACQUIRE) != ready)
         warmc_cpu_relax();
       return;
     }
-    if (__atomic_compare_exchange_n(&gc_page_epoch[h], &e, busy, 0,
+    if (__atomic_compare_exchange_n(&ST->gc_page_epoch[h], &e, busy, 0,
                                     __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
       break;
   }
   u64 first = ((u64)h * GC_GRAN) / GC_UNIT;
-  u64 nbits = ((u64)gc_pages[h].ngran * GC_GRAN) / GC_UNIT;
-  for (u64 i = 0; i < nbits / 64; i++) gc_markbits[first / 64 + i] = 0;
-  __atomic_store_n(&gc_page_epoch[h], ready, __ATOMIC_RELEASE);
+  u64 nbits = ((u64)ST->gc_pages[h].ngran * GC_GRAN) / GC_UNIT;
+  for (u64 i = 0; i < nbits / 64; i++) ST->gc_markbits[first / 64 + i] = 0;
+  __atomic_store_n(&ST->gc_page_epoch[h], ready, __ATOMIC_RELEASE);
 }
 
 static void gc_add_live(u32 h, u64 bytes) {
-  if (!gc_conc_on) { gc_pages[h].live += bytes; return; }
-  __atomic_fetch_add(&gc_pages[h].live, bytes, __ATOMIC_RELAXED);
+  if (!ST->gc_conc_on) { ST->gc_pages[h].live += bytes; return; }
+  __atomic_fetch_add(&ST->gc_pages[h].live, bytes, __ATOMIC_RELAXED);
 }
 
 static u32 gc_bit_set(u32 g, u64 addr) {
   u32 h = gc_page_head(g);
-  if (__atomic_load_n(&gc_page_epoch[h], __ATOMIC_ACQUIRE) !=
-      GC_EPOCH_READY(gc_cycle_no))
+  if (__atomic_load_n(&ST->gc_page_epoch[h], __ATOMIC_ACQUIRE) !=
+      GC_EPOCH_READY(ST->gc_cycle_no))
     gc_bits_claim_page(h);
-  u64 i = (GC_ADDR(addr) - (u64)(uptr)gc_base) / GC_UNIT;
+  u64 i = (GC_ADDR(addr) - (u64)(uptr)ST->gc_base) / GC_UNIT;
   u64 m = 1ull << (i & 63);
 
-  if (!gc_conc_on) {
-    if (gc_markbits[i >> 6] & m) return 0;
-    gc_markbits[i >> 6] |= m;
+  if (!ST->gc_conc_on) {
+    if (ST->gc_markbits[i >> 6] & m) return 0;
+    ST->gc_markbits[i >> 6] |= m;
     return 1;
   }
-  u64 old = __atomic_fetch_or(&gc_markbits[i >> 6], m, __ATOMIC_RELAXED);
+  u64 old = __atomic_fetch_or(&ST->gc_markbits[i >> 6], m, __ATOMIC_RELAXED);
   return (old & m) ? 0 : 1;
 }
 
 static u32 gc_bit_test(u64 addr) {
-  u64 i = (GC_ADDR(addr) - (u64)(uptr)gc_base) / GC_UNIT;
-  return (gc_markbits[i >> 6] >> (i & 63)) & 1u;
+  u64 i = (GC_ADDR(addr) - (u64)(uptr)ST->gc_base) / GC_UNIT;
+  return (ST->gc_markbits[i >> 6] >> (i & 63)) & 1u;
 }
 
 static u64 gc_bits_next(u64 i, u64 e) {
   while (i < e) {
-    u64 w = gc_markbits[i >> 6] & (~0ull << (i & 63));
+    u64 w = ST->gc_markbits[i >> 6] & (~0ull << (i & 63));
     if (w) {
       u64 n = (i & ~63ull) + (u64)__builtin_ctzll(w);
       return n < e ? n : e;
@@ -2223,11 +2312,11 @@ static u64 gc_bits_next(u64 i, u64 e) {
 
 #define GC_PAGE_FOREACH(h, var)                                               \
   for (u64 _b = ((u64)(h) * GC_GRAN) / GC_UNIT,                               \
-            _e = _b + ((u64)gc_pages[h].ngran * GC_GRAN) / GC_UNIT,           \
-            _i = (gc_page_epoch[h] == GC_EPOCH_READY(gc_cycle_no)              \
+            _e = _b + ((u64)ST->gc_pages[h].ngran * GC_GRAN) / GC_UNIT,           \
+            _i = (ST->gc_page_epoch[h] == GC_EPOCH_READY(ST->gc_cycle_no)              \
                       ? gc_bits_next(_b, _e)                                  \
                       : _e);                                                  \
-       _i < _e && ((var) = gc_base + _i * GC_UNIT, 1);                        \
+       _i < _e && ((var) = ST->gc_base + _i * GC_UNIT, 1);                        \
        _i = gc_bits_next(_i + 1, _e))
 
 static void gc_release_pages(u32 h, u32 n) {
@@ -2235,118 +2324,143 @@ static void gc_release_pages(u32 h, u32 n) {
   u64 bytes = (u64)n * GC_GRAN;
   if (bytes < gc_opt_release) return;
   if (sys_madvise(gc_gran_addr(h), (usz)bytes, WARMC_MADV_FREE) == 0) {
-    gc_released += bytes;
-    gc_nreleases++;
+    ST->gc_released += bytes;
+    ST->gc_nreleases++;
 
     if (WARMC_MADV_ZEROES)
-      for (u32 i = 0; i < n; i++) gc_pages[h + i].dirty = 0;
+      for (u32 i = 0; i < n; i++) ST->gc_pages[h + i].dirty = 0;
   }
 }
 
 static u64 gc_min_trigger(void) {
   u64 t = gc_opt_min_kb * 1024ull;
-  return t > gc_heap_bytes / 4 ? gc_heap_bytes / 4 : t;
+  return t > ST->gc_heap_bytes / 4 ? ST->gc_heap_bytes / 4 : t;
 }
 
 static void gc_init(void) {
-  if (gc_base) return;
+  if (ST->gc_base) return;
 
   /* Their addresses escape here, or the optimiser splits each struct into
      separate scalars and lays them out as it likes -- padding and line gone. */
-  __asm__ volatile("" : : "r"(&gc_mut), "r"(&gc_mqp), "r"(&gc_col) : "memory");
 
-  gc_base = (u8 *)sys_mmap_lazy((usz)(gc_heap_bytes + GC_GRAN));
-  if (!gc_base || gc_base == (u8 *)-1) die("cannot reserve the managed heap");
+  ST->gc_map_len = ST->gc_heap_bytes + GC_GRAN;
+  ST->gc_base = (u8 *)sys_mmap_lazy((usz)ST->gc_map_len);
+  if (!ST->gc_base || ST->gc_base == (u8 *)-1) die("cannot reserve the managed heap");
+  ST->gc_map = ST->gc_base;
 
-  gc_base += (u64)(-(long)(u64)gc_base) & (GC_GRAN - 1);
-  gc_heap_bytes &= ~(GC_GRAN - 1);
-  if (gc_heap_bytes < 2 * GC_GRAN) die("the managed heap is smaller than two pages");
-  gc_ngran = gc_heap_bytes / GC_GRAN;
-  gc_reserve_gran = gc_ngran / 32;
-  if (gc_reserve_gran < 2 * GC_MEDIUM_GRAN) gc_reserve_gran = 2 * GC_MEDIUM_GRAN;
-  if (gc_reserve_gran > gc_ngran / 8) gc_reserve_gran = gc_ngran / 8;
+  ST->gc_base += (u64)(-(long)(u64)ST->gc_base) & (GC_GRAN - 1);
+  ST->gc_heap_bytes &= ~(GC_GRAN - 1);
+  if (ST->gc_heap_bytes < 2 * GC_GRAN) die("the managed heap is smaller than two pages");
+  ST->gc_ngran = ST->gc_heap_bytes / GC_GRAN;
+  ST->gc_reserve_gran = ST->gc_ngran / 32;
+  if (ST->gc_reserve_gran < 2 * GC_MEDIUM_GRAN) ST->gc_reserve_gran = 2 * GC_MEDIUM_GRAN;
+  if (ST->gc_reserve_gran > ST->gc_ngran / 8) ST->gc_reserve_gran = ST->gc_ngran / 8;
 
-  gc_pages = (GcPage *)sys_mmap(0, (usz)(gc_ngran * sizeof(GcPage)),
+  ST->gc_pages = (GcPage *)sys_mmap(0, (usz)(ST->gc_ngran * sizeof(GcPage)),
                                 PROT_READ | PROT_WRITE,
                                 MAP_PRIVATE | MAP_ANONYMOUS);
-  gc_page_epoch = (u32 *)sys_mmap(0, (usz)(gc_ngran * sizeof(u32)),
+  ST->gc_page_epoch = (u32 *)sys_mmap(0, (usz)(ST->gc_ngran * sizeof(u32)),
                                   PROT_READ | PROT_WRITE,
                                   MAP_PRIVATE | MAP_ANONYMOUS);
-  gc_granfree_words = (gc_ngran + 63) / 64;
-  gc_granfree = (u64 *)sys_mmap(0, (usz)(gc_granfree_words * 8),
+  ST->gc_granfree_words = (ST->gc_ngran + 63) / 64;
+  ST->gc_granfree = (u64 *)sys_mmap(0, (usz)(ST->gc_granfree_words * 8),
                                 PROT_READ | PROT_WRITE,
                                 MAP_PRIVATE | MAP_ANONYMOUS);
 
-  gc_markbits = (u64 *)sys_mmap_lazy((usz)(gc_heap_bytes / GC_UNIT / 8));
-  gc_gran_map = (u8 *)sys_mmap(0, (usz)gc_ngran, PROT_READ | PROT_WRITE,
+  ST->gc_markbits = (u64 *)sys_mmap_lazy((usz)(ST->gc_heap_bytes / GC_UNIT / 8));
+  ST->gc_gran_map = (u8 *)sys_mmap(0, (usz)ST->gc_ngran, PROT_READ | PROT_WRITE,
                                MAP_PRIVATE | MAP_ANONYMOUS);
 
   /* Each as large as the heap's units, 512 MB a piece by default, and
      touched only as far as a cycle's grey objects reach. */
-  gc_capgrey = gc_heap_bytes / GC_UNIT;
-  gc_grey = (u8 **)sys_mmap_lazy((usz)(gc_capgrey * sizeof(u8 *)));
-  gc_mq = (u8 **)sys_mmap_lazy((usz)(gc_capgrey * sizeof(u8 *)));
-  if (!gc_pages || gc_pages == (GcPage *)-1 || !gc_granfree ||
-      gc_granfree == (u64 *)-1 || !gc_markbits || gc_markbits == (u64 *)-1 ||
-      !gc_grey || gc_grey == (u8 **)-1 || !gc_page_epoch ||
-      gc_page_epoch == (u32 *)-1 || !gc_mq || gc_mq == (u8 **)-1 ||
-      !gc_gran_map || gc_gran_map == (u8 *)-1)
+  ST->gc_capgrey = ST->gc_heap_bytes / GC_UNIT;
+  ST->gc_grey = (u8 **)sys_mmap_lazy((usz)(ST->gc_capgrey * sizeof(u8 *)));
+  ST->gc_mq = (u8 **)sys_mmap_lazy((usz)(ST->gc_capgrey * sizeof(u8 *)));
+  if (!ST->gc_pages || ST->gc_pages == (GcPage *)-1 || !ST->gc_granfree ||
+      ST->gc_granfree == (u64 *)-1 || !ST->gc_markbits || ST->gc_markbits == (u64 *)-1 ||
+      !ST->gc_grey || ST->gc_grey == (u8 **)-1 || !ST->gc_page_epoch ||
+      ST->gc_page_epoch == (u32 *)-1 || !ST->gc_mq || ST->gc_mq == (u8 **)-1 ||
+      !ST->gc_gran_map || ST->gc_gran_map == (u8 *)-1)
     die("cannot reserve the collector's side tables");
-  warmc_gc_fast.base = (u64)(uptr)gc_base;
-  warmc_gc_fast.heap_bytes = gc_heap_bytes;
-  warmc_gc_fast.map = gc_gran_map;
-  warmc_gc_fast.page_epoch = gc_page_epoch;
-  warmc_gc_fast.markbits = gc_markbits;
-  warmc_gc_fast.mq = gc_mq;
-  warmc_gc_fast.mqp = &gc_mqp.head;
-  gc_gran_mark_free(0, gc_ngran, 1);
+  ST->gc_fast.base = (u64)(uptr)ST->gc_base;
+  ST->gc_fast.heap_bytes = ST->gc_heap_bytes;
+  ST->gc_fast.map = ST->gc_gran_map;
+  ST->gc_fast.page_epoch = ST->gc_page_epoch;
+  ST->gc_fast.markbits = ST->gc_markbits;
+  ST->gc_fast.mq = ST->gc_mq;
+  ST->gc_fast.mqp = &ST->gc_mqp.head;
+  gc_gran_mark_free(0, ST->gc_ngran, 1);
   gc_check_tbi();
 
-  gc_typetab = (const GcTypeInfo **)sys_mmap_lazy(
+  ST->gc_typetab = (const GcTypeInfo **)sys_mmap_lazy(
       (usz)(GC_MAX_TYPES * sizeof(void *)));
-  if (!gc_typetab || gc_typetab == (const GcTypeInfo **)-1)
+  if (!ST->gc_typetab || ST->gc_typetab == (const GcTypeInfo **)-1)
     die("cannot reserve the type table");
 
-  gc_typetab[0] = &gc_type_reserved;
-  gc_ntypes = 1;
-  gc_trigger = gc_min_trigger();
+  ST->gc_typetab[0] = &gc_type_reserved;
+  ST->gc_ntypes = 1;
+  ST->gc_trigger = gc_min_trigger();
+}
+
+/* The modules whose heap types some store registered, and in how many:
+   a module's descriptor and code stay while a store's heap may hold its
+   objects (warmc_rt_forget_desc).  typed_stores adds delta to md's count
+   and says what it is then. */
+static struct { const ModuleDesc *md; u32 stores; } typed[MAX_MODULE_DESCS];
+static u32 ntyped;
+static u8 typed_lock;
+
+static u32 typed_stores(const ModuleDesc *md, int delta) {
+  spin_acquire(&typed_lock);
+  u32 i = 0;
+  while (i < ntyped && typed[i].md != md) i++;
+  if (i == ntyped && delta > 0) {
+    if (ntyped == MAX_MODULE_DESCS) { spin_release(&typed_lock); die("too many modules"); }
+    typed[ntyped].md = md;
+    typed[ntyped++].stores = 0;
+  }
+  u32 n = 0;
+  if (i < ntyped) {
+    n = typed[i].stores = (u32)((int)typed[i].stores + delta);
+    if (!n) typed[i] = typed[--ntyped];
+  }
+  spin_release(&typed_lock);
+  return n;
 }
 
 static u32 gc_register_types(const ModuleDesc *md) {
 
   if (!md->ngctypes && !md->ntags) return 0;
   gc_init();
-  for (u32 i = 0; i < gc_ndesc_types; i++)
-    if (gc_desc_types[i].md == md) return gc_desc_types[i].base;
-  if (gc_ndesc_types >= MAX_MODULE_DESCS) die("too many modules");
-  if (gc_ntypes + md->ngctypes + md->ntags > GC_MAX_TYPES)
+  for (u32 i = 0; i < ST->gc_ndesc_types; i++)
+    if (ST->gc_desc_types[i].md == md) return ST->gc_desc_types[i].base;
+  if (ST->gc_ndesc_types >= MAX_MODULE_DESCS) die("too many modules");
+  if (ST->gc_ntypes + md->ngctypes + md->ntags > GC_MAX_TYPES)
     die("too many heap types");
-  u32 base = gc_ntypes;
-  for (u32 i = 0; i < md->ngctypes; i++) gc_typetab[gc_ntypes++] = &md->gctypes[i];
-  for (u32 i = 0; i < md->ntags; i++) gc_typetab[gc_ntypes++] = &md->exntypes[i];
-  gc_desc_types[gc_ndesc_types].md = md;
-  gc_desc_types[gc_ndesc_types].base = base;
-  gc_ndesc_types++;
+  u32 base = ST->gc_ntypes;
+  for (u32 i = 0; i < md->ngctypes; i++) ST->gc_typetab[ST->gc_ntypes++] = &md->gctypes[i];
+  for (u32 i = 0; i < md->ntags; i++) ST->gc_typetab[ST->gc_ntypes++] = &md->exntypes[i];
+  ST->gc_desc_types[ST->gc_ndesc_types].md = md;
+  ST->gc_desc_types[ST->gc_ndesc_types].base = base;
+  ST->gc_ndesc_types++;
+  typed_stores(md, 1);
   return base;
 }
 
-static u64 gc_good = GC_C_R;
-static u64 gc_badmask = GC_C_M0 | GC_C_M1;
-static u32 gc_mark_epoch;
 
 static void gc_publish_colour(void) {
-  gc_badmask = GC_COLOUR_MASK & ~gc_good;
-  warmc_gc_fast.good = gc_good;
-  for (u32 i = 0; i < ninstances; i++)
-    if (instances[i]) instances[i]->vm.gc_badmask = gc_badmask;
+  ST->gc_badmask = GC_COLOUR_MASK & ~ST->gc_good;
+  ST->gc_fast.good = ST->gc_good;
+  for (u32 i = 0; i < ST->ninstances; i++)
+    if (ST->instances[i]) ST->instances[i]->vm.gc_badmask = ST->gc_badmask;
 }
 
 static void gc_check_tbi(void) {
 #if defined(__x86_64__)
   return;   /* no TBI: every deref masks the colour instead (GC_CANON) */
 #endif
-  volatile u64 *raw = (volatile u64 *)gc_base;
-  volatile u64 *tagged = (volatile u64 *)((u64)(uptr)gc_base | GC_COLOUR_MASK);
+  volatile u64 *raw = (volatile u64 *)ST->gc_base;
+  volatile u64 *tagged = (volatile u64 *)((u64)(uptr)ST->gc_base | GC_COLOUR_MASK);
   *raw = 0x5aa5c33c0f0f1e1eull;
   if (*tagged != 0x5aa5c33c0f0f1e1eull)
     die("this machine does not ignore the top byte of an address");
@@ -2365,111 +2479,105 @@ static void gc_zero(u8 *p, u64 n) {
   for (; i < n; i++) p[i] = 0;
 }
 
-static u32 gc_page_lock;
 
 static u32 gc_lock(void) {
-  if (!__atomic_load_n(&gc_conc_on, __ATOMIC_RELAXED)) return 0;
-  while (__atomic_exchange_n(&gc_page_lock, 1u, __ATOMIC_ACQUIRE))
+  if (!__atomic_load_n(&ST->gc_conc_on, __ATOMIC_RELAXED)) return 0;
+  while (__atomic_exchange_n(&ST->gc_page_lock, 1u, __ATOMIC_ACQUIRE))
     warmc_cpu_relax();
   return 1;
 }
 
 static void gc_unlock(u32 held) {
-  if (held) __atomic_store_n(&gc_page_lock, 0u, __ATOMIC_RELEASE);
+  if (held) __atomic_store_n(&ST->gc_page_lock, 0u, __ATOMIC_RELEASE);
 }
 
 static u32 gc_page_open(u32 ngran, u8 kind) {
   u64 g = gc_gran_take(ngran);
   if (g == (u64)-1) return (u32)-1;
   for (u32 i = 0; i < ngran; i++) {
-    GcPage *T = &gc_pages[g + i];
+    GcPage *T = &ST->gc_pages[g + i];
     if (T->dirty) gc_zero(gc_gran_addr((u32)g + i), GC_GRAN);
     T->dirty = 1;
     T->reloc = 0;
     T->head = (u32)g;
     T->ngran = 0;
     T->live = 0;
-    gc_gran_map[g + i] = (u8)((i < 0x7fu ? i : 0x7fu) << 1);
+    ST->gc_gran_map[g + i] = (u8)((i < 0x7fu ? i : 0x7fu) << 1);
     __atomic_store_n(&T->kind, (u8)GCP_TAIL, __ATOMIC_RELEASE);
   }
-  GcPage *P = &gc_pages[g];
+  GcPage *P = &ST->gc_pages[g];
   P->ngran = ngran;
   P->top = gc_gran_addr((u32)g);
   P->live = 0;
 
-  P->alloc_cycle = (u32)gc_cycle_no;
+  P->alloc_cycle = (u32)ST->gc_cycle_no;
 
   __atomic_store_n(&P->kind, kind, __ATOMIC_RELEASE);
 
-  gc_page_epoch[g] = 0;
-  gc_npages_opened++;
+  ST->gc_page_epoch[g] = 0;
+  ST->gc_npages_opened++;
   return (u32)g;
 }
 
 static void gc_page_free(u32 h) {
-  GcPage *P = &gc_pages[h];
+  GcPage *P = &ST->gc_pages[h];
   u32 n = P->ngran;
   for (u32 i = 0; i < n; i++) {
-    gc_pages[h + i].kind = GCP_FREE;
-    gc_pages[h + i].ngran = 0;
-    gc_pages[h + i].live = 0;
-    gc_pages[h + i].reloc = 0;
-    gc_gran_map[h + i] = 0;
+    ST->gc_pages[h + i].kind = GCP_FREE;
+    ST->gc_pages[h + i].ngran = 0;
+    ST->gc_pages[h + i].live = 0;
+    ST->gc_pages[h + i].reloc = 0;
+    ST->gc_gran_map[h + i] = 0;
   }
   gc_gran_mark_free(h, n, 1);
-  gc_gran_used -= n;
-  gc_npages_freed++;
+  ST->gc_gran_used -= n;
+  ST->gc_npages_freed++;
   gc_release_pages(h, n);
 }
 
 static u64 gc_page_room(u32 h) {
-  return (u64)(gc_gran_addr(h) + (u64)gc_pages[h].ngran * GC_GRAN - gc_pages[h].top);
+  return (u64)(gc_gran_addr(h) + (u64)ST->gc_pages[h].ngran * GC_GRAN - ST->gc_pages[h].top);
 }
 
-/* [0] the cursor, [1] the end; compiled code bumps [0] on every inline
-   allocation through vmctx, so the cell has a line to itself. */
-static u64 gc_lab_cell[GC_LINE / 8] __attribute__((aligned(GC_LINE)));
-static u8 *gc_lab_start;
 static u32 gc_opt_lab = 1;
-static u64 gc_nlabs;
 #define GC_LAB_CAP (16u << 10)
 
 #define GC_LAB_MIN_TAIL 256u
 
 static u64 gc_lab_sync(void) {
-  if (!gc_lab_start) return 0;
-  u64 used = GC_ADDR(gc_lab_cell[0]) - (u64)(uptr)gc_lab_start;
-  gc_lab_start = (u8 *)(uptr)GC_ADDR(gc_lab_cell[0]);
-  gc_mut.alloc_since += used;
-  gc_mut.fast_bytes += used;
+  if (!ST->gc_lab_start) return 0;
+  u64 used = GC_ADDR(ST->gc_lab_cell[0]) - (u64)(uptr)ST->gc_lab_start;
+  ST->gc_lab_start = (u8 *)(uptr)GC_ADDR(ST->gc_lab_cell[0]);
+  ST->gc_mut.alloc_since += used;
+  ST->gc_mut.fast_bytes += used;
   return used;
 }
 
 static u64 gc_lab_close(void) {
   u64 used = gc_lab_sync();
-  if (gc_lab_cell[1]) {
-    u32 h = gc_page_head(gc_page_of((void *)(uptr)gc_lab_cell[0]));
-    if ((u64)(uptr)gc_pages[h].top == GC_ADDR(gc_lab_cell[1]))
-      gc_pages[h].top = (u8 *)(uptr)GC_ADDR(gc_lab_cell[0]);
+  if (ST->gc_lab_cell[1]) {
+    u32 h = gc_page_head(gc_page_of((void *)(uptr)ST->gc_lab_cell[0]));
+    if ((u64)(uptr)ST->gc_pages[h].top == GC_ADDR(ST->gc_lab_cell[1]))
+      ST->gc_pages[h].top = (u8 *)(uptr)GC_ADDR(ST->gc_lab_cell[0]);
   }
-  gc_lab_start = 0;
-  gc_lab_cell[0] = gc_lab_cell[1] = 0;
+  ST->gc_lab_start = 0;
+  ST->gc_lab_cell[0] = ST->gc_lab_cell[1] = 0;
   return used;
 }
 
 static void gc_lab_recolour(void) {
-  if (!gc_lab_cell[1]) return;
-  gc_lab_cell[0] = GC_ADDR(gc_lab_cell[0]) | gc_good;
-  gc_lab_cell[1] = GC_ADDR(gc_lab_cell[1]) | gc_good;
+  if (!ST->gc_lab_cell[1]) return;
+  ST->gc_lab_cell[0] = GC_ADDR(ST->gc_lab_cell[0]) | ST->gc_good;
+  ST->gc_lab_cell[1] = GC_ADDR(ST->gc_lab_cell[1]) | ST->gc_good;
 }
 
 static u8 *gc_bump(u32 *pg, u32 ngran, u8 kind, u64 total) {
   for (u32 round = 0; round < 2; round++) {
     if (*pg != (u32)-1 && gc_page_room(*pg) >= total) {
-      u8 *p = gc_pages[*pg].top;
-      gc_pages[*pg].top += total;
+      u8 *p = ST->gc_pages[*pg].top;
+      ST->gc_pages[*pg].top += total;
 
-      gc_pages[*pg].alloc_cycle = (u32)gc_cycle_no;
+      ST->gc_pages[*pg].alloc_cycle = (u32)ST->gc_cycle_no;
       return p;
     }
     if (round) break;
@@ -2484,15 +2592,15 @@ static u8 *gc_alloc_raw(u64 total) {
   u32 held = gc_lock();
   u8 *p = 0;
   if (total <= GC_SMALL_MAX) {
-    p = gc_bump(&gc_small_page, GC_SMALL_GRAN, GCP_SMALL, total);
+    p = gc_bump(&ST->gc_small_page, GC_SMALL_GRAN, GCP_SMALL, total);
   } else if (total <= GC_MEDIUM_MAX) {
-    p = gc_bump(&gc_medium_page, GC_MEDIUM_GRAN, GCP_MEDIUM, total);
+    p = gc_bump(&ST->gc_medium_page, GC_MEDIUM_GRAN, GCP_MEDIUM, total);
   } else {
 
     u32 n = (u32)((total + GC_GRAN - 1) / GC_GRAN);
     u32 h = gc_page_open(n, GCP_LARGE);
     if (h != (u32)-1) {
-      gc_pages[h].top = gc_gran_addr(h) + total;
+      ST->gc_pages[h].top = gc_gran_addr(h) + total;
       p = gc_gran_addr(h);
     }
   }
@@ -2502,38 +2610,37 @@ static u8 *gc_alloc_raw(u64 total) {
 
 static void gc_lab_refill(void) {
   if (!gc_opt_lab || gc_opt_stress) return;
-  u64 q = gc_trigger > gc_mut.alloc_since ? gc_trigger - gc_mut.alloc_since : 0;
+  u64 q = ST->gc_trigger > ST->gc_mut.alloc_since ? ST->gc_trigger - ST->gc_mut.alloc_since : 0;
   if (q > GC_LAB_CAP) q = GC_LAB_CAP;
   q &= ~(u64)(GC_UNIT - 1);
   if (q < 2 * GC_LAB_MIN_TAIL) return;
   u32 held = gc_lock();
-  u8 *p = gc_bump(&gc_lab_page, GC_SMALL_GRAN, GCP_SMALL, q);
+  u8 *p = gc_bump(&ST->gc_lab_page, GC_SMALL_GRAN, GCP_SMALL, q);
   gc_unlock(held);
   if (!p) return;
-  gc_nlabs++;
-  gc_lab_start = p;
+  ST->gc_nlabs++;
+  ST->gc_lab_start = p;
 
-  gc_lab_cell[0] = (u64)(uptr)p | gc_good;
-  gc_lab_cell[1] = ((u64)(uptr)p + q) | gc_good;
+  ST->gc_lab_cell[0] = (u64)(uptr)p | ST->gc_good;
+  ST->gc_lab_cell[1] = ((u64)(uptr)p + q) | ST->gc_good;
 }
 
 static u64 gc_heal_ptr(u64 v);
 static u64 gc_heal_reloc(u64 v);
 
-static u64 gc_born_skipped;
 
 static u32 gc_being_born(u64 v) {
   if (GCW_TYPE(((const GcHeader *)(uptr)GC_ADDR(v))->w)) return 0;
-  if (!__atomic_load_n(&gc_conc_on, __ATOMIC_RELAXED))
+  if (!__atomic_load_n(&ST->gc_conc_on, __ATOMIC_RELAXED))
     die("a heap object names the reserved type index zero");
-  gc_born_skipped++;
+  ST->gc_born_skipped++;
   return 1;
 }
 
 /* The head granule of the page of granule g, where an object starts: the
    map says how far back it is. */
 static u32 gc_head_of(u64 g) {
-  return (u32)g - ((u32)gc_gran_map[g] >> 1);
+  return (u32)g - ((u32)ST->gc_gran_map[g] >> 1);
 }
 
 /* The collector's mark of v, a healed reference into the heap: its bit,
@@ -2541,17 +2648,17 @@ static u32 gc_head_of(u64 g) {
    then set; the object onto the grey stack.  Its bytes are counted as live
    when it is scanned (gc_scan_object), its type looked up once. */
 static void gc_mark_word(u64 v) {
-  u64 off = GC_ADDR(v) - (u64)(uptr)gc_base;
+  u64 off = GC_ADDR(v) - (u64)(uptr)ST->gc_base;
   u32 h = gc_head_of(off >> GC_GRAN_SHIFT);
-  if (__atomic_load_n(&gc_page_epoch[h], __ATOMIC_ACQUIRE) != GC_EPOCH_READY(gc_cycle_no))
+  if (__atomic_load_n(&ST->gc_page_epoch[h], __ATOMIC_ACQUIRE) != GC_EPOCH_READY(ST->gc_cycle_no))
     gc_bits_claim_page(h);
   u64 i = off / GC_UNIT, m = 1ull << (i & 63);
-  if (__atomic_load_n(&gc_markbits[i >> 6], __ATOMIC_RELAXED) & m) return;
+  if (__atomic_load_n(&ST->gc_markbits[i >> 6], __ATOMIC_RELAXED) & m) return;
   if (gc_being_born(v)) return;
-  if (!gc_conc_on) gc_markbits[i >> 6] |= m;
-  else if (__atomic_fetch_or(&gc_markbits[i >> 6], m, __ATOMIC_RELAXED) & m) return;
-  if (gc_col.ngrey >= gc_capgrey) die("the collector's mark stack overflowed");
-  gc_grey[gc_col.ngrey++] = (u8 *)(uptr)GC_CANON(v);
+  if (!ST->gc_conc_on) ST->gc_markbits[i >> 6] |= m;
+  else if (__atomic_fetch_or(&ST->gc_markbits[i >> 6], m, __ATOMIC_RELAXED) & m) return;
+  if (ST->gc_col.ngrey >= ST->gc_capgrey) die("the collector's mark stack overflowed");
+  ST->gc_grey[ST->gc_col.ngrey++] = (u8 *)(uptr)GC_CANON(v);
 }
 
 /* The program's shade: the object's bit, and the object onto the queue for
@@ -2563,21 +2670,13 @@ static void gc_mark_ref(u64 v) {
   u32 g = gc_page_of((void *)(uptr)v);
   if (!gc_bit_set(g, v)) return;
   u8 *p = (u8 *)(uptr)GC_CANON(v);
-  gc_mut.barrier_shaded++;
-  gc_mq[gc_mqp.head++] = p;
+  ST->gc_mut.barrier_shaded++;
+  ST->gc_mq[ST->gc_mqp.head++] = p;
 
-  if (gc_mqp.head - gc_mqp.pub >= GC_MQ_BATCH)
-    __atomic_store_n(&gc_mqp.pub, gc_mqp.head, __ATOMIC_RELEASE);
+  if (ST->gc_mqp.head - ST->gc_mqp.pub >= GC_MQ_BATCH)
+    __atomic_store_n(&ST->gc_mqp.pub, ST->gc_mqp.head, __ATOMIC_RELEASE);
 }
 
-enum {
-  GCJ_ROUND,
-  GCJ_IDLE,
-  GCJ_MARK,
-  GCJ_RELOC,
-  GCJ_SLOT,
-  GCJ_N
-};
 
 static void gc_jitter(u32 point);
 
@@ -2603,7 +2702,7 @@ static void gc_reloc_slot(u64 *slot) {
 static void gc_scan_object(u8 *p) {
   const GcHeader *h = (const GcHeader *)p;
   const GcTypeInfo *ti = gc_typeinfo(h->w);
-  gc_add_live(gc_head_of((GC_ADDR(p) - (u64)(uptr)gc_base) >> GC_GRAN_SHIFT),
+  gc_add_live(gc_head_of((GC_ADDR(p) - (u64)(uptr)ST->gc_base) >> GC_GRAN_SHIFT),
               gc_object_bytes_ti(h, ti));
   if (ti->kind == GCK_ARRAY) {
     if (!ti->elem_is_ref) return;
@@ -2617,31 +2716,25 @@ static void gc_scan_object(u8 *p) {
 }
 
 static void gc_drain(void) {
-  while (gc_col.ngrey) gc_scan_object(gc_grey[--gc_col.ngrey]);
+  while (ST->gc_col.ngrey) gc_scan_object(ST->gc_grey[--ST->gc_col.ngrey]);
 }
 
 static u64 gc_take_queue(void) {
-  u64 pub = __atomic_load_n(&gc_mqp.pub, __ATOMIC_ACQUIRE);
-  u64 n = pub - gc_col.mq_tail;
-  while (gc_col.mq_tail < pub) {
-    if (gc_col.ngrey >= gc_capgrey) die("the collector's mark stack overflowed");
-    gc_grey[gc_col.ngrey++] = gc_mq[gc_col.mq_tail++];
+  u64 pub = __atomic_load_n(&ST->gc_mqp.pub, __ATOMIC_ACQUIRE);
+  u64 n = pub - ST->gc_col.mq_tail;
+  while (ST->gc_col.mq_tail < pub) {
+    if (ST->gc_col.ngrey >= ST->gc_capgrey) die("the collector's mark stack overflowed");
+    ST->gc_grey[ST->gc_col.ngrey++] = ST->gc_mq[ST->gc_col.mq_tail++];
   }
   return n;
 }
 
 #define gc_mark_slot_shared gc_mark_slot
 
-static u64 gc_reloc_pages, gc_reloc_bytes, gc_reloc_objs, gc_reloc_stalls;
 
-static u64 gc_reloc_lost, gc_reloc_mut, gc_reloc_pages_all, gc_reloc_objs_all;
 
 static u32 gc_opt_reloc_stall;
-static u64 gc_reloc_tried;
-static u32 gc_evac_small = (u32)-1, gc_evac_medium = (u32)-1;
 
-static u64 *gc_fwd;
-static u64 gc_fwd_slots;
 
 static u64 gc_fwd_hash(u64 a) {
   a >>= 4;
@@ -2651,20 +2744,20 @@ static u64 gc_fwd_hash(u64 a) {
 
 static u64 gc_fwd_await(u64 i) {
   for (;;) {
-    u64 to = __atomic_load_n(&gc_fwd[i * 2 + 1], __ATOMIC_ACQUIRE);
+    u64 to = __atomic_load_n(&ST->gc_fwd[i * 2 + 1], __ATOMIC_ACQUIRE);
     if (to) return to;
     warmc_cpu_relax();
   }
 }
 
 static u64 gc_fwd_get(u64 from) {
-  if (!__atomic_load_n(&gc_fwd, __ATOMIC_RELAXED)) return 0;
+  if (!__atomic_load_n(&ST->gc_fwd, __ATOMIC_RELAXED)) return 0;
   __atomic_thread_fence(__ATOMIC_ACQUIRE);
-  u64 m = gc_fwd_slots - 1;
+  u64 m = ST->gc_fwd_slots - 1;
   u64 i = gc_fwd_hash(from) & m;
   for (u64 tries = 0; ; tries++) {
-    if (tries > gc_fwd_slots) die("the forwarding table has no free slot");
-    u64 k = __atomic_load_n(&gc_fwd[i * 2], __ATOMIC_ACQUIRE);
+    if (tries > ST->gc_fwd_slots) die("the forwarding table has no free slot");
+    u64 k = __atomic_load_n(&ST->gc_fwd[i * 2], __ATOMIC_ACQUIRE);
     if (!k) return 0;
     if (k == from) return gc_fwd_await(i);
     i = (i + 1) & m;
@@ -2672,15 +2765,15 @@ static u64 gc_fwd_get(u64 from) {
 }
 
 static u64 gc_fwd_claim(u64 from, u32 *mine) {
-  u64 m = gc_fwd_slots - 1;
+  u64 m = ST->gc_fwd_slots - 1;
   u64 i = gc_fwd_hash(from) & m;
 
   for (u64 tries = 0; ; tries++) {
-    if (tries > gc_fwd_slots) die("the forwarding table filled up");
-    u64 k = __atomic_load_n(&gc_fwd[i * 2], __ATOMIC_ACQUIRE);
+    if (tries > ST->gc_fwd_slots) die("the forwarding table filled up");
+    u64 k = __atomic_load_n(&ST->gc_fwd[i * 2], __ATOMIC_ACQUIRE);
     if (!k) {
       u64 expect = 0;
-      if (__atomic_compare_exchange_n(&gc_fwd[i * 2], &expect, from, 0,
+      if (__atomic_compare_exchange_n(&ST->gc_fwd[i * 2], &expect, from, 0,
                                       __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
         *mine = 1;
         return i;
@@ -2696,37 +2789,35 @@ static void gc_page_free(u32 h);
 
 /* No granule may have moved any more: the forwarding table is gone. */
 static void gc_map_settle(void) {
-  for (u64 g = 0; g < gc_gran_hwm; g++) gc_gran_map[g] &= (u8)~GCM_MOVED;
+  for (u64 g = 0; g < ST->gc_gran_hwm; g++) ST->gc_gran_map[g] &= (u8)~GCM_MOVED;
 }
 
-static u64 *gc_fwd_dead;
-static u64 gc_fwd_dead_slots;
 
 static void gc_fwd_retire(void) {
-  gc_fwd_dead = gc_fwd;
-  gc_fwd_dead_slots = gc_fwd_slots;
-  gc_fwd = 0;
-  gc_fwd_slots = 0;
+  ST->gc_fwd_dead = ST->gc_fwd;
+  ST->gc_fwd_dead_slots = ST->gc_fwd_slots;
+  ST->gc_fwd = 0;
+  ST->gc_fwd_slots = 0;
   gc_map_settle();
 
-  for (u32 h = 0; h < gc_gran_hwm; h++)
-    if (gc_pages[h].kind == GCP_FWD) gc_page_free(h);
+  for (u32 h = 0; h < ST->gc_gran_hwm; h++)
+    if (ST->gc_pages[h].kind == GCP_FWD) gc_page_free(h);
 }
 
 static void gc_fwd_unmap(void) {
-  if (gc_fwd_dead) sys_munmap(gc_fwd_dead, (usz)(gc_fwd_dead_slots * 16));
-  gc_fwd_dead = 0;
-  gc_fwd_dead_slots = 0;
+  if (ST->gc_fwd_dead) sys_munmap(ST->gc_fwd_dead, (usz)(ST->gc_fwd_dead_slots * 16));
+  ST->gc_fwd_dead = 0;
+  ST->gc_fwd_dead_slots = 0;
 }
 
 static u64 gc_reloc_object(u64 from);
 
 static u32 gc_reloc_wanted(u64 a) {
-  if (__atomic_load_n(&gc_phase, __ATOMIC_ACQUIRE) != GCPH_RELOC) return 0;
-  u64 off = a - (u64)(uptr)gc_base;
-  if (off >= gc_heap_bytes) return 0;
+  if (__atomic_load_n(&ST->gc_phase, __ATOMIC_ACQUIRE) != GCPH_RELOC) return 0;
+  u64 off = a - (u64)(uptr)ST->gc_base;
+  if (off >= ST->gc_heap_bytes) return 0;
   u32 h = gc_page_head((u32)(off >> GC_GRAN_SHIFT));
-  return __atomic_load_n(&gc_pages[h].reloc, __ATOMIC_ACQUIRE);
+  return __atomic_load_n(&ST->gc_pages[h].reloc, __ATOMIC_ACQUIRE);
 }
 
 /* Whether the object at a may have moved: only one on a page chosen for
@@ -2735,44 +2826,44 @@ static u32 gc_reloc_wanted(u64 a) {
    colour alone, with no look in the table -- most of those the program's
    barrier and the collector's mark heal. */
 static u32 gc_may_have_moved(u64 a) {
-  u64 off = a - (u64)(uptr)gc_base;
-  if (off >= gc_heap_bytes) return 0;
-  return __atomic_load_n(&gc_gran_map[off >> GC_GRAN_SHIFT], __ATOMIC_ACQUIRE) & GCM_MOVED;
+  u64 off = a - (u64)(uptr)ST->gc_base;
+  if (off >= ST->gc_heap_bytes) return 0;
+  return __atomic_load_n(&ST->gc_gran_map[off >> GC_GRAN_SHIFT], __ATOMIC_ACQUIRE) & GCM_MOVED;
 }
 
 static u64 gc_heal_ptr(u64 v) {
   u64 a = GC_ADDR(v);
-  if (!gc_may_have_moved(a)) return a | gc_good;
+  if (!gc_may_have_moved(a)) return a | ST->gc_good;
   u64 to = gc_fwd_get(a);
-  return (to ? to : a) | gc_good;
+  return (to ? to : a) | ST->gc_good;
 }
 
 static u64 gc_heal_reloc(u64 v) {
   u64 a = GC_ADDR(v);
-  if (!gc_may_have_moved(a)) return a | gc_good;
+  if (!gc_may_have_moved(a)) return a | ST->gc_good;
   u64 to = gc_fwd_get(a);
   if (!to) {
     if (gc_reloc_wanted(a)) to = gc_reloc_object(a);
     else to = gc_fwd_get(a);
   }
-  return (to ? to : a) | gc_good;
+  return (to ? to : a) | ST->gc_good;
 }
 
 static u64 gc_page_nlive(u32 h) {
   u64 b = ((u64)h * GC_GRAN) / GC_UNIT;
-  u64 e = b + ((u64)gc_pages[h].ngran * GC_GRAN) / GC_UNIT;
-  if (gc_page_epoch[h] != GC_EPOCH_READY(gc_cycle_no)) return 0;
+  u64 e = b + ((u64)ST->gc_pages[h].ngran * GC_GRAN) / GC_UNIT;
+  if (ST->gc_page_epoch[h] != GC_EPOCH_READY(ST->gc_cycle_no)) return 0;
   u64 n = 0;
-  for (u64 w = b / 64; w < e / 64; w++) n += (u64)__builtin_popcountll(gc_markbits[w]);
+  for (u64 w = b / 64; w < e / 64; w++) n += (u64)__builtin_popcountll(ST->gc_markbits[w]);
   return n;
 }
 
 static u32 gc_reloc_candidate(u32 h, u32 eighths) {
-  const GcPage *P = &gc_pages[h];
+  const GcPage *P = &ST->gc_pages[h];
   if (P->kind != GCP_SMALL && P->kind != GCP_MEDIUM) return 0;
   if (gc_page_current(h)) return 0;
 
-  if (P->alloc_cycle == (u32)gc_cycle_no) return 0;
+  if (P->alloc_cycle == (u32)ST->gc_cycle_no) return 0;
   if (P->reloc) return 0;
   u64 cap = (u64)P->ngran * GC_GRAN;
   return P->live * 8 <= cap * eighths;
@@ -2780,31 +2871,31 @@ static u32 gc_reloc_candidate(u32 h, u32 eighths) {
 
 static void gc_select_reloc(void) {
 
-  gc_reloc_pages = gc_reloc_bytes = gc_reloc_objs = 0;
+  ST->gc_reloc_pages = ST->gc_reloc_bytes = ST->gc_reloc_objs = 0;
   if (!gc_opt_reloc) return;
-  u64 room = (gc_ngran - gc_gran_used) * GC_GRAN;
+  u64 room = (ST->gc_ngran - ST->gc_gran_used) * GC_GRAN;
 
   /* four granules kept for the program's allocations while relocation
      runs, out of what the reserve leaves it */
-  if (room > (gc_reserve_gran + 4) * GC_GRAN) room -= 4 * GC_GRAN;
+  if (room > (ST->gc_reserve_gran + 4) * GC_GRAN) room -= 4 * GC_GRAN;
   u64 nobj = 0;
   for (u32 eighths = 1; eighths <= gc_opt_reloc && eighths <= 8; eighths++) {
-    for (u32 h = 0; h < gc_gran_hwm; h++) {
+    for (u32 h = 0; h < ST->gc_gran_hwm; h++) {
 
-      u8 kind = __atomic_load_n(&gc_pages[h].kind, __ATOMIC_ACQUIRE);
+      u8 kind = __atomic_load_n(&ST->gc_pages[h].kind, __ATOMIC_ACQUIRE);
       if (kind == GCP_TAIL || kind == GCP_FREE) continue;
       if (!gc_reloc_candidate(h, eighths)) continue;
-      if (gc_pages[h].live > room) continue;
-      gc_pages[h].reloc = 1;
-      for (u32 i = 0; i < gc_pages[h].ngran; i++) gc_gran_map[h + i] |= GCM_MOVED;
-      room -= gc_pages[h].live;
-      gc_reloc_bytes += gc_pages[h].live;
-      gc_reloc_pages++;
-      gc_reloc_pages_all++;
+      if (ST->gc_pages[h].live > room) continue;
+      ST->gc_pages[h].reloc = 1;
+      for (u32 i = 0; i < ST->gc_pages[h].ngran; i++) ST->gc_gran_map[h + i] |= GCM_MOVED;
+      room -= ST->gc_pages[h].live;
+      ST->gc_reloc_bytes += ST->gc_pages[h].live;
+      ST->gc_reloc_pages++;
+      ST->gc_reloc_pages_all++;
       nobj += gc_page_nlive(h);
     }
   }
-  if (!gc_reloc_pages) return;
+  if (!ST->gc_reloc_pages) return;
 
   u64 slots = 16;
   while (slots < nobj * 2) slots <<= 1;
@@ -2812,31 +2903,25 @@ static void gc_select_reloc(void) {
                            MAP_PRIVATE | MAP_ANONYMOUS);
   if (!t || t == (u64 *)-1) {
 
-    for (u32 h = 0; h < gc_gran_hwm; h++) gc_pages[h].reloc = 0;
+    for (u32 h = 0; h < ST->gc_gran_hwm; h++) ST->gc_pages[h].reloc = 0;
     gc_map_settle();
-    gc_reloc_pages = gc_reloc_bytes = 0;
+    ST->gc_reloc_pages = ST->gc_reloc_bytes = 0;
     return;
   }
 
-  gc_fwd_slots = slots;
-  __atomic_store_n(&gc_fwd, t, __ATOMIC_RELEASE);
+  ST->gc_fwd_slots = slots;
+  __atomic_store_n(&ST->gc_fwd, t, __ATOMIC_RELEASE);
 }
 
-static GcRoots *gc_rootlist;
 static const u32 gc_one = 1;
 
-typedef struct { u64 gpr[10]; u64 sp; u64 pc; } GcCtx;
-GcCtx warmc_gc_ctx;
-static u32 gc_from_wasm;
 
 static u32 gc_may_collect(void) {
-  if (gc_no_collect) return 0;
-  return !(gc_from_wasm && warmc_gc_invoke_depth > 1);
+  if (ST->gc_no_collect) return 0;
+  return !(ST->gc_from_wasm && ST->gc_invoke_depth > 1);
 }
 
-u64 warmc_gc_invoke_depth;
 
-static u32 gc_no_collect;
 
 static const FuncUnwind *find_unwind_in(u64 pc, const ModuleDesc **owner);
 static u64 load64(u64 addr);
@@ -2844,10 +2929,10 @@ static u64 load64(u64 addr);
 typedef void (*GcRootFn)(u64 *slot);
 
 static void gc_visit_frames(GcRootFn fn) {
-  if (!gc_from_wasm) return;
-  u64 pc = warmc_gc_ctx.pc, sp = warmc_gc_ctx.sp;
+  if (!ST->gc_from_wasm) return;
+  u64 pc = ST->gc_ctx.pc, sp = ST->gc_ctx.sp;
   u64 *gprloc[10];
-  for (u32 i = 0; i < 10; i++) gprloc[i] = &warmc_gc_ctx.gpr[i];
+  for (u32 i = 0; i < 10; i++) gprloc[i] = &ST->gc_ctx.gpr[i];
   u64 fp = 0;
   for (u32 guard = 0; ; guard++) {
     if (guard > (1u << 24)) die("the collector's frame walk did not terminate");
@@ -2904,8 +2989,8 @@ static void gc_visit_frames(GcRootFn fn) {
 }
 
 static void gc_visit_globals(GcRootFn fn) {
-  for (u32 i = 0; i < ninstances; i++) {
-    Instance *in = instances[i];
+  for (u32 i = 0; i < ST->ninstances; i++) {
+    Instance *in = ST->instances[i];
     if (!in || !in->md) continue;
     for (u32 g = 0; g < in->md->nglobals; g++) {
       if (in->md->globals[g].type != VT_REF) continue;
@@ -2916,9 +3001,9 @@ static void gc_visit_globals(GcRootFn fn) {
 }
 
 static void gc_visit_tables(GcRootFn fn) {
-  u32 n = __atomic_load_n(&ninstances, __ATOMIC_ACQUIRE);
+  u32 n = __atomic_load_n(&ST->ninstances, __ATOMIC_ACQUIRE);
   for (u32 i = 0; i < n; i++) {
-    Instance *in = instances[i];
+    Instance *in = ST->instances[i];
     if (!in || !in->md) continue;
     u32 ntab = in->tabs ? in->md->ntables : 0;
     for (u32 t = 0; t < ntab; t++) {
@@ -2933,13 +3018,13 @@ static void gc_visit_tables(GcRootFn fn) {
 static void gc_visit_strong_roots(GcRootFn fn) {
   gc_visit_frames(fn);
   gc_visit_globals(fn);
-  for (u32 i = 0; i < ninstances; i++) {
-    Instance *in = instances[i];
+  for (u32 i = 0; i < ST->ninstances; i++) {
+    Instance *in = ST->instances[i];
     if (!in || !in->md) continue;
     for (u64 k = 0; k < (in->elem_values ? in->nelem_values : 0); k++)
       fn((u64 *)&in->elem_values[k]);
   }
-  for (GcRoots *r = gc_rootlist; r; r = r->next)
+  for (GcRoots *r = ST->gc_rootlist; r; r = r->next)
     for (u32 i = 0; i < *r->n; i++) fn(&r->base[i]);
 }
 
@@ -2950,8 +3035,6 @@ static const char *const gc_jitter_name[GCJ_N] = { "round", "idle", "mark",
 
 static u32 gc_opt_jitter;
 static u64 gc_opt_jitter_seed;
-static u64 gc_jitter_state[2];
-static u64 gc_jitter_hits[2][GCJ_N];
 
 static u64 gc_jitter_mix(u64 x) {
   x += 0x9e3779b97f4a7c15ull;
@@ -2969,10 +3052,10 @@ static u64 gc_jitter_next(u64 *s) {
 static void gc_jitter(u32 point) {
   if (!gc_opt_jitter) return;
   u32 who = gcth_on_collector() ? 1u : 0u;
-  u64 r = gc_jitter_next(&gc_jitter_state[who]);
+  u64 r = gc_jitter_next(&ST->gc_jitter_state[who]);
   u32 sh = gc_jitter_shift[point];
   if ((r & ((256u << sh) - 1u)) >= gc_opt_jitter) return;
-  gc_jitter_hits[who][point]++;
+  ST->gc_jitter_hits[who][point]++;
 
   u32 n = (u32)(r >> 8) & 0x3ffu;
   if (!(r & 0xf000ull)) n <<= 6;
@@ -2995,45 +3078,35 @@ static void gc_verify(void);
 #define GCR_ROUND(w)          ((u32)((w) >> 3))
 #define GCR_WORD(kind, round) ((u64)(kind) | ((u64)(round) << 3))
 
-static u64 gc_poll;
-static GcthGate gc_round_done;
 
-__attribute__((aligned(GC_LINE))) static GcthGate gc_mut_wait;
-static u32 gc_round_ok;
-static u32 gcth_stopping, gcth_started;
-static GcthGate gcth_stopped;
 
-static u64 gc_nrounds_asked, gc_nrounds, gc_nrounds_refused, gc_nrounds_aborted;
 
-static u64 gc_t_rounds, gc_round_max;
 
 #define GC_ROUND_POLL_NS    1000000ull
 
 #define GC_ROUND_BACKOFF_NS  100000ull
 
-static GcthGate gcth_idle;
 
 static u32 gcth_idle_seen(void) {
-  return __atomic_load_n(&gcth_idle.v, __ATOMIC_ACQUIRE);
+  return __atomic_load_n(&ST->gcth_idle.v, __ATOMIC_ACQUIRE);
 }
 
-static u64 gc_nrests, gc_nrests_late;
 
 static void gcth_pause_since(u32 seen, u64 ns) {
-  gc_nrests++;
-  gc_nrests_late += (u64)(gcth_park_timeout(&gcth_idle, seen, ns) != 0);
+  ST->gc_nrests++;
+  ST->gc_nrests_late += (u64)(gcth_park_timeout(&ST->gcth_idle, seen, ns) != 0);
 }
 
 static void gcth_pause(u64 ns) { gcth_pause_since(gcth_idle_seen(), ns); }
 
 static void gcth_nudge(void) {
-  gcth_unpark(&gcth_idle, __atomic_load_n(&gcth_idle.v, __ATOMIC_RELAXED) + 1u);
+  gcth_unpark(&ST->gcth_idle, __atomic_load_n(&ST->gcth_idle.v, __ATOMIC_RELAXED) + 1u);
 }
 
 static void gc_assert_at_safepoint(void) {
 
-  if (!gc_from_wasm) return;
-  u64 pc = warmc_gc_ctx.pc;
+  if (!ST->gc_from_wasm) return;
+  u64 pc = ST->gc_ctx.pc;
   if (!find_unwind(pc))
     die("a round was answered at an address no compiled function owns");
 #if defined(__x86_64__)
@@ -3053,30 +3126,27 @@ static void gc_assert_at_safepoint(void) {
 #endif
 }
 
-static u32 gc_round_active;
 static u32 gc_opt_die_round;
-static u32 gc_rounds_seen;
-static u64 gc_claim_slot, gc_claim_from;
 
 static void gc_service_round(void) {
-  u64 w = __atomic_load_n(&gc_poll, __ATOMIC_ACQUIRE);
+  u64 w = __atomic_load_n(&ST->gc_poll, __ATOMIC_ACQUIRE);
   if (!w) return;
   u32 n = GCR_ROUND(w), kind = GCR_KIND(w);
 
   gc_jitter(GCJ_ROUND);
 
   u64 expect = w;
-  if (!__atomic_compare_exchange_n(&gc_poll, &expect, (u64)0, 0,
+  if (!__atomic_compare_exchange_n(&ST->gc_poll, &expect, (u64)0, 0,
                                    __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
     return;
 
   u32 ok = 0;
-  gc_round_active = n + 1;
+  ST->gc_round_active = n + 1;
 
   if (gc_may_collect()) {
     gc_assert_at_safepoint();
-    if (gc_opt_die_round && g_catching &&
-        ++gc_rounds_seen == gc_opt_die_round)
+    if (gc_opt_die_round && ST->g_catching &&
+        ++ST->gc_rounds_seen == gc_opt_die_round)
       die("a round handler was asked to fail");
     u64 t0 = gc_opt_stats ? sys_nanos() : 0;
     switch (kind) {
@@ -3089,75 +3159,75 @@ static void gc_service_round(void) {
     }
     if (gc_opt_stats) {
       u64 dt = sys_nanos() - t0;
-      gc_t_rounds += dt;
-      if (dt > gc_round_max) gc_round_max = dt;
+      ST->gc_t_rounds += dt;
+      if (dt > ST->gc_round_max) ST->gc_round_max = dt;
 
-      gc_t_total += dt;
-      gc_pause_count++;
-      if (dt > gc_pause_max) gc_pause_max = dt;
-      gc_pause_hist[dt < 10000 ? 0 : dt < 100000 ? 1 : dt < 1000000 ? 2
+      ST->gc_t_total += dt;
+      ST->gc_pause_count++;
+      if (dt > ST->gc_pause_max) ST->gc_pause_max = dt;
+      ST->gc_pause_hist[dt < 10000 ? 0 : dt < 100000 ? 1 : dt < 1000000 ? 2
                                 : dt < 10000000 ? 3 : 4]++;
     }
     ok = 1;
-    gc_nrounds++;
+    ST->gc_nrounds++;
   } else {
-    gc_nrounds_refused++;
+    ST->gc_nrounds_refused++;
   }
-  __atomic_store_n(&gc_round_ok, ok, __ATOMIC_RELAXED);
+  __atomic_store_n(&ST->gc_round_ok, ok, __ATOMIC_RELAXED);
 
   gc_jitter(GCJ_ROUND);
-  gc_round_active = 0;
-  gcth_unpark(&gc_round_done, n);
+  ST->gc_round_active = 0;
+  gcth_unpark(&ST->gc_round_done, n);
 }
 
 static void gc_answer_outstanding(u64 *counter) {
-  if (gc_round_active) {
-    u32 n = gc_round_active - 1;
-    gc_round_active = 0;
+  if (ST->gc_round_active) {
+    u32 n = ST->gc_round_active - 1;
+    ST->gc_round_active = 0;
     if (counter) (*counter)++;
-    __atomic_store_n(&gc_round_ok, 0u, __ATOMIC_RELAXED);
-    gcth_unpark(&gc_round_done, n);
+    __atomic_store_n(&ST->gc_round_ok, 0u, __ATOMIC_RELAXED);
+    gcth_unpark(&ST->gc_round_done, n);
     return;
   }
-  u64 w = __atomic_load_n(&gc_poll, __ATOMIC_ACQUIRE);
+  u64 w = __atomic_load_n(&ST->gc_poll, __ATOMIC_ACQUIRE);
   if (!w) return;
   u64 expect = w;
-  if (!__atomic_compare_exchange_n(&gc_poll, &expect, (u64)0, 0,
+  if (!__atomic_compare_exchange_n(&ST->gc_poll, &expect, (u64)0, 0,
                                    __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
     return;
   if (counter) (*counter)++;
-  __atomic_store_n(&gc_round_ok, 0u, __ATOMIC_RELAXED);
-  gcth_unpark(&gc_round_done, GCR_ROUND(w));
+  __atomic_store_n(&ST->gc_round_ok, 0u, __ATOMIC_RELAXED);
+  gcth_unpark(&ST->gc_round_done, GCR_ROUND(w));
 }
 
-static void gc_abort_round(void) { gc_answer_outstanding(&gc_nrounds_aborted); }
+static void gc_abort_round(void) { gc_answer_outstanding(&ST->gc_nrounds_aborted); }
 
 static u32 gc_opt_trap_round;
 
 static void gc_trap_round_arm(void) {
   if (!gc_opt_trap_round) return;
-  if (__atomic_load_n(&gcth_started, __ATOMIC_ACQUIRE)) return;
-  if (__atomic_load_n(&gc_poll, __ATOMIC_RELAXED)) return;
-  u32 n = GCR_ROUND(__atomic_load_n(&gc_poll, __ATOMIC_RELAXED)) + 1;
-  u32 last = __atomic_load_n(&gc_round_done.v, __ATOMIC_RELAXED);
+  if (__atomic_load_n(&ST->gcth_started, __ATOMIC_ACQUIRE)) return;
+  if (__atomic_load_n(&ST->gc_poll, __ATOMIC_RELAXED)) return;
+  u32 n = GCR_ROUND(__atomic_load_n(&ST->gc_poll, __ATOMIC_RELAXED)) + 1;
+  u32 last = __atomic_load_n(&ST->gc_round_done.v, __ATOMIC_RELAXED);
   if (last >= n) n = last + 1;
 
-  gc_nrounds_asked++;
-  __atomic_store_n(&gc_poll, GCR_WORD(GCR_NOP, n), __ATOMIC_RELEASE);
+  ST->gc_nrounds_asked++;
+  __atomic_store_n(&ST->gc_poll, GCR_WORD(GCR_NOP, n), __ATOMIC_RELEASE);
 }
 
 static void gc_mut_nudge(void) {
-  gcth_unpark(&gc_mut_wait,
-              __atomic_load_n(&gc_mut_wait.v, __ATOMIC_RELAXED) + 1u);
+  gcth_unpark(&ST->gc_mut_wait,
+              __atomic_load_n(&ST->gc_mut_wait.v, __ATOMIC_RELAXED) + 1u);
 }
 
 static u32 gc_round_ask(u32 kind) {
-  u32 n = GCR_ROUND(__atomic_load_n(&gc_poll, __ATOMIC_RELAXED));
-  u32 last = __atomic_load_n(&gc_round_done.v, __ATOMIC_RELAXED);
+  u32 n = GCR_ROUND(__atomic_load_n(&ST->gc_poll, __ATOMIC_RELAXED));
+  u32 last = __atomic_load_n(&ST->gc_round_done.v, __ATOMIC_RELAXED);
   if (last > n) n = last;
   n++;
-  gc_nrounds_asked++;
-  __atomic_store_n(&gc_poll, GCR_WORD(kind, n), __ATOMIC_RELEASE);
+  ST->gc_nrounds_asked++;
+  __atomic_store_n(&ST->gc_poll, GCR_WORD(kind, n), __ATOMIC_RELEASE);
 
   gc_mut_nudge();
 
@@ -3167,70 +3237,69 @@ static u32 gc_round_ask(u32 kind) {
 
 static u32 gc_round_drop(u32 kind, u32 n) {
   u64 expect = GCR_WORD(kind, n);
-  return (u32)__atomic_compare_exchange_n(&gc_poll, &expect, (u64)0, 0,
+  return (u32)__atomic_compare_exchange_n(&ST->gc_poll, &expect, (u64)0, 0,
                                           __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
 }
 
 static void gc_round_repost(u32 kind, u32 n) {
-  __atomic_store_n(&gc_poll, GCR_WORD(kind, n), __ATOMIC_RELEASE);
+  __atomic_store_n(&ST->gc_poll, GCR_WORD(kind, n), __ATOMIC_RELEASE);
   gc_mut_nudge();
 }
 
 static u32 gc_round(u32 kind) {
   u32 n = gc_round_ask(kind);
   for (;;) {
-    if (__atomic_load_n(&gc_round_done.v, __ATOMIC_ACQUIRE) == n) break;
-    if (__atomic_load_n(&gcth_stopping, __ATOMIC_ACQUIRE)) {
+    if (__atomic_load_n(&ST->gc_round_done.v, __ATOMIC_ACQUIRE) == n) break;
+    if (__atomic_load_n(&ST->gcth_stopping, __ATOMIC_ACQUIRE)) {
 
       gc_round_drop(kind, n);
       return 0;
     }
-    gcth_park_timeout(&gc_round_done, n - 1, GC_ROUND_POLL_NS);
+    gcth_park_timeout(&ST->gc_round_done, n - 1, GC_ROUND_POLL_NS);
   }
-  return __atomic_load_n(&gc_round_ok, __ATOMIC_RELAXED);
+  return __atomic_load_n(&ST->gc_round_ok, __ATOMIC_RELAXED);
 }
 
-static u64 gc_nrounds_held, gc_nrounds_collided, gc_nmark_rests;
 
 static u32 gc_queue_pending(void) {
-  return __atomic_load_n(&gc_mqp.pub, __ATOMIC_ACQUIRE) !=
-         __atomic_load_n(&gc_col.mq_tail, __ATOMIC_RELAXED);
+  return __atomic_load_n(&ST->gc_mqp.pub, __ATOMIC_ACQUIRE) !=
+         __atomic_load_n(&ST->gc_col.mq_tail, __ATOMIC_RELAXED);
 }
 
 #define GC_MARK_END_POLL_NS 100000ull
 
 static void gc_mark_end_rest(u32 n) {
-  gc_nmark_rests++;
+  ST->gc_nmark_rests++;
   for (u32 i = __atomic_load_n(&gcth_spin, __ATOMIC_RELAXED); i; i--) {
-    if (__atomic_load_n(&gc_round_done.v, __ATOMIC_ACQUIRE) == n) return;
+    if (__atomic_load_n(&ST->gc_round_done.v, __ATOMIC_ACQUIRE) == n) return;
     if (gc_queue_pending()) return;
     warmc_cpu_relax();
   }
-  gcth_park_timeout(&gc_round_done, n - 1, GC_MARK_END_POLL_NS);
+  gcth_park_timeout(&ST->gc_round_done, n - 1, GC_MARK_END_POLL_NS);
 }
 
 static u32 gc_round_mark_end(void) {
   u32 n = gc_round_ask(GCR_MARK_END);
   for (;;) {
-    if (__atomic_load_n(&gc_round_done.v, __ATOMIC_ACQUIRE) == n) break;
-    if (__atomic_load_n(&gcth_stopping, __ATOMIC_ACQUIRE)) {
+    if (__atomic_load_n(&ST->gc_round_done.v, __ATOMIC_ACQUIRE) == n) break;
+    if (__atomic_load_n(&ST->gcth_stopping, __ATOMIC_ACQUIRE)) {
       gc_round_drop(GCR_MARK_END, n);
       return 0;
     }
     if (gc_queue_pending()) {
 
       if (!gc_round_drop(GCR_MARK_END, n)) {
-        gc_nrounds_collided++;
+        ST->gc_nrounds_collided++;
 
-        gcth_park_timeout(&gc_round_done, n - 1, GC_ROUND_POLL_NS);
+        gcth_park_timeout(&ST->gc_round_done, n - 1, GC_ROUND_POLL_NS);
         continue;
       }
-      gc_nrounds_held++;
+      ST->gc_nrounds_held++;
 
-      gc_col.mark_wait_took += gc_take_queue();
-      while (gc_col.ngrey) {
-        gc_scan_object(gc_grey[--gc_col.ngrey]);
-        gc_col.mark_conc_objs++;
+      ST->gc_col.mark_wait_took += gc_take_queue();
+      while (ST->gc_col.ngrey) {
+        gc_scan_object(ST->gc_grey[--ST->gc_col.ngrey]);
+        ST->gc_col.mark_conc_objs++;
       }
       gc_jitter(GCJ_MARK);
       gc_round_repost(GCR_MARK_END, n);
@@ -3238,7 +3307,7 @@ static u32 gc_round_mark_end(void) {
     }
     gc_mark_end_rest(n);
   }
-  return __atomic_load_n(&gc_round_ok, __ATOMIC_RELAXED);
+  return __atomic_load_n(&ST->gc_round_ok, __ATOMIC_RELAXED);
 }
 
 static u32 gc_opt_verify;
@@ -3258,22 +3327,22 @@ static void gc_verify_fail(const char *what, u64 a) {
 
 static void gc_verify_ref_at(u64 v, u32 strong) {
   if (!GC_IS_OBJ(v)) return;
-  if (strong && (v & gc_badmask))
+  if (strong && (v & ST->gc_badmask))
     gc_verify_fail("a root wears a colour compiled code would refuse", v);
-  u64 off = GC_ADDR(v) - (u64)(uptr)gc_base;
-  if (off >= gc_heap_bytes) return;
+  u64 off = GC_ADDR(v) - (u64)(uptr)ST->gc_base;
+  if (off >= ST->gc_heap_bytes) return;
   u64 healed = gc_heal_ptr(v);
-  u32 g = (u32)((GC_ADDR(healed) - (u64)(uptr)gc_base) >> GC_GRAN_SHIFT);
-  if (gc_pages[g].kind == GCP_FREE)
+  u32 g = (u32)((GC_ADDR(healed) - (u64)(uptr)ST->gc_base) >> GC_GRAN_SHIFT);
+  if (ST->gc_pages[g].kind == GCP_FREE)
     gc_verify_fail("a reference heals to a page that has been freed", v);
   u32 h = gc_page_head(g);
-  if (gc_pages[h].reloc)
+  if (ST->gc_pages[h].reloc)
     gc_verify_fail("a reference heals to a page that was relocated", v);
   if (gc_bit_test(healed)) return;
 
-  if (gc_pages[h].alloc_cycle == (u32)gc_cycle_no &&
+  if (ST->gc_pages[h].alloc_cycle == (u32)ST->gc_cycle_no &&
       GC_ADDR(healed) >= (u64)(uptr)gc_gran_addr(h) &&
-      GC_ADDR(healed) < (u64)(uptr)gc_pages[h].top)
+      GC_ADDR(healed) < (u64)(uptr)ST->gc_pages[h].top)
     return;
   gc_verify_fail("a reference does not heal to a live object's first word", v);
 }
@@ -3283,17 +3352,17 @@ static void gc_verify_ref_slot(u64 *slot) { gc_verify_ref_at(*slot, 1); }
 static void gc_verify_ref_weak(u64 *slot) { gc_verify_ref_at(*slot, 0); }
 
 static void gc_verify(void) {
-  for (u64 g = 0; g < gc_gran_hwm; g++) {
-    u32 free = (gc_granfree[g >> 6] >> (g & 63)) & 1u;
-    if (free != (gc_pages[g].kind == GCP_FREE))
+  for (u64 g = 0; g < ST->gc_gran_hwm; g++) {
+    u32 free = (ST->gc_granfree[g >> 6] >> (g & 63)) & 1u;
+    if (free != (ST->gc_pages[g].kind == GCP_FREE))
       gc_verify_fail("the free bitmap and the page kinds disagree",
                      (u64)(uptr)gc_gran_addr((u32)g));
   }
   u64 total = 0;
-  for (u32 h = 0; h < gc_gran_hwm; h++) {
-    if (gc_pages[h].kind == GCP_TAIL || gc_pages[h].kind == GCP_FREE) continue;
-    if (gc_pages[h].kind == GCP_FWD) continue;
-    u64 end = (u64)(uptr)gc_gran_addr(h) + (u64)gc_pages[h].ngran * GC_GRAN;
+  for (u32 h = 0; h < ST->gc_gran_hwm; h++) {
+    if (ST->gc_pages[h].kind == GCP_TAIL || ST->gc_pages[h].kind == GCP_FREE) continue;
+    if (ST->gc_pages[h].kind == GCP_FWD) continue;
+    u64 end = (u64)(uptr)gc_gran_addr(h) + (u64)ST->gc_pages[h].ngran * GC_GRAN;
     u64 seen = 0;
     u8 *p;
     GC_PAGE_FOREACH(h, p) {
@@ -3314,12 +3383,12 @@ static void gc_verify(void) {
           gc_verify_ref(*(u64 *)(p + refoffs[i]));
       }
     }
-    if (seen != gc_pages[h].live)
+    if (seen != ST->gc_pages[h].live)
       gc_verify_fail("a page's live bytes are not what the walk finds",
                      (u64)(uptr)gc_gran_addr(h));
     total += seen;
   }
-  if (total != gc_marked)
+  if (total != ST->gc_marked)
     gc_verify_fail("the heap's marked bytes are not what the pages hold", total);
   gc_visit_strong_roots(gc_verify_ref_slot);
 
@@ -3330,33 +3399,33 @@ static u64 gc_reloc_object(u64 from) {
   u32 mine = 0;
   u64 i = gc_fwd_claim(from, &mine);
   if (!mine) {
-    __atomic_fetch_add(&gc_reloc_lost, 1ull, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&ST->gc_reloc_lost, 1ull, __ATOMIC_RELAXED);
     return gc_fwd_await(i);
   }
 
   gc_jitter(GCJ_RELOC);
   u32 mut = !gcth_on_collector();
-  if (mut) { gc_reloc_mut++; gc_claim_from = from; gc_claim_slot = i + 1; }
+  if (mut) { ST->gc_reloc_mut++; ST->gc_claim_from = from; ST->gc_claim_slot = i + 1; }
   u64 bytes = gc_object_bytes((const GcHeader *)(uptr)from);
   u32 h = gc_page_head(gc_page_of((const void *)(uptr)from));
   u8 *dst = 0;
   if (!gc_opt_reloc_stall ||
-      __atomic_fetch_add(&gc_reloc_tried, 1ull, __ATOMIC_RELAXED) %
+      __atomic_fetch_add(&ST->gc_reloc_tried, 1ull, __ATOMIC_RELAXED) %
               gc_opt_reloc_stall) {
     u32 held = gc_lock();
-    gc_evacuating = 1;
-    dst = gc_pages[h].kind == GCP_SMALL
-              ? gc_bump(&gc_evac_small, GC_SMALL_GRAN, GCP_SMALL, bytes)
-              : gc_bump(&gc_evac_medium, GC_MEDIUM_GRAN, GCP_MEDIUM, bytes);
-    gc_evacuating = 0;
+    ST->gc_evacuating = 1;
+    dst = ST->gc_pages[h].kind == GCP_SMALL
+              ? gc_bump(&ST->gc_evac_small, GC_SMALL_GRAN, GCP_SMALL, bytes)
+              : gc_bump(&ST->gc_evac_medium, GC_MEDIUM_GRAN, GCP_MEDIUM, bytes);
+    ST->gc_evacuating = 0;
     gc_unlock(held);
   }
 
   if (!dst) {
-    __atomic_store_n(&gc_pages[h].reloc, (u8)2, __ATOMIC_RELEASE);
-    __atomic_fetch_add(&gc_reloc_stalls, 1ull, __ATOMIC_RELAXED);
-    __atomic_store_n(&gc_fwd[i * 2 + 1], from, __ATOMIC_RELEASE);
-    if (mut) gc_claim_slot = 0;
+    __atomic_store_n(&ST->gc_pages[h].reloc, (u8)2, __ATOMIC_RELEASE);
+    __atomic_fetch_add(&ST->gc_reloc_stalls, 1ull, __ATOMIC_RELAXED);
+    __atomic_store_n(&ST->gc_fwd[i * 2 + 1], from, __ATOMIC_RELEASE);
+    if (mut) ST->gc_claim_slot = 0;
     return from;
   }
   mem_move(dst, (const u8 *)(uptr)from, bytes);
@@ -3364,110 +3433,110 @@ static u64 gc_reloc_object(u64 from) {
   gc_bit_set(dg, (u64)(uptr)dst);
   gc_add_live(gc_page_head(dg), bytes);
 
-  __atomic_store_n(&gc_fwd[i * 2 + 1], (u64)(uptr)dst, __ATOMIC_RELEASE);
-  if (mut) gc_claim_slot = 0;
-  __atomic_fetch_add(&gc_reloc_objs, 1ull, __ATOMIC_RELAXED);
-  __atomic_fetch_add(&gc_reloc_objs_all, 1ull, __ATOMIC_RELAXED);
+  __atomic_store_n(&ST->gc_fwd[i * 2 + 1], (u64)(uptr)dst, __ATOMIC_RELEASE);
+  if (mut) ST->gc_claim_slot = 0;
+  __atomic_fetch_add(&ST->gc_reloc_objs, 1ull, __ATOMIC_RELAXED);
+  __atomic_fetch_add(&ST->gc_reloc_objs_all, 1ull, __ATOMIC_RELAXED);
   return (u64)(uptr)dst;
 }
 
 static void gc_relocate(void) {
-  u64 hwm = __atomic_load_n(&gc_gran_hwm, __ATOMIC_RELAXED);
+  u64 hwm = __atomic_load_n(&ST->gc_gran_hwm, __ATOMIC_RELAXED);
 
   gc_jitter(GCJ_RELOC);
-  if (gc_reloc_pages) {
+  if (ST->gc_reloc_pages) {
     for (u32 h = 0; h < hwm; h++) {
-      if (!__atomic_load_n(&gc_pages[h].reloc, __ATOMIC_ACQUIRE)) continue;
+      if (!__atomic_load_n(&ST->gc_pages[h].reloc, __ATOMIC_ACQUIRE)) continue;
       u8 *p;
       GC_PAGE_FOREACH(h, p) gc_reloc_object((u64)(uptr)p);
     }
 
     for (u32 h = 0; h < hwm; h++) {
-      u8 r = __atomic_load_n(&gc_pages[h].reloc, __ATOMIC_ACQUIRE);
+      u8 r = __atomic_load_n(&ST->gc_pages[h].reloc, __ATOMIC_ACQUIRE);
       if (!r) continue;
       if (r == 1) {
-        gc_pages[h].kind = GCP_FWD;
-        gc_pages[h].live = 0;
+        ST->gc_pages[h].kind = GCP_FWD;
+        ST->gc_pages[h].live = 0;
       }
-      __atomic_store_n(&gc_pages[h].reloc, (u8)0, __ATOMIC_RELEASE);
-      if (r == 1) gc_release_pages(h, gc_pages[h].ngran);
+      __atomic_store_n(&ST->gc_pages[h].reloc, (u8)0, __ATOMIC_RELEASE);
+      if (r == 1) gc_release_pages(h, ST->gc_pages[h].ngran);
     }
 
-    gc_marked = 0;
-    for (u32 h = 0; h < __atomic_load_n(&gc_gran_hwm, __ATOMIC_RELAXED); h++) {
-      if (gc_pages[h].kind == GCP_TAIL || gc_pages[h].kind == GCP_FREE) continue;
-      if (gc_pages[h].kind == GCP_FWD) continue;
-      gc_marked += gc_pages[h].live;
+    ST->gc_marked = 0;
+    for (u32 h = 0; h < __atomic_load_n(&ST->gc_gran_hwm, __ATOMIC_RELAXED); h++) {
+      if (ST->gc_pages[h].kind == GCP_TAIL || ST->gc_pages[h].kind == GCP_FREE) continue;
+      if (ST->gc_pages[h].kind == GCP_FWD) continue;
+      ST->gc_marked += ST->gc_pages[h].live;
     }
 
   }
 
-  __atomic_store_n(&gc_phase, GCPH_IDLE, __ATOMIC_RELEASE);
-  __atomic_store_n(&gc_full_done, gc_cycle_serves, __ATOMIC_RELEASE);
+  __atomic_store_n(&ST->gc_phase, GCPH_IDLE, __ATOMIC_RELEASE);
+  __atomic_store_n(&ST->gc_full_done, ST->gc_cycle_serves, __ATOMIC_RELEASE);
   gc_mut_nudge();
 }
 
 static void gc_mark_start(void) {
 
   gc_lab_close();
-  gc_cycle_no++;
-  gc_col.ngrey = 0;
-  gc_mqp.head = gc_col.mq_tail = 0;
-  __atomic_store_n(&gc_mqp.pub, (u64)0, __ATOMIC_RELAXED);
+  ST->gc_cycle_no++;
+  ST->gc_col.ngrey = 0;
+  ST->gc_mqp.head = ST->gc_col.mq_tail = 0;
+  __atomic_store_n(&ST->gc_mqp.pub, (u64)0, __ATOMIC_RELAXED);
 
-  for (u32 h = 0; h < gc_gran_hwm; h++) {
-    if (gc_pages[h].kind == GCP_FREE) continue;
-    gc_pages[h].live = 0;
-    gc_pages[h].reloc = 0;
+  for (u32 h = 0; h < ST->gc_gran_hwm; h++) {
+    if (ST->gc_pages[h].kind == GCP_FREE) continue;
+    ST->gc_pages[h].live = 0;
+    ST->gc_pages[h].reloc = 0;
   }
-  gc_mark_epoch ^= 1u;
-  gc_good = gc_mark_epoch ? GC_C_M1 : GC_C_M0;
+  ST->gc_mark_epoch ^= 1u;
+  ST->gc_good = ST->gc_mark_epoch ? GC_C_M1 : GC_C_M0;
   gc_publish_colour();
 
-  gc_cycle_serves = __atomic_load_n(&gc_full_req, __ATOMIC_ACQUIRE);
-  gc_mut.alloc_since = 0;
-  warmc_gc_fast.ready = GC_EPOCH_READY(gc_cycle_no);
-  warmc_gc_fast.marking = 1;
-  __atomic_store_n(&gc_phase, GCPH_MARK, __ATOMIC_RELEASE);
+  ST->gc_cycle_serves = __atomic_load_n(&ST->gc_full_req, __ATOMIC_ACQUIRE);
+  ST->gc_mut.alloc_since = 0;
+  ST->gc_fast.ready = GC_EPOCH_READY(ST->gc_cycle_no);
+  ST->gc_fast.marking = 1;
+  __atomic_store_n(&ST->gc_phase, GCPH_MARK, __ATOMIC_RELEASE);
   gc_visit_strong_roots(gc_mark_slot);
 }
 
 static void gc_mark_finish(void) {
-  __atomic_store_n(&gc_mqp.pub, gc_mqp.head, __ATOMIC_RELEASE);
-  gc_mark_end_took += gc_take_queue();
+  __atomic_store_n(&ST->gc_mqp.pub, ST->gc_mqp.head, __ATOMIC_RELEASE);
+  ST->gc_mark_end_took += gc_take_queue();
   gc_drain();
-  warmc_gc_fast.marking = 0;
-  __atomic_store_n(&gc_phase, GCPH_IDLE, __ATOMIC_RELEASE);
+  ST->gc_fast.marking = 0;
+  __atomic_store_n(&ST->gc_phase, GCPH_IDLE, __ATOMIC_RELEASE);
 
   gc_fwd_retire();
 
-  for (u32 h = 0; h < gc_gran_hwm; h++) {
-    if (gc_pages[h].kind == GCP_TAIL || gc_pages[h].kind == GCP_FREE) continue;
-    if (gc_pages[h].kind == GCP_FWD) continue;
-    if (gc_pages[h].live) continue;
-    if (gc_pages[h].alloc_cycle == (u32)gc_cycle_no) continue;
+  for (u32 h = 0; h < ST->gc_gran_hwm; h++) {
+    if (ST->gc_pages[h].kind == GCP_TAIL || ST->gc_pages[h].kind == GCP_FREE) continue;
+    if (ST->gc_pages[h].kind == GCP_FWD) continue;
+    if (ST->gc_pages[h].live) continue;
+    if (ST->gc_pages[h].alloc_cycle == (u32)ST->gc_cycle_no) continue;
 
     if (gc_page_current(h)) continue;
     gc_page_free(h);
   }
 
-  gc_marked = 0;
-  for (u32 h = 0; h < gc_gran_hwm; h++) {
-    if (gc_pages[h].kind == GCP_TAIL || gc_pages[h].kind == GCP_FREE) continue;
-    if (gc_pages[h].kind == GCP_FWD) continue;
-    gc_marked += gc_pages[h].live;
+  ST->gc_marked = 0;
+  for (u32 h = 0; h < ST->gc_gran_hwm; h++) {
+    if (ST->gc_pages[h].kind == GCP_TAIL || ST->gc_pages[h].kind == GCP_FREE) continue;
+    if (ST->gc_pages[h].kind == GCP_FWD) continue;
+    ST->gc_marked += ST->gc_pages[h].live;
   }
 
-  gc_live = gc_marked;
-  gc_trigger = gc_live * gc_opt_growth / 100;
-  if (gc_trigger < gc_min_trigger()) gc_trigger = gc_min_trigger();
-  gc_ncycles++;
+  ST->gc_live = ST->gc_marked;
+  ST->gc_trigger = ST->gc_live * gc_opt_growth / 100;
+  if (ST->gc_trigger < gc_min_trigger()) ST->gc_trigger = gc_min_trigger();
+  ST->gc_ncycles++;
 }
 
 static void gc_prepare(void) {
   gc_fwd_unmap();
 
-  gc_evac_small = gc_evac_medium = (u32)-1;
+  ST->gc_evac_small = ST->gc_evac_medium = (u32)-1;
   gc_select_reloc();
 }
 
@@ -3476,32 +3545,32 @@ static void gc_prepare(void) {
    mark flips it: a flip to R would send every reference the program loads
    until then through the barrier's slow path for nothing. */
 static void gc_reloc_start(void) {
-  if (!gc_reloc_pages) {
-    __atomic_store_n(&gc_phase, (u32)GCPH_IDLE, __ATOMIC_RELEASE);
+  if (!ST->gc_reloc_pages) {
+    __atomic_store_n(&ST->gc_phase, (u32)GCPH_IDLE, __ATOMIC_RELEASE);
     return;
   }
-  gc_good = GC_C_R;
+  ST->gc_good = GC_C_R;
   gc_publish_colour();
 
   gc_lab_recolour();
-  __atomic_store_n(&gc_phase, (u32)GCPH_RELOC, __ATOMIC_RELEASE);
+  __atomic_store_n(&ST->gc_phase, (u32)GCPH_RELOC, __ATOMIC_RELEASE);
   gc_visit_strong_roots(gc_reloc_slot);
 }
 
 static void gc_reloc_abandon(void) {
-  for (u32 h = 0; h < gc_gran_hwm; h++) gc_pages[h].reloc = 0;
+  for (u32 h = 0; h < ST->gc_gran_hwm; h++) ST->gc_pages[h].reloc = 0;
   gc_map_settle();
-  gc_fwd_dead = gc_fwd;
-  gc_fwd_dead_slots = gc_fwd_slots;
-  gc_fwd = 0;
-  gc_fwd_slots = 0;
+  ST->gc_fwd_dead = ST->gc_fwd;
+  ST->gc_fwd_dead_slots = ST->gc_fwd_slots;
+  ST->gc_fwd = 0;
+  ST->gc_fwd_slots = 0;
   gc_fwd_unmap();
-  gc_reloc_pages = gc_reloc_bytes = 0;
+  ST->gc_reloc_pages = ST->gc_reloc_bytes = 0;
 }
 
 static void gc_collect(void) {
   if (!gc_may_collect()) return;
-  gc_ncycles_stw++;
+  ST->gc_ncycles_stw++;
   u64 t0 = gc_opt_stats ? sys_nanos() : 0;
   gc_mark_start();
   gc_visit_tables(gc_mark_slot_shared);
@@ -3513,19 +3582,19 @@ static void gc_collect(void) {
   if (gc_opt_verify) gc_verify();
   if (gc_opt_stats) {
     u64 dt = sys_nanos() - t0;
-    gc_t_total += dt;
-    gc_pause_count++;
-    if (dt > gc_pause_max) gc_pause_max = dt;
-    gc_pause_hist[dt < 10000 ? 0 : dt < 100000 ? 1 : dt < 1000000 ? 2
+    ST->gc_t_total += dt;
+    ST->gc_pause_count++;
+    if (dt > ST->gc_pause_max) ST->gc_pause_max = dt;
+    ST->gc_pause_hist[dt < 10000 ? 0 : dt < 100000 ? 1 : dt < 1000000 ? 2
                               : dt < 10000000 ? 3 : 4]++;
   }
 }
 
 static void gc_mark_conc(void) {
   for (;;) {
-    while (gc_col.ngrey) {
-      gc_scan_object(gc_grey[--gc_col.ngrey]);
-      gc_col.mark_conc_objs++;
+    while (ST->gc_col.ngrey) {
+      gc_scan_object(ST->gc_grey[--ST->gc_col.ngrey]);
+      ST->gc_col.mark_conc_objs++;
     }
     gc_jitter(GCJ_MARK);
     if (!gc_take_queue()) return;
@@ -3536,9 +3605,9 @@ static void gc_cycle_body(void);
 
 static void gc_cycle_conc(void) {
 
-  __atomic_store_n(&gc_cycle_running, 1u, __ATOMIC_RELEASE);
+  __atomic_store_n(&ST->gc_cycle_running, 1u, __ATOMIC_RELEASE);
   gc_cycle_body();
-  __atomic_store_n(&gc_cycle_running, 0u, __ATOMIC_RELEASE);
+  __atomic_store_n(&ST->gc_cycle_running, 0u, __ATOMIC_RELEASE);
 }
 
 /* WARMC_GC_MARK_STALL=US: the collector asleep that long once a mark is on,
@@ -3552,7 +3621,7 @@ static void gc_cycle_body(void) {
   if (gc_opt_mark_stall) {
     u64 end = sys_nanos() + gc_opt_mark_stall * 1000ull;
     for (u64 now; (now = sys_nanos()) < end;) {
-      if (__atomic_load_n(&gcth_stopping, __ATOMIC_ACQUIRE)) break;
+      if (__atomic_load_n(&ST->gcth_stopping, __ATOMIC_ACQUIRE)) break;
       gcth_pause(end - now);
     }
   }
@@ -3560,14 +3629,14 @@ static void gc_cycle_body(void) {
     gc_visit_tables(gc_mark_slot_shared);
     gc_mark_conc();
     if (gc_round_mark_end()) break;
-    if (__atomic_load_n(&gcth_stopping, __ATOMIC_ACQUIRE)) return;
+    if (__atomic_load_n(&ST->gcth_stopping, __ATOMIC_ACQUIRE)) return;
     gcth_pause(GC_ROUND_BACKOFF_NS);
   }
   gc_prepare();
   for (;;) {
     if (gc_round(GCR_RELOC_START)) break;
 
-    if (__atomic_load_n(&gcth_stopping, __ATOMIC_ACQUIRE)) {
+    if (__atomic_load_n(&ST->gcth_stopping, __ATOMIC_ACQUIRE)) {
       gc_reloc_abandon();
       return;
     }
@@ -3579,96 +3648,102 @@ static void gc_cycle_body(void) {
 }
 
 static u32 gc_cycle_wanted(void) {
-  if (__atomic_load_n(&gc_full_req, __ATOMIC_ACQUIRE) !=
-      __atomic_load_n(&gc_full_done, __ATOMIC_ACQUIRE))
+  if (__atomic_load_n(&ST->gc_full_req, __ATOMIC_ACQUIRE) !=
+      __atomic_load_n(&ST->gc_full_done, __ATOMIC_ACQUIRE))
     return 1;
-  u64 trig = __atomic_load_n(&gc_trigger, __ATOMIC_RELAXED);
-  return trig && __atomic_load_n(&gc_mut.alloc_since, __ATOMIC_RELAXED) >= trig;
+  u64 trig = __atomic_load_n(&ST->gc_trigger, __ATOMIC_RELAXED);
+  return trig && __atomic_load_n(&ST->gc_mut.alloc_since, __ATOMIC_RELAXED) >= trig;
 }
 
 #define GC_PACE_POLL_NS 10000000ull
 
 static void gcth_collector(void) {
 
-  __atomic_store_n(&gc_conc_on, 1u, __ATOMIC_RELEASE);
-  while (!__atomic_load_n(&gcth_stopping, __ATOMIC_ACQUIRE)) {
+  __atomic_store_n(&ST->gc_conc_on, 1u, __ATOMIC_RELEASE);
+  while (!__atomic_load_n(&ST->gcth_stopping, __ATOMIC_ACQUIRE)) {
 
     u32 seen = gcth_idle_seen();
     if (gc_cycle_wanted()) { gc_cycle_conc(); continue; }
     gc_jitter(GCJ_IDLE);
     gcth_pause_since(seen, GC_PACE_POLL_NS);
   }
-  gcth_unpark(&gcth_stopped, 1);
+  gcth_unpark(&ST->gcth_stopped, 1);
 }
 
 static void gc_conc_start(void) {
-  gc_conc_tried = 1;
+#if defined(WARMC_JIT)
+  /* refused while as many stores' collectors run as may: asked again at
+     the next trigger, collecting on this thread meanwhile */
   if (!gcth_spawn(gcth_collector)) return;
-  __atomic_store_n(&gcth_started, 1u, __ATOMIC_RELEASE);
+  ST->gc_conc_tried = 1;
+#else
+  ST->gc_conc_tried = 1;
+  if (!gcth_spawn(gcth_collector)) return;
+#endif
+  __atomic_store_n(&ST->gcth_started, 1u, __ATOMIC_RELEASE);
 }
 
 static void gc_request_cycle(void) {
   if (!gc_may_collect()) return;
-  if (!__atomic_load_n(&gc_conc_on, __ATOMIC_ACQUIRE)) { gc_collect(); return; }
-  u64 want = __atomic_add_fetch(&gc_full_req, 1ull, __ATOMIC_ACQ_REL);
+  if (!__atomic_load_n(&ST->gc_conc_on, __ATOMIC_ACQUIRE)) { gc_collect(); return; }
+  u64 want = __atomic_add_fetch(&ST->gc_full_req, 1ull, __ATOMIC_ACQ_REL);
   gcth_nudge();
   for (;;) {
-    u32 seen = __atomic_load_n(&gc_mut_wait.v, __ATOMIC_ACQUIRE);
-    if (__atomic_load_n(&gc_full_done, __ATOMIC_ACQUIRE) >= want) return;
-    if (__atomic_load_n(&gc_poll, __ATOMIC_RELAXED)) { gc_service_round(); continue; }
+    u32 seen = __atomic_load_n(&ST->gc_mut_wait.v, __ATOMIC_ACQUIRE);
+    if (__atomic_load_n(&ST->gc_full_done, __ATOMIC_ACQUIRE) >= want) return;
+    if (__atomic_load_n(&ST->gc_poll, __ATOMIC_RELAXED)) { gc_service_round(); continue; }
 
-    if (__atomic_load_n(&gcth_stopping, __ATOMIC_ACQUIRE)) return;
-    gcth_park_timeout(&gc_mut_wait, seen, GC_ROUND_POLL_NS);
+    if (__atomic_load_n(&ST->gcth_stopping, __ATOMIC_ACQUIRE)) return;
+    gcth_park_timeout(&ST->gc_mut_wait, seen, GC_ROUND_POLL_NS);
   }
 }
 
 static u64 gc_opt_assist = 4;
-static u64 gc_nassists, gc_nassists_stw;
 
 #define GC_ASSIST_TRIES  4u
 #define GC_ASSIST_WAIT_NS 100000ull
 
 static void gc_assist(void) {
-  gc_nassists++;
-  u64 start = gc_ncycles;
+  ST->gc_nassists++;
+  u64 start = ST->gc_ncycles;
   for (u32 idle = 0;;) {
 
-    u32 seen = __atomic_load_n(&gc_mut_wait.v, __ATOMIC_ACQUIRE);
-    if (gc_ncycles != start) return;
-    if (__atomic_load_n(&gc_poll, __ATOMIC_RELAXED)) { gc_service_round(); continue; }
-    if (__atomic_load_n(&gcth_stopping, __ATOMIC_ACQUIRE)) return;
+    u32 seen = __atomic_load_n(&ST->gc_mut_wait.v, __ATOMIC_ACQUIRE);
+    if (ST->gc_ncycles != start) return;
+    if (__atomic_load_n(&ST->gc_poll, __ATOMIC_RELAXED)) { gc_service_round(); continue; }
+    if (__atomic_load_n(&ST->gcth_stopping, __ATOMIC_ACQUIRE)) return;
 
-    if (__atomic_load_n(&gc_phase, __ATOMIC_ACQUIRE) == GCPH_IDLE &&
-        !__atomic_load_n(&gc_cycle_running, __ATOMIC_ACQUIRE) &&
+    if (__atomic_load_n(&ST->gc_phase, __ATOMIC_ACQUIRE) == GCPH_IDLE &&
+        !__atomic_load_n(&ST->gc_cycle_running, __ATOMIC_ACQUIRE) &&
         ++idle > GC_ASSIST_TRIES) {
-      gc_nassists_stw++;
+      ST->gc_nassists_stw++;
       gc_collect();
       return;
     }
-    gcth_park_timeout(&gc_mut_wait, seen, GC_ASSIST_WAIT_NS);
+    gcth_park_timeout(&ST->gc_mut_wait, seen, GC_ASSIST_WAIT_NS);
   }
 }
 
 u64 warmc_gc_load_barrier(u64 ref, u64 *slot) {
-  gc_mut.barrier_slow++;
+  ST->gc_mut.barrier_slow++;
   u64 good = gc_heal_reloc(ref);
   if (slot) *slot = good;
 
-  if (gc_phase == GCPH_MARK) gc_mark_ref(good);
+  if (ST->gc_phase == GCPH_MARK) gc_mark_ref(good);
   return good;
 }
 
 static u64 gc_load(u64 *slot) {
   u64 v = *slot;
-  if (!(v & gc_badmask)) return v;
+  if (!(v & ST->gc_badmask)) return v;
   return warmc_gc_load_barrier(v, slot);
 }
 
 static void gc_mark_copied(u64 *dst, u64 n) {
-  if (gc_phase != GCPH_MARK) return;
+  if (ST->gc_phase != GCPH_MARK) return;
   for (u64 i = 0; i < n; i++) {
     u64 v = dst[i];
-    if (!(v & gc_badmask)) continue;
+    if (!(v & ST->gc_badmask)) continue;
     if (!gc_in_heap(v)) continue;
     u64 h = gc_heal_ptr(v);
     dst[i] = h;
@@ -3677,21 +3752,21 @@ static void gc_mark_copied(u64 *dst, u64 n) {
 }
 
 static void gc_collect_if_due(void) {
-  if (!gc_may_collect() || !(gc_opt_stress || gc_mut.alloc_since >= gc_trigger))
+  if (!gc_may_collect() || !(gc_opt_stress || ST->gc_mut.alloc_since >= ST->gc_trigger))
     return;
-  if (gc_opt_conc && !gc_conc_tried) gc_conc_start();
+  if (gc_opt_conc && !ST->gc_conc_tried) gc_conc_start();
 
-  if (__atomic_load_n(&gc_conc_on, __ATOMIC_ACQUIRE)) {
+  if (__atomic_load_n(&ST->gc_conc_on, __ATOMIC_ACQUIRE)) {
 
-    if (__atomic_load_n(&gc_phase, __ATOMIC_ACQUIRE) == GCPH_IDLE) gcth_nudge();
-    if (gc_opt_assist && gc_mut.alloc_since >= gc_opt_assist * gc_trigger)
+    if (__atomic_load_n(&ST->gc_phase, __ATOMIC_ACQUIRE) == GCPH_IDLE) gcth_nudge();
+    if (gc_opt_assist && ST->gc_mut.alloc_since >= gc_opt_assist * ST->gc_trigger)
       gc_assist();
-  } else if (!__atomic_load_n(&gcth_started, __ATOMIC_ACQUIRE)) {
+  } else if (!__atomic_load_n(&ST->gcth_started, __ATOMIC_ACQUIRE)) {
 
     gc_collect();
   } else {
 
-    if (gc_opt_assist && gc_mut.alloc_since >= gc_opt_assist * gc_trigger)
+    if (gc_opt_assist && ST->gc_mut.alloc_since >= gc_opt_assist * ST->gc_trigger)
       gc_assist();
   }
 }
@@ -3701,9 +3776,9 @@ static void *gc_alloc(u32 type_id, const GcTypeInfo *ti, u64 payload, u64 len) {
 
   gc_lab_sync();
 
-  if (__atomic_load_n(&gc_poll, __ATOMIC_RELAXED)) gc_service_round();
+  if (__atomic_load_n(&ST->gc_poll, __ATOMIC_RELAXED)) gc_service_round();
 
-  if (payload > gc_heap_bytes) warmc_trap(TRAP_HEAP_OOM);
+  if (payload > ST->gc_heap_bytes) warmc_trap(TRAP_HEAP_OOM);
   u64 total = ti->hdr_size + payload;
   if (total < GC_UNIT) total = GC_UNIT;
   total = (total + (GC_UNIT - 1)) & ~(u64)(GC_UNIT - 1);
@@ -3711,18 +3786,18 @@ static void *gc_alloc(u32 type_id, const GcTypeInfo *ti, u64 payload, u64 len) {
   gc_collect_if_due();
 
   for (u32 round = 0; ; round++) {
-    gc_reserve_open = round == 2;
+    ST->gc_reserve_open = round == 2;
     u8 *p = gc_alloc_raw(total);
-    gc_reserve_open = 0;
+    ST->gc_reserve_open = 0;
     if (p) {
-      gc_mut.alloc_since += total;
-      gc_mut.bytes_alloc += total;
+      ST->gc_mut.alloc_since += total;
+      ST->gc_mut.bytes_alloc += total;
       GcHeader *h = (GcHeader *)p;
       h->w = type_id;
       h->len = (u32)len;
-      p = (u8 *)(uptr)((u64)(uptr)p | gc_good);
+      p = (u8 *)(uptr)((u64)(uptr)p | ST->gc_good);
 
-      if (gc_lab_cell[1] - gc_lab_cell[0] < GC_LAB_MIN_TAIL) {
+      if (ST->gc_lab_cell[1] - ST->gc_lab_cell[0] < GC_LAB_MIN_TAIL) {
         gc_lab_close();
         gc_lab_refill();
       }
@@ -3740,19 +3815,19 @@ static void *gc_alloc(u32 type_id, const GcTypeInfo *ti, u64 payload, u64 len) {
 }
 
 void warmc_gc_collect(void) {
-  u32 saved = gc_from_wasm;
-  gc_from_wasm = 0;
+  u32 saved = ST->gc_from_wasm;
+  ST->gc_from_wasm = 0;
   gc_init();
   gc_lab_sync();
   gc_request_cycle();
-  gc_from_wasm = saved;
+  ST->gc_from_wasm = saved;
 }
 
 static void *exn_alloc(Instance *in, u32 tag) {
   const GcTypeInfo *ti = &in->md->exntypes[tag];
-  gc_no_collect++;
+  ST->gc_no_collect++;
   void *p = gc_alloc(in->exntype_base + tag, ti, ti->body_size, 0);
-  gc_no_collect--;
+  ST->gc_no_collect--;
   return p;
 }
 
@@ -3766,51 +3841,51 @@ static void *exn_alloc(Instance *in, u32 tag) {
    walk can move what the throwing frame's callee-saved registers point at,
    so they come back through regs for the unwinder to restore. */
 static void *exn_safepoint(void *e, WarmRegs *regs, u64 sp, u64 pc) {
-  u32 saved = gc_from_wasm;
-  gc_from_wasm = 1;
-  if (!gc_may_collect() || !(gc_opt_stress || gc_mut.alloc_since >= gc_trigger ||
-                             __atomic_load_n(&gc_poll, __ATOMIC_RELAXED))) {
-    gc_from_wasm = saved;
+  u32 saved = ST->gc_from_wasm;
+  ST->gc_from_wasm = 1;
+  if (!gc_may_collect() || !(gc_opt_stress || ST->gc_mut.alloc_since >= ST->gc_trigger ||
+                             __atomic_load_n(&ST->gc_poll, __ATOMIC_RELAXED))) {
+    ST->gc_from_wasm = saved;
     return e;
   }
-  for (u32 i = 0; i < 10; i++) warmc_gc_ctx.gpr[i] = regs->gpr[i];
-  warmc_gc_ctx.sp = sp;
-  warmc_gc_ctx.pc = pc;
+  for (u32 i = 0; i < 10; i++) ST->gc_ctx.gpr[i] = regs->gpr[i];
+  ST->gc_ctx.sp = sp;
+  ST->gc_ctx.pc = pc;
   u64 slot = (u64)(uptr)e;
   GcRoots hold;
   warmc_gc_hold(&slot, &gc_one, &hold);
   gc_lab_sync();
-  if (__atomic_load_n(&gc_poll, __ATOMIC_RELAXED)) gc_service_round();
+  if (__atomic_load_n(&ST->gc_poll, __ATOMIC_RELAXED)) gc_service_round();
   gc_collect_if_due();
-  gc_from_wasm = saved;
+  ST->gc_from_wasm = saved;
   warmc_gc_release(&hold);
-  for (u32 i = 0; i < 10; i++) regs->gpr[i] = warmc_gc_ctx.gpr[i];
+  for (u32 i = 0; i < 10; i++) regs->gpr[i] = ST->gc_ctx.gpr[i];
   return (void *)(uptr)gc_heal_ptr(slot);
 }
 
 void warmc_gc_hold(u64 *base, const u32 *n, void *slot) {
   GcRoots *r = (GcRoots *)slot;
-  r->next = gc_rootlist;
+  r->next = ST->gc_rootlist;
   r->base = base;
   r->n = n;
-  gc_rootlist = r;
+  ST->gc_rootlist = r;
 }
-void warmc_gc_release(void *slot) { gc_rootlist = ((GcRoots *)slot)->next; }
+void warmc_gc_release(void *slot) { ST->gc_rootlist = ((GcRoots *)slot)->next; }
 
 static void gc_catch_save(GcCatch *c) {
-  c->roots = gc_rootlist;
-  c->from_wasm = gc_from_wasm;
-  c->no_collect = gc_no_collect;
+  c->roots = ST->gc_rootlist;
+  c->from_wasm = ST->gc_from_wasm;
+  c->no_collect = ST->gc_no_collect;
 }
 
 static void gc_after_trap(const GcCatch *c) {
-  gc_rootlist = (GcRoots *)c->roots;
-  gc_from_wasm = c->from_wasm;
-  gc_no_collect = c->no_collect;
-  if (gc_claim_slot) {
-    __atomic_store_n(&gc_fwd[(gc_claim_slot - 1) * 2 + 1], gc_claim_from,
+  ST->gc_rootlist = (GcRoots *)c->roots;
+  ST->gc_from_wasm = c->from_wasm;
+  ST->gc_no_collect = c->no_collect;
+  if (ST->gc_claim_slot) {
+    __atomic_store_n(&ST->gc_fwd[(ST->gc_claim_slot - 1) * 2 + 1], ST->gc_claim_from,
                      __ATOMIC_RELEASE);
-    gc_claim_slot = 0;
+    ST->gc_claim_slot = 0;
   }
   gc_abort_round();
 }
@@ -3837,18 +3912,18 @@ static void *rt_array_new(WarmInstance *vm, u32 type_index, u64 len) {
 }
 
 void *warmc_struct_new_w(WarmInstance *vm, u32 type_index) {
-  u32 saved = gc_from_wasm;
-  gc_from_wasm = 1;
+  u32 saved = ST->gc_from_wasm;
+  ST->gc_from_wasm = 1;
   void *r = rt_struct_new(vm, type_index);
-  gc_from_wasm = saved;
+  ST->gc_from_wasm = saved;
   return r;
 }
 
 void *warmc_array_new_w(WarmInstance *vm, u32 type_index, u64 len) {
-  u32 saved = gc_from_wasm;
-  gc_from_wasm = 1;
+  u32 saved = ST->gc_from_wasm;
+  ST->gc_from_wasm = 1;
   void *r = rt_array_new(vm, type_index, len);
-  gc_from_wasm = saved;
+  ST->gc_from_wasm = saved;
   return r;
 }
 
@@ -3894,10 +3969,10 @@ static void *rt_array_new_fill(WarmInstance *vm, u32 type_index, u64 len,
 
 void *warmc_array_new_fill_w(WarmInstance *vm, u32 type_index, u64 len,
                              u64 lo, u64 hi) {
-  u32 saved = gc_from_wasm;
-  gc_from_wasm = 1;
+  u32 saved = ST->gc_from_wasm;
+  ST->gc_from_wasm = 1;
   void *r = rt_array_new_fill(vm, type_index, len, lo, hi);
-  gc_from_wasm = saved;
+  ST->gc_from_wasm = saved;
   return r;
 }
 
@@ -3973,23 +4048,23 @@ void warmc_array_init_elem(WarmInstance *vm, u32 type_index, u32 seg, void *a,
 
 void *warmc_array_new_data_w(WarmInstance *vm, u32 type_index, u32 seg,
                              u32 so, u32 n) {
-  u32 id, saved = gc_from_wasm;
-  gc_from_wasm = 1;
+  u32 id, saved = ST->gc_from_wasm;
+  ST->gc_from_wasm = 1;
   const GcTypeInfo *ti = gc_type_of(vm, type_index, &id);
   void *a = gc_alloc(id, ti, (u64)n * ti->body_size, n);
   arr_init_data(INST_OF(vm), ti, a, seg, 0, so, n);
-  gc_from_wasm = saved;
+  ST->gc_from_wasm = saved;
   return a;
 }
 
 void *warmc_array_new_elem_w(WarmInstance *vm, u32 type_index, u32 seg,
                              u32 so, u32 n) {
-  u32 id, saved = gc_from_wasm;
-  gc_from_wasm = 1;
+  u32 id, saved = ST->gc_from_wasm;
+  ST->gc_from_wasm = 1;
   const GcTypeInfo *ti = gc_type_of(vm, type_index, &id);
   void *a = gc_alloc(id, ti, (u64)n * ti->body_size, n);
   arr_init_elem(INST_OF(vm), ti, a, seg, 0, so, n);
-  gc_from_wasm = saved;
+  ST->gc_from_wasm = saved;
   return a;
 }
 
@@ -4035,7 +4110,7 @@ __attribute__((noreturn)) static void refuse_instance(const char *why) {
   eputs("warmc-rt: cannot instantiate: ");
   eputs(why);
   eputs("\n");
-  if (g_catching) { g_catching = 0; g_trap_code = TRAP_LINK; warmc_longjmp(g_catch_buf, 1); }
+  if (ST->g_catching) { ST->g_catching = 0; ST->g_trap_code = TRAP_LINK; warmc_longjmp(ST->g_catch_buf, 1); }
   sys_exit(4);
 }
 
@@ -4065,17 +4140,17 @@ static WarmMemory *make_memory(u64 min_pages, u64 max_pages, u32 has_max,
   M->index64 = index64;
 
   usz reserve = (usz)GUARD_RESERVE;
-  u8 *base = !index64 && (needs_guard || !nguards)
+  u8 *base = !index64 && (needs_guard || !__atomic_load_n(&guards.live, __ATOMIC_RELAXED))
                ? (u8 *)sys_mmap(0, reserve, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS)
                : 0;
   M->map = base;
   M->map_len = reserve;
   if (base) {
-    if (nguards >= MAX_GUARDS) die("too many guarded memories");
-    if (!nguards) install_fault_handler();
-    guards[nguards].base = base;
-    guards[nguards].len = GUARD_RESERVE;
-    nguards++;
+    install_fault_handler();
+    if (!range_add(&guards, base, GUARD_RESERVE)) {
+      sys_munmap(base, reserve);
+      die("too many guarded memories");
+    }
     M->guarded = 1;
 
     usz align = 2u << 20;
@@ -4151,7 +4226,7 @@ static int type_matches(const ExportDesc *e, const ImportDesc *im) {
 
 __attribute__((noreturn))
 static void link_error(const char *what, const char *mod, const char *name) {
-  if (g_catching) { g_catching = 0; g_trap_code = TRAP_LINK; warmc_longjmp(g_catch_buf, 1); }
+  if (ST->g_catching) { ST->g_catching = 0; ST->g_trap_code = TRAP_LINK; warmc_longjmp(ST->g_catch_buf, 1); }
   eputs("warmc-rt: link error: ");
   eputs(what);
   eputs(" \"");
@@ -4208,7 +4283,7 @@ static void data_init(Instance *in, const u8 *p) {
 
 WarmInstance *warmc_instantiate_bound(const ModuleDesc *md,
                                       const WarmBinding *binds) {
-  if (ninstances >= MAX_INSTANCES && !nfree_slots) die("too many instances");
+  if (ST->ninstances >= MAX_INSTANCES && !ST->nfree_slots) die("too many instances");
   if (md->det_profile) set_default_nan_mode();
 
   u64 tail = (u64)INSTANCE_GLOBAL_SIZE * md->nglobals + 16ull * md->nimported_funcs +
@@ -4226,31 +4301,32 @@ WarmInstance *warmc_instantiate_bound(const ModuleDesc *md,
   in->mems = md->nmemories ? inst_alloc(sizeof(WarmMemory *) * md->nmemories) : 0;
   in->tags = md->ntags ? inst_alloc(sizeof(void *) * md->ntags) : 0;
 
-  in->making_prev = g_making;
-  g_making = in;
+  in->making_prev = ST->g_making;
+  ST->g_making = in;
 
   /* a freed instance's slot, or a new one: either is one a collection
      under way does not visit, as it did not see it when it began */
-  if (nfree_slots) {
-    while (instances[free_hint]) free_hint++;
-    in->slot = free_hint++;
-    nfree_slots--;
-    __atomic_store_n(&instances[in->slot], in, __ATOMIC_RELEASE);
+  if (ST->nfree_slots) {
+    while (ST->instances[ST->free_hint]) ST->free_hint++;
+    in->slot = ST->free_hint++;
+    ST->nfree_slots--;
+    __atomic_store_n(&ST->instances[in->slot], in, __ATOMIC_RELEASE);
   } else {
-    in->slot = ninstances;
-    instances[ninstances] = in;
-    __atomic_store_n(&ninstances, ninstances + 1, __ATOMIC_RELEASE);
+    in->slot = ST->ninstances;
+    ST->instances[ST->ninstances] = in;
+    __atomic_store_n(&ST->ninstances, ST->ninstances + 1, __ATOMIC_RELEASE);
   }
 
   register_desc(md);
 
   WarmInstance *v = &in->vm;
-  v->stack_limit = g_stack_limit;
+  v->stack_limit = ST->g_stack_limit;
 
-  v->gc_badmask = gc_badmask;
+  v->gc_badmask = ST->gc_badmask;
 
-  v->gc_lab = (u64)(uptr)gc_lab_cell;
+  v->gc_lab = (u64)(uptr)ST->gc_lab_cell;
   v->gc_hdr_base = (u64)in->gctype_base;
+  v->store = ST;
   u64 *imports = inst_imports(in);
   FuncRef *funcrefs = inst_funcrefs(in);
 
@@ -4424,9 +4500,9 @@ WarmInstance *warmc_instantiate_bound(const ModuleDesc *md,
   if (md->has_start) {
     u64 zero[WARMC_FARGS_WORDS] = { 0 }, ret[WARMC_RETBUF_WORDS] = { 0 };
     FuncRef fr = funcrefs[md->start_func];
-    warmc_invoke(fr.code, (WarmInstance *)fr.instance, zero, zero, ret);
+    rt_invoke(fr.code, (WarmInstance *)fr.instance, zero, zero, ret);
   }
-  g_making = in->making_prev;
+  ST->g_making = in->making_prev;
   return v;
 }
 
@@ -4593,9 +4669,9 @@ static int call_export(const ExportDesc *e, const char *name,
   }
   u64 stk_bytes = 8ull * SLOT_WORDS * nstk;
 
-  FuncRef fr = warmc_export_func(vm, e);
+  FuncRef fr = warmc_export_func(ST->g_vm, e);
 #define RT_INVOKE(ia, fa, rr) \
-  warmc_invoke_s(fr.code, (WarmInstance *)fr.instance, ia, fa, rr, stk, stk_bytes)
+  rt_invoke_s(fr.code, (WarmInstance *)fr.instance, ia, fa, rr, stk, stk_bytes)
 #define RT_INVOKE_CATCHING(ia, fa, rr) \
   warmc_invoke_catching_s(fr.code, (WarmInstance *)fr.instance, ia, fa, rr, \
                           stk, stk_bytes)
@@ -4686,12 +4762,7 @@ static u64 rt_getenv_u64(const char *name, u64 dflt) {
   return r;
 }
 
-static GcthGate gcth_req;
-static GcthGate gcth_ack;
 static u32 gcth_test_stop;
-static u64 gcth_send_ns;
-static u64 gcth_lat_min, gcth_lat_sum, gcth_lat_n;
-static u64 gcth_count;
 static u32 gcth_test_die, gcth_test_fault;
 
 #define GCTH_TEST_DEADLINE 5000000000ull
@@ -4699,74 +4770,72 @@ static u32 gcth_test_die, gcth_test_fault;
 static void gcth_pingpong(void) {
   u32 seen = 0;
   for (;;) {
-    while (__atomic_load_n(&gcth_req.v, __ATOMIC_ACQUIRE) == seen)
-      gcth_park(&gcth_req, seen);
-    seen = __atomic_load_n(&gcth_req.v, __ATOMIC_ACQUIRE);
+    while (__atomic_load_n(&ST->gcth_req.v, __ATOMIC_ACQUIRE) == seen)
+      gcth_park(&ST->gcth_req, seen);
+    seen = __atomic_load_n(&ST->gcth_req.v, __ATOMIC_ACQUIRE);
     if (gcth_test_stop) break;
 
-    u64 dt = sys_nanos() - gcth_send_ns;
-    gcth_lat_sum += dt;
-    gcth_lat_n++;
-    if (dt < gcth_lat_min) gcth_lat_min = dt;
-    gcth_count++;
-    gcth_unpark(&gcth_ack, seen);
+    u64 dt = sys_nanos() - ST->gcth_send_ns;
+    ST->gcth_lat_sum += dt;
+    ST->gcth_lat_n++;
+    if (dt < ST->gcth_lat_min) ST->gcth_lat_min = dt;
+    ST->gcth_count++;
+    gcth_unpark(&ST->gcth_ack, seen);
   }
 
   if (gcth_test_fault) *(volatile u32 *)0 = 0;
   if (gcth_test_die)
     die("the collector's thread reached a state it believes impossible");
-  gcth_unpark(&gcth_ack, seen);
+  gcth_unpark(&ST->gcth_ack, seen);
 }
 
-static u32 gcth_nreq;
 
 static void gcth_rally(const char *what, u64 n) {
-  gcth_lat_min = ~0ull; gcth_lat_sum = 0; gcth_lat_n = 0; gcth_nwaits = 0;
+  ST->gcth_lat_min = ~0ull; ST->gcth_lat_sum = 0; ST->gcth_lat_n = 0; ST->gcth_nwaits = 0;
   u64 t0 = sys_nanos();
   for (u64 i = 0; i < n; i++) {
-    u32 want = gcth_nreq + 1;
-    gcth_send_ns = sys_nanos();
-    gcth_unpark(&gcth_req, want);
-    while (__atomic_load_n(&gcth_ack.v, __ATOMIC_ACQUIRE) != want)
-      if (gcth_park_timeout(&gcth_ack, gcth_nreq, GCTH_TEST_DEADLINE))
+    u32 want = ST->gcth_nreq + 1;
+    ST->gcth_send_ns = sys_nanos();
+    gcth_unpark(&ST->gcth_req, want);
+    while (__atomic_load_n(&ST->gcth_ack.v, __ATOMIC_ACQUIRE) != want)
+      if (gcth_park_timeout(&ST->gcth_ack, ST->gcth_nreq, GCTH_TEST_DEADLINE))
         die("the collector's thread did not answer a handshake");
-    gcth_nreq = want;
+    ST->gcth_nreq = want;
   }
   u64 t1 = sys_nanos();
   eputs("gcth: "); put_u64_e(n); eputs(" round trips "); eputs(what);
   eputs(": "); put_u64_e((t1 - t0) / n); eputs(" ns each, wake ");
-  put_u64_e(gcth_lat_min); eputs("/");
-  put_u64_e(gcth_lat_sum / (gcth_lat_n ? gcth_lat_n : 1));
-  eputs(" ns min/mean, "); put_u64_e(gcth_nwaits); eputs(" into the kernel\n");
+  put_u64_e(ST->gcth_lat_min); eputs("/");
+  put_u64_e(ST->gcth_lat_sum / (ST->gcth_lat_n ? ST->gcth_lat_n : 1));
+  eputs(" ns min/mean, "); put_u64_e(ST->gcth_nwaits); eputs(" into the kernel\n");
 }
 
 static u64 gcth_round_period_ns;
 
 static void gcth_round_driver(void) {
-  while (!__atomic_load_n(&gcth_stopping, __ATOMIC_ACQUIRE)) {
+  while (!__atomic_load_n(&ST->gcth_stopping, __ATOMIC_ACQUIRE)) {
     if (!gc_round(GCR_NOP)) gcth_pause(GC_ROUND_BACKOFF_NS);
     else if (gcth_round_period_ns) gcth_pause(gcth_round_period_ns);
   }
-  gcth_unpark(&gcth_stopped, 1);
+  gcth_unpark(&ST->gcth_stopped, 1);
 }
 
-static u64 gcth_stop_late;
 /* How long an exit waits for the collector's thread to stop, 50 ms unless
    WARMC_GC_STOP_WAIT_MS says otherwise: a test of whether it hears the
    stop at all gives it longer than a loaded machine may take to run it. */
 static u64 gcth_stop_wait_ns = 50000000ull;
 
 static void gcth_stop(void) {
-  if (!__atomic_load_n(&gcth_started, __ATOMIC_ACQUIRE)) return;
-  __atomic_store_n(&gcth_stopping, 1u, __ATOMIC_SEQ_CST);
+  if (!__atomic_load_n(&ST->gcth_started, __ATOMIC_ACQUIRE)) return;
+  __atomic_store_n(&ST->gcth_stopping, 1u, __ATOMIC_SEQ_CST);
 
   gc_answer_outstanding(0);
   gcth_nudge();
 
   u64 deadline = sys_nanos() + gcth_stop_wait_ns;
-  while (!__atomic_load_n(&gcth_stopped.v, __ATOMIC_ACQUIRE)) {
-    if (sys_nanos() >= deadline) { gcth_stop_late++; return; }
-    gcth_park_timeout(&gcth_stopped, 0, GC_ROUND_POLL_NS);
+  while (!__atomic_load_n(&ST->gcth_stopped.v, __ATOMIC_ACQUIRE)) {
+    if (sys_nanos() >= deadline) { ST->gcth_stop_late++; return; }
+    gcth_park_timeout(&ST->gcth_stopped, 0, GC_ROUND_POLL_NS);
   }
 }
 
@@ -4774,7 +4843,7 @@ static void gcth_start_rounds(u64 period_us) {
   gcth_round_period_ns = period_us * 1000ull;
   if (!gcth_spawn(gcth_round_driver))
     die("could not start the collector's thread");
-  __atomic_store_n(&gcth_started, 1u, __ATOMIC_RELEASE);
+  __atomic_store_n(&ST->gcth_started, 1u, __ATOMIC_RELEASE);
 }
 
 __attribute__((noreturn)) static void gcth_selftest(u64 n) {
@@ -4800,23 +4869,23 @@ __attribute__((noreturn)) static void gcth_selftest(u64 n) {
   if (!m) m = 1;
   gcth_rally("parked", m);
 
-  eputs("gcth: counter "); put_u64_e(gcth_count); eputs(" of ");
+  eputs("gcth: counter "); put_u64_e(ST->gcth_count); eputs(" of ");
   put_u64_e(n + m); eputs("\n");
-  if (gcth_count != n + m) die("the ping-pong lost a handshake");
+  if (ST->gcth_count != n + m) die("the ping-pong lost a handshake");
 
   if (gcth_test_die) {
 
-    if (warmc_setjmp(g_catch_buf)) {
+    if (warmc_setjmp(ST->g_catch_buf)) {
       eputs("gcth: the collector's die longjmped into the mutator\n");
       sys_exit(3);
     }
-    g_catching = 1;
+    ST->g_catching = 1;
   }
 
   gcth_test_stop = 1;
-  gcth_unpark(&gcth_req, gcth_nreq + 1);
-  while (__atomic_load_n(&gcth_ack.v, __ATOMIC_ACQUIRE) != gcth_nreq + 1)
-    if (gcth_park_timeout(&gcth_ack, gcth_nreq, GCTH_TEST_DEADLINE))
+  gcth_unpark(&ST->gcth_req, ST->gcth_nreq + 1);
+  while (__atomic_load_n(&ST->gcth_ack.v, __ATOMIC_ACQUIRE) != ST->gcth_nreq + 1)
+    if (gcth_park_timeout(&ST->gcth_ack, ST->gcth_nreq, GCTH_TEST_DEADLINE))
       die("the collector's thread did not stop");
   if (gcth_test_die) {
     eputs("gcth: the collector died and the process did not\n");
@@ -4851,7 +4920,7 @@ static void gc_read_options(void) {
   gc_opt_reloc_stall = (u32)rt_getenv_u64("WARMC_GC_RELOC_STALL", 0);
   gc_opt_mark_stall = rt_getenv_u64("WARMC_GC_MARK_STALL", 0);
   { u64 kb = rt_getenv_u64("WARMC_GC_HEAP_KB", 0);
-    if (kb) gc_heap_bytes = kb * 1024ull; }
+    if (kb) gc_opt_heap_bytes = kb * 1024ull; }
   gcth_spin = (u32)rt_getenv_u64("WARMC_GC_THREAD_SPIN", GCTH_SPINS);
   gc_opt_trap_round = (u32)rt_getenv_u64("WARMC_GC_TRAP_ROUND", 0);
   gc_opt_die_round = (u32)rt_getenv_u64("WARMC_GC_DIE_ROUND", 0);
@@ -4863,122 +4932,133 @@ static void gc_read_options(void) {
   if (gc_opt_stress) gc_opt_conc = 0;
   if (rt_getenv("WARMC_GC_ROUNDS")) gc_opt_conc = 0;
   gc_opt_jitter_seed = rt_getenv_u64("WARMC_GC_JITTER_SEED", 1);
-
-  gc_jitter_state[0] = gc_jitter_mix(gc_opt_jitter_seed);
-  gc_jitter_state[1] = gc_jitter_mix(gc_opt_jitter_seed + 0x5bf03635ull);
   if (gc_opt_stress) gc_opt_lab = 0;
+}
+
+/* What a store starts with that is not zero, the options read */
+static void store_defaults(Store *w) {
+  w->gc_heap_bytes = gc_opt_heap_bytes;
+  w->gc_cycle_no = 1;
+  w->gc_good = GC_C_R;
+  w->gc_fast.good = GC_C_R;
+  w->gc_badmask = GC_C_M0 | GC_C_M1;
+  w->gc_small_page = w->gc_medium_page = w->gc_lab_page = (u32)-1;
+  w->gc_evac_small = w->gc_evac_medium = (u32)-1;
+  w->g_restab.len = 1;
+  w->gc_jitter_state[0] = gc_jitter_mix(gc_opt_jitter_seed);
+  w->gc_jitter_state[1] = gc_jitter_mix(gc_opt_jitter_seed + 0x5bf03635ull);
 }
 
 static void gc_report(void) {
   if (!gc_opt_stats) return;
   eputs("gc: ");
-  put_u64_e(gc_ncycles);
+  put_u64_e(ST->gc_ncycles);
   eputs(" cycles, ");
-  put_u64_e(gc_live);
+  put_u64_e(ST->gc_live);
   eputs(" bytes live, ");
-  put_u64_e(gc_mut.bytes_alloc);
+  put_u64_e(ST->gc_mut.bytes_alloc);
   eputs(" bytes allocated, ");
-  put_u64_e(gc_gran_used * GC_GRAN);
+  put_u64_e(ST->gc_gran_used * GC_GRAN);
   eputs(" bytes of pages (peak ");
-  put_u64_e(gc_gran_peak * GC_GRAN);
+  put_u64_e(ST->gc_gran_peak * GC_GRAN);
   eputs("), ");
-  put_u64_e(gc_npages_opened);
+  put_u64_e(ST->gc_npages_opened);
   eputs(" pages opened, ");
-  put_u64_e(gc_npages_freed);
+  put_u64_e(ST->gc_npages_freed);
   eputs(" freed, ");
-  put_u64_e(gc_nlabs);
+  put_u64_e(ST->gc_nlabs);
   eputs(" regions, ");
-  put_u64_e(gc_mut.fast_bytes);
+  put_u64_e(ST->gc_mut.fast_bytes);
   eputs(" bytes fast-allocated, ");
 
-  put_u64_e(__atomic_load_n(&gc_trigger, __ATOMIC_RELAXED));
+  put_u64_e(__atomic_load_n(&ST->gc_trigger, __ATOMIC_RELAXED));
   eputs(" byte trigger\n");
   eputs("  relocated: ");
-  put_u64_e(gc_reloc_pages);
+  put_u64_e(ST->gc_reloc_pages);
   eputs(" pages, ");
-  put_u64_e(gc_reloc_objs);
+  put_u64_e(ST->gc_reloc_objs);
   eputs(" objects, ");
-  put_u64_e(gc_reloc_bytes);
+  put_u64_e(ST->gc_reloc_bytes);
   eputs(" bytes; released ");
-  put_u64_e(gc_released);
+  put_u64_e(ST->gc_released);
   eputs(" bytes in ");
-  put_u64_e(gc_nreleases);
+  put_u64_e(ST->gc_nreleases);
   eputs(" calls, ");
-  put_u64_e(gc_reloc_stalls);
+  put_u64_e(ST->gc_reloc_stalls);
   eputs(" left for want of room\n");
 
   eputs("  relocation: ");
-  put_u64_e(gc_reloc_pages_all);
+  put_u64_e(ST->gc_reloc_pages_all);
   eputs(" pages and ");
-  put_u64_e(gc_reloc_objs_all);
+  put_u64_e(ST->gc_reloc_objs_all);
   eputs(" objects over the run, ");
-  put_u64_e(gc_reloc_mut);
+  put_u64_e(ST->gc_reloc_mut);
   eputs(" moved by the program, ");
-  put_u64_e(gc_reloc_lost);
+  put_u64_e(ST->gc_reloc_lost);
   eputs(" claims lost\n");
 
   eputs("  barrier: ");
-  put_u64_e(gc_mut.barrier_slow + warmc_gc_fast.healed);
+  put_u64_e(ST->gc_mut.barrier_slow + ST->gc_fast.healed);
   eputs(" loads healed (");
-  put_u64_e(warmc_gc_fast.healed);
+  put_u64_e(ST->gc_fast.healed);
   eputs(" by the fast path), ");
-  put_u64_e(gc_mut.barrier_shaded + warmc_gc_fast.shaded);
+  put_u64_e(ST->gc_mut.barrier_shaded + ST->gc_fast.shaded);
   eputs(" objects shaded (");
-  put_u64_e(warmc_gc_fast.shaded);
+  put_u64_e(ST->gc_fast.shaded);
   eputs(" by the fast path)\n");
 
   eputs("  mark: ");
-  put_u64_e(gc_col.mark_conc_objs);
+  put_u64_e(ST->gc_col.mark_conc_objs);
   eputs(" objects scanned beside the program, ");
-  put_u64_e(gc_mark_end_took);
+  put_u64_e(ST->gc_mark_end_took);
   eputs(" taken at mark end, ");
-  put_u64_e(gc_col.mark_wait_took);
+  put_u64_e(ST->gc_col.mark_wait_took);
   eputs(" taken waiting for it, ");
-  put_u64_e(gc_born_skipped);
+  put_u64_e(ST->gc_born_skipped);
   eputs(" still being born, ");
-  put_u64_e(gc_nassists);
+  put_u64_e(ST->gc_nassists);
   eputs(" assists (");
-  put_u64_e(gc_nassists_stw);
+  put_u64_e(ST->gc_nassists_stw);
   eputs(" that gave up waiting), ");
-  put_u64_e(gc_ncycles_stw);
+  put_u64_e(ST->gc_ncycles_stw);
   eputs(" cycles run by the mutator, ");
-  eputs(gc_conc_on ? "on a thread\n" : "stop-the-world\n");
+  eputs(ST->gc_conc_on ? "on a thread\n" : "stop-the-world\n");
   eputs("  rounds: ");
-  put_u64_e(gc_nrounds_asked);
+  put_u64_e(ST->gc_nrounds_asked);
   eputs(" asked, ");
-  put_u64_e(gc_nrounds);
+  put_u64_e(ST->gc_nrounds);
   eputs(" answered, ");
-  put_u64_e(gc_nrounds_refused);
+  put_u64_e(ST->gc_nrounds_refused);
   eputs(" refused, ");
-  put_u64_e(gc_nrounds_aborted);
+  put_u64_e(ST->gc_nrounds_aborted);
   eputs(" lost to a trap, ");
 
-  put_u64_e(gcth_stop_late);
+  put_u64_e(ST->gcth_stop_late);
   eputs(" exits the collector outlasted\n");
 
   eputs("  round time: ");
-  put_u64_e(gc_t_rounds);
+  put_u64_e(ST->gc_t_rounds);
   eputs(" ns answering, ");
-  put_u64_e(gc_round_max);
+  put_u64_e(ST->gc_round_max);
   eputs(" ns longest; the collector rested ");
-  put_u64_e(gc_nrests);
+  put_u64_e(ST->gc_nrests);
   eputs(" times, ");
-  put_u64_e(gc_nrests_late);
+  put_u64_e(ST->gc_nrests_late);
   eputs(" of them unwoken until the timeout\n");
 
   eputs("  mark end: ");
-  put_u64_e(gc_nrounds_held);
+  put_u64_e(ST->gc_nrounds_held);
   eputs(" held back to mark, ");
-  put_u64_e(gc_nrounds_collided);
+  put_u64_e(ST->gc_nrounds_collided);
   eputs(" already taken, ");
-  put_u64_e(gc_nmark_rests);
+  put_u64_e(ST->gc_nmark_rests);
   eputs(" rests\n");
   eputs("  pauses: ");
-  put_u64_e(gc_pause_count);
+  put_u64_e(ST->gc_pause_count);
   eputs(", ");
-  put_u64_e(gc_pause_max);
+  put_u64_e(ST->gc_pause_max);
   eputs(" ns longest, ");
-  put_u64_e(gc_t_total);
+  put_u64_e(ST->gc_t_total);
   eputs(" ns in the collector\n");
   if (gc_opt_jitter) {
 
@@ -4988,14 +5068,14 @@ static void gc_report(void) {
         eputs(" ");
         eputs(gc_jitter_name[i]);
         eputs(w ? "/collector " : "/mutator ");
-        put_u64_e(gc_jitter_hits[w][i]);
+        put_u64_e(ST->gc_jitter_hits[w][i]);
       }
     eputs("\n");
   }
   eputs("  pauses under 10us/100us/1ms/10ms/over: ");
   for (u32 i = 0; i < 5; i++) {
     if (i) eputs("/");
-    put_u64_e(gc_pause_hist[i]);
+    put_u64_e(ST->gc_pause_hist[i]);
   }
   eputs("\n");
 }
@@ -5020,7 +5100,6 @@ void warmc_report_run(WarmInstance *v) {
   else if (warmc_report_extra) warmc_report_extra(v);
 }
 
-static WarmInstance *g_cinsts[MAX_INSTANCES];
 
 void *(*warmc_host_lookup)(const char *name);
 
@@ -5031,21 +5110,6 @@ __attribute__((noreturn)) static void host_unimplemented(const char *name) {
   warmc_trap(TRAP_UNREACHABLE);
 }
 
-typedef struct {
-  u32 rt;
-  u32 own;
-  u32 lends;
-  u32 pad;
-  u64 rep;
-} ResSlot;
-
-typedef struct {
-  ResSlot *slots;
-  u32 *freelist;
-  u32 len, cap, nfree;
-} ResTable;
-
-static ResTable g_restab = { 0, 0, 1, 0, 0 };
 
 static void res_grow(ResTable *t) {
   u32 cap = t->cap ? t->cap * 2 : 8;
@@ -5062,7 +5126,7 @@ static void res_grow(ResTable *t) {
 }
 
 static u32 res_add(u32 rt, u64 rep, u32 own) {
-  ResTable *t = &g_restab;
+  ResTable *t = &ST->g_restab;
   u32 i;
   if (t->nfree) {
     i = t->freelist[--t->nfree];
@@ -5079,7 +5143,7 @@ static u32 res_add(u32 rt, u64 rep, u32 own) {
 }
 
 static ResSlot *res_get(u32 rt, u32 h) {
-  ResTable *t = &g_restab;
+  ResTable *t = &ST->g_restab;
   if (h >= t->len) warmc_trap(TRAP_UNREACHABLE);
   ResSlot *s = &t->slots[h];
   if (!s->rt || s->rt != rt + 1) warmc_trap(TRAP_UNREACHABLE);
@@ -5087,7 +5151,7 @@ static ResSlot *res_get(u32 rt, u32 h) {
 }
 
 static void res_free_slot(u32 rt, u32 h) {
-  ResTable *t = &g_restab;
+  ResTable *t = &ST->g_restab;
   (void)rt;
   t->slots[h].rt = 0;
   t->freelist[t->nfree++] = h;
@@ -5116,7 +5180,7 @@ u64 warmc_res_lift_borrow(u32 rt, u32 h) {
 }
 
 void warmc_res_release(u32 rt, u32 h) {
-  ResTable *t = &g_restab;
+  ResTable *t = &ST->g_restab;
   (void)rt;
   if (h < t->len && t->slots[h].lends) t->slots[h].lends--;
 }
@@ -5191,7 +5255,7 @@ static u32 component_instantiate(u32 *err) {
       binds[j].code = 0;
       binds[j].name = ci->binds[j].name;
       binds[j].inst = ci->binds[j].inst == 0xffffffffu
-                        ? 0 : g_cinsts[ci->binds[j].inst];
+                        ? 0 : ST->g_cinsts[ci->binds[j].inst];
       if (ci->binds[j].host) {
         void *code = builtin_host(ci->binds[j].host);
         if (!code && warmc_host_lookup) code = warmc_host_lookup(ci->binds[j].host);
@@ -5199,9 +5263,9 @@ static u32 component_instantiate(u32 *err) {
         if (!code) binds[j].inst = (WarmInstance *)(void *)ci->binds[j].host;
       }
     }
-    g_cinsts[i] = err ? warmc_instantiate_bound_catching(ci->md, n ? binds : 0, err)
+    ST->g_cinsts[i] = err ? warmc_instantiate_bound_catching(ci->md, n ? binds : 0, err)
                       : warmc_instantiate_bound(ci->md, n ? binds : 0);
-    if (!g_cinsts[i]) return *err;
+    if (!ST->g_cinsts[i]) return *err;
   }
   return 0;
 }
@@ -5217,7 +5281,7 @@ WarmInstance *warmc_component_export(const char *name, const ExportDesc **out) {
   const ComponentDesc *cd = warmc_component;
   for (u32 i = 0; i < cd->nexports; i++) {
     if (!streq(cd->exports[i].name, name)) continue;
-    WarmInstance *v = g_cinsts[cd->exports[i].inst];
+    WarmInstance *v = ST->g_cinsts[cd->exports[i].inst];
     const ExportDesc *e = warmc_find_export(v, cd->exports[i].export_name);
     if (!e) return 0;
     *out = e;
@@ -5259,8 +5323,8 @@ __attribute__((noreturn)) static void component_run(int argc, char **argv) {
       sys_exit(2);
     }
 
-    vm = g_cinsts[cd->exports[k].inst];
-    g_desc = INST_OF(vm)->md;
+    ST->g_vm = ST->g_cinsts[cd->exports[k].inst];
+    g_desc = INST_OF(ST->g_vm)->md;
     const ExportDesc *e = find_export(cd->exports[k].export_name);
     if (!e) {
       eputs("warmc-rt: the component names a core export that is missing: ");
@@ -5272,7 +5336,7 @@ __attribute__((noreturn)) static void component_run(int argc, char **argv) {
     hot = (reps > 0);
     i = j + 1;
   }
-  warmc_report_run(vm);
+  warmc_report_run(ST->g_vm);
   sys_exit(rc);
 }
 
@@ -5288,6 +5352,7 @@ void warmc_gcth_run_tests(void) {
 #if !defined(WARMC_JIT)
 __attribute__((noreturn)) static void warmc_run(int argc, char **argv) {
   gc_read_options();
+  store_defaults(ST);
 
   if (warmc_gcth_tests) warmc_gcth_tests();
 
@@ -5306,7 +5371,7 @@ __attribute__((noreturn)) static void warmc_run(int argc, char **argv) {
     if (margin > (256u << 10)) margin = 256u << 10;
     if (limit < lo + margin) limit = lo + margin;
   }
-  g_stack_limit = limit;
+  ST->g_stack_limit = limit;
 
   sys_exit(warmc_driver_hook(argc, argv));
 }
@@ -5344,7 +5409,7 @@ int warmc_cli_main(int argc, char **argv) {
     argv++;
   }
   g_desc = sel;
-  vm = warmc_instantiate(sel);
+  ST->g_vm = warmc_instantiate(sel);
 
   int reps = 0;
   if (argc >= 3 && streq(argv[1], "--bench")) {
@@ -5366,7 +5431,7 @@ int warmc_cli_main(int argc, char **argv) {
       hot = (reps > 0);
       i = j + 1;
     }
-    warmc_report_run(vm);
+    warmc_report_run(ST->g_vm);
     sys_exit(rc);
   }
 
@@ -5374,7 +5439,7 @@ int warmc_cli_main(int argc, char **argv) {
   if (!e) e = find_export("main");
   if (e) {
     int r = call_export(e, "_start", 0, 0, 0, 0);
-    warmc_report_run(vm);
+    warmc_report_run(ST->g_vm);
     sys_exit(r);
   }
 
@@ -5417,17 +5482,9 @@ __attribute__((noreturn)) void warmc_start_c(long *sp) {
    scanning tables, which a collection under way may be doing with its
    tables.  One that starts later waits for a round only the thread running
    wasm answers, and finds the slot empty by then. */
-static Instance *inst_graveyard;
 
 static void memory_release(WarmMemory *M) {
-  if (M->guarded) {
-    for (u32 i = 0; i < nguards; i++)
-      if (guards[i].base == M->map) {
-        guards[i] = guards[nguards - 1];
-        nguards--;
-        break;
-      }
-  }
+  if (M->guarded) range_remove(&guards, M->map);
   if (M->map) sys_munmap(M->map, (usz)M->map_len);
   inst_free(M);
 }
@@ -5458,31 +5515,31 @@ static void inst_release(Instance *in) {
 }
 
 static void inst_sweep(void) {
-  if (!inst_graveyard || __atomic_load_n(&gc_cycle_running, __ATOMIC_ACQUIRE)) return;
-  while (inst_graveyard) {
-    Instance *in = inst_graveyard;
-    inst_graveyard = in->dead_next;
+  if (!ST->inst_graveyard || __atomic_load_n(&ST->gc_cycle_running, __ATOMIC_ACQUIRE)) return;
+  while (ST->inst_graveyard) {
+    Instance *in = ST->inst_graveyard;
+    ST->inst_graveyard = in->dead_next;
     inst_release(in);
   }
 }
 
 void warmc_instance_free(WarmInstance *v) {
   Instance *in = INST_OF(v);
-  for (u32 i = 0; i < nregistry;)
-    if (registry[i].inst == v) registry[i] = registry[--nregistry];
+  for (u32 i = 0; i < ST->nregistry;)
+    if (ST->registry[i].inst == v) ST->registry[i] = ST->registry[--ST->nregistry];
     else i++;
-  __atomic_store_n(&instances[in->slot], (Instance *)0, __ATOMIC_SEQ_CST);
-  if (in->slot + 1 == ninstances) {
-    u32 n = ninstances - 1;
-    while (n && !instances[n - 1]) { n--; nfree_slots--; }
-    __atomic_store_n(&ninstances, n, __ATOMIC_RELEASE);
+  __atomic_store_n(&ST->instances[in->slot], (Instance *)0, __ATOMIC_SEQ_CST);
+  if (in->slot + 1 == ST->ninstances) {
+    u32 n = ST->ninstances - 1;
+    while (n && !ST->instances[n - 1]) { n--; ST->nfree_slots--; }
+    __atomic_store_n(&ST->ninstances, n, __ATOMIC_RELEASE);
   } else {
-    nfree_slots++;
-    if (in->slot < free_hint) free_hint = in->slot;
+    ST->nfree_slots++;
+    if (in->slot < ST->free_hint) ST->free_hint = in->slot;
   }
-  if (free_hint > ninstances) free_hint = ninstances;
-  in->dead_next = inst_graveyard;
-  inst_graveyard = in;
+  if (ST->free_hint > ST->ninstances) ST->free_hint = ST->ninstances;
+  in->dead_next = ST->inst_graveyard;
+  ST->inst_graveyard = in;
   inst_sweep();
 }
 
@@ -5491,16 +5548,92 @@ void warmc_instance_free(WarmInstance *v) {
    types are registered for objects that may outlive the instances -- and
    its code and data must stay where they are. */
 int warmc_rt_forget_desc(const ModuleDesc *md) {
-  for (u32 i = 0; i < gc_ndesc_types; i++)
-    if (gc_desc_types[i].md == md) return 0;
+  if (typed_stores(md, 0)) return 0;
   descs_acquire();
   for (u32 i = 0; i < ndescs; i++) {
     if (descs[i] != md) continue;
-    descs[i] = descs[ndescs - 1];
-    desc_sorted[i] = desc_sorted[ndescs - 1];
+    __atomic_store_n(&descs_gen, descs_gen + 1, __ATOMIC_RELAXED);
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    __atomic_store_n(&descs[i], descs[ndescs - 1], __ATOMIC_RELAXED);
+    __atomic_store_n(&desc_sorted[i], desc_sorted[ndescs - 1], __ATOMIC_RELAXED);
     __atomic_store_n(&ndescs, ndescs - 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&descs_gen, descs_gen + 1, __ATOMIC_RELEASE);
     break;
   }
   descs_release();
   return 1;
 }
+
+#if defined(WARMC_JIT)
+/* ---- stores -----------------------------------------------------------------
+   A JIT's host makes a store for each store (src/capi.c), enters it on a
+   thread for as long as that thread runs the store's wasm, and deletes it
+   with the store.  Everything a store holds is its own: its instances,
+   its heap and side tables, its collector's thread, its WASI state. */
+
+/* WASI's state of a store, which rt/wasi.c frees */
+void warmc_wasi_store_free(void *wasi);
+
+Store *warmc_rt_store_new(void) {
+  Store *w = (Store *)sys_mmap(0, sizeof(Store), PROT_READ | PROT_WRITE,
+                               MAP_PRIVATE | MAP_ANONYMOUS);
+  if (!w || w == (Store *)-1) return 0;
+  store_defaults(w);
+  return w;
+}
+
+/* The store the calling thread runs from now on, with the limit its frames
+   run to; what it ran before comes back, for warmc_rt_store_leave. */
+Store *warmc_rt_store_enter(Store *w, u64 limit) {
+  Store *prev = warmc_store;
+  warmc_store = w;
+  warmc_rt_thread_enter(limit);
+  return prev;
+}
+
+void warmc_rt_store_leave(Store *prev) { warmc_store = prev; }
+
+static void unmap_lazy(void *p, u64 len) {
+  if (!p) return;
+#if !defined(WARMC_DARWIN)
+  lazy_forget((u8 *)p);
+#endif
+  sys_munmap(p, (usz)len);
+}
+
+/* A store given back, on a thread that runs no wasm of it: its collector
+   stopped and waited for, every instance and what it owns freed, its heap
+   and side tables unmapped. */
+void warmc_rt_store_delete(Store *w) {
+  if (!w) return;
+  Store *prev = warmc_store;
+  warmc_store = w;
+  if (__atomic_load_n(&ST->gcth_started, __ATOMIC_ACQUIRE)) {
+    __atomic_store_n(&ST->gcth_stopping, 1u, __ATOMIC_SEQ_CST);
+    gc_answer_outstanding(0);
+    gcth_nudge();
+    gcth_join();
+  }
+  for (u32 i = 0; i < ST->ninstances; i++)
+    if (ST->instances[i]) warmc_instance_free(&ST->instances[i]->vm);
+  inst_sweep();
+  for (u32 i = 0; i < ST->gc_ndesc_types; i++)
+    typed_stores(ST->gc_desc_types[i].md, -1);
+  if (ST->gc_base) {
+    unmap_lazy(ST->gc_map, ST->gc_map_len);
+    sys_munmap(ST->gc_pages, (usz)(ST->gc_ngran * sizeof(GcPage)));
+    sys_munmap(ST->gc_page_epoch, (usz)(ST->gc_ngran * sizeof(u32)));
+    sys_munmap(ST->gc_granfree, (usz)(ST->gc_granfree_words * 8));
+    unmap_lazy(ST->gc_markbits, ST->gc_heap_bytes / GC_UNIT / 8);
+    sys_munmap(ST->gc_gran_map, (usz)ST->gc_ngran);
+    unmap_lazy(ST->gc_grey, ST->gc_capgrey * sizeof(u8 *));
+    unmap_lazy(ST->gc_mq, ST->gc_capgrey * sizeof(u8 *));
+    unmap_lazy(ST->gc_typetab, GC_MAX_TYPES * sizeof(void *));
+    if (ST->gc_fwd) sys_munmap(ST->gc_fwd, (usz)(ST->gc_fwd_slots * 16));
+    gc_fwd_unmap();
+  }
+  if (ST->wasi) warmc_wasi_store_free(ST->wasi);
+  warmc_store = prev == w ? 0 : prev;
+  sys_munmap(w, sizeof(Store));
+}
+#endif

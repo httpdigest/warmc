@@ -20,10 +20,15 @@
    (wasm_memory_new and the like) is the export of a tiny module made for
    it, as is a host function that wasm code is handed as a reference.
 
-   Threads.  The runtime runs one thread's wasm at a time: every call into
-   it takes one lock, which a host function calling back in already holds,
-   and a thread that takes it sets the stack limit wasm runs to from its
-   own stack. */
+   Threads.  Each store is a store of the runtime's own (rt/store.h): its
+   instances, the heap of its GC objects and that heap's collector, its
+   WASI state.  Threads run wasm of different stores at once.  One store
+   runs on one thread at a time: every call into it takes the store's lock,
+   which a host function calling back into it already holds, and a thread
+   that enters it sets the stack limit wasm runs to from its own stack.  A
+   host function that calls into another store enters that one, and comes
+   back to its own as it returns.  What one store's wasm can reach is that
+   store's alone: an import or a reference of another store's is refused. */
 
 /* the library's exports: wasm.h's functions and warm.h's, and nothing else */
 #if defined(_WIN32)
@@ -41,6 +46,17 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+
+#ifdef _WIN32
+unsigned long __stdcall GetActiveProcessorCount(unsigned short group);
+static long host_ncpus(void) {
+  unsigned long n = GetActiveProcessorCount((unsigned short)0xffff);
+  return n ? (long)n : 1;
+}
+#else
+static long host_ncpus(void) { return sysconf(_SC_NPROCESSORS_ONLN); }
+#endif
 
 /* the runtime's, which warm_rt.h does not declare */
 void *warmc_table_get(WarmInstance *v, u64 i, u32 tab);
@@ -52,8 +68,12 @@ void *warmc_memory_view(WarmInstance *inst, u32 idx, u8 **base, u64 *size,
                         u64 *pages, u64 *max_pages, u64 *decl_max, u32 *flags);
 void *warmc_table_view(WarmInstance *inst, u32 idx, u64 *len, u64 *max_len,
                        u32 *flags);
-void warmc_rt_thread_enter(u64 limit);
 void warmc_instance_free(WarmInstance *v);
+struct Store *warmc_rt_store_new(void);
+struct Store *warmc_rt_store_enter(struct Store *st, u64 limit);
+void warmc_rt_store_leave(struct Store *prev);
+void warmc_rt_store_delete(struct Store *st);
+void warmc_rt_set_collectors(u32 n);
 int warmc_rt_forget_desc(const ModuleDesc *md);
 extern void *(*warmc_rt_malloc_hook)(u64 bytes);
 extern void (*warmc_rt_free_hook)(void *p);
@@ -79,12 +99,10 @@ static char *xstrdup_n(const char *s, size_t n) {
   return d;
 }
 
-/* ---- the runtime's lock ------------------------------------------------ */
+/* ---- entering the runtime ------------------------------------------------ */
 
 static pthread_once_t g_rt_once = PTHREAD_ONCE_INIT;
-static pthread_mutex_t g_rt_lock;
 static bool g_rt_ok;
-static _Thread_local unsigned g_depth;
 static _Thread_local u64 g_limit;
 
 static void *rt_malloc(u64 n) { return calloc(1, (size_t)n); }
@@ -95,12 +113,10 @@ static void rt_init(void) {
   jit_reserve();
   warmc_rt_malloc_hook = rt_malloc;
   warmc_rt_free_hook = free;
-  pthread_mutexattr_t a;
-  pthread_mutexattr_init(&a);
-  pthread_mutexattr_settype(&a, PTHREAD_MUTEX_RECURSIVE);
-  pthread_mutex_init(&g_rt_lock, &a);
-  pthread_mutexattr_destroy(&a);
   g_rt_ok = warmc_rt_library_mode() != 0;
+  /* as many stores' collectors at once as there are processors */
+  long n = host_ncpus();
+  warmc_rt_set_collectors(n > 0 ? (u32)n : 1);
 }
 
 /* The limit wasm's frames run to on this thread: its stack less a margin
@@ -122,15 +138,33 @@ static u64 thread_limit(void) {
   return g_limit;
 }
 
-static void rt_enter(void) {
-  pthread_once(&g_rt_once, rt_init);
-  pthread_mutex_lock(&g_rt_lock);
-  if (g_depth++ == 0) warmc_rt_thread_enter(thread_limit());
+/* The store the calling thread runs wasm of, innermost first: a host
+   function may call into another. */
+typedef struct Entered {
+  wasm_store_t *store;
+  struct Store *prev;
+  struct Entered *outer;
+} Entered;
+static _Thread_local Entered *g_entered;
+
+static void store_lock(wasm_store_t *s);
+static void store_unlock(wasm_store_t *s);
+static struct Store *store_rt(wasm_store_t *s);
+
+/* s's lock taken and its runtime store the thread's, until rt_leave; e is
+   the caller's, which says what to go back to */
+static void rt_enter(wasm_store_t *s, Entered *e) {
+  store_lock(s);
+  e->store = s;
+  e->prev = warmc_rt_store_enter(store_rt(s), thread_limit());
+  e->outer = g_entered;
+  g_entered = e;
 }
 
-static void rt_leave(void) {
-  g_depth--;
-  pthread_mutex_unlock(&g_rt_lock);
+static void rt_leave(Entered *e) {
+  g_entered = e->outer;
+  warmc_rt_store_leave(e->prev);
+  store_unlock(e->store);
 }
 
 /* ---- vectors ------------------------------------------------------------ */
@@ -683,6 +717,11 @@ typedef struct { WarmInstance *vm; ModuleRec *mod; } RtInst;
 
 struct wasm_store_t {
   wasm_engine_t *engine;
+  struct Store *rt;     /* the runtime's (rt/store.h) */
+  pthread_mutex_t lock; /* a thread running its wasm holds it, recursively */
+  /* what its WASI sees, whose strings the runtime keeps pointers to
+     (warm_wasi_imports) */
+  warm_wasi_config_t *wasi;
   Ent *pinned;          /* what the store holds, newest first */
   /* a function's Ent by its code, instance and type: two functions whose
      bodies compiled alike share their code (codegen's merge), and are
@@ -695,10 +734,25 @@ struct wasm_store_t {
 };
 
 own wasm_store_t *wasm_store_new(wasm_engine_t *e) {
+  pthread_once(&g_rt_once, rt_init);
+  struct Store *rt = warmc_rt_store_new();
+  if (!rt) return NULL;
   wasm_store_t *s = xzalloc(sizeof *s);
   s->engine = e;
+  s->rt = rt;
+  pthread_mutexattr_t a;
+  pthread_mutexattr_init(&a);
+  pthread_mutexattr_settype(&a, PTHREAD_MUTEX_RECURSIVE);
+  pthread_mutex_init(&s->lock, &a);
+  pthread_mutexattr_destroy(&a);
   return s;
 }
+
+static void store_lock(wasm_store_t *s) { pthread_mutex_lock(&s->lock); }
+static void store_unlock(wasm_store_t *s) { pthread_mutex_unlock(&s->lock); }
+static struct Store *store_rt(wasm_store_t *s) { return s->rt; }
+
+static void wasi_config_free(warm_wasi_config_t *c);
 
 /* ---- modules ------------------------------------------------------------- */
 
@@ -709,16 +763,14 @@ struct ModuleRec {
 };
 
 /* A module no handle and no instance holds any more: its code goes, unless
-   the collector still refers to it (its heap types). */
+   a store's heap may still hold objects of its types. */
 static void module_release(ModuleRec *m) {
   if (!m || atomic_fetch_sub(&m->refs, 1) != 1) return;
   /* no optimised code goes in place from now on; what is in place goes
      with the module's own */
   const void *md2 = jit_module_detach_tier(m->jm);
-  rt_enter();
   bool forget = warmc_rt_forget_desc(m->md) != 0;
   if (forget && md2) warmc_rt_forget_desc((const ModuleDesc *)md2);
-  rt_leave();
   jit_module_free(m->jm, forget);
   free(m);
 }
@@ -848,9 +900,10 @@ static void rt_inst_free(wasm_store_t *s, size_t i) {
   if (!ri->vm) return;
   MapSlot *m = map_find(&s->inst_ents, (u64)(uptr)ri->vm, 0);
   if (m) m->v = NULL;
-  rt_enter();
+  Entered en;
+  rt_enter(s, &en);
   warmc_instance_free(ri->vm);
-  rt_leave();
+  rt_leave(&en);
   ri->vm = NULL;
   module_release(ri->mod);
   ri->mod = NULL;
@@ -960,6 +1013,10 @@ void wasm_store_delete(own wasm_store_t *s) {
     e = next;
   }
   for (size_t i = 0; i < s->ninsts; i++) rt_inst_free(s, i);
+  /* the runtime's store before s->wasi, which its WASI state points into */
+  warmc_rt_store_delete(s->rt);
+  wasi_config_free(s->wasi);
+  pthread_mutex_destroy(&s->lock);
   free(s->insts);
   free(s->funcs.s);
   free(s->refs.s);
@@ -1064,7 +1121,8 @@ static bool to_raw(wasm_store_t *s, const wasm_val_t *v, uint8_t k, u64 *lo) {
   if (!e) { *lo = 0; return true; }
   if (e->kind == K_RAW) { *lo = ((RawEnt *)e)->raw; return true; }
   if (k == WASM_FUNCREF) {
-    if (e->kind != K_FUNC) return false;
+    /* a function of another store's, which wasm here could call */
+    if (e->kind != K_FUNC || (e->store && e->store != s)) return false;
     FuncEnt *f = (FuncEnt *)e;
     if (f->native) return false;
     FuncRef *c = f->host ? host_cell(f->host) : f->cell;
@@ -1378,9 +1436,10 @@ static WarmInstance *proxy_instance(wasm_store_t *s, const char *wat,
   ModuleRec *m = proxy_module(s->engine, wat);
   WarmBinding none = { 0, 0, 0, 0 };
   u32 err = 0;
-  rt_enter();
+  Entered en;
+  rt_enter(s, &en);
   WarmInstance *v = warmc_instantiate_bound_catching(m->md, binds ? binds : &none, &err);
-  rt_leave();
+  rt_leave(&en);
   if (!v) {
     fprintf(stderr, "libwarmc: internal: %s does not instantiate: %s\n", wat,
             warmc_trap_name(err));
@@ -1565,10 +1624,11 @@ static wasm_trap_t *invoke(const FuncEnt *f, const u64 *argv, u64 *resv, size_t 
   u64 ret_small[WARMC_RETBUF_WORDS];
   u64 *ret = ret_small;
   if (nr > WARMC_RET_MAX_RESULTS) ret = xzalloc((WARMC_RET_SCRATCH + 2 * nr) * 8);
-  rt_enter();
+  Entered en;
+  rt_enter(s, &en);
   u32 trap = warmc_invoke_catching_s(f->cell->code, (WarmInstance *)f->cell->instance,
                                      iargs, fargs, ret, stk, nstk * 8);
-  rt_leave();
+  rt_leave(&en);
   if (stk != stk_small) free(stk);
   wasm_trap_t *t = NULL;
   if (trap) {
@@ -1875,9 +1935,10 @@ own wasm_globaltype_t *wasm_global_type(const wasm_global_t *g) {
 
 void wasm_global_get(const wasm_global_t *g, own wasm_val_t *out) {
   const ExtEnt *x = (const ExtEnt *)g;
-  rt_enter();
+  Entered en;
+  rt_enter(x->e.store, &en);
   u64 v = x->cell[0];
-  rt_leave();
+  rt_leave(&en);
   from_raw(x->e.store, v, x->valkind, out);
 }
 
@@ -1885,9 +1946,10 @@ void wasm_global_set(wasm_global_t *g, const wasm_val_t *v) {
   ExtEnt *x = (ExtEnt *)g;
   u64 raw;
   if (!x->mutable_ || !to_raw(x->e.store, v, x->valkind, &raw)) return;
-  rt_enter();
+  Entered en;
+  rt_enter(x->e.store, &en);
   x->cell[0] = raw;
-  rt_leave();
+  rt_leave(&en);
 }
 
 own wasm_table_t *wasm_table_new(wasm_store_t *s, const wasm_tabletype_t *t,
@@ -1910,9 +1972,10 @@ own wasm_table_t *wasm_table_new(wasm_store_t *s, const wasm_tabletype_t *t,
   ExtEnt *x = ext_new(s, K_TABLE, v, "t", 1, 0);
   x->valkind = k;
   if (raw) {
-    rt_enter();
+    Entered en;
+    rt_enter(s, &en);
     for (u32 i = 0; i < t->limits.min; i++) warmc_table_set(v, i, (void *)(uptr)raw, 0);
-    rt_leave();
+    rt_leave(&en);
   }
   return (wasm_table_t *)&x->e;
 }
@@ -1921,9 +1984,10 @@ own wasm_tabletype_t *wasm_table_type(const wasm_table_t *t) {
   const ExtEnt *x = (const ExtEnt *)t;
   u64 len = 0, max = 0;
   u32 flags = 0;
-  rt_enter();
+  Entered en;
+  rt_enter(x->e.store, &en);
   warmc_table_view(x->owner, x->index, &len, &max, &flags);
-  rt_leave();
+  rt_leave(&en);
   wasm_limits_t l = limits_of(len, max, flags & 1);
   return wasm_tabletype_new(wasm_valtype_new(x->valkind), &l);
 }
@@ -1932,10 +1996,11 @@ own wasm_ref_t *wasm_table_get(const wasm_table_t *t, wasm_table_size_t i) {
   const ExtEnt *x = (const ExtEnt *)t;
   u64 len = 0, max = 0;
   u32 flags = 0;
-  rt_enter();
+  Entered en;
+  rt_enter(x->e.store, &en);
   warmc_table_view(x->owner, x->index, &len, &max, &flags);
   u64 raw = i < len ? (u64)(uptr)warmc_table_get(x->owner, i, x->index) : 0;
-  rt_leave();
+  rt_leave(&en);
   wasm_val_t v;
   from_raw(x->e.store, raw, x->valkind, &v);
   return v.of.ref;
@@ -1949,11 +2014,12 @@ bool wasm_table_set(wasm_table_t *t, wasm_table_size_t i, wasm_ref_t *r) {
   u64 raw, len = 0, max = 0;
   u32 flags = 0;
   if (!to_raw(x->e.store, &v, x->valkind, &raw)) return false;
-  rt_enter();
+  Entered en;
+  rt_enter(x->e.store, &en);
   warmc_table_view(x->owner, x->index, &len, &max, &flags);
   bool ok = i < len;
   if (ok) warmc_table_set(x->owner, i, (void *)(uptr)raw, x->index);
-  rt_leave();
+  rt_leave(&en);
   return ok;
 }
 
@@ -1961,9 +2027,10 @@ wasm_table_size_t wasm_table_size(const wasm_table_t *t) {
   const ExtEnt *x = (const ExtEnt *)t;
   u64 len = 0, max = 0;
   u32 flags = 0;
-  rt_enter();
+  Entered en;
+  rt_enter(x->e.store, &en);
   warmc_table_view(x->owner, x->index, &len, &max, &flags);
-  rt_leave();
+  rt_leave(&en);
   return len > UINT32_MAX ? UINT32_MAX : (wasm_table_size_t)len;
 }
 
@@ -1974,9 +2041,10 @@ bool wasm_table_grow(wasm_table_t *t, wasm_table_size_t delta, wasm_ref_t *init)
   v.of.ref = init;
   u64 raw;
   if (!to_raw(x->e.store, &v, x->valkind, &raw)) return false;
-  rt_enter();
+  Entered en;
+  rt_enter(x->e.store, &en);
   u64 old = warmc_table_grow(x->owner, (void *)(uptr)raw, delta, x->index);
-  rt_leave();
+  rt_leave(&en);
   return old != (u64)-1;
 }
 
@@ -2026,9 +2094,10 @@ wasm_memory_pages_t wasm_memory_size(const wasm_memory_t *mem) {
 
 bool wasm_memory_grow(wasm_memory_t *mem, wasm_memory_pages_t delta) {
   ExtEnt *x = (ExtEnt *)mem;
-  rt_enter();
+  Entered en;
+  rt_enter(x->e.store, &en);
   u64 old = warmc_memory_grow(x->owner, delta, x->index);
-  rt_leave();
+  rt_leave(&en);
   return old != (u64)-1;
 }
 
@@ -2120,6 +2189,12 @@ own wasm_instance_t *warm_instance_new(wasm_store_t *s, const wasm_module_t *mod
     const JitExtern *x = &jm->imports[i];
     const Ent *e = imports && i < imports->size ? (const Ent *)imports->data[i] : NULL;
     if (!e) { why = msgf("no import given for \"%s\".\"%s\"%s", x, ""); break; }
+    /* a store's wasm reaches its own store's alone: another's runs in the
+       other store's runtime, on whatever thread that one is entered by */
+    if (e->store && e->store != s) {
+      why = msgf("import \"%s\".\"%s\" is of another store%s", x, "");
+      break;
+    }
     if (ent_extkind(e) != x->kind) {
       why = msgf("import \"%s\".\"%s\" is a %s, and was given another kind", x,
                  kind_name(x->kind));
@@ -2163,9 +2238,10 @@ own wasm_instance_t *warm_instance_new(wasm_store_t *s, const wasm_module_t *mod
   }
   u32 err = 0;
   WarmInstance *partial = NULL;
-  rt_enter();
+  Entered en;
+  rt_enter(s, &en);
   WarmInstance *v = warmc_instantiate_bound_catching_p(md, b, &err, &partial);
-  rt_leave();
+  rt_leave(&en);
   free(b);
   /* what a failed instantiation left behind is the store's, as what it
      wrote into the store's other instances may still call it */
@@ -2301,6 +2377,8 @@ struct warm_wasi_config_t {
   bool inherit_env;
   char **dirs; size_t ndirs;
   char **listen; size_t nlisten;
+  /* the store's next older one (wasm_store_t.wasi) */
+  struct warm_wasi_config_t *older;
 };
 
 own warm_wasi_config_t *warm_wasi_config_new(void) {
@@ -2319,14 +2397,19 @@ static void strv_add(char ***v, size_t *n, const char *s) {
   (*v)[*n] = NULL;
 }
 
-void warm_wasi_config_delete(own warm_wasi_config_t *c) {
-  if (!c) return;
-  strv_free(c->argv, c->argc);
-  strv_free(c->env, c->nenv);
-  strv_free(c->dirs, c->ndirs);
-  strv_free(c->listen, c->nlisten);
-  free(c);
+static void wasi_config_free(warm_wasi_config_t *c) {
+  while (c) {
+    warm_wasi_config_t *older = c->older;
+    strv_free(c->argv, c->argc);
+    strv_free(c->env, c->nenv);
+    strv_free(c->dirs, c->ndirs);
+    strv_free(c->listen, c->nlisten);
+    free(c);
+    c = older;
+  }
 }
+
+void warm_wasi_config_delete(own warm_wasi_config_t *c) { wasi_config_free(c); }
 
 void warm_wasi_config_tcplisten(warm_wasi_config_t *c, const char *addr) {
   strv_add(&c->listen, &c->nlisten, addr);
@@ -2358,14 +2441,11 @@ bool warm_wasi_config_preopen_dir(warm_wasi_config_t *c, const char *host,
   return true;
 }
 
-/* The world rt/wasi.c serves now, whose strings it keeps pointers to */
-static warm_wasi_config_t g_wasi_world;
-static wasm_store_t *g_wasi_store;
-
+/* proc_exit, on the thread of the store whose program called it */
 static void wasi_exit(int code) {
   char msg[64];
   int n = snprintf(msg, sizeof msg, "exit status %d", code);
-  TrapEnt *t = trap_make(g_wasi_store, msg, (size_t)n);
+  TrapEnt *t = trap_make(g_entered->store, msg, (size_t)n);
   t->is_exit = true;
   t->exit_status = code;
   g_host_trap = t;
@@ -2387,37 +2467,31 @@ bool warm_wasi_imports(wasm_store_t *s, const wasm_module_t *module,
   const JitModule *jm = jm_of(module);
   ModuleRec *sig = proxy_module(s->engine, warmc_jit_wasi_wat);
 
-  /* the world, copied: the caller may delete its config */
-  warm_wasi_config_t w;
-  memset(&w, 0, sizeof w);
-  for (size_t i = 0; i < c->argc; i++) strv_add(&w.argv, &w.argc, c->argv[i]);
-  if (!w.argv) strv_add(&w.argv, &w.argc, "main");
+  /* what the program sees, copied: the caller may delete its config */
+  warm_wasi_config_t *w = xzalloc(sizeof *w);
+  for (size_t i = 0; i < c->argc; i++) strv_add(&w->argv, &w->argc, c->argv[i]);
+  if (!w->argv) strv_add(&w->argv, &w->argc, "main");
   if (c->inherit_env)
-    for (char **e = host_environ; e && *e; e++) strv_add(&w.env, &w.nenv, *e);
-  for (size_t i = 0; i < c->nenv; i++) strv_add(&w.env, &w.nenv, c->env[i]);
-  for (size_t i = 0; i < c->ndirs; i++) strv_add(&w.dirs, &w.ndirs, c->dirs[i]);
-  for (size_t i = 0; i < c->nlisten; i++) strv_add(&w.listen, &w.nlisten, c->listen[i]);
-  rt_enter();
+    for (char **e = host_environ; e && *e; e++) strv_add(&w->env, &w->nenv, *e);
+  for (size_t i = 0; i < c->nenv; i++) strv_add(&w->env, &w->nenv, c->env[i]);
+  for (size_t i = 0; i < c->ndirs; i++) strv_add(&w->dirs, &w->ndirs, c->dirs[i]);
+  for (size_t i = 0; i < c->nlisten; i++) strv_add(&w->listen, &w->nlisten, c->listen[i]);
+  Entered en;
+  rt_enter(s, &en);
   const char *bad = NULL;
-  int ok = warmc_wasi_jit_setup((int)w.argc, w.argv, w.env, (int)w.nenv,
-                                (const char *const *)w.dirs, (int)w.ndirs,
-                                (const char *const *)w.listen, (int)w.nlisten, &bad);
+  int ok = warmc_wasi_jit_setup((int)w->argc, w->argv, w->env, (int)w->nenv,
+                                (const char *const *)w->dirs, (int)w->ndirs,
+                                (const char *const *)w->listen, (int)w->nlisten, &bad);
+  /* the store's until it goes, as is every one before it: a setup that
+     failed half way may have left pointers into either */
+  w->older = s->wasi;
+  s->wasi = w;
   if (ok) {
-    strv_free(g_wasi_world.argv, g_wasi_world.argc);
-    strv_free(g_wasi_world.env, g_wasi_world.nenv);
-    strv_free(g_wasi_world.dirs, g_wasi_world.ndirs);
-    strv_free(g_wasi_world.listen, g_wasi_world.nlisten);
-    g_wasi_world = w;
-    g_wasi_store = s;
     warmc_wasi_exit_hook = wasi_exit;
     if (tier_mode() == TIER_ENV_HOST) warmc_wasi_call_hook = tier_host_wait;
   }
-  rt_leave();
+  rt_leave(&en);
   if (!ok) {
-    strv_free(w.argv, w.argc);
-    strv_free(w.env, w.nenv);
-    strv_free(w.dirs, w.ndirs);
-    strv_free(w.listen, w.nlisten);
     wasm_extern_vec_new_empty(out);
     return false;
   }

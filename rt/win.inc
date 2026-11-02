@@ -166,9 +166,9 @@ static long warmc_win_veh(void *info) {
 }
 
 static void install_fault_handler(void) {
-  static u32 installed;
-  if (__atomic_exchange_n(&installed, 1, __ATOMIC_ACQ_REL)) return;
+  if (!once_begin(&fault_handler_once)) return;
   AddVectoredExceptionHandler(1, warmc_win_veh);
+  once_end(&fault_handler_once);
 }
 
 /* ---- entry: ISA check, command line, environment ---- */

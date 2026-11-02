@@ -15,8 +15,30 @@ extern void *malloc(usz);
 extern void *realloc(void *, usz);
 extern void free(void *);
 
-static int g_argc;
-static char **g_argv;
+/* What a program's WASI sees: its arguments, its environment, its file
+   descriptors, the random stream it may be given.  A program has one; in a
+   JIT's library each store has its own (rt/store.h), set up by
+   warm_wasi_imports for that store and freed with it. */
+typedef struct Fd Fd;
+typedef struct {
+  int g_argc;
+  char **g_argv;
+  u64 g_seed_state;
+  int g_seed_fixed;
+  char **g_env;
+  int g_nenv, g_capenv;
+  int g_env_inherit;
+  Fd *g_fds;
+  u32 g_nfds;
+} WasiStore;
+
+#if defined(WARMC_JIT)
+#include "store.h"
+#define WS ((WasiStore *)ST->wasi)
+#else
+static WasiStore g_wasi;
+#define WS (&g_wasi)
+#endif
 
 static void err_u64(unsigned long long v) {
   char b[24];
@@ -139,8 +161,6 @@ static u64 wasi_proc_exit(WarmInstance *vm, u64 code) {
   warmc_rt_exit((int)(u32)code);
 }
 
-static u64 g_seed_state;
-static int g_seed_fixed;
 
 static u64 splitmix64(u64 *s) {
   *s += 0x9e3779b97f4a7c15ull;
@@ -162,17 +182,17 @@ static void seed_init(void) {
   if (!v) return;
   u64 n = 0;
   for (const char *p = v; *p >= '0' && *p <= '9'; p++) n = n * 10 + (u64)(*p - '0');
-  g_seed_state = n;
-  g_seed_fixed = 1;
+  WS->g_seed_state = n;
+  WS->g_seed_fixed = 1;
   err("warmc-wasi: random_get is a fixed stream (WARMC_RANDOM_SEED)\n");
 }
 
 static u64 wasi_random_get(WarmInstance *vm, u64 buf_, u64 len_) {
   u32 buf = (u32)buf_, len = (u32)len_;
   if (!ok(vm, buf, len)) return WASI_EFAULT;
-  if (g_seed_fixed) {
+  if (WS->g_seed_fixed) {
     for (u32 i = 0; i < len;) {
-      u64 w = splitmix64(&g_seed_state);
+      u64 w = splitmix64(&WS->g_seed_state);
       for (u32 k = 0; k < 8 && i < len; k++, i++)
         vm->mem_base[buf + i] = (u8)(w >> (8 * k));
     }
@@ -225,35 +245,32 @@ static u64 vec_get(WarmInstance *vm, char **v, int n, u64 ptrs_, u64 blob_) {
 }
 
 static u64 wasi_args_sizes_get(WarmInstance *vm, u64 pc, u64 ps) {
-  return sizes_get(vm, g_argv, g_argc, pc, ps);
+  return sizes_get(vm, WS->g_argv, WS->g_argc, pc, ps);
 }
 static u64 wasi_args_get(WarmInstance *vm, u64 p, u64 b) {
-  return vec_get(vm, g_argv, g_argc, p, b);
+  return vec_get(vm, WS->g_argv, WS->g_argc, p, b);
 }
 
-static char **g_env;
-static int g_nenv, g_capenv;
-static int g_env_inherit;
 
 static int add_env(char *kv) {
 
-  if (g_nenv + 1 >= g_capenv) {
-    int cap = g_capenv ? g_capenv * 2 : 32;
-    char **p = (char **)realloc(g_env, (usz)cap * sizeof *p);
+  if (WS->g_nenv + 1 >= WS->g_capenv) {
+    int cap = WS->g_capenv ? WS->g_capenv * 2 : 32;
+    char **p = (char **)realloc(WS->g_env, (usz)cap * sizeof *p);
     if (!p) return 0;
-    g_env = p;
-    g_capenv = cap;
+    WS->g_env = p;
+    WS->g_capenv = cap;
   }
-  g_env[g_nenv++] = kv;
+  WS->g_env[WS->g_nenv++] = kv;
   return 1;
 }
 
 static char **guest_environ(void) {
-  if (g_env_inherit) return warmc_rt_environ();
+  if (WS->g_env_inherit) return warmc_rt_environ();
 
-  if (!g_env) return 0;
-  g_env[g_nenv] = 0;
-  return g_env;
+  if (!WS->g_env) return 0;
+  WS->g_env[WS->g_nenv] = 0;
+  return WS->g_env;
 }
 
 static int environ_count(void) {
@@ -351,7 +368,7 @@ static u64 clock_query(int want_res, u32 id, u64 *out) {
 #define FDFLAG_SYNC     0x10u
 #define FDFLAG_ALL      0x1fu
 
-typedef struct {
+struct Fd {
   int host;
   u8 type;
   u8 preopen;
@@ -363,10 +380,7 @@ typedef struct {
 
   void *dir;
   u64 dir_cookie;
-} Fd;
-
-static Fd *g_fds;
-static u32 g_nfds;
+};
 
 static void fd_clear(Fd *f) {
   f->host = -1;
@@ -382,28 +396,28 @@ static void fd_clear(Fd *f) {
 }
 
 static int fds_reserve(u32 want) {
-  if (want < g_nfds) return 1;
+  if (want < WS->g_nfds) return 1;
   if (want >= FD_LIMIT) return 0;
-  u32 n = g_nfds ? g_nfds : FD_INIT;
+  u32 n = WS->g_nfds ? WS->g_nfds : FD_INIT;
   while (n <= want) n *= 2;
   if (n > FD_LIMIT) n = FD_LIMIT;
-  Fd *p = (Fd *)realloc(g_fds, (usz)n * sizeof *p);
+  Fd *p = (Fd *)realloc(WS->g_fds, (usz)n * sizeof *p);
   if (!p) return 0;
-  for (u32 i = g_nfds; i < n; i++) fd_clear(&p[i]);
-  g_fds = p;
-  g_nfds = n;
+  for (u32 i = WS->g_nfds; i < n; i++) fd_clear(&p[i]);
+  WS->g_fds = p;
+  WS->g_nfds = n;
   return 1;
 }
 
 static Fd *fd_get(u32 i) {
-  if (i >= g_nfds || g_fds[i].host < 0) return 0;
-  return &g_fds[i];
+  if (i >= WS->g_nfds || WS->g_fds[i].host < 0) return 0;
+  return &WS->g_fds[i];
 }
 
 static int fd_alloc(void) {
 
-  for (u32 i = 0; i < g_nfds; i++) if (g_fds[i].host < 0) return (int)i;
-  u32 at = g_nfds;
+  for (u32 i = 0; i < WS->g_nfds; i++) if (WS->g_fds[i].host < 0) return (int)i;
+  u32 at = WS->g_nfds;
   if (!fds_reserve(at)) return -1;
   return (int)at;
 }
@@ -615,14 +629,14 @@ static u32 wasi_path_open(WarmInstance *vm, u64 dirfd_, u64 dirflags_,
   int slot = fd_alloc();
   if (slot < 0) { close(hostfd); return 33 ; }
 
-  fd_clear(&g_fds[slot]);
-  g_fds[slot].host = hostfd;
-  g_fds[slot].type = ft;
-  g_fds[slot].fdflags = (u16)(fdflags & FDFLAG_ALL);
+  fd_clear(&WS->g_fds[slot]);
+  WS->g_fds[slot].host = hostfd;
+  WS->g_fds[slot].type = ft;
+  WS->g_fds[slot].fdflags = (u16)(fdflags & FDFLAG_ALL);
 
-  g_fds[slot].rights = rights & (ft == FT_DIR ? RIGHTS_DIR : RIGHTS_FILE);
-  g_fds[slot].rights_inh = rights_inh;
-  if (!put32(vm, (u32)pfd_, (u32)slot)) { close(hostfd); g_fds[slot].host = -1; return WASI_EFAULT; }
+  WS->g_fds[slot].rights = rights & (ft == FT_DIR ? RIGHTS_DIR : RIGHTS_FILE);
+  WS->g_fds[slot].rights_inh = rights_inh;
+  if (!put32(vm, (u32)pfd_, (u32)slot)) { close(hostfd); WS->g_fds[slot].host = -1; return WASI_EFAULT; }
   return WASI_ESUCCESS;
 }
 
@@ -833,13 +847,13 @@ static u64 wasi_fd_seek2(WarmInstance *vm, u64 fd_, u64 off_, u64 whence_, u64 p
   Fd *f = fd_get((u32)fd_);
   if (!f) return WASI_EBADF;
 
-  static const int W[3] = { 0 , 1 , 2  };
+  static const int whence[3] = { 0 , 1 , 2  };
   u32 w = (u32)whence_;
   if (w > 2) return 28 ;
   /* a seek that leaves the offset where it is asks only for fd_tell */
   u64 need = (off_ == 0 && w == 1) ? R_FD_SEEK | R_FD_TELL : R_FD_SEEK;
   if (!(f->rights & need)) return WASI_ENOTCAPABLE;
-  long long r = lseek(f->host, (long long)off_, W[w]);
+  long long r = lseek(f->host, (long long)off_, whence[w]);
   if (r < 0) return to_wasi_errno(h_errno);
   if (!put64(vm, (u32)pn_, (u64)r)) return WASI_EFAULT;
   return WASI_ESUCCESS;
@@ -1199,10 +1213,10 @@ static u64 wasi_fd_renumber(WarmInstance *vm, u64 from_, u64 to_) {
   if (!fd_get(a) || !fd_get(b)) return WASI_EBADF;
 
   if (a == b) return WASI_ESUCCESS;
-  if (g_fds[b].dir) closedir(g_fds[b].dir);
-  if (g_fds[b].host >= 0 && !g_fds[b].keep_host) close(g_fds[b].host);
-  g_fds[b] = g_fds[a];
-  fd_clear(&g_fds[a]);
+  if (WS->g_fds[b].dir) closedir(WS->g_fds[b].dir);
+  if (WS->g_fds[b].host >= 0 && !WS->g_fds[b].keep_host) close(WS->g_fds[b].host);
+  WS->g_fds[b] = WS->g_fds[a];
+  fd_clear(&WS->g_fds[a]);
   return WASI_ESUCCESS;
 }
 
@@ -1420,14 +1434,14 @@ static u64 wasi_sock_accept(WarmInstance *vm, u64 fd_, u64 flags_, u64 pfd_) {
 
   int slot = fd_alloc();
   if (slot < 0) { close(hostfd); return 33 ; }
-  fd_clear(&g_fds[slot]);
-  g_fds[slot].host = hostfd;
-  g_fds[slot].type = FT_SOCK_STREAM;
-  g_fds[slot].fdflags = fdflags;
-  g_fds[slot].rights = RIGHTS_SOCKET;
+  fd_clear(&WS->g_fds[slot]);
+  WS->g_fds[slot].host = hostfd;
+  WS->g_fds[slot].type = FT_SOCK_STREAM;
+  WS->g_fds[slot].fdflags = fdflags;
+  WS->g_fds[slot].rights = RIGHTS_SOCKET;
   if (!put32(vm, (u32)pfd_, (u32)slot)) {
     close(hostfd);
-    fd_clear(&g_fds[slot]);
+    fd_clear(&WS->g_fds[slot]);
     return WASI_EFAULT;
   }
   return WASI_ESUCCESS;
@@ -1535,14 +1549,14 @@ static int add_preopen(const char *spec) {
   int slot = fd_alloc();
   if (slot < 0) { close(fd); free(host); return 0; }
 
-  fd_clear(&g_fds[slot]);
-  g_fds[slot].host = fd;
-  g_fds[slot].type = FT_DIR;
-  g_fds[slot].preopen = 1;
+  fd_clear(&WS->g_fds[slot]);
+  WS->g_fds[slot].host = fd;
+  WS->g_fds[slot].type = FT_DIR;
+  WS->g_fds[slot].preopen = 1;
 
-  g_fds[slot].pre_name = guest && *guest ? guest : host;
-  g_fds[slot].rights = RIGHTS_DIR;
-  g_fds[slot].rights_inh = RIGHTS_DIR | RIGHTS_FILE;
+  WS->g_fds[slot].pre_name = guest && *guest ? guest : host;
+  WS->g_fds[slot].rights = RIGHTS_DIR;
+  WS->g_fds[slot].rights_inh = RIGHTS_DIR | RIGHTS_FILE;
   return 1;
 }
 
@@ -1606,11 +1620,11 @@ static int add_listener(const char *spec) {
 
   int slot = fd_alloc();
   if (slot < 0) { close(s); return 0; }
-  fd_clear(&g_fds[slot]);
-  g_fds[slot].host = s;
-  g_fds[slot].type = FT_SOCK_STREAM;
-  g_fds[slot].fdflags = FDFLAG_NONBLOCK;
-  g_fds[slot].rights = RIGHTS_LISTENER;
+  fd_clear(&WS->g_fds[slot]);
+  WS->g_fds[slot].host = s;
+  WS->g_fds[slot].type = FT_SOCK_STREAM;
+  WS->g_fds[slot].fdflags = FDFLAG_NONBLOCK;
+  WS->g_fds[slot].rights = RIGHTS_LISTENER;
   return 1;
 }
 
@@ -1619,13 +1633,13 @@ extern int isatty(int);
 static int fds_init(void) {
   if (!fds_reserve(2)) return 0;
   for (u32 i = 0; i < 3; i++) {
-    fd_clear(&g_fds[i]);
-    g_fds[i].host = (int)i;
+    fd_clear(&WS->g_fds[i]);
+    WS->g_fds[i].host = (int)i;
 
-    g_fds[i].type = isatty((int)i) ? FT_CHAR : FT_UNKNOWN;
-    g_fds[i].keep_host = 1;
+    WS->g_fds[i].type = isatty((int)i) ? FT_CHAR : FT_UNKNOWN;
+    WS->g_fds[i].keep_host = 1;
 
-    g_fds[i].rights = (i == 0 ? R_FD_READ : R_FD_WRITE) |
+    WS->g_fds[i].rights = (i == 0 ? R_FD_READ : R_FD_WRITE) |
                       R_FD_FDSTAT_SET_FLAGS | R_POLL_FD_READWRITE |
                       R_FD_FILESTAT_GET;
   }
@@ -1691,30 +1705,51 @@ static const struct { const char *name; void *fn; } BINDINGS[] = {
    and the environment.  The strings stay the caller's, alive until it sets
    up the next.  0, with *bad the directory or listener, when one cannot be
    opened. */
+/* every descriptor the store's WASI opened closed, with its directory
+   stream, and the standard three let go */
+static void fds_close_all(WasiStore *ws) {
+  for (u32 i = 0; i < ws->g_nfds; i++)
+    if (ws->g_fds[i].host >= 0) {
+      if (ws->g_fds[i].dir) closedir(ws->g_fds[i].dir);
+      if (!ws->g_fds[i].keep_host) close(ws->g_fds[i].host);
+      fd_clear(&ws->g_fds[i]);
+    }
+}
+
 int warmc_wasi_jit_setup(int argc, char **argv, char **env, int nenv,
                          const char *const *dirs, int ndirs,
                          const char *const *listen, int nlisten, const char **bad) {
-  for (u32 i = 0; i < g_nfds; i++)
-    if (g_fds[i].host >= 0) {
-      if (!g_fds[i].keep_host) close(g_fds[i].host);
-      fd_clear(&g_fds[i]);
-    }
+  if (!ST->wasi) {
+    WasiStore *ws = (WasiStore *)malloc(sizeof *ws);
+    if (!ws) return 0;
+    *ws = (WasiStore){ 0 };
+    ST->wasi = ws;
+    seed_init();
+  }
+  fds_close_all(WS);
   if (!fds_init()) return 0;
   for (int i = 0; i < ndirs; i++)
     if (!add_preopen(dirs[i])) { if (bad) *bad = dirs[i]; return 0; }
   for (int i = 0; i < nlisten; i++)
     if (!add_listener(listen[i])) { if (bad) *bad = listen[i]; return 0; }
-  g_nenv = 0;
-  g_env_inherit = 0;
+  WS->g_nenv = 0;
+  WS->g_env_inherit = 0;
   for (int i = 0; i < nenv; i++)
     if (!add_env(env[i])) return 0;
   if (!add_env(0)) return 0;
-  g_nenv--;
-  g_argc = argc;
-  g_argv = argv;
-  static int seeded;
-  if (!seeded) { seed_init(); seeded = 1; }
+  WS->g_nenv--;
+  WS->g_argc = argc;
+  WS->g_argv = argv;
   return 1;
+}
+
+/* A store's WASI state, with the store (rt/rt.c, warmc_rt_store_delete) */
+void warmc_wasi_store_free(void *wasi) {
+  WasiStore *ws = (WasiStore *)wasi;
+  fds_close_all(ws);
+  free(ws->g_fds);
+  free(ws->g_env);
+  free(ws);
 }
 
 /* The C function behind the wasi_snapshot_preview1 function of the given
@@ -1775,7 +1810,7 @@ static int drive(int argc, char **argv) {
       listen_at[nlisten++] = argv[++i];
       continue;
     }
-    if (str_eq(a, "--inherit-env")) { g_env_inherit = 1; continue; }
+    if (str_eq(a, "--inherit-env")) { WS->g_env_inherit = 1; continue; }
     /* which module, in a program warmc made of several: a flag only there,
        so that a program of one passes its guest every argument it did */
     if (warmc_nmodules > 1 && str_eq(a, "--module") && i + 1 < argc) {
@@ -1801,8 +1836,8 @@ static int drive(int argc, char **argv) {
     }
   free(listen_at);
 
-  g_argc = argc;
-  g_argv = argv;
+  WS->g_argc = argc;
+  WS->g_argv = argv;
   seed_init();
 
   u32 e = 0;

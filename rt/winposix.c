@@ -146,7 +146,13 @@ extern int HeapFree(void *heap, u32 flags, void *p);
 #define E_NOTEMPTY 39
 #define E_LOOP 40
 
+/* each thread's: in a JIT's library, the threads of several stores make
+   calls at once */
+#if defined(WARMC_JIT)
+static _Thread_local int g_errno;
+#else
 static int g_errno;
+#endif
 
 int *__errno_location(void) { return &g_errno; }
 
@@ -304,19 +310,34 @@ typedef struct {
   u8 append, nonblock;
 } WFd;
 
-static WFd *g_fd;
+/* In chunks that never move, so that a descriptor's entry stays where it
+   is while another thread -- another store's, in a JIT's library -- opens
+   more; a slot is taken, given back and the table grown under g_fd_lock. */
+#define WFD_CHUNK  256
+#define WFD_CHUNKS 256
+static WFd *g_fdc[WFD_CHUNKS];
 static int g_nfd;
-static int g_fd_ready;
+static u32 g_fd_ready;
+static u8 g_fd_lock;
 
+static void fd_lock(void) {
+  while (__atomic_test_and_set(&g_fd_lock, __ATOMIC_ACQUIRE))
+    while (__atomic_load_n(&g_fd_lock, __ATOMIC_RELAXED)) __builtin_ia32_pause();
+}
+static void fd_unlock(void) { __atomic_clear(&g_fd_lock, __ATOMIC_RELEASE); }
+
+static WFd *fd_slot(int i) { return &g_fdc[i / WFD_CHUNK][i % WFD_CHUNK]; }
+
+/* under the lock */
 static int fd_grow(int want) {
-  if (want < g_nfd) return 1;
-  int n = g_nfd ? g_nfd : 16;
-  while (n <= want) n *= 2;
-  WFd *p = (WFd *)realloc(g_fd, (usz)n * sizeof *p);
-  if (!p) return 0;
-  for (int i = g_nfd; i < n; i++) __builtin_memset(&p[i], 0, sizeof p[i]);
-  g_fd = p;
-  g_nfd = n;
+  while (want >= g_nfd) {
+    if (g_nfd / WFD_CHUNK >= WFD_CHUNKS) return 0;
+    WFd *c = (WFd *)malloc(WFD_CHUNK * sizeof *c);
+    if (!c) return 0;
+    __builtin_memset(c, 0, WFD_CHUNK * sizeof *c);
+    __atomic_store_n(&g_fdc[g_nfd / WFD_CHUNK], c, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_nfd, g_nfd + WFD_CHUNK, __ATOMIC_RELEASE);
+  }
   return 1;
 }
 
@@ -326,41 +347,52 @@ static u8 handle_kind(void *h) {
 }
 
 static void fds_setup(void) {
-  if (g_fd_ready) return;
-  g_fd_ready = 1;
-  if (!fd_grow(2)) return;
-  for (int i = 0; i < 3; i++) {
-    void *h = GetStdHandle((u32)(-10 - i));
-    if (h == INVALID_HANDLE) h = 0;
-    g_fd[i].h = h;
-    g_fd[i].used = 1;
-    g_fd[i].std = 1;
-    g_fd[i].kind = h ? handle_kind(h) : FTYPE_CHAR;
+  if (__atomic_load_n(&g_fd_ready, __ATOMIC_ACQUIRE)) return;
+  fd_lock();
+  if (!g_fd_ready && fd_grow(2)) {
+    for (int i = 0; i < 3; i++) {
+      void *h = GetStdHandle((u32)(-10 - i));
+      if (h == INVALID_HANDLE) h = 0;
+      WFd *f = fd_slot(i);
+      f->h = h;
+      f->used = 1;
+      f->std = 1;
+      f->kind = h ? handle_kind(h) : FTYPE_CHAR;
+    }
+    __atomic_store_n(&g_fd_ready, 1, __ATOMIC_RELEASE);
   }
+  fd_unlock();
 }
 
 static WFd *fd_at(int fd) {
   fds_setup();
-  if (fd < 0 || fd >= g_nfd || !g_fd[fd].used) { g_errno = E_BADF; return 0; }
-  return &g_fd[fd];
+  if (fd < 0 || fd >= __atomic_load_n(&g_nfd, __ATOMIC_ACQUIRE) || !fd_slot(fd)->used) {
+    g_errno = E_BADF;
+    return 0;
+  }
+  return fd_slot(fd);
 }
 
 /* Takes ownership of h and of a copy of wpath. */
 static int fd_new(void *h, const u16 *wpath) {
   fds_setup();
-  int slot = -1;
-  for (int i = 0; i < g_nfd; i++) if (!g_fd[i].used) { slot = i; break; }
-  if (slot < 0) {
-    slot = g_nfd;
-    if (!fd_grow(slot)) { CloseHandle(h); return fail(E_NOMEM); }
-  }
   u16 *copy = 0;
   if (wpath && !(copy = wdup(wpath))) { CloseHandle(h); return -1; }
-  __builtin_memset(&g_fd[slot], 0, sizeof g_fd[slot]);
-  g_fd[slot].h = h;
-  g_fd[slot].wpath = copy;
-  g_fd[slot].used = 1;
-  g_fd[slot].kind = handle_kind(h);
+  u8 kind = handle_kind(h);
+  fd_lock();
+  int slot = -1;
+  for (int i = 0; i < g_nfd; i++) if (!fd_slot(i)->used) { slot = i; break; }
+  if (slot < 0) {
+    slot = g_nfd;
+    if (!fd_grow(slot)) { fd_unlock(); free(copy); CloseHandle(h); return fail(E_NOMEM); }
+  }
+  WFd *f = fd_slot(slot);
+  __builtin_memset(f, 0, sizeof *f);
+  f->h = h;
+  f->wpath = copy;
+  f->kind = kind;
+  f->used = 1;
+  fd_unlock();
   return slot;
 }
 
@@ -369,7 +401,9 @@ int close(int fd) {
   if (!f) return -1;
   if (!f->std && f->h) CloseHandle(f->h);
   free(f->wpath);
+  fd_lock();
   __builtin_memset(f, 0, sizeof *f);
+  fd_unlock();
   return 0;
 }
 
@@ -380,12 +414,11 @@ int dup(int fd) {
   if (!DuplicateHandle(GetCurrentProcess(), f->h, GetCurrentProcess(), &nh, 0,
                        0, DUPLICATE_SAME_ACCESS))
     return fail_last();
-  /* fd_new may grow the table, which moves it, so f is read out first. */
   u8 append = f->append, nonblock = f->nonblock;
   int nfd = fd_new(nh, f->wpath);
   if (nfd >= 0) {
-    g_fd[nfd].append = append;
-    g_fd[nfd].nonblock = nonblock;
+    fd_slot(nfd)->append = append;
+    fd_slot(nfd)->nonblock = nonblock;
   }
   return nfd;
 }
@@ -660,8 +693,8 @@ static int win_open(const u16 *wp, int flags) {
     return fail(win_errno(e));
   }
   int fd = fd_new(h, wp);
-  if (fd >= 0 && (flags & H_APPEND)) g_fd[fd].append = 1;
-  if (fd >= 0 && (flags & H_NONBLOCK)) g_fd[fd].nonblock = 1;
+  if (fd >= 0 && (flags & H_APPEND)) fd_slot(fd)->append = 1;
+  if (fd >= 0 && (flags & H_NONBLOCK)) fd_slot(fd)->nonblock = 1;
   return fd;
 }
 

@@ -120,16 +120,7 @@ SYM(warmc_invoke_s):
     cbz     x17, 3f
     ldr     x20, [x17]
 3:
-    LOADADDR x22, SYM(warmc_gc_invoke_depth)
-    ldr     x9, [x22]
-    add     x9, x9, #1
-    str     x9, [x22]
-
     blr     x16
-
-    ldr     x9, [x22]
-    sub     x9, x9, #1
-    str     x9, [x22]
 
     str     x0, [x21, #0]
     str     q0, [x21, #16]
@@ -559,8 +550,22 @@ SYM(warmc_throw_ref):
     brk     #0
     SIZE_DIRECTIVE(SYM(warmc_throw_ref))
 
+/* The store's GcCtx (rt/store.h): in the JIT's library the store of the
+   instance in x0, in a program or shared library its one store's. */
+#define VM_STORE     88
+#define STORE_GC_CTX 88
+    .macro STORE_CTX reg
+#if defined(WARMC_JIT)
+    ldr     \reg, [x0, #VM_STORE]
+    add     \reg, \reg, #STORE_GC_CTX
+#else
+    LOADADDR \reg, SYM(warmc_store0)
+    add     \reg, \reg, #STORE_GC_CTX
+#endif
+    .endm
+
     .macro GC_ENTER
-    LOADADDR x9, SYM(warmc_gc_ctx)
+    STORE_CTX x9
     stp     x19, x20, [x9, #0]
     stp     x21, x22, [x9, #16]
     stp     x23, x24, [x9, #32]
@@ -571,7 +576,7 @@ SYM(warmc_throw_ref):
     .endm
 
     .macro GC_LEAVE
-    LOADADDR x9, SYM(warmc_gc_ctx)
+    ldr     x9, [sp, #16]
     ldp     x19, x20, [x9, #0]
     ldp     x21, x22, [x9, #16]
     ldp     x23, x24, [x9, #32]
@@ -585,11 +590,12 @@ SYM(warmc_throw_ref):
 SYM(\name):
 
     GC_ENTER
-    stp     x29, x30, [sp, #-16]!
+    stp     x29, x30, [sp, #-32]!
     mov     x29, sp
+    str     x9, [sp, #16]
     bl      SYM(\name\()_w)
     GC_LEAVE
-    ldp     x29, x30, [sp], #16
+    ldp     x29, x30, [sp], #32
     ret
     SIZE_DIRECTIVE(SYM(\name))
     .endm
@@ -610,7 +616,8 @@ SYM(\name):
    that takes the slow path.  Most
    need only the good colour: the object is on no page chosen for
    relocation, and no mark is on or the object is marked already.  Those it
-   heals here, from warmc_gc_fast (rt.c GcFast, at the offsets named below),
+   heals here, from the store's gc_fast (rt/store.h GcFast, at the offsets
+   named below; the store the instance in x19 is in, in the JIT's library),
    with six registers saved, and while a mark is on it shades the object if
    no one has: its mark bit set, it goes onto the program's end of the mark
    queue, shown to the collector every GC_MQ_BATCH, as gc_mark_ref does --
@@ -638,7 +645,11 @@ SYM(warmc_gc_load_stub):
     stp     x16, x17, [sp, #-48]!
     stp     x12, x13, [sp, #16]
     stp     x10, x11, [sp, #32]
-    LOADADDR x16, SYM(warmc_gc_fast)
+#if defined(WARMC_JIT)
+    ldr     x16, [x19, #VM_STORE]
+#else
+    LOADADDR x16, SYM(warmc_store0)
+#endif
     ldp     x12, x13, [x16, #GCF_BASE]      /* the heap's base and size */
     and     x17, x14, #0xf8ffffffffffffff   /* the address, its colour off */
     sub     x12, x17, x12
