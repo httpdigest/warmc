@@ -713,6 +713,39 @@ handle or an instance of it lives. `wasm_module_serialize` writes the
 compiled code, which `wasm_module_deserialize` loads without compiling
 again, in a build of libwarmc made from the same sources.
 
+With `warm_config_tiered_set(config, true)` compiling is **tiered**:
+`wasm_module_new` compiles the module at `-O0`, with what makes its code and
+its instances fit the optimised code's (Go's and GHC's rewritten signatures,
+guard pages), and returns. A thread of the library's compiles the module
+again at the configured level, one module at a time, and places that code
+beside the first. The first instruction of every `-O0` function, a nop put
+there for it, then becomes a branch to the function's optimised code. Every
+way into a function goes through that entry: calls from `-O0` code,
+exports, tables, references, other modules' imports of it. So the calls
+after the tier-up run optimised code, also those of instances made before
+it, while every code address the C API and the instances hold stays what it
+was. Instances and their objects (memories, tables, globals, GC objects)
+are shared by both tiers. A call already running when the optimised code
+arrives runs on in the `-O0` code until it returns, so a loop in a function
+that has started stays unoptimised. A program that spends most of its time
+in one call, as a WASI command does, is better compiled untiered; tiering
+suits a module whose exports are called again and again, or one that must
+start soon. `warm_module_optimized` says whether a module's optimised code
+is in place, waiting for it if asked. A tiered module serialises its
+optimised code. Time until a module can run, against untiered and against
+wasmtime 50.0.1 (Cranelift) through the same harness, at 16 threads:
+
+| module | untiered | tiered | optimised code in place | wasmtime |
+|---|---|---|---|---|
+| Go net/http server | 394 ms | 170 ms | 573 ms | 263 ms |
+| Go text/template | 344 ms | 119 ms | 458 ms | 141 ms |
+| Zig divmod | 308 ms | 154 ms | 460 ms | 106 ms |
+| Haskell containers | 139 ms | 102 ms | 243 ms | 178 ms |
+| C++ random | 72 ms | 12.6 ms | 84 ms | 27 ms |
+| Kotlin extensions | 66 ms | 17 ms | 80 ms | 237 ms |
+| Rust vecops | 58 ms | 8.0 ms | 66 ms | 11 ms |
+| C mathlib | 15 ms | 4.9 ms | 20 ms | 6.5 ms |
+
 ```c
 /* host.c */
 #include <stdio.h>
@@ -760,8 +793,8 @@ takes them.
 API alone. A WASI command runs as with `warmc --wasi`, its arguments after
 the module; any other module runs as the CLI harness runs it, each export
 followed by its arguments. It takes `-O<n>`, `-f[no-]<pass>` and `-j<n>`
-(the compile's threads), and `--serialize=FILE` and `--precompiled` to
-write a compiled module and run one.
+(the compile's threads), `--tiered`, and `--serialize=FILE` and
+`--precompiled` to write a compiled module and run one.
 
 ```sh
 build/warmrun test/wasi/hello.wat
@@ -1400,6 +1433,9 @@ as in `--target=macos`.
 | `WARMC_GC_VERIFY`, `WARMC_GC_STRESS` | program | heap verification after each cycle; collect on every allocation |
 | `WARMC_GC_RELEASE` | program | return a freed run of at least this many bytes to the system (`madvise`); 0, the default, keeps them |
 | `WARMC_RANDOM_SEED` | program | make WASI preview 1 `random_get` deterministic |
+| `WARMC_TIERED` | libwarmc | `1` makes every engine tiered; `wait`, also each module's compile waits for its optimised code; `host`, the first call out to the host (a host function's, or WASI's `fd_write`) waits for every module's |
+| `WARMC_TIER_DEFER` | libwarmc | a tiered module's optimised code goes in place only once something waits for it (`warm_module_optimized`, `WARMC_TIERED=host`) |
+| `WARMC_TIER_DEBUG` | libwarmc | print each tier-up: how many functions it sent on, and when |
 
 Many more `WARMC_*` variables exist for debugging individual passes, the
 register allocator, the linker and the collector. Search for `getenv` in
@@ -1907,7 +1943,10 @@ Most of the suite is **differential**. warmc's output is compared with:
   against what the JIT compiles of each module (`test/spec/jitdriver.c`);
   and wasm-c-api's thirteen examples, against their output, with
   `test/capi/api.c`'s checks of every function `wasm.h` and `warm.h`
-  declare (`test/capi/run.py`)
+  declare (`test/capi/run.py`). Tiered, the cases run on the `-O0` code
+  alone and on the optimised code entered through the `-O0` entries, and
+  programs of every producer run with the tier-up under their frames
+  (`test/run_tiers.py`), against the same programs untiered
 - wabt's `wasm-interp`, for the hand-written cases in `test/cases`: at `-O0`,
   `-O1` and `-O2`; with the register allocator and SSA verified; with
   `-fgssa-all`, with `-fdead-frames`, with `-fexact-trap`, and with far
