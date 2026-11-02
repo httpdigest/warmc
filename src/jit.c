@@ -7,13 +7,19 @@
    kept as an image, whose relocations name either a place in its own
    sections or a symbol of the runtime.
 
-   Loading maps the text within branch range of the runtime: its calls of
-   warmc_trap, warmc_gc_load_stub and the rest are the BL (on x86-64, the
-   call rel32) a linked program has, which a veneer could not stand in for,
-   as several of them are entered with every register live
-   (warmc_gc_load_stub keeps x16 and x17).  The data goes within ADRP's
-   (RIP-relative addressing's) reach of the text.  The code is then byte for
-   byte what the object `-c` writes holds, at its new address. */
+   Loading maps the text within branch range of the runtime where there is
+   room, so that its calls of warmc_trap, warmc_gc_load_stub and the rest
+   are the BL (on x86-64, the call rel32) a linked program has.  On AArch64
+   a process whose own runtime has taken the room around the library -- a
+   Go program's, Node's -- has its text placed where the system has room,
+   and a call of the runtime out of a BL's reach goes through a veneer at
+   the end of the module's text, which branches through x16: nothing the
+   compiler keeps is in x16 or x17 at a call, warmc_gc_load_stub's
+   included (rt/start.S), and the veneer leaves the stack and the return
+   address as the call made them, so that the runtime sees the frames it
+   would have.  The data goes within ADRP's (RIP-relative addressing's)
+   reach of the text.  The code is otherwise byte for byte what the object
+   `-c` writes holds, at its new address. */
 
 #include "warmc.h"
 #include "ir.h"
@@ -75,6 +81,8 @@ __declspec(dllimport) void __stdcall GetSystemInfo(SYSTEM_INFO *si);
 #endif
 #ifdef __APPLE__
 #include <libkern/OSCacheControl.h>
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
 #include <pthread.h>
 #endif
 
@@ -721,6 +729,12 @@ static void *rt_sym(const char *name) {
 #define TEXT_ARENA (96ull << 20)
 #define DATA_ARENA (512ull << 20)
 #define MIN_ARENA (4ull << 20)
+/* a veneer: ldr x16, #8; br x16; and the address it branches to */
+#if defined(__aarch64__)
+#define VENEER_BYTES 16u
+#else
+#define VENEER_BYTES 0u
+#endif
 
 typedef struct { uintptr_t at; size_t len; } Span;
 typedef struct {
@@ -846,24 +860,96 @@ static void *reserve_within(uintptr_t lo, uintptr_t hi, size_t len, bool text,
   return NULL;
 }
 #else
+/* The free gaps of the address space between lo and hi, in ascending
+   order, as the system lists what is mapped: at most max of them, their
+   count returned.  A hint is where mmap places a mapping only when the
+   range there is free -- elsewhere it puts it where it likes, which on
+   macOS is not the first room above the hint, and a mapping with MAP_JIT
+   cannot be placed with MAP_FIXED -- so the room is found first, as
+   Windows' VirtualQuery finds it.  In a Go program the pages just above
+   the library are Go's own and malloc's, and the room in reach was
+   missed. */
+#define MAX_GAPS 256
+static size_t free_gaps(uintptr_t lo, uintptr_t hi, uintptr_t gaps[][2], size_t max) {
+  size_t n = 0;
+  uintptr_t prev = 0;
+#ifdef __APPLE__
+  /* nothing maps below the first region, the main executable: the
+     system's lowest address is where that was loaded */
+  bool first = true;
+#endif
+#ifdef __APPLE__
+  mach_vm_address_t addr = 0;
+  for (;;) {
+    mach_vm_size_t size = 0;
+    vm_region_basic_info_data_64_t info;
+    mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t obj = MACH_PORT_NULL;
+    if (mach_vm_region(mach_task_self(), &addr, &size, VM_REGION_BASIC_INFO_64,
+                       (vm_region_info_t)&info, &cnt, &obj) != KERN_SUCCESS)
+      break;
+    uintptr_t start = (uintptr_t)addr, end = (uintptr_t)(addr + size);
+    if (first) { prev = start; first = false; }
+#else
+  FILE *maps = fopen("/proc/self/maps", "r");
+  if (!maps) return 0;
+  char line[512];
+  while (fgets(line, sizeof line, maps)) {
+    unsigned long a, b;
+    if (sscanf(line, "%lx-%lx", &a, &b) != 2) continue;
+    uintptr_t start = a, end = b;
+#endif
+    if (start > prev && start > lo && prev < hi && n < max) {
+      gaps[n][0] = prev > lo ? prev : lo;
+      gaps[n][1] = start < hi ? start : hi;
+      n++;
+    }
+    if (end > prev) prev = end;
+    if (prev >= hi) break;
+#ifdef __APPLE__
+    addr = end;
+  }
+#else
+  }
+  fclose(maps);
+#endif
+  if (prev < hi && n < max) {
+    gaps[n][0] = prev > lo ? prev : lo;
+    gaps[n][1] = hi;
+    n++;
+  }
+  return n;
+}
+
+static void *reserve_in_gap(uintptr_t at, size_t len, bool text) {
+  uint8_t *p = reserve_at(at, len, text);
+  if (p && (uintptr_t)p == at) return p;
+  /* taken meanwhile by another thread's mapping, or placed elsewhere */
+  if (p) release(p, len);
+  return NULL;
+}
+
 static void *reserve_within(uintptr_t lo, uintptr_t hi, size_t len, bool text,
                             uintptr_t above) {
   size_t gran = page_size();
   if (hi < lo || hi - lo < len) return NULL;
-  uintptr_t hints[2] = { round_up(above, gran), 0 };
-  if (g_rt_lo > lo + len + gran) hints[1] = (g_rt_lo - len - gran) & ~(uintptr_t)(gran - 1);
-  for (int h = 0; h < 2; h++) {
-    uintptr_t hint = hints[h];
-    if (!hint) continue;
-    /* the system places a mapping at the first room at or above its hint:
-       walking up from there, past what is in the way, finds the room */
-    for (int k = 0; k < 64 && hint >= lo && hint <= hi - len; k++) {
-      uint8_t *p = reserve_at(hint, len, text);
-      if (!p) { hint += 1u << 20; continue; }
-      if ((uintptr_t)p >= lo && (uintptr_t)p + len <= hi) return p;
-      release(p, len);
-      if ((uintptr_t)p <= hint) hint += 1u << 20;
-      else break;   /* nothing above the hint within reach */
+  uintptr_t gaps[MAX_GAPS][2];
+  size_t n = free_gaps(lo, hi, gaps, MAX_GAPS);
+  /* up from above the runtime, then down from below it */
+  for (size_t i = 0; i < n; i++) {
+    uintptr_t a = round_up(gaps[i][0] > above ? gaps[i][0] : above, gran);
+    if (a < gaps[i][1] && gaps[i][1] - a >= len) {
+      void *p = reserve_in_gap(a, len, text);
+      if (p) return p;
+    }
+  }
+  for (size_t i = n; i-- > 0;) {
+    uintptr_t top = gaps[i][1] < g_rt_lo ? gaps[i][1] : g_rt_lo;
+    if (top < len) continue;
+    uintptr_t a = (top - len) & ~(uintptr_t)(gran - 1);
+    if (a >= gaps[i][0] && a + len <= gaps[i][1]) {
+      void *p = reserve_in_gap(a, len, text);
+      if (p) return p;
     }
   }
   return NULL;
@@ -909,6 +995,14 @@ static ArenaPair *pair_new(size_t want_text, size_t want_data) {
   if (tlen < want_text) tlen = round_up(want_text, MIN_ARENA);
   for (; tlen >= MIN_ARENA && tlen >= want_text && !t; tlen /= 2)
     t = reserve_within(lo, hi, tlen, true, g_rt_hi + REACH_SLACK);
+#if defined(__aarch64__)
+  /* no room within reach: anywhere, the runtime's calls through veneers */
+  if (!t) {
+    tlen = TEXT_ARENA < want_text ? round_up(want_text, MIN_ARENA) : TEXT_ARENA;
+    for (; tlen >= MIN_ARENA && tlen >= want_text && !t; tlen /= 2)
+      t = reserve_at(0, tlen, true);
+  }
+#endif
   if (!t) return NULL;
   tlen *= 2;
   uintptr_t tb = (uintptr_t)t;
@@ -935,6 +1029,13 @@ void jit_reserve(void) {
   if (!g_arenas) pair_new(0, 0);
   pthread_mutex_unlock(&g_map_lock);
 }
+
+/* As the library is loaded: before the program's own start-up runs, and
+   whatever it maps then -- the Go runtime's heap arenas and malloc's zones
+   leave no room within a branch of the runtime in a Go program by the time
+   its main makes an engine.  Address space only: nothing is committed
+   until a module is placed. */
+__attribute__((constructor)) static void jit_reserve_at_load(void) { jit_reserve(); }
 
 static uint8_t *arena_take(Arena *a, size_t len) {
   for (size_t i = 0; i < a->nfree; i++) {
@@ -1089,6 +1190,14 @@ static bool apply(uint8_t *at, uint64_t P, uint64_t SA, uint8_t kind) {
   return false;
 }
 
+#if defined(__aarch64__)
+static bool veneers_always(void) {
+  static int on = -1;
+  if (on < 0) on = getenv("WARMC_JIT_VENEERS") != NULL;
+  return on;
+}
+#endif
+
 /* Places an image's sections, sec[i] its bytes, and makes their
    relocations against where they landed; NULL with *err set when there is
    no room within reach of the runtime. */
@@ -1108,7 +1217,10 @@ static JitCode *load(const JitImage *im, const uint8_t *const sec[NSEC],
   size_t gran = page_size();
   JitCode *c = calloc(1, sizeof *c);
   if (!c) { free(ext); *err = fmt_err("out of memory"); return NULL; }
-  c->text_map = round_up(im->seclen[0] ? im->seclen[0] : 1, gran);
+  /* the veneers after the text, one for each of the runtime's symbols */
+  uint64_t veneer_at = round_up(im->seclen[0], 8);
+  uint64_t text_len = veneer_at + (uint64_t)im->next * VENEER_BYTES;
+  c->text_map = round_up(text_len ? text_len : 1, gran);
   /* rodata and the custom sections first, then data on a page of its own;
      all of it read-only once written */
   uint64_t custom_at = round_up(im->seclen[1], 16);
@@ -1131,25 +1243,47 @@ static JitCode *load(const JitImage *im, const uint8_t *const sec[NSEC],
 #endif
   for (int i = 0; i < NSEC; i++)
     if (im->seclen[i]) memcpy((uint8_t *)(uintptr_t)c->base[i], sec[i], im->seclen[i]);
+#if defined(__aarch64__)
+  /* ldr x16, #8; br x16; the symbol's address */
+  for (uint32_t i = 0; i < im->next; i++) {
+    uint8_t *v = c->text + veneer_at + (uint64_t)i * VENEER_BYTES;
+    wr32(v, 0x58000050u);
+    wr32(v + 4, 0xd61f0200u);
+    uint64_t a = (uint64_t)(uintptr_t)ext[i];
+    for (int b = 0; b < 8; b++) v[8 + b] = (uint8_t)(a >> (8 * b));
+  }
+#endif
   const char *bad = NULL;
   for (uint32_t i = 0; i < im->nrel && !bad; i++) {
     const JitRel *r = &im->rel[i];
     uint64_t SA = r->tsec == JIT_EXT ? (uint64_t)(uintptr_t)ext[r->target] + (uint64_t)(int64_t)r->addend
                                      : c->base[r->tsec] + r->target;
     uint64_t P = c->base[r->sec] + r->off;
-    if (!apply((uint8_t *)(uintptr_t)P, P, SA, r->kind))
-      bad = r->tsec == JIT_EXT ? im->ext[r->target] : "the module's own code or data";
+#if defined(__aarch64__)
+    /* WARMC_JIT_VENEERS, for tests: every call of the runtime through its
+       veneer, as a module placed out of reach makes them */
+    if (!(veneers_always() && r->kind == REL_CALL26 && r->tsec == JIT_EXT && !r->addend))
+#endif
+    if (apply((uint8_t *)(uintptr_t)P, P, SA, r->kind)) continue;
+#if defined(__aarch64__)
+    /* a call of the runtime out of reach: through its veneer */
+    if (r->kind == REL_CALL26 && r->tsec == JIT_EXT && !r->addend &&
+        apply((uint8_t *)(uintptr_t)P, P,
+              c->base[0] + veneer_at + (uint64_t)r->target * VENEER_BYTES, r->kind))
+      continue;
+#endif
+    bad = r->tsec == JIT_EXT ? im->ext[r->target] : "the module's own code or data";
   }
 #ifdef __APPLE__
   pthread_jit_write_protect_np(1);
-  sys_icache_invalidate(c->text, im->seclen[0]);
+  sys_icache_invalidate(c->text, text_len);
 #elif defined(_WIN32)
   unsigned long was;
   VirtualProtect(c->text, c->text_map, PAGE_EXECUTE_READ, &was);
-  FlushInstructionCache(GetCurrentProcess(), c->text, im->seclen[0]);
+  FlushInstructionCache(GetCurrentProcess(), c->text, text_len);
 #else
   mprotect(c->text, c->text_map, PROT_READ | PROT_EXEC);
-  __builtin___clear_cache((char *)c->text, (char *)c->text + im->seclen[0]);
+  __builtin___clear_cache((char *)c->text, (char *)c->text + text_len);
 #endif
   free(ext);
   if (bad) {

@@ -1456,6 +1456,7 @@ as in `--target=macos`.
 | `WARMC_TIERED` | libwarmc | `1` makes every engine tiered; `wait`, also each module's compile waits for its optimised code; `host`, the first call out to the host (a host function's, or WASI's `fd_write`) waits for every module's |
 | `WARMC_TIER_DEFER` | libwarmc | a tiered module's optimised code goes in place only once something waits for it (`warm_module_optimized`, `WARMC_TIERED=host`) |
 | `WARMC_TIER_DEBUG` | libwarmc | print each tier-up: how many functions it sent on, and when |
+| `WARMC_JIT_VENEERS` | libwarmc | every call of the runtime from a module's code through a veneer, as code placed out of a branch's reach makes it (AArch64) |
 
 Many more `WARMC_*` variables exist for debugging individual passes, the
 register allocator, the linker and the collector. Search for `getenv` in
@@ -1640,10 +1641,17 @@ as `-c` would and keeps its object as an image: its sections and the
 relocations still to make, which name either a place in its own sections or
 one of the runtime's symbols. Loading places the text within branch range of
 the runtime the library carries -- 128 MiB on AArch64, 2 GiB on x86-64 --
-from address space reserved beside it, so its calls of the runtime are the
-instructions a linked program has, and the data within reach of the text;
-the relocations are made against where everything landed, and the code is
-then byte for byte the object's. The runtime instantiates the module's
+from address space reserved beside it as the library is loaded, so that its
+calls of the runtime are the instructions a linked program has, and the data
+within reach of the text; the relocations are made against where everything
+landed, and the code is then byte for byte the object's. On AArch64, in a
+process whose own runtime had the room around the library before it was
+loaded -- Node's, which loads it late -- the text goes where the system has
+room, and a call of the runtime out of a branch's reach goes through a
+veneer at the end of the module's text: a load of the runtime function's
+address into `x16` and a branch to it, which leaves the stack and the return
+address as the call made them, `x16` being a register the compiler keeps no
+value in at a call. The runtime instantiates the module's
 descriptor as it does a linked program's, and finds its frames by the
 descriptor's tables. A tiered module is compiled at `-O0` first, with an
 entry each function's optimised code can be sent through -- a nop the

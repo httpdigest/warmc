@@ -243,6 +243,13 @@ start spec-jit python3 test/spec/run.py "--levels=jit -O2"
 start cases-jit-tier0 env WARMC_JIT=1 WARMC_TIERED=1 WARMC_TIER_DEFER=1 ./test/run_tests.sh
 start cases-jit-tier2 env WARMC_JIT=1 WARMC_TIERED=wait ./test/run_tests.sh
 start tiers python3 test/run_tiers.py
+# The JIT's calls of the runtime through veneers, as code placed out of a
+# branch's reach of it makes them (AArch64's; x86-64's reach is the
+# address space the JIT is given, and it has none).
+case "$(uname -s)" in
+  MINGW*|CLANG*|MSYS*) ;;
+  *) start cases-jit-veneers env WARMC_JIT=1 WARMC_JIT_VENEERS=1 ./test/run_tests.sh ;;
+esac
 
 # A second, independent engine over the same corpus; the row skips itself
 # politely where wasmtime is not installed.

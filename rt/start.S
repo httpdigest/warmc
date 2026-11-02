@@ -602,7 +602,12 @@ SYM(\name):
 
 /* warmc_gc_load_stub: the load barrier's slow path, for a reference in x14
    whose colour is not the good one, loaded from the slot at x15; the healed
-   reference comes back in x14 and every other register is as it was.  Most
+   reference comes back in x14 and every other register is as it was but
+   x16 and x17, which come back changed, as from any call: the JIT's code
+   may come here through a veneer that branches through x16 (src/jit.c),
+   and nothing the compiler keeps is in either (isel.c's TMP0 and TMP1).
+   Each return writes them, so that code relying on them fails every test
+   that takes the slow path.  Most
    need only the good colour: the object is on no page chosen for
    relocation, and no mark is on or the object is marked already.  Those it
    heals here, from warmc_gc_fast (rt.c GcFast, at the offsets named below),
@@ -668,6 +673,8 @@ LOCAL(gcb_heal):
     ldp     x10, x11, [sp, #32]
     ldp     x12, x13, [sp, #16]
     ldp     x16, x17, [sp], #48
+    movz    x16, #0x5a5a
+    movz    x17, #0xa5a5
     ret
 LOCAL(gcb_shade):
     lsr     x12, x11, #6
@@ -766,6 +773,8 @@ LOCAL(gcb_slow):
     ldp     x16, x17, [sp, #128]
     ldr     x30, [sp, #144]
     add     sp, sp, #672
+    movz    x16, #0x5a5a
+    movz    x17, #0xa5a5
     ret
     SIZE_DIRECTIVE(SYM(warmc_gc_load_stub))
 
