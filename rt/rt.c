@@ -1133,23 +1133,46 @@ static const ModuleDesc *descs[MAX_MODULE_DESCS];
 static u8 desc_sorted[MAX_MODULE_DESCS];
 static u32 ndescs;
 
+/* Who changes the list: an instantiation, a module's release, and a JIT's
+   tier-up (warmc_rt_add_desc), which runs beside wasm on another thread.
+   The unwinder, the collector's frame walk and the trap handler read it
+   without a lock, so an entry is written before the count that shows it
+   is. */
+static u8 descs_lock;
+
+static void descs_acquire(void) {
+  while (__atomic_test_and_set(&descs_lock, __ATOMIC_ACQUIRE))
+    while (__atomic_load_n(&descs_lock, __ATOMIC_RELAXED)) {}
+}
+static void descs_release(void) { __atomic_clear(&descs_lock, __ATOMIC_RELEASE); }
+
 static void register_desc(const ModuleDesc *md) {
-  for (u32 i = 0; i < ndescs; i++) if (descs[i] == md) return;
-  if (ndescs >= MAX_MODULE_DESCS) die("too many modules");
+  descs_acquire();
+  u32 n = ndescs;
+  for (u32 i = 0; i < n; i++) if (descs[i] == md) { descs_release(); return; }
+  if (n >= MAX_MODULE_DESCS) die("too many modules");
   u8 sorted = 1;
   for (u32 k = 1; k < md->nunwind; k++)
     if ((u64)(uptr)md->unwind[k].code <
         (u64)(uptr)md->unwind[k - 1].code) { sorted = 0; break; }
-  desc_sorted[ndescs] = sorted;
-  descs[ndescs++] = md;
+  desc_sorted[n] = sorted;
+  descs[n] = md;
+  __atomic_store_n(&ndescs, n + 1, __ATOMIC_RELEASE);
+  descs_release();
 }
+
+/* A module's code of a later tier (src/jit.c), found by its addresses as
+   the module's own is: its frames unwind, are walked by the collector and
+   trap by its descriptor's tables.  Never instantiated. */
+void warmc_rt_add_desc(const ModuleDesc *md) { register_desc(md); }
 
 static u32 gc_no_collect;
 static void *exn_alloc(Instance *in, u32 tag);
 static void *exn_safepoint(void *e, WarmRegs *regs, u64 sp, u64 pc);
 
 static const FuncUnwind *find_unwind_in(u64 pc, const ModuleDesc **owner) {
-  for (u32 i = 0; i < ndescs; i++) {
+  u32 n = __atomic_load_n(&ndescs, __ATOMIC_ACQUIRE);
+  for (u32 i = 0; i < n; i++) {
     const ModuleDesc *md = descs[i];
     if (!desc_sorted[i]) {
       for (u32 k = 0; k < md->nunwind; k++) {
@@ -5470,12 +5493,14 @@ void warmc_instance_free(WarmInstance *v) {
 int warmc_rt_forget_desc(const ModuleDesc *md) {
   for (u32 i = 0; i < gc_ndesc_types; i++)
     if (gc_desc_types[i].md == md) return 0;
+  descs_acquire();
   for (u32 i = 0; i < ndescs; i++) {
     if (descs[i] != md) continue;
     descs[i] = descs[ndescs - 1];
     desc_sorted[i] = desc_sorted[ndescs - 1];
-    ndescs--;
+    __atomic_store_n(&ndescs, ndescs - 1, __ATOMIC_RELEASE);
     break;
   }
+  descs_release();
   return 1;
 }

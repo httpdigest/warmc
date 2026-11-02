@@ -587,6 +587,14 @@ typedef struct {
   /* -fsealed: a module through whose boundary no reference passes
      (Module.gc_sealed) has its casts and type tests decided inline */
   bool sealed;
+  /* every function's first instruction, at its symbol, one a later tier
+     can overwrite with a branch while the code runs (src/jit.c's tier-up):
+     a nop on AArch64, a five-byte nop on an eight-byte boundary on x86-64 */
+  bool patchable;
+  /* the register allocator's scan under its first eviction rule alone,
+     without trying the others (regalloc.inc): a first tier's, whose code
+     runs only until the second's is in place */
+  bool ra_one_rule;
   bool print_ir;
   bool stats;
   bool profile;
@@ -613,6 +621,8 @@ typedef struct {
   /* the bytes of code ahead of the function's symbol: the check an entry
      from outside the module makes (codegen_entry_off), or 0 */
   uint32_t entry_off;
+  /* the symbol on an eight-byte boundary (OptOpts.patchable on x86-64) */
+  bool align8;
   const char *sym;
   FuncUnwind uw;
   uint64_t insts_emitted;

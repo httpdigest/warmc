@@ -120,6 +120,13 @@ __attribute__((noreturn))
    process of the program's own ends the process for. */
 void (*warmc_wasi_exit_hook)(int code);
 
+/* A JIT's host's test of its tiers (src/capi.c, WARMC_TIERED=host): run
+   at each write, which nearly every program makes from the midst of what
+   it runs -- Go's from under its scheduler's loop, GHC's from under its
+   trampoline's -- with those frames live below. */
+void (*warmc_wasi_call_hook)(void);
+#define WASI_CALL_HOOK() do { if (warmc_wasi_call_hook) warmc_wasi_call_hook(); } while (0)
+
 static u64 wasi_proc_exit(WarmInstance *vm, u64 code) {
   if ((u32)code >= 126) {
     err("warmc-wasi: proc_exit(");
@@ -760,6 +767,7 @@ static int host_ready(int fd, int writing, int wait) {
 
 static u64 fs_io(WarmInstance *vm, u64 fd_, u64 iovs, u64 niov, u64 pn,
                  int writing) {
+  if (writing) WASI_CALL_HOOK();
   Fd *f = fd_get((u32)fd_);
   if (!f) return WASI_EBADF;
   if (!(f->rights & (writing ? R_FD_WRITE : R_FD_READ))) return WASI_ENOTCAPABLE;

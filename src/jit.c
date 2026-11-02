@@ -28,6 +28,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #ifdef _WIN32
 #include <malloc.h>
@@ -165,10 +166,20 @@ typedef struct {
   Module *m;
   ObjBuilder *o;
   JitModule *partial;
+  /* which tier the compile is of: 0 untiered, 1 the first, 2 the second,
+     placed near the first's code (near) */
+  int tier;
+  void *near;           /* an ArenaPair, which lives as long as the process */
   /* results */
   JitModule *mod;
   uint8_t *wasm;
   size_t wasm_len;
+  /* a tier's: where each function's code starts, by its index in the
+     module (0 where it has none), and the second tier's code and image */
+  uint64_t *entries;
+  uint32_t nentries;
+  JitCode *code2;
+  JitImage *image2;
 } CompileJob;
 
 static bool run_caught(void (*fn)(CompileJob *), CompileJob *job, char **err) {
@@ -186,6 +197,8 @@ static bool run_caught(void (*fn)(CompileJob *), CompileJob *job, char **err) {
     if (job->o) obj_free(job->o);
     if (job->m) module_free(job->m);
     jit_module_free(job->partial, true);
+    free(job->entries);
+    job->entries = NULL;
   } else {
     fn(job);
   }
@@ -481,7 +494,37 @@ static JitImage *image_of(ObjBuilder *o) {
 
 /* ---- compiling ---------------------------------------------------------- */
 
-static JitCode *load(const JitImage *im, const uint8_t *const sec[NSEC], char **err);
+static JitCode *load(const JitImage *im, const uint8_t *const sec[NSEC],
+                     void *near, char **err);
+static uint64_t code_text(const JitCode *c);
+
+/* Where each function's code starts in the object's text, by the
+   function's index in the module as it was read (parse.c names it
+   wasm_func_N, whatever pruning renumbers), and UINT64_MAX where it has
+   none: imported, or left out as nothing reaches it (its symbol then names
+   the stub that says so, codegen_drop_function) -- the functions a tier-up
+   sends on. */
+static uint64_t *func_entries(const Module *m, const ObjBuilder *o, uint32_t *n) {
+  uint32_t top = 0;
+  for (uint32_t j = 0; j < m->nfuncs; j++) {
+    unsigned k;
+    if (m->funcs[j].sym && sscanf(m->funcs[j].sym, "wasm_func_%u", &k) == 1 && k + 1 > top)
+      top = k + 1;
+  }
+  uint64_t *e = malloc(sizeof(uint64_t) * (top ? top : 1));
+  if (!e) warmc_fatal("out of memory");
+  for (uint32_t k = 0; k < top; k++) e[k] = UINT64_MAX;
+  for (uint32_t j = 0; j < m->nfuncs; j++) {
+    unsigned k;
+    if (m->funcs[j].imported || (m->reached && !m->reached[j]) || !m->funcs[j].sym ||
+        sscanf(m->funcs[j].sym, "wasm_func_%u", &k) != 1)
+      continue;
+    uint32_t si = obj_find_sym((ObjBuilder *)o, m->funcs[j].sym);
+    if (si != UINT32_MAX && o->syms[si].section == 0) e[k] = o->syms[si].value;
+  }
+  *n = top;
+  return e;
+}
 
 static void do_compile(CompileJob *job) {
   OptOpts opt;
@@ -500,6 +543,26 @@ static void do_compile(CompileJob *job) {
   }
   compile_finish_opts(&opt);
   opt.sole_instance = false;
+  if (job->tier == 1) {
+    /* The first tier: -O0, and as the second tier has them what makes a
+       function's code callable from the other tier's and the instance the
+       same -- the signatures Go's and GHC's rewrites give their functions
+       (go-sp, trampoline), and guard pages under the memories, which the
+       instance is made with -- and an entry the tier-up can send on.  The
+       register allocator tries one eviction rule, not five: what it saves
+       is a quarter of an -O0 compile, for code that runs until the second
+       tier's arrives. */
+    OptOpts o2 = opt;
+    compile_set_level(&opt, 0);
+    opt.go_sp = o2.go_sp;
+    opt.trampoline = o2.trampoline;
+    opt.guard_pages = o2.guard_pages;
+    opt.patchable = true;
+    opt.ra_one_rule = true;
+    /* every function its own code, sent on to its own: two that compile
+       alike at -O0 need not at the level asked for, nor be of one type */
+    codegen_set_merge(false);
+  }
 
   if (wasm_is_component(job->bin, job->len))
     warmc_fatal("a component: the C API compiles core modules");
@@ -507,34 +570,51 @@ static void do_compile(CompileJob *job) {
   job->m = m;
   wasm_validate(m);
 
-  JitModule *jm = calloc(1, sizeof *jm);
-  if (!jm) warmc_fatal("out of memory");
-  job->partial = jm;
-  jm->build_tag = WARMC_JIT_BUILD_TAG;
-  read_types(m, jm);
+  JitModule *jm = NULL;
+  if (job->tier != 2) {
+    jm = calloc(1, sizeof *jm);
+    if (!jm) warmc_fatal("out of memory");
+    job->partial = jm;
+    jm->build_tag = WARMC_JIT_BUILD_TAG;
+    read_types(m, jm);
+  }
 
   ObjBuilder o;
   memset(&o, 0, sizeof o);
   job->o = &o;
   compile_module(m, &o, &opt);
+  if (job->tier) job->entries = func_entries(m, &o, &job->nentries);
   /* the module first: what is left is the object */
   module_free(m);
   job->m = NULL;
-  jm->image = image_of(&o);
+  JitImage *im = image_of(&o);
   const uint8_t *sec[NSEC] = { o.text.data, o.rodata.data, o.data.data, o.custom.data };
   char *lerr = NULL;
-  jm->code = load(jm->image, sec, &lerr);
-  if (!jm->code) {
+  JitCode *code = load(im, sec, job->near, &lerr);
+  if (!code) {
     char msg[512];
     snprintf(msg, sizeof msg, "%s", lerr ? lerr : "the module cannot be placed");
     free(lerr);
+    image_free(im);
     warmc_fatal("%s", msg);
   }
   obj_free(&o);
   job->o = NULL;
+  for (uint32_t k = 0; job->tier && k < job->nentries; k++)
+    if (job->entries[k] != UINT64_MAX) job->entries[k] += code_text(code);
+  if (job->tier == 2) {
+    job->code2 = code;
+    job->image2 = im;
+    return;
+  }
+  jm->image = im;
+  jm->code = code;
   job->partial = NULL;
   job->mod = jm;
 }
+
+static void tier_start(JitModule *jm, const uint8_t *bin, size_t len, const JitOpts *o,
+                       uint64_t *entries, uint32_t nentries);
 
 JitModule *jit_compile(const uint8_t *bin, size_t len, const JitOpts *o,
                        char **err) {
@@ -543,7 +623,9 @@ JitModule *jit_compile(const uint8_t *bin, size_t len, const JitOpts *o,
   job.bin = bin;
   job.len = len;
   job.opts = o;
+  job.tier = o && o->tiered ? 1 : 0;
   if (!run_caught(do_compile, &job, err)) return NULL;
+  if (job.tier) tier_start(job.mod, bin, len, o, job.entries, job.nentries);
   return job.mod;
 }
 
@@ -589,8 +671,11 @@ uint8_t *jit_wat2wasm(const char *text, size_t len, size_t *out_len, char **err)
 
 void jit_unload(JitCode *c);
 
+static void tier_free(JitTier *t, bool unload);
+
 void jit_module_free(JitModule *m, bool unload) {
   if (!m) return;
+  if (m->tier) tier_free(m->tier, unload);
   if (unload) jit_unload(m->code);
   image_free(m->image);
   free_externs(m->imports, m->nimports);
@@ -906,6 +991,8 @@ struct JitCode {
   const void *md;
 };
 
+static uint64_t code_text(const JitCode *c) { return (uint64_t)(uintptr_t)c->text; }
+
 void jit_unload(JitCode *c) {
   if (!c) return;
   pthread_mutex_lock(&g_map_lock);
@@ -922,12 +1009,14 @@ void jit_unload(JitCode *c) {
 }
 
 /* Pages for a module's text and its data, from one pair; false when no
-   pair has room and no new one can be reserved within reach. */
-static bool place(JitCode *c) {
+   pair has room and no new one can be reserved within reach.  The pair
+   near first, when given: a second tier's code within a branch of the
+   first's. */
+static bool place(JitCode *c, ArenaPair *near) {
   pthread_mutex_lock(&g_map_lock);
-  for (int round = 0; round < 2 && !c->text; round++) {
-    for (ArenaPair *p = round ? pair_new(c->text_map, c->data_map) : g_arenas; p;
-         p = round ? NULL : p->next) {
+  for (int round = near ? -1 : 0; round < 2 && !c->text; round++) {
+    for (ArenaPair *p = round < 0 ? near : round ? pair_new(c->text_map, c->data_map) : g_arenas;
+         p; p = round ? NULL : p->next) {
       uint8_t *t = arena_take(&p->text, c->text_map);
       if (!t) continue;
       uint8_t *d = arena_take(&p->data, c->data_map);
@@ -1003,7 +1092,8 @@ static bool apply(uint8_t *at, uint64_t P, uint64_t SA, uint8_t kind) {
 /* Places an image's sections, sec[i] its bytes, and makes their
    relocations against where they landed; NULL with *err set when there is
    no room within reach of the runtime. */
-static JitCode *load(const JitImage *im, const uint8_t *const sec[NSEC], char **err) {
+static JitCode *load(const JitImage *im, const uint8_t *const sec[NSEC],
+                     void *near, char **err) {
   void **ext = malloc(sizeof(void *) * (im->next ? im->next : 1));
   if (!ext) { *err = fmt_err("out of memory"); return NULL; }
   for (uint32_t i = 0; i < im->next; i++) {
@@ -1024,7 +1114,7 @@ static JitCode *load(const JitImage *im, const uint8_t *const sec[NSEC], char **
   uint64_t custom_at = round_up(im->seclen[1], 16);
   uint64_t data_at = round_up(custom_at + im->seclen[3], gran);
   c->data_map = round_up(data_at + im->seclen[2] + 1, gran);
-  if (!place(c)) {
+  if (!place(c, (ArenaPair *)near)) {
     *err = fmt_err("no memory within reach of the runtime for %zu bytes of code",
                    (size_t)im->seclen[0]);
     free(c);
@@ -1080,6 +1170,321 @@ static JitCode *load(const JitImage *im, const uint8_t *const sec[NSEC], char **
 
 const void *jit_module_desc(const JitModule *m) { return m->code ? m->code->md : NULL; }
 
+/* ---- tiers ----------------------------------------------------------------
+   A tiered module compiles at -O0 first (do_compile's first tier), which is
+   what jit_compile hands back, and again at the level asked for on a
+   thread of its own, one module at a time, under the compile lock as any
+   compile is.  The second tier's code is placed beside the first's and
+   its descriptor given to the runtime, which then finds its frames as the
+   module's own -- to unwind them, walk them for the collector, trap in
+   them.  The first instruction of each function's -O0 code, a nop put
+   there for this (OptOpts.patchable), then becomes a branch to its second
+   tier's code: every way into a function -- a call from -O0 code, an
+   export, a reference in a table, an import of it by another module --
+   goes through the -O0 code's entry, and so on to the optimised code from
+   then on, while the code addresses the instance, the tables and the C
+   API's handles hold stay what they were.  The second tier's code calls
+   its own functions straight.
+
+   The two tiers keep to one convention between them: a call from either
+   to either.  A function whose call is running when the tier-up comes
+   runs to its end in the code it started in -- a loop in -O0 code stays
+   there until its function returns -- so it is the calls after the
+   tier-up that run optimised.
+
+   Both tiers' code stays until the module goes; a second tier that
+   arrives after it is unloaded again unused. */
+
+void warmc_rt_add_desc(const void *md);
+
+enum { TIER_QUEUED, TIER_DONE, TIER_FAILED };
+
+static double now_ms(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
+}
+
+struct JitTier {
+  JitModule *jm;              /* NULL once the module needs it no more */
+  uint8_t *bin;
+  size_t len;
+  int level;
+  char **flags;
+  uint32_t nflags, threads;
+  uint64_t *entry0;           /* each function's -O0 code, or UINT64_MAX */
+  uint32_t nentry0;
+  JitCode *code2;
+  JitImage *image2;
+  int state;
+  int refs;                   /* the module's, and the queue's until done */
+  double t0;                  /* when the -O0 code was ready (WARMC_TIER_DEBUG) */
+  bool wanted;                /* something waits for it (WARMC_TIER_DEFER) */
+  JitTier *next;
+};
+
+static pthread_mutex_t g_tier_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_tier_cv = PTHREAD_COND_INITIALIZER;
+static JitTier *g_tier_head, *g_tier_tail;
+static bool g_tier_running;
+static bool g_tier_busy;          /* the worker is compiling one */
+static JitTier *g_tier_current;   /* which */
+/* WARMC_TIER_DEFER, for tests: a second tier goes in place only once
+   something waits for it (jit_module_optimized, jit_tiers_wait), never on
+   its own -- so that a test knows the -O0 code is what runs until it asks,
+   and that the tier-up comes while the frames it has made are live */
+static int g_tier_defer = -1;
+
+static void tier_unref_locked(JitTier *t) {
+  if (--t->refs) return;
+  free(t->bin);
+  for (uint32_t i = 0; i < t->nflags; i++) free(t->flags[i]);
+  free(t->flags);
+  free(t->entry0);
+  free(t);
+}
+
+/* One function's -O0 entry sent to its second tier's code: the nop
+   becomes a B (on x86-64, the five-byte nop a jmp rel32, in one store of
+   the aligned word it begins).  Both are an instruction another core may
+   be running as it changes, the old one or the new. */
+static bool tier_patch_one(uint64_t at, uint64_t to) {
+#if defined(__x86_64__)
+  if (at & 7) return false;
+  uint8_t *p = (uint8_t *)(uintptr_t)at;
+  static const uint8_t nop5[5] = { 0x0f, 0x1f, 0x44, 0x00, 0x00 };
+  if (memcmp(p, nop5, 5)) return false;
+  int64_t d = (int64_t)(to - (at + 5));
+  if (d < INT32_MIN || d > INT32_MAX) return false;
+  uint64_t w;
+  memcpy(&w, p, 8);
+  w = (w & ~0xffffffffffull) | 0xe9u | ((uint64_t)(uint32_t)(int32_t)d << 8);
+  __atomic_store_n((uint64_t *)(uintptr_t)at, w, __ATOMIC_RELEASE);
+  return true;
+#else
+  uint32_t *p = (uint32_t *)(uintptr_t)at;
+  if (*p != 0xd503201fu) return false;
+  int64_t d = (int64_t)(to - at);
+  if ((d & 3) || d < -(1ll << 27) || d >= (1ll << 27)) return false;
+  __atomic_store_n(p, 0x14000000u | ((uint32_t)(d >> 2) & 0x03ffffffu), __ATOMIC_RELEASE);
+  return true;
+#endif
+}
+
+/* Every function of the first tier that the second has sent to it; how
+   many were.  The text is writable while it runs: on macOS for this thread
+   alone, elsewhere also executable, which other threads go on running. */
+static uint32_t tier_patch(const JitCode *c0, const uint64_t *e0, uint32_t n0,
+                           const uint64_t *e2, uint32_t n2) {
+  uint32_t n = 0;
+#ifdef __APPLE__
+  pthread_jit_write_protect_np(0);
+#elif defined(_WIN32)
+  unsigned long was;
+  if (!VirtualProtect(c0->text, c0->text_map, 0x40u /* PAGE_EXECUTE_READWRITE */, &was))
+    return 0;
+#else
+  if (mprotect(c0->text, c0->text_map, PROT_READ | PROT_WRITE | PROT_EXEC)) return 0;
+#endif
+  for (uint32_t k = 0; k < n0 && k < n2; k++)
+    if (e0[k] != UINT64_MAX && e2[k] != UINT64_MAX && tier_patch_one(e0[k], e2[k])) n++;
+#ifdef __APPLE__
+  pthread_jit_write_protect_np(1);
+  sys_icache_invalidate(c0->text, c0->text_map);
+#elif defined(_WIN32)
+  VirtualProtect(c0->text, c0->text_map, PAGE_EXECUTE_READ, &was);
+  FlushInstructionCache(GetCurrentProcess(), c0->text, c0->text_map);
+#else
+  mprotect(c0->text, c0->text_map, PROT_READ | PROT_EXEC);
+  __builtin___clear_cache((char *)c0->text, (char *)c0->text + c0->text_map);
+#endif
+  return n;
+}
+
+/* The second tier of t's module: compiled, then put in place unless the
+   module has gone meanwhile. */
+static void tier_run(JitTier *t) {
+  JitOpts o;
+  memset(&o, 0, sizeof o);
+  o.opt_level = t->level;
+  o.flags = (const char *const *)t->flags;
+  o.nflags = t->nflags;
+  o.threads = t->threads;
+  CompileJob job;
+  memset(&job, 0, sizeof job);
+  job.bin = t->bin;
+  job.len = t->len;
+  job.opts = &o;
+  job.tier = 2;
+  pthread_mutex_lock(&g_tier_lock);
+  job.near = t->jm ? (void *)t->jm->code->pair : NULL;
+  pthread_mutex_unlock(&g_tier_lock);
+  bool ok = job.near && run_caught(do_compile, &job, NULL);
+  pthread_mutex_lock(&g_tier_lock);
+  if (g_tier_defer < 0) g_tier_defer = warmc_getenv("WARMC_TIER_DEFER") != NULL;
+  while (ok && g_tier_defer && t->jm && !t->wanted) pthread_cond_wait(&g_tier_cv, &g_tier_lock);
+  if (ok && t->jm) {
+    warmc_rt_add_desc(job.code2->md);
+    uint32_t sent = tier_patch(t->jm->code, t->entry0, t->nentry0, job.entries, job.nentries);
+    if (warmc_getenv("WARMC_TIER_DEBUG")) {
+      uint32_t n0 = 0;
+      for (uint32_t k = 0; k < t->nentry0; k++) n0 += t->entry0[k] != UINT64_MAX;
+      fprintf(stderr, "warmc: tier-up: %u of %u functions sent to -O%d code, %.1f ms after the -O0 code\n",
+              sent, n0, t->level, now_ms() - t->t0);
+    }
+    t->code2 = job.code2;
+    t->image2 = job.image2;
+    t->state = TIER_DONE;
+  } else {
+    if (ok) {
+      jit_unload(job.code2);
+      image_free(job.image2);
+    }
+    t->state = TIER_FAILED;
+  }
+  pthread_cond_broadcast(&g_tier_cv);
+  tier_unref_locked(t);
+  pthread_mutex_unlock(&g_tier_lock);
+  free(job.entries);
+}
+
+static void *tier_worker(void *arg) {
+  (void)arg;
+  pthread_mutex_lock(&g_tier_lock);
+  for (;;) {
+    while (!g_tier_head) pthread_cond_wait(&g_tier_cv, &g_tier_lock);
+    JitTier *t = g_tier_head;
+    g_tier_head = t->next;
+    if (!g_tier_head) g_tier_tail = NULL;
+    t->next = NULL;
+    if (!t->jm) {
+      /* the module went before its turn */
+      t->state = TIER_FAILED;
+      pthread_cond_broadcast(&g_tier_cv);
+      tier_unref_locked(t);
+      continue;
+    }
+    g_tier_busy = true;
+    g_tier_current = t;
+    pthread_mutex_unlock(&g_tier_lock);
+    tier_run(t);
+    pthread_mutex_lock(&g_tier_lock);
+    g_tier_busy = false;
+    g_tier_current = NULL;
+    pthread_cond_broadcast(&g_tier_cv);
+  }
+  return NULL;
+}
+
+void jit_tiers_wait(void) {
+  pthread_mutex_lock(&g_tier_lock);
+  for (JitTier *t = g_tier_head; t; t = t->next) t->wanted = true;
+  if (g_tier_current) g_tier_current->wanted = true;
+  pthread_cond_broadcast(&g_tier_cv);
+  while (g_tier_head || g_tier_busy) pthread_cond_wait(&g_tier_cv, &g_tier_lock);
+  pthread_mutex_unlock(&g_tier_lock);
+}
+
+static char *dup_cstr(const char *s) {
+  size_t n = strlen(s);
+  char *d = malloc(n + 1);
+  if (!d) return NULL;
+  memcpy(d, s, n + 1);
+  return d;
+}
+
+/* Queues the module's second tier; with no memory for it, the module
+   keeps its first. */
+static void tier_start(JitModule *jm, const uint8_t *bin, size_t len, const JitOpts *o,
+                       uint64_t *entries, uint32_t nentries) {
+  JitTier *t = calloc(1, sizeof *t);
+  uint8_t *b = malloc(len ? len : 1);
+  char **fl = calloc(o->nflags ? o->nflags : 1, sizeof(char *));
+  bool ok = t && b && fl;
+  for (uint32_t i = 0; ok && i < o->nflags; i++) ok = (fl[i] = dup_cstr(o->flags[i])) != NULL;
+  if (!ok) {
+    if (fl) for (uint32_t i = 0; i < o->nflags; i++) free(fl[i]);
+    free(fl); free(b); free(t); free(entries);
+    return;
+  }
+  memcpy(b, bin, len);
+  t->jm = jm;
+  t->bin = b;
+  t->len = len;
+  t->level = o->opt_level;
+  t->flags = fl;
+  t->nflags = o->nflags;
+  t->threads = o->threads;
+  t->entry0 = entries;
+  t->nentry0 = nentries;
+  t->state = TIER_QUEUED;
+  t->refs = 2;
+  t->t0 = now_ms();
+  jm->tier = t;
+  pthread_mutex_lock(&g_tier_lock);
+  if (g_tier_tail) g_tier_tail->next = t;
+  else g_tier_head = t;
+  g_tier_tail = t;
+  if (!g_tier_running) {
+    pthread_t th;
+    pthread_attr_t a;
+    pthread_attr_init(&a);
+    pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
+    /* the compiler's recursion is deep on a big function */
+    pthread_attr_setstacksize(&a, 64u << 20);
+    if (pthread_create(&th, &a, tier_worker, NULL) == 0) g_tier_running = true;
+    pthread_attr_destroy(&a);
+  }
+  if (!g_tier_running) {
+    /* no thread for it: the module keeps its first tier */
+    g_tier_head = g_tier_tail = NULL;
+    t->state = TIER_FAILED;
+    t->refs = 1;
+  }
+  pthread_cond_broadcast(&g_tier_cv);
+  pthread_mutex_unlock(&g_tier_lock);
+}
+
+bool jit_module_optimized(const JitModule *m, bool wait) {
+  JitTier *t = m->tier;
+  if (!t) return true;
+  pthread_mutex_lock(&g_tier_lock);
+  if (wait) {
+    t->wanted = true;
+    pthread_cond_broadcast(&g_tier_cv);
+  }
+  while (wait && t->state == TIER_QUEUED) pthread_cond_wait(&g_tier_cv, &g_tier_lock);
+  bool done = t->state == TIER_DONE;
+  pthread_mutex_unlock(&g_tier_lock);
+  return done;
+}
+
+const void *jit_module_detach_tier(JitModule *m) {
+  JitTier *t = m ? m->tier : NULL;
+  if (!t) return NULL;
+  pthread_mutex_lock(&g_tier_lock);
+  t->jm = NULL;
+  /* a deferred one waits no more, to be unloaded */
+  pthread_cond_broadcast(&g_tier_cv);
+  const void *md = t->state == TIER_DONE && t->code2 ? t->code2->md : NULL;
+  pthread_mutex_unlock(&g_tier_lock);
+  return md;
+}
+
+static void tier_free(JitTier *t, bool unload) {
+  pthread_mutex_lock(&g_tier_lock);
+  t->jm = NULL;
+  pthread_cond_broadcast(&g_tier_cv);
+  JitCode *c2 = t->code2;
+  JitImage *im2 = t->image2;
+  t->code2 = NULL;
+  t->image2 = NULL;
+  tier_unref_locked(t);
+  pthread_mutex_unlock(&g_tier_lock);
+  if (unload) jit_unload(c2);
+  image_free(im2);
+}
+
 /* ---- serialising ---------------------------------------------------------
    "WARMJIT\2", the build tag, then the types, the sections as the module's
    code has them where it runs, and the image, each count and length a u64
@@ -1107,6 +1512,13 @@ static void put_extern(Buf *b, const JitExtern *x, bool imp) {
 uint8_t *jit_serialize(const JitModule *m, size_t *len) {
   const JitImage *im = m->image;
   const JitCode *c = m->code;
+  /* a tiered module's optimised code, which a load of it runs from the
+     start; its -O0 code when that never comes */
+  if (m->tier && jit_module_optimized(m, true)) {
+    pthread_mutex_lock(&g_tier_lock);
+    if (m->tier->code2) { im = m->tier->image2; c = m->tier->code2; }
+    pthread_mutex_unlock(&g_tier_lock);
+  }
   if (!im || !c) return NULL;
   /* the bytes are a Buf's, xmalloc's: not while a compile has its heap */
   pthread_mutex_lock(&g_compile_lock);
@@ -1296,7 +1708,7 @@ JitModule *jit_deserialize(const uint8_t *p, size_t len, char **err) {
     *err = fmt_err("a serialised module that is cut short or damaged");
     return NULL;
   }
-  m->code = load(im, sec, err);
+  m->code = load(im, sec, NULL, err);
   if (!m->code) {
     jit_module_free(m, false);
     return NULL;

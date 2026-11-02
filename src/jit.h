@@ -64,9 +64,13 @@ typedef struct JitCode JitCode;
    serialised (the image), what it imports and exports, and every function
    type it has. */
 typedef struct JitImage JitImage;
+typedef struct JitTier JitTier;
 typedef struct {
   JitCode *code;
   JitImage *image;
+  /* a tiered module's optimised code still to come or in place (jit.c),
+     else NULL */
+  JitTier *tier;
   JitExtern *imports; uint32_t nimports;
   JitExtern *exports; uint32_t nexports;
   JitTypeId *ftypes; uint32_t nftypes;
@@ -80,6 +84,10 @@ typedef struct {
   const char *const *flags;     /* more options, as warmc's -O and -f */
   uint32_t nflags;
   uint32_t threads;             /* how many compile at once; 0: the default */
+  /* compile at -O0 first, which is quick, and at the level asked for
+     behind it, on a thread of its own, sending each function's calls to
+     its optimised code once that is in place */
+  bool tiered;
 } JitOpts;
 
 /* Compiles a binary module and places it; NULL with *err set (to a message
@@ -105,6 +113,21 @@ const void *jit_module_desc(const JitModule *m);
    and wasm_module_deserialize trade in. */
 uint8_t *jit_serialize(const JitModule *m, size_t *len);
 JitModule *jit_deserialize(const uint8_t *p, size_t len, char **err);
+
+/* Whether a tiered module's optimised code is in place (any other
+   module's is from the start), waiting for it to be with wait: false
+   when it never will be, its compile having failed. */
+bool jit_module_optimized(const JitModule *m, bool wait);
+
+/* Waits until every tiered module's optimised code is in place, or has
+   failed. */
+void jit_tiers_wait(void);
+
+/* No optimised code goes in place for the module after this: what the
+   module's release does first.  The descriptor of the optimised code when
+   it is in place, which the runtime is to forget with the module's own,
+   else NULL. */
+const void *jit_module_detach_tier(JitModule *m);
 
 /* Frees the module, and its code with unload -- when no instance uses it
    any more, nor the runtime's collector (its heap types) */

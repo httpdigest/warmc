@@ -3974,6 +3974,7 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
   s->out_bytes = call_out_bytes(f, out_bytes);
   s->far_br = far || warmc_getenv("WARMC_FAR_BRANCH") != NULL;
   s->naive = !opt->regalloc;
+  s->one_rule = opt->ra_one_rule;
 
   s->loc = xmalloc(f->ninsts * sizeof(int));
   s->cls = xmalloc(f->ninsts);
@@ -4178,10 +4179,15 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
   EarlyRet er;
   size_t er_site = 0;
   bool early = early_ret_shape(s, &er);
+  /* the instruction a tier-up turns into a branch to the function's next
+     tier: a nop, which AArch64 lets one core replace with a B while another
+     runs it */
+  if (opt->patchable) a64_nop(&pro);
+  size_t pro_patch = pro.len;
   if (early) er_site = early_ret_test(f, &pro, &er);
   size_t pro_from = pro.len;
   emit_prologue(s, &pro);
-  if (early && pro.len == pro_from) { pro.len = 0; early = false; }
+  if (early && pro.len == pro_from) { pro.len = pro_patch; early = false; }
   if (early) s->early_main = 1u + (er.edge ^ 1u);
   /* A return block only the entry went to is gone with that edge: laid out
      after the entry, it would cost the rest of the function a branch over

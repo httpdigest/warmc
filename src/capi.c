@@ -574,11 +574,32 @@ static void map_put(Map *m, u64 a, u64 b, void *v) { map_put3(m, a, b, 0, v); }
 
 /* ---- configuration, engine, store ------------------------------------------ */
 
+/* WARMC_TIERED, for testing tiers through programs that know nothing of
+   them: 1 makes every engine tiered; wait also has a module's compile
+   wait for its optimised code, so that everything runs that code, entered
+   through the -O0 code's; host has the first call out to the host -- a
+   host function's, or WASI's fd_write -- wait for every module's, so that
+   -O0 frames below it return into optimised callees and call them from
+   then on. */
+enum { TIER_ENV_OFF, TIER_ENV_ON, TIER_ENV_WAIT, TIER_ENV_HOST };
+static int g_tier_mode = -1;
+
+static int tier_mode(void) {
+  if (g_tier_mode < 0) {
+    const char *v = getenv("WARMC_TIERED");
+    g_tier_mode = !v || !*v || !strcmp(v, "0") ? TIER_ENV_OFF
+                : !strcmp(v, "wait") ? TIER_ENV_WAIT
+                : !strcmp(v, "host") ? TIER_ENV_HOST : TIER_ENV_ON;
+  }
+  return g_tier_mode;
+}
+
 struct wasm_config_t {
   int level;
   char **flags;
   size_t nflags;
   uint32_t threads;
+  bool tiered;
 };
 
 own wasm_config_t *wasm_config_new(void) {
@@ -601,6 +622,8 @@ bool warm_config_opt_level_set(wasm_config_t *c, int level) {
 }
 
 void warm_config_compile_threads_set(wasm_config_t *c, uint32_t n) { c->threads = n; }
+
+void warm_config_tiered_set(wasm_config_t *c, bool on) { c->tiered = on; }
 
 void warm_config_flag_add(wasm_config_t *c, const char *flag) {
   c->flags = realloc(c->flags, (c->nflags + 1) * sizeof(char *));
@@ -632,6 +655,7 @@ own wasm_engine_t *wasm_engine_new_with_config(own wasm_config_t *c) {
   e->opts.flags = (const char *const *)e->config->flags;
   e->opts.nflags = (uint32_t)e->config->nflags;
   e->opts.threads = e->config->threads;
+  e->opts.tiered = e->config->tiered || tier_mode() != TIER_ENV_OFF;
   pthread_mutex_init(&e->lock, NULL);
   return e;
 }
@@ -688,8 +712,12 @@ struct ModuleRec {
    the collector still refers to it (its heap types). */
 static void module_release(ModuleRec *m) {
   if (!m || atomic_fetch_sub(&m->refs, 1) != 1) return;
+  /* no optimised code goes in place from now on; what is in place goes
+     with the module's own */
+  const void *md2 = jit_module_detach_tier(m->jm);
   rt_enter();
   bool forget = warmc_rt_forget_desc(m->md) != 0;
+  if (forget && md2) warmc_rt_forget_desc((const ModuleDesc *)md2);
   rt_leave();
   jit_module_free(m->jm, forget);
   free(m);
@@ -1167,6 +1195,7 @@ static void set_message(wasm_message_t *out, const char *msg) {
 /* A placed module's record, counted once; NULL for no module */
 static ModuleRec *module_rec(JitModule *jm) {
   if (!jm) return NULL;
+  if (tier_mode() == TIER_ENV_WAIT) jit_module_optimized(jm, true);
   ModuleRec *m = xzalloc(sizeof *m);
   atomic_init(&m->refs, 1);
   m->jm = jm;
@@ -1209,6 +1238,10 @@ bool wasm_module_validate(wasm_store_t *s, const wasm_byte_vec_t *bin) {
 
 static const JitModule *jm_of(const wasm_module_t *m) {
   return ((const ModuleEnt *)m)->mod->jm;
+}
+
+bool warm_module_optimized(const wasm_module_t *m, bool wait) {
+  return jit_module_optimized(((const ModuleEnt *)m)->mod->jm, wait);
 }
 
 void wasm_module_imports(const wasm_module_t *m, own wasm_importtype_vec_t *out) {
@@ -1313,7 +1346,10 @@ static ModuleRec *proxy_module(wasm_engine_t *e, const char *wat) {
   char *err = NULL;
   size_t n = 0;
   uint8_t *bin = jit_wat2wasm(wat, strlen(wat), &n, &err);
-  ModuleRec *m = bin ? module_rec(jit_compile(bin, n, &e->opts, &err)) : NULL;
+  /* a host object's module is a few lines: nothing to tier */
+  JitOpts po = e->opts;
+  po.tiered = false;
+  ModuleRec *m = bin ? module_rec(jit_compile(bin, n, &po, &err)) : NULL;
   jit_free(bin);
   if (!m) {
     fprintf(stderr, "libwarmc: internal: %s: %s\n", wat, err ? err : "?");
@@ -1646,6 +1682,14 @@ own wasm_trap_t *warm_func_call_raw(const wasm_func_t *fn, warm_val_raw_t *vals,
   return t;
 }
 
+/* WARMC_TIERED=host: the first call out to the host -- a host function's,
+   or WASI's fd_write (rt/wasi.c's hook) -- waits for every module's
+   optimised code */
+static _Atomic bool g_tier_waited;
+static void tier_host_wait(void) {
+  if (tier_mode() == TIER_ENV_HOST && !atomic_exchange(&g_tier_waited, true)) jit_tiers_wait();
+}
+
 /* A host function called from wasm: warm_host_thunk keeps the argument
    registers and calls this with them, its HostFunc the context the call
    passed as the instance.  Results go back in x0 / d0 for one, and to the
@@ -1654,6 +1698,7 @@ own wasm_trap_t *warm_func_call_raw(const wasm_func_t *fn, warm_val_raw_t *vals,
 __attribute__((used))
 void warm_host_dispatch(HostFunc *h, const u64 *gpr, const u64 *fpr,
                         const u8 *stk, u64 *ret) {
+  tier_host_wait();
   wasm_store_t *s = h->store;
   const wasm_functype_t *ft = h->type;
   size_t np = ft->params.size, nr = ft->results.size;
@@ -2234,6 +2279,7 @@ void wasm_instance_exports(const wasm_instance_t *inst, own wasm_extern_vec_t *o
    engine, as the type an import must have to be bound. */
 
 extern const char warmc_jit_wasi_wat[];
+extern void (*warmc_wasi_call_hook)(void);
 int warmc_wasi_jit_setup(int argc, char **argv, char **env, int nenv,
                          const char *const *dirs, int ndirs,
                          const char *const *listen, int nlisten, const char **bad);
@@ -2364,6 +2410,7 @@ bool warm_wasi_imports(wasm_store_t *s, const wasm_module_t *module,
     g_wasi_world = w;
     g_wasi_store = s;
     warmc_wasi_exit_hook = wasi_exit;
+    if (tier_mode() == TIER_ENV_HOST) warmc_wasi_call_hook = tier_host_wait;
   }
   rt_leave();
   if (!ok) {

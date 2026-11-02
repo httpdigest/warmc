@@ -13,7 +13,9 @@
 
    OPTIONS: -O<n> and -f[no-]<pass> as warmc takes them, and -j<n>, how many
    threads compile at once (the fewer, the less memory a compile takes at
-   its peak, and the longer); --dir=HOST[::GUEST],
+   its peak, and the longer); --tiered to start the module at -O0 and send
+   its calls to the code -O<n> makes once it is ready
+   (warm_config_tiered_set); --dir=HOST[::GUEST],
    --env=NAME=VALUE, --inherit-env and --tcplisten=[ADDR:]PORT for a WASI
    command; --serialize=FILE to write the compiled module there, and
    --precompiled when MODULE is such a file. */
@@ -182,10 +184,11 @@ int main(int argc, char **argv) {
     else if (!strncmp(a, "--tcplisten=", 12)) warm_wasi_config_tcplisten(wasi, a + 12);
     else if (!strncmp(a, "--serialize=", 12)) serialize = a + 12;
     else if (!strcmp(a, "--precompiled")) precompiled = true;
+    else if (!strcmp(a, "--tiered")) warm_config_tiered_set(config, true);
     else die(2, "unknown option", a);
   }
   if (i >= argc) {
-    fputs("usage: warmrun [-O<n>] [-f<pass>] [-j<n>] [--dir=HOST[::GUEST]] [--env=K=V] "
+    fputs("usage: warmrun [-O<n>] [-f<pass>] [-j<n>] [--tiered] [--dir=HOST[::GUEST]] [--env=K=V] "
           "[--inherit-env]\n               [--tcplisten=ADDR] [--serialize=FILE] "
           "[--precompiled] MODULE [ARGS...]\n", stderr);
     return 2;

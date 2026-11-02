@@ -1682,6 +1682,7 @@ static int produce_body_x64(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
 
   s->far_br = false;
   s->naive = !opt->regalloc;
+  s->one_rule = opt->ra_one_rule;
 
   s->loc = xmalloc(f->ninsts * sizeof(int));
   s->cls = xmalloc(f->ninsts);
@@ -1801,6 +1802,10 @@ static int produce_body_x64(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
   s->block_off = xmalloc(f->nblocks * sizeof(uint32_t));
   for (uint32_t i = 0; i < f->nblocks; i++) s->block_off[i] = 0xffffffffu;
 
+  /* the instruction a tier-up turns into a jmp rel32 to the function's next
+     tier: a five-byte nop in an aligned eight-byte word, which one locked
+     store replaces whole while another core runs it */
+  if (opt->patchable) buf_bytes(&pro, "\x0f\x1f\x44\x00\x00", 5);
   emit_prologue(s, &pro);
 
   const char *lal_s = warmc_getenv("WARMC_LOOP_ALIGN");
@@ -1921,6 +1926,7 @@ static int produce_body_x64(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
   for (uint32_t i = 0; i < f->nblocks; i++) g_stats.loop_tops += f->loop_top[i] != UINT32_MAX;
   memset(fout, 0, sizeof *fout);
   fout->want_align = opt->align && has_loop;
+  fout->align8 = opt->patchable;
   fout->code_len = (uint32_t)(pro.len + s->body.len);
   fout->code = xmalloc_long(fout->code_len ? fout->code_len : 1);
   memcpy(fout->code, pro.data, pro.len);

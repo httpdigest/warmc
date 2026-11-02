@@ -726,6 +726,9 @@ void codegen_commit_function(ObjBuilder *obj, FuncOut *fo) {
   if (fo->want_align)
     while (((obj->text.len + fo->entry_off) & (ALIGN_BYTES - 1)) != fo->phase)
       g_target->pad_nop(&obj->text);
+  else if (fo->align8)
+    while ((obj->text.len + fo->entry_off) & 7)
+      g_target->pad_nop(&obj->text);
   uint64_t base = obj->text.len;
   buf_bytes(&obj->text, fo->code, fo->code_len);
   for (uint32_t i = 0; i < fo->nrelocs; i++)

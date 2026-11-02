@@ -72,6 +72,8 @@ typedef struct {
 
   bool mem_valid;
   bool naive;
+  /* the scan under the one eviction rule only (OptOpts.ra_trials off) */
+  bool one_rule;
 
   SplitCtl *split_sc;
   bool split_collect;

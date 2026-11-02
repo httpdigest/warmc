@@ -2372,7 +2372,7 @@ static void regalloc_linear(Isel *s) {
     { EV_WDENSITY, EV_DENSITY }, { EV_CONTESTED, EV_DENSITY },
     { EV_DENSITY, EV_DENSITY },
   };
-  int ntrial = warmc_getenv("WARMC_NO_RA_TRIALS")
+  int ntrial = s->one_rule || warmc_getenv("WARMC_NO_RA_TRIALS")
                    ? 0 : (int)(sizeof trial_rule / sizeof trial_rule[0]);
   bool trial_dbg = warmc_getenv("WARMC_RA_TRIAL_DEBUG") != NULL;
   uint32_t slot0 = slot;

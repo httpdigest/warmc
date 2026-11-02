@@ -41,12 +41,27 @@ WASM_API_EXTERN void warm_config_flag_add(wasm_config_t*, const char* flag);
    has cores, up to a limit, and fewer for a small module. */
 WASM_API_EXTERN void warm_config_compile_threads_set(wasm_config_t*, uint32_t n);
 
+/* Tiered compiling: wasm_module_new compiles at -O0, which takes a fraction
+   of the time, and hands the module back; the module is compiled again at
+   the configured level on a thread of the library's, and its calls go to
+   the optimised code once that is in place, instances made before then
+   too.  A call already running when it arrives runs on in the -O0 code
+   until it returns -- a long loop in a function that has started stays
+   unoptimised -- so a program that runs most of its time in one call, as
+   a WASI command does, is better compiled untiered.  Off by default. */
+WASM_API_EXTERN void warm_config_tiered_set(wasm_config_t*, bool enable);
+
 /* wasm_module_new, saying why when it fails: the message (NUL-terminated,
    which its size counts) is the compiler's diagnostic, such as
    "invalid: type mismatch in i32.add".  error_out may be NULL. */
 WASM_API_EXTERN own wasm_module_t* warm_module_new(
   wasm_store_t*, const wasm_byte_vec_t* binary, own wasm_message_t* error_out);
 
+/* Whether the module's code at the configured level is in place, waiting
+   until it is with wait: true at once for an untiered module, false when
+   it never will be (its compile at that level failed, and the module runs
+   its -O0 code). */
+WASM_API_EXTERN bool warm_module_optimized(const wasm_module_t*, bool wait);
 /* A module in the text format, assembled to the binary one; false, with
    error_out set when it is not NULL, when it does not assemble. */
 WASM_API_EXTERN bool warm_wat2wasm(
