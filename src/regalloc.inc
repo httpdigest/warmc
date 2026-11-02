@@ -2383,9 +2383,16 @@ static void regalloc_linear(Isel *s) {
   int best_rule = 0;
   /* whether this pass ranked an integer value's victims by its rule */
   bool ranked = false;
+  /* The incumbent is scanned last, so that where it stays the cheapest -- in
+     nine functions of ten that rank -- its assignment is the one in place,
+     and no last pass makes it again.  Each pass starts from the same reset,
+     whichever ran before it. */
+  double rule_cost[sizeof trial_rule / sizeof trial_rule[0]];
+  int last_rule = -1;
   for (int trial = 0; trial <= ntrial; trial++) {
     bool final = trial == ntrial;
-    int rule_i = final ? best_rule : trial;
+    int rule_i = final ? best_rule : ntrial ? (trial + 1) % ntrial : 0;
+    if (final && best_rule == last_rule) break;
     if (trial > 0) {
       for (int r = 0; r < 32; r++) {
         gpr_end[r] = fpr_end[r] = -1;
@@ -2748,14 +2755,23 @@ static void regalloc_linear(Isel *s) {
       cost += 2.0 * (double)(__builtin_popcount(s->used_gpr_cs & ~used_gcs0) +
                              __builtin_popcount(s->used_fpr_cs & ~used_fcs0));
       if (trial_dbg)
-        fprintf(stderr, "ratrial[%u] rule %d cost %.1f\n", f->func_index, trial, cost);
-      if (trial == 0) { best_cost = cost; best_rule = 0; base_cost = cost; }
-      else if (cost < best_cost * (1 - 1e-9) && cost < RA_TRIAL_MARGIN * base_cost) {
-        best_cost = cost; best_rule = trial;
-      }
+        fprintf(stderr, "ratrial[%u] rule %d cost %.1f\n", f->func_index, rule_i, cost);
+      rule_cost[rule_i] = cost;
+      last_rule = rule_i;
     }
     /* no rule ranked anything: this is the last pass's assignment */
-    if (trial == 0 && !ranked) break;
+    if (trial == 0 && !ranked) { best_rule = rule_i; break; }
+    /* every rule priced: the incumbent's price, and a rule that undercuts
+       the cheapest before it, in the rules' order, by the margin */
+    if (trial == ntrial - 1) {
+      best_cost = base_cost = rule_cost[0];
+      best_rule = 0;
+      for (int r = 1; r < ntrial; r++)
+        if (rule_cost[r] < best_cost * (1 - 1e-9) && rule_cost[r] < RA_TRIAL_MARGIN * base_cost) {
+          best_cost = rule_cost[r];
+          best_rule = r;
+        }
+    }
   }
   if (trial_dbg && ntrial)
     fprintf(stderr, "ratrial[%u] chose %d\n", f->func_index, best_rule);
