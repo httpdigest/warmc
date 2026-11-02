@@ -18,9 +18,9 @@ The passes are all of -f's but seven: fma, dead-frames, acc-tail,
 float-reassoc and addr-nowrap change what a program can see, which these
 suites compare, and have rows of their own; gssa-all is not a pass but a stronger gssa; and exact-trap is none
 either, but a mode that turns trampoline, go-sp, dead-frames and acc-tail
-off, with rows of its own too.  This script reads src/main.c's list and
-fails if a pass is missing from both PASSES and LEFT_OUT, so a new pass
-joins the combinations.
+off, with rows of its own too.  This script reads the pass names off
+compile_parse_flag, wherever in src/ it is, and fails if a pass is missing
+from both PASSES and LEFT_OUT, so a new pass joins the combinations.
 
 make check's rows turn no pass off on their own: these settings are where
 each pass is off, beside every other on and off.  The cases run with the
@@ -62,9 +62,23 @@ SUITES = {
 CORPORA = ["ctests", "cpptests", "rstests", "gotests", "stdgotests", "astests", "kttests",
            "zigtests", "hstests", "javatests"]
 
+def flag_names():
+    """The pass names -f takes: the strcmps of compile_parse_flag, in
+    whichever of src/*.c defines it, or None where none does."""
+    src_dir = os.path.join(ROOT, "src")
+    for fn in sorted(os.listdir(src_dir)):
+        if not fn.endswith(".c"):
+            continue
+        src = open(os.path.join(src_dir, fn)).read()
+        m = re.search(r'^bool compile_parse_flag\(.*?^\}$', src, re.S | re.M)
+        if m:
+            return set(re.findall(r'strcmp\(name, "([a-z-]+)"\)', m.group(0)))
+    return None
+
 def check_passes():
-    src = open(os.path.join(ROOT, "src", "main.c")).read()
-    names = set(re.findall(r'strcmp\(name, "([a-z-]+)"\)', src))
+    names = flag_names()
+    if not names:
+        return None, None
     missing = names - set(PASSES) - LEFT_OUT
     stale = (set(PASSES) | LEFT_OUT) - names
     return missing, stale
@@ -112,8 +126,11 @@ def main():
     args = ap.parse_args()
     os.chdir(ROOT)
     missing, stale = check_passes()
+    if missing is None:
+        print("FAIL[combos]: no compile_parse_flag in src/*.c with the pass names -f takes")
+        return 1
     if missing or stale:
-        print("FAIL[combos]: src/main.c's passes and this script's disagree: %s"
+        print("FAIL[combos]: compile_parse_flag's passes and this script's disagree: %s"
               % ", ".join(["new %s" % p for p in sorted(missing)] + ["gone %s" % p for p in sorted(stale)]))
         return 1
     suites = list(SUITES) + ["corpora"] if args.suites == "all" else args.suites.split(",")
