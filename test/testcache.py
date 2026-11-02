@@ -330,7 +330,9 @@ def clear():
 def selftest():
     """The trim weighs a result by the block it takes, the oldest going
     first, and WARMC_TESTCACHE_REFS_ONLY keeps a reference but no run or
-    row.  Exits 1 with what went wrong."""
+    row.  The build shims (test/shims) key a build of a package by its
+    directory on what is in it, and give a kept executable back runnable.
+    Exits 1 with what went wrong."""
     import subprocess
     import sys
     import tempfile
@@ -361,13 +363,52 @@ def selftest():
                       if os.path.exists(os.path.join(d, "b", "testcache", kind, "kk", "k" * 64)))
         if kept != ["ref"]:
             bad.append("with WARMC_TESTCACHE_REFS_ONLY kept %s, not ref alone" % (kept or "nothing"))
+        bad += selftest_buildcache(d)
     finally:
         shutil.rmtree(d, ignore_errors=True)
     for b in bad:
         print("FAIL[testcache]: " + b)
     if not bad:
-        print("testcache: the trim weighs blocks on disk; refs-only keeps references alone")
+        print("testcache: the trim weighs blocks on disk; refs-only keeps references alone; "
+              "a package's build is kept by what is in it, runnable")
     return 1 if bad else 0
+
+
+def selftest_buildcache(d):
+    """go build -o OUT . through the go shim, with a go of its own that
+    builds an executable of the package's sources: what the shim gives back
+    is the sources' as they are now, and runnable, kept or not."""
+    import stat
+    import subprocess
+    import sys
+    bad = []
+    fake = os.path.join(d, "fakego")
+    with open(fake, "w") as f:
+        f.write("#!/bin/sh\n"
+                "[ \"$1\" = version ] && { echo go version fake; exit 0; }\n"
+                "cat *.go > \"$3\" && chmod 755 \"$3\"\n")
+    os.chmod(fake, 0o755)
+    pkg = os.path.join(d, "pkg")
+    os.makedirs(pkg)
+    shim = os.path.join(os.path.dirname(os.path.abspath(__file__)), "shims", "go")
+    env = dict(os.environ, BUILD=os.path.join(d, "bc"))
+    env.pop("WARMC_NO_TESTCACHE", None)
+    env.pop("WARMC_TESTCACHE_REFS_ONLY", None)
+    out = os.path.join(d, "out")
+    for want in ("one", "one", "two"):
+        with open(os.path.join(pkg, "a.go"), "w") as f:
+            f.write(want)
+        if os.path.exists(out):
+            os.remove(out)
+        subprocess.run([sys.executable, shim, "build", "-o", out, "."], cwd=pkg, check=True,
+                       env=dict(env, WARMC_SHIM_REAL=fake), capture_output=True)
+        with open(out) as f:
+            got = f.read()
+        if got != want:
+            bad.append("go build . through the shim gave %r where the package is %r" % (got, want))
+        if not os.stat(out).st_mode & stat.S_IXUSR:
+            bad.append("go build . through the shim gave a program that does not run")
+    return bad
 
 
 def main(argv):

@@ -4,9 +4,11 @@ and rustc, each with an -o OUT.  The key is what the build is made of: the
 tool's version as it reports it (tinygo and rustup's rustc are wrappers, so
 their own files say nothing of the compiler behind them), every argument
 (OUT by its file name alone), the contents of every file an argument names
-and of the other files in a source's directory, and every GO, TINYGO, CARGO
-and RUST setting.  What is kept is OUT and what the build said; a build
-that failed is not kept.  Any other use of the tool goes to it.  The shims
+and of the other files in a source's directory -- or in a directory an
+argument names, as `go build .` names its package -- and every GO, TINYGO,
+CARGO and RUST setting.  What is kept is OUT, its mode (a native
+executable's run bits), and what the build said; a build that failed is
+not kept.  Any other use of the tool goes to it.  The shims
 beside this call it; run_all.sh puts wrappers that run them first on PATH,
 each naming its tool in WARMC_SHIM_REAL."""
 import os
@@ -61,6 +63,9 @@ def main(name):
             parts.append(testcache.File(path))
             if path.endswith(SOURCES[name]):
                 dirs.add(os.path.dirname(os.path.abspath(path)))
+        elif i > 0 and os.path.isdir(path):
+            # a package by its directory: what is in it
+            dirs.add(os.path.abspath(path))
     for d in sorted(dirs):
         for f in sorted(os.listdir(d)):
             p = os.path.join(d, f)
@@ -71,7 +76,8 @@ def main(name):
                  if k.startswith(("GO", "TINYGO", "CARGO", "RUST")))
     k = testcache.key("build", name, ver.stdout + ver.stderr, parts, env)
     said = testcache.get("build-said", k)
-    if said is not None and testcache.get_file("build", k, out):
+    if said is not None and len(said) == 3 and testcache.get_file("build", k, out):
+        os.chmod(out, said[2])
         sys.stdout.write(said[0])
         sys.stderr.write(said[1])
         sys.exit(0)
@@ -80,5 +86,5 @@ def main(name):
     sys.stderr.write(r.stderr)
     if r.returncode == 0 and os.path.isfile(out):
         testcache.put_file("build", k, out)
-        testcache.put("build-said", k, [r.stdout, r.stderr])
+        testcache.put("build-said", k, [r.stdout, r.stderr, os.stat(out).st_mode & 0o7777])
     sys.exit(r.returncode)
