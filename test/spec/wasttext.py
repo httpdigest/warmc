@@ -174,7 +174,10 @@ def check(wast, spec, outdir, warmc, sh, timeout):
         if kind != "text":
             continue
         stem = os.path.splitext(cmd["filename"])[0]
-        src_path = os.path.join(outdir, stem + ".text.wat")
+        # the process's own: make check's spec rows check a file's text at
+        # once, in the same directory, and one row's removal of what another
+        # was about to read made that one's module read as empty
+        src_path = os.path.join(outdir, "%s.text.%d.wat" % (stem, os.getpid()))
         with open(src_path, "w", encoding="utf-8", newline="") as f:
             f.write(text)
         # what a run before wrote is not taken for what this one did
@@ -219,4 +222,8 @@ def check(wast, spec, outdir, warmc, sh, timeout):
             nfail += 1
             failures.append("text: line %d: warmc's module (%s) exits %d, want %d"
                             % (line, wrong[:40], r.returncode, want))
+    for _, _, src_path in texts:
+        for p in (src_path, src_path[:-len(".wat")] + ".wasm"):
+            if os.path.exists(p):
+                os.remove(p)
     return npass, nfail, failures
