@@ -17,6 +17,74 @@ static bool dominates(IrFunc *f, uint32_t a, uint32_t b) {
   return ir_dominates_checked(f, a, b);
 }
 
+static uint32_t *count_uses(IrFunc *f);
+
+/* The cleanup passes that count every value's uses as they start: fold,
+   thread, load combining and param pruning, in that order in a round.  A
+   pass that finds nothing to do leaves the function as it was, so a round
+   that changes nothing between two of them counts the same uses twice --
+   a twentieth of compiling Go.  The first count a pass makes, before it
+   changes anything, takes the round's copy instead when nothing has
+   changed since it was made, or makes it; every other count is the
+   pass's own (count_uses).  WARMC_VERIFY_UC counts anew and compares. */
+enum { UC_FOLD = 1, UC_THREAD = 3, UC_LDCOMB = 7, UC_PRUNE = 13 };
+static bool g_verify_uc;
+static pthread_once_t g_verify_uc_once = PTHREAD_ONCE_INIT;
+static void verify_uc_init(void) { g_verify_uc = warmc_getenv("WARMC_VERIFY_UC") != NULL; }
+
+static uint32_t *count_uses_shared(IrFunc *f, int pass) {
+  if (f->uc_pass != pass) return count_uses(f);
+  f->uc_pass = -1;
+  size_t bytes = (size_t)(f->ninsts ? f->ninsts : 1) * sizeof(uint32_t);
+  if (f->uc && f->uc_gen == f->ir_gen && f->uc_n == f->ninsts) {
+    uint32_t *u = xmalloc(bytes);
+    memcpy(u, f->uc, bytes);
+    pthread_once(&g_verify_uc_once, verify_uc_init);
+    if (g_verify_uc) {
+      uint32_t *c = count_uses(f);
+      if (memcmp(c, u, bytes))
+        warmc_fatal("internal: the use counts a cleanup round shared are not the "
+                    "function's in %s", f->m->funcs[f->func_index].sym);
+      xfree(c);
+    }
+    return u;
+  }
+  uint32_t *c = count_uses(f);
+  if (f->uc_cap < f->ninsts || !f->uc) {
+    xfree(f->uc);
+    f->uc_cap = f->ninsts ? f->ninsts : 1;
+    f->uc = xmalloc((size_t)f->uc_cap * sizeof(uint32_t));
+  }
+  memcpy(f->uc, c, bytes);
+  f->uc_n = f->ninsts;
+  f->uc_gen = f->ir_gen;
+  return c;
+}
+
+/* Whether a cleanup pass the round runs can find nothing to do for want
+   of an instruction it works on: none of ops[] is an opcode of any of the
+   function's instructions -- every one ever made, a superset of those its
+   blocks hold.  Each of escape, array bounds, null checks, bounds checks
+   and load combining looked through the whole function for one, at every
+   round, and Go's functions have none of most of them.  Only for the pass
+   the round is running (run_pass), where the round's generation follows
+   every change; elsewhere the pass looks for itself. */
+static bool round_lacks(IrFunc *f, int pass, const uint16_t *ops, uint32_t nops) {
+  if (f->run_pass != pass) return false;
+  if (!f->ops_ok || f->ops_gen != f->ir_gen) {
+    memset(f->ops, 0, sizeof f->ops);
+    for (uint32_t v = 0; v < f->ninsts; v++) {
+      uint16_t op = f->insts[v].op;
+      if (op < I_OP_COUNT) f->ops[op >> 6] |= 1ull << (op & 63);
+    }
+    f->ops_gen = f->ir_gen;
+    f->ops_ok = true;
+  }
+  for (uint32_t k = 0; k < nops; k++)
+    if (f->ops[ops[k] >> 6] >> (ops[k] & 63) & 1) return false;
+  return true;
+}
+
 static uint32_t *count_uses(IrFunc *f) {
   uint32_t *uses = xcalloc(f->ninsts ? f->ninsts : 1, sizeof(uint32_t));
   for (uint32_t oi = 0; oi < f->norder; oi++) {
@@ -595,7 +663,7 @@ static bool prune_params(IrFunc *f) {
   uint32_t ngone = 0, capgone = 0, ndropped = 0, capdropped = 0;
   while (changed) {
     changed = false;
-    if (!uses) uses = count_uses(f);
+    if (!uses) uses = count_uses_shared(f, UC_PRUNE);
     ngone = ndropped = 0;
     for (uint32_t oi = 0; oi < f->norder; oi++) {
       uint32_t bi = f->order[oi];
@@ -4112,7 +4180,7 @@ static bool fold_flag_branches(IrFunc *f, const uint32_t *uses) {
 
 static bool pass_fold(IrFunc *f, const OptOpts *o) {
   bool changed = false;
-  uint32_t *uses = count_uses(f);
+  uint32_t *uses = count_uses_shared(f, UC_FOLD);
   for (uint32_t oi = 0; oi < f->norder; oi++)
     if (fold_block(f, f->order[oi], o, uses)) changed = true;
   if (fold_flag_branches(f, uses)) changed = true;
@@ -4636,6 +4704,8 @@ static Ref es_materialize(IrFunc *f, const EsObj *o, uint32_t bi, uint32_t *at,
 static bool pass_escape(IrFunc *f, bool partial) {
   uint32_t n = f->ninsts, nb = f->nblocks;
   if (!n || !f->norder) return false;
+  static const uint16_t allocs[] = { I_STRUCT_NEW, I_ARRAY_NEW };
+  if (round_lacks(f, 11, allocs, 2)) return false;
   Module *m = f->m;
   bool dbg = warmc_getenv("WARMC_ESCAPE_DEBUG") != NULL;
 
@@ -6845,7 +6915,8 @@ static bool pass_thread(IrFunc *f) {
   if (f->npads) return false;
   bool changed = !warmc_getenv("WARMC_NO_PCMP") && param_compares(f);
   if (changed) prune_params(f);
-  uint32_t *nread = count_uses(f), nnread = f->ninsts;
+  uint32_t *nread = changed ? count_uses(f) : count_uses_shared(f, UC_THREAD);
+  uint32_t nnread = f->ninsts;
   /* read once a pass: asked of every block, they were a percent of a
      compile's time */
   bool known = !warmc_getenv("WARMC_NO_TKNOWN");
@@ -11946,6 +12017,8 @@ static uint64_t array_known_len(IrFunc *f, Ref r, int depth) {
 }
 
 static bool pass_array_bounds(IrFunc *f) {
+  static const uint16_t arrays[] = { I_ARRAY_LEN, I_ARRAY_GET, I_ARRAY_SET };
+  if (round_lacks(f, 9, arrays, 3)) return false;
   bool changed = false;
   for (uint32_t bi = 0; bi < f->nblocks; bi++) {
     Block *b = &f->blocks[bi];
@@ -12388,6 +12461,9 @@ static bool pass_gc_nullchk(IrFunc *f) {
      every function of a module in linear memory -- there is nothing to do,
      and three sets for every block to build: 70 ms of compiling
      stdgotests/webtext. */
+  static const uint16_t accesses[] = { I_FIELD_GET, I_FIELD_SET, I_ARRAY_GET,
+                                       I_ARRAY_SET, I_ARRAY_LEN, I_I31_GET, I_REF_TEST };
+  if (round_lacks(f, 10, accesses, 7)) return false;
   bool any = false;
   for (uint32_t oi = 0; oi < f->norder && !any; oi++) {
     const Block *b = &f->blocks[f->order[oi]];
@@ -12571,6 +12647,8 @@ static bool pass_bce(IrFunc *f, Module *m) {
 
   /* Nothing to do without a check, which with guard pages is most
      functions; a set is read only below its count. */
+  static const uint16_t checks[] = { I_BOUNDS_CHECK };
+  if (round_lacks(f, 8, checks, 1)) return false;
   bool any = false;
   for (uint32_t oi = 0; oi < f->norder && !any; oi++) {
     const Block *b = &f->blocks[f->order[oi]];
@@ -22295,6 +22373,8 @@ static bool ldc_block(IrFunc *f, uint32_t bi, const uint32_t *uses,
 
 static bool pass_load_combine(IrFunc *f, const OptOpts *o) {
   /* every combination is rooted at an integer or */
+  static const uint16_t ors[] = { I_OR };
+  if (round_lacks(f, 7, ors, 1)) return false;
   bool any = false;
   for (uint32_t oi = 0; oi < f->norder && !any; oi++) {
     const Block *b = &f->blocks[f->order[oi]];
@@ -22306,7 +22386,7 @@ static bool pass_load_combine(IrFunc *f, const OptOpts *o) {
   }
   if (!any) return false;
   uint32_t nuses = f->ninsts;
-  uint32_t *uses = count_uses(f);
+  uint32_t *uses = count_uses_shared(f, UC_LDCOMB);
   uint8_t *or_operand = xcalloc(nuses ? nuses : 1, 1);
   for (uint32_t oi = 0; oi < f->norder; oi++) {
     Block *b = &f->blocks[f->order[oi]];
@@ -22690,9 +22770,13 @@ static void pt_init(void) {
 static void opt_cleanup(IrFunc *f, const OptOpts *o) {
   if (o->addr_nowrap && df_sp != UINT32_MAX && fx_is(f->m))
     TP("addr_nowrap", pass_addr_nowrap(f));
+  /* whatever was done to the function before, its counts are not shared */
+  f->ir_gen++;
   uint32_t ver = 1, done[16] = {0};
 #define RUN(i, nm, call) \
-  (done[i] != ver && (TP(nm, call) ? (ver++, true) : (done[i] = ver, false)))
+  (done[i] != ver && (f->uc_pass = f->run_pass = (i), TP(nm, call)) \
+       ? (f->uc_pass = f->run_pass = -1, ver++, f->ir_gen++, true) \
+       : (f->uc_pass = f->run_pass = -1, done[i] != ver ? (done[i] = ver, false) : false))
   for (int round = 0; round < 6; round++) {
     bool changed = false;
     if (o->throwjump && RUN(0, "throwjump", pass_local_throw(f))) changed = true;
@@ -22713,7 +22797,7 @@ static void opt_cleanup(IrFunc *f, const OptOpts *o) {
     if (o->escape && RUN(11, "escape", pass_escape(f, o->pescape))) changed = true;
     if (o->dce && RUN(12, "dce", pass_dce(f))) changed = true;
     if (RUN(13, "prune_params", prune_params(f))) changed = true;
-    if (ir_order_changed(f)) ver++;
+    if (ir_order_changed(f)) { ver++; f->ir_gen++; }
     if (!changed) break;
   }
 #undef RUN

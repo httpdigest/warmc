@@ -110,6 +110,8 @@ IrFunc *ir_new(Module *m, uint32_t func_index) {
   f->nlocals = m->funcs[func_index].ntotal_locals;
   f->local_types = m->funcs[func_index].local_types;
   f->entry = REF_NONE;
+  f->uc_pass = -1;
+  f->run_pass = -1;
 
   const Func *fn = &m->funcs[func_index];
   size_t body = fn->body && fn->body_end > fn->body
@@ -134,6 +136,7 @@ IrFunc *ir_new(Module *m, uint32_t func_index) {
 
 void ir_free(IrFunc *f) {
   if (!f) return;
+  xfree(f->uc);
   xfree(f->kb_epoch);
   xfree(f->kb_bits);
   xfree(f->ord_tmp);

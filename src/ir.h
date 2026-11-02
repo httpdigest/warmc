@@ -352,6 +352,21 @@ typedef struct {
      past */
   uint32_t ks_base;
 
+  /* opt.c's cleanup rounds: ir_gen moves on whenever a pass changes the
+     function, and uc is the use counts (count_uses) of the function as it
+     was at uc_gen, which a pass of the round that counts before it changes
+     anything shares; uc_pass is the pass the round is running, -1 outside */
+  uint64_t ir_gen, uc_gen;
+  uint32_t *uc;
+  uint32_t uc_n, uc_cap;
+  int uc_pass;
+  /* which opcodes the function's instructions have, made at ops_gen; the
+     cleanup pass the round is running (run_pass), -1 outside */
+  uint64_t ops_gen;
+  uint64_t ops[(I_OP_COUNT + 63) / 64];
+  bool ops_ok;
+  int run_pass;
+
   struct IrChunk *chunks;
   char *bump;
   size_t bump_left;
