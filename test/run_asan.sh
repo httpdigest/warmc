@@ -26,12 +26,13 @@ if [ ! -x "$ASAN" ]; then
   exit 0
 fi
 
-for src in src/*.c src/*.h src/*.inc; do
-  if [ "$src" -nt "$ASAN" ]; then
-    echo "asan: $ASAN is older than $src -- run \`make asan\`"
-    exit 1
-  fi
-done
+# make's own verdict, from what the build is made of: not every file in
+# src/ is (jit.c, capi.c and warmrun.c are the JIT library's), and a newer
+# one of those made the build look stale after each change to the JIT
+if ! make -s -q BUILD="$BUILD" "$ASAN" 2>/dev/null; then
+  echo "asan: $ASAN is older than what it is built from -- run \`make asan\`"
+  exit 1
+fi
 
 WORK="$BUILD/testrun/asan"
 mkdir -p "$WORK"
