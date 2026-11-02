@@ -1,0 +1,9 @@
+[package]
+name = "warmc-jit-host"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "host"
+path = "src/main.rs"

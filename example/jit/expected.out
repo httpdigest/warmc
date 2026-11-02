@@ -1,0 +1,6 @@
+log: Hello from wasm!
+fib(90) = 2880067194370816120
+div(7, 2) = 3
+div(1, 0) trapped: integer divide by zero
+peek(16) = 72
+peek(65536) trapped: out of bounds memory access

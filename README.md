@@ -224,8 +224,9 @@ On Linux, set `WARMC_RT=$PWD/build/warmrt.a` and leave out `--target macos`.
 > **Note:** the default target is `linux`, even on a macOS host. Pass
 > `--target macos` to get a binary you can run on the Mac.
 
-The `example/` directory has two real-world inputs. Each comes with its
-pre-built `.wasm` and a macOS binary.
+The `example/` directory has two real-world inputs, each with its pre-built
+`.wasm` and a macOS binary, and `example/jit/`, hosts of the JIT in ten
+languages (see [A JIT](#a-jit-libwarmc-and-the-c-api)).
 
 ```sh
 # TinyGo: prints, then writes ./helloworld.txt, so it needs a preopened directory
@@ -808,6 +809,14 @@ call that made it. `warm_wasi_imports` binds a module's
 `wasi_snapshot_preview1` imports from a `warm_wasi_config_t`: arguments,
 environment, preopened directories and TCP listeners, as `warmc --wasi`
 takes them.
+
+`example/jit/` has a host of the library in each of C, C++, Java, Kotlin,
+Haskell, Go, Node.js, Bun, Zig and Rust, each through its language's own
+way of calling C: C++'s RAII over `wasm.h`, the JVM's foreign function API,
+GHC's FFI, cgo, `node:ffi`, `bun:ffi`, Zig's translation of `wasm.h`, Rust's
+`extern "C"`. Each compiles one module, gives it a host function written in
+its language, calls it, reads its memory and catches its traps
+([example/jit/README.md](example/jit/README.md)).
 
 `build/warmrun` runs a module through the library, written against the C
 API alone. A WASI command runs as with `warmc --wasi`, its arguments after
@@ -2025,7 +2034,11 @@ Most of the suite is **differential**. warmc's output is compared with:
   declare (`test/capi/run.py`). Tiered, the cases run on the `-O0` code
   alone and on the optimised code entered through the `-O0` entries, and
   programs of every producer run with the tier-up under their frames
-  (`test/run_tiers.py`), against the same programs untiered
+  (`test/run_tiers.py`), against the same programs untiered. The cases also
+  run with every call of the runtime through a veneer, as code placed out of
+  a branch's reach makes them, and `example/jit/`'s hosts, each run as it
+  is and with veneers, must print `example/jit/expected.out`
+  (`test/run_jit_examples.py`)
 - wabt's `wasm-interp`, for the hand-written cases in `test/cases`: at `-O0`,
   `-O1` and `-O2`; with the register allocator and SSA verified; with
   `-fgssa-all`, with `-fdead-frames`, with `-fexact-trap`, and with far
@@ -2266,7 +2279,7 @@ rt/             the runtime linked into every program and shared library
   const_ops.inc                           the constant-expression opcodes, shared with the compiler
 test/           test drivers (run_all.sh is make check), cases, benchmark and test corpora, the spec harness (spec/), TeaVM's driver and WASI adapter (teavm/), the suites' cache (testcache.py, row.py) and the caching wasmtime, tinygo, go and rustc make check runs (shims/)
 lwjgl/          LWJGL 3 programs through TeaVM and warmc: the platform layer (platform/), the TeaVM transformer (teavm/), the C glue (native/), the build driver and a demo
-example/        TinyGo and Kotlin sample programs (source, .wasm and a macOS build)
+example/        TinyGo and Kotlin sample programs (source, .wasm and a macOS build), and jit/: hosts of the JIT in ten languages
 Makefile        the build, the pinned dependencies and the test targets
 .github/        CI: make smoke on pushes to main and on pull requests, make check nightly
 ```

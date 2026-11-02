@@ -245,11 +245,13 @@ start cases-jit-tier2 env WARMC_JIT=1 WARMC_TIERED=wait ./test/run_tests.sh
 start tiers python3 test/run_tiers.py
 # The JIT's calls of the runtime through veneers, as code placed out of a
 # branch's reach of it makes them (AArch64's; x86-64's reach is the
-# address space the JIT is given, and it has none).
+# address space the JIT is given, and it has none).  And the embedding
+# examples, a host in each language whose toolchain is installed.
 case "$(uname -s)" in
   MINGW*|CLANG*|MSYS*) ;;
   *) start cases-jit-veneers env WARMC_JIT=1 WARMC_JIT_VENEERS=1 ./test/run_tests.sh ;;
 esac
+start jit-examples python3 test/run_jit_examples.py
 
 # A second, independent engine over the same corpus; the row skips itself
 # politely where wasmtime is not installed.

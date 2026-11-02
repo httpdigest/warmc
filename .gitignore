@@ -2,3 +2,10 @@ build/
 *.o
 a.out
 __pycache__/
+# what building example/jit's hosts in place leaves (the README's commands)
+/host
+/host.jar
+/example/jit/go/host
+/example/jit/zig/zig-out/
+/example/jit/zig/.zig-cache/
+/example/jit/rust/target/
