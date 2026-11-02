@@ -10,6 +10,8 @@ SPEC.py, one per transform under test/mutants, defines
     SUITES = ((label, argv, env), ...)
     EQUIVALENT = {name: why, ...}        (optional)
     TARGETS = [make target, ...]         (optional; build/warmc by default)
+    SOURCES = [directory, ...]           (optional; ["src"] by default)
+    OWN = [name under build/, ...]       (optional)
 
 A mutant replaces each old, which must occur in path exactly once, by its
 new.  The suites run in order, from the repository's root, with BUILD set;
@@ -25,7 +27,12 @@ the rest of the repository and of build/ -- corpora, tools, runtimes, the
 test cache, whose references are keyed by contents and so are as good for
 a mutant's programs as for any -- and builds only warmc there (and what
 TARGETS adds: `jit`, the library, for a mutant of the JIT), without LTO,
-so that a mutant costs one object's compile and a link.  A worker's warmc,
+so that a mutant costs one object's compile and a link.  A spec whose
+mutants are of the runtime names rt in SOURCES, which the workers then
+copy as well, and in OWN the runtimes' archives and objects, which they
+build of their own (TARGETS) rather than share the tree's; a later spec
+that does not finds rt/ the tree's again.
+A worker's warmc,
 built, must compile the optimiser's cases (test/cases_opt) to the bytes the
 tree's build/warmc does -- once more after building it all anew -- or the
 run stops: a mutant tried on some other warmc tells nothing.  What a suite
@@ -60,7 +67,9 @@ OWN = {"obj", "warmc", "testrun", "checklogs", "obj-asan", "obj-tsan", "warmc.dS
        "vecbench", "stdgo", "ktbench", "javabench",
        # the JIT's (make jit), which a worker builds of its own src/
        "jit", "obj-pic", "libwarmc.dylib", "libwarmc.dylib.dSYM", "libwarmc.so",
-       "libwarmc.dll", "libwarmc.dll.a", "warmrun", "warmrun.exe", "warmrun.dSYM", "capi"}
+       "libwarmc.dll", "libwarmc.dll.a", "warmrun", "warmrun.exe", "warmrun.dSYM", "capi",
+       # run_gcthread.sh's program, which two workers' runtimes must not share
+       "gcthread"}
 
 
 def sh(cmd, cwd, env=None, t=900):
@@ -131,24 +140,39 @@ def reference():
     return mods, objects(os.path.join(ROOT, "build", "warmc"), mods)
 
 
-def setup(k, ref, targets):
-    """Worker k's directory, its src/ the tree's as it is now, warmc (and
-    targets) built"""
+def setup(k, ref, targets, sources, own):
+    """Worker k's directory, its sources (src/, and rt/ for a spec of the
+    runtime) the tree's as they are now, warmc (and targets) built"""
     w = os.path.join(WS, "w%d" % k)
     os.makedirs(w, exist_ok=True)
     for e in os.listdir(ROOT):
         p = os.path.join(w, e)
-        if e not in ("src", "build", ".git") and not os.path.lexists(p):
+        if e in ("build", ".git") or e in sources:
+            continue
+        # a copy an earlier spec's worker made, the tree's again
+        if os.path.isdir(p) and not os.path.islink(p):
+            shutil.rmtree(p)
+        if not os.path.lexists(p):
             os.symlink(os.path.join(ROOT, e), p)
-    sync(os.path.join(ROOT, "src"), os.path.join(w, "src"))
+    for e in sources:
+        p = os.path.join(w, e)
+        # never synced into through a link: that would be the tree's
+        if os.path.islink(p):
+            os.remove(p)
+        sync(os.path.join(ROOT, e), p)
     b = os.path.join(w, "build")
     os.makedirs(b, exist_ok=True)
-    for e in OWN:
+    for e in os.listdir(b):
+        p = os.path.join(b, e)
+        if e not in OWN and e not in own and not os.path.islink(p):
+            # the runtimes an earlier spec's worker built, the tree's again
+            shutil.rmtree(p) if os.path.isdir(p) else os.remove(p)
+    for e in OWN | set(own):
         if os.path.islink(os.path.join(b, e)):
             os.remove(os.path.join(b, e))
     for e in os.listdir(os.path.join(ROOT, "build")):
         p = os.path.join(b, e)
-        if e not in OWN and not os.path.lexists(p):
+        if e not in OWN and e not in own and not os.path.lexists(p):
             os.symlink(os.path.join(ROOT, "build", e), p)
     rc, out = sh(["make", "-j8", "BUILD=build", "CFLAGS=" + CFLAGS] + targets, w)
     if rc:
@@ -215,6 +239,8 @@ def main():
         exec(f.read(), ns)
     M, SUITES, EQUIV = ns["M"], ns["SUITES"], ns.get("EQUIVALENT", {})
     targets = ns.get("TARGETS", ["build/warmc"])
+    sources = ns.get("SOURCES", ["src"])
+    own = ns.get("OWN", [])
     names = args or list(M)
     orig, stale = {}, []
     for n in names:
@@ -233,7 +259,7 @@ def main():
     os.makedirs(WS, exist_ok=True)
     ref = reference()
     with concurrent.futures.ThreadPoolExecutor(jobs) as ex:
-        workers = list(ex.map(lambda k: setup(k, ref, targets), range(jobs)))
+        workers = list(ex.map(lambda k: setup(k, ref, targets, sources, own), range(jobs)))
     print("%d workers built in %.0fs" % (jobs, time.time() - t0), flush=True)
     free = list(workers)
     lock = threading.Lock()

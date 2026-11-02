@@ -13,6 +13,11 @@
     byte: the header libwarmc implements is that release of the standard's.
   * test/capi/api.c, the library's own tests of what the examples do not
     reach.
+  * test/capi/stores.c: two hundred threads, each with stores of its own,
+    in them all at once -- every thread inside wasm at the same moment, GC
+    heaps collecting side by side, traps, exceptions, host functions calling
+    into a second store, WASI arguments per store, stores made and deleted
+    while the others run, one store that every thread takes turns in.
 
 Run by `make check` (test/run_all.sh) and on its own:
     python3 test/capi/run.py [-v]
@@ -141,11 +146,28 @@ def main():
         except subprocess.TimeoutExpired:
             fails.append("api.c: timed out after %gs" % TIMEOUT)
 
+    exe = hostbuild.exe(os.path.join(WORK, "stores"))
+    r = build_c(os.path.join(ROOT, "test", "capi", "stores.c"), exe)
+    if r.returncode:
+        fails.append("stores.c: cannot build: %s" % r.stderr.strip()[:300])
+    else:
+        try:
+            # collections early, as the test sets for itself where it can
+            r = subprocess.run([exe], cwd=WORK, capture_output=True, text=True, timeout=TIMEOUT,
+                               env=dict(os.environ, WARMC_GC_MIN_KB="256"))
+            ran += 1
+            if r.returncode:
+                fails.append("stores.c: exit %d:\n%s" % (r.returncode, (r.stdout + r.stderr)[-1500:]))
+            elif verbose:
+                print(r.stdout.strip())
+        except subprocess.TimeoutExpired:
+            fails.append("stores.c: timed out after %gs" % TIMEOUT)
+
     for f in fails:
         print("FAIL " + f)
-    print("capi: %d of %d passed (%d upstream examples, wasm.h, api.c)"
+    print("capi: %d of %d passed (%d upstream examples, wasm.h, api.c, stores.c)"
           % (ran - len([f for f in fails if "exit" in f or "differs" in f or "is not" in f]),
-             len(EXAMPLES) + 2, len(EXAMPLES)))
+             len(EXAMPLES) + 3, len(EXAMPLES)))
     return 1 if fails else 0
 
 if __name__ == "__main__":
