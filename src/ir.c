@@ -931,8 +931,9 @@ void ir_mark_reachable(IrFunc *f) {
   f->order_sig_valid = false;
 }
 
-bool ir_order_changed(IrFunc *f) {
-  pthread_once(&g_dom_check_once, dom_check_init);
+/* The graph as it is against the one the last ir_order ordered, filled into
+   order_sig_new: true when they are the same. */
+static bool order_sig_same(IrFunc *f) {
   size_t len = order_sig_len_of(f);
   if (len > f->order_sig_cap) {
     size_t osc_ = f->order_sig_cap;
@@ -943,11 +944,22 @@ bool ir_order_changed(IrFunc *f) {
                                f->order_sig_cap * sizeof(uint32_t));
   }
   order_sig_fill(f, f->order_sig_new);
-  if (f->order_sig_valid && f->order_sig_len == len &&
-      memcmp(f->order_sig, f->order_sig_new, len * sizeof(uint32_t)) == 0)
-    return false;
+  return f->order_sig_valid && f->order_sig_len == len &&
+         memcmp(f->order_sig, f->order_sig_new, len * sizeof(uint32_t)) == 0;
+}
+
+/* Whether what the last ir_order found still holds: nothing it reads of
+   the graph has changed since. */
+bool ir_order_current(IrFunc *f) {
+  return f->order_sig_valid && order_sig_same(f);
+}
+
+bool ir_order_changed(IrFunc *f) {
+  pthread_once(&g_dom_check_once, dom_check_init);
+  if (order_sig_same(f)) return false;
 
   bool reducible = order_once(f, false, false);
+  f->reducible = reducible;
 
   mark_diverging(f);
   order_once(f, true, reducible);

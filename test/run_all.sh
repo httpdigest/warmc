@@ -221,7 +221,12 @@ watch_rows() {
 
 start cases-O0 env WARMC_FLAGS=-O0 ./test/run_tests.sh
 start cases-O1 env WARMC_FLAGS=-O1 ./test/run_tests.sh
-start cases-O2 env WARMC_VERIFY_RA=1 WARMC_VERIFY_SSA=1 WARMC_FLAGS=-O2 ./test/run_tests.sh
+# At -O2 with the optimiser's own checks: the register allocation's, SSA
+# form's, the cleanup round's shared use counts recounted (WARMC_VERIFY_UC),
+# and every pass a cheap test stops at once run whole anyway, to show it
+# would have found nothing (WARMC_VERIFY_GATES).
+start cases-O2 env WARMC_VERIFY_RA=1 WARMC_VERIFY_SSA=1 WARMC_VERIFY_UC=1 WARMC_VERIFY_GATES=1 \
+  WARMC_FLAGS=-O2 ./test/run_tests.sh
 
 # The JIT (libwarmc, build/warmrun): the C API's own tests with the
 # upstream examples, the cases compiled through the library, and the
@@ -326,8 +331,10 @@ start wasi     ./test/run_wasi.sh
 
 start wasi-noexp env WARMC_FLAGS="--no-export-names" ./test/run_wasi.sh
 start gowasi   ./test/run_gowasi.sh
-# Go's net/http server, on a listener and a directory preopened
-start gohttp   python3 test/run_gohttp.py
+# Go's net/http server, on a listener and a directory preopened; its
+# compiles check the cleanup round's shortcuts as cases-O2's do, on the
+# graphs Go's resume dispatch threads into, irreducible ones among them
+start gohttp   env WARMC_VERIFY_UC=1 WARMC_VERIFY_GATES=1 python3 test/run_gohttp.py
 start wasip2   ./test/run_wasip2.sh
 start gowasip2 ./test/run_gowasip2.sh
 start rswasip2 ./test/run_rswasip2.sh

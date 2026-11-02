@@ -32,6 +32,17 @@ static bool g_verify_uc;
 static pthread_once_t g_verify_uc_once = PTHREAD_ONCE_INIT;
 static void verify_uc_init(void) { g_verify_uc = warmc_getenv("WARMC_VERIFY_UC") != NULL; }
 
+/* A pass that stops at once where a cheap test rules out all its work:
+   WARMC_VERIFY_GATES runs it whole anyway and stops the compile if it
+   finds any. */
+static bool g_verify_gates;
+static pthread_once_t g_verify_gates_once = PTHREAD_ONCE_INIT;
+static void verify_gates_init(void) { g_verify_gates = warmc_getenv("WARMC_VERIFY_GATES") != NULL; }
+static bool verify_gates(void) {
+  pthread_once(&g_verify_gates_once, verify_gates_init);
+  return g_verify_gates;
+}
+
 static uint32_t *count_uses_shared(IrFunc *f, int pass) {
   if (f->uc_pass != pass) return count_uses(f);
   f->uc_pass = -1;
@@ -72,10 +83,16 @@ static uint32_t *count_uses_shared(IrFunc *f, int pass) {
 static bool round_lacks(IrFunc *f, int pass, const uint16_t *ops, uint32_t nops) {
   if (f->run_pass != pass) return false;
   if (!f->ops_ok || f->ops_gen != f->ir_gen) {
+    /* what the blocks hold, reachable or not (pass_array_bounds walks them
+       all), and not the instructions no block lists any more, of which a
+       function late in its rounds has more than it has live ones */
     memset(f->ops, 0, sizeof f->ops);
-    for (uint32_t v = 0; v < f->ninsts; v++) {
-      uint16_t op = f->insts[v].op;
-      if (op < I_OP_COUNT) f->ops[op >> 6] |= 1ull << (op & 63);
+    for (uint32_t bi = 0; bi < f->nblocks; bi++) {
+      const Block *b = &f->blocks[bi];
+      for (uint32_t i = 0; i < b->ninsts; i++) {
+        uint16_t op = f->insts[b->insts[i]].op;
+        if (op < I_OP_COUNT) f->ops[op >> 6] |= 1ull << (op & 63);
+      }
     }
     f->ops_gen = f->ir_gen;
     f->ops_ok = true;
@@ -7121,8 +7138,24 @@ static uint32_t ns_scc(IrFunc *f, uint32_t *comp) {
   return ncomp;
 }
 
+static bool pass_nodesplit_whole(IrFunc *f);
 static bool pass_nodesplit(IrFunc *f) {
   if (f->npads) return false;
+  /* A reducible graph's every cycle has one way in, its header (Hecht and
+     Ullman), so none has a side entry to split.  The last ordering knows,
+     while the graph is still as it ordered it -- a fifth of node splitting's
+     time in compiling Go, most functions' graphs being reducible. */
+  if (f->reducible && ir_order_current(f)) {
+    if (!verify_gates()) return false;
+    uint32_t nb = f->nblocks, ni = f->ninsts;
+    if (pass_nodesplit_whole(f) || f->nblocks != nb || f->ninsts != ni)
+      warmc_fatal("WARMC_VERIFY_GATES: node splitting split a reducible graph");
+    return false;
+  }
+  return pass_nodesplit_whole(f);
+}
+
+static bool pass_nodesplit_whole(IrFunc *f) {
   uint32_t nb0 = f->nblocks, ni0 = f->ninsts;
   uint32_t *comp = xmalloc((nb0 ? nb0 : 1) * sizeof(uint32_t));
   uint32_t ncomp = ns_scc(f, comp);
@@ -22375,16 +22408,31 @@ static bool pass_load_combine(IrFunc *f, const OptOpts *o) {
   /* every combination is rooted at an integer or */
   static const uint16_t ors[] = { I_OR };
   if (round_lacks(f, 7, ors, 1)) return false;
+  /* and each leaf of one is an operand of one of the tree's ors, which
+     ldc_lane takes only as an unsigned narrow load or the shift of one: Go
+     has ors everywhere and next to none of these, and counting the uses
+     was most of what the pass did there */
   bool any = false;
   for (uint32_t oi = 0; oi < f->norder && !any; oi++) {
     const Block *b = &f->blocks[f->order[oi]];
     for (uint32_t i = 0; i < b->ninsts && !any; i++) {
       const Inst *in = &f->insts[b->insts[i]];
-      any = in->op == I_OR && in->nargs == 2 &&
-            (in->type == VT_I32 || in->type == VT_I64);
+      if (in->op != I_OR || in->nargs != 2 || (in->type != VT_I32 && in->type != VT_I64))
+        continue;
+      const Ref *a = ir_args(f, b->insts[i]);
+      for (int k = 0; k < 2 && !any; k++) {
+        Ref c = a[k];
+        if (c < f->ninsts && f->insts[c].op == I_SHL && f->insts[c].nargs == 2)
+          c = ir_args(f, c)[0];
+        if (c >= f->ninsts) continue;
+        const Inst *li = &f->insts[c];
+        any = li->op == I_LOAD && li->nargs == 1 && !(li->imm2 & MEMF_SIGNED) &&
+              MEMF_SIZE(li->imm2) < 3;
+      }
     }
   }
-  if (!any) return false;
+  if (!any && !verify_gates()) return false;
+  bool gated = !any;
   uint32_t nuses = f->ninsts;
   uint32_t *uses = count_uses_shared(f, UC_LDCOMB);
   uint8_t *or_operand = xcalloc(nuses ? nuses : 1, 1);
@@ -22405,6 +22453,8 @@ static bool pass_load_combine(IrFunc *f, const OptOpts *o) {
     if (ldc_block(f, f->order[oi], uses, nuses, or_operand, o)) changed = true;
   xfree(uses);
   xfree(or_operand);
+  if (changed && gated)
+    warmc_fatal("WARMC_VERIFY_GATES: load combining found loads its gate ruled out");
   if (changed) ir_apply_subst(f);
   return changed;
 }

@@ -305,6 +305,10 @@ typedef struct {
   uint32_t *order_sig, *order_sig_new;
   size_t order_sig_len, order_sig_cap;
   bool order_sig_valid;
+  /* every cycle of the graph the last ir_order ordered has one way in, its
+     header: no retreating edge goes to a block that does not dominate the
+     block it leaves */
+  bool reducible;
 
   uint32_t nlocals;
   ValType *local_types;
@@ -425,6 +429,7 @@ const uint32_t *ir_emit_order(IrFunc *f, uint32_t skip, uint32_t *n);
 uint32_t ir_loop_header_at(const IrFunc *f, uint32_t t);
 /* ir_order, saying whether the graph had changed since the last. */
 bool ir_order_changed(IrFunc *f);
+bool ir_order_current(IrFunc *f);
 void ir_compact(IrFunc *f);
 void ir_path_share(const IrFunc *f, float *share);
 
