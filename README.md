@@ -1,20 +1,27 @@
 # warmc
 
-**warmc** is an ahead-of-time compiler that turns WebAssembly into standalone
-native executables, or into shared libraries that other languages call. It
-needs no JIT, interpreter or VM process at run time.
+**warmc** compiles WebAssembly to native code, ahead of time or as a JIT.
+Ahead of time it turns a module into a standalone executable, or into a
+shared library that other languages call, which needs no JIT, interpreter or
+VM process at run time. As a library, libwarmc, it is a JIT behind the
+standard WebAssembly C API (`wasm.h`): a host program compiles modules in its
+own process and calls them, optionally tiered, `-O0` code first and the
+optimised code once it is ready.
 
-You give it a `.wasm` or `.wat` file and it produces a Linux, macOS or Windows
-binary. That binary is linked against a small freestanding runtime, which
-provides traps, a concurrent garbage collector for Wasm GC and exception
-handling. With `--wasi` it also links a sandboxed WASI preview 1 host, or a
-WASI 0.2 one for a component (on Linux and macOS).
+You give the compiler a `.wasm` or `.wat` file and it produces a Linux, macOS
+or Windows binary. That binary is linked against a small freestanding
+runtime, which provides traps, a concurrent garbage collector for Wasm GC and
+exception handling. With `--wasi` it also links a sandboxed WASI preview 1
+host, or a WASI 0.2 one for a component (on Linux and macOS). The JIT
+library carries the same runtime and the preview 1 host, and runs on macOS,
+Linux and Windows hosts.
 
-warmc is a single C11 program with no LLVM or other compiler-library
-dependency. Everything between the WebAssembly bytes and the finished
-executable is written from scratch: the text-format assembler, the validator,
-an SSA optimiser, instruction selectors and register allocators for AArch64
-and x86-64, ELF, Mach-O and COFF object writers, and a linker.
+warmc is written in C11 with no LLVM or other compiler-library dependency.
+Everything between the WebAssembly bytes and the finished executable is
+written from scratch: the text-format assembler, the validator, an SSA
+optimiser, instruction selectors and register allocators for AArch64 and
+x86-64, ELF, Mach-O and COFF object writers, a linker, and the JIT's loader,
+which places the same code in the running process.
 
 ```console
 $ build/warmc --target macos --rt build/warmrt-macos.a --wasi -o hello example/tinygo/main.wasm
@@ -39,6 +46,14 @@ Hello world!
   (WASI 0.2 programs only for Linux and macOS).
   With `--shared`, each target gets a shared library instead: a `.so`, a
   `.dylib` or a `.dll`.
+- **A JIT behind the WebAssembly C API.** libwarmc implements `wasm.h`
+  (wasm-c-api, byte for byte) on macOS and Linux (AArch64) and Windows
+  (x86-64), with `include/warm.h` for what the standard has no word for. It
+  compiles a whole module at once to the code `-c` makes, in less memory
+  than wasmtime takes, or tiered: ready to run at `-O0` in a fraction of a
+  full compile's time (Go's `net/http` server in 170 ms, where wasmtime
+  takes 256), the optimised code sent in once a thread of the library's has
+  made it. See [A JIT](#a-jit-libwarmc-and-the-c-api).
 
 - **Self-contained toolchain.** warmc links executables and shared libraries
   itself. It reads `.a` archives and ELF, Mach-O and COFF objects,
@@ -97,7 +112,8 @@ Hello world!
   Functions compile in parallel and are laid out in a deterministic order.
 - **Fast code.** Across 364 benchmark kernels compiled from Go, TinyGo, Rust,
   Zig, AssemblyScript, Kotlin, Java, C, C++ and Haskell, warmc's steady-state
-  code takes 0.45× wasmtime's time (geometric mean), with much lower peak
+  code -- ahead of time and in the JIT alike, whose code is the same --
+  takes 0.45× wasmtime's time (geometric mean), with much lower peak
   memory. Against the same programs compiled natively (at `-O2` or the
   nearest level each toolchain has), over the 300 kernels with a native
   ratio, it takes 1.02× the time. See [Performance](#performance).
@@ -177,6 +193,11 @@ This builds everything into `build/`:
 | `build/warmgcth*.a` | the runtime plus GC thread self-tests, used by the test suite |
 | `build/a64_test` | the AArch64 encoder's self-test (`make check-encoder` runs it with the x86-64 one) |
 
+`make jit` builds the JIT on top of that: `build/libwarmc.dylib` on macOS,
+`build/libwarmc.so` on Linux, `build/libwarmc.dll` with its import library
+`build/libwarmc.dll.a` on Windows, and `build/warmrun`, which runs a module
+through it.
+
 `BUILD=DIR` builds into another directory. `make clean` removes `build/`,
 including the pinned dependencies cached there (the spec testsuite,
 `wasm-tools`, wasi-sdk, TeaVM and the Kotlin stdlib), which the targets that
@@ -214,6 +235,15 @@ build/warmc --target macos --wasi -o tinygo-hello example/tinygo/main.wasm
 # Kotlin/Wasm (uses Wasm GC)
 build/warmc --target macos --wasi -o kt-hello example/kotlin/out/hello.wasm
 ./kt-hello                # points = 5, sum = 70
+```
+
+The same programs through the JIT, compiled in the process that runs them:
+
+```sh
+make jit
+build/warmrun test/wasi/hello.wat
+build/warmrun --dir=. example/tinygo/main.wasm
+build/warmrun --tiered example/kotlin/out/hello.wasm    # -O0 first, -O2 behind it
 ```
 
 ---
@@ -732,19 +762,9 @@ in one call, as a WASI command does, is better compiled untiered; tiering
 suits a module whose exports are called again and again, or one that must
 start soon. `warm_module_optimized` says whether a module's optimised code
 is in place, waiting for it if asked. A tiered module serialises its
-optimised code. Time until a module can run, against untiered and against
-wasmtime 50.0.1 (Cranelift) through the same harness, at 16 threads:
-
-| module | untiered | tiered | optimised code in place | wasmtime |
-|---|---|---|---|---|
-| Go net/http server | 394 ms | 170 ms | 573 ms | 263 ms |
-| Go text/template | 344 ms | 119 ms | 458 ms | 141 ms |
-| Zig divmod | 308 ms | 154 ms | 460 ms | 106 ms |
-| Haskell containers | 139 ms | 102 ms | 243 ms | 178 ms |
-| C++ random | 72 ms | 12.6 ms | 84 ms | 27 ms |
-| Kotlin extensions | 66 ms | 17 ms | 80 ms | 237 ms |
-| Rust vecops | 58 ms | 8.0 ms | 66 ms | 11 ms |
-| C mathlib | 15 ms | 4.9 ms | 20 ms | 6.5 ms |
+optimised code. How long a compile takes, untiered and tiered, and the
+memory it takes, against wasmtime: [Compiling in the
+JIT](#compiling-in-the-jit).
 
 ```c
 /* host.c */
@@ -1446,6 +1466,8 @@ variables, `WARMC_GC_*` among them, at its first call.
 
 ## WebAssembly feature support
 
+What follows holds for compiling ahead of time and in the JIT alike.
+
 | Feature | Status |
 |---|---|
 | Core 1.0 / 2.0: multi-value, bulk memory, reference types, saturating conversions, sign extension | ✅ |
@@ -1612,6 +1634,24 @@ Functions compile in parallel and are laid out deterministically.
   and the module is valid all the same. `--print-ir` and `WARMC_TIME` give
   the names too. `-s` leaves them out. Windows output has no symbol table; a
   COFF object (`-c`) carries the names.
+
+**JIT** (`src/jit.c`, `capi.c`, `rt/jit.c`). The library compiles a module
+as `-c` would and keeps its object as an image: its sections and the
+relocations still to make, which name either a place in its own sections or
+one of the runtime's symbols. Loading places the text within branch range of
+the runtime the library carries -- 128 MiB on AArch64, 2 GiB on x86-64 --
+from address space reserved beside it, so its calls of the runtime are the
+instructions a linked program has, and the data within reach of the text;
+the relocations are made against where everything landed, and the code is
+then byte for byte the object's. The runtime instantiates the module's
+descriptor as it does a linked program's, and finds its frames by the
+descriptor's tables. A tiered module is compiled at `-O0` first, with an
+entry each function's optimised code can be sent through -- a nop the
+tier-up makes a branch -- and again at the configured level on a thread of
+the library's, whose code is placed beside the first and given to the
+runtime as a second descriptor of the module. A compile takes the
+compiler's global settings, so one runs at a time, and gives back its
+working memory when it ends.
 
 **Runtime** (`rt/`):
 - **Platforms.** On Linux the runtime makes raw syscalls, on macOS it uses
@@ -1858,6 +1898,37 @@ native build: each kernel's wasm through WABT's `wasm2c` and `clang -O2`
 (SIMDe for its SIMD, `make simde`), so that what it finds is what warmc's
 code generation leaves behind, not what the source's compiler put in the
 wasm; it lists each kernel warmc takes more than 5% longer on.
+
+### Compiling in the JIT
+
+The JIT's code is the code above; what it adds is the compile, in the
+process that runs the module. One harness through `wasm.h`, built against
+libwarmc and against wasmtime 50.0.1's library (Cranelift), compiles a
+module in a fresh process on the author's 16-core Apple silicon machine:
+the best time of several compiles, and the most memory the process took
+during its first above what it held before (`phys_footprint`). warmc
+compiles at `-O2`, every function to the end; tiered, a module is ready to
+run once its `-O0` code is, and its optimised code is in place the column
+after.
+
+| Module | warmc | tiered: ready | tiered: optimised | wasmtime | warmc peak | wasmtime peak |
+|---|---:|---:|---:|---:|---:|---:|
+| Go's `net/http` server | 391 ms | 170 ms | 573 ms | 256 ms | 79 MiB | 266 MiB |
+| Go, `text/template` | 340 ms | 119 ms | 458 ms | 144 ms | 54 MiB | 183 MiB |
+| Zig, `divmod` | 296 ms | 154 ms | 460 ms | 99 ms | 61 MiB | 478 MiB |
+| Haskell, `containers` | 134 ms | 102 ms | 243 ms | 165 ms | 63 MiB | 271 MiB |
+| C++, `random` | 68 ms | 12.6 ms | 84 ms | 27 ms | 28 MiB | 61 MiB |
+| Kotlin, `extensions` | 61 ms | 17 ms | 80 ms | 259 ms | 27 MiB | 235 MiB |
+| Rust, `vecops` | 55 ms | 8.0 ms | 66 ms | 11 ms | 20 MiB | 34 MiB |
+| C, `mathlib` | 14 ms | 4.9 ms | 20 ms | 6.3 ms | 8.2 MiB | 16 MiB |
+
+A compile at `-O2` takes more time than Cranelift's on most modules -- its
+optimiser runs inlining and cleanup rounds over each function until they
+stop finding work -- and less memory on every one, a third to a ninth of
+wasmtime's on the large ones: the functions in flight are bounded by their
+size (twice the largest), and each compile's working memory comes from a
+heap of its own that is given back when it ends. Tiered, warmc is ready to run before wasmtime on all but
+`divmod`, a module of a few very large functions.
 
 ---
 
@@ -2228,7 +2299,15 @@ Makefile        the build, the pinned dependencies and the test targets
   names reach only a COFF object (`-c`).
 - **Exceptions** do not propagate through host (C) frames.
 - **The collector** does not run while wasm is re-entered from a host call.
-- **Instances** are never freed, and a process holds at most 4096 of them.
+- **Instances** of a linked program are never freed, and it holds at most
+  4096 of them; the JIT frees an instance once nothing holds it, and holds
+  at most 65,536 at a time.
+- **The JIT** runs one thread's wasm at a time: every call into it takes
+  one lock. One WASI world is live in a process at a time, the last that
+  `warm_wasi_imports` set up. A tiered module's calls that are running when
+  its optimised code arrives stay in the `-O0` code until they return (no
+  on-stack replacement), and the library makes one module's optimised code
+  at a time, which another compile waits behind.
 - **A shared library** holds one instance. Calls from several threads take
   turns on it, and its imports cannot be rebound once it has been made. It
   imports only functions, each of which C must be able to stand in for; on
