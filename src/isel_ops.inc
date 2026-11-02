@@ -2386,6 +2386,46 @@ static void emit_inst(Isel *s, Ref v) {
       break;
     }
 
+    /* warmc_cont_op(vm, site, area): the operands into the frame's area,
+       sixteen bytes each, and the way on back in w0; what the instruction
+       gives back is in the area after it (I_CONT_GET) */
+    case I_CONT_OP: {
+      csa_save(s, v);
+      for (uint32_t i = 0; i < in->nargs; i++) {
+        uint32_t at = s->cont_area_off + ARG_STACK_SLOT * i;
+        Ref x = a[i];
+        if (is_vec_value(f, x)) sp_access(s, B, true, 4, 1, 1, rd(s, x, FTMP), at, TMP1);
+        else if (is_fp_value(f, x)) sp_access(s, B, true, 3, 1, 0, rd(s, x, FTMP), at, TMP1);
+        else sp_access(s, B, true, 3, 0, 0, rd(s, x, TMP0), at, TMP1);
+      }
+      a64_mov_reg(B, SF64, R0, REG_VMCTX);
+      a64_load_imm(B, SF32, R1, in->imm);
+      if (s->cont_area_off < 0x1000) {
+        a64_add_imm(B, SF64, R2, RSP, s->cont_area_off, 0);
+      } else {
+        a64_load_imm(B, SF64, TMP0, s->cont_area_off);
+        a64_add_extx(B, R2, RSP, TMP0, 0);
+      }
+      uint32_t sym = obj_intern_sym(s->o, "warmc_cont_op", SYM_UNDEF_FUNC, -1, 0);
+      isel_reloc(s, REL_CALL26, B->len, sym, 0);
+      a64_bl(B, 0);
+      note_site(s);
+      note_safepoint(s, v);
+      s->mem_valid = false;
+      commit(s, v, R0);
+      csa_restore(s, v);
+      break;
+    }
+    case I_CONT_GET: {
+      uint32_t off = s->cont_area_off + ARG_STACK_SLOT * (uint32_t)in->imm;
+      ValType rt = (ValType)in->type;
+      bool vec = rt == VT_V128, fp = vt_is_float(rt);
+      int d = wr(s, v, vec || fp ? F0 : S0);
+      sp_access(s, B, false, vec ? 4 : wide ? 3 : 2, fp, vec, d, off, TMP0);
+      commit(s, v, d);
+      break;
+    }
+
     case I_EXN_OBJ: {
       int d = wr(s, v, S0);
       a64_ldr_imm(B, 3, d, RSP, s->exn_slot);

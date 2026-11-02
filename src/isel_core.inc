@@ -55,6 +55,9 @@ typedef struct {
 
   uint32_t exn_slot;
   uint32_t throw_area_off, throw_area_bytes;
+  /* the area a stack-switching instruction's values go through, after the
+     throw area */
+  uint32_t cont_area_off, cont_area_bytes;
   uint32_t frame;
   /* arm64, a frame past a scaled offset's reach: its slots are laid out
      last, and far_save is the near slot a far access parks the register it
@@ -858,7 +861,7 @@ static bool const_arg(IrFunc *f, Ref v, uint64_t *out) {
 
 static bool invalidates_mem(uint16_t op) {
   switch (op) {
-    case I_CALL: case I_CALL_INDIRECT: case I_CALL_REF:
+    case I_CALL: case I_CALL_INDIRECT: case I_CALL_REF: case I_CONT_OP:
     case I_MEM_GROW: case I_MEM_COPY:
     case I_MEM_FILL: case I_MEM_INIT: case I_DATA_DROP: case I_TABLE_GET:
     case I_TABLE_SET: case I_TABLE_GROW: case I_TABLE_FILL: case I_TABLE_COPY:
@@ -1046,6 +1049,22 @@ static void analyse_function(Isel *s) {
 
           s->has_call = s->call_other = true;
           break;
+
+        /* a stack switch's operands and what it gives back go through an
+           area of the frame's (warmc_cont_op) */
+        case I_CONT_OP: {
+          uint32_t want = ARG_STACK_SLOT * in->nargs;
+          if (want > s->cont_area_bytes) s->cont_area_bytes = want;
+          s->has_call = s->call_other = true;
+          s->calls_wasm = true;
+          touches_instance = true;
+          break;
+        }
+        case I_CONT_GET: {
+          uint32_t want = ARG_STACK_SLOT * ((uint32_t)in->imm + 1u);
+          if (want > s->cont_area_bytes) s->cont_area_bytes = want;
+          break;
+        }
         default: break;
       }
     }

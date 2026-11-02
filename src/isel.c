@@ -1529,7 +1529,8 @@ static void emit_memop_r(Isel *s, Ref v, const Ref *a, bool fill) {
 static bool block_calls(IrFunc *f, const Block *b) {
   for (uint32_t i = 0; i < b->ninsts; i++) {
     uint16_t op = f->insts[b->insts[i]].op;
-    if (op == I_CALL || op == I_CALL_INDIRECT || op == I_CALL_REF) return true;
+    if (op == I_CALL || op == I_CALL_INDIRECT || op == I_CALL_REF || op == I_CONT_OP)
+      return true;
   }
   return false;
 }
@@ -3449,8 +3450,9 @@ static uint32_t call_out_bytes(IrFunc *f, uint32_t tail_bytes) {
     for (uint32_t i = 0; i < b->ninsts; i++) {
       Ref v = b->insts[i];
       uint16_t op = f->insts[v].op;
+      /* a stack switch's operands go to its own area (I_CONT_OP) */
       if (!inst_clobbers_caller_saved(f, v) || op == I_RETURN_CALL ||
-          op == I_RETURN_CALL_INDIRECT || op == I_RETURN_CALL_REF)
+          op == I_RETURN_CALL_INDIRECT || op == I_RETURN_CALL_REF || op == I_CONT_OP)
         continue;
       bool wc = op == I_CALL || op == I_CALL_INDIRECT || op == I_CALL_REF;
       wasm_call |= wc;
@@ -4142,7 +4144,8 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
   s->exn_slot = s->fpsave_off + 8u * nfp;
 
   s->throw_area_off = (s->exn_slot + (s->has_pads ? 8u : 0u) + 15u) & ~15u;
-  s->frame = s->throw_area_off + s->throw_area_bytes;
+  s->cont_area_off = (s->throw_area_off + s->throw_area_bytes + 15u) & ~15u;
+  s->frame = s->cont_area_off + s->cont_area_bytes;
   s->frame = (s->frame + 15) & ~15u;
   /* Past a scaled offset's reach the slots go last, behind everything else
      the frame holds and a save slot for sp_access, so only they and the
@@ -4157,7 +4160,8 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
     s->fpsave_off = s->retptr_slot + (f->sig->nresults > 1 ? 8u : 0u);
     s->exn_slot = s->fpsave_off + 8u * nfp;
     s->throw_area_off = (s->exn_slot + (s->has_pads ? 8u : 0u) + 15u) & ~15u;
-    s->slots_off = (s->throw_area_off + s->throw_area_bytes + 15u) & ~15u;
+    s->cont_area_off = (s->throw_area_off + s->throw_area_bytes + 15u) & ~15u;
+    s->slots_off = (s->cont_area_off + s->cont_area_bytes + 15u) & ~15u;
     s->frame = (s->slots_off + 8u * s->nslots + 15u) & ~15u;
   }
   {

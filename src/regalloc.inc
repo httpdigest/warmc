@@ -2,7 +2,7 @@
 
 static bool op_clobbers_caller_saved(uint16_t op) {
   switch (op) {
-    case I_CALL: case I_CALL_INDIRECT: case I_CALL_REF:
+    case I_CALL: case I_CALL_INDIRECT: case I_CALL_REF: case I_CONT_OP:
     case I_THROW: case I_THROW_REF:
     case I_MEM_GROW: case I_MEM_COPY: case I_MEM_FILL: case I_MEM_INIT:
     case I_DATA_DROP: case I_TABLE_GET: case I_TABLE_SET:
@@ -45,7 +45,7 @@ static bool inst_clobbers_caller_saved(const IrFunc *f, Ref v) {
    allocates nothing else on that heap, nowhere else would. */
 static bool op_is_safepoint(uint16_t op) {
   switch (op) {
-    case I_CALL: case I_CALL_INDIRECT: case I_CALL_REF:
+    case I_CALL: case I_CALL_INDIRECT: case I_CALL_REF: case I_CONT_OP:
     case I_STRUCT_NEW: case I_ARRAY_NEW: case I_ARRAY_NEW_SEG:
     case I_THROW:
       return true;

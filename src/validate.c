@@ -196,6 +196,82 @@ static CompType *array_type_at(V *v, uint32_t idx) {
   return comp_type_at(v, idx, CT_ARRAY);
 }
 
+/* ---- stack switching ---------------------------------------------------- */
+
+/* the function type of continuation type idx */
+static CompType *cont_func_at(V *v, uint32_t idx) {
+  if (idx >= v->m->ntypes) invalid(v, "unknown type");
+  if (v->m->types[idx].kind != CT_CONT)
+    invalid(v, "type mismatch: type index is not a continuation type");
+  return &v->m->types[v->m->types[idx].cont_ft];
+}
+
+/* tag x's type, [params] -> [results] */
+static CompType *tag_type_at(V *v, uint32_t x) {
+  if (x >= v->m->ntags) invalid(v, "unknown tag");
+  return &v->m->types[v->m->tags[x].type_index];
+}
+
+/* [ps1] -> [rs1] <: [ps2] -> [rs2]: contravariant in the parameters,
+   covariant in the results */
+static bool fn_subtype(const Module *m, const ValType *ps1, uint32_t np1,
+                       const ValType *rs1, uint32_t nr1, const ValType *ps2,
+                       uint32_t np2, const ValType *rs2, uint32_t nr2) {
+  if (np1 != np2 || nr1 != nr2) return false;
+  for (uint32_t i = 0; i < np1; i++)
+    if (!vt_subtype(m, ps2[i], ps1[i])) return false;
+  for (uint32_t i = 0; i < nr1; i++)
+    if (!vt_subtype(m, rs1[i], rs2[i])) return false;
+  return true;
+}
+
+/* A resume's handler clauses, for a resume whose continuation returns rs:
+   (on $e $l), a suspension with $e taken to $l with its payload and the
+   continuation that resumes it; (on $e switch), a switch with $e taken
+   here. */
+static void check_handlers(V *v, const ValType *rs, uint32_t nr) {
+  Module *m = v->m;
+  uint32_t n = rd_u32(&v->rd);
+  for (uint32_t i = 0; i < n; i++) {
+    uint8_t kind = rd_u8(&v->rd);
+    if (kind > 1) warmc_malformed("unknown handler clause 0x%02x", kind);
+    CompType *tt = tag_type_at(v, rd_u32(&v->rd));
+    if (kind == 1) {
+      /* the tag's results are the resume's, so that a switch to here
+         returns them as the continuation would */
+      if (tt->nparams || tt->nresults != nr)
+        invalid(v, "type mismatch: a switch handler's tag does not match the resume");
+      for (uint32_t j = 0; j < nr; j++)
+        if (!vt_subtype(m, tt->results[j], rs[j]) || !vt_subtype(m, rs[j], tt->results[j]))
+          invalid(v, "type mismatch: a switch handler's tag does not match the resume");
+      continue;
+    }
+    uint32_t d = rd_u32(&v->rd);
+    if (d >= v->nctl) invalid(v, "unknown label");
+    uint32_t nl;
+    const ValType *ls = label_types(v, d, &nl);
+    if (nl != tt->nparams + 1)
+      invalid(v, "type mismatch: a handler's label does not take the tag's payload and a continuation");
+    for (uint32_t j = 0; j < tt->nparams; j++)
+      if (!vt_subtype(m, tt->params[j], ls[j]))
+        invalid(v, "type mismatch: a handler's label does not accept the tag's payload");
+    ValType kt = ls[nl - 1];
+    if (!vt_is_ref(kt) || !vt_concrete(kt) || vt_type_index(kt) >= m->ntypes ||
+        m->types[vt_type_index(kt)].kind != CT_CONT)
+      invalid(v, "type mismatch: a handler's label does not take a continuation");
+    const CompType *kf = &m->types[m->types[vt_type_index(kt)].cont_ft];
+    /* the continuation of the suspension: [tag's results] -> [the resume's] */
+    if (!fn_subtype(m, tt->results, tt->nresults, rs, nr, kf->params, kf->nparams,
+                    kf->results, kf->nresults))
+      invalid(v, "type mismatch: a handler's continuation type does not match");
+  }
+}
+
+/* ref.test, ref.cast and br_on_cast cannot target a continuation type */
+static void check_castable(V *v, ValType t) {
+  if (vt_subtype(v->m, t, vt_ref(true, HT_CONT))) invalid(v, "invalid cast");
+}
+
 static const FieldType *field_at(V *v, const CompType *t, uint32_t j) {
   if (j >= t->nfields) invalid(v, "unknown field");
   return &t->fields[j];
@@ -302,6 +378,7 @@ static void check_catch(V *v) {
   if (kind < 2) {
     if (x >= m->ntags) invalid(v, "unknown tag");
     CompType *tt = &m->types[m->tags[x].type_index];
+    if (tt->nresults) invalid(v, "type mismatch: an exception's tag has results");
     np = tt->nparams;
     ps = tt->params;
   }
@@ -334,6 +411,9 @@ static void validate_body(V *v) {
                       v->func_index, v->rd.end - v->rd.p);
     uint32_t op = wasm_read_op(&v->rd);
     const OpInfo *oi = wasm_op_info(op);
+    /* under --wasm=3.0, stack switching's opcodes are as 3.0 has them:
+       none */
+    if (g_wasm30 && op >= 0xe0 && op <= 0xe6) oi = NULL;
 
     if (!oi) {
       if (op > 0xff)
@@ -427,6 +507,7 @@ static void validate_body(V *v) {
         uint32_t x = rd_u32(&v->rd);
         if (x >= m->ntags) invalid(v, "unknown tag");
         CompType *tt = &m->types[m->tags[x].type_index];
+        if (tt->nresults) invalid(v, "type mismatch: an exception's tag has results");
         pop_many(v, tt->params, tt->nparams);
         mark_unreachable(v);
         break;
@@ -445,6 +526,84 @@ static void validate_body(V *v) {
         for (uint32_t i = 0; i < nc; i++) check_catch(v);
         pop_many(v, in, nin);
         push_ctrl(v, 0x1f, in, nin, out, nout);
+        break;
+      }
+
+      /* ---- stack switching (refused under --wasm=3.0, as the opcodes it
+         does not have) ---- */
+      case 0xe0: {
+        uint32_t ct = rd_u32(&v->rd);
+        ((Func *)v->fn)->uses_cont = true;
+        cont_func_at(v, ct);
+        pop_expect(v, vt_ref(true, (HeapType)v->m->types[ct].cont_ft));
+        push(v, vt_ref(false, (HeapType)ct));
+        break;
+      }
+      case 0xe1: {
+        uint32_t ct = rd_u32(&v->rd), ct2 = rd_u32(&v->rd);
+        ((Func *)v->fn)->uses_cont = true;
+        CompType *f1 = cont_func_at(v, ct), *f2 = cont_func_at(v, ct2);
+        if (f2->nparams > f1->nparams)
+          invalid(v, "type mismatch: cont.bind's result takes more than its operand");
+        uint32_t nb = f1->nparams - f2->nparams;
+        if (!fn_subtype(m, f1->params + nb, f2->nparams, f1->results, f1->nresults,
+                        f2->params, f2->nparams, f2->results, f2->nresults))
+          invalid(v, "type mismatch: cont.bind's types do not match");
+        pop_expect(v, vt_ref(true, (HeapType)ct));
+        pop_many(v, f1->params, nb);
+        push(v, vt_ref(false, (HeapType)ct2));
+        break;
+      }
+      case 0xe2: {
+        ((Func *)v->fn)->uses_cont = true;
+        CompType *tt = tag_type_at(v, rd_u32(&v->rd));
+        pop_many(v, tt->params, tt->nparams);
+        push_many(v, tt->results, tt->nresults);
+        break;
+      }
+      case 0xe3: case 0xe4: case 0xe5: {
+        ((Func *)v->fn)->uses_cont = true;
+        uint32_t ct = rd_u32(&v->rd);
+        CompType *ft = cont_func_at(v, ct);
+        CompType *et = NULL;
+        if (op == 0xe4) {
+          et = tag_type_at(v, rd_u32(&v->rd));
+          if (et->nresults)
+            invalid(v, "type mismatch: resume_throw's tag has results");
+        }
+        check_handlers(v, ft->results, ft->nresults);
+        pop_expect(v, vt_ref(true, (HeapType)ct));
+        if (op == 0xe3) pop_many(v, ft->params, ft->nparams);
+        else if (op == 0xe4) pop_many(v, et->params, et->nparams);
+        else pop_expect(v, vt_ref(true, HT_EXN));
+        push_many(v, ft->results, ft->nresults);
+        break;
+      }
+      case 0xe6: {
+        ((Func *)v->fn)->uses_cont = true;
+        uint32_t ct = rd_u32(&v->rd);
+        CompType *f1 = cont_func_at(v, ct);
+        CompType *tt = tag_type_at(v, rd_u32(&v->rd));
+        if (tt->nparams)
+          invalid(v, "type mismatch: switch's tag takes parameters");
+        /* $ct1 = cont [t1* (ref null? $ct2)] -> [te1*], te1* <: t*;
+           $ct2 = cont [t2*] -> [te2*], t* <: te2* */
+        if (!f1->nparams)
+          invalid(v, "type mismatch: switch's continuation takes no continuation");
+        ValType kt = f1->params[f1->nparams - 1];
+        if (!vt_is_ref(kt) || !vt_concrete(kt) || vt_type_index(kt) >= m->ntypes ||
+            m->types[vt_type_index(kt)].kind != CT_CONT)
+          invalid(v, "type mismatch: switch's continuation takes no continuation");
+        const CompType *f2 = &m->types[m->types[vt_type_index(kt)].cont_ft];
+        if (f1->nresults != tt->nresults || f2->nresults != tt->nresults)
+          invalid(v, "type mismatch: switch's tag does not match its continuations");
+        for (uint32_t j = 0; j < tt->nresults; j++)
+          if (!vt_subtype(m, f1->results[j], tt->results[j]) ||
+              !vt_subtype(m, tt->results[j], f2->results[j]))
+            invalid(v, "type mismatch: switch's tag does not match its continuations");
+        pop_expect(v, vt_ref(true, (HeapType)ct));
+        pop_many(v, f1->params, f1->nparams - 1);
+        push_many(v, f2->params, f2->nparams);
         break;
       }
 
@@ -938,6 +1097,7 @@ static void validate_body(V *v) {
             bool nul = (op == OP_PREFIXED(0xfb, 21) || op == OP_PREFIXED(0xfb, 23));
             bool cast = op >= OP_PREFIXED(0xfb, 22);
             ValType want = vt_ref(nul, read_heaptype(v));
+            check_castable(v, want);
 
             ValType got = pop_ref(v, cast ? "ref.cast" : "ref.test");
             if (got != BOT && vt_join(m, got, want) == VT_BOT)
@@ -959,6 +1119,7 @@ static void validate_body(V *v) {
             ValType t1 = vt_ref((flags & 1) != 0, read_heaptype(v));
             ValType t2 = vt_ref((flags & 2) != 0, read_heaptype(v));
             if (d >= v->nctl) invalid(v, "unknown label");
+            check_castable(v, t2);
 
             if (!vt_subtype(m, t2, t1))
               invalid(v, "type mismatch: br_on_cast target is not a subtype of its source");
@@ -1198,6 +1359,11 @@ static void check_declared_subtyping(Module *m) {
       warmc_invalid("type %u: supertype %u is final", i, t->super);
     if (t->kind != s->kind)
       warmc_invalid("type %u: does not match supertype %u", i, t->super);
+    if (t->kind == CT_CONT) {
+      if (!heap_subtype(m, (HeapType)t->cont_ft, (HeapType)s->cont_ft))
+        warmc_invalid("type %u: does not match supertype %u", i, t->super);
+      continue;
+    }
     if (t->kind == CT_FUNC) {
       if (t->nparams != s->nparams || t->nresults != s->nresults)
         warmc_invalid("type %u: does not match supertype %u", i, t->super);
@@ -1288,6 +1454,11 @@ static void validate_bodies(Module *m, const uint32_t *fns, uint32_t nb) {
 }
 
 static void validate_module(Module *m) {
+  /* a continuation type is of a function type */
+  for (uint32_t i = 0; i < m->ntypes; i++)
+    if (m->types[i].kind == CT_CONT &&
+        (m->types[i].cont_ft >= m->ntypes || m->types[m->types[i].cont_ft].kind != CT_FUNC))
+      warmc_invalid("type %u: a continuation type of something not a function type", i);
   check_declared_subtyping(m);
 
   for (uint32_t i = 0; i < m->nfuncs; i++) {
@@ -1305,7 +1476,9 @@ static void validate_module(Module *m) {
     if (m->types[m->tags[i].type_index].kind != CT_FUNC)
       warmc_invalid("tag %u: type %u is not a function type", i,
                     m->tags[i].type_index);
-    if (m->types[m->tags[i].type_index].nresults != 0)
+    /* a tag with results is stack switching's, for suspend and switch;
+       an exception's has none (throw and the catch clauses check that) */
+    if (g_wasm30 && m->types[m->tags[i].type_index].nresults != 0)
       warmc_invalid("tag %u: non-empty tag result type", i);
   }
 

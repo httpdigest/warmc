@@ -104,7 +104,7 @@ static uint32_t body_bytes(Module *m, uint32_t fi) {
 
 static bool raises(uint16_t op) {
   return op == I_CALL || op == I_CALL_INDIRECT || op == I_CALL_REF ||
-         op == I_THROW || op == I_THROW_REF;
+         op == I_THROW || op == I_THROW_REF || op == I_CONT_OP;
 }
 
 static void split_at_raising_sites(IrFunc *g) {
@@ -264,6 +264,7 @@ static bool callee_calls_are_cold(IrFunc *g) {
       switch (g->insts[b->insts[i]].op) {
         case I_CALL: case I_CALL_INDIRECT: case I_CALL_REF:
         case I_RETURN_CALL: case I_RETURN_CALL_INDIRECT: case I_RETURN_CALL_REF:
+        case I_CONT_OP:
           return false;
         default: break;
       }
@@ -287,7 +288,7 @@ static uint32_t warm_returning_calls(IrFunc *g, uint32_t *in_loop) {
     for (uint32_t i = 0; i < b->ninsts; i++) {
       uint16_t op = g->insts[b->insts[i]].op;
       if (op == I_CALL_REF && opt_once_call(g, b->insts[i])) continue;
-      if (op == I_CALL || op == I_CALL_INDIRECT || op == I_CALL_REF) n++;
+      if (op == I_CALL || op == I_CALL_INDIRECT || op == I_CALL_REF || op == I_CONT_OP) n++;
       if ((op == I_CALL_INDIRECT || op == I_CALL_REF) && b->loop_depth)
         (*in_loop)++;
     }

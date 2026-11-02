@@ -220,7 +220,9 @@ static inline const GcField *gcti_fields(const GcTypeInfo *t) {
   return (const GcField *)(const void *)((const u8 *)t + t->fields);
 }
 
-enum { GCK_STRUCT = 0, GCK_ARRAY = 1, GCK_EXN = 2 };
+/* GCK_CONT: a continuation's handle (rt/cont.inc), the one type the
+   runtime has of its own, at type index 1 of every store */
+enum { GCK_STRUCT = 0, GCK_ARRAY = 1, GCK_EXN = 2, GCK_CONT = 3 };
 
 typedef struct {
   u32 w;
@@ -400,7 +402,46 @@ typedef struct {
      its functions have */
   const u8 *text_base;
   const FuncTypeDesc *ftypes;
+
+  /* the stack-switching instructions, which compiled code names by their
+     index here (warmc_cont_op): present only in the descriptor of a module
+     that has any, the one whose code calls warmc_cont_op */
+  u32 ncont_sites, cont_pad;
+  const struct ContSite *cont_sites;
 } ModuleDesc;
+
+/* A stack-switching instruction, as the runtime carries it out: its op
+   (CONT_NEW .. CONT_SWITCH, rt/cont.inc), the tag it suspends, switches or
+   throws (an index of the module's), how many values it takes and gives
+   back on its way through, and their kinds (CK_I32 .. CK_REF), and its
+   handlers: kind 0 (on $t $l) and kind 1 (on $t switch).  The kinds and
+   handlers are where the offsets from the site say. */
+#define CONT_SITE_BYTES 32u
+enum { CONT_NEW = 0, CONT_BIND, CONT_SUSPEND, CONT_RESUME, CONT_RESUME_THROW,
+       CONT_RESUME_THROW_REF, CONT_SWITCH };
+enum { CK_I32 = 0, CK_I64, CK_F32, CK_F64, CK_V128, CK_REF };
+typedef struct { u32 kind, tag; } ContHandler;
+typedef struct ContSite {
+  u8 op, pad[3];
+  u32 tag;
+  u32 nin, nout, nhandlers;
+  i32 in_kinds, out_kinds, handlers;
+} ContSite;
+_Static_assert(sizeof(ContSite) == CONT_SITE_BYTES, "ContSite is CONT_SITE_BYTES");
+static inline const u8 *cs_in_kinds(const ContSite *s) {
+  return (const u8 *)s + s->in_kinds;
+}
+static inline const u8 *cs_out_kinds(const ContSite *s) {
+  return (const u8 *)s + s->out_kinds;
+}
+static inline const ContHandler *cs_handlers(const ContSite *s) {
+  return (const ContHandler *)(const void *)((const u8 *)s + s->handlers);
+}
+
+/* the stack-switching instruction at site of vm's module, its operands in
+   the slots at area (sixteen bytes each), where what it gives back is put:
+   0 for its own way on, 1 + k for its handler k (rt/start.S) */
+u32 warmc_cont_op(WarmInstance *vm, u32 site, u64 *area);
 
 #define WARMC_ASSERT_OFF(type, field, n) \
   _Static_assert(__builtin_offsetof(type, field) == (n), \
@@ -609,6 +650,12 @@ enum {
   TRAP_ARRAY_OOB = 15,
 
   TRAP_CAST = 16,
+
+  /* stack switching's: a null continuation, one already resumed, bound or
+     switched to, and a suspension no handler takes */
+  TRAP_NULL_CONT = 17,
+  TRAP_CONT_CONSUMED = 18,
+  TRAP_UNHANDLED_TAG = 19,
 
   TRAP_LINK = 100,
 

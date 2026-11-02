@@ -71,8 +71,94 @@ typedef struct {
 
 /* The callee-saved registers and the stack pointer and return address of
    the wasm frame that called into an allocation, which a collection there
-   walks from and rewrites (start.S's GC_ENTER and GC_LEAVE) */
-typedef struct { u64 gpr[10]; u64 sp; u64 pc; } GcCtx;
+   walks from and rewrites (start.S's GC_ENTER and GC_LEAVE).  One that
+   called a stack-switching operation (warmc_cont_op) keeps its float
+   callee-saved registers and frame pointer here too, and is taken up again
+   from here with the status the operation returns (warmc_cont_jump). */
+typedef struct { u64 gpr[10]; u64 sp; u64 pc; u64 fpr[8]; u64 fp; u64 status; } GcCtx;
+#define GCCTX_FPR    96
+#define GCCTX_FP     160
+#define GCCTX_STATUS 168
+_Static_assert(__builtin_offsetof(GcCtx, fpr) == GCCTX_FPR &&
+               __builtin_offsetof(GcCtx, fp) == GCCTX_FP &&
+               __builtin_offsetof(GcCtx, status) == GCCTX_STATUS,
+               "start.S's GCCTX offsets");
+
+/* A stack of the stack-switching proposal's continuations, rt/cont.inc's.
+   The store's root is the stack every call into its wasm starts on. */
+typedef struct Fiber Fiber;
+struct Fiber {
+  /* compiled code's frame where it waits -- at a suspension, or at the
+     resume that runs its child -- which it is taken up from, and the area
+     of that frame its operation's values come back to; nothing of the
+     runtime's is on its stack while it waits.  A fiber yet to start has
+     warmc_fiber_entry for its frame. */
+  GcCtx ctx;
+  u64 *area;
+  /* its stack's mapping, and the limit compiled code checks frames on it
+     against */
+  u8 *map;
+  u64 map_len;
+  u64 limit;
+  /* on Windows, the thread's TEB's StackBase, StackLimit and
+     DeallocationStack while it runs, which host code reads (the root's as
+     they were when it last waited) */
+  u64 teb_base, teb_limit, teb_dealloc;
+  /* while it runs, the fiber whose resume runs it; while it is suspended,
+     the one below it in its chain (child), the chain's top first */
+  Fiber *parent, *child;
+  /* the resume that runs it, whose handlers a suspension looks for, the
+     instance that resume is in, and how deep in calls into wasm it is */
+  const struct ContSite *rsite;
+  void *rvm;
+  u64 depth;
+  u32 state;
+  /* who has it: 0 no one, 1 the collector walking it, 2 the program, which
+     runs it or is about to (cont_claim) */
+  u32 own;
+  /* the collector's epoch its references were last healed in */
+  u32 seen;
+  /* the cycle its chain's handle was made in, at the chain's top */
+  u32 born;
+  /* the function a fiber that has not started calls, and the values bound
+     ahead of the ones a resume gives (cont.bind), sixteen bytes each */
+  void *fn_code, *fn_instance;
+  u32 nbound, capbound;
+  u64 *bound;
+  u8 *bound_kinds;
+  /* at a chain's top while it is suspended: its handle, which the end of
+     a mark frees the chain with when no mark reached it */
+  u64 handle;
+  /* every fiber of the store */
+  Fiber *next_all, *prev_all;
+};
+
+/* the most values a stack-switching operation passes on at once: wasm's
+   thousand parameters and a continuation */
+#define CONT_XFER_MAX 1024u
+#define CONT_POOL 64u
+
+typedef struct {
+  Fiber root;
+  /* the fiber that runs, 0 for the root */
+  Fiber *cur;
+  Fiber *all, *free_fibers, *zombies;
+  void *chunks;
+  /* how many of the transfer area's values are the collector's roots for
+     now, their kinds in xfer_kind; the collector's epoch (cont_claim) */
+  u32 xfer_n, epoch;
+  Fiber *transit;
+  /* what WARMC_GC_STATS reports: fibers made, freed by a mark's end and
+     live, stacks mapped, and switches */
+  u64 nmade, nswept, nlive, nmapped, nswitch;
+  /* a fiber about to start: the kinds of its arguments */
+  const u8 *start_kinds;
+  u32 start_n, nstacks;
+  struct { u8 *map; u64 len; } stacks[CONT_POOL];
+  u8 xfer_kind[CONT_XFER_MAX];
+  u8 kinds[CONT_XFER_MAX];
+  u64 xfer[2 * CONT_XFER_MAX];
+} ContState;
 
 /* the points gc_jitter perturbs (WARMC_GC_JITTER) */
 enum { GCJ_ROUND, GCJ_IDLE, GCJ_MARK, GCJ_RELOC, GCJ_SLOT, GCJ_N };
@@ -258,6 +344,9 @@ struct Store {
 
   /* ---- WASI's, which rt/wasi.c keeps (WasiStore there) ---- */
   void *wasi;
+
+  /* ---- stack switching's (rt/cont.inc) ---- */
+  ContState cont;
 };
 
 #define STORE_GC_FAST 0

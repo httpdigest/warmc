@@ -574,6 +574,7 @@ static void do_compile(CompileJob *job) {
 
   if (wasm_is_component(job->bin, job->len))
     warmc_fatal("a component: the C API compiles core modules");
+  g_wasm30 = opt.wasm30;
   Module *m = wasm_parse(job->bin, job->len);
   job->m = m;
   wasm_validate(m);
@@ -640,6 +641,7 @@ JitModule *jit_compile(const uint8_t *bin, size_t len, const JitOpts *o,
 static void do_validate(CompileJob *job) {
   OptOpts opt;
   reset_settings(&opt);
+  g_wasm30 = false;
   if (wasm_is_component(job->bin, job->len))
     warmc_fatal("a component: the C API compiles core modules");
   Module *m = wasm_parse(job->bin, job->len);

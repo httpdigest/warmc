@@ -606,7 +606,7 @@ typedef struct {
 
 typedef struct { uint32_t first, end; } TokRange;
 
-enum { JOB_GLOBAL, JOB_TABLE, JOB_ELEM, JOB_DATA, JOB_FUNC, JOB_TAG };
+enum { JOB_GLOBAL, JOB_TABLE, JOB_ELEM, JOB_DATA, JOB_FUNC, JOB_TAG, JOB_PHANTOM };
 typedef struct { uint8_t kind; uint32_t index; } Job;
 
 typedef struct {
@@ -665,7 +665,21 @@ typedef struct {
 
 typedef struct { uint32_t type; Typeuse tu; bool imported; } WTag;
 
-typedef struct { Bytes mod, nm; uint8_t kind; uint32_t index, group; } WImport;
+/* group: the compact import group it is in, 0 for none; shared, a group
+   whose members share the one extern type written after their names.  A
+   group with no members is one entry of no name, `empty`: of a shared one,
+   index is its type's in phantoms -- a type that names nothing it imports,
+   though a func's typeuse still defines the type it implies. */
+typedef struct { Bytes mod, nm; uint8_t kind; uint32_t index, group; bool shared, empty; } WImport;
+typedef struct {
+  uint8_t kind;
+  Typeuse tu;
+  uint32_t type;
+  ValType vt;
+  bool mut;
+  uint64_t min, max;
+  bool has_max, index64;
+} WPhantom;
 typedef struct { Bytes nm; uint8_t kind; Ref target; } WExport;
 
 typedef struct {
@@ -720,7 +734,9 @@ typedef struct {
   VEC(WGlobal) gl;
   VEC(WTag) tg;
   VEC(WImport) im;
+  VEC(WPhantom) ph;
   uint32_t im_cur_group, im_group_seq;
+  bool im_cur_shared;
   VEC(WExport) ex;
   VEC(WElem) el;
   VEC(WData) da;
@@ -1061,6 +1077,7 @@ static bool heaptype_of_word(const Tok *t, HeapType *out) {
     { "eq", HT_EQ }, { "i31", HT_I31 }, { "struct", HT_STRUCT },
     { "array", HT_ARRAY }, { "exn", HT_EXN }, { "none", HT_NONE },
     { "nofunc", HT_NOFUNC }, { "noextern", HT_NOEXTERN }, { "noexn", HT_NOEXN },
+    { "cont", HT_CONT }, { "nocont", HT_NOCONT },
   };
   for (size_t i = 0; i < sizeof abs / sizeof abs[0]; i++)
     if (tok_is_word(t, abs[i].n)) { *out = abs[i].h; return true; }
@@ -1089,6 +1106,8 @@ static bool valtype_of_word(const Tok *t, ValType *out) {
     { "nullfuncref", VT_REF_ABS(true, HT_NOFUNC) },
     { "nullexternref", VT_REF_ABS(true, HT_NOEXTERN) },
     { "nullexnref", VT_REF_ABS(true, HT_NOEXN) },
+    { "contref", VT_REF_ABS(true, HT_CONT) },
+    { "nullcontref", VT_REF_ABS(true, HT_NOCONT) },
   };
   for (size_t i = 0; i < sizeof sh / sizeof sh[0]; i++)
     if (tok_is_word(t, sh[i].n)) { *out = sh[i].v; return true; }
@@ -1210,10 +1229,55 @@ static void declare_field(P *p) {
 
     p->i = open + 2;
     if (tk(p)->kind == TK_STRING) p->i++;
+    /* a group of no members, (import "mod") or (import "mod" (func ...)),
+       declares nothing */
+    if (at_rpar(p) || (at_lpar(p) && !at_group(p, "item"))) {
+      if (at_lpar(p) && tk_at(p, p->i + 2)->kind == TK_ID)
+        pos_err(p->path, tk_at(p, p->i + 2)->line, tk_at(p, p->i + 2)->col,
+                "identifier not allowed");
+      if (p->first_def)
+        pos_err(p->path, line, col, "import after a %s definition", p->first_def);
+      p->i = end;
+      return;
+    }
     /* (import "mod" (item "nm" (func ...)) ...) shares the module name
-       across a group -- the text form of the compact import section. */
+       across a group -- the text form of the compact import section; and
+       (import "mod" (item "nm") ... (func ...)) the extern type too, one
+       entry of its kind for each item. */
     bool grouped = at_group(p, "item");
-    do {
+    if (grouped && tk_at(p, p->i + 3)->kind == TK_RPAR) {
+      uint32_t nitems = 0;
+      while (at_group(p, "item")) {
+        uint32_t io = p->i;
+        p->i += 2;
+        if (tk(p)->kind == TK_STRING) p->i++;
+        if (!at_rpar(p)) perr(p, "every item of a group sharing a type names no type");
+        p->i = io;
+        skip_group(p);
+        nitems++;
+      }
+      if (!at_lpar(p)) perr(p, "expected an import descriptor");
+      uint32_t dopen = p->i;
+      p->i++;
+      const Tok *dk = tk(p);
+      p->i++;
+      if (tk(p)->kind == TK_ID) perr(p, "identifier not allowed");
+      Space *sp = NULL;
+      const char *what = NULL;
+      if (tok_is_word(dk, "func")) { sp = &p->funcs; what = "function"; }
+      else if (tok_is_word(dk, "table")) { sp = &p->tables; what = "table"; }
+      else if (tok_is_word(dk, "memory")) { sp = &p->mems; what = "memory"; }
+      else if (tok_is_word(dk, "global")) { sp = &p->globals; what = "global"; }
+      else if (tok_is_word(dk, "tag")) { sp = &p->tags; what = "tag"; }
+      else pos_err(p->path, dk->line, dk->col, "unknown import kind");
+      if (p->first_def)
+        pos_err(p->path, dk->line, dk->col, "import after a %s definition", p->first_def);
+      for (uint32_t k = 0; k < nitems; k++) {
+        space_add(sp, p->a, NULL, 0, p->path, dk->line, dk->col, what);
+        if (sp == &p->funcs) note_func_open(p, dopen);
+      }
+      grouped = false;
+    } else do {
       uint32_t item_open = 0;
       if (grouped) {
         if (!at_group(p, "item")) break;
@@ -1499,8 +1563,12 @@ static void parse_type(P *p, bool in_rec) {
     if (wrapped) expect_rpar(p);
     write_valtype(s, v);
     wb_byte(s, mut ? 1 : 0);
+  } else if (eat_word(p, "cont")) {
+    /* (cont $ft): the function type, as an s33 */
+    wb_byte(s, 0x5d);
+    write_heaptype(s, (HeapType)take_index(p, &p->types, "type"));
   } else {
-    perr(p, "expected func, struct or array");
+    perr(p, "expected func, struct, array or cont");
   }
   expect_rpar(p);
   if (sub) expect_rpar(p);
@@ -1730,6 +1798,10 @@ static void write_type_u32_second(P *p, WBuf *b, uint32_t op, uint32_t type) {
     case OP_PREFIXED(0xfb, 17):
       wb_u32(b, take_index(p, &p->types, "type"));
       return;
+    case 0xe6:
+      /* switch $ct $tag */
+      wb_u32(b, take_index(p, &p->tags, "tag"));
+      return;
     default:
       perr(p, "internal: no operand rule for opcode 0x%x", op);
   }
@@ -1754,6 +1826,8 @@ static bool take_reftype_nullable(P *p, HeapType *h) {
   *h = vt_heap(v);
   return vt_nullable(v);
 }
+
+static void write_handlers(P *p, WBuf *b);
 
 static void write_instr_imm(P *p, WBuf *b, uint32_t op, const OpInfo *oi) {
   write_opcode(b, op);
@@ -1883,6 +1957,15 @@ static void write_instr_imm(P *p, WBuf *b, uint32_t op, const OpInfo *oi) {
       break;
     }
     case IMM_TAG: wb_u32(b, take_index(p, &p->tags, "tag")); break;
+    case IMM_TYPE_TYPE:
+      wb_u32(b, take_index(p, &p->types, "type"));
+      wb_u32(b, take_index(p, &p->types, "type"));
+      break;
+    case IMM_RESUME: case IMM_RESUME_THROW:
+      wb_u32(b, take_index(p, &p->types, "type"));
+      if (oi->imm == IMM_RESUME_THROW) wb_u32(b, take_index(p, &p->tags, "tag"));
+      write_handlers(p, b);
+      break;
     case IMM_LANE: {
       uint64_t lane = take_nat(p, "a lane index", 255);
       wb_byte(b, (uint8_t)lane);
@@ -1903,6 +1986,29 @@ static void write_instr_imm(P *p, WBuf *b, uint32_t op, const OpInfo *oi) {
     default:
       perr(p, "internal: unhandled immediate kind for '%s'", oi->name);
   }
+}
+
+/* a resume's handler clauses: (on $tag $label), (on $tag switch) */
+static void write_handlers(P *p, WBuf *b) {
+  WBuf tmp = {0};
+  uint32_t n = 0;
+  while (at_group(p, "on")) {
+    p->i += 2;
+    uint32_t tag = take_index(p, &p->tags, "tag");
+    if (eat_word(p, "switch")) {
+      wb_byte(&tmp, 0x01);
+      wb_u32(&tmp, tag);
+    } else {
+      wb_byte(&tmp, 0x00);
+      wb_u32(&tmp, tag);
+      wb_u32(&tmp, take_label(p));
+    }
+    expect_rpar(p);
+    n++;
+  }
+  wb_u32(b, n);
+  wb_raw(b, tmp.p, tmp.n);
+  xfree(tmp.p);
 }
 
 static void write_catches(P *p, WBuf *b) {
@@ -2150,6 +2256,52 @@ static bool take_inline_import(P *p, Bytes *mod, Bytes *nm) {
   return true;
 }
 
+static void write_valtype(WBuf *b, ValType v);
+static void write_limits(WBuf *b, uint64_t min, uint64_t max, bool has_max, bool index64);
+
+/* an import's kind and extern type, as the import section has them */
+static void write_import_type(WBuf *sec, P *p, const WImport *im) {
+  wb_byte(sec, im->kind);
+  if (im->empty) {
+    const WPhantom *ph = &p->ph.v[im->index];
+    switch (ph->kind) {
+      case EK_FUNC: wb_u32(sec, ph->type); break;
+      case EK_TABLE:
+        write_valtype(sec, ph->vt);
+        write_limits(sec, ph->min, ph->max, ph->has_max, ph->index64);
+        break;
+      case EK_MEM: write_limits(sec, ph->min, ph->max, ph->has_max, ph->index64); break;
+      case EK_GLOBAL: write_valtype(sec, ph->vt); wb_byte(sec, ph->mut ? 1 : 0); break;
+      case EK_TAG: wb_byte(sec, 0x00); wb_u32(sec, ph->type); break;
+    }
+    return;
+  }
+  switch (im->kind) {
+    case EK_FUNC: wb_u32(sec, p->fn.v[im->index].type); break;
+    case EK_TABLE: {
+      WTable *t = &p->tb.v[im->index];
+      write_valtype(sec, t->elem);
+      write_limits(sec, t->min, t->max, t->has_max, t->index64);
+      break;
+    }
+    case EK_MEM: {
+      WMem *m = &p->mem.v[im->index];
+      write_limits(sec, m->min, m->max, m->has_max, m->index64);
+      break;
+    }
+    case EK_GLOBAL: {
+      WGlobal *g = &p->gl.v[im->index];
+      write_valtype(sec, g->type);
+      wb_byte(sec, g->mut ? 1 : 0);
+      break;
+    }
+    case EK_TAG:
+      wb_byte(sec, 0x00);
+      wb_u32(sec, p->tg.v[im->index].type);
+      break;
+  }
+}
+
 static void add_import(P *p, Bytes mod, Bytes nm, uint8_t kind, uint32_t index) {
   WImport *im = VEC_PUSH(p, p->im, WImport);
   im->mod = mod;
@@ -2157,6 +2309,7 @@ static void add_import(P *p, Bytes mod, Bytes nm, uint8_t kind, uint32_t index) 
   im->kind = kind;
   im->index = index;
   im->group = p->im_cur_group;
+  im->shared = p->im_cur_shared;
 }
 
 static TokRange record_group(P *p) {
@@ -2513,9 +2666,84 @@ static void parse_import_desc(P *p, Bytes mod, Bytes nm);
 
 static void parse_import(P *p) {
   Bytes mod = take_string(p, "a module name");
+  /* a group of no members: (import "mod"), or (import "mod" (func ...)),
+     whose members would share that type */
+  if (at_rpar(p) || (at_lpar(p) && !at_group(p, "item"))) {
+    WImport *im = VEC_PUSH(p, p->im, WImport);
+    im->mod = mod;
+    im->group = ++p->im_group_seq;
+    im->empty = true;
+    if (at_rpar(p)) return;
+    im->shared = true;
+    WPhantom *ph = VEC_PUSH(p, p->ph, WPhantom);
+    uint32_t pi = p->ph.n - 1;
+    im->index = pi;
+    expect_lpar(p);
+    const Tok *kw = tk(p);
+    p->i++;
+    if (tk(p)->kind == TK_ID) perr(p, "identifier not allowed");
+    if (tok_is_word(kw, "func") || tok_is_word(kw, "tag")) {
+      ph->kind = tok_is_word(kw, "func") ? EK_FUNC : EK_TAG;
+      read_typeuse(p, NULL, &ph->tu, true);
+      add_job(p, JOB_PHANTOM, pi);
+    } else if (tok_is_word(kw, "table")) {
+      ph->kind = EK_TABLE;
+      take_limits(p, &ph->min, &ph->max, &ph->has_max, &ph->index64);
+      ph->vt = take_valtype(p);
+    } else if (tok_is_word(kw, "memory")) {
+      ph->kind = EK_MEM;
+      take_limits(p, &ph->min, &ph->max, &ph->has_max, &ph->index64);
+    } else if (tok_is_word(kw, "global")) {
+      ph->kind = EK_GLOBAL;
+      if (at_group(p, "mut")) {
+        p->i += 2;
+        ph->mut = true;
+        ph->vt = take_valtype(p);
+        expect_rpar(p);
+      } else {
+        ph->vt = take_valtype(p);
+      }
+    } else {
+      pos_err(p->path, kw->line, kw->col, "unknown import kind");
+    }
+    im->kind = ph->kind;
+    expect_rpar(p);
+    return;
+  }
   /* the grouped text form: (import "mod" (item "nm" (func ...)) ...) */
   if (at_group(p, "item")) {
     p->im_cur_group = ++p->im_group_seq;
+    if (tk_at(p, p->i + 3)->kind == TK_RPAR) {
+      /* (item "nm") ... then the one type they all have */
+      Bytes names[64], *nms = names;
+      uint32_t n = 0, cap = 64;
+      while (at_group(p, "item")) {
+        p->i += 2;
+        if (n == cap) {
+          Bytes *more = xmalloc(sizeof(Bytes) * cap * 2);
+          memcpy(more, nms, sizeof(Bytes) * n);
+          if (nms != names) xfree(nms);
+          nms = more;
+          cap *= 2;
+        }
+        nms[n++] = take_string(p, "an import name");
+        expect_rpar(p);
+      }
+      uint32_t desc = p->i;
+      p->im_cur_shared = true;
+      for (uint32_t k = 0; k < n; k++) {
+        p->i = desc;
+        parse_import_desc(p, mod, nms[k]);
+      }
+      if (!n) {
+        p->i = desc;
+        skip_group(p);
+      }
+      p->im_cur_shared = false;
+      if (nms != names) xfree(nms);
+      p->im_cur_group = 0;
+      return;
+    }
     while (at_group(p, "item")) {
       p->i += 2;
       Bytes nm = take_string(p, "an import name");
@@ -2711,6 +2939,9 @@ static void encode_expressions(P *p) {
         }
         break;
       }
+      case JOB_PHANTOM:
+        p->ph.v[i].type = resolve_typeuse(p, &p->ph.v[i].tu);
+        break;
       case JOB_TAG:
         p->tg.v[i].type = resolve_typeuse(p, &p->tg.v[i].tu);
         break;
@@ -2760,7 +2991,9 @@ static void emit_section(WBuf *out, uint8_t id, WBuf *body) {
 
 static uint32_t count_imported(P *p, uint8_t kind) {
   uint32_t n = 0;
-  for (uint32_t i = 0; i < p->im.n; i++) if (p->im.v[i].kind == kind) n++;
+  /* an empty group's entry imports nothing */
+  for (uint32_t i = 0; i < p->im.n; i++)
+    if (p->im.v[i].kind == kind && !p->im.v[i].empty) n++;
   return n;
 }
 
@@ -3033,37 +3266,16 @@ static uint8_t *assemble(P *p, size_t *len_out) {
             run_end++;
           wb_name(&sec, im->mod);
           wb_u32(&sec, 0);
-          wb_byte(&sec, 0x7f);
-          wb_u32(&sec, run_end - i);
+          wb_byte(&sec, im->shared ? 0x7e : 0x7f);
+          /* 0x7e: the one type its members share, ahead of their names */
+          if (im->shared) write_import_type(&sec, p, im);
+          wb_u32(&sec, im->empty ? 0 : run_end - i);
         }
       }
+      if (im->empty) continue;
       if (!im->group) wb_name(&sec, im->mod);
       wb_name(&sec, im->nm);
-      wb_byte(&sec, im->kind);
-      switch (im->kind) {
-        case EK_FUNC: wb_u32(&sec, p->fn.v[im->index].type); break;
-        case EK_TABLE: {
-          WTable *t = &p->tb.v[im->index];
-          write_valtype(&sec, t->elem);
-          write_limits(&sec, t->min, t->max, t->has_max, t->index64);
-          break;
-        }
-        case EK_MEM: {
-          WMem *m = &p->mem.v[im->index];
-          write_limits(&sec, m->min, m->max, m->has_max, m->index64);
-          break;
-        }
-        case EK_GLOBAL: {
-          WGlobal *g = &p->gl.v[im->index];
-          write_valtype(&sec, g->type);
-          wb_byte(&sec, g->mut ? 1 : 0);
-          break;
-        }
-        case EK_TAG:
-          wb_byte(&sec, 0x00);
-          wb_u32(&sec, p->tg.v[im->index].type);
-          break;
-      }
+      if (!im->shared) write_import_type(&sec, p, im);
     }
     emit_section(&out, 2, &sec);
   }

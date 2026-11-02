@@ -290,7 +290,9 @@ static void identify_group(Module *m, uint32_t first, uint32_t n) {
     mix(&g, t->has_super ? 1 : 0);
     if (t->has_super) mix_type_ref(&g, m, t->super, first, n);
     mix(&g, t->kind);
-    if (t->kind == CT_FUNC) {
+    if (t->kind == CT_CONT) {
+      mix_type_ref(&g, m, t->cont_ft < m->ntypes ? t->cont_ft : 0, first, n);
+    } else if (t->kind == CT_FUNC) {
       mix(&g, t->nparams);
       for (uint32_t j = 0; j < t->nparams; j++)
         mix_valtype(&g, m, t->params[j], first, n);
@@ -328,6 +330,9 @@ static bool id_types_alike(const Module *m, const CompType *a,
     return false;
   if (a->has_super && m->types[a->super].id != m->types[b->super].id)
     return false;
+  if (a->kind == CT_CONT)
+    return a->cont_ft < m->ntypes && b->cont_ft < m->ntypes &&
+           m->types[a->cont_ft].id == m->types[b->cont_ft].id;
   if (a->kind == CT_FUNC) {
     if (a->nparams != b->nparams || a->nresults != b->nresults) return false;
     for (uint32_t i = 0; i < a->nparams; i++)
@@ -393,21 +398,24 @@ static void build_display(Module *m, uint32_t i) {
   t->display[t->depth] = t->id;
 }
 
-typedef enum { HH_FUNC, HH_EXTERN, HH_ANY, HH_EXN } HeapHier;
+typedef enum { HH_FUNC, HH_EXTERN, HH_ANY, HH_EXN, HH_CONT } HeapHier;
 
 static HeapHier heap_hier(const Module *m, HeapType h) {
   if (h >= 0)
-    return m->types[h].kind == CT_FUNC ? HH_FUNC : HH_ANY;
+    return m->types[h].kind == CT_FUNC ? HH_FUNC
+         : m->types[h].kind == CT_CONT ? HH_CONT : HH_ANY;
   switch (h) {
     case HT_EXTERN: case HT_NOEXTERN: return HH_EXTERN;
     case HT_EXN: case HT_NOEXN: return HH_EXN;
+    case HT_CONT: case HT_NOCONT: return HH_CONT;
     case HT_FUNC: case HT_NOFUNC: return HH_FUNC;
     default: return HH_ANY;
   }
 }
 
 static bool heap_is_bottom(HeapType h) {
-  return h == HT_NOFUNC || h == HT_NOEXTERN || h == HT_NONE || h == HT_NOEXN;
+  return h == HT_NOFUNC || h == HT_NOEXTERN || h == HT_NONE || h == HT_NOEXN ||
+         h == HT_NOCONT;
 }
 
 static int any_rank(HeapType h) {
@@ -423,6 +431,7 @@ static HeapType concrete_top(const Module *m, HeapType h) {
   switch (m->types[h].kind) {
     case CT_STRUCT: return HT_STRUCT;
     case CT_ARRAY:  return HT_ARRAY;
+    case CT_CONT:   return HT_CONT;
     default:        return HT_FUNC;
   }
 }
@@ -467,6 +476,7 @@ ValType vt_join(const Module *m, ValType a, ValType b) {
     case HH_FUNC: return vt_ref(nul, HT_FUNC);
     case HH_EXTERN: return vt_ref(nul, HT_EXTERN);
     case HH_EXN: return vt_ref(nul, HT_EXN);
+    case HH_CONT: return vt_ref(nul, HT_CONT);
     default: return vt_ref(nul, HT_ANY);
   }
 }
@@ -501,8 +511,20 @@ static void layout_struct(Module *m, CompType *t) {
   t->hdr_size = GC_HDR_BYTES;
 }
 
+bool g_wasm30;
+
 static void parse_comptype(Module *m, Rd *r, CompType *t) {
   uint8_t form = rd_u8(r);
+  if (form == 0x5d && !g_wasm30) {
+    /* (cont $ft): validate.c checks that $ft is a function type */
+    int64_t ft = rd_s33(r);
+    if (ft < 0)
+      warmc_malformed("type %u: a continuation type of an abstract heap type",
+                      (uint32_t)(t - m->types));
+    t->kind = CT_CONT;
+    t->cont_ft = ft > VT_HEAP_MAX ? VT_HEAP_MAX : (uint32_t)ft;
+    return;
+  }
   if (form == 0x5f) {
     t->kind = CT_STRUCT;
     t->nfields = rd_count(r);
@@ -666,6 +688,20 @@ static void parse_import_desc(Module *m, Rd *r, Import *im, uint32_t index) {
   }
 }
 
+/* Past an import's extern type, reading what parse_import_desc reads */
+static void skip_import_desc(Rd *r, uint8_t kind) {
+  uint64_t min, max;
+  bool has_max, index64;
+  switch (kind) {
+    case EK_FUNC: rd_u32(r); break;
+    case EK_TABLE: rd_reftype_checked(r); rd_limits(r, &min, &max, &has_max, &index64); break;
+    case EK_MEM: rd_limits(r, &min, &max, &has_max, &index64); break;
+    case EK_GLOBAL: rd_valtype_checked(r); rd_mutability(r); break;
+    case EK_TAG: rd_tag_attribute_and_type(r); break;
+    default: warmc_malformed("unknown import kind %d", kind);
+  }
+}
+
 static void parse_imports(Module *m, Rd *r) {
   uint32_t nentries = rd_count(r);
   m->nimports = 0;
@@ -679,7 +715,7 @@ static void parse_imports(Module *m, Rd *r) {
     /* Compact import section (binaryen --enable-compact-imports): an entry
        with an empty field name and kind byte 0x7f is a group -- one module
        name shared by a vector of imports written without theirs. */
-    if (kind == 0x7f) {
+    if (kind == 0x7f && !g_wasm30) {
       if (name_len != 0)
         warmc_malformed("compact import group with a non-empty field name");
       uint32_t gn = rd_count(r);
@@ -690,6 +726,26 @@ static void parse_imports(Module *m, Rd *r) {
         im->name = rd_name(r, &im->name_len);
         im->kind = (ExternKind)rd_u8(r);
         parse_import_desc(m, r, im, m->nimports - 1);
+      }
+      continue;
+    }
+    /* ... and 0x7e, a group whose imports share one extern type too,
+       written once ahead of their names */
+    if (kind == 0x7e && !g_wasm30) {
+      if (name_len != 0)
+        warmc_malformed("compact import group with a non-empty field name");
+      uint8_t k = rd_u8(r);
+      Rd desc = *r;
+      skip_import_desc(r, k);
+      uint32_t gn = rd_count(r);
+      for (uint32_t i = 0; i < gn; i++) {
+        Import *im = PUSH(imports, nimports, Import);
+        im->module = module;
+        im->module_len = module_len;
+        im->name = rd_name(r, &im->name_len);
+        im->kind = (ExternKind)k;
+        Rd d = desc;
+        parse_import_desc(m, &d, im, m->nimports - 1);
       }
       continue;
     }
@@ -1067,6 +1123,12 @@ void wasm_skip_core_rectype(Rd *r) {
 void module_free(Module *m) {
   if (!m) return;
   xfree(m->customs);
+  for (uint32_t i = 0; i < m->ncont_sites; i++) {
+    xfree(m->cont_sites[i].kinds);
+    xfree(m->cont_sites[i].handlers);
+  }
+  xfree(m->cont_sites);
+  xfree(m->cont_first);
   for (uint32_t i = 0; i < m->ntypes; i++) {
     xfree(m->types[i].params); xfree(m->types[i].results); xfree(m->types[i].display);
     xfree(m->types[i].fields);

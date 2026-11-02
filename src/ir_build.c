@@ -2,6 +2,7 @@
 #include "opcodes.h"
 #include "target.h"
 
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -48,6 +49,9 @@ typedef struct {
 
   uint32_t *pads; uint32_t npads, cap_pads;
   uint32_t ntry;
+  /* the stack-switching instructions read so far, dead ones too: the next
+     one is the function's site of that number (module_cont_sites) */
+  uint32_t ncont;
 
   ValType **btypes; uint32_t nbtypes, cap_btypes;
 } Bld;
@@ -1278,6 +1282,198 @@ static void gc_build(Bld *b, uint32_t sub, const char *sym) {
   }
 }
 
+/* ---- stack switching ---- */
+
+static pthread_mutex_t g_cont_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static uint8_t ck_of(ValType t) {
+  switch (t) {
+    case VT_I32: return CK_I32;
+    case VT_I64: return CK_I64;
+    case VT_F32: return CK_F32;
+    case VT_F64: return CK_F64;
+    case VT_V128: return CK_V128;
+    default: return CK_REF;
+  }
+}
+
+static const CompType *cont_type_ft(const Module *m, uint32_t ct) {
+  return &m->types[m->types[ct].cont_ft];
+}
+
+static const CompType *tag_ft(const Module *m, uint32_t tag) {
+  return &m->types[m->tags[tag].type_index];
+}
+
+/* one site's record: the kinds of in (n of them, a continuation after them
+   when with_cont) and out */
+static void cont_site_set(ContSiteInfo *s, const ValType *in, uint32_t nin, bool with_cont,
+                          const ValType *out, uint32_t nout) {
+  s->nin = nin + (with_cont ? 1u : 0u);
+  s->nout = nout;
+  s->kinds = xmalloc(s->nin + s->nout + 1);
+  for (uint32_t i = 0; i < nin; i++) s->kinds[i] = ck_of(in[i]);
+  if (with_cont) s->kinds[nin] = CK_REF;
+  for (uint32_t i = 0; i < nout; i++) s->kinds[s->nin + i] = ck_of(out[i]);
+}
+
+/* The module's stack-switching instructions, read from the bodies of the
+   functions validation found them in, in function and code order -- the
+   order ir_build meets them in, which names each by its number in its
+   function -- once, whichever thread asks first. */
+const ContSiteInfo *module_cont_sites(Module *m) {
+  pthread_mutex_lock(&g_cont_lock);
+  if (!m->cont_built) {
+    uint32_t cap = 0;
+    m->cont_first = xcalloc((size_t)m->nfuncs + 1, sizeof(uint32_t));
+    for (uint32_t fi = 0; fi < m->nfuncs; fi++) {
+      m->cont_first[fi] = m->ncont_sites;
+      const Func *fn = &m->funcs[fi];
+      if (!fn->uses_cont || fn->imported || !fn->body) continue;
+      Rd r = rd_make(fn->body, fn->body_end, m->bin);
+      while (!rd_eof(&r)) {
+        uint32_t op = wasm_read_op(&r);
+        if (op < 0xe0 || op > 0xe6) {
+          if (!wasm_skip_imm(&r, op))
+            warmc_fatal("internal: function %u: an opcode the site table cannot read", fi);
+          continue;
+        }
+        if (m->ncont_sites == cap) {
+          cap = cap ? cap * 2 : 16;
+          m->cont_sites = xrealloc(m->cont_sites, cap * sizeof(ContSiteInfo));
+        }
+        ContSiteInfo *s = &m->cont_sites[m->ncont_sites++];
+        memset(s, 0, sizeof *s);
+        s->op = (uint8_t)(op - 0xe0);
+        switch (op) {
+          case 0xe0: {
+            ValType fr = VT_FUNCREF, k = vt_ref(false, (HeapType)rd_u32(&r));
+            cont_site_set(s, &fr, 1, false, &k, 1);
+            break;
+          }
+          case 0xe1: {
+            const CompType *f1 = cont_type_ft(m, rd_u32(&r));
+            uint32_t ct2 = rd_u32(&r);
+            const CompType *f2 = cont_type_ft(m, ct2);
+            ValType k = vt_ref(false, (HeapType)ct2);
+            cont_site_set(s, f1->params, f1->nparams - f2->nparams, true, &k, 1);
+            break;
+          }
+          case 0xe2: {
+            s->tag = rd_u32(&r);
+            const CompType *tt = tag_ft(m, s->tag);
+            cont_site_set(s, tt->params, tt->nparams, false, tt->results, tt->nresults);
+            break;
+          }
+          case 0xe3: case 0xe4: case 0xe5: {
+            const CompType *ft = cont_type_ft(m, rd_u32(&r));
+            if (op == 0xe4) s->tag = rd_u32(&r);
+            if (op == 0xe3) {
+              cont_site_set(s, ft->params, ft->nparams, true, ft->results, ft->nresults);
+            } else if (op == 0xe4) {
+              const CompType *et = tag_ft(m, s->tag);
+              cont_site_set(s, et->params, et->nparams, true, ft->results, ft->nresults);
+            } else {
+              ValType x = vt_ref(true, HT_EXN);
+              cont_site_set(s, &x, 1, true, ft->results, ft->nresults);
+            }
+            s->nhandlers = rd_u32(&r);
+            s->handlers = xmalloc(2 * sizeof(uint32_t) * (s->nhandlers + 1));
+            for (uint32_t k = 0; k < s->nhandlers; k++) {
+              s->handlers[2 * k] = rd_u8(&r);
+              s->handlers[2 * k + 1] = rd_u32(&r);
+              if (s->handlers[2 * k] == 0) (void)rd_u32(&r);
+            }
+            break;
+          }
+          case 0xe6: {
+            const CompType *f1 = cont_type_ft(m, rd_u32(&r));
+            s->tag = rd_u32(&r);
+            const CompType *f2 =
+                cont_type_ft(m, vt_type_index(f1->params[f1->nparams - 1]));
+            cont_site_set(s, f1->params, f1->nparams, false, f2->params, f2->nparams);
+            break;
+          }
+        }
+      }
+    }
+    m->cont_first[m->nfuncs] = m->ncont_sites;
+    m->cont_built = true;
+  }
+  pthread_mutex_unlock(&g_cont_lock);
+  return m->cont_sites;
+}
+
+/* the site of the stack-switching instruction op ir_build has just read */
+static uint32_t cont_site(Bld *b, uint32_t op) {
+  Module *m = b->m;
+  module_cont_sites(m);
+  uint32_t fi = b->f->func_index;
+  uint32_t i = m->cont_first[fi] + b->ncont++;
+  if (i >= m->cont_first[fi + 1] || m->cont_sites[i].op != op - 0xe0)
+    warmc_fatal("internal: function %u: a stack-switching instruction the site "
+                "table does not have", fi);
+  return i;
+}
+
+/* The instruction at site, its operands the stack's top nin values, and
+   the way it goes on when it may throw. */
+static Ref cont_emit(Bld *b, uint32_t site, bool throws) {
+  IrFunc *f = b->f;
+  uint32_t nin = b->m->cont_sites[site].nin;
+  uint32_t base = b->sp - nin;
+  Ref op = ir_emit(f, b->cur, I_CONT_OP, VT_I32, &b->stack[base], nin, site, 0);
+  b->sp = base;
+  if (throws) eh_split(b);
+  return op;
+}
+
+static Ref cont_get(Bld *b, uint32_t blk, uint32_t i, ValType t) {
+  return ir_emit(b->f, blk, I_CONT_GET, t, NULL, 0, i, 0);
+}
+
+/* A resume's ways on: its own (0), and each (on $t $l) handler's (1 + k),
+   which reads the tag's payload and the continuation and goes to $l; an
+   (on $t switch) handler's is never taken. */
+static void cont_dispatch(Bld *b, Ref op, uint32_t nh, const uint32_t *kind,
+                          const uint32_t *label) {
+  IrFunc *f = b->f;
+  bool any = false;
+  for (uint32_t k = 0; k < nh; k++) any |= kind[k] == 0;
+  if (!any) return;
+  uint32_t from = b->cur;
+  uint32_t normal = new_block(b, NULL, 0);
+  set_term(b, from, T_BRTABLE);
+  f->blocks[from].term_arg = op;
+  ir_add_edge(f, from, normal, NULL, 0);
+  for (uint32_t k = 0; k < nh; k++) {
+    if (kind[k] != 0) { ir_add_edge(f, from, normal, NULL, 0); continue; }
+    if (label[k] >= b->nctl) warmc_fatal("handler label depth %u out of range", label[k]);
+    Ctl *t = &b->ctl[b->nctl - 1 - label[k]];
+    uint32_t hb = new_block(b, NULL, 0);
+    ir_add_edge(f, from, hb, NULL, 0);
+    f->blocks[hb].sealed = true;
+    uint32_t arity = t->kind == C_LOOP ? t->nparams : t->nresults;
+    const ValType *lt = t->kind == C_LOOP ? t->params : t->results;
+    Ref *args = xmalloc((arity ? arity : 1) * sizeof(Ref));
+    for (uint32_t i = 0; i < arity; i++) args[i] = cont_get(b, hb, i, lt[i]);
+    if (t->kind == C_FUNC) {
+      Block *rb = &f->blocks[hb];
+      rb->term = T_RETURN;
+      rb->nret = arity;
+      rb->ret_args = ir_alloc(f, (arity ? arity : 1) * sizeof(Ref));
+      memcpy(rb->ret_args, args, arity * sizeof(Ref));
+    } else {
+      jump_to(b, hb, t->target, args, arity);
+      if (t->kind != C_LOOP) t->after_reached = true;
+    }
+    xfree(args);
+  }
+  ir_add_edge(f, from, normal, NULL, 0);
+  f->blocks[normal].sealed = true;
+  b->cur = normal;
+}
+
 IrFunc *ir_build_unordered(Module *m, uint32_t fi, const OptOpts *opt) {
   Func *fn = &m->funcs[fi];
   IrFunc *f = ir_new(m, fi);
@@ -1310,6 +1506,7 @@ IrFunc *ir_build_unordered(Module *m, uint32_t fi, const OptOpts *opt) {
 
       Rd r = rd_make(b->rd.p - 1, b->rd.end, b->rd.start);
       uint32_t full = wasm_read_op(&r);
+      if (full >= 0xe0 && full <= 0xe6) b->ncont++;
       if (!wasm_skip_imm(&r, full))
         warmc_malformed("unknown opcode 0x%02x in unreachable code", op);
       b->rd.p = r.p;
@@ -1413,6 +1610,65 @@ IrFunc *ir_build_unordered(Module *m, uint32_t fi, const OptOpts *opt) {
         Ref x = pop(b);
         ir_emit(f, b->cur, I_THROW_REF, VT_BOT, &x, 1, 0, 0);
         end_with_throw(b);
+        break;
+      }
+
+      /* ---- stack switching: each a call of the runtime's, what it gives
+         back read after it (I_CONT_OP, I_CONT_GET) ---- */
+      case 0xe0: {
+        uint32_t ct = rdu32(b);
+        uint32_t site = cont_site(b, op);
+        (void)cont_emit(b, site, false);
+        push(b, cont_get(b, b->cur, 0, vt_ref(false, (HeapType)ct)));
+        break;
+      }
+      case 0xe1: {
+        (void)rdu32(b);
+        uint32_t ct2 = rdu32(b);
+        uint32_t site = cont_site(b, op);
+        (void)cont_emit(b, site, false);
+        push(b, cont_get(b, b->cur, 0, vt_ref(false, (HeapType)ct2)));
+        break;
+      }
+      case 0xe2: {
+        uint32_t tag = rdu32(b);
+        uint32_t site = cont_site(b, op);
+        (void)cont_emit(b, site, true);
+        const CompType *tt = tag_ft(m, tag);
+        for (uint32_t i = 0; i < tt->nresults; i++)
+          push(b, cont_get(b, b->cur, i, tt->results[i]));
+        break;
+      }
+      case 0xe3: case 0xe4: case 0xe5: {
+        uint32_t ct = rdu32(b);
+        if (op == 0xe4) (void)rdu32(b);
+        uint32_t nh = rdu32(b);
+        uint32_t *kind = xmalloc((nh + 1) * sizeof(uint32_t));
+        uint32_t *label = xmalloc((nh + 1) * sizeof(uint32_t));
+        for (uint32_t k = 0; k < nh; k++) {
+          kind[k] = rd8(b);
+          (void)rdu32(b);
+          label[k] = kind[k] == 0 ? rdu32(b) : 0;
+        }
+        uint32_t site = cont_site(b, op);
+        Ref x = cont_emit(b, site, true);
+        cont_dispatch(b, x, nh, kind, label);
+        xfree(kind);
+        xfree(label);
+        const CompType *ft = cont_type_ft(m, ct);
+        for (uint32_t i = 0; i < ft->nresults; i++)
+          push(b, cont_get(b, b->cur, i, ft->results[i]));
+        break;
+      }
+      case 0xe6: {
+        uint32_t ct = rdu32(b);
+        (void)rdu32(b);
+        uint32_t site = cont_site(b, op);
+        (void)cont_emit(b, site, true);
+        const CompType *f1 = cont_type_ft(m, ct);
+        const CompType *f2 = cont_type_ft(m, vt_type_index(f1->params[f1->nparams - 1]));
+        for (uint32_t i = 0; i < f2->nparams; i++)
+          push(b, cont_get(b, b->cur, i, f2->params[i]));
         break;
       }
 

@@ -90,9 +90,12 @@ typedef int32_t HeapType;
 #define HT_EXN      (-0x17)
 
 #define HT_NOEXN    (-0x0c)
+/* the stack-switching proposal's: continuations, and their bottom */
+#define HT_CONT     (-0x18)
+#define HT_NOCONT   (-0x0b)
 
-#define HT_BYTE_LO 0x69
-#define HT_BYTE_HI 0x74
+#define HT_BYTE_LO 0x68
+#define HT_BYTE_HI 0x75
 #define HT_OF_BYTE(b) ((HeapType)(b) - 0x80)
 
 typedef uint32_t ValType;
@@ -170,6 +173,11 @@ static inline uint8_t vt_abi_code(ValType t) {
 }
 const char *vt_name(ValType t);
 
+/* --wasm=3.0: what is past Wasm 3.0 refused -- stack switching (its types,
+   instructions and tags with results) and compact import groups -- as 3.0
+   has none of it (parse.c; the JIT's per compile) */
+extern bool g_wasm30;
+
 typedef struct {
   ValType type;
   bool mutable_;
@@ -177,7 +185,8 @@ typedef struct {
   uint32_t offset;
 } FieldType;
 
-typedef enum { CT_FUNC = 0, CT_STRUCT = 1, CT_ARRAY = 2 } CompKind;
+/* CT_CONT: a continuation type, (cont $ft), of the function type cont_ft */
+typedef enum { CT_FUNC = 0, CT_STRUCT = 1, CT_ARRAY = 2, CT_CONT = 3 } CompKind;
 
 enum {
   RTK_ANY = 0, RTK_EQ, RTK_I31, RTK_STRUCT, RTK_ARRAY,
@@ -201,6 +210,13 @@ enum {
 
 #define EXN_VALS_OFF 32u
 
+/* rt/warm_rt.h's ContSite: a stack-switching instruction's record, its op
+   and the kinds of the values it passes */
+#define CONT_SITE_BYTES 32u
+enum { CONT_NEW = 0, CONT_BIND, CONT_SUSPEND, CONT_RESUME, CONT_RESUME_THROW,
+       CONT_RESUME_THROW_REF, CONT_SWITCH };
+enum { CK_I32 = 0, CK_I64, CK_F32, CK_F64, CK_V128, CK_REF };
+
 #define STRUCT_MAX_BYTES (1u << 28)
 
 typedef struct {
@@ -215,6 +231,9 @@ typedef struct {
   uint32_t nfields;
 
   uint32_t body_size;
+
+  /* a continuation type's function type */
+  uint32_t cont_ft;
 
   uint32_t hdr_size;
   bool final_;
@@ -270,7 +289,21 @@ typedef struct {
   uint32_t import_index;
   char *sym;
   char *name;   /* the name section's name for it, or NULL */
+  /* a stack-switching instruction is in its body (validate.c) */
+  bool uses_cont;
 } Func;
+
+/* A stack-switching instruction of the module's, as the runtime's ContSite
+   carries it (rt/warm_rt.h): its op (CONT_NEW ..), the tag it names, the
+   kinds (CK_I32 ..) of the nin values it takes and of the nout it gives
+   back on its own way, and its handlers' kinds and tags, two words each */
+typedef struct {
+  uint8_t op;
+  uint32_t tag;
+  uint32_t nin, nout, nhandlers;
+  uint8_t *kinds;
+  uint32_t *handlers;
+} ContSiteInfo;
 
 typedef enum {
 #define CONST_OP(name, extra) IOP_##name,
@@ -430,6 +463,13 @@ typedef struct {
   uint8_t **owned_bodies;
   uint32_t nowned_bodies;
 
+  /* the stack-switching instructions, function by function in their
+     order, and where each function's first is (module_cont_sites) */
+  ContSiteInfo *cont_sites;
+  uint32_t ncont_sites;
+  uint32_t *cont_first;
+  bool cont_built;
+
   bool *reached;
   /* per function, whether its address can leave its code: exported, or
      named by a segment or a global's or table's initialiser -- validate.c's
@@ -488,7 +528,7 @@ static inline bool vt_ref_collectable(const Module *m, ValType t) {
   }
   switch (vt_heap(t)) {
     case HT_FUNC: case HT_NOFUNC: case HT_NOEXTERN: case HT_NONE:
-    case HT_NOEXN: case HT_I31:
+    case HT_NOEXN: case HT_NOCONT: case HT_I31:
       return false;
     default:
       return true;
@@ -505,6 +545,8 @@ void wasm_check_utf8(const uint8_t *p, uint32_t n);
 size_t wasm_utf8_prefix(const uint8_t *p, size_t n);
 void wasm_validate(Module *m);
 void module_free(Module *m);
+/* the module's stack-switching sites, worked out once (ir_build.c) */
+const ContSiteInfo *module_cont_sites(Module *m);
 uint32_t module_add_distinct_func_type(Module *m, const ValType *params, uint32_t nparams,
                                        const ValType *results, uint32_t nresults);
 uint32_t *module_type_canon(const Module *m);
@@ -597,10 +639,15 @@ enum {
   TRAP_HEAP_OOM = 14,
   TRAP_ARRAY_OOB = 15,
   TRAP_CAST = 16,
+  /* stack switching's: a null continuation, one already resumed, bound or
+     switched to, and a suspension no handler takes */
+  TRAP_NULL_CONT = 17,
+  TRAP_CONT_CONSUMED = 18,
+  TRAP_UNHANDLED_TAG = 19,
   TRAP_LINK = 100
 };
 
-#define TRAP_CODE_COUNT 17
+#define TRAP_CODE_COUNT 20
 
 typedef struct {
   uint32_t pc;

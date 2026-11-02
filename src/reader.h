@@ -92,10 +92,16 @@ static inline int64_t rd_i64(Rd *r) { return rd_sleb(r, 64); }
 
 static inline int64_t rd_s33(Rd *r) { return rd_sleb(r, 33); }
 
+/* cont and nocont, the stack-switching proposal's, past 3.0 */
+static inline bool ht_byte_ok(uint8_t b) {
+  return b >= HT_BYTE_LO && b <= HT_BYTE_HI &&
+         !(g_wasm30 && (b == 0x68 || b == 0x75));
+}
+
 static inline HeapType rd_heaptype(Rd *r) {
   const uint8_t *save = r->p;
   uint8_t b = rd_u8(r);
-  if (b >= HT_BYTE_LO && b <= HT_BYTE_HI) return HT_OF_BYTE(b);
+  if (ht_byte_ok(b)) return HT_OF_BYTE(b);
   if (b == 0x62)
     warmc_malformed(
         "malformed heap type: exact reference types (the custom-descriptors "
@@ -121,8 +127,7 @@ static inline HeapType rd_heaptype(Rd *r) {
 
 static inline bool vt_starts_here(uint8_t b) {
   return b == VT_I32 || b == VT_I64 || b == VT_F32 || b == VT_F64 ||
-         b == VT_V128 || b == 0x63 || b == 0x64 ||
-         (b >= HT_BYTE_LO && b <= HT_BYTE_HI);
+         b == VT_V128 || b == 0x63 || b == 0x64 || ht_byte_ok(b);
 }
 
 static inline ValType rd_valtype(Rd *r) {
@@ -133,7 +138,7 @@ static inline ValType rd_valtype(Rd *r) {
     case 0x63: return vt_ref(true, rd_heaptype(r));
     case 0x64: return vt_ref(false, rd_heaptype(r));
   }
-  if (b >= HT_BYTE_LO && b <= HT_BYTE_HI) return vt_ref(true, HT_OF_BYTE(b));
+  if (ht_byte_ok(b)) return vt_ref(true, HT_OF_BYTE(b));
   warmc_malformed("unknown value type 0x%02x", b);
 }
 

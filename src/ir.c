@@ -790,7 +790,8 @@ static bool call_arm(const IrFunc *f, uint32_t bi) {
   for (int steps = 0; steps < 8; steps++) {
     for (uint32_t i = 0; i < b->ninsts && !calls; i++) {
       uint16_t op = f->insts[b->insts[i]].op;
-      calls = op == I_CALL || op == I_CALL_INDIRECT || op == I_CALL_REF;
+      calls = op == I_CALL || op == I_CALL_INDIRECT || op == I_CALL_REF ||
+              op == I_CONT_OP;
     }
     if (b->term != T_JUMP || b->nsuccs != 1 || b->succs[0].eh) return false;
     uint32_t t = b->succs[0].target;
@@ -1617,7 +1618,7 @@ const char *ir_op_name(uint16_t op) {
     N(I_VDOTI7, "vdoti7"), N(I_VDOTI7ADD, "vdoti7add"),
     N(I_VTRUNCSAT, "vtruncsat"), N(I_VCONVERT, "vconvert"),
     N(I_VDEMOTE, "vdemote"), N(I_VPROMOTE, "vpromote"),
-    N(I_THROW, "throw"), N(I_THROW_REF, "throw_ref"),
+    N(I_THROW, "throw"), N(I_THROW_REF, "throw_ref"), N(I_CONT_OP, "cont.op"), N(I_CONT_GET, "cont.get"),
     N(I_EXN_OBJ, "exn.obj"), N(I_EXN_PAYLOAD, "exn.payload"),
     N(I_MEM_LIMIT, "mem.limit"),
     N(I_STRUCT_NEW, "struct.new"), N(I_FIELD_GET, "field.get"),
@@ -1822,7 +1823,7 @@ void ir_verify(IrFunc *f, const char *stage) {
                     "empty block", stage, bi, f->m->funcs[f->func_index].sym);
       uint16_t last = f->insts[b->insts[b->ninsts - 1]].op;
       if (last != I_CALL && last != I_CALL_INDIRECT && last != I_CALL_REF &&
-          last != I_THROW && last != I_THROW_REF)
+          last != I_THROW && last != I_THROW_REF && last != I_CONT_OP)
         warmc_fatal("ir_verify(%s): b%u in %s reaches a landing pad but ends "
                     "in %s", stage, bi, f->m->funcs[f->func_index].sym,
                     ir_op_name(last));

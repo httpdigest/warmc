@@ -15,6 +15,13 @@ static const OpInfo OPCODES[] = {
   { 0x08, "throw", IMM_TAG, 0, NULL },
   { 0x0a, "throw_ref", IMM_NONE, 0, NULL },
   { 0x1f, "try_table", IMM_TRY_TABLE, 0, NULL },
+  { 0xe0, "cont.new", IMM_TYPE, 0, NULL },
+  { 0xe1, "cont.bind", IMM_TYPE_TYPE, 0, NULL },
+  { 0xe2, "suspend", IMM_TAG, 0, NULL },
+  { 0xe3, "resume", IMM_RESUME, 0, NULL },
+  { 0xe4, "resume_throw", IMM_RESUME_THROW, 0, NULL },
+  { 0xe5, "resume_throw_ref", IMM_RESUME, 0, NULL },
+  { 0xe6, "switch", IMM_TYPE_U32, 0, NULL },
   { 0x0b, "end", IMM_NONE, 0, NULL },
   { 0x0c, "br", IMM_LABEL, 0, NULL },
   { 0x0d, "br_if", IMM_LABEL, 0, NULL },
@@ -752,6 +759,26 @@ bool wasm_walk_imm(Rd *r, uint32_t op, WasmTypeFn on_type, void *ctx) {
     case IMM_F32: rd_u32le(r); break;
     case IMM_F64: rd_u64le(r); break;
     case IMM_V128: rd_u64le(r); rd_u64le(r); break;
+    case IMM_TYPE_TYPE: {
+      uint32_t t = rd_u32(r);
+      if (on_type) on_type(t, ctx);
+      t = rd_u32(r);
+      if (on_type) on_type(t, ctx);
+      break;
+    }
+    case IMM_RESUME: case IMM_RESUME_THROW: {
+      uint32_t t = rd_u32(r);
+      if (on_type) on_type(t, ctx);
+      if (oi->imm == IMM_RESUME_THROW) rd_u32(r);
+      uint32_t n = rd_u32(r);
+      for (uint32_t i = 0; i < n; i++) {
+        uint8_t kind = rd_u8(r);
+        if (kind > 1) warmc_malformed("unknown handler clause 0x%02x", kind);
+        rd_u32(r);
+        if (kind == 0) rd_u32(r);
+      }
+      break;
+    }
   }
   return true;
 }

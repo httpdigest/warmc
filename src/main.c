@@ -195,6 +195,9 @@ static const char *usage_text =
   "  --profile=P   compile for a wasm profile: full (default) or\n"
   "                deterministic.  Unrelated to the bare --profile above,\n"
   "                which is warmc's own instruction counter\n"
+  "  --wasm=3.0    refuse what is past Wasm 3.0: stack switching (its types,\n"
+  "                instructions and tags with results) and compact import\n"
+  "                groups\n"
   "  -c            emit a relocatable object and stop\n"
   "  --shared      build a shared library (.dylib, .so, .dll) that other\n"
   "                programs call through their C FFI: each exported function\n"
@@ -1163,6 +1166,8 @@ static int warmc_main(int argc, char **argv) {
      a global in an argument or a frame's stores left out, whatever their
      own flags and their order say */
   compile_finish_opts(&opt);
+  /* every module this run reads is read so */
+  g_wasm30 = opt.wasm30;
   if (!input) { fputs(usage_text, stderr); return 2; }
   /* A library's runtime finds its module as warmc_module; the prefix names
      the library's C helpers instead. */

@@ -160,8 +160,10 @@ static uint32_t call_out_bytes(IrFunc *f, uint32_t tail_bytes) {
     for (uint32_t i = 0; i < b->ninsts; i++) {
       Ref v = b->insts[i];
       uint16_t op = f->insts[v].op;
+      /* a stack switch's operands go to its own area, its three
+         arguments in registers to a trampoline that makes its own room */
       if (!op_clobbers_caller_saved(op) || op == I_RETURN_CALL ||
-          op == I_RETURN_CALL_INDIRECT || op == I_RETURN_CALL_REF)
+          op == I_RETURN_CALL_INDIRECT || op == I_RETURN_CALL_REF || op == I_CONT_OP)
         continue;
       bool wc = op == I_CALL || op == I_CALL_INDIRECT || op == I_CALL_REF;
       wasm_call |= wc;
@@ -1781,7 +1783,8 @@ static int produce_body_x64(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
   s->exn_slot = s->fpsave_off + 8u * nfp;
 
   s->throw_area_off = (s->exn_slot + (s->has_pads ? 8u : 0u) + 15u) & ~15u;
-  s->frame = s->throw_area_off + s->throw_area_bytes;
+  s->cont_area_off = (s->throw_area_off + s->throw_area_bytes + 15u) & ~15u;
+  s->frame = s->cont_area_off + s->cont_area_bytes;
   s->frame = (s->frame + 15) & ~15u;
   {
     int list[NCS_GPR];

@@ -2454,6 +2454,51 @@ static void emit_inst(Isel *s, Ref v) {
       break;
     }
 
+    /* warmc_cont_op(vm, site, area): the operands into the frame's area,
+       sixteen bytes each, and the way on back in eax; what the instruction
+       gives back is in the area after it (I_CONT_GET) */
+    case I_CONT_OP: {
+      csa_save(s, v);
+      for (uint32_t i = 0; i < in->nargs; i++) {
+        int32_t at = (int32_t)(s->cont_area_off + ARG_STACK_SLOT * i);
+        Ref x = a[i];
+        if (is_vec_value(f, x))
+          x64_vmovdqu_store(B, rd(s, x, FTMP), X_RSP, X64_NOIDX, 0, at);
+        else if (is_fp_value(f, x))
+          x64_vmovs_store(B, 1, rd(s, x, FTMP), X_RSP, X64_NOIDX, 0, at);
+        else
+          x64_store64(B, rd(s, x, TMP0), X_RSP, X64_NOIDX, 0, at);
+      }
+      x64_mov_rr(B, 1, X_RCX, REG_VMCTX);
+      x64_mov_ri(B, 0, X_RDX, in->imm);
+      x64_lea(B, 1, X_R8, X_RSP, X64_NOIDX, 0, (int32_t)s->cont_area_off);
+      emit_call_sym(s, "warmc_cont_op");
+      note_site(s);
+      note_safepoint(s, v);
+      s->mem_valid = false;
+      commit(s, v, X_RAX);
+      csa_restore(s, v);
+      break;
+    }
+    case I_CONT_GET: {
+      int32_t off = (int32_t)(s->cont_area_off + ARG_STACK_SLOT * (uint32_t)in->imm);
+      if ((ValType)in->type == VT_V128) {
+        int d = wr(s, v, F0);
+        x64_vmovdqu_load(B, d, X_RSP, X64_NOIDX, 0, off);
+        commit(s, v, d);
+      } else if (vt_is_float((ValType)in->type)) {
+        int d = wr(s, v, F0);
+        x64_vmovs_load(B, wide, d, X_RSP, X64_NOIDX, 0, off);
+        commit(s, v, d);
+      } else {
+        int d = wr(s, v, S0);
+        if (wide) x64_load64(B, d, X_RSP, X64_NOIDX, 0, off);
+        else x64_load32(B, d, X_RSP, X64_NOIDX, 0, off);
+        commit(s, v, d);
+      }
+      break;
+    }
+
     case I_EXN_OBJ: {
       int d = wr(s, v, S0);
       x64_load64(B, d, X_RSP, X64_NOIDX, 0, (int32_t)s->exn_slot);

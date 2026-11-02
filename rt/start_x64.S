@@ -334,6 +334,164 @@ warmc_throw_ref:
     GC_TRAMPOLINE warmc_array_new_data
     GC_TRAMPOLINE warmc_array_new_elem
 
+/* warmc_cont_op(vm rcx, site rdx, area r8): a stack-switching instruction
+   (rt/cont.inc).  Its frame is kept in the store's GcCtx as an
+   allocation's is, with the low halves of xmm8-15 (GCCTX_FPR), and taken
+   up again from there.  warmc_cont_op_w gives back 0 for a return to the
+   caller, with status 0, or the context of the fiber to run, which
+   warmc_cont_jump takes up: its callee-saved registers and stack, at the
+   return address of its own warmc_cont_op, which returns the context's
+   status (GCCTX_STATUS).  No frame of this one's stays on a stack that
+   waits. */
+#define GCCTX_FPR    96
+#define GCCTX_STATUS 168
+    .globl warmc_cont_op
+warmc_cont_op:
+#if defined(WARMC_JIT)
+    movq   VM_STORE(%rcx), %rax
+    addq   $STORE_GC_CTX, %rax
+#else
+    leaq   warmc_store0+STORE_GC_CTX(%rip), %rax
+#endif
+    movq   %rsi,  0(%rax)
+    movq   %rdi,  8(%rax)
+    movq   %rbx, 16(%rax)
+    movq   %rbp, 24(%rax)
+    movq   %r12, 32(%rax)
+    movq   %r13, 40(%rax)
+    movq   %r14, 48(%rax)
+    movq   %r15, 56(%rax)
+    leaq   8(%rsp), %r10
+    movq   %r10, 80(%rax)
+    movq   (%rsp), %r10
+    movq   %r10, 88(%rax)
+    movq   %xmm8,  GCCTX_FPR+0(%rax)
+    movq   %xmm9,  GCCTX_FPR+8(%rax)
+    movq   %xmm10, GCCTX_FPR+16(%rax)
+    movq   %xmm11, GCCTX_FPR+24(%rax)
+    movq   %xmm12, GCCTX_FPR+32(%rax)
+    movq   %xmm13, GCCTX_FPR+40(%rax)
+    movq   %xmm14, GCCTX_FPR+48(%rax)
+    movq   %xmm15, GCCTX_FPR+56(%rax)
+    subq   $40, %rsp
+#if defined(WARMC_JIT)
+    movq   %rax, 32(%rsp)
+#endif
+    callq  warmc_cont_op_w
+    testq  %rax, %rax
+    jnz    1f
+#if defined(WARMC_JIT)
+    movq   32(%rsp), %r10
+#else
+    leaq   warmc_store0+STORE_GC_CTX(%rip), %r10
+#endif
+    addq   $40, %rsp
+    movq    0(%r10), %rsi
+    movq    8(%r10), %rdi
+    movq   16(%r10), %rbx
+    movq   24(%r10), %rbp
+    movq   32(%r10), %r12
+    movq   40(%r10), %r13
+    movq   48(%r10), %r14
+    movq   56(%r10), %r15
+    ret
+1:  movq   %rax, %rcx
+
+/* warmc_cont_jump(ctx rcx): the fiber whose context ctx is taken up where it
+   waits, its warmc_cont_op returning ctx's status */
+    .globl warmc_cont_jump
+warmc_cont_jump:
+    movq    0(%rcx), %rsi
+    movq    8(%rcx), %rdi
+    movq   16(%rcx), %rbx
+    movq   24(%rcx), %rbp
+    movq   32(%rcx), %r12
+    movq   40(%rcx), %r13
+    movq   48(%rcx), %r14
+    movq   56(%rcx), %r15
+    movq   GCCTX_FPR+0(%rcx),  %xmm8
+    movq   GCCTX_FPR+8(%rcx),  %xmm9
+    movq   GCCTX_FPR+16(%rcx), %xmm10
+    movq   GCCTX_FPR+24(%rcx), %xmm11
+    movq   GCCTX_FPR+32(%rcx), %xmm12
+    movq   GCCTX_FPR+40(%rcx), %xmm13
+    movq   GCCTX_FPR+48(%rcx), %xmm14
+    movq   GCCTX_FPR+56(%rcx), %xmm15
+    movq   80(%rcx), %rsp
+    movq   GCCTX_STATUS(%rcx), %rax
+    jmpq   *88(%rcx)
+
+/* a fiber's first frame: warmc_fiber_run(fiber, in rsi's place), which
+   never returns, at the top of its stack */
+    .globl warmc_fiber_entry
+warmc_fiber_entry:
+    movq   %rsi, %rcx
+    subq   $32, %rsp
+    callq  warmc_fiber_run
+    int3
+
+/* warmc_fiber_invoke: warmc_invoke_s for a fiber's function, whose call's
+   return address, warmc_fiber_ret, is where the collector's frame walk and
+   the unwinder know a fiber's frames end by (rt/cont.inc).  A label of its
+   own is safe here: COFF's linker moves no code away from it. */
+    .globl warmc_fiber_invoke
+    .globl warmc_fiber_ret
+warmc_fiber_invoke:
+    pushq  %rbx
+    subq   $672, %rsp
+    movups %xmm6,  512(%rsp)
+    movups %xmm7,  528(%rsp)
+    movups %xmm8,  544(%rsp)
+    movups %xmm9,  560(%rsp)
+    movups %xmm10, 576(%rsp)
+    movups %xmm11, 592(%rsp)
+    movups %xmm12, 608(%rsp)
+    movups %xmm13, 624(%rsp)
+    movups %xmm14, 640(%rsp)
+    movups %xmm15, 656(%rsp)
+    movq   728(%rsp), %rax
+    movq   736(%rsp), %r10
+    movq   $480, %r11
+    cmpq   %r11, %r10
+    cmova  %r11, %r10
+    leaq   32(%rsp), %r11
+    testq  %r10, %r10
+    jz     2f
+1:  movq   (%rax), %rbx
+    movq   %rbx, (%r11)
+    addq   $8, %rax
+    addq   $8, %r11
+    subq   $8, %r10
+    jnz    1b
+2:  movq   %rcx, %r11
+    movq   %rdx, %rcx
+    movq   720(%rsp), %rbx
+    movups   (%r9), %xmm0
+    movups 16(%r9), %xmm1
+    movups 32(%r9), %xmm2
+    movups 48(%r9), %xmm3
+    movq     (%r8), %rdx
+    movq   16(%r8), %r9
+    movq    8(%r8), %r8
+    leaq   32(%rbx), %r10
+    callq  *%r11
+warmc_fiber_ret:
+    movq   %rax,  (%rbx)
+    movups %xmm0, 16(%rbx)
+    movups 512(%rsp), %xmm6
+    movups 528(%rsp), %xmm7
+    movups 544(%rsp), %xmm8
+    movups 560(%rsp), %xmm9
+    movups 576(%rsp), %xmm10
+    movups 592(%rsp), %xmm11
+    movups 608(%rsp), %xmm12
+    movups 624(%rsp), %xmm13
+    movups 640(%rsp), %xmm14
+    movups 656(%rsp), %xmm15
+    addq   $672, %rsp
+    popq   %rbx
+    ret
+
 /* Load-barrier stub.  Contract with isel_x64: slot address in R10, value in
    R11, result back in R11; everything else the generated code could hold
    live is preserved (flags excepted -- the isel's test/jcc consumed them).

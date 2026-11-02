@@ -441,7 +441,21 @@ $(TESTSUITE_STAMP):
 	@rm -f $(BUILD)/testsuite/.commit-*
 	@touch $@
 
-testsuite: $(TESTSUITE_STAMP)
+# The stack-switching proposal's tests, which its own repository keeps
+# (test/core/stack-switching), pinned likewise
+STACK_SWITCHING_COMMIT := d9fbe345495d15af623b981440d6aaacd5ad015c
+STACK_SWITCHING_STAMP  := $(BUILD)/stack-switching/.commit-$(STACK_SWITCHING_COMMIT)
+
+$(STACK_SWITCHING_STAMP):
+	@mkdir -p $(BUILD)
+	@test -d $(BUILD)/stack-switching/.git || \
+	  git clone -q https://github.com/WebAssembly/stack-switching.git $(BUILD)/stack-switching
+	@cd $(BUILD)/stack-switching && { git checkout -q $(STACK_SWITCHING_COMMIT) 2>/dev/null || \
+	  { git fetch -q origin && git checkout -q $(STACK_SWITCHING_COMMIT); }; }
+	@rm -f $(BUILD)/stack-switching/.commit-*
+	@touch $@
+
+testsuite: $(TESTSUITE_STAMP) $(STACK_SWITCHING_STAMP)
 
 # test/spec/run.py reads this line to know which version to insist on.
 WASM_TOOLS_VERSION := 1.263.0

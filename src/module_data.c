@@ -239,6 +239,11 @@ void codegen_prewarm_symbols(Module *m, ObjBuilder *o) {
   for (size_t i = 0; i < sizeof helpers / sizeof helpers[0]; i++)
     obj_intern_sym(o, helpers[i], SYM_UNDEF_FUNC, -1, 0);
   if (g_pin) obj_intern_sym(o, "warmc_xenter", SYM_UNDEF_FUNC, -1, 0);
+  for (uint32_t i = 0; i < m->nfuncs; i++)
+    if (m->funcs[i].uses_cont) {
+      obj_intern_sym(o, "warmc_cont_op", SYM_UNDEF_FUNC, -1, 0);
+      break;
+    }
   if (g_memop_r) {
     obj_intern_sym(o, "warmc_memmove_r", SYM_UNDEF_FUNC, -1, 0);
     obj_intern_sym(o, "warmc_memset_r", SYM_UNDEF_FUNC, -1, 0);
@@ -1485,7 +1490,9 @@ void codegen_emit_module_data(Module *m, ObjBuilder *o) {
      exception */
   bool walked = !m->sole_instance || m->ntags;
   for (uint32_t i = 0; i < m->ntypes && !walked; i++)
-    if (m->types[i].kind == CT_STRUCT || m->types[i].kind == CT_ARRAY) walked = true;
+    if (m->types[i].kind == CT_STRUCT || m->types[i].kind == CT_ARRAY ||
+        m->types[i].kind == CT_CONT)
+      walked = true;
   for (uint32_t i = 0; i < g_nunwind && walked; i++) {
     const FuncUnwind *u = &g_unwind[i];
     if (!(u->saved & UW_HAS_LR)) continue;
@@ -1603,6 +1610,48 @@ void codegen_emit_module_data(Module *m, ObjBuilder *o) {
   }
   xfree(exnrefs_off); xfree(exnrefs_n);
 
+  /* The stack-switching sites (rt/warm_rt.h ContSite), each one's handlers
+     and kinds after them all, at offsets from the site. */
+  module_cont_sites(m);
+  uint32_t ncs = m->ncont_sites;
+  uint64_t cont_off = 0;
+  if (ncs) {
+    buf_align(&o->rodata, 8);
+    cont_off = o->rodata.len;
+    uint64_t *hpos = xmalloc(ncs * sizeof(uint64_t));
+    uint64_t *kpos = xmalloc(ncs * sizeof(uint64_t));
+    uint64_t pos = cont_off + (uint64_t)CONT_SITE_BYTES * ncs;
+    for (uint32_t i = 0; i < ncs; i++) {
+      const ContSiteInfo *cs = &m->cont_sites[i];
+      pos = (pos + 3) & ~(uint64_t)3;
+      hpos[i] = pos;
+      pos += 8ull * cs->nhandlers;
+      kpos[i] = pos;
+      pos += cs->nin + cs->nout;
+    }
+    for (uint32_t i = 0; i < ncs; i++) {
+      const ContSiteInfo *cs = &m->cont_sites[i];
+      uint64_t at = o->rodata.len;
+      buf_u8(&o->rodata, cs->op);
+      buf_u8(&o->rodata, 0); buf_u8(&o->rodata, 0); buf_u8(&o->rodata, 0);
+      buf_u32(&o->rodata, cs->tag);
+      buf_u32(&o->rodata, cs->nin);
+      buf_u32(&o->rodata, cs->nout);
+      buf_u32(&o->rodata, cs->nhandlers);
+      buf_u32(&o->rodata, (uint32_t)(int32_t)(int64_t)(kpos[i] - at));
+      buf_u32(&o->rodata, (uint32_t)(int32_t)(int64_t)(kpos[i] + cs->nin - at));
+      buf_u32(&o->rodata, (uint32_t)(int32_t)(int64_t)(hpos[i] - at));
+    }
+    for (uint32_t i = 0; i < ncs; i++) {
+      const ContSiteInfo *cs = &m->cont_sites[i];
+      while (o->rodata.len < hpos[i]) buf_u8(&o->rodata, 0);
+      for (uint32_t k = 0; k < 2 * cs->nhandlers; k++) buf_u32(&o->rodata, cs->handlers[k]);
+      for (uint32_t k = 0; k < cs->nin + cs->nout; k++) buf_u8(&o->rodata, cs->kinds[k]);
+    }
+    xfree(hpos);
+    xfree(kpos);
+  }
+
   buf_align(&o->data, 8);
   uint64_t desc_off = o->data.len;
   obj_intern_sym(o, module_sym(), SYM_GLOBAL_DATA, 2, desc_off);
@@ -1683,6 +1732,14 @@ void codegen_emit_module_data(Module *m, ObjBuilder *o) {
     buf_u64(&o->data, 0);
   }
   data_ptr(o, 2, ftypes_off);
+  /* only a module with stack-switching instructions has the table's fields,
+     which only its code's calls of the runtime read (warmc_cont_op): every
+     other module's descriptor stays as it was */
+  if (ncs) {
+    buf_u32(&o->data, ncs);
+    buf_u32(&o->data, 0);
+    data_ptr(o, 1, cont_off);
+  }
 
   uint64_t ictab_off = o->data.len;
   emit_icall_tables(m, o);

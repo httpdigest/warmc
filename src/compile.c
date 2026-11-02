@@ -937,6 +937,7 @@ void compile_default_opts(OptOpts *o) {
 /* -O<n> or -f[no-]<pass>, as the CLI takes them: true when a is one of them
    (an unknown pass name is a fatal diagnostic), false when it is not. */
 bool compile_parse_flag(OptOpts *o, const char *a) {
+  if (!strcmp(a, "--wasm=3.0")) { o->wasm30 = true; return true; }
   if (a[0] == '-' && a[1] == 'O' && a[2] >= '0' && a[2] <= '3' && !a[3]) {
     compile_set_level(o, a[2] - '0');
     return true;

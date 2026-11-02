@@ -694,6 +694,9 @@ static const char *trap_name(u32 code) {
     case TRAP_HEAP_OOM: return "allocation failed";
     case TRAP_ARRAY_OOB: return "out of bounds array access";
     case TRAP_CAST: return "cast failure";
+    case TRAP_NULL_CONT: return "null continuation reference";
+    case TRAP_CONT_CONSUMED: return "continuation already consumed";
+    case TRAP_UNHANDLED_TAG: return "unhandled tag";
 
     case TRAP_LINK: return "link failure, or an internal error above";
     case TRAP_HOST: return "host function trapped";
@@ -727,7 +730,7 @@ static void rt_invoke(void *fn, WarmInstance *v, const u64 *iargs,
 /* What a catching call finds of the collector's state when it starts, and
    puts back when a trap ends it: the roots the frames it unwound held go,
    its caller's stay. */
-typedef struct { void *roots; u32 from_wasm, no_collect; } GcCatch;
+typedef struct { void *roots; u32 from_wasm, no_collect; Fiber *fiber; } GcCatch;
 static void gc_catch_save(GcCatch *c);
 static void gc_after_trap(const GcCatch *c);
 static void gc_trap_round_arm(void);
@@ -1306,6 +1309,28 @@ extern char warmc_xenter[];
 #define XENTER_RET 0ull
 #endif
 
+/* warmc_fiber_invoke's call's return address (rt/start.S), where the
+   frames of a stack-switching fiber end, the frame of the resume that runs
+   it in its parent next (rt/cont.inc) */
+void warmc_fiber_invoke(void *fn, WarmInstance *vm, const u64 *iargs,
+                        const u64 *fargs, u64 *retbuf, const u64 *stk,
+                        u64 stk_bytes);
+#if defined(__x86_64__)
+extern char warmc_fiber_ret[];
+#define FIBER_RET ((u64)(uptr)warmc_fiber_ret)
+#else
+#define FIBER_RET_OFF 164   /* start.S checks it */
+#define FIBER_RET ((u64)(uptr)warmc_fiber_invoke + FIBER_RET_OFF)
+#endif
+static Fiber *cont_unwind_out(void);
+
+static WarmRegs regs_of_ctx(const GcCtx *c) {
+  WarmRegs r;
+  for (u32 i = 0; i < 10; i++) r.gpr[i] = c->gpr[i];
+  for (u32 i = 0; i < 8; i++) r.fpr[i] = c->fpr[i];
+  return r;
+}
+
 __attribute__((noreturn))
 static void unwind(WarmExn *exn, u64 pc, u64 sp, WarmRegs regs) {
   const WarmExn *xw = (const WarmExn *)(uptr)GC_CANON((u64)(uptr)exn);
@@ -1317,6 +1342,15 @@ static void unwind(WarmExn *exn, u64 pc, u64 sp, WarmRegs regs) {
       sp = fp + 32;
       pc = load64(fp + 8);
       fp = load64(fp);
+      continue;
+    }
+    if (pc == FIBER_RET) {
+      /* out of a fiber's function: on from its resume in the parent */
+      Fiber *p = cont_unwind_out();
+      regs = regs_of_ctx(&p->ctx);
+      sp = p->ctx.sp;
+      pc = p->ctx.pc;
+      fp = 0;
       continue;
     }
     const FuncUnwind *u = find_unwind(pc);
@@ -2038,6 +2072,10 @@ static void inst_sweep(void);
 
 void warmc_rt_thread_enter(u64 limit) {
   inst_sweep();
+  /* a host function a fiber called, calling in again: it runs on the
+     fiber's stack, whose limit stays */
+  if (ST->cont.cur) return;
+  ST->cont.root.limit = limit;
   if (limit == ST->g_stack_limit) return;
   ST->g_stack_limit = limit;
   for (u32 i = 0; i < ST->ninstances; i++)
@@ -2056,6 +2094,7 @@ _Static_assert(GC_MAX_TYPES <= (1u << 27),
                "a type index has to stay below the mark colour's high bit");
 
 static const GcTypeInfo gc_type_reserved;
+static const GcTypeInfo gc_type_cont;
 
 static void gc_typeinfo_fail(u32 id) {
   if (!id) die("a heap object names the reserved type index zero");
@@ -2448,7 +2487,8 @@ static void gc_init(void) {
     die("cannot reserve the type table");
 
   ST->gc_typetab[0] = &gc_type_reserved;
-  ST->gc_ntypes = 1;
+  ST->gc_typetab[1] = &gc_type_cont;
+  ST->gc_ntypes = 2;
   ST->gc_trigger = gc_min_trigger();
 }
 
@@ -2569,9 +2609,18 @@ static u32 gc_page_open(u32 ngran, u8 kind) {
   return (u32)g;
 }
 
+static u32 gc_opt_verify;
+
 static void gc_page_free(u32 h) {
   GcPage *P = &ST->gc_pages[h];
   u32 n = P->ngran;
+  /* WARMC_GC_VERIFY: what was freed poisoned, so that a reference a root
+     missed reads garbage rather than the object that was there; a page is
+     zeroed again when it is opened (dirty) */
+  if (gc_opt_verify) {
+    u64 *w = (u64 *)(void *)gc_gran_addr(h);
+    for (u64 i = 0; i < (u64)n * GC_GRAN / 8; i++) w[i] = 0xa5a5a5a5a5a5a5a5ull;
+  }
   for (u32 i = 0; i < n; i++) {
     ST->gc_pages[h + i].kind = GCP_FREE;
     ST->gc_pages[h + i].ngran = 0;
@@ -2757,11 +2806,14 @@ static void gc_reloc_slot(u64 *slot) {
   *slot = gc_heal_reloc(v);
 }
 
+static void gc_scan_cont(u8 *p);
+
 static void gc_scan_object(u8 *p) {
   const GcHeader *h = (const GcHeader *)p;
   const GcTypeInfo *ti = gc_typeinfo(h->w);
   gc_add_live(gc_head_of((GC_ADDR(p) - (u64)(uptr)ST->gc_base) >> GC_GRAN_SHIFT),
               gc_object_bytes_ti(h, ti));
+  if (ti->kind == GCK_CONT) { gc_scan_cont(p); return; }
   if (ti->kind == GCK_ARRAY) {
     if (!ti->elem_is_ref) return;
     u64 n = h->len;
@@ -2986,11 +3038,10 @@ static u64 load64(u64 addr);
 
 typedef void (*GcRootFn)(u64 *slot);
 
-static void gc_visit_frames(GcRootFn fn) {
-  if (!ST->gc_from_wasm) return;
-  u64 pc = ST->gc_ctx.pc, sp = ST->gc_ctx.sp;
-  u64 *gprloc[10];
-  for (u32 i = 0; i < 10; i++) gprloc[i] = &ST->gc_ctx.gpr[i];
+/* The frames from the one at pc and sp up, whose callee-saved registers
+   are at gprloc: to the end of the stack's, or to the end of a fiber's
+   (FIBER_RET), which it says by returning 1. */
+static u32 gc_walk_frames(u64 pc, u64 sp, u64 **gprloc, GcRootFn fn) {
   u64 fp = 0;
   for (u32 guard = 0; ; guard++) {
     if (guard > (1u << 24)) die("the collector's frame walk did not terminate");
@@ -3003,10 +3054,11 @@ static void gc_visit_frames(GcRootFn fn) {
       fp = load64(fp);
       continue;
     }
+    if (pc == FIBER_RET) return 1;
     const ModuleDesc *md = 0;
     const FuncUnwind *u = find_unwind_in(pc, &md);
 
-    if (!u) return;
+    if (!u) return 0;
     u32 off = (u32)(pc - (u64)(uptr)u->code);
 
     const u8 *s = u->gcsites;
@@ -3025,7 +3077,7 @@ static void gc_visit_frames(GcRootFn fn) {
       }
       break;
     }
-    if (!(u->saved & UW_HAS_LR)) return;
+    if (!(u->saved & UW_HAS_LR)) return 0;
     u64 entry = sp + u->frame + u->saved_bytes;
     u64 next_pc = load64(entry - 8);
     fp = load64(entry - 16);
@@ -3043,6 +3095,25 @@ static void gc_visit_frames(GcRootFn fn) {
     }
     sp = entry;
     pc = next_pc;
+  }
+}
+
+/* The program's frames: the running fiber's, and up through the fibers
+   whose resumes run it, each waiting at its ctx, to the root's. */
+static void gc_visit_frames(GcRootFn fn) {
+  if (!ST->gc_from_wasm) return;
+  u64 *gprloc[10];
+  for (u32 i = 0; i < 10; i++) gprloc[i] = &ST->gc_ctx.gpr[i];
+  u64 pc = ST->gc_ctx.pc, sp = ST->gc_ctx.sp;
+  Fiber *f = ST->cont.cur;
+  while (gc_walk_frames(pc, sp, gprloc, fn)) {
+    if (!f) die("the collector's frame walk left a fiber the store does not run");
+    f = f->parent;
+    if (!f) die("the collector's frame walk found a fiber with no parent");
+    for (u32 i = 0; i < 10; i++) gprloc[i] = &f->ctx.gpr[i];
+    pc = f->ctx.pc;
+    sp = f->ctx.sp;
+    if (f == &ST->cont.root) f = 0;
   }
 }
 
@@ -3073,6 +3144,8 @@ static void gc_visit_tables(GcRootFn fn) {
   }
 }
 
+static void cont_visit_roots(GcRootFn fn);
+
 static void gc_visit_strong_roots(GcRootFn fn) {
   gc_visit_frames(fn);
   gc_visit_globals(fn);
@@ -3084,6 +3157,7 @@ static void gc_visit_strong_roots(GcRootFn fn) {
   }
   for (GcRoots *r = ST->gc_rootlist; r; r = r->next)
     for (u32 i = 0; i < *r->n; i++) fn(&r->base[i]);
+  cont_visit_roots(fn);
 }
 
 static const unsigned char gc_jitter_shift[GCJ_N] = { 0, 0, 0, 0, 0 };
@@ -3368,7 +3442,6 @@ static u32 gc_round_mark_end(void) {
   return __atomic_load_n(&ST->gc_round_ok, __ATOMIC_RELAXED);
 }
 
-static u32 gc_opt_verify;
 static void gc_verify_fail(const char *what, u64 a) {
   eputs("gc: heap check failed: ");
   eputs(what);
@@ -3555,9 +3628,12 @@ static void gc_mark_start(void) {
   ST->gc_mut.alloc_since = 0;
   ST->gc_fast.ready = GC_EPOCH_READY(ST->gc_cycle_no);
   ST->gc_fast.marking = 1;
+  __atomic_store_n(&ST->cont.epoch, ST->cont.epoch + 1u, __ATOMIC_RELEASE);
   __atomic_store_n(&ST->gc_phase, GCPH_MARK, __ATOMIC_RELEASE);
   gc_visit_strong_roots(gc_mark_slot);
 }
+
+static void cont_sweep(void);
 
 static void gc_mark_finish(void) {
   __atomic_store_n(&ST->gc_mqp.pub, ST->gc_mqp.head, __ATOMIC_RELEASE);
@@ -3566,6 +3642,7 @@ static void gc_mark_finish(void) {
   ST->gc_fast.marking = 0;
   __atomic_store_n(&ST->gc_phase, GCPH_IDLE, __ATOMIC_RELEASE);
 
+  cont_sweep();
   gc_fwd_retire();
 
   for (u32 h = 0; h < ST->gc_gran_hwm; h++) {
@@ -3611,6 +3688,7 @@ static void gc_reloc_start(void) {
   gc_publish_colour();
 
   gc_lab_recolour();
+  __atomic_store_n(&ST->cont.epoch, ST->cont.epoch + 1u, __ATOMIC_RELEASE);
   __atomic_store_n(&ST->gc_phase, (u32)GCPH_RELOC, __ATOMIC_RELEASE);
   gc_visit_strong_roots(gc_reloc_slot);
 }
@@ -3931,12 +4009,16 @@ void warmc_gc_hold(u64 *base, const u32 *n, void *slot) {
 void warmc_gc_release(void *slot) { ST->gc_rootlist = ((GcRoots *)slot)->next; }
 
 static void gc_catch_save(GcCatch *c) {
+  c->fiber = ST->cont.cur;
   c->roots = ST->gc_rootlist;
   c->from_wasm = ST->gc_from_wasm;
   c->no_collect = ST->gc_no_collect;
 }
 
+static void cont_after_trap(Fiber *keep);
+
 static void gc_after_trap(const GcCatch *c) {
+  cont_after_trap(c->fiber);
   ST->gc_rootlist = (GcRoots *)c->roots;
   ST->gc_from_wasm = c->from_wasm;
   ST->gc_no_collect = c->no_collect;
@@ -3948,6 +4030,8 @@ static void gc_after_trap(const GcCatch *c) {
   gc_abort_round();
 }
 unsigned warmc_gc_hold_bytes(void) { return (unsigned)sizeof(GcRoots); }
+
+#include "cont.inc"
 
 static const GcTypeInfo *gc_type_of(WarmInstance *vm, u32 type_index, u32 *id) {
   Instance *in = INST_OF(vm);
@@ -5026,6 +5110,10 @@ static void gc_read_options(void) {
   { u64 kb = rt_getenv_u64("WARMC_GC_HEAP_KB", 0);
     if (kb) gc_opt_heap_bytes = kb * 1024ull;
     else gc_heap_from_cgroup(); }
+  /* each stack-switching fiber's stack, rounded to 64 KiB, the guard
+     page's granule on every target */
+  { u64 kb = rt_getenv_u64("WARMC_CONT_STACK_KB", 0);
+    if (kb) cont_stack_bytes = (kb * 1024ull + 0xffffull) & ~0xffffull; }
   gcth_spin = (u32)rt_getenv_u64("WARMC_GC_THREAD_SPIN", GCTH_SPINS);
   gc_opt_trap_round = (u32)rt_getenv_u64("WARMC_GC_TRAP_ROUND", 0);
   gc_opt_die_round = (u32)rt_getenv_u64("WARMC_GC_DIE_ROUND", 0);
@@ -5078,6 +5166,19 @@ static void gc_report(void) {
 
   put_u64_e(__atomic_load_n(&ST->gc_trigger, __ATOMIC_RELAXED));
   eputs(" byte trigger\n");
+  if (ST->cont.nmade) {
+    eputs("  continuations: ");
+    put_u64_e(ST->cont.nmade);
+    eputs(" fibers made, ");
+    put_u64_e(ST->cont.nswept);
+    eputs(" freed unreached, ");
+    put_u64_e(ST->cont.nlive);
+    eputs(" live, ");
+    put_u64_e(ST->cont.nmapped);
+    eputs(" stacks mapped, ");
+    put_u64_e(ST->cont.nswitch);
+    eputs(" switches\n");
+  }
   eputs("  relocated: ");
   put_u64_e(ST->gc_reloc_pages);
   eputs(" pages, ");
@@ -5756,6 +5857,7 @@ void warmc_rt_store_delete(Store *w) {
     gcth_nudge();
     gcth_join();
   }
+  cont_free_all();
   for (u32 i = 0; i < ST->ninstances; i++)
     if (ST->instances[i]) warmc_instance_free(&ST->instances[i]->vm);
   inst_sweep();

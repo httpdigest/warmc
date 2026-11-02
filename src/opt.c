@@ -7399,7 +7399,8 @@ static bool ks_copyable(IrFunc *f, uint32_t y) {
   for (uint32_t i = 0; i < b->ninsts; i++) {
     uint16_t op = f->insts[b->insts[i]].op;
     if (is_call_op(op) || op == I_RETURN_CALL || op == I_RETURN_CALL_INDIRECT ||
-        op == I_RETURN_CALL_REF || op == I_RESULT || op == I_THROW || op == I_THROW_REF)
+        op == I_RETURN_CALL_REF || op == I_RESULT || op == I_THROW || op == I_THROW_REF ||
+        op == I_CONT_GET)
       return false;
   }
   for (uint32_t s = 0; s < b->nsuccs; s++)
@@ -8214,7 +8215,7 @@ static const CallFx *call_effects(Module *m, const OptOpts *o, uint32_t fi,
 static bool is_call_op(uint16_t op) {
   return op == I_CALL || op == I_CALL_INDIRECT || op == I_CALL_REF ||
          op == I_RETURN_CALL || op == I_RETURN_CALL_INDIRECT ||
-         op == I_RETURN_CALL_REF;
+         op == I_RETURN_CALL_REF || op == I_CONT_OP;
 }
 
 /* ---- calls through a global a class initializer disarms (pass_once) ----
@@ -8577,6 +8578,9 @@ static void fx_scan_direct(Module *m, const OptOpts *o, uint32_t fi) {
 
         case I_CALL_INDIRECT: case I_RETURN_CALL_INDIRECT:
         case I_CALL_REF: case I_RETURN_CALL_REF:
+        /* a stack switch runs whatever the continuation or the handler
+           does next */
+        case I_CONT_OP:
           writes_globals = true;
           gany = true;
           writes_mem = true;
@@ -9000,7 +9004,8 @@ static void df_scan(Module *m, IrFunc *g, uint32_t fi) {
       Inst *in = &g->insts[v];
       Ref *a = ir_args(g, v);
       if (in->op == I_CALL_INDIRECT || in->op == I_CALL_REF ||
-          in->op == I_RETURN_CALL_INDIRECT || in->op == I_RETURN_CALL_REF)
+          in->op == I_RETURN_CALL_INDIRECT || in->op == I_RETURN_CALL_REF ||
+          in->op == I_CONT_OP)
         d->indirect = true;
       for (uint32_t j = 0; j < in->nargs; j++) {
         Ref x = a[j];
@@ -12820,7 +12825,7 @@ static void loop_effects(IrFunc *f, const OptOpts *o, const uint32_t *lblk,
           break;
         case I_CALL: case I_CALL_INDIRECT: case I_CALL_REF:
         case I_RETURN_CALL: case I_RETURN_CALL_INDIRECT:
-        case I_RETURN_CALL_REF: {
+        case I_RETURN_CALL_REF: case I_CONT_OP: {
           const CallFx *fx = site_effects(f, o, v);
           lf->may_grow = true;
           lf->gc_field_set_mask |= fx->gc_field_mask;
@@ -12900,6 +12905,7 @@ static bool stops_block(const Inst *in) {
   switch (in->op) {
     case I_CALL: case I_CALL_INDIRECT: case I_CALL_REF:
     case I_RETURN_CALL: case I_RETURN_CALL_INDIRECT: case I_RETURN_CALL_REF:
+    case I_CONT_OP: case I_CONT_GET:
 
     case I_THROW: case I_THROW_REF:
     case I_TRAP: case I_TRAP_IF:
@@ -13234,7 +13240,7 @@ static bool inst_hoistable(IrFunc *f, Ref v, bool reach_mem, bool reach_any,
 
 bool ir_op_is_gc_safepoint(uint16_t op) {
   switch (op) {
-    case I_CALL: case I_CALL_INDIRECT: case I_CALL_REF:
+    case I_CALL: case I_CALL_INDIRECT: case I_CALL_REF: case I_CONT_OP:
     case I_STRUCT_NEW: case I_ARRAY_NEW: case I_ARRAY_NEW_SEG:
     case I_THROW:
       return true;
@@ -14327,7 +14333,7 @@ static bool gl_round_trip(IrFunc *f, Ref v, Ref base, const Ref *subst,
 static bool gl_opaque(uint32_t op) {
   return op == I_CALL || op == I_CALL_INDIRECT || op == I_CALL_REF ||
          op == I_RETURN_CALL || op == I_RETURN_CALL_INDIRECT ||
-         op == I_RETURN_CALL_REF;
+         op == I_RETURN_CALL_REF || op == I_CONT_OP;
 }
 
 static bool lh_writes_mem(uint32_t op) {
@@ -21173,7 +21179,7 @@ static bool unroll_one(IrFunc *f, uint32_t hb, Ref *fixmap, uint32_t *cycleid,
       if (op == I_CALL || op == I_CALL_INDIRECT || op == I_CALL_REF ||
           op == I_RETURN_CALL || op == I_RETURN_CALL_INDIRECT ||
           op == I_RETURN_CALL_REF || op == I_RESULT ||
-          op == I_THROW || op == I_THROW_REF)
+          op == I_THROW || op == I_THROW_REF || op == I_CONT_OP || op == I_CONT_GET)
         UREJ("body makes a call", unr_rej_body);
       if (op == I_MEM_GROW || op == I_TABLE_GROW)
         UREJ("body grows state", unr_rej_body);

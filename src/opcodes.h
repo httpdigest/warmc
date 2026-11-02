@@ -37,7 +37,13 @@ typedef enum {
   IMM_BR_CAST,
   IMM_LANE,
   IMM_MEMARG_LANE,
-  IMM_LANES16
+  IMM_LANES16,
+  /* stack switching: two type indices (cont.bind); a continuation type and
+     handler clauses (resume, resume_throw_ref); and between them a tag
+     (resume_throw) */
+  IMM_TYPE_TYPE,
+  IMM_RESUME,
+  IMM_RESUME_THROW
 } ImmKind;
 
 typedef struct {

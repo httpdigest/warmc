@@ -606,6 +606,139 @@ SYM(\name):
     GC_TRAMPOLINE warmc_array_new_data
     GC_TRAMPOLINE warmc_array_new_elem
 
+/* warmc_cont_op(vm x0, site w1, area x2): a stack-switching instruction
+   (rt/cont.inc), its frame kept in the store's gc_ctx as an allocation's
+   is, with d8-d15 and x29 beside it (GCCTX_FPR, GCCTX_FP), from where it
+   is taken up again.  warmc_cont_op_w gives back 0 for a return to its
+   caller, with status 0, or the context of the fiber to run, which
+   warmc_cont_jump takes up: its callee-saved registers, frame pointer and
+   stack, and the status its own warmc_cont_op returns there (GCCTX_STATUS).
+   No frame of this one's stays on a stack that waits. */
+#define GCCTX_FPR    96
+#define GCCTX_FP     160
+#define GCCTX_STATUS 168
+    .globl SYM(warmc_cont_op)
+    FUNC_DIRECTIVES(SYM(warmc_cont_op))
+SYM(warmc_cont_op):
+    GC_ENTER
+    stp     d8,  d9,  [x9, #GCCTX_FPR]
+    stp     d10, d11, [x9, #GCCTX_FPR + 16]
+    stp     d12, d13, [x9, #GCCTX_FPR + 32]
+    stp     d14, d15, [x9, #GCCTX_FPR + 48]
+    str     x29, [x9, #GCCTX_FP]
+    stp     x29, x30, [sp, #-32]!
+    mov     x29, sp
+    str     x9, [sp, #16]
+    bl      SYM(warmc_cont_op_w)
+    cbnz    x0, 1f
+    GC_LEAVE
+    ldp     x29, x30, [sp], #32
+    ret
+1:  b       SYM(warmc_cont_jump)
+    SIZE_DIRECTIVE(SYM(warmc_cont_op))
+
+/* warmc_cont_jump(ctx x0): the fiber whose context ctx is taken up where it
+   waits, its warmc_cont_op returning ctx's status */
+    .globl SYM(warmc_cont_jump)
+    FUNC_DIRECTIVES(SYM(warmc_cont_jump))
+SYM(warmc_cont_jump):
+    ldp     x19, x20, [x0, #0]
+    ldp     x21, x22, [x0, #16]
+    ldp     x23, x24, [x0, #32]
+    ldp     x25, x26, [x0, #48]
+    ldp     x27, x28, [x0, #64]
+    ldp     x9, x30, [x0, #80]
+    ldp     d8,  d9,  [x0, #GCCTX_FPR]
+    ldp     d10, d11, [x0, #GCCTX_FPR + 16]
+    ldp     d12, d13, [x0, #GCCTX_FPR + 32]
+    ldp     d14, d15, [x0, #GCCTX_FPR + 48]
+    ldr     x29, [x0, #GCCTX_FP]
+    mov     sp, x9
+    ldr     x0, [x0, #GCCTX_STATUS]
+    br      x30
+    SIZE_DIRECTIVE(SYM(warmc_cont_jump))
+
+/* a fiber's first frame: warmc_fiber_run(fiber), which never returns, at
+   the top of its stack, the frame chain ending there */
+    .globl SYM(warmc_fiber_entry)
+    FUNC_DIRECTIVES(SYM(warmc_fiber_entry))
+SYM(warmc_fiber_entry):
+    mov     x0, x19
+    mov     x29, #0
+    mov     x30, #0
+    bl      SYM(warmc_fiber_run)
+    brk     #0
+    SIZE_DIRECTIVE(SYM(warmc_fiber_entry))
+
+/* warmc_fiber_invoke: warmc_invoke_s for a fiber's function, whose call's
+   return address, FIBER_RET_OFF bytes in, is where the collector's frame
+   walk and the unwinder know a fiber's frames end by (rt/cont.inc) */
+#define FIBER_RET_OFF 164
+    .globl SYM(warmc_fiber_invoke)
+    FUNC_DIRECTIVES(SYM(warmc_fiber_invoke))
+SYM(warmc_fiber_invoke):
+    stp     x29, x30, [sp, #-16]!
+    mov     x29, sp
+    stp     x19, x20, [sp, #-16]!
+    stp     x21, x22, [sp, #-16]!
+
+    add     x9, x6, #15
+    and     x9, x9, #-16
+    mov     x10, #512
+    cmp     x9, x10
+    csel    x9, x9, x10, hi
+    sub     sp, sp, x9
+    mov     x10, #0
+1:  cmp     x10, x6
+    b.hs    2f
+    ldr     x11, [x5, x10]
+    str     x11, [sp, x10]
+    add     x10, x10, #8
+    b       1b
+2:
+    mov     x21, x4
+    mov     x16, x0
+    mov     x17, x1
+
+    ldp     q0, q1, [x3, #0]
+    ldp     q2, q3, [x3, #32]
+    ldp     q4, q5, [x3, #64]
+    ldp     q6, q7, [x3, #96]
+
+    ldp     x9,  x10, [x2, #0]
+    ldp     x11, x12, [x2, #16]
+    ldp     x13, x14, [x2, #32]
+    ldr     x15,      [x2, #48]
+
+    mov     x0, x17
+    mov     x1, x9
+    mov     x2, x10
+    mov     x3, x11
+    mov     x4, x12
+    mov     x5, x13
+    mov     x6, x14
+    mov     x7, x15
+    add     x8, x21, #32
+
+    mov     x19, x17
+    cbz     x17, 3f
+    ldr     x20, [x17]
+3:
+    blr     x16
+LOCAL(fiber_ret):
+    str     x0, [x21, #0]
+    str     q0, [x21, #16]
+
+    sub     sp, x29, #32
+    ldp     x21, x22, [sp], #16
+    ldp     x19, x20, [sp], #16
+    ldp     x29, x30, [sp], #16
+    ret
+    .if LOCAL(fiber_ret) - SYM(warmc_fiber_invoke) - FIBER_RET_OFF
+    .error "warmc_fiber_invoke's return address is not FIBER_RET_OFF bytes in"
+    .endif
+    SIZE_DIRECTIVE(SYM(warmc_fiber_invoke))
+
 /* warmc_gc_load_stub: the load barrier's slow path, for a reference in x14
    whose colour is not the good one, loaded from the slot at x15; the healed
    reference comes back in x14 and every other register is as it was but

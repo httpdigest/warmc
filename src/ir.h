@@ -159,6 +159,15 @@ typedef enum {
      it for an object or an i31 (warmc_any_of_extern, rt.c) */
   I_ANY_OF_EXTERN, I_EXTERN_OF_ANY,
 
+  /* A stack-switching instruction, the module's site imm
+     (module_cont_sites), its operands the args: a call of the runtime
+     (warmc_cont_op) that may run any code before it returns, and may throw.
+     Its value is the way it goes on: 0 its own, 1 + k its handler k.  What
+     it gives back is read by I_CONT_GETs (imm the value's index) after it,
+     before anything else may run: in the block after it, or in the one its
+     dispatch goes to. */
+  I_CONT_OP, I_CONT_GET,
+
   I_NOP,
   I_OP_COUNT
 } IrOp;
@@ -600,6 +609,8 @@ typedef struct {
   bool profile;
 
   bool det_profile;
+  /* --wasm=3.0 (g_wasm30, set from it as a compile parses) */
+  bool wasm30;
 } OptOpts;
 
 bool ir_op_is_gc_safepoint(uint16_t op);
