@@ -2205,10 +2205,60 @@ static void gc_gran_mark_free(u64 g, u64 n, u32 free) {
    have not made room for (gc_alloc), which takes it as a last resort: a
    heap whose live data fills it should hold as much as it did without. */
 
+/* The free granule a page of one granule takes when there is a hole too
+   short for a medium page below the high-water mark: the first of the
+   shortest one.  Else -1, and it takes the first free granule as a larger
+   page does.  Holes fill first, so that a small page leaves the runs of
+   eight a medium page needs alone while it can -- in a small heap, one that
+   took the first free granule of the one such run left none, its objects
+   live for good and its page too full for relocation to move.  Taking
+   granules past the high-water mark before such a run kept them whole as
+   well, and cost the collecting kernels 3%, the heap growing into memory
+   it had not touched. */
+static u64 gc_gran_take_hole(void) {
+  u64 hole = (u64)-1, hole_len = GC_MEDIUM_GRAN;
+  u64 run = 0, start = 0, lim = ST->gc_gran_hwm;
+  for (u64 w = 0; w * 64 < lim; w++) {
+    u64 end = lim - w * 64 < 64 ? lim - w * 64 : 64;
+    u64 bits = ST->gc_granfree[w];
+    if (end < 64) bits &= (1ull << end) - 1;
+    for (u64 b = 0; b < end;) {
+      u64 rest = bits >> b;
+      if (rest & 1) {
+        /* free from b: to the next used granule, or to the word's end */
+        u64 len = ~rest ? (u64)__builtin_ctzll(~rest) : 64;
+        if (len > end - b) len = end - b;
+        if (!run) start = w * 64 + b;
+        run += len;
+        b += len;
+        continue;
+      }
+      /* used from b: a run before it ends */
+      if (run && run < hole_len) {
+        hole = start;
+        hole_len = run;
+        if (run == 1) return hole;
+      }
+      run = 0;
+      b += rest ? (u64)__builtin_ctzll(rest) : end - b;
+    }
+  }
+  return hole;
+}
+
 static u64 gc_gran_take(u32 n) {
   if (!ST->gc_evacuating && !ST->gc_reserve_open &&
       ST->gc_gran_used + n + ST->gc_reserve_gran > ST->gc_ngran)
     return (u64)-1;
+  if (n == 1) {
+    u64 g = gc_gran_take_hole();
+    if (g != (u64)-1) {
+      gc_gran_mark_free(g, 1, 0);
+      ST->gc_gran_used += 1;
+      if (ST->gc_gran_used > ST->gc_gran_peak) ST->gc_gran_peak = ST->gc_gran_used;
+      return g;
+    }
+  }
   u64 run = 0, start = 0;
   u64 lim = (ST->gc_gran_hwm + n + 64) / 64 + 1;
   if (lim > ST->gc_granfree_words) lim = ST->gc_granfree_words;
@@ -2582,7 +2632,15 @@ static u8 *gc_bump(u32 *pg, u32 ngran, u8 kind, u64 total) {
     }
     if (round) break;
     u32 h = gc_page_open(ngran, kind);
-    if (h == (u32)-1) return 0;
+    if (h == (u32)-1) {
+      /* No room in it and no page to open: it is let go, so that the
+         cycles the allocation waits for now may free or relocate it.  A
+         page allocation bumps into is neither, and the one an allocation
+         found too full stayed that, dead objects and all, for good -- in a
+         small heap, the eight granules a medium object needed. */
+      *pg = (u32)-1;
+      return 0;
+    }
     *pg = h;
   }
   return 0;
@@ -5340,9 +5398,46 @@ __attribute__((noreturn)) static void component_run(int argc, char **argv) {
   sys_exit(rc);
 }
 
+/* WARMC_GC_PLACETEST: where a page of one granule goes (gc_gran_take_hole),
+   in a heap of 24 granules laid out by hand -- a medium page's run of eight
+   free, below holes of one and two -- as each page taken changes it. */
+__attribute__((noreturn)) static void gc_place_selftest(void) {
+  ST->gc_heap_bytes = 24 * GC_GRAN;
+  gc_init();
+  u32 m = gc_page_open(GC_MEDIUM_GRAN, GCP_MEDIUM);
+  u32 p[7];
+  for (u32 i = 0; i < 7; i++) p[i] = gc_page_open(1, GCP_SMALL);
+  if (m != 0 || p[0] != 8 || p[6] != 14) {
+    eputs("gcplace: the layout did not come out as laid\n");
+    sys_exit(1);
+  }
+  /* free: 0-7, 9, 12-13; used: 8, 10, 11, 14; the high-water mark 15 */
+  gc_page_free(m);
+  gc_page_free(p[1]);
+  gc_page_free(p[4]);
+  gc_page_free(p[5]);
+  static const u32 want[] = { 9, 12, 13, 0, 1, 2 };
+  for (u32 i = 0; i < sizeof want / sizeof want[0]; i++) {
+    u32 g = gc_page_open(1, GCP_SMALL);
+    if (g != want[i]) {
+      eputs("gcplace: page ");
+      put_u64_e(i);
+      eputs(" took granule ");
+      put_u64_e(g);
+      eputs(", not ");
+      put_u64_e(want[i]);
+      eputs("\n");
+      sys_exit(1);
+    }
+  }
+  eputs("gcplace: ok\n");
+  sys_exit(0);
+}
+
 void warmc_gcth_run_tests(void) {
   { u64 n = rt_getenv_u64("WARMC_GC_THREADTEST", 0);
     if (n) gcth_selftest(n); }
+  if (rt_getenv("WARMC_GC_PLACETEST")) gc_place_selftest();
   if (rt_getenv("WARMC_GC_ROUNDS"))
     gcth_start_rounds(rt_getenv_u64("WARMC_GC_ROUNDS", 0));
 }

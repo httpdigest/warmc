@@ -93,5 +93,14 @@ if run_test exit 0 WARMC_GC_ROUNDS=0 WARMC_GC_STATS=1 WARMC_GC_STOP_WAIT_MS=5000
   fi
 fi
 
-if [ "$fail" -eq 0 ]; then say "5 passed, 0 failed"; else say "failed"; fi
+# Where a page of one granule goes (rt.c gc_gran_take_hole): into the
+# shortest hole that a medium page could not use, and only then into the
+# first free granule, of a run of eight that a medium page could -- in a
+# heap of 24 granules laid out by hand, page after page.
+if run_test place 0 WARMC_GC_PLACETEST=1; then
+  grep -q '^gcplace: ok$' "$WORK/place.log" ||
+    bad place "did not finish: $(tail -1 "$WORK/place.log")"
+fi
+
+if [ "$fail" -eq 0 ]; then say "6 passed, 0 failed"; else say "failed"; fi
 exit $fail

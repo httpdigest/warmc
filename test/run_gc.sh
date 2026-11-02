@@ -448,12 +448,14 @@ esac
 # A 4 MB heap with little room to spare (cases_gc/tightheap.wat): live data
 # on every page, of 1.75 to 3 MB, that only relocation frees; and one filled
 # past where the program's allocations stop for the room relocation keeps,
-# then an exception thrown.  Stopped-the-world and with the collector on its
-# thread.  Each passes with 256 KB or more of live data to spare, and one or
-# more runs out of memory without any one of: the room relocation keeps
-# (rt.c gc_reserve_gran), relocation's use of it and a last resort's, the
-# second cycle a failed allocation waits for, or the allocation buffers'
-# small pages.
+# then an exception thrown.  And a 1 MB heap whose one place for a medium
+# object is a medium page of dead ones that allocation still bumps into.
+# Stopped-the-world and with the collector on its thread.  Each passes with
+# 256 KB or more of live data to spare, and one or more runs out of memory
+# without any one of: the room relocation keeps (rt.c gc_reserve_gran),
+# relocation's use of it and a last resort's, the second cycle a failed
+# allocation waits for, the allocation buffers' small pages, or a page that
+# could not take an allocation let go (gc_bump).
 case "${WARMC_GC_STRESS:-}${WARMC_GC_RELOC:-}${WARMC_GC_RELOCATE_ALL:-}\
 ${WARMC_GC_RELOC_STALL:-}${WARMC_GC_MARK_STALL:-}${WARMC_GC_HEAP_KB:-}${WARMC_GC_MIN_KB:-}\
 ${WARMC_GC_GROWTH:-}${WARMC_GC_LAB:-}${WARMC_GC_ROUNDS:-}${WARMC_GC_CONC:-}\
@@ -467,6 +469,8 @@ ${WARMC_GC_JITTER:-}" in
       expect frag           "OK" 622592 20000 61 400 6
       expect frag_structs   "OK" 589824 20000 7 6
       expect full_then_throw "OK" 942
+      export WARMC_GC_HEAP_KB=1024
+      expect dead_medium_page "OK" 10 12000 40
       unset WARMC_GC_HEAP_KB WARMC_GC_CONC
     done
     ;;

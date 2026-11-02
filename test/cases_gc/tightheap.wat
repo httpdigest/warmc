@@ -20,6 +20,15 @@
 ;; the exception's object is allocated where no cycle may run (rt.c
 ;; exn_alloc), and takes that room at once.
 ;;
+;; dead_medium_page, in a 1 MB heap of sixteen granules, fills a medium page
+;; of eight -- the first -- with `n` arrays of `len` i32s that it drops,
+;; until the next one would not fit, then holds `small` arrays of 4 KB, which
+;; take most of the eight granules left; then makes one more medium array.
+;; Nowhere but in the dead medium page are eight granules free together,
+;; and that page is the one allocation bumps into: a cycle may free it only
+;; once the allocation that found no room in it has let it go (rt.c
+;; gc_bump).
+;;
 ;; An export fails with unreachable on the first value that is not what it
 ;; was, and runs out of memory with "allocation failed".
 (module
@@ -140,6 +149,35 @@
         (then (call $fail)))
       (if (i32.ne (array.get $a32 (local.get $a) (i32.const 1021))
                   (i32.xor (local.get $i) (i32.const -1)))
+        (then (call $fail)))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br $l))))
+
+  (func (export "dead_medium_page") (param $n i32) (param $len i32) (param $small i32)
+    (local $i i32) (local $k (ref $keep)) (local $a (ref $a32))
+    (block $d (loop $l
+      (br_if $d (i32.ge_u (local.get $i) (local.get $n)))
+      (local.set $a (array.new_default $a32 (local.get $len)))
+      (array.set $a32 (local.get $a) (i32.const 0) (local.get $i))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br $l)))
+    (local.set $k (array.new_default $keep (local.get $small)))
+    (local.set $i (i32.const 0))
+    (block $d (loop $l
+      (br_if $d (i32.ge_u (local.get $i) (local.get $small)))
+      (local.set $a (array.new_default $a32 (i32.const 1022)))
+      (array.set $a32 (local.get $a) (i32.const 0) (local.get $i))
+      (array.set $keep (local.get $k) (local.get $i) (local.get $a))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br $l)))
+    (local.set $a (array.new_default $a32 (local.get $len)))
+    (array.set $a32 (local.get $a) (i32.sub (local.get $len) (i32.const 1)) (i32.const 7))
+    (local.set $i (i32.const 0))
+    (block $d (loop $l
+      (br_if $d (i32.ge_u (local.get $i) (local.get $small)))
+      (if (i32.ne (array.get $a32 (ref.as_non_null (array.get $keep (local.get $k) (local.get $i)))
+                                  (i32.const 0))
+                  (local.get $i))
         (then (call $fail)))
       (local.set $i (i32.add (local.get $i) (i32.const 1)))
       (br $l))))
