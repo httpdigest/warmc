@@ -1373,7 +1373,10 @@ exists so that `test/run_nobar.sh` can show that a module without GC
 references compiles to the same bytes either way.
 
 `-j N` (or `WARMC_JOBS`) caps the number of compile threads. By default warmc
-picks a count from the module size and the number of cores. Functions are
+picks a count from the module size and the number of processors the process
+may use: those online, fewer where its affinity mask allows fewer, and on
+Linux fewer again where its cgroup v2 hierarchy's CPU quota does -- a
+container's `--cpus=1.5` is two. Functions are
 placed in index order whatever the scheduling, so the output does not depend
 on the count (`test/run_jobs.sh` checks it); `-j1` also makes the count
 exact, as a module with fewer functions than threads uses fewer.
@@ -1490,7 +1493,7 @@ as in `--target=macos`.
 | `WARMC_JOBS` | compiler | same as `-j` |
 | `WARMC_CACHE` | compiler | a directory that keeps what each compile did, under a digest of warmc itself, every argument (the output by its file name only), every file an argument names, every archive next to the runtime, and every `WARMC_` setting except the ones only a program reads: its exit status, what it printed, and its output. A compile whose digest is already there makes its output a hard link to the kept copy, prints what it printed then and exits as it did -- a refusal and the verdicts of `--validate-only` and `--dump-*` included. Not used with `--shared`, `--header`, `--keep-obj`, `--emit-wasm`, `--print-ir` or an external linker, nor for a compile that crashed. `make check` and the test scripts set it to `build/warmc-cache` |
 | `WARMC_TIME` | compiler | print phase timings, peak memory and the slowest functions |
-| `WARMC_GC_HEAP_KB` | program | GC heap reservation (default 1 GiB): each store's, in the JIT |
+| `WARMC_GC_HEAP_KB` | program | GC heap reservation (default 1 GiB, or on Linux half a cgroup's memory limit where that is less): each store's, in the JIT |
 | `WARMC_GC_MIN_KB`, `WARMC_GC_GROWTH` | program | collection trigger: minimum size (default 16384, or a quarter of the heap if that is less), and growth as a percentage of live data (default 200) |
 | `WARMC_GC_CONC` | program | `0` disables the background collector thread |
 | `WARMC_GC_STATS` | program | print a GC report at exit |
@@ -1498,6 +1501,8 @@ as in `--target=macos`.
 | `WARMC_GC_VERIFY`, `WARMC_GC_STRESS` | program | heap verification after each cycle; collect on every allocation |
 | `WARMC_GC_RELEASE` | program | return a freed run of at least this many bytes to the system (`madvise`); 0, the default, keeps them |
 | `WARMC_RANDOM_SEED` | program | make WASI preview 1 `random_get` deterministic |
+| `WARMC_LIMITS_DEBUG` | compiler, program, libwarmc | print the processors found (online, affinity, cgroup quota) and, on Linux, the heap a cgroup's memory limit gave |
+| `WARMC_CGROUP_ROOT` | compiler, program, libwarmc | a directory put in front of `/proc/self/cgroup`, `/proc/self/mountinfo` and the cgroup files: a tree laid out by hand, as `test/run_limits.sh` lays them out |
 | `WARMC_TIERED` | libwarmc | `1` makes every engine tiered; `wait`, also each module's compile waits for its optimised code; `host`, the first call out to the host (a host function's, or WASI's `fd_write`) waits for every module's |
 | `WARMC_TIER_DEFER` | libwarmc | a tiered module's optimised code goes in place only once something waits for it (`warm_module_optimized`, `WARMC_TIERED=host`) |
 | `WARMC_TIER_DEBUG` | libwarmc | print each tier-up: how many functions it sent on, and when |
@@ -1738,9 +1743,14 @@ working memory when it ends.
     medium page that there is, and only then into the first free granule,
     so that the runs of eight granules a medium object needs stay whole.
   - In the JIT, each store has a heap and a collector of its own. As many
-    stores' collectors run on threads at once as the machine has
-    processors; a store past them collects on its own thread until one
-    stops.
+    stores' collectors run on threads at once as the process may use
+    processors (as compile threads count them); a store past them collects
+    on its own thread until one stops.
+  - A heap reserves a gibibyte. On Linux, in a cgroup v2 hierarchy whose
+    memory is limited (a container's `--memory`), it reserves half the
+    least of `memory.max` and `memory.high` from the process's cgroup up,
+    if that is less, and 4 MiB at least: a heap that fills traps,
+    allocation failed, before the system stops the process for its memory.
   - The program stops only for short handshake rounds.
   - Roots come from precise per-call-site stack maps.
   - A load barrier in compiled code heals stale references. On AArch64 one
@@ -2238,6 +2248,11 @@ The other rows check what has no second engine to compare with:
   collector thread under load, and where a page of one granule goes in a
   heap laid out by hand (`run_gcthread.sh`); relaxed SIMD and `-ffma`
   (`test/cases_relaxed`, `cases_fma`) check their own answers too
+- what a cgroup v2 hierarchy limits the process to, in trees laid out by
+  hand -- nested limits, a mount whose root is the process's cgroup, an
+  escaped mount point, cgroup v1 alone, limits of "max" -- for the
+  compiler's processors and, in a Linux container, a program's heap, and
+  with a container's real `--cpus` and `--memory` (`test/run_limits.sh`)
 - that every spelling of an `-O` level compiles to the same bytes
   (`test/run_levels.sh`) and the thread count never reaches the output
   (`test/run_jobs.sh`)
@@ -2320,6 +2335,7 @@ src/            the compiler
   isel*.c isel_*.inc regalloc.inc         instruction selection and register allocation
   a64.c x64.c                             machine-code encoders
   codegen.c compile.c module_data.c       per-function emission, parallel driver, module descriptor
+  limits.c                                the processors the process may use: affinity, a cgroup's quota
   elf.c macho.c coff.c pe.c link.c        object writers and linker
   shlib.c                                 --shared: the C entry points, header and .def
   jit.c capi.c                            the JIT: compiling and placing a module, and the C API over it
@@ -2328,6 +2344,7 @@ include/        wasm.h (the WebAssembly C API) and warm.h (libwarmc's additions)
 rt/             the runtime linked into every program and shared library
   rt.c            instantiation, traps, GC, exceptions, CLI harness
   store.h                                 a store: what the runtime keeps for the instances that run together
+  cgroup.inc                              the CPU and memory limits a cgroup v2 hierarchy sets, for the runtime and the compiler
   start.S start_x64.S                     entry, invoke, throw and GC trampolines
   lib.c                                   a shared library's face: the C calls, its lock and its traps
   hook.c gcthook.c                        defaults that a driver, or the GC thread tests, replace
@@ -2396,6 +2413,10 @@ Makefile        the build, the pinned dependencies and the test targets
   its optimised code arrives stay in the `-O0` code until they return (no
   on-stack replacement), and the library makes one module's optimised code
   at a time, which another compile waits behind.
+- **Resource limits** come from a Linux cgroup v2 hierarchy and the
+  affinity mask alone: cgroup v1's quotas, a Windows job object's and
+  macOS's are not read. A memory limit sizes a GC heap; a linear memory may
+  grow past it, until the system stops the process.
 - **A shared library** holds one instance. Calls from several threads take
   turns on it, and its imports cannot be rebound once it has been made. It
   imports only functions, each of which C must be able to stand in for; on
