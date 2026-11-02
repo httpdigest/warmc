@@ -69,17 +69,30 @@ Hello world!
   calls**, **exception handling** (`try_table` / `exnref`), **memory64** and
   table64, **multi-memory**, and extended constant expressions. See
   [WebAssembly feature support](#webassembly-feature-support).
+- **Stack switching.** The stack-switching proposal's continuations
+  (`cont.new`, `cont.bind`, `suspend`, `resume`, `resume_throw`,
+  `resume_throw_ref`, `switch`) are on by default, ahead of time and in the
+  JIT, on every target. Each continuation runs on a stack of its own, and a
+  switch jumps straight from one fiber's compiled code to the other's: a
+  suspension and its resume take 21 ns together on an Apple M-series core
+  (a generator's ten million values in 0.21 s). `--wasm=3.0` refuses what
+  Wasm 3.0 does not have.
 - **Passes the official spec testsuite.** The 258 core `.wast` files of the
-  pinned upstream testsuite (its top level; its `proposals/`, `legacy/` and
-  `custom/` directories are not run) pass with zero failures: 6,928
-  validation and 60,743 execution checks, counting each module that must
-  compile and each instantiation as well as the assertions, at `-O1`, at
-  `-O2`, and at `-O2 --profile=deterministic`. The text format is checked
-  through warmc's own text front end: the quoted modules, malformed ones
-  among them, go to it directly, and the 5,121 modules the files write as
-  text are assembled by it to the bytes wasm-tools makes of them, except
-  for two where wasm-tools gives a function a type that is not final and
-  warmc follows the spec.
+  pinned upstream testsuite (its top level, compiled with `--wasm=3.0`), the
+  four of its `proposals/` directories for the compact import section and
+  the extended name section, and the stack-switching proposal's own tests
+  and seventeen example programs (schedulers, actors, pipes, generators,
+  async/await; from its repository, pinned by commit) pass with zero
+  failures: 7,184 validation and 61,029 execution checks, counting each
+  module that must compile and each instantiation as well as the
+  assertions, at `-O0`, `-O1`, `-O2`, `-O2 --profile=deterministic` and in
+  the JIT. The testsuite's other proposals' directories are of proposals
+  warmc does not implement, and `legacy/` and the top `custom/` are not
+  run. The text format is checked through warmc's own text front end: the
+  quoted modules, malformed ones among them, go to it directly, and the
+  5,398 modules the files write as text are assembled by it to the bytes
+  wasm-tools makes of them, except for two where wasm-tools gives a
+  function a type that is not final and warmc follows the spec.
 - **Optimising compiler.** It optimises over SSA with block parameters. Passes
   include:
   - inlining and devirtualisation, repeated as each exposes more: a call on
@@ -1467,6 +1480,7 @@ on each corpus (Apple M-series):
 | `--symbol-prefix=P` | name the module descriptor `P_module`; with `-c` and several modules, the i-th is named `Pi_module`; with `--shared`, the prefix of the library's own functions instead; ignored for a component |
 | `--custom-sections=default\|all\|none` | which of the module's custom sections the output carries (see [Custom sections](#custom-sections)); `default` leaves out the name section and `.debug_*` |
 | `--no-export-names` | drop the export-name table, keeping only `_start` and `main`; not for a component or with `--shared` |
+| `--wasm=3.0` | refuse what is past Wasm 3.0: stack switching (its types, instructions and tags with results) and the compact import section (both forms) |
 | `--no-function-names` | name every function's symbol `wasm_func_N`, by its index, rather than as the name section does |
 | `--no-dead-strip` | keep unreferenced sections in the link |
 | `-s`, `--strip` | leave the names of the module's and the runtime's functions out of the executable's symbol table (Linux and macOS), which only debuggers and profilers read |
@@ -1499,6 +1513,7 @@ as in `--target=macos`.
 | `WARMC_GC_STATS` | program | print a GC report at exit |
 | `WARMC_GC_STOP_WAIT_MS` | program | how long an exit waits for the collector's thread to stop (default 50) |
 | `WARMC_GC_VERIFY`, `WARMC_GC_STRESS` | program | heap verification after each cycle; collect on every allocation |
+| `WARMC_CONT_STACK_KB` | program, libwarmc | the stack of each stack-switching fiber (default 1024 KiB, rounded up to 64 KiB) |
 | `WARMC_GC_RELEASE` | program | return a freed run of at least this many bytes to the system (`madvise`); 0, the default, keeps them |
 | `WARMC_RANDOM_SEED` | program | make WASI preview 1 `random_get` deterministic |
 | `WARMC_LIMITS_DEBUG` | compiler, program, libwarmc | print the processors found (online, affinity, cgroup quota) and, on Linux, the heap a cgroup's memory limit gave |
@@ -1522,13 +1537,14 @@ What follows holds for compiling ahead of time and in the JIT alike.
 | Feature | Status |
 |---|---|
 | Core 1.0 / 2.0: multi-value, bulk memory, reference types, saturating conversions, sign extension | ✅ |
-| Compact import section (a module's imports grouped under one module name) | ✅ (the `0x7f` form; the `0x7e` one is refused) |
+| Compact import section (a module's imports grouped under one module name) | ✅ both forms: `0x7f`, and `0x7e`, whose imports share one type as well; in the text format, `(import "m" (item "n" ...) ...)` and `(import "m" (item "n") ... (func ...))` |
 | SIMD (`v128`) and relaxed SIMD | ✅ (NEON on AArch64, AVX2 on x86-64) |
 | Tail calls | ✅ |
 | Typed function references | ✅ |
 | GC: struct, array, i31, recursive types and subtyping, casts | ✅ |
 | Exception handling: `try_table`, `throw`, `throw_ref`, `exnref` | ✅ |
 | Exception handling: legacy `try` / `catch` / `delegate` | ❌ |
+| Stack switching: continuation types, `cont.new`, `cont.bind`, `suspend`, `resume`, `resume_throw`, `resume_throw_ref`, `switch`, tags with results | ✅ on by default; `--wasm=3.0` refuses it (see [How it works](#how-it-works)) |
 | memory64 and table64 | ✅ (a 64-bit memory up to 2^26 pages, 4 TiB, or 2^20, 64 GiB, when it declares no maximum; a 32-bit memory up to 65535 pages) |
 | Multi-memory | ✅ |
 | Extended constant expressions | ✅ |
@@ -1536,7 +1552,7 @@ What follows holds for compiling ahead of time and in the JIT alike.
 | Custom annotations: `(@custom ...)` | ✅ (and wasm-tools' `(@producers ...)` and `(@dylink.0 ...)`) |
 | Name section and name annotations | ✅ functions' names become their symbols' (see [How it works](#how-it-works)); the text assembler writes them from `$id`s and `(@name ...)` on functions. Module, local, type and field names are not used. |
 | Threads, shared memory, atomics | ❌ a shared memory is rejected when parsing, atomic instructions when validating |
-| Stack switching, stringref, wide arithmetic, custom page sizes, custom descriptors | ❌ |
+| Stringref, wide arithmetic, custom page sizes, custom descriptors | ❌ |
 | Component Model | partial, see [Components and WIT](#components-and-wit) |
 
 ---
@@ -1765,7 +1781,29 @@ working memory when it ends.
 - **Exceptions.** They are unwound by walking warmc's own compact unwind
   tables, with no DWARF and no libunwind. The collector walks the same
   tables for its roots, and nothing else does: a program's only module with
-  no tag to throw and no type of the collector's has none.
+  no tag, no type of the collector's and no continuation type has none.
+- **Stack switching** (`rt/cont.inc`). A continuation is a chain of fibers,
+  each with a stack of its own (1 MiB, `WARMC_CONT_STACK_KB`, mapped with
+  a guard and kept in a pool of 64 once its fiber ends); what wasm holds is
+  a handle on the collector's heap naming the chain, which a `resume`,
+  `switch` or `cont.bind` empties, so that a second use traps. Each
+  instruction is a call of the runtime with its operands in an area of the
+  caller's frame: it keeps the frame's callee-saved registers, stack pointer
+  and return address, as an allocation does, and a switch leaves the fiber
+  waiting with nothing of the runtime's on its stack -- the runtime writes
+  what the other fiber is given into that one's area and jumps to where its
+  compiled code waits. A suspension's handler is looked for on the resumes
+  above it in the same call into wasm, never past a host function. A handle
+  comes from the program's allocation buffer when it has room. The
+  collector walks a suspended chain's frames when it marks its handle, and
+  frees a chain nothing reached at the mark's end; the program heals a
+  chain's references as it takes it up, for the cycle it missed, and
+  counts each stack it makes towards the next cycle. An exception a fiber
+  does not catch goes on from the resume in its parent; one thrown into a
+  suspended continuation is unwound from where it waits; a trap ends the
+  fibers up to the call that catches it. The instances' stack limit is the
+  running fiber's, and on Windows so are the thread's stack bounds in its
+  TEB.
 - **Data segments.** A memory the module defines, whose every active segment
   has a constant offset that fits its initial size, gets the image those
   segments make of it, compressed at compile time (`src/datapack.c`, LZ77 in
@@ -2103,7 +2141,12 @@ Most of the suite is **differential**. warmc's output is compared with:
   exception thrown out of wasm, a host function calling into a second store
   and a trap back in the first, WASI arguments per store, stores made and
   deleted while the rest run, one store every thread takes turns in, and
-  imports and references of another store refused. Tiered, the cases run on the `-O0` code
+  imports and references of another store refused; and stack switching on
+  many threads at once (`test/capi/cont.c`): a generator's continuation kept
+  in a global between calls while the store's heap collects, a trap in
+  another fiber, a host function on a fiber's stack calling back into the
+  store, where a suspension stops at the host, and stores deleted with
+  fibers waiting. Tiered, the cases run on the `-O0` code
   alone and on the optimised code entered through the `-O0` entries, and
   programs of every producer run with the tier-up under their frames
   (`test/run_tiers.py`), against the same programs untiered. The cases also
@@ -2248,6 +2291,14 @@ The other rows check what has no second engine to compare with:
   collector thread under load, and where a page of one granule goes in a
   heap laid out by hand (`run_gcthread.sh`); relaxed SIMD and `-ffma`
   (`test/cases_relaxed`, `cases_fma`) check their own answers too
+- stack switching beyond the proposal's tests (`test/run_cont.sh`, at every
+  level): references in suspended frames, bound to a continuation and on
+  their way through a suspension across collections -- under every
+  collector test mode -- fibers dropped and freed, exceptions into, out of
+  and through fibers, every trap, a fiber's own stack running out, a chain
+  of a hundred fibers, `switch`, and twenty-two arguments and eighteen
+  results through every way a value goes; its runtime's rules are
+  mutation-tested (`test/mutants/cont.py`)
 - what a cgroup v2 hierarchy limits the process to, in trees laid out by
   hand -- nested limits, a mount whose root is the process's cgroup, an
   escaped mount point, cgroup v1 alone, limits of "max" -- for the
@@ -2400,6 +2451,13 @@ Makefile        the build, the pinned dependencies and the test targets
 - **Windows executables** carry no symbol table, so there the name section's
   names reach only a COFF object (`-c`).
 - **Exceptions** do not propagate through host (C) frames.
+- **Stack switching:** a suspension finds no handler past a host function's
+  frames -- a handler of an outer call into wasm is never taken -- and
+  traps, unhandled tag. On Windows a fiber's stack is committed whole when
+  it first runs (1 MiB by default, `WARMC_CONT_STACK_KB`), where macOS and
+  Linux commit its pages as they are touched, so the system's commit limit
+  bounds how many fibers live at once; and a fiber switch is not
+  compatible with CET shadow stacks, which warmc's output does not ask for.
 - **The collector** does not run while wasm is re-entered from a host call.
 - **Instances** of a linked program are never freed, and it holds at most
   4096 of them; the JIT frees an instance once nothing holds it, and holds
