@@ -127,7 +127,12 @@ def main():
         fails.append("api.c: cannot build: %s" % r.stderr.strip()[:300])
     else:
         try:
-            r = subprocess.run([exe], cwd=WORK, capture_output=True, text=True, timeout=TIMEOUT)
+            # test_tiers' tier-ups held back until its host import asks for
+            # them (src/jit.c), set here as well as by the test itself:
+            # Windows has no setenv, and a DLL's C library its own copy of
+            # the environment
+            r = subprocess.run([exe], cwd=WORK, capture_output=True, text=True, timeout=TIMEOUT,
+                               env=dict(os.environ, WARMC_TIER_DEFER="1"))
             ran += 1
             if r.returncode:
                 fails.append("api.c: exit %d:\n%s" % (r.returncode, (r.stdout + r.stderr)[-1500:]))

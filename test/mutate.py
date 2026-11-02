@@ -9,6 +9,7 @@ SPEC.py, one per transform under test/mutants, defines
     M = {name: (path, [(old, new), ...]), ...}
     SUITES = ((label, argv, env), ...)
     EQUIVALENT = {name: why, ...}        (optional)
+    TARGETS = [make target, ...]         (optional; build/warmc by default)
 
 A mutant replaces each old, which must occur in path exactly once, by its
 new.  The suites run in order, from the repository's root, with BUILD set;
@@ -22,7 +23,8 @@ Without rebuilding the world: each of J workers (4 by default) is a
 directory under build/mut with a copy of src/ of its own beside symlinks to
 the rest of the repository and of build/ -- corpora, tools, runtimes, the
 test cache, whose references are keyed by contents and so are as good for
-a mutant's programs as for any -- and builds only warmc there, without LTO,
+a mutant's programs as for any -- and builds only warmc there (and what
+TARGETS adds: `jit`, the library, for a mutant of the JIT), without LTO,
 so that a mutant costs one object's compile and a link.  A worker's warmc,
 built, must compile the optimiser's cases (test/cases_opt) to the bytes the
 tree's build/warmc does -- once more after building it all anew -- or the
@@ -55,7 +57,10 @@ CFLAGS = ("-std=c11 -O2 -fvisibility=hidden -fno-exceptions -g0 "
 TRIM_PID = os.path.join(ROOT, "build", ".cache-trim.pid")
 OWN = {"obj", "warmc", "testrun", "checklogs", "obj-asan", "obj-tsan", "warmc.dSYM", "mut",
        "gobench", "rsbench", "cbench", "zigbench", "hsbench", "asbench", "cppbench",
-       "vecbench", "stdgo", "ktbench", "javabench"}
+       "vecbench", "stdgo", "ktbench", "javabench",
+       # the JIT's (make jit), which a worker builds of its own src/
+       "jit", "obj-pic", "libwarmc.dylib", "libwarmc.dylib.dSYM", "libwarmc.so",
+       "libwarmc.dll", "libwarmc.dll.a", "warmrun", "warmrun.exe", "warmrun.dSYM", "capi"}
 
 
 def sh(cmd, cwd, env=None, t=900):
@@ -126,8 +131,9 @@ def reference():
     return mods, objects(os.path.join(ROOT, "build", "warmc"), mods)
 
 
-def setup(k, ref):
-    """Worker k's directory, its src/ the tree's as it is now, warmc built"""
+def setup(k, ref, targets):
+    """Worker k's directory, its src/ the tree's as it is now, warmc (and
+    targets) built"""
     w = os.path.join(WS, "w%d" % k)
     os.makedirs(w, exist_ok=True)
     for e in os.listdir(ROOT):
@@ -144,7 +150,7 @@ def setup(k, ref):
         p = os.path.join(b, e)
         if e not in OWN and not os.path.lexists(p):
             os.symlink(os.path.join(ROOT, "build", e), p)
-    rc, out = sh(["make", "-j8", "BUILD=build", "CFLAGS=" + CFLAGS, "build/warmc"], w)
+    rc, out = sh(["make", "-j8", "BUILD=build", "CFLAGS=" + CFLAGS] + targets, w)
     if rc:
         sys.exit("mutate: worker %d's warmc does not build\n%s" % (k, out[-2000:]))
     for again in (True, False):
@@ -152,7 +158,7 @@ def setup(k, ref):
             return w
         if again:
             # an object newer than its source and still not of it: all anew
-            rc, out = sh(["make", "-B", "-j8", "BUILD=build", "CFLAGS=" + CFLAGS, "build/warmc"], w)
+            rc, out = sh(["make", "-B", "-j8", "BUILD=build", "CFLAGS=" + CFLAGS] + targets, w)
             if rc:
                 sys.exit("mutate: worker %d's warmc does not build\n%s" % (k, out[-2000:]))
     sys.exit("mutate: worker %d's warmc compiles test/cases_opt otherwise than build/warmc "
@@ -208,6 +214,7 @@ def main():
     with open(spec) as f:
         exec(f.read(), ns)
     M, SUITES, EQUIV = ns["M"], ns["SUITES"], ns.get("EQUIVALENT", {})
+    targets = ns.get("TARGETS", ["build/warmc"])
     names = args or list(M)
     orig, stale = {}, []
     for n in names:
@@ -226,7 +233,7 @@ def main():
     os.makedirs(WS, exist_ok=True)
     ref = reference()
     with concurrent.futures.ThreadPoolExecutor(jobs) as ex:
-        workers = list(ex.map(lambda k: setup(k, ref), range(jobs)))
+        workers = list(ex.map(lambda k: setup(k, ref, targets), range(jobs)))
     print("%d workers built in %.0fs" % (jobs, time.time() - t0), flush=True)
     free = list(workers)
     lock = threading.Lock()
@@ -243,7 +250,7 @@ def main():
             with open(dst, "w") as f:
                 f.write(s)
             t = time.time()
-            rc, out = sh(["make", "BUILD=build", "CFLAGS=" + CFLAGS, "build/warmc"], w)
+            rc, out = sh(["make", "BUILD=build", "CFLAGS=" + CFLAGS] + targets, w)
             if rc:
                 res, killed = "does not build: " + out[-160:].replace("\n", " "), True
             else:

@@ -149,13 +149,14 @@ export GC_PAUSE_CHECK=0
 # pressure, far branches, the canonical ABI, component linking and shared
 # libraries -- most of warmc, in under 30 CPU-seconds of a workstation and
 # well under a minute of a CI runner, against the fifteen minutes the whole
-# of this takes there, and the JIT's C API and the cases through it.  CI runs
+# of this takes there, and the JIT's C API and the cases through it, tiered
+# too (the tier-up's sending on is each host's own code).  CI runs
 # it on every push.  adapter and wit are left
 # out: their wasmtime runs and subprocesses cost a minute and more of a macOS
 # or Windows runner.
 SMOKE_ROWS="cases-O0 cases-O1 cases-O2 traps-O0 traps-O2 gc-O2 gcthread relaxed
   workload-O2 vecwork-O2 simd-O2 control-O2 addr32-O2 addrmulti-O2 addr64-O2
-  wasi link reject pressure bincases canon clink shared capi cases-jit"
+  wasi link reject pressure bincases canon clink shared capi cases-jit cases-jit-tier2"
 # Under MSYS2 every process costs a tenth of a second to start, and reject
 # starts warmc two hundred times to ask what no host can answer differently
 # -- whether the front end refuses a malformed module, and why -- so on
@@ -234,6 +235,14 @@ start cases-O2 env WARMC_VERIFY_RA=1 WARMC_VERIFY_SSA=1 WARMC_VERIFY_UC=1 WARMC_
 start capi python3 test/capi/run.py
 start cases-jit env WARMC_JIT=1 ./test/run_tests.sh
 start spec-jit python3 test/spec/run.py "--levels=jit -O2"
+# Tiered (src/jit.c's tiers): the -O0 code a tiered module starts with, on
+# its own (its optimised code held back, and never asked for); the
+# optimised code entered through the -O0 code's entries, by an instance of
+# the -O0 module (each module waits for its optimised code); and programs
+# of every producer with the tier-up under their running frames.
+start cases-jit-tier0 env WARMC_JIT=1 WARMC_TIERED=1 WARMC_TIER_DEFER=1 ./test/run_tests.sh
+start cases-jit-tier2 env WARMC_JIT=1 WARMC_TIERED=wait ./test/run_tests.sh
+start tiers python3 test/run_tiers.py
 
 # A second, independent engine over the same corpus; the row skips itself
 # politely where wasmtime is not installed.

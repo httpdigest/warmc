@@ -982,6 +982,230 @@ static int wanted(const char *name) {
   return !any;
 }
 
+/* ---- tiers ---------------------------------------------------------------
+   A tiered module's calls go to its optimised code once that is in place,
+   also from frames of its -O0 code that are running when it arrives: the
+   host import here waits for it under run's -O0 frame, which then calls
+   the optimised functions straight and through the table, holds a GC
+   reference across the collections an optimised function's allocations
+   bring, has optimised code read and write the object its -O0 code made,
+   and catches what an optimised function throws; oob traps in
+   optimised code under an -O0 frame, on a memory of one page at most,
+   whose reservation is the guard pages the instance was made with or
+   that page alone.  Every answer is an untiered engine's too. */
+
+static const char *TIER_WAT =
+  "(module\n"
+  "  (import \"t\" \"wait\" (func $wait))\n"
+  "  (type $box (struct (field (mut i32))))\n"
+  "  (type $ii (func (param i32) (result i32)))\n"
+  "  (tag $e (param i32))\n"
+  "  (memory 1 1)\n"
+  "  (table 2 funcref)\n"
+  "  (elem (i32.const 0) $sq $inc)\n"
+  "  (global $g (mut (ref null $box)) (ref.null $box))\n"
+  "  (func $sq (param i32) (result i32) (i32.mul (local.get 0) (local.get 0)))\n"
+  "  (func $inc (param i32) (result i32) (i32.add (local.get 0) (i32.const 1)))\n"
+  "  (func $work (param $n i32) (result i32) (local $i i32) (local $s i32)\n"
+  "    (block $done (loop $l\n"
+  "      (br_if $done (i32.ge_u (local.get $i) (local.get $n)))\n"
+  "      (local.set $s (i32.add (local.get $s) (call $sq (local.get $i))))\n"
+  "      (local.set $s (i32.add (local.get $s) (call_indirect (type $ii) (local.get $i)\n"
+  "                                            (i32.and (local.get $i) (i32.const 1)))))\n"
+  "      (local.set $i (i32.add (local.get $i) (i32.const 1)))\n"
+  "      (br $l)))\n"
+  "    (local.get $s))\n"
+  "  (func $churn (param $n i32) (result i32) (local $i i32) (local $s i32)\n"
+  "    (block $done (loop $l\n"
+  "      (br_if $done (i32.ge_u (local.get $i) (local.get $n)))\n"
+  "      (global.set $g (struct.new $box (local.get $i)))\n"
+  "      (local.set $s (i32.add (local.get $s) (struct.get $box 0 (global.get $g))))\n"
+  "      (local.set $i (i32.add (local.get $i) (i32.const 1)))\n"
+  "      (br $l)))\n"
+  "    (local.get $s))\n"
+  "  (func $thrower (param i32) (throw $e (i32.mul (local.get 0) (i32.const 3))))\n"
+  "  (func $peek (param $b (ref null $box)) (result i32)\n"
+  "    (struct.set $box 0 (local.get $b) (i32.add (struct.get $box 0 (local.get $b)) (i32.const 5)))\n"
+  "    (struct.get $box 0 (local.get $b)))\n"
+  "  (func (export \"run\") (param $n i32) (result i32) (local $b (ref null $box)) (local $s i32)\n"
+  "    (local.set $b (struct.new $box (i32.const 1000)))\n"
+  "    (local.set $s (call $work (local.get $n)))\n"
+  "    (call $wait)\n"
+  "    (local.set $s (i32.add (local.get $s) (call $churn (i32.const 3000000))))\n"
+  "    (local.set $s (i32.add (local.get $s) (call $work (local.get $n))))\n"
+  "    (local.set $s (i32.add (local.get $s) (block $h (result i32)\n"
+  "      (try_table (catch $e $h) (call $thrower (i32.const 14)))\n"
+  "      (i32.const -1))))\n"
+  "    (local.set $s (i32.add (local.get $s) (call $peek (local.get $b))))\n"
+  "    (i32.add (local.get $s) (struct.get $box 0 (local.get $b))))\n"
+  "  (func $load (param i32) (result i32) (i32.load (local.get 0)))\n"
+  "  (func (export \"oob\") (param i32) (result i32) (call $wait) (call $load (local.get 0))))\n";
+
+static wasm_trap_t *tier_wait(void *env, const wasm_val_vec_t *args, wasm_val_vec_t *results) {
+  (void)args; (void)results;
+  if (env) CHECK(warm_module_optimized((const wasm_module_t *)env, true));
+  return NULL;
+}
+
+/* run(n) and oob(65536) of a fresh instance of the module of engine e,
+   oob first with oob_first: run's result, and oob's trap message in msg */
+static int32_t tier_answers(wasm_engine_t *e, bool tiered, bool oob_first, char *msg, size_t n) {
+  wasm_store_t *s = wasm_store_new(e);
+  wasm_byte_vec_t b;
+  wasm_message_t err;
+  CHECK(warm_wat2wasm(TIER_WAT, strlen(TIER_WAT), &b, &err));
+  wasm_module_t *m = warm_module_new(s, &b, &err);
+  if (!m) printf("FAIL: cannot compile: %s\n", err.data);
+  CHECK(m != NULL);
+  wasm_byte_vec_delete(&b);
+  int32_t r = INT32_MIN;
+  msg[0] = 0;
+  if (m) {
+    /* tiered, the optimised code is not in place before the first call waits */
+    wasm_functype_t *ft = wasm_functype_new_0_0();
+    wasm_func_t *w = wasm_func_new_with_env(s, ft, tier_wait, tiered ? m : NULL, NULL);
+    wasm_functype_delete(ft);
+    wasm_extern_t *im[1] = { wasm_func_as_extern(w) };
+    wasm_instance_t *in = instance(s, m, im, 1);
+    wasm_val_t a[1], res[1] = { WASM_INIT_VAL };
+    wasm_val_vec_t av = WASM_ARRAY_VEC(a), rv = WASM_ARRAY_VEC(res);
+    for (int k = 0; k < 2; k++) {
+      if ((k == 0) == oob_first) {
+        a[0] = (wasm_val_t)WASM_I32_VAL(65536);
+        wasm_trap_t *t = in ? wasm_func_call(func(in, 1), &av, &rv) : NULL;
+        CHECK(t != NULL);
+        if (t) {
+          snprintf(msg, n, "%s", trap_msg(t));
+          wasm_trap_delete(t);
+        }
+      } else {
+        a[0] = (wasm_val_t)WASM_I32_VAL(1000);
+        wasm_trap_t *t = in ? wasm_func_call(func(in, 0), &av, &rv) : NULL;
+        if (t) printf("FAIL: run traps: %s\n", trap_msg(t));
+        CHECK(in && !t);
+        if (in && !t) r = res[0].of.i32;
+        if (t) wasm_trap_delete(t);
+      }
+    }
+    if (tiered) CHECK(warm_module_optimized(m, false));
+  }
+  wasm_store_delete(s);
+  return r;
+}
+
+static void test_tiers(void) {
+  /* the optimised code goes in place only when the host's import waits for
+     it, under run's and oob's -O0 frames (src/jit.c) */
+#ifndef _WIN32
+  setenv("WARMC_TIER_DEFER", "1", 1);   /* run.py sets it too */
+#endif
+  /* a guarded memory live throughout: the runtime gives the first memory
+     of a process guard pages whatever its module says, which would hide
+     a tiered instance made without the ones its optimised code needs */
+  wasm_store_t *gs = wasm_store_new(engine);
+  wasm_module_t *gm = module(gs, "(module (memory 1))");
+  wasm_instance_t *gin = instance(gs, gm, NULL, 0);
+  CHECK(gin != NULL);
+  char want_msg[256], msg[256];
+  int32_t want = tier_answers(engine, false, false, want_msg, sizeof want_msg);
+  CHECK(strstr(want_msg, "out of bounds") != NULL);
+  /* as the levels have them, and with every function of its own at -O2 */
+  for (int inl = 0; inl < 2; inl++) {
+    wasm_config_t *c = wasm_config_new();
+    warm_config_tiered_set(c, true);
+    if (!inl) warm_config_flag_add(c, "-fno-inline");
+    wasm_engine_t *te = wasm_engine_new_with_config(c);
+    for (int round = 0; round < 2; round++) {
+      /* the tier-up under run's frame, then under oob's */
+      int32_t got = tier_answers(te, true, round == 1, msg, sizeof msg);
+      if (got != want) printf("FAIL: tiered run gave %d, untiered %d\n", got, want);
+      CHECK(got == want);
+      CHECK(!strcmp(msg, want_msg));
+    }
+    wasm_engine_delete(te);
+  }
+  wasm_config_t *c = wasm_config_new();
+  warm_config_tiered_set(c, true);
+  wasm_engine_t *te = wasm_engine_new_with_config(c);
+  /* an untiered module of a tiered engine's config is optimised from the start */
+  wasm_store_t *s = wasm_store_new(engine);
+  wasm_module_t *m = module(s, "(module (func (export \"f\")))");
+  CHECK(m && warm_module_optimized(m, false));
+  /* a tiered module serialised is its optimised code, which loads untiered */
+  wasm_store_t *ts = wasm_store_new(te);
+  wasm_module_t *tm = module(ts, "(module (func (export \"f\") (result i32) (i32.const 42)))");
+  if (tm) {
+    wasm_byte_vec_t ser;
+    wasm_module_serialize(tm, &ser);
+    CHECK(warm_module_optimized(tm, false));
+    wasm_module_t *back = wasm_module_deserialize(ts, &ser);
+    CHECK(back && warm_module_optimized(back, false));
+    wasm_instance_t *in = instance(ts, back, NULL, 0);
+    wasm_val_t res[1] = { WASM_INIT_VAL };
+    wasm_val_vec_t av = WASM_EMPTY_VEC, rv = WASM_ARRAY_VEC(res);
+    CHECK(in && !wasm_func_call(func(in, 0), &av, &rv) && res[0].of.i32 == 42);
+    wasm_byte_vec_delete(&ser);
+  }
+  wasm_store_delete(ts);
+  wasm_store_delete(s);
+  wasm_engine_delete(te);
+  /* A tiered module gone, its optimised code's descriptor with it: the
+     runtime's list of them takes the last in each one's place, which puts
+     the optimised code's, registered after E's descriptor, ahead of it --
+     where E's exception, unwound through every descriptor up to its own,
+     would read the tables unmapped with that code.  E is placed before
+     the tiered module goes, so nothing new lands where they were, and the
+     tiered module has no heap types, for which the runtime would keep its
+     code and data where they are. */
+  wasm_store_t *es = wasm_store_new(engine);
+  /* thrown from frames of their own, a recursion no inlining flattens:
+     a throw the catch's function made itself would be a jump */
+  wasm_module_t *em = module(es,
+    "(module (tag $e (param i32))\n"
+    "  (func $t (param i32)\n"
+    "    (if (local.get 0) (then (call $t (i32.sub (local.get 0) (i32.const 1)))))\n"
+    "    (throw $e (i32.const 9)))\n"
+    "  (func (export \"f\") (result i32)\n"
+    "    (block $h (result i32) (try_table (catch $e $h) (call $t (i32.const 5))) (i32.const -1))))");
+  wasm_config_t *c3 = wasm_config_new();
+  warm_config_tiered_set(c3, true);
+  wasm_engine_t *te3 = wasm_engine_new_with_config(c3);
+  wasm_store_t *as = wasm_store_new(te3);
+  static const char *A_WAT =
+    "(module (import \"t\" \"wait\" (func $wait))\n"
+    "  (func $one (result i32) (i32.const 1))\n"
+    "  (func (export \"run\") (param i32) (result i32) (call $wait) (call $one)))";
+  wasm_byte_vec_t ab;
+  wasm_message_t aerr;
+  CHECK(warm_wat2wasm(A_WAT, strlen(A_WAT), &ab, &aerr));
+  wasm_module_t *am = warm_module_new(as, &ab, &aerr);
+  wasm_byte_vec_delete(&ab);
+  CHECK(am != NULL);
+  if (am && em) {
+    wasm_functype_t *ft = wasm_functype_new_0_0();
+    wasm_func_t *w = wasm_func_new_with_env(as, ft, tier_wait, am, NULL);
+    wasm_functype_delete(ft);
+    wasm_extern_t *im[1] = { wasm_func_as_extern(w) };
+    wasm_instance_t *ain = instance(as, am, im, 1);
+    wasm_instance_t *ein = instance(es, em, NULL, 0);
+    wasm_val_t a[1] = { WASM_I32_VAL(10) }, r[1] = { WASM_INIT_VAL };
+    wasm_val_vec_t av = WASM_ARRAY_VEC(a), rv = WASM_ARRAY_VEC(r);
+    CHECK(ain && !wasm_func_call(func(ain, 0), &av, &rv));
+    /* the module and its instance go only with the handles to them */
+    wasm_instance_delete(ain);
+    wasm_module_delete(am);
+    wasm_store_delete(as);
+    as = NULL;
+    wasm_val_t eres[1] = { WASM_INIT_VAL };
+    wasm_val_vec_t eav = WASM_EMPTY_VEC, erv = WASM_ARRAY_VEC(eres);
+    CHECK(ein && !wasm_func_call(func(ein, 0), &eav, &erv) && eres[0].of.i32 == 9);
+  }
+  if (as) wasm_store_delete(as);
+  wasm_engine_delete(te3);
+  wasm_store_delete(es);
+  wasm_store_delete(gs);
+}
+
 #define RUN(t) do { if (wanted(#t)) { if (g_verbose) printf("%s\n", #t); t(); } } while (0)
 
 int main(int argc, char **argv) {
@@ -1004,6 +1228,7 @@ int main(int argc, char **argv) {
   RUN(test_threads);
   RUN(test_wasi);
   RUN(test_custom);
+  RUN(test_tiers);
   wasm_engine_delete(engine);
   printf("capi: %d checks, %d failed\n", nchecks, nfails);
   return nfails ? 1 : 0;
