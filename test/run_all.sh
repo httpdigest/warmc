@@ -282,6 +282,11 @@ start gc-modes ./test/run_gc_modes.sh
 
 start gcthread env GCTHREAD_ROUNDS=50000 ./test/run_gcthread.sh
 
+# What a cgroup v2 hierarchy limits the process to: the compiler's and the
+# JIT's processors, and the heap a Linux program reserves (in a container,
+# with real limits as well, where podman runs one)
+start limits ./test/run_limits.sh
+
 # -O3, in the rows whose answers do not depend on how a float rounds: fma
 # fuses a multiply into the add that reads it, which every row comparing
 # float results with another engine would see
