@@ -48,7 +48,8 @@
     (i32.add (call $grand (local.get $x))
              (call $grand (i32.add (local.get $x) (i32.const 1)))))
 
-  ;; a tail call disqualifies outright
+  ;; a tail call, which a splice makes a call and a return
+  ;; (inline_tail.wat has the rest)
   (func $mid_tail (param $x i32) (result i32)
     (return_call $grand (local.get $x)))
 
@@ -100,7 +101,7 @@
   (func (export "wide_stays_call") (result i32)
     (call $mid_wide (i32.const 4)))
 
-  (func (export "tail_stays_call") (result i32)
+  (func (export "tail_call_inlined") (result i32)
     (call $mid_tail (i32.const 30)))
 
   ;; a loop site with a constant argument: the in-loop evidence rule's yes

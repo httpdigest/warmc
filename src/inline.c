@@ -51,7 +51,7 @@ static struct {
   uint32_t max_callee, growth, tiny;
   uint32_t retcalls, retcall_cost, retcall_total, depth, round2_growth;
   long only, upto, max;
-  bool dbg, noscore, leafonly, notrans, round2;
+  bool dbg, noscore, leafonly, notrans, notail, round2;
 } g_inl;
 
 static void inl_init(void) {
@@ -85,6 +85,8 @@ static void inl_init(void) {
   g_inl.noscore = warmc_getenv("WARMC_INLINE_NOSCORE") != NULL;
   g_inl.leafonly = warmc_getenv("WARMC_INLINE_LEAFONLY") != NULL;
   g_inl.notrans = warmc_getenv("WARMC_NO_INLINE_TRANS") != NULL;
+  /* the old gate: no callee that makes a tail call */
+  g_inl.notail = warmc_getenv("WARMC_INLINE_NO_TAIL") != NULL;
   g_inl.round2 = warmc_getenv("WARMC_INLINE_ROUND2") != NULL;
 }
 
@@ -253,6 +255,68 @@ static bool has_tail_call(IrFunc *g) {
           op == I_RETURN_CALL_REF) return true;
     }
   return false;
+}
+
+/* A callee's tail calls as calls, each followed by the return of what it
+   returns, for a splice: inlined, the callee's frame is gone either way, so
+   what a tail call saves -- that frame, while what it calls runs -- the
+   splice saves too, and the call it leaves is the caller's own call, made
+   from the caller's frame as the call of the callee was.  A call that
+   gives several results ends its block, as one the builder makes does, so
+   that a splice into a try gives it the site's handler edges: the
+   results and the return go in a block of their own.  The calls are then
+   returning calls like any other, which the caps count. */
+static void untail(IrFunc *g) {
+  Module *m = g->m;
+  bool any = false;
+  uint32_t nb = g->nblocks;
+  for (uint32_t bi = 0; bi < nb; bi++) {
+    Block *b = &g->blocks[bi];
+    if (!b->reachable || !b->ninsts) continue;
+    Ref call = b->insts[b->ninsts - 1];
+    Inst *in = &g->insts[call];
+    CompType *sig;
+    switch (in->op) {
+      case I_RETURN_CALL:
+        sig = &m->types[m->funcs[in->imm].type_index];
+        in->op = I_CALL;
+        break;
+      case I_RETURN_CALL_INDIRECT:
+        sig = &m->types[in->imm];
+        in->op = I_CALL_INDIRECT;
+        break;
+      case I_RETURN_CALL_REF:
+        sig = &m->types[in->imm];
+        in->op = I_CALL_REF;
+        break;
+      default:
+        continue;
+    }
+    any = true;
+    uint32_t nres = sig->nresults;
+    in->type = nres == 1 ? sig->results[0] : 0;
+    uint32_t rb = bi;
+    if (nres > 1) {
+      rb = ir_new_block(g);
+      b = &g->blocks[bi];
+      b->term = T_JUMP;
+      ir_add_edge(g, bi, rb, NULL, 0);
+      Block *r = &g->blocks[rb];
+      r->sealed = r->filled = r->reachable = true;
+    }
+    Ref *ret = ir_alloc(g, (nres ? nres : 1) * sizeof(Ref));
+    if (nres == 1) ret[0] = call;
+    else
+      for (uint32_t i = 0; i < nres; i++) {
+        Ref a[1] = { call };
+        ret[i] = ir_emit(g, rb, I_RESULT, sig->results[i], a, 1, i, 0);
+      }
+    Block *r = &g->blocks[rb];
+    r->term = T_RETURN;
+    r->nret = r->cap_ret = nres;
+    r->ret_args = ret;
+  }
+  if (any) ir_order(g);
 }
 
 /* The old leaf gate, kept verbatim behind WARMC_INLINE_LEAFONLY. */
@@ -830,12 +894,13 @@ static IrFunc *inl_callee(IrFunc *f, const OptOpts *o, InlMemos *memo,
   if (e->verdict == 0) {
     e->verdict = 2;
     IrFunc *g = ir_build(m, fidx, o);
+    if (!g_inl.notail) untail(g);
     inl_summarize(e, g);
     uint32_t lc;
     uint32_t built = warm_returning_calls(g, &lc);
     uint32_t r = surviving_calls(f, g, fidx, &lc);
     param_indirect_calls(g, e);
-    if (has_tail_call(g)) {
+    if (g_inl.notail && has_tail_call(g)) {
       g_stats.inl_rej_tailcall++;
       inl_dbg(f, fidx, bi, "tail call");
       ir_free(g);
@@ -866,6 +931,7 @@ static IrFunc *inl_callee(IrFunc *f, const OptOpts *o, InlMemos *memo,
   if (!want_split) return e->plain;
   if (!e->split) {
     e->split = ir_build(m, fidx, o);
+    if (!g_inl.notail) untail(e->split);
     split_at_raising_sites(e->split);
   }
   return e->split;
