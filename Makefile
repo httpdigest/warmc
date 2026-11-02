@@ -325,9 +325,11 @@ $(BUILD)/jit/buildtag.h: $(JIT_TAG_INPUTS)
 	  echo "#define WARMC_JIT_BUILD_TAG 0x$${t}ull" > $@.tmp
 	@cmp -s $@.tmp $@ && rm -f $@.tmp || mv $@.tmp $@
 
-$(LIBOBJ)/jit.o: CFLAGS += -include $(BUILD)/jit/buildtag.h
+$(LIBOBJ)/jit.o: override CFLAGS += -include $(BUILD)/jit/buildtag.h
 $(LIBOBJ)/jit.o: $(BUILD)/jit/buildtag.h
-$(LIBOBJ)/capi.o: CFLAGS += -Iinclude -Irt
+# override: a CFLAGS from make's command line (test/mutate.py's, a profiling
+# build's) replaces a target's own += of it otherwise
+$(LIBOBJ)/capi.o: override CFLAGS += -Iinclude -Irt
 
 $(LIBWARMC): $(LIBWARMC_OBJS) $(BUILD)/jit/rtsyms.o $(BUILD)/jit/wasiwat.o $(JIT_RT_OBJS) \
              src/libwarmc.exports src/libwarmc.map
