@@ -53,7 +53,10 @@ Hello world!
   than wasmtime takes, or tiered: ready to run at `-O0` in a fraction of a
   full compile's time (Go's `net/http` server in 170 ms, where wasmtime
   takes 256), the optimised code sent in once a thread of the library's has
-  made it. See [A JIT](#a-jit-libwarmc-and-the-c-api).
+  made it. Each store is apart from the others, its GC heap and collector
+  its own, and threads run in different stores at once: a server calls into
+  a store for each request on every thread it serves from. See [A
+  JIT](#a-jit-libwarmc-and-the-c-api).
 
 - **Self-contained toolchain.** warmc links executables and shared libraries
   itself. It reads `.a` archives and ELF, Mach-O and COFF objects,
@@ -802,13 +805,46 @@ clang -Iinclude -o host host.c -Lbuild -lwarmc -Wl,-rpath,build   # macOS, Linux
 clang -Iinclude -o host.exe host.c build/libwarmc.dll.a           # Windows, with build/ on PATH
 ```
 
-The runtime runs one thread's wasm at a time: every call into it takes one
-lock, which a host function that calls back in already holds. A host
-function is called with the arguments wasm passed; its trap ends the wasm
-call that made it. `warm_wasi_imports` binds a module's
-`wasi_snapshot_preview1` imports from a `warm_wasi_config_t`: arguments,
-environment, preopened directories and TCP listeners, as `warmc --wasi`
-takes them.
+Each `wasm_store_t` is a store of the runtime's own: its instances, the
+heap of its GC objects and that heap's collector, its WASI state, the trap a
+call into it is catching. Threads run wasm in different stores at the same
+time, and a module compiled once runs in every store that obtains it
+(`wasm_module_share` and `wasm_module_obtain`), so a server makes a store
+for each request, or for each thread it serves from, and calls into all of
+them at once. One store runs on one thread at a time: a call into it takes
+the store's lock, which a host function that calls back into it already
+holds. A host function may call into another store, and its thread comes
+back to its own store as it returns. What one store's wasm can reach is that
+store's alone: an import, or a function reference put in a table or passed
+as an argument, of another store's is refused. A host function is called
+with the arguments wasm passed; its trap ends the wasm call that made it.
+`warm_wasi_imports` binds a module's `wasi_snapshot_preview1` imports for a
+store from a `warm_wasi_config_t`: arguments, environment, preopened
+directories and TCP listeners, as `warmc --wasi` takes them -- what one
+store's program sees, beside every other store's.
+
+```c
+/* a thread of a server: a store of its own, the module compiled once */
+void *serve(void *shared) {
+  wasm_store_t *store = wasm_store_new(engine);
+  wasm_module_t *module = wasm_module_obtain(store, shared);
+  wasm_extern_vec_t imports = WASM_EMPTY_VEC, exports;
+  wasm_instance_t *instance = wasm_instance_new(store, module, &imports, NULL);
+  wasm_instance_exports(instance, &exports);
+  /* ... wasm_func_call on its exports, beside every other thread ... */
+  wasm_extern_vec_delete(&exports);
+  wasm_instance_delete(instance);
+  wasm_module_delete(module);
+  wasm_store_delete(store);
+  return NULL;
+}
+```
+
+A call of a one-instruction export takes 37 ns on one thread; twelve
+threads, each in a store of its own, make 198 million of them a second,
+twelve times one thread's, and a call of 200 µs of arithmetic takes each of
+them as long as it takes one (on the author's 16-core Apple silicon
+machine, twelve of its cores the fast ones).
 
 `example/jit/` has a host of the library in each of C, C++, Java, Kotlin,
 Haskell, Go, Node.js, Bun, Zig and Rust, each through its language's own
@@ -1454,7 +1490,7 @@ as in `--target=macos`.
 | `WARMC_JOBS` | compiler | same as `-j` |
 | `WARMC_CACHE` | compiler | a directory that keeps what each compile did, under a digest of warmc itself, every argument (the output by its file name only), every file an argument names, every archive next to the runtime, and every `WARMC_` setting except the ones only a program reads: its exit status, what it printed, and its output. A compile whose digest is already there makes its output a hard link to the kept copy, prints what it printed then and exits as it did -- a refusal and the verdicts of `--validate-only` and `--dump-*` included. Not used with `--shared`, `--header`, `--keep-obj`, `--emit-wasm`, `--print-ir` or an external linker, nor for a compile that crashed. `make check` and the test scripts set it to `build/warmc-cache` |
 | `WARMC_TIME` | compiler | print phase timings, peak memory and the slowest functions |
-| `WARMC_GC_HEAP_KB` | program | GC heap reservation (default 1 GiB) |
+| `WARMC_GC_HEAP_KB` | program | GC heap reservation (default 1 GiB): each store's, in the JIT |
 | `WARMC_GC_MIN_KB`, `WARMC_GC_GROWTH` | program | collection trigger: minimum size (default 16384, or a quarter of the heap if that is less), and growth as a percentage of live data (default 200) |
 | `WARMC_GC_CONC` | program | `0` disables the background collector thread |
 | `WARMC_GC_STATS` | program | print a GC report at exit |
@@ -1662,7 +1698,19 @@ address into `x16` and a branch to it, which leaves the stack and the return
 address as the call made them, `x16` being a register the compiler keeps no
 value in at a call. The runtime instantiates the module's
 descriptor as it does a linked program's, and finds its frames by the
-descriptor's tables. A tiered module is compiled at `-O0` first, with an
+descriptor's tables. What belongs to the instances that run together --
+their slots, the heap of their GC objects and its collector's thread, the
+trap a call is catching, their WASI state -- the runtime keeps in a store
+(`rt/store.h`), as the core spec has one. A linked program has one, at an
+address the runtime reads as it would a global; the library has one for
+each `wasm_store_t`, and a thread-local pointer to the one its thread runs,
+set as the thread enters a store and put back as it leaves. Compiled code
+reaches its store through the instance's header, where the barrier's stub
+and the allocation trampolines read it, so a module's code is the same in
+every store. What every store shares -- the modules' descriptors, the guard
+pages, the lazily committed mappings -- is under locks of its own, and the
+fault handler, which may take none, reads a slot again when it changed
+under it. A tiered module is compiled at `-O0` first, with an
 entry each function's optimised code can be sent through -- a nop the
 tier-up makes a branch -- and again at the configured level on a thread of
 the library's, whose code is placed beside the first and given to the
@@ -1684,7 +1732,15 @@ working memory when it ends.
   - Evacuation has room kept for it: the program's allocations leave a
     thirty-second of the heap free, at least 1 MB and at most an eighth of
     it. An allocation that finds no room waits for up to two cycles, then
-    takes that room, before it fails.
+    takes that room, before it fails; the page it found too full is let
+    go first, so that those cycles may free it.
+  - A page of one granule goes into the shortest hole too short for a
+    medium page that there is, and only then into the first free granule,
+    so that the runs of eight granules a medium object needs stay whole.
+  - In the JIT, each store has a heap and a collector of its own. As many
+    stores' collectors run on threads at once as the machine has
+    processors; a store past them collects on its own thread until one
+    stops.
   - The program stops only for short handshake rounds.
   - Roots come from precise per-call-site stack maps.
   - A load barrier in compiled code heals stale references. On AArch64 one
@@ -2031,7 +2087,13 @@ Most of the suite is **differential**. warmc's output is compared with:
   against what the JIT compiles of each module (`test/spec/jitdriver.c`);
   and wasm-c-api's thirteen examples, against their output, with
   `test/capi/api.c`'s checks of every function `wasm.h` and `warm.h`
-  declare (`test/capi/run.py`). Tiered, the cases run on the `-O0` code
+  declare (`test/capi/run.py`), and two hundred threads in stores of their
+  own at once (`test/capi/stores.c`): every thread inside wasm at the same
+  moment, each store's heap collecting beside the others', traps, an
+  exception thrown out of wasm, a host function calling into a second store
+  and a trap back in the first, WASI arguments per store, stores made and
+  deleted while the rest run, one store every thread takes turns in, and
+  imports and references of another store refused. Tiered, the cases run on the `-O0` code
   alone and on the optimised code entered through the `-O0` entries, and
   programs of every producer run with the tier-up under their frames
   (`test/run_tiers.py`), against the same programs untiered. The cases also
@@ -2173,7 +2235,8 @@ The other rows check what has no second engine to compare with:
 - the GC suite (`test/cases_gc`), whose exports check their own answers, at
   each level, at `-O3`, with `-fexact-trap`, without the register
   allocator, without each of several passes, in every collector mode (`run_gc_modes.sh`) and with the
-  collector thread under load (`run_gcthread.sh`); relaxed SIMD and `-ffma`
+  collector thread under load, and where a page of one granule goes in a
+  heap laid out by hand (`run_gcthread.sh`); relaxed SIMD and `-ffma`
   (`test/cases_relaxed`, `cases_fma`) check their own answers too
 - that every spelling of an `-O` level compiles to the same bytes
   (`test/run_levels.sh`) and the thread count never reaches the output
@@ -2264,6 +2327,7 @@ src/            the compiler
 include/        wasm.h (the WebAssembly C API) and warm.h (libwarmc's additions)
 rt/             the runtime linked into every program and shared library
   rt.c            instantiation, traps, GC, exceptions, CLI harness
+  store.h                                 a store: what the runtime keeps for the instances that run together
   start.S start_x64.S                     entry, invoke, throw and GC trampolines
   lib.c                                   a shared library's face: the C calls, its lock and its traps
   hook.c gcthook.c                        defaults that a driver, or the GC thread tests, replace
@@ -2292,8 +2356,8 @@ Makefile        the build, the pinned dependencies and the test targets
 - **Native imports are AArch64's alone,** and `lwjgl/` is macOS's alone and
   has LWJGL's core, GLFW and OpenGL bindings alone.
 - **No wasm threads.** Shared memories and atomics are rejected. (The
-  runtime itself has a collector thread, and a library takes calls from
-  several threads.)
+  runtime itself has a collector thread, the JIT runs its stores on several
+  threads at once, and a library takes calls from several threads.)
 - **No WASI 0.2 on Windows.** On Windows, the preview 1 host has no
   sockets, so `--tcplisten` fails there.
 - **WASI 0.2** has no `wasi:sockets` or `wasi:http`, and implements only part
@@ -2313,8 +2377,8 @@ Makefile        the build, the pinned dependencies and the test targets
   types takes more than 512 bytes of stack arguments -- more than 32
   parameters past the registers on AArch64, or 64 on x86-64 -- as a function
   the host calls has room for no more.
-- **Guarded memories:** at most 1024 per process (see [Embedding compiled
-  modules in C](#embedding-compiled-modules-in-c)).
+- **Guarded memories:** at most 1024 per process, 4096 in the JIT's (see
+  [Embedding compiled modules in C](#embedding-compiled-modules-in-c)).
 - **`--system-ld`** does not link Windows output.
 - **Windows executables** carry no symbol table, so there the name section's
   names reach only a COFF object (`-c`).
@@ -2322,10 +2386,13 @@ Makefile        the build, the pinned dependencies and the test targets
 - **The collector** does not run while wasm is re-entered from a host call.
 - **Instances** of a linked program are never freed, and it holds at most
   4096 of them; the JIT frees an instance once nothing holds it, and holds
-  at most 65,536 at a time.
-- **The JIT** runs one thread's wasm at a time: every call into it takes
-  one lock. One WASI world is live in a process at a time, the last that
-  `warm_wasi_imports` set up. A tiered module's calls that are running when
+  at most 65,536 at a time in a store.
+- **The JIT** runs one thread's wasm at a time in a store: a call into a
+  store takes that store's lock, so two threads whose host functions call
+  into each other's stores at the same moment wait for each other for good,
+  as any two locks taken in opposite orders do. A store reaches nothing of
+  another's -- an import or a reference of another store's is refused, and
+  a GC object made in one is never another's. A tiered module's calls that are running when
   its optimised code arrives stay in the `-O0` code until they return (no
   on-stack replacement), and the library makes one module's optimised code
   at a time, which another compile waits behind.
