@@ -46,17 +46,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
-
-#ifdef _WIN32
-unsigned long __stdcall GetActiveProcessorCount(unsigned short group);
-static long host_ncpus(void) {
-  unsigned long n = GetActiveProcessorCount((unsigned short)0xffff);
-  return n ? (long)n : 1;
-}
-#else
-static long host_ncpus(void) { return sysconf(_SC_NPROCESSORS_ONLN); }
-#endif
 
 /* the runtime's, which warm_rt.h does not declare */
 void *warmc_table_get(WarmInstance *v, u64 i, u32 tab);
@@ -75,6 +64,7 @@ void warmc_rt_store_leave(struct Store *prev);
 void warmc_rt_store_delete(struct Store *st);
 void warmc_rt_set_collectors(u32 n);
 int warmc_rt_forget_desc(const ModuleDesc *md);
+long warmc_host_cpus(void);
 extern void *(*warmc_rt_malloc_hook)(u64 bytes);
 extern void (*warmc_rt_free_hook)(void *p);
 
@@ -114,8 +104,9 @@ static void rt_init(void) {
   warmc_rt_malloc_hook = rt_malloc;
   warmc_rt_free_hook = free;
   g_rt_ok = warmc_rt_library_mode() != 0;
-  /* as many stores' collectors at once as there are processors */
-  long n = host_ncpus();
+  /* as many stores' collectors at once as there are processors the
+     process may use (src/limits.c) */
+  long n = warmc_host_cpus();
   warmc_rt_set_collectors(n > 0 ? (u32)n : 1);
 }
 

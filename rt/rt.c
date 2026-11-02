@@ -4959,6 +4959,52 @@ __attribute__((noreturn)) static void gcth_selftest(u64 n) {
   sys_exit(0);
 }
 
+#if !defined(WARMC_DARWIN) && !defined(WARMC_WINDOWS)
+#include "cgroup.inc"
+
+static long cg_read_file(const char *path, char *buf, long cap) {
+  long fd = sys(56 /* openat */, -100 /* AT_FDCWD */, (long)path, 0, 0, 0, 0);
+  if (fd < 0) return -1;
+  long n = 0, r;
+  while (n < cap - 1 &&
+         (r = sys(63 /* read */, fd, (long)(buf + n), cap - 1 - n, 0, 0, 0)) > 0)
+    n += r;
+  sys(57 /* close */, fd, 0, 0, 0, 0, 0);
+  buf[n] = 0;
+  return n;
+}
+#endif
+
+/* The heap a store reserves where WARMC_GC_HEAP_KB does not say: a
+   gibibyte, or less in a cgroup whose memory is limited (rt/cgroup.inc) --
+   half the limit, and four mebibytes at least -- so that a full heap traps,
+   allocation failed, before the system stops the process for its memory.
+   The other half is the linear memories', the code's and every other
+   store's.  On Linux. */
+static void gc_heap_from_cgroup(void) {
+#if !defined(WARMC_DARWIN) && !defined(WARMC_WINDOWS)
+  usz cap = 1u << 20;
+  char *buf = (char *)sys_mmap(0, cap, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS);
+  if (!buf || buf == (char *)-1) return;
+  const char *root = rt_getenv("WARMC_CGROUP_ROOT");
+  CgLimits lim;
+  cg_limits(cg_read_file, root ? root : "", buf, (long)cap, &lim);
+  sys_munmap(buf, cap);
+  if (lim.mem) {
+    u64 h = lim.mem / 2;
+    if (h < (4ull << 20)) h = 4ull << 20;
+    if (h < gc_opt_heap_bytes) gc_opt_heap_bytes = h;
+  }
+  if (rt_getenv("WARMC_LIMITS_DEBUG")) {
+    eputs("warmc-rt: heap ");
+    put_u64_e(gc_opt_heap_bytes);
+    eputs(" bytes (cgroup memory ");
+    put_u64_e(lim.mem);
+    eputs(")\n");
+  }
+#endif
+}
+
 static void gc_read_options(void) {
 
   if (rt_getenv("WARMC_GC"))
@@ -4978,7 +5024,8 @@ static void gc_read_options(void) {
   gc_opt_reloc_stall = (u32)rt_getenv_u64("WARMC_GC_RELOC_STALL", 0);
   gc_opt_mark_stall = rt_getenv_u64("WARMC_GC_MARK_STALL", 0);
   { u64 kb = rt_getenv_u64("WARMC_GC_HEAP_KB", 0);
-    if (kb) gc_opt_heap_bytes = kb * 1024ull; }
+    if (kb) gc_opt_heap_bytes = kb * 1024ull;
+    else gc_heap_from_cgroup(); }
   gcth_spin = (u32)rt_getenv_u64("WARMC_GC_THREAD_SPIN", GCTH_SPINS);
   gc_opt_trap_round = (u32)rt_getenv_u64("WARMC_GC_TRAP_ROUND", 0);
   gc_opt_die_round = (u32)rt_getenv_u64("WARMC_GC_DIE_ROUND", 0);

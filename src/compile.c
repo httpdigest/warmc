@@ -9,15 +9,6 @@
 #include <pthread.h>
 #include <unistd.h>
 
-#ifdef _WIN32
-unsigned long __stdcall GetActiveProcessorCount(unsigned short group);
-static long host_ncpus(void) {
-  unsigned long n = GetActiveProcessorCount((unsigned short)0xffff);
-  return n ? (long)n : 1;
-}
-#else
-static long host_ncpus(void) { return sysconf(_SC_NPROCESSORS_ONLN); }
-#endif
 
 static double now_ms(void) {
   struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -193,7 +184,7 @@ static uint32_t want_threads(Module *m, uint32_t nfuncs) {
     const char *e = warmc_getenv("WARMC_JOBS");
     n = e ? atol(e) : 0;
   }
-  long cores = host_ncpus();
+  long cores = warmc_host_cpus();
   if (cores < 1) cores = 1;
   if (n <= 0) {
     uint64_t kb = 0;

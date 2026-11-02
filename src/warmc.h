@@ -66,6 +66,9 @@ size_t xmalloc_fit(size_t n);
 double peak_rss_mb(void);
 /* getenv for the WARMC_ switches, from a copy taken on first use (util.c). */
 const char *warmc_getenv(const char *name);
+/* the processors the process may use: online, affinity, cgroup quota
+   (src/limits.c) */
+long warmc_host_cpus(void);
 /* whether a WARMC_ setting is a program's alone (the GC's, the random
    seed), which the compile cache keys nothing on, and whether this compile
    read one even so (util.c) */
