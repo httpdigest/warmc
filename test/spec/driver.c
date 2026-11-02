@@ -284,6 +284,12 @@ static int run_one(const SpecFile *f) {
           } else fail_at(cmd->line, "expected an exception");
           break;
         }
+        if (cmd->expect == EXPECT_SUSPENSION) {
+          /* exactly a suspension no handler took */
+          if (trap == TRAP_UNHANDLED_TAG) npass++;
+          else fail_at(cmd->line, "expected an unhandled suspension");
+          break;
+        }
         if (cmd->expect == EXPECT_TRAP || cmd->expect == EXPECT_EXHAUSTION) {
           if (trap) npass++;
           else fail_at(cmd->line, "expected a trap");

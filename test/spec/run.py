@@ -90,6 +90,43 @@ import wasttext
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 BUILD = os.environ.get("BUILD", os.path.join(ROOT, "build"))
 SUITE = os.environ.get("WASM_TESTSUITE", os.path.join(BUILD, "testsuite"))
+# The proposals past 3.0 that warmc implements, whose files the testsuite
+# keeps in a directory each under proposals/ -- and stack switching, whose
+# tests are its own repository's (STACK_SWITCHING, pinned as the testsuite
+# is); their files run beside the top level's, under their own names, which
+# no two of them share.  The top level's are Wasm 3.0's, and are compiled
+# with --wasm=3.0 (CORE_FLAGS): they assert, as 3.0 has it, that a tag has
+# no results, which stack switching lets a tag have.
+PROPOSAL_DIRS = ["proposals/compact-import-section", "proposals/extended-name-section/custom"]
+STACK_SWITCHING = os.path.join(BUILD, "stack-switching")
+STACK_SWITCHING_DIR = "test/core/stack-switching"
+# and the proposal's example programs: schedulers, actors, pipes, generators
+# and async/await, each run to its end
+STACK_SWITCHING_EXAMPLES = "proposals/stack-switching/examples"
+CORE_FLAGS = ["--wasm=3.0"]
+
+def file_flags(path):
+    """what warmc compiles a corpus file's modules with"""
+    if "WASM_TESTSUITE" in os.environ:
+        return []
+    return CORE_FLAGS if os.path.dirname(os.path.abspath(path)) == os.path.abspath(SUITE) else []
+
+def corpus_files():
+    """{file name: its path}: the top level's .wast files and the proposal
+    directories' (not with WASM_TESTSUITE, a directory of its own)"""
+    dirs = [SUITE] + ([] if "WASM_TESTSUITE" in os.environ else
+                      [os.path.join(SUITE, d) for d in PROPOSAL_DIRS] +
+                      [os.path.join(STACK_SWITCHING, STACK_SWITCHING_DIR),
+                       os.path.join(STACK_SWITCHING, STACK_SWITCHING_EXAMPLES)])
+    out = {}
+    for d in dirs:
+        for f in sorted(os.listdir(d)):
+            if not f.endswith(".wast"):
+                continue
+            if f in out:
+                raise SystemExit("spec: %s is in %s and in %s" % (f, out[f], d))
+            out[f] = os.path.join(d, f)
+    return out
 WORK = os.path.join(BUILD, "spec")
 WARMC = os.path.join(BUILD, "warmc") + (".exe" if os.name == "nt" else "")
 EXPECTED = os.path.join(ROOT, "test", "spec", "expected.json")
@@ -99,7 +136,7 @@ EXIT_INVALID = 3
 
 RUNTIME_COMMANDS = {
     "action", "assert_return", "assert_trap", "assert_exhaustion",
-    "assert_exception",
+    "assert_exception", "assert_suspension",
     "assert_uninstantiable", "assert_unlinkable", "register",
 }
 
@@ -117,6 +154,7 @@ def _pinned(name):
 
 WASM_TOOLS_VERSION = _pinned("WASM_TOOLS_VERSION")
 TESTSUITE_COMMIT = _pinned("TESTSUITE_COMMIT")
+STACK_SWITCHING_COMMIT = _pinned("STACK_SWITCHING_COMMIT")
 WASM_TOOLS = os.path.join(BUILD, "tools", "bin",
                           "wasm-tools.exe" if os.name == "nt" else "wasm-tools")
 
@@ -178,23 +216,23 @@ def wast2json(wast, outdir):
         f.write(key)
     return out, None
 
-def validate(path):
+def validate(path, flags=()):
     """Compile-time verdict for one module file: (exit code, first message).
 
     No optimisation level: this parses and type-checks and stops, so its
     answer is the same whichever level the executables are built at.
     """
-    r = sh([WARMC, "--validate-only", path], timeout=WARMC_TIMEOUT)
+    r = sh([WARMC, "--validate-only"] + list(flags) + [path], timeout=WARMC_TIMEOUT)
     msg = (r.stderr.strip().splitlines() or [""])[0]
     return r.returncode, msg
 
-def validate_all(paths):
+def validate_all(paths, flags=()):
     """validate() of each path: {path: (exit code, message)}, one warmc for
     them all where it says each one's verdict"""
-    got = run_wat.verdicts(sh, [WARMC, "--validate-only"], paths, WARMC_TIMEOUT)
+    got = run_wat.verdicts(sh, [WARMC, "--validate-only"] + list(flags), paths, WARMC_TIMEOUT)
     for p in paths:
         if p not in got:
-            got[p] = validate(p)
+            got[p] = validate(p, flags)
     return got
 
 def run_file(wast, idx, levels, verbose=False):
@@ -217,9 +255,10 @@ def run_file(wast, idx, levels, verbose=False):
 
     npass = nfail = nskip = 0
     failures = []
+    flags = file_flags(wast)
     verdict = validate_all([os.path.join(outdir, cmd["filename"]) for cmd in spec["commands"]
                             if cmd["type"] in ("module", "module_definition", "assert_malformed",
-                                               "assert_invalid") and "filename" in cmd])
+                                               "assert_invalid") and "filename" in cmd], flags)
     for cmd in spec["commands"]:
         kind = cmd["type"]
         if kind in RUNTIME_COMMANDS:
@@ -576,6 +615,11 @@ def main():
         print("spec: the testsuite at %s is not the pinned %s (run `make testsuite`)"
               % (SUITE, TESTSUITE_COMMIT[:7]))
         return 2
+    if "WASM_TESTSUITE" not in os.environ and not os.path.exists(
+            os.path.join(STACK_SWITCHING, ".commit-" + STACK_SWITCHING_COMMIT)):
+        print("spec: the stack-switching tests at %s are not the pinned %s (run `make testsuite`)"
+              % (STACK_SWITCHING, STACK_SWITCHING_COMMIT[:7]))
+        return 2
     if not os.path.exists(WASM_TOOLS):
         print("spec: %s not found (run `make wasm-tools`)" % WASM_TOOLS)
         return 2
@@ -585,7 +629,8 @@ def main():
         with open(EXPECTED) as f:
             expected = json.load(f)
 
-    files = sorted(f for f in os.listdir(SUITE) if f.endswith(".wast"))
+    paths = corpus_files()
+    files = sorted(paths)
     if pattern:
         files = [f for f in files if pattern in f]
 
@@ -603,7 +648,7 @@ def main():
 
     index_of = {n: i for i, n in enumerate(files)}
 
-    tasks = sorted(((os.path.join(SUITE, n), index_of[n], levels, verbose)
+    tasks = sorted(((paths[n], index_of[n], levels, verbose)
                     for n in files),
                    key=lambda t: -os.path.getsize(t[0]))
     results = {}

@@ -18,6 +18,10 @@
     heaps collecting side by side, traps, exceptions, host functions calling
     into a second store, WASI arguments per store, stores made and deleted
     while the others run, one store that every thread takes turns in.
+  * test/capi/cont.c: stack switching on many threads, each in stores of
+    its own: a generator's continuation kept between calls while the heap
+    collects, a trap in another fiber, a host function on a fiber's stack
+    calling back into the store, stores deleted with fibers waiting.
 
 Run by `make check` (test/run_all.sh) and on its own:
     python3 test/capi/run.py [-v]
@@ -163,11 +167,27 @@ def main():
         except subprocess.TimeoutExpired:
             fails.append("stores.c: timed out after %gs" % TIMEOUT)
 
+    exe = hostbuild.exe(os.path.join(WORK, "cont"))
+    r = build_c(os.path.join(ROOT, "test", "capi", "cont.c"), exe)
+    if r.returncode:
+        fails.append("cont.c: cannot build: %s" % r.stderr.strip()[:300])
+    else:
+        try:
+            r = subprocess.run([exe], cwd=WORK, capture_output=True, text=True, timeout=TIMEOUT,
+                               env=dict(os.environ, WARMC_GC_MIN_KB="256"))
+            ran += 1
+            if r.returncode:
+                fails.append("cont.c: exit %d:\n%s" % (r.returncode, (r.stdout + r.stderr)[-1500:]))
+            elif verbose:
+                print(r.stdout.strip())
+        except subprocess.TimeoutExpired:
+            fails.append("cont.c: timed out after %gs" % TIMEOUT)
+
     for f in fails:
         print("FAIL " + f)
-    print("capi: %d of %d passed (%d upstream examples, wasm.h, api.c, stores.c)"
+    print("capi: %d of %d passed (%d upstream examples, wasm.h, api.c, stores.c, cont.c)"
           % (ran - len([f for f in fails if "exit" in f or "differs" in f or "is not" in f]),
-             len(EXAMPLES) + 3, len(EXAMPLES)))
+             len(EXAMPLES) + 4, len(EXAMPLES)))
     return 1 if fails else 0
 
 if __name__ == "__main__":

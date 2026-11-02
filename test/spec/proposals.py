@@ -2,9 +2,10 @@
 
 Wasm 3.0 is 1.0 + 2.0 + the 3.0 additions merged into one standard, and the
 upstream corpus reflects that: the `.wast` files sit in one flat directory
-with no grouping.  (`proposals/` in the checkout holds only post-3.0 work --
-threads, custom page sizes, wide arithmetic, custom descriptors -- which warmc
-does not implement.)  So a per-proposal conformance table needs a mapping, and
+with no grouping.  (`proposals/` in the checkout holds post-3.0 work -- of which run.py's
+PROPOSAL_DIRS names what warmc implements: the compact import section and the
+extended name section; not threads, custom page sizes, wide arithmetic or
+custom descriptors.)  So a per-proposal conformance table needs a mapping, and
 this is it.
 
 Two things about it are worth stating plainly:
@@ -56,7 +57,18 @@ ADDRESS64 = {
     "table_init64", "table_set64", "table_size64",
 }
 
+# past 3.0, from the testsuite's proposals/ directories (run.py PROPOSAL_DIRS)
+COMPACT_IMPORTS = {"binary-compact-imports", "imports-compact"}
+
+EXTENDED_NAMES = {"name", "name_annot"}
+
+# the stack-switching proposal's repository's (run.py STACK_SWITCHING)
+STACK_SWITCHING = {"cont", "resume_throw", "validation", "validation_gc"}
+
 ORDER = [
+    ("Stack switching", "post-3.0", STACK_SWITCHING),
+    ("Compact import section", "post-3.0", COMPACT_IMPORTS),
+    ("Extended name section", "post-3.0", EXTENDED_NAMES),
     ("Relaxed SIMD", "3.0", RELAXED_SIMD),
     ("Garbage collection", "3.0", GC),
     ("Typed references", "3.0", TYPED_REFS),

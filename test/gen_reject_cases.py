@@ -382,7 +382,9 @@ case("tag_bad_attribute", "malformed", "attribute",
 case("tag_unknown_type", "invalid", "unknown type",
      module([section(1, vec([T_VOID])),
              tagsec([b"\x00" + leb(3)])]))
-case("tag_with_result", "invalid", "non-empty tag result type",
+# A tag with results is stack switching's (a suspension's answer): past
+# Wasm 3.0, accepted by default and invalid under --wasm=3.0 (invalid30)
+case("tag_with_result", "invalid30", "non-empty tag result type",
      module([section(1, vec([T_VOID_I32])),
              tagsec([b"\x00" + leb(0)])]))
 
@@ -542,7 +544,7 @@ case("tag_import_ok", "accept", "",
 case("tag_import_bad_attribute", "malformed", "attribute",
      module([section(1, vec([T_I32_VOID])),
              section(2, vec([imp("m", "t", 4, b"\x01" + leb(0))]))]))
-case("tag_import_with_result", "invalid", "non-empty tag result type",
+case("tag_import_with_result", "invalid30", "non-empty tag result type",
      module([section(1, vec([T_VOID_I32])),
              section(2, vec([imp("m", "t", 4, b"\x00" + leb(0))]))]))
 case("catch_imported_tag_ok", "accept", "",
@@ -1127,6 +1129,12 @@ case("compact_import_named_group", "malformed", "non-empty field name",
      module([section(1, vec([T_VOID])),
              section(2, vec([name("m") + name("x") + b"\x7f" +
                              vec([name("f") + b"\x00" + leb(0)])]))]))
+# ... and the 0x7e group, whose imports share one type written before their
+# names, likewise.
+case("compact_import_named_shared_group", "malformed", "non-empty field name",
+     module([section(1, vec([T_VOID])),
+             section(2, vec([name("m") + name("x") + b"\x7e" + b"\x00" + leb(0) +
+                             vec([name("f")])]))]))
 
 # Exact reference types are the custom-descriptors proposal, which is not
 # supported; the refusal must name it instead of reading the 0x62 prefix as

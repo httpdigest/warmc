@@ -1,4 +1,22 @@
 {
+ "actor-lwt.wast": {
+  "fail": 0,
+  "pass": 9,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 11,
+  "text_fail": 0,
+  "text_pass": 9
+ },
+ "actor.wast": {
+  "fail": 0,
+  "pass": 6,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 8,
+  "text_fail": 0,
+  "text_pass": 6
+ },
  "address.wast": {
   "fail": 0,
   "pass": 5,
@@ -133,6 +151,24 @@
   "run_pass": 25,
   "text_fail": 0,
   "text_pass": 5
+ },
+ "async-await.wast": {
+  "fail": 0,
+  "pass": 6,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 8,
+  "text_fail": 0,
+  "text_pass": 6
+ },
+ "binary-compact-imports.wast": {
+  "fail": 0,
+  "pass": 13,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 11,
+  "text_fail": 0,
+  "text_pass": 2
  },
  "binary-gc.wast": {
   "fail": 0,
@@ -331,6 +367,24 @@
   "run_pass": 703,
   "text_fail": 0,
   "text_pass": 402
+ },
+ "cont.wast": {
+  "fail": 0,
+  "pass": 39,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 61,
+  "text_fail": 0,
+  "text_pass": 39
+ },
+ "control-lwt.wast": {
+  "fail": 0,
+  "pass": 5,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 7,
+  "text_fail": 0,
+  "text_pass": 5
  },
  "conversions.wast": {
   "fail": 0,
@@ -584,6 +638,42 @@
   "text_fail": 0,
   "text_pass": 1
  },
+ "fun-actor-lwt.wast": {
+  "fail": 0,
+  "pass": 9,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 11,
+  "text_fail": 0,
+  "text_pass": 9
+ },
+ "fun-lwt.wast": {
+  "fail": 0,
+  "pass": 5,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 7,
+  "text_fail": 0,
+  "text_pass": 5
+ },
+ "fun-pipes.wast": {
+  "fail": 0,
+  "pass": 2,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 4,
+  "text_fail": 0,
+  "text_pass": 2
+ },
+ "fun-state.wast": {
+  "fail": 0,
+  "pass": 1,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 3,
+  "text_fail": 0,
+  "text_pass": 1
+ },
  "func.wast": {
   "fail": 0,
   "pass": 79,
@@ -601,6 +691,33 @@
   "run_pass": 30,
   "text_fail": 0,
   "text_pass": 10
+ },
+ "generator-extended.wast": {
+  "fail": 0,
+  "pass": 1,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 3,
+  "text_fail": 0,
+  "text_pass": 1
+ },
+ "generator.wast": {
+  "fail": 0,
+  "pass": 1,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 3,
+  "text_fail": 0,
+  "text_pass": 1
+ },
+ "generators.wast": {
+  "fail": 0,
+  "pass": 4,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 6,
+  "text_fail": 0,
+  "text_pass": 4
  },
  "global.wast": {
   "fail": 0,
@@ -682,6 +799,15 @@
   "run_pass": 126,
   "text_fail": 0,
   "text_pass": 93
+ },
+ "imports-compact.wast": {
+  "fail": 0,
+  "pass": 24,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 45,
+  "text_fail": 0,
+  "text_pass": 29
  },
  "imports.wast": {
   "fail": 0,
@@ -925,6 +1051,15 @@
   "run_pass": 80,
   "text_fail": 0,
   "text_pass": 28
+ },
+ "lwt.wast": {
+  "fail": 0,
+  "pass": 5,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 7,
+  "text_fail": 0,
+  "text_pass": 5
  },
  "memory-multi.wast": {
   "fail": 0,
@@ -1178,6 +1313,24 @@
   "text_fail": 0,
   "text_pass": 2
  },
+ "name.wast": {
+  "fail": 0,
+  "pass": 25,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 20,
+  "text_fail": 0,
+  "text_pass": 52
+ },
+ "name_annot.wast": {
+  "fail": 0,
+  "pass": 15,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 11,
+  "text_fail": 0,
+  "text_pass": 15
+ },
  "names.wast": {
   "fail": 0,
   "pass": 4,
@@ -1204,6 +1357,15 @@
   "run_pass": 0,
   "text_fail": 0,
   "text_pass": 0
+ },
+ "pipes.wast": {
+  "fail": 0,
+  "pass": 2,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 4,
+  "text_fail": 0,
+  "text_pass": 2
  },
  "ref.wast": {
   "fail": 0,
@@ -1313,6 +1475,15 @@
   "text_fail": 0,
   "text_pass": 1
  },
+ "resume_throw.wast": {
+  "fail": 0,
+  "pass": 16,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 23,
+  "text_fail": 0,
+  "text_pass": 16
+ },
  "return.wast": {
   "fail": 0,
   "pass": 21,
@@ -1348,6 +1519,33 @@
   "run_pass": 41,
   "text_fail": 0,
   "text_pass": 18
+ },
+ "scheduler1.wast": {
+  "fail": 0,
+  "pass": 2,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 4,
+  "text_fail": 0,
+  "text_pass": 2
+ },
+ "scheduler2-throw.wast": {
+  "fail": 0,
+  "pass": 2,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 4,
+  "text_fail": 0,
+  "text_pass": 2
+ },
+ "scheduler2.wast": {
+  "fail": 0,
+  "pass": 2,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 4,
+  "text_fail": 0,
+  "text_pass": 2
  },
  "select.wast": {
   "fail": 0,
@@ -1925,6 +2123,15 @@
   "text_fail": 0,
   "text_pass": 1
  },
+ "static-lwt.wast": {
+  "fail": 0,
+  "pass": 5,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 7,
+  "text_fail": 0,
+  "text_pass": 5
+ },
  "store.wast": {
   "fail": 0,
   "pass": 59,
@@ -2320,5 +2527,23 @@
   "run_pass": 4,
   "text_fail": 0,
   "text_pass": 0
+ },
+ "validation.wast": {
+  "fail": 0,
+  "pass": 45,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 6,
+  "text_fail": 0,
+  "text_pass": 45
+ },
+ "validation_gc.wast": {
+  "fail": 0,
+  "pass": 12,
+  "run": "ok",
+  "run_fail": 0,
+  "run_pass": 8,
+  "text_fail": 0,
+  "text_pass": 12
  }
 }

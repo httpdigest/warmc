@@ -309,6 +309,18 @@ static int run_one(const SpecFile *f) {
             }
             wasm_byte_vec_delete(&msg);
           } else fail_at(cmd->line, "expected an exception");
+        } else if (cmd->expect == EXPECT_SUSPENSION) {
+          wasm_message_t msg;
+          if (trap) {
+            wasm_trap_message(trap, &msg);
+            if (!strcmp(msg.data, "unhandled tag")) npass++;
+            else {
+              nfail++;
+              out("FAIL "); out(cur_file->name); out(":"); put_u(cmd->line);
+              out(": expected an unhandled suspension, got a trap: "); out(msg.data); out("\n");
+            }
+            wasm_byte_vec_delete(&msg);
+          } else fail_at(cmd->line, "expected an unhandled suspension");
         } else if (cmd->expect == EXPECT_TRAP || cmd->expect == EXPECT_EXHAUSTION) {
           if (trap) npass++;
           else fail_at(cmd->line, "expected a trap");

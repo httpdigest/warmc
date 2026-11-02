@@ -17,11 +17,22 @@ while read -r name cls frag; do
   # whichever it is and warmc detects the kind from the bytes, not the name.
   src="$WORK/$name.wasm"
   [ -f "$WORK/$name.wat" ] && src="$WORK/$name.wat"
-  wtimeout ./$BUILD/warmc --validate-only "$src" >/dev/null 2>"$err"
+  # invalid30: what is past Wasm 3.0 (stack switching's), which warmc takes
+  # by default and refuses as invalid under --wasm=3.0
+  level=()
+  if [ "$cls" = invalid30 ]; then
+    if ! wtimeout ./$BUILD/warmc --validate-only "$src" >/dev/null 2>"$err"; then
+      printf 'FAIL[reject] %s: want accepted without --wasm=3.0: %s\n' "$name" "$(head -1 "$err")"
+      fail=$((fail + 1))
+      continue
+    fi
+    level=(--wasm=3.0)
+  fi
+  wtimeout ./$BUILD/warmc ${level[@]+"${level[@]}"} --validate-only "$src" >/dev/null 2>"$err"
   rc=$?
   case "$cls" in
     malformed) want=2 ;;
-    invalid)   want=3 ;;
+    invalid|invalid30) want=3 ;;
     accept)    want=0 ;;
     *) echo "FAIL[reject] $name: unknown class $cls"; fail=$((fail + 1)); continue ;;
   esac

@@ -61,7 +61,7 @@ LANE_BITS = {"i8": 8, "i16": 16, "i32": 32, "i64": 64, "f32": 32, "f64": 64}
 
 CMD = {"module": 0, "register": 1, "invoke": 2, "get": 3}
 EXPECT = {"ok": 0, "trap": 1, "exhaustion": 2, "fail_instantiate": 3,
-          "exception": 4}
+          "exception": 4, "suspension": 5}
 
 class Unsupported(Exception):
     pass
@@ -279,6 +279,8 @@ def generate(spec, module_files, stem, idx, paths=None):
                 cmds.append(action_cmd(cmd["action"], EXPECT["exhaustion"], line, []))
             elif kind == "assert_exception":
                 cmds.append(action_cmd(cmd["action"], EXPECT["exception"], line, []))
+            elif kind == "assert_suspension":
+                cmds.append(action_cmd(cmd["action"], EXPECT["suspension"], line, []))
             elif kind in ("assert_uninstantiable", "assert_unlinkable"):
                 fn = cmd.get("filename")
                 if fn not in index_of:

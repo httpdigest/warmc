@@ -51,8 +51,10 @@ enum { CMD_MODULE, CMD_REGISTER, CMD_INVOKE, CMD_GET };
 /* EXPECT_EXCEPTION is its own verdict rather than a trap: a wast file asserts
  * the two separately, and a module whose `try_table` failed to catch would
  * otherwise pass an `assert_exception` for the wrong reason. */
+/* EXPECT_SUSPENSION: stack switching's assert_suspension, a suspension no
+ * handler takes, which traps (unhandled tag) */
 enum { EXPECT_OK, EXPECT_TRAP, EXPECT_EXHAUSTION, EXPECT_FAIL_INSTANTIATE,
-       EXPECT_EXCEPTION };
+       EXPECT_EXCEPTION, EXPECT_SUSPENSION };
 
 typedef struct {
   unsigned char op;

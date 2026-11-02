@@ -100,6 +100,7 @@ prepare tinygo-libs warm_tinygo
 prepare cases   ./test/run_tests.sh --prepare
 prepare traps   ./test/run_traps.sh --prepare
 prepare gc      ./test/run_gc.sh --prepare
+prepare cont    ./test/run_cont.sh --prepare
 prepare relaxed ./test/run_relaxed.sh --prepare
 prepare fma     ./test/run_fma.sh --prepare
 prepare components python3 test/run_components.py --prepare
@@ -154,7 +155,7 @@ export GC_PAUSE_CHECK=0
 # it on every push.  adapter and wit are left
 # out: their wasmtime runs and subprocesses cost a minute and more of a macOS
 # or Windows runner.
-SMOKE_ROWS="cases-O0 cases-O1 cases-O2 traps-O0 traps-O2 gc-O2 gcthread relaxed
+SMOKE_ROWS="cases-O0 cases-O1 cases-O2 traps-O0 traps-O2 gc-O2 cont-O2 gcthread relaxed
   workload-O2 vecwork-O2 simd-O2 control-O2 addr32-O2 addrmulti-O2 addr64-O2
   wasi link reject pressure bincases canon clink shared capi cases-jit cases-jit-tier2"
 # Under MSYS2 every process costs a tenth of a second to start, and reject
@@ -292,10 +293,12 @@ start limits ./test/run_limits.sh
 # float results with another engine would see
 start traps-O3 env WARMC_FLAGS=-O3 ./test/run_traps.sh
 start gc-O3    env WARMC_FLAGS=-O3 ./test/run_gc.sh
+start cont-O3  env WARMC_FLAGS=-O3 ./test/run_cont.sh
 
 for lv in -O0 -O1 -O2; do
   start "traps$lv" env WARMC_FLAGS=$lv ./test/run_traps.sh
   start "gc$lv" env WARMC_FLAGS=$lv ./test/run_gc.sh
+  start "cont$lv" env WARMC_FLAGS=$lv ./test/run_cont.sh
   start "workload$lv" env WARMC_FLAGS=$lv ./test/run_workload.sh
   start "workload-clang0$lv" \
     env WORKLOAD_CLANG_OPT=-O0 WARMC_FLAGS=$lv ./test/run_workload.sh
