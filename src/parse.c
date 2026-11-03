@@ -56,6 +56,45 @@ static bool name_u32(const uint8_t **p, const uint8_t *end, uint32_t *out) {
    a size past its end, an index out of range or not increasing, a name not
    UTF-8 -- gives no names at all.  A name that is empty or holds a NUL,
    which no symbol can, leaves only its function without one. */
+/* metadata.code.branch_hint: for each function with hints, its index and
+   its hints in increasing offset, each an offset from the body's start, a
+   size of 1 and the hint, 0 or 1.  One that is not so is let go whole: a
+   hint only steers where code goes and what is kept in registers. */
+static void read_branch_hints(Module *m) {
+  static const char nm[] = "metadata.code.branch_hint";
+  const CustomSec *c = NULL;
+  for (uint32_t i = 0; i < m->ncustoms && !c; i++)
+    if (m->customs[i].name_len == sizeof nm - 1 && !memcmp(m->customs[i].name, nm, sizeof nm - 1))
+      c = &m->customs[i];
+  if (!c || warmc_getenv("WARMC_NO_BRANCH_HINTS")) return;
+  const uint8_t *p = c->data, *end = c->data + c->len;
+  uint32_t nf;
+  if (!name_u32(&p, end, &nf)) return;
+  for (uint32_t k = 0; k < nf; k++) {
+    uint32_t fi, n;
+    if (!name_u32(&p, end, &fi) || !name_u32(&p, end, &n) || fi < m->nimported_funcs ||
+        fi >= m->nfuncs || n > (uint32_t)(end - p))
+      return;
+    Func *f = &m->funcs[fi];
+    uint32_t *off = xmalloc((n ? n : 1) * sizeof(uint32_t));
+    uint8_t *val = xmalloc(n ? n : 1);
+    uint32_t last = 0;
+    for (uint32_t h = 0; h < n; h++) {
+      uint32_t o, sz;
+      if (!name_u32(&p, end, &o) || !name_u32(&p, end, &sz) || sz != 1 || p >= end ||
+          *p > 1 || (h && o <= last)) {
+        xfree(off); xfree(val);
+        return;
+      }
+      off[h] = o;
+      val[h] = *p++;
+      last = o;
+    }
+    xfree(f->bh_off); xfree(f->bh_val);
+    f->bh_off = off; f->bh_val = val; f->nbh = n;
+  }
+}
+
 static void read_func_names(Module *m) {
   const CustomSec *c = NULL;
   for (uint32_t i = 0; i < m->ncustoms && !c; i++)
@@ -932,6 +971,7 @@ static void parse_code(Module *m, Rd *r) {
     }
     f->body = br.p;
     f->body_end = body_end;
+    f->code_start = body_start;
     r->p = body_end;
   }
 }
@@ -1078,6 +1118,7 @@ Module *wasm_parse(const uint8_t *bin, size_t len) {
     warmc_invalid("%s", invalid);
   }
   read_func_names(m);
+  read_branch_hints(m);
   return m;
 }
 

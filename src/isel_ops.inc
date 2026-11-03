@@ -3302,6 +3302,7 @@ static void emit_block(Isel *s, uint32_t bi, uint32_t next_bi) {
     s->pc_live = true;
     for (; pck < pce && s->pc[pck].lo == i; pck++)
       if (s->pc[pck].kind == PC_CLUSTER) piece_fill(s, &s->pc[pck]);
+      else if (s->pc[pck].kind == PC_VREST) vac_move(s, &s->pc[pck]);
     s->at_eh_site = eh && i + 1 == b->ninsts;
     if (s->at_eh_site) emit_eh_stores(s, bi);
     if (s->paired[b->insts[i]]) continue;
@@ -3318,6 +3319,8 @@ static void emit_block(Isel *s, uint32_t bi, uint32_t next_bi) {
   /* the loop pieces of the loops this block enters */
   for (; pck < pce; pck++)
     if (s->pc[pck].kind == PC_FILL) piece_fill(s, &s->pc[pck]);
+    else if (s->pc[pck].kind == PC_VREST || s->pc[pck].kind == PC_VSAVE)
+      vac_move(s, &s->pc[pck]);
   s->pc_live = false;
   s->pc_term = s->pc_head != NULL;
   s->at_eh_site = false;

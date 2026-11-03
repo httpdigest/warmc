@@ -6305,6 +6305,23 @@ static bool td_numeric(ValType t) {
   return t == VT_I32 || t == VT_I64 || t == VT_F32 || t == VT_F64 || t == VT_V128;
 }
 
+/* A parameter jump threading may leave undefined on some way, which the
+   repair hands a zero (td_repair): a number, or a reference, whose zero is
+   null -- read on no way that reaches a use, so a non-nullable one's type
+   is never asked of it (luawasm's merges of a value pair, an i64 and an
+   eqref, ahead of the test of the flag its try-ops set).  WARMC_TD_REFS=1:
+   it made luawasm's bounce 12% and methodcall 5% faster, but its nbodies
+   12% and 17% slower, the threaded edges' values spilling in their loops. */
+static bool td_param_ok(ValType t) {
+  static _Atomic int refs = -1;
+  int r = atomic_load_explicit(&refs, memory_order_relaxed);
+  if (r < 0) {
+    r = warmc_getenv("WARMC_TD_REFS") != NULL;
+    atomic_store_explicit(&refs, r, memory_order_relaxed);
+  }
+  return td_numeric(t) || (r && vt_is_ref(t));
+}
+
 /* The test of a block that branches on nothing but a compare of one of its
    parameters with a constant -- binaryen's `c ? x : 1` merged into the block
    whose `if` tests it -- as the opcode and constant, or false.  The compare
@@ -6381,7 +6398,7 @@ static bool thread_dispatch(IrFunc *f, uint32_t B, const uint32_t *nread,
   uint64_t tmask = f->insts[sw].type == VT_I64 ? ~0ull : 0xffffffffu;
   /* The repair needs a zero of each parameter's type; see td_repair. */
   for (uint32_t q = 0; q < b->nparams; q++)
-    if (!td_numeric((ValType)f->insts[b->params[q]].type)) return false;
+    if (!td_param_ok((ValType)f->insts[b->params[q]].type)) return false;
 
   TdVec made = {0};
   uint32_t nb0 = f->nblocks;
@@ -6768,7 +6785,7 @@ static bool thread_known(IrFunc *f, uint32_t B, const uint32_t *nread, uint32_t 
     if (nread[v] != here) return false;
   }
   for (uint32_t q = 0; q < b->nparams; q++)
-    if (!td_numeric((ValType)f->insts[b->params[q]].type)) return false;
+    if (!td_param_ok((ValType)f->insts[b->params[q]].type)) return false;
   /* where the test is true: B's way 0 */
   KSet yes = {0};
   if (b->term == T_BRIF && b->term_arg == x) ks_range(&yes, 1, mask, mask);
@@ -12203,6 +12220,88 @@ static bool gc_counted_cond(IrFunc *f, uint32_t hb, uint32_t bi, Ref cond, bool 
   return false;
 }
 
+/* x as base + c: through adds and subtractions of constants, in x's own
+   width (c mod 2^64; for an i32 x its low half matters), and for an i32,
+   through a wrap of an i64 on to that i64's own form -- wrap(k) - 1 and
+   wrap(k - 1) are one value. */
+static Ref gc_lin(IrFunc *f, Ref x, uint64_t *c) {
+  *c = 0;
+  for (int d = 0; d < 8; d++) {
+    x = ir_resolve(f, x);
+    Inst *in = &f->insts[x];
+    uint64_t k;
+    if ((in->op == I_ADD || in->op == I_SUB) && in->nargs == 2 &&
+        is_const(f, ir_args(f, x)[1], &k)) {
+      if (!vt_is_64((ValType)in->type)) k = (uint64_t)(int64_t)(int32_t)(uint32_t)k;
+      *c += in->op == I_ADD ? k : 0 - k;
+      x = ir_args(f, x)[0];
+      continue;
+    }
+    if (in->op == I_ADD && in->nargs == 2 && is_const(f, ir_args(f, x)[0], &k)) {
+      if (!vt_is_64((ValType)in->type)) k = (uint64_t)(int64_t)(int32_t)(uint32_t)k;
+      *c += k;
+      x = ir_args(f, x)[1];
+      continue;
+    }
+    if (in->op == I_WRAP && in->nargs == 1) { x = ir_args(f, x)[0]; continue; }
+    break;
+  }
+  return ir_resolve(f, x);
+}
+
+/* A fact x <u zext(n) of an i64 x proves an i32 index idx below n where idx
+   is x's low half: x then fits in 32 bits, and wrap distributes over the
+   constants either takes. */
+static bool gc_idx_wide(IrFunc *f, Ref fx, Ref flen, Ref idx, Ref *n32) {
+  Inst *fi = &f->insts[fx];
+  if (!vt_is_64((ValType)fi->type) || vt_is_64((ValType)f->insts[idx].type)) return false;
+  Ref l = ir_resolve(f, flen);
+  Inst *li = &f->insts[l];
+  if (li->op != I_EXTENDU || li->nargs != 1) return false;
+  uint64_t ca, cb;
+  Ref a = gc_lin(f, fx, &ca), b = gc_lin(f, idx, &cb);
+  if (a != b || (uint32_t)ca != (uint32_t)cb) return false;
+  /* the base itself an i64 on both sides: an i32 base was not widened */
+  if (!vt_is_64((ValType)f->insts[a].type)) return false;
+  *n32 = ir_resolve(f, ir_args(f, l)[0]);
+  return true;
+}
+
+/* Is a bound L at most obj's length?  Its length itself (array.len of the
+   same object, or the allocation's), or an unsigned min with one of those
+   as an operand -- select(a, b, a <u b) and its spellings -- which luawasm
+   makes of a table's used length and its array's, the first never above
+   the second, so that its own test of an index proves the access too. */
+static bool gc_len_covers(IrFunc *f, Ref L, Ref obj, Ref alen, int depth) {
+  L = ir_resolve(f, L);
+  Inst *li = &f->insts[L];
+  if (li->op == I_ARRAY_LEN && li->nargs == 1 && gc_ref_root(f, ir_args(f, L)[0]) == obj)
+    return true;
+  if (alen != REF_NONE && alen == L) return true;
+  if (depth <= 0 || li->op != I_SELECT || li->nargs != 3) return false;
+  Ref x = ir_resolve(f, ir_args(f, L)[0]), y = ir_resolve(f, ir_args(f, L)[1]);
+  Ref c = ir_resolve(f, ir_args(f, L)[2]);
+  bool inv = false;
+  while (f->insts[c].op == I_EQZ && f->insts[c].nargs == 1) {
+    c = ir_resolve(f, ir_args(f, c)[0]);
+    inv = !inv;
+  }
+  Inst *ci = &f->insts[c];
+  if (ci->nargs != 2) return false;
+  Ref p = ir_resolve(f, ir_args(f, c)[0]), q = ir_resolve(f, ir_args(f, c)[1]);
+  /* the operand the select takes where the condition holds: the smaller */
+  Ref small, big;
+  switch (ci->op) {
+    case I_LTU: case I_LEU: small = p; big = q; break;
+    case I_GTU: case I_GEU: small = q; big = p; break;
+    default: return false;
+  }
+  if (inv) { Ref t = small; small = big; big = t; }
+  /* (the other way round it is the max) */
+  if (x != small || y != big) return false;
+  return gc_len_covers(f, x, obj, alen, depth - 1) || gc_len_covers(f, y, obj, alen, depth - 1);
+}
+
 /* What a dominating test or cast proved of an object: that it is null or an
    ht. */
 typedef struct { Ref obj; HeapType ht; } GcTy;
@@ -12624,14 +12723,11 @@ static bool pass_gc_nullchk(IrFunc *f) {
             Ref idx = ir_resolve(f, ir_args(f, v)[1]);
             Ref alen = gc_array_len_value(f, obj);
             for (uint32_t k = 0; k < bcounts[bi]; k++) {
-              if (bsets[bi][k].idx != idx) continue;
               Ref L = bsets[bi][k].len;
-              Inst *li = &f->insts[L];
-              bool ours =
-                  (li->op == I_ARRAY_LEN && li->nargs == 1 &&
-                   gc_ref_root(f, ir_args(f, L)[0]) == obj) ||
-                  (alen != REF_NONE && alen == L);
-              if (!ours) continue;
+              if (bsets[bi][k].idx != idx &&
+                  !gc_idx_wide(f, bsets[bi][k].idx, L, idx, &L))
+                continue;
+              if (!gc_len_covers(f, L, obj, alen, 3)) continue;
               in->imm2 |= GCF_NOBOUND;
               changed = true;
               g_stats.checks_removed++;
@@ -22824,6 +22920,165 @@ static bool pass_addr_nowrap(IrFunc *f) {
   return changed;
 }
 
+/* Struct fields read again: a field.get of a field the function has just
+   read, or written, on the same object -- with no write of a field at that
+   offset, on any object, and no call between -- is the value it read or
+   wrote.  Mutable fields too, which CSE leaves (gc_field_immutable): a
+   Lua table's array part, read once for its length and again for every
+   access, or self.v read three times in one swap.  Forward over the
+   blocks in order: a block with one way in starts from its predecessor's
+   state, a merge from what every way in agrees on, a loop's header from
+   what its preheader holds that nothing in the loop writes (the loop
+   makes no call); a landing pad from nothing.  Writes kill by offset only,
+   as objects of two types at one offset may be one object; a packed
+   field's write forwards nothing (its read extends). */
+#define RLE_MAX 48
+typedef struct { Ref root, value; uint64_t off; uint32_t size; ValType ty; } RleEnt;
+typedef struct { RleEnt e[RLE_MAX]; uint32_t n; bool valid; } RleSet;
+
+static bool rle_kills_all(uint16_t op) {
+  switch (op) {
+    case I_CALL: case I_CALL_INDIRECT: case I_CALL_REF:
+    case I_RETURN_CALL: case I_RETURN_CALL_INDIRECT: case I_RETURN_CALL_REF:
+    case I_THROW: case I_THROW_REF: case I_CONT_OP:
+      return true;
+    default:
+      return false;
+  }
+}
+
+static void rle_kill_off(RleSet *st, uint64_t off) {
+  uint32_t k = 0;
+  for (uint32_t j = 0; j < st->n; j++)
+    if (st->e[j].off != off) st->e[k++] = st->e[j];
+  st->n = k;
+}
+
+static void rle_put(RleSet *st, RleEnt e) {
+  for (uint32_t j = 0; j < st->n; j++)
+    if (st->e[j].root == e.root && st->e[j].off == e.off) { st->e[j] = e; return; }
+  if (st->n == RLE_MAX) {
+    memmove(&st->e[0], &st->e[1], (RLE_MAX - 1) * sizeof(RleEnt));
+    st->n--;
+  }
+  st->e[st->n++] = e;
+}
+
+static bool pass_gc_rle(IrFunc *f) {
+  static const uint16_t gets[] = { I_FIELD_GET };
+  if (round_lacks(f, 15, gets, 1)) return false;
+  uint32_t nb = f->nblocks;
+  RleSet *out = xcalloc(nb ? nb : 1, sizeof(RleSet));
+  /* what each block writes: offsets as bits of a hash, or everything */
+  uint64_t *wmask = xcalloc(nb ? nb : 1, sizeof(uint64_t));
+  uint8_t *wall = xcalloc(nb ? nb : 1, 1);
+  bool any_get = false;
+  for (uint32_t oi = 0; oi < f->norder; oi++) {
+    uint32_t bi = f->order[oi];
+    const Block *b = &f->blocks[bi];
+    for (uint32_t i = 0; i < b->ninsts; i++) {
+      const Inst *in = &f->insts[b->insts[i]];
+      if (in->op == I_FIELD_SET) wmask[bi] |= (uint64_t)1 << ((in->imm >> 2) & 63);
+      else if (rle_kills_all(in->op)) wall[bi] = 1;
+      else if (in->op == I_FIELD_GET) any_get = true;
+    }
+  }
+  bool changed = false;
+  if (!any_get) goto done;
+  uint8_t *inloop = xmalloc(nb ? nb : 1);
+  uint32_t *stack = xmalloc((nb ? nb : 1) * sizeof(uint32_t));
+  RleSet cur;
+  for (uint32_t oi = 0; oi < f->norder; oi++) {
+    uint32_t bi = f->order[oi];
+    Block *b = &f->blocks[bi];
+    cur.n = 0;
+    cur.valid = true;
+    bool back = false;
+    uint32_t fwd = 0, first = UINT32_MAX;
+    for (uint32_t p = 0; p < b->npreds; p++) {
+      uint32_t pb = b->preds[p];
+      if (!f->blocks[pb].reachable) continue;
+      if (f->blocks[pb].rpo >= b->rpo) back = true;
+      else { fwd++; if (first == UINT32_MAX) first = pb; }
+    }
+    if (b->is_pad || bi == f->entry || !fwd) {
+      /* nothing known */
+    } else if (!back) {
+      const RleSet *a = &out[first];
+      for (uint32_t j = 0; j < a->n; j++) {
+        RleEnt e = a->e[j];
+        bool all = true;
+        for (uint32_t p = 0; p < b->npreds && all; p++) {
+          uint32_t pb = b->preds[p];
+          if (pb == first || !f->blocks[pb].reachable) continue;
+          const RleSet *o = &out[pb];
+          bool found = false;
+          for (uint32_t q = 0; q < o->n && !found; q++)
+            found = o->e[q].root == e.root && o->e[q].off == e.off && o->e[q].value == e.value;
+          all = found;
+        }
+        if (all) cur.e[cur.n++] = e;
+      }
+    } else if (fwd == 1 && loop_body(f, bi, inloop, stack) == first) {
+      uint64_t m = 0;
+      bool killed = false;
+      for (uint32_t x = 0; x < nb && !killed; x++)
+        if (inloop[x]) { m |= wmask[x]; killed = wall[x] != 0 || f->blocks[x].is_pad; }
+      if (!killed) {
+        const RleSet *a = &out[first];
+        for (uint32_t j = 0; j < a->n; j++)
+          if (!((m >> ((a->e[j].off >> 2) & 63)) & 1)) cur.e[cur.n++] = a->e[j];
+      }
+    }
+    for (uint32_t i = 0; i < b->ninsts; i++) {
+      Ref v = b->insts[i];
+      Inst *in = &f->insts[v];
+      if (in->op == I_FIELD_GET && in->nargs >= 1) {
+        Ref root = gc_ref_root(f, ir_args(f, v)[0]);
+        uint32_t size = (uint32_t)(in->imm2 & (7u | GCF_SIGNED));
+        Ref hit = REF_NONE;
+        for (uint32_t j = 0; j < cur.n && hit == REF_NONE; j++) {
+          const RleEnt *e = &cur.e[j];
+          if (e->root != root || e->off != in->imm || e->size != size) continue;
+          if (e->ty == (ValType)in->type ||
+              (vt_is_ref(e->ty) && vt_is_ref((ValType)in->type)))
+            hit = e->value;
+        }
+        if (hit != REF_NONE) {
+          ir_replace(f, v, hit);
+          ir_make_nop(in);
+          g_stats.gc_loads_reused++;
+          changed = true;
+          continue;
+        }
+        rle_put(&cur, (RleEnt){ root, v, in->imm, size, (ValType)in->type });
+      } else if (in->op == I_FIELD_SET && in->nargs >= 2) {
+        Ref root = gc_ref_root(f, ir_args(f, v)[0]);
+        Ref val = ir_resolve(f, ir_args(f, v)[1]);
+        if (!(in->imm2 & GCF_INIT)) rle_kill_off(&cur, in->imm);
+        uint32_t size = (uint32_t)(in->imm2 & 7u);
+        /* a packed field's read extends what is stored: nothing to give */
+        if (size >= 2) {
+          rle_put(&cur, (RleEnt){ root, val, in->imm, size, (ValType)f->insts[val].type });
+        } else {
+          uint32_t k = 0;
+          for (uint32_t j = 0; j < cur.n; j++)
+            if (!(cur.e[j].root == root && cur.e[j].off == in->imm)) cur.e[k++] = cur.e[j];
+          cur.n = k;
+        }
+      } else if (rle_kills_all(in->op)) {
+        cur.n = 0;
+      }
+    }
+    out[bi] = cur;
+  }
+  xfree(inloop); xfree(stack);
+done:
+  xfree(out); xfree(wmask); xfree(wall);
+  if (changed) ir_apply_subst(f);
+  return changed;
+}
+
 static double pt_now(void) {
   struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
   return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
@@ -22888,6 +23143,8 @@ static void opt_cleanup(IrFunc *f, const OptOpts *o) {
     if (o->thread && RUN(3, "thread", pass_thread(f))) changed = true;
     if (o->thread && o->nodesplit && RUN(4, "nodesplit", pass_nodesplit(f))) changed = true;
     if (o->cse && RUN(5, "cse", pass_cse(f, o))) changed = true;
+    if (o->cse && o->gcpure && !warmc_getenv("WARMC_NO_GCRLE") &&
+        RUN(15, "gcrle", pass_gc_rle(f))) changed = true;
     if (o->memopt && RUN(6, "memopt", pass_memopt(f, o))) changed = true;
 
     if (o->ldcomb && RUN(7, "ldcomb", pass_load_combine(f, o))) changed = true;

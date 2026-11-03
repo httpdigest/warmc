@@ -424,7 +424,7 @@ static void print_stats(void) {
           " exact_store_checks=%llu exact_memop_checks=%llu\n"
           "             reloads=%llu caller_saves=%llu csa_restores=%llu"
           " v128_spills=%llu rb_trips=%llu split_cuts=%llu split_invs=%llu pieces=%llu"
-          " loop_pieces=%llu recomputes=%llu dead_frame_stores=%llu tramp_funcs=%llu gosp_funcs=%llu"
+          " loop_pieces=%llu vacates=%llu gc_loads_reused=%llu recomputes=%llu dead_frame_stores=%llu tramp_funcs=%llu gosp_funcs=%llu"
           " go_resume_pruned=%llu go_resume_split=%llu go_noret_calls=%llu wrap_params=%llu\n"
           "             escape_removed=%llu escape_forwarded=%llu escape_made=%llu gloop=%llu\n"
           "             loop_closed=%llu reassoc=%llu cmp_reused=%llu csel_fused=%llu cincs=%llu mul_wide=%llu fma=%llu gssa=%llu bitrevs=%llu common_factors=%llu threaded_known=%llu param_compares=%llu key_splits=%llu bfi_apart=%llu ccmp_chains=%llu loop_tops=%llu loop_consts=%llu small_loops=%llu slp_groups=%llu\n"
@@ -474,6 +474,8 @@ static void print_stats(void) {
           (unsigned long long)g_stats.split_invs,
           (unsigned long long)g_stats.pieces,
           (unsigned long long)g_stats.loop_pieces,
+          (unsigned long long)g_stats.vacates,
+          (unsigned long long)g_stats.gc_loads_reused,
           (unsigned long long)g_stats.recomputes,
           (unsigned long long)g_stats.dead_frame_stores,
           (unsigned long long)g_stats.tramp_funcs,

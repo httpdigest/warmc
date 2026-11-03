@@ -403,8 +403,8 @@ static void spill_debug(Isel *s, const char *kind, const Interval *cur,
   if (in->op == I_CONST && !vt_is_float((ValType)in->type) &&
       (ValType)in->type != VT_V128)
     cost = ir_const_cost(in->imm, vt_is_64((ValType)in->type));
-  fprintf(stderr, "%s[%u] %s len=%d w=%.0f xcall=%d ref=%d cost=%d nr=%d",
-          kind, s->f->func_index, ir_op_name(in->op), cur->end - cur->start, w,
+  fprintf(stderr, "%s[%u] v%u %s len=%d w=%.0f xcall=%d ref=%d cost=%d nr=%d",
+          kind, s->f->func_index, cur->value, ir_op_name(in->op), cur->end - cur->start, w,
           cur->crosses_call, vt_is_ref((ValType)in->type), cost,
           s->no_remat[cur->value]);
   if (in->op == I_GLOBAL_GET) {
@@ -572,7 +572,9 @@ static double csa_crossing_cost(const Interval *cur, const Range *R,
       if (deepest && call_depth[a] > *deepest) *deepest = call_depth[a];
       double w = call_share ? call_share[a] : 1.0;
       for (int k = 0; k < call_depth[a]; k++) w *= 10.0;
-      if (call_cold[a]) w /= cold_div;
+      /* a call on a rare way (2) weighs what a cold block does */
+      if (call_cold[a] == 2) w *= 0.01;
+      else if (call_cold[a]) w /= cold_div;
       c += 2.0 * w;
     }
   }
@@ -1020,10 +1022,19 @@ static int piece_cand_cmp(const void *a, const void *b) {
   return x->v < y->v ? -1 : x->v > y->v;
 }
 
+/* where a block's pieces at one position go: a vacated value's restore
+   first, then the pieces read there, a vacated value's save, the fills of
+   the loops the block enters */
+static int piece_rank(uint8_t kind) {
+  return kind == PC_VREST ? 0 : kind == PC_VSAVE ? 2 : kind == PC_FILL ? 3 : 1;
+}
+
 static int piece_cmp(const void *a, const void *b) {
   const struct Piece *x = a, *y = b;
   if (x->block != y->block) return x->block < y->block ? -1 : 1;
   if (x->lo != y->lo) return x->lo < y->lo ? -1 : 1;
+  int rx = piece_rank(x->kind), ry = piece_rank(y->kind);
+  if (rx != ry) return rx < ry ? -1 : 1;
   return x->v < y->v ? -1 : x->v > y->v;
 }
 
@@ -1037,6 +1048,411 @@ static int lpc_cmp(const void *a, const void *b) {
   if (x->gain != y->gain) return x->gain > y->gain ? -1 : 1;
   if (x->hdr != y->hdr) return x->hdr < y->hdr ? -1 : 1;
   return x->v < y->v ? -1 : x->v > y->v;
+}
+
+/* Vacating.  A loop piece needs a register free across the loop, and in a
+   loop nested in others the values the outer code keeps -- live through
+   the loop, never read there -- may hold every one: luawasm's sieve kept
+   its outer loops' state in all the callee-saved registers and reloaded
+   its inner loop's bound and kind flag from the stack every trip.  Such a
+   value can give its register up for the loop: stored to a slot of its own
+   at the end of each block entering it (all of which go nowhere else),
+   loaded back at the start of each block the loop leaves to where it is
+   live.  try_vacate looks for a register whose holders across the loop and
+   at its fills are all such values, priced at their stores and loads by
+   the blocks' frequencies against the piece's gain, and frees it: the
+   holders' ranges inside the loop go, their saves and restores are
+   PC_VSAVE and PC_VREST pieces.  The loop makes no call (a loop piece's
+   condition), so no safepoint sees a holder only in its slot. */
+typedef struct { int32_t lo, hi; uint32_t own; } OwnR;
+typedef struct { OwnR *v; uint32_t n, cap; } OwnL;
+#define OWN_PIECE UINT32_MAX
+typedef struct { uint32_t web, hdr, xfirst, xn; } VacRec;
+
+typedef struct {
+  bool built;
+  const Interval *sorted;
+  uint32_t ns;
+  OwnL own[2][32];
+  VacRec *rec; uint32_t nrec, cap;
+  uint32_t *xp; uint32_t nxp, capxp;  /* each record's entry and exit blocks */
+  uint32_t *bstampA, *bstampB, *bstampC, *bstampD, *wstamp, stamp, stamp2;
+  uint32_t nvac;
+} VacCtx;
+
+static void own_add(OwnL *L, int32_t lo, int32_t hi, uint32_t own, bool sorted) {
+  if (L->n == L->cap) {
+    L->cap = L->cap ? L->cap * 2 : 16;
+    L->v = xrealloc(L->v, L->cap * sizeof(OwnR));
+  }
+  uint32_t z = L->n++;
+  while (sorted && z && L->v[z - 1].lo > lo) { L->v[z] = L->v[z - 1]; z--; }
+  L->v[z].lo = lo; L->v[z].hi = hi; L->v[z].own = own;
+}
+
+static int ownr_cmp(const void *a, const void *b) {
+  const OwnR *x = a, *y = b;
+  if (x->lo != y->lo) return x->lo < y->lo ? -1 : 1;
+  return x->hi < y->hi ? -1 : x->hi > y->hi;
+}
+
+static int range_lo_cmp(const void *a, const void *b) {
+  const Range *x = a, *y = b;
+  return x->lo < y->lo ? -1 : x->lo > y->lo;
+}
+
+static double blk_freq(const Block *b) {
+  if (b->cold) return 0.01;
+  double w = 1.0;
+  for (uint32_t d = 0; d < b->loop_depth && d < 8; d++) w *= 10.0;
+  return w;
+}
+
+/* the first range of L (sorted, disjoint but for shared ends) ending at or
+   after lo */
+static uint32_t own_first(const OwnL *L, int32_t lo) {
+  uint32_t a = 0, b = L->n;
+  while (a < b) {
+    uint32_t m = (a + b) / 2;
+    if (L->v[m].hi < lo) a = m + 1; else b = m;
+  }
+  return a;
+}
+
+typedef struct { uint32_t block; uint8_t kind; } VacAct;
+
+/* What vacating w from the loop (the blocks stamped st in bstampA) takes:
+   a save at the end of each entry; for each exit target where w is live, a
+   restore at its start, and -- as some other way may come into it, which
+   has passed no save -- a save at the end of each of its predecessors
+   outside the loop, where w is in its register.  None of it may fall in a
+   loop w is vacated from already, nor that loop's saves and restores in
+   this one.  Appends to act; false where it cannot be done. */
+static bool vac_plan(IrFunc *f, VacCtx *vc, uint32_t w, uint32_t st,
+                     const uint32_t *ent, uint32_t nent, const uint32_t *ex,
+                     uint32_t nex, const uint32_t *web, uint32_t n,
+                     const Isel *s, const uint32_t *lblk, const uint32_t *lfirst,
+                     const uint32_t *lcount, VacAct **act, uint32_t *nact,
+                     uint32_t *cap, double *cost) {
+  uint32_t stc = ++vc->stamp2;
+  for (uint32_t r2 = 0; r2 < vc->nrec; r2++) {
+    const VacRec *o = &vc->rec[r2];
+    if (o->web != w) continue;
+    for (uint32_t j = 0; j < lcount[o->hdr]; j++) {
+      uint32_t bi = lblk[lfirst[o->hdr] + j];
+      if (vc->bstampA[bi] == st) return false;
+      vc->bstampC[bi] = stc;
+    }
+    for (uint32_t z = 0; z < o->xn; z++)
+      if (vc->bstampA[vc->xp[o->xfirst + z]] == st) return false;
+  }
+  uint32_t std = ++vc->stamp2;
+#define VAC_ADD(b_, k_) do {                                                   \
+    uint32_t bb_ = (b_);                                                       \
+    if (vc->bstampC[bb_] == stc) return false;                                 \
+    if ((k_) == PC_VSAVE && vc->bstampD[bb_] == std) break;                    \
+    if ((k_) == PC_VSAVE) vc->bstampD[bb_] = std;                              \
+    if (*nact == *cap) {                                                       \
+      *cap = *cap ? *cap * 2 : 16;                                             \
+      *act = xrealloc(*act, *cap * sizeof(VacAct));                            \
+    }                                                                          \
+    (*act)[(*nact)++] = (VacAct){ bb_, (k_) };                                 \
+    *cost += blk_freq(&f->blocks[bb_]);                                        \
+  } while (0)
+  for (uint32_t z = 0; z < nent; z++) VAC_ADD(ent[z], PC_VSAVE);
+  for (uint32_t z = 0; z < nex; z++) {
+    uint32_t t = ex[z];
+    bool live = false;
+    for (uint32_t m = s->lv_in_off[t]; m < s->lv_in_off[t + 1] && !live; m++)
+      live = s->lv_in[m] < n && web[s->lv_in[m]] == w;
+    if (!live) continue;
+    VAC_ADD(t, PC_VREST);
+    const Block *tb = &f->blocks[t];
+    for (uint32_t p = 0; p < tb->npreds; p++) {
+      uint32_t q = tb->preds[p];
+      if (!f->blocks[q].reachable || vc->bstampA[q] == st) continue;
+      if (f->blocks[q].is_pad) return false;
+      VAC_ADD(q, PC_VSAVE);
+    }
+  }
+#undef VAC_ADD
+  return true;
+}
+
+/* u's web touched, and the webs a read of u reads besides: the operand a
+   wrap that takes no register reads in its place (walias), the operands a
+   spilled value recomputed at its reads is made of (mark_recompute) */
+static void vac_touch(Isel *s, IrFunc *f, VacCtx *vc, const uint32_t *web, uint32_t n,
+                      Ref u, uint32_t st, int depth) {
+  if (u >= n) return;
+  vc->wstamp[web[u]] = st;
+  if (depth > 4) return;
+  if (s->walias && s->walias[u])
+    vac_touch(s, f, vc, web, n, ir_args(f, u)[0], st, depth + 1);
+#if RA_HAVE_RECOMP
+  if (s->recomp && s->recomp[u]) {
+    Ref x, y;
+    uint64_t c;
+    recomp_shape(f, u, &x, &y, &c);
+    if (x != REF_NONE) vac_touch(s, f, vc, web, n, x, st, depth + 1);
+    if (y != REF_NONE) vac_touch(s, f, vc, web, n, y, st, depth + 1);
+  }
+#endif
+}
+
+static int try_vacate(Isel *s, IrFunc *f, VacCtx *vc, RList rl[2][32], Ref v,
+                      uint32_t hb, double gain, const uint32_t *lblk,
+                      const uint32_t *lfirst_a, const uint32_t *lcount_a,
+                      const int32_t *blk_start,
+                      const int32_t *blk_end, const uint32_t *web,
+                      const Interval *iv, const Range *R, const int32_t *num,
+                      const int *gpool, int ngpool, Ref *eu, uint32_t eucap,
+                      uint32_t n, struct Piece **pcs, uint32_t *npcs,
+                      uint32_t *cap_pcs, uint32_t *slot) {
+  uint32_t nb = f->nblocks;
+  uint32_t lfirst = lfirst_a[hb], lcount = lcount_a[hb];
+  const Block *hd = &f->blocks[hb];
+  int cl = s->cls[v];
+  if (cl && (ValType)f->insts[v].type == VT_V128) return -1;
+  if (warmc_getenv("WARMC_VACATE_MAX") &&
+      vc->nvac >= (uint32_t)atoi(warmc_getenv("WARMC_VACATE_MAX")))
+    return -1;
+  if (!vc->built) {
+    vc->built = true;
+    vc->bstampA = xcalloc(nb ? nb : 1, sizeof(uint32_t));
+    vc->bstampB = xcalloc(nb ? nb : 1, sizeof(uint32_t));
+    vc->bstampC = xcalloc(nb ? nb : 1, sizeof(uint32_t));
+    vc->bstampD = xcalloc(nb ? nb : 1, sizeof(uint32_t));
+    vc->wstamp = xcalloc(n ? n : 1, sizeof(uint32_t));
+    /* every register's holders, as the range lists have them */
+    for (uint32_t i = 0; i < vc->ns; i++) {
+      const Interval *X = &vc->sorted[i];
+      int l = s->loc[X->value];
+      if (l == LOC_NONE || IS_SLOT(l) || l >= 32) continue;
+      OwnL *L = &vc->own[X->cls ? 1 : 0][l];
+      if (X->rcount)
+        for (uint32_t y = 0; y < X->rcount; y++)
+          own_add(L, R[X->rfirst + y].lo, R[X->rfirst + y].hi, X->value, false);
+      else
+        own_add(L, X->start, X->end, X->value, false);
+    }
+    for (uint32_t k = 0; k < *npcs; k++) {
+      const struct Piece *p = &(*pcs)[k];
+      OwnL *L = &vc->own[s->cls[p->v] ? 1 : 0][p->reg];
+      if (p->kind == PC_LOOP) own_add(L, blk_start[p->block], blk_end[p->block], OWN_PIECE, false);
+      else if (p->kind == PC_FILL) own_add(L, blk_end[p->block], blk_end[p->block], OWN_PIECE, false);
+    }
+    for (int c = 0; c < 2; c++)
+      for (int r = 0; r < 32; r++)
+        if (vc->own[c][r].n > 1)
+          qsort(vc->own[c][r].v, vc->own[c][r].n, sizeof(OwnR), ownr_cmp);
+  }
+  /* the loop's blocks (A), its entries and exits (B) */
+  uint32_t st = ++vc->stamp;
+  for (uint32_t j = 0; j < lcount; j++) vc->bstampA[lblk[lfirst + j]] = st;
+  uint32_t *ent = xmalloc((hd->npreds + 1) * sizeof(uint32_t)), nent = 0;
+  uint32_t *ex = NULL, nex = 0, capex = 0;
+  int result = -1;
+  Range *cuts = xmalloc((lcount + hd->npreds + 1) * sizeof(Range));
+  uint32_t ncut = 0;
+  uint32_t *owners = xmalloc(64 * sizeof(uint32_t));
+  VacAct *act = NULL;
+  uint32_t nact = 0, capact = 0;
+  for (uint32_t p = 0; p < hd->npreds; p++) {
+    uint32_t pb = hd->preds[p];
+    const Block *P = &f->blocks[pb];
+    if (!P->reachable || P->rpo >= hd->rpo) continue;
+    if (P->nsuccs != 1 || P->succs[0].target != hb || P->succs[0].eh) goto out;
+    if (vc->bstampB[pb] != st) { vc->bstampB[pb] = st; ent[nent++] = pb; }
+  }
+  for (uint32_t j = 0; j < lcount; j++) {
+    const Block *b = &f->blocks[lblk[lfirst + j]];
+    for (uint32_t e = 0; e < b->nsuccs; e++) {
+      uint32_t t = b->succs[e].target;
+      if (vc->bstampA[t] == st) continue;
+      if (b->succs[e].eh || t == f->entry || f->blocks[t].is_pad) goto out;
+      if (vc->bstampB[t] == st) {
+        bool isent = false;
+        for (uint32_t k = 0; k < nent; k++) isent |= ent[k] == t;
+        if (isent) goto out;
+        continue;
+      }
+      vc->bstampB[t] = st;
+      if (nex == capex) { capex = capex ? capex * 2 : 8; ex = xrealloc(ex, capex * sizeof(uint32_t)); }
+      ex[nex++] = t;
+    }
+  }
+  /* the webs the loop or its entries' edges touch */
+  for (uint32_t j = 0; j < lcount + nent; j++) {
+    uint32_t bi = j < lcount ? lblk[lfirst + j] : ent[j - lcount];
+    const Block *b = &f->blocks[bi];
+    if (j < lcount) {
+      for (uint32_t k = 0; k < b->nparams; k++) vc->wstamp[web[b->params[k]]] = st;
+      for (uint32_t i = 0; i < b->ninsts; i++) {
+        Ref x = b->insts[i];
+        if (x < n) vc->wstamp[web[x]] = st;
+        uint32_t ne = eff_uses(s, f, x, eu, eucap);
+        for (uint32_t k = 0; k < ne; k++) vac_touch(s, f, vc, web, n, eu[k], st, 0);
+        const Inst *xi = &f->insts[x];
+        for (uint32_t k = 0; k < xi->nargs; k++) vac_touch(s, f, vc, web, n, ir_args(f, x)[k], st, 0);
+      }
+      if ((b->term == T_BRIF || b->term == T_BRTABLE) && b->term_arg < n) {
+        vac_touch(s, f, vc, web, n, b->term_arg, st, 0);
+        uint32_t ne = eff_uses(s, f, b->term_arg, eu, eucap);
+        for (uint32_t k = 0; k < ne; k++) vac_touch(s, f, vc, web, n, eu[k], st, 0);
+      }
+      if (b->term != T_JUMP && b->term != T_BRIF && b->term != T_BRTABLE) goto out;
+    }
+    for (uint32_t e = 0; e < b->nsuccs; e++)
+      for (uint32_t k = 0; k < b->succs[e].nargs; k++)
+        vac_touch(s, f, vc, web, n, b->succs[e].args[k], st, 0);
+  }
+  /* what the register must be free over: the loop's blocks, the fills */
+  for (uint32_t j = 0; j < lcount; j++) {
+    uint32_t bi = lblk[lfirst + j];
+    cuts[ncut++] = (Range){ blk_start[bi], blk_end[bi] };
+  }
+  for (uint32_t k = 0; k < nent; k++)
+    cuts[ncut++] = (Range){ blk_end[ent[k]], blk_end[ent[k]] };
+  qsort(cuts, ncut, sizeof(Range), range_lo_cmp);
+
+  const int *pool = cl ? FPR_ALLOC : gpool;
+  int npool = cl ? NFPR_ALLOC : ngpool;
+  int best = -1;
+  double best_cost = gain;
+  for (int k = 0; k < npool; k++) {
+    int rr = pool[k];
+    if (cl ? (fpr_is_callee_saved(rr) && !(s->used_fpr_cs & (1u << rr)))
+           : ((gpr_is_callee_saved(rr) && !(s->used_gpr_cs & (1u << rr))) ||
+              rr == RA_ALLOC_RES_REG))
+      continue;
+    const OwnL *L = &vc->own[cl ? 1 : 0][rr];
+    uint32_t no = 0;
+    bool ok = true;
+    for (uint32_t c = 0; c < ncut && ok; c++)
+      for (uint32_t a = own_first(L, cuts[c].lo); a < L->n && L->v[a].lo <= cuts[c].hi && ok; a++) {
+        uint32_t w = L->v[a].own;
+        bool seen = false;
+        for (uint32_t q = 0; q < no && !seen; q++) seen = owners[q] == w;
+        if (seen) continue;
+        if (w == OWN_PIECE || no == 64 || vc->wstamp[w] == st || s->pinned[w] ||
+            (s->csa_on && s->csa_on[w]) || s->loc[w] != rr ||
+            (ValType)f->insts[w].type == VT_V128)
+          ok = false;
+        else
+          owners[no++] = w;
+      }
+    if (!ok || !no) continue;
+    double cost = 0;
+    nact = 0;
+    for (uint32_t q = 0; q < no && ok; q++)
+      ok = vac_plan(f, vc, owners[q], st, ent, nent, ex, nex, web, n, s, lblk,
+                    lfirst_a, lcount_a, &act, &nact, &capact, &cost);
+    if (ok && cost < best_cost) { best_cost = cost; best = rr; }
+  }
+  if (best < 0) goto out;
+  {
+    int rr = best;
+    OwnL *L = &vc->own[cl ? 1 : 0][rr];
+    uint32_t no = 0;
+    for (uint32_t c = 0; c < ncut; c++)
+      for (uint32_t a = own_first(L, cuts[c].lo); a < L->n && L->v[a].lo <= cuts[c].hi; a++) {
+        bool seen = false;
+        for (uint32_t q = 0; q < no && !seen; q++) seen = owners[q] == L->v[a].own;
+        if (!seen) owners[no++] = L->v[a].own;
+      }
+    /* the holders' ranges, less the cuts (a cut splits at most the one
+       range it falls inside) */
+    uint32_t ncap = L->n + ncut + 1;
+    OwnR *nv = xmalloc(ncap * sizeof(OwnR));
+    uint32_t nn = 0;
+    for (uint32_t a = 0; a < L->n; a++) {
+      OwnR x = L->v[a];
+      bool mine = false;
+      for (uint32_t q = 0; q < no && !mine; q++) mine = owners[q] == x.own;
+      if (!mine) { nv[nn++] = x; continue; }
+      int32_t lo = x.lo;
+      for (uint32_t c = 0; c < ncut && lo <= x.hi; c++) {
+        if (cuts[c].hi < lo || cuts[c].lo > x.hi) continue;
+        if (cuts[c].lo > lo) nv[nn++] = (OwnR){ lo, cuts[c].lo - 1, x.own };
+        lo = cuts[c].hi + 1;
+      }
+      if (lo <= x.hi) nv[nn++] = (OwnR){ lo, x.hi, x.own };
+    }
+    if (warmc_getenv("WARMC_VAC_CHECK")) {
+      /* every range the list had is still one, but the holders' */
+      RList *Ro = &rl[cl ? 1 : 0][rr];
+      for (uint32_t a = 0; a < Ro->n; a++) {
+        bool found = false;
+        for (uint32_t b2 = 0; b2 < L->n && !found; b2++)
+          found = L->v[b2].lo == Ro->v[a].lo && L->v[b2].hi == Ro->v[a].hi;
+        if (!found)
+          fprintf(stderr, "vaccheck[%u] r%d: range %d..%d not in the holders' lists\n",
+                  f->func_index, rr, Ro->v[a].lo, Ro->v[a].hi);
+      }
+      for (uint32_t b2 = 0; b2 < L->n; b2++) {
+        bool found = false;
+        for (uint32_t a = 0; a < Ro->n && !found; a++)
+          found = L->v[b2].lo == Ro->v[a].lo && L->v[b2].hi == Ro->v[a].hi;
+        if (!found)
+          fprintf(stderr, "vaccheck[%u] r%d: holder v%u range %d..%d not in the list\n",
+                  f->func_index, rr, L->v[b2].own, L->v[b2].lo, L->v[b2].hi);
+      }
+    }
+    xfree(L->v);
+    L->v = nv; L->n = nn; L->cap = ncap;
+    RList *Rl = &rl[cl ? 1 : 0][rr];
+    Rl->n = 0;
+    for (uint32_t a = 0; a < L->n; a++) rl_add(Rl, L->v[a].lo, L->v[a].hi, false);
+    if (!s->vac_slot) {
+      s->vac_slot = xmalloc((n ? n : 1) * sizeof(int32_t));
+      for (uint32_t z = 0; z < n; z++) s->vac_slot[z] = -1;
+    }
+    for (uint32_t q = 0; q < no; q++) {
+      uint32_t w = owners[q];
+      double cost = 0;
+      nact = 0;
+      if (!vac_plan(f, vc, w, st, ent, nent, ex, nex, web, n, s, lblk, lfirst_a,
+                    lcount_a, &act, &nact, &capact, &cost))
+        warmc_fatal("internal: a vacating planned twice came out otherwise");
+      if (s->vac_slot[w] < 0) s->vac_slot[w] = (int32_t)take_slot(s, w, slot);
+      if (vc->nrec == vc->cap) {
+        vc->cap = vc->cap ? vc->cap * 2 : 16;
+        vc->rec = xrealloc(vc->rec, vc->cap * sizeof(VacRec));
+      }
+      VacRec *rc = &vc->rec[vc->nrec++];
+      rc->web = w; rc->hdr = hb; rc->xfirst = vc->nxp; rc->xn = nact;
+      if (*npcs + nact > *cap_pcs) {
+        *cap_pcs = (*npcs + nact) * 2;
+        *pcs = xrealloc(*pcs, *cap_pcs * sizeof(struct Piece));
+      }
+      for (uint32_t z = 0; z < nact; z++) {
+        uint32_t t = act[z].block;
+        if (vc->nxp == vc->capxp) {
+          vc->capxp = vc->capxp ? vc->capxp * 2 : 32;
+          vc->xp = xrealloc(vc->xp, vc->capxp * sizeof(uint32_t));
+        }
+        vc->xp[vc->nxp++] = t;
+        uint32_t at = act[z].kind == PC_VSAVE ? f->blocks[t].ninsts : 0;
+        (*pcs)[(*npcs)++] = (struct Piece){ w, t, at, at, rr, act[z].kind };
+      }
+      vc->nvac++;
+      g_stats.vacates++;
+      if (warmc_getenv("WARMC_LP_DEBUG")) {
+        fprintf(stderr, "vacate[%u] v%u r%d hdr b%u for v%u cost=%.0f gain=%.0f",
+                f->func_index, w, rr, hb, v, cost, gain);
+        fprintf(stderr, " (%s in b%u; loop", ir_op_name(f->insts[w].op), f->insts[w].block);
+        for (uint32_t j = 0; j < lcount; j++) fprintf(stderr, " b%u", lblk[lfirst + j]);
+        for (uint32_t z = 0; z < nact; z++)
+          fprintf(stderr, "; %s b%u", act[z].kind == PC_VSAVE ? "save" : "restore", act[z].block);
+        fprintf(stderr, ")\n");
+      }
+    }
+    result = rr;
+  }
+out:
+  xfree(ent); xfree(ex); xfree(cuts); xfree(owners); xfree(act);
+  return result;
 }
 
 /* Loop pieces.  A value with no register that a loop reads and that is made
@@ -1061,8 +1477,16 @@ static void place_loop_pieces(Isel *s, IrFunc *f, RList rl[2][32],
                               const int32_t *num, const int *gpool, int ngpool,
                               Ref *eu, uint32_t eucap, uint32_t n,
                               struct Piece **pcs, uint32_t *npcs,
-                              uint32_t *cap_pcs) {
+                              uint32_t *cap_pcs, const Range *R, uint32_t *slot,
+                              const Interval *sorted, uint32_t ns) {
   uint32_t nb = f->nblocks;
+  VacCtx vc;
+  memset(&vc, 0, sizeof vc);
+  vc.sorted = sorted;
+  vc.ns = ns;
+  bool vac_ok = !warmc_getenv("WARMC_NO_VACATE");
+  if (vac_ok && warmc_getenv("WARMC_VACATE_ONLY"))
+    vac_ok = (uint32_t)atoi(warmc_getenv("WARMC_VACATE_ONLY")) == f->func_index;
   /* most functions spill nothing a loop could read, and remake nothing
      that costs more than a move */
   bool any = false;
@@ -1246,11 +1670,23 @@ static void place_loop_pieces(Isel *s, IrFunc *f, RList rl[2][32],
       }
       if (ok) got = rr;
     }
+    if (got >= 0 && warmc_getenv("WARMC_LP_DEBUG"))
+      fprintf(stderr, "lpfree[%u] v%u r%d hdr b%u\n", f->func_index, v, got, hb);
+    /* (a value remade at each use -- a constant, the memory base plus an
+       offset -- costs the loop a move or two there, no memory traffic: no
+       save and restore around the loop pays for that.  asbench/matrix's
+       division magic and gobench/multiret's constant ran 7% and 9% slower
+       vacated, the moved code its loops' alignment.) */
+    if (got < 0 && vac_ok && !remat_ok(s, v))
+      got = try_vacate(s, f, &vc, rl, v, hb, cand[x].gain, lblk, lfirst,
+                       lcount, blk_start, blk_end, web, iv, R, num, gpool,
+                       ngpool, eu, eucap, n, pcs, npcs, cap_pcs, slot);
     if (warmc_getenv("WARMC_LP_DEBUG"))
       fprintf(stderr, "lp[%u] v%u hdr b%u gain=%.0f reg=%d\n", f->func_index, v, hb,
               cand[x].gain, got);
     if (got < 0) continue;
     RList *L = &rl[cl ? 1 : 0][got];
+    OwnL *OL = vc.built ? &vc.own[cl ? 1 : 0][got] : NULL;
     uint32_t need = lcount[hb] + hd->npreds;
     if (*npcs + need > *cap_pcs) {
       *cap_pcs = (*npcs + need) * 2;
@@ -1259,12 +1695,14 @@ static void place_loop_pieces(Isel *s, IrFunc *f, RList rl[2][32],
     for (uint32_t j = 0; j < lcount[hb]; j++) {
       uint32_t bi = lblk[lfirst[hb] + j];
       rl_add(L, blk_start[bi], blk_end[bi], true);
+      if (OL) own_add(OL, blk_start[bi], blk_end[bi], OWN_PIECE, true);
       (*pcs)[(*npcs)++] = (struct Piece){ v, bi, 0, UINT32_MAX, got, PC_LOOP };
     }
     for (uint32_t p = 0; p < hd->npreds; p++) {
       uint32_t pb = hd->preds[p];
       if (!f->blocks[pb].reachable || f->blocks[pb].rpo >= hd->rpo) continue;
       rl_add(L, blk_end[pb], blk_end[pb], true);
+      if (OL) own_add(OL, blk_end[pb], blk_end[pb], OWN_PIECE, true);
       (*pcs)[(*npcs)++] = (struct Piece){ v, pb, f->blocks[pb].ninsts,
                                           f->blocks[pb].ninsts, got, PC_FILL };
     }
@@ -1272,6 +1710,10 @@ static void place_loop_pieces(Isel *s, IrFunc *f, RList rl[2][32],
   }
   xfree(member); xfree(mstack); xfree(lfirst); xfree(lcount); xfree(lblk);
   xfree(rw); xfree(rstamp); xfree(rvals); xfree(cand);
+  for (int c = 0; c < 2; c++)
+    for (int r = 0; r < 32; r++) xfree(vc.own[c][r].v);
+  xfree(vc.rec); xfree(vc.xp); xfree(vc.bstampA); xfree(vc.bstampB);
+  xfree(vc.bstampC); xfree(vc.bstampD); xfree(vc.wstamp);
 }
 
 #if RA_HAVE_RECOMP
@@ -1490,6 +1932,8 @@ static uint32_t share_slots(Isel *s, const Interval *iv, uint32_t n,
     if (IS_SLOT(s->loc[v])) span_note(sp, SLOT_OF(s->loc[v]), iv, v, vec);
     if (s->csa_slot && s->csa_slot[v] >= 0)
       span_note(sp, (uint32_t)s->csa_slot[v], iv, v, vec);
+    if (s->vac_slot && s->vac_slot[v] >= 0)
+      span_note(sp, (uint32_t)s->vac_slot[v], iv, v, vec);
   }
   for (uint32_t bi = 0; bi < f->nblocks; bi++) {
     Block *b = &f->blocks[bi];
@@ -1565,6 +2009,8 @@ static uint32_t share_slots(Isel *s, const Interval *iv, uint32_t n,
       if (verify) ocsa[v] = (uint32_t)s->csa_slot[v];
       s->csa_slot[v] = (int32_t)map[s->csa_slot[v]];
     }
+    if (s->vac_slot && s->vac_slot[v] >= 0)
+      s->vac_slot[v] = (int32_t)map[s->vac_slot[v]];
   }
   uint32_t nnew = 2 * count[1] + count[0];
   if (verify) {
@@ -1772,7 +2218,9 @@ static void regalloc_linear(Isel *s) {
         uint64_t ft;
         int64_t fl;
         call_depth[ncalls] = (uint8_t)(b->loop_depth < 8 ? b->loop_depth : 8);
-        call_cold[ncalls] = gc_fastnew_shape(f, r, &ft, &fl) ? 1 : 0;
+        /* the allocation's slow path, or a call on a way a branch hint
+           says is rare */
+        call_cold[ncalls] = b->cold ? 2 : gc_fastnew_shape(f, r, &ft, &fl) ? 1 : 0;
         call_share[ncalls] = bshare[bi];
         call_pos[ncalls++] = pos;
       }
@@ -2340,9 +2788,12 @@ static void regalloc_linear(Isel *s) {
      resumes at a pad; both make the whole web ineligible. */
   uint8_t *inelig = xcalloc(n ? n : 1, 1);
   if (csa_ok) {
-    for (uint32_t i = 0; i < n; i++)
-      if (iv[i].end >= 0 && vt_is_ref((ValType)f->insts[i].type))
-        inelig[web[i]] = 1;
+    /* (a reference saved around a call is in its slot there, which the
+       call's stack map then names: note_safepoint) */
+    if (!isel_csa_refs())
+      for (uint32_t i = 0; i < n; i++)
+        if (iv[i].end >= 0 && vt_is_ref((ValType)f->insts[i].type))
+          inelig[web[i]] = 1;
     for (uint32_t bi = 0; bi < f->nblocks; bi++) {
       Block *b = &f->blocks[bi];
       if (!b->reachable || !b->is_pad) continue;
@@ -2936,7 +3387,8 @@ static void regalloc_linear(Isel *s) {
     uint32_t nlps = 0, cap_lps = 0;
     if (!warmc_getenv("WARMC_NO_LOOP_PIECES"))
       place_loop_pieces(s, f, rl, blk_start, blk_end, lin_off, lin, web, iv, num,
-                        gpool, ngpool, eu, eucap, n, &lps, &nlps, &cap_lps);
+                        gpool, ngpool, eu, eucap, n, &lps, &nlps, &cap_lps, R, &slot,
+                        sorted, ns);
     /* (value, block) of each, sorted: a block's own pieces leave them out */
     uint64_t *lpkey = xmalloc((nlps ? nlps : 1) * sizeof(uint64_t));
     for (uint32_t k = 0; k < nlps; k++)
@@ -3043,6 +3495,11 @@ static void regalloc_linear(Isel *s) {
       rl_add(&rl[cl ? 1 : 0][got], plo, phi, true);
       pcs[npcs++] = (struct Piece){ c->v, c->block, c->lo, c->hi, got, PC_CLUSTER };
     }
+    if (npcs && warmc_getenv("WARMC_PIECE_DUMP") &&
+        (uint32_t)atoi(warmc_getenv("WARMC_PIECE_DUMP")) == f->func_index)
+      for (uint32_t x = 0; x < npcs; x++)
+        fprintf(stderr, "piece v%u b%u %u..%u r%d k%d pos %d..%d\n", pcs[x].v, pcs[x].block,
+                pcs[x].lo, pcs[x].hi, pcs[x].reg, pcs[x].kind, blk_start[pcs[x].block], blk_end[pcs[x].block]);
     if (npcs) {
       qsort(pcs, npcs, sizeof(struct Piece), piece_cmp);
       s->pc = pcs;
@@ -3414,6 +3871,27 @@ static void regalloc_linear(Isel *s) {
     }
   }
 
+  if (warmc_getenv("WARMC_LOC_DEBUG") &&
+      (unsigned)atoi(warmc_getenv("WARMC_LOC_DEBUG")) == f->func_index) {
+    compute_liveness(s);
+    for (uint32_t oi = 0; oi < f->norder; oi++) {
+      uint32_t hb = f->order[oi];
+      Block *hd = &f->blocks[hb];
+      bool is_hdr = false;
+      for (uint32_t p = 0; p < hd->npreds && !is_hdr; p++)
+        is_hdr = f->blocks[hd->preds[p]].rpo >= hd->rpo;
+      if (!is_hdr) continue;
+      fprintf(stderr, "loc[%u] hdr b%u depth=%u:", f->func_index, hb, hd->loop_depth);
+      for (uint32_t k = s->lv_in_off[hb]; k < s->lv_in_off[hb + 1]; k++) {
+        Ref v = s->lv_in[k];
+        int l = s->loc[web[v]];
+        fprintf(stderr, " v%u=%s%d%s(w%.0f)", v, l == LOC_NONE ? "none" : IS_SLOT(l) ? "s" : "r",
+                l == LOC_NONE ? 0 : IS_SLOT(l) ? (int)SLOT_OF(l) : l,
+                iv[web[v]].crosses_call ? "x" : "", weight[web[v]]);
+      }
+      fputc('\n', stderr);
+    }
+  }
   xfree(weight);
   xfree(wlat);
   xfree(wuse);
@@ -3632,6 +4110,14 @@ static void regalloc_linear(Isel *s) {
   }
 
   s->nslots = share_slots(s, iv, n, slot, blk_end);
+  /* every member of a web saved around calls is, for note_safepoint, which
+     meets members */
+  if (s->csa_on)
+    for (uint32_t v = 0; v < n; v++)
+      if (web[v] != v && s->csa_on[web[v]]) {
+        s->csa_on[v] = 1;
+        s->csa_slot[v] = s->csa_slot[web[v]];
+      }
 
   xfree(web); xfree(mem_head); xfree(mem_tail); xfree(mem_next);
   for (int i = 0; i < 32; i++) { xfree(gpr_occ[i].v); xfree(fpr_occ[i].v); }

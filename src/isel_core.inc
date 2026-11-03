@@ -172,6 +172,14 @@ typedef struct {
 #define PC_CLUSTER 0
 #define PC_LOOP 1
 #define PC_FILL 2
+  /* A value vacated from a loop (place_loop_pieces): live through it, never
+     read there, it gives its register to a loop piece.  PC_VSAVE stores the
+     register into its slot (vac_slot) at the end of each block entering the
+     loop, before the fills there; PC_VREST loads it back at the start of
+     each block the loop leaves to where it is live. */
+#define PC_VREST 3
+#define PC_VSAVE 4
+  int32_t *vac_slot;
   uint32_t npc;
   uint32_t *pc_bfirst, *pc_bn;
   int32_t *pc_head, *pc_next;
@@ -773,7 +781,10 @@ static void note_safepoint(Isel *s, Ref v) {
                     f->m->funcs[f->func_index].sym);
       continue;
     }
-    if (IS_SLOT(l)) {
+    if (!IS_SLOT(l) && s->csa_on && s->csa_on[x] && s->csa_slot && s->csa_slot[x] >= 0) {
+      /* saved around the call, in its own slot while the call runs */
+      entry = GCROOT_SLOT(slot_off(s, (uint32_t)s->csa_slot[x]));
+    } else if (IS_SLOT(l)) {
       entry = GCROOT_SLOT(slot_off(s, SLOT_OF(l)));
     } else {
       int ci = isel_cs_index(l);
@@ -979,7 +990,10 @@ static void analyse_function(Isel *s) {
 
         case I_FIELD_GET: case I_ARRAY_GET: case I_EXN_PAYLOAD:
           if (load_needs_barrier(f, in)) {
-            s->has_call = s->call_other = true;
+            /* a64's barrier stub keeps the return address of a function
+               that makes no call itself (emit_gc_load_stubs): a load is no
+               call there, under warmc's own calling convention */
+            if (!isel_barrier_keeps_lr()) s->has_call = s->call_other = true;
             touches_instance = true;
           }
           break;

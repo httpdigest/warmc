@@ -272,6 +272,27 @@ void ir_add_edge(IrFunc *f, uint32_t from, uint32_t to, const Ref *args, uint32_
   t->preds[t->npreds++] = from;
 }
 
+/* The blocks only rare ways reach: every way in from before it (a back
+   edge aside) a cold edge (a branch hint's) or from a cold block.  The
+   order must be up to date. */
+void ir_mark_cold(IrFunc *f) {
+  for (uint32_t oi = 0; oi < f->norder; oi++) {
+    uint32_t bi = f->order[oi];
+    Block *b = &f->blocks[bi];
+    if (bi == f->entry || b->cold || b->is_pad) continue;
+    bool any = false, all = true;
+    for (uint32_t p = 0; p < b->npreds && all; p++) {
+      const Block *pb = &f->blocks[b->preds[p]];
+      if (!pb->reachable || pb->rpo >= b->rpo) continue;
+      any = true;
+      if (pb->cold) continue;
+      for (uint32_t e = 0; e < pb->nsuccs && all; e++)
+        if (pb->succs[e].target == bi && !pb->succs[e].cold) all = false;
+    }
+    if (any && all) b->cold = true;
+  }
+}
+
 void ir_add_eh_edge(IrFunc *f, uint32_t from, uint32_t to) {
   ir_add_edge(f, from, to, NULL, 0);
   f->blocks[from].succs[f->blocks[from].nsuccs - 1].eh = true;
@@ -1652,7 +1673,7 @@ void ir_print(IrFunc *f, const char *stage) {
                 vt_name((ValType)f->insts[b->params[i]].type));
       fprintf(stderr, ")");
     }
-    fprintf(stderr, ":  ; depth=%u preds=", b->loop_depth);
+    fprintf(stderr, ":  ; depth=%u%s preds=", b->loop_depth, b->cold ? " cold" : "");
     for (uint32_t i = 0; i < b->npreds; i++) fprintf(stderr, "%sb%u", i ? "," : "", b->preds[i]);
     if (b->is_pad) fprintf(stderr, " pad(kind=%u tag=%u)", b->pad_kind, b->pad_tag);
     for (uint32_t i = 0; i < b->nsuccs; i++)

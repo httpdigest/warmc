@@ -1319,7 +1319,7 @@ void warmc_fiber_invoke(void *fn, WarmInstance *vm, const u64 *iargs,
 extern char warmc_fiber_ret[];
 #define FIBER_RET ((u64)(uptr)warmc_fiber_ret)
 #else
-#define FIBER_RET_OFF 164   /* start.S checks it */
+#define FIBER_RET_OFF 196   /* start.S checks it */
 #define FIBER_RET ((u64)(uptr)warmc_fiber_invoke + FIBER_RET_OFF)
 #endif
 static Fiber *cont_unwind_out(void);

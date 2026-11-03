@@ -252,6 +252,8 @@ typedef struct {
   Ref *args;
   uint32_t nargs, cap;
   bool eh;
+  /* rarely taken: a branch hint said so (metadata.code.branch_hint) */
+  bool cold;
 } Edge;
 
 typedef enum { T_NONE, T_JUMP, T_BRIF, T_BRTABLE, T_RETURN, T_TRAP } TermKind;
@@ -451,6 +453,7 @@ bool ir_reads_low32(const IrFunc *f, Ref u, uint32_t j);
 const char *ir_op_name(uint16_t op);
 void ir_verify(IrFunc *f, const char *stage);
 void ir_print(IrFunc *f, const char *stage);
+void ir_mark_cold(IrFunc *f);
 
 /* Two properties an instruction may have, which passes ask apart:
    - ir_has_no_effect: running it or not changes nothing but its value, so
@@ -702,7 +705,7 @@ typedef struct {
 
   uint64_t bar_masks, bar_elided;
   uint64_t caller_saves, csa_restores, spills_v128_xcall, range_budget_trips;
-  uint64_t split_cuts, split_invs, pieces, loop_pieces, recomputes,
+  uint64_t split_cuts, split_invs, pieces, loop_pieces, vacates, gc_loads_reused, recomputes,
            dead_frame_stores, tramp_funcs, gosp_funcs,
            go_resume_pruned, go_resume_split, go_noret_calls, wrap_params;
   uint64_t devirt_ref, devirt_indirect, devirt_null_kept;

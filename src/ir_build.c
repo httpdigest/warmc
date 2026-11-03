@@ -54,6 +54,10 @@ typedef struct {
   uint32_t ncont;
 
   ValType **btypes; uint32_t nbtypes, cap_btypes;
+  /* the function's next branch hint (Func.bh_off), and the hint of the
+     instruction being read, -1 for none */
+  uint32_t bh_next;
+  int hint;
 } Bld;
 
 static inline uint8_t rd8(Bld *b) { return rd_u8(&b->rd); }
@@ -1499,6 +1503,12 @@ IrFunc *ir_build_unordered(Module *m, uint32_t fi, const OptOpts *opt) {
   b->ctl[0].stack_base = 0;
 
   while (!rd_eof(&b->rd)) {
+    b->hint = -1;
+    if (fn->nbh) {
+      uint32_t at = (uint32_t)(b->rd.p - fn->code_start);
+      while (b->bh_next < fn->nbh && fn->bh_off[b->bh_next] < at) b->bh_next++;
+      if (b->bh_next < fn->nbh && fn->bh_off[b->bh_next] == at) b->hint = fn->bh_val[b->bh_next];
+    }
     uint8_t op = rd8(b);
 
     if (b->dead && op != 0x02 && op != 0x03 && op != 0x04 && op != 0x05 &&
@@ -1540,6 +1550,11 @@ IrFunc *ir_build_unordered(Module *m, uint32_t fi, const OptOpts *opt) {
           f->blocks[b->cur].term_arg = cond;
           ir_add_edge(f, b->cur, then_b, &b->stack[base], np);
           ir_add_edge(f, b->cur, else_b, &b->stack[base], np);
+          /* likely not taken: the then arm is the rare way; likely: the else */
+          if (b->hint >= 0) {
+            Block *cb = &f->blocks[b->cur];
+            cb->succs[cb->nsuccs - (b->hint ? 1 : 2)].cold = true;
+          }
           f->blocks[then_b].sealed = true;
           f->blocks[else_b].sealed = true;
           b->sp = base;
@@ -1759,7 +1774,11 @@ IrFunc *ir_build_unordered(Module *m, uint32_t fi, const OptOpts *opt) {
         uint32_t d = rdu32(b);
         if (d >= b->nctl) warmc_fatal("branch depth %u out of range", d);
         Ref cond = pop(b);
+        uint32_t from = b->cur;
         branch_if(b, d, cond, REF_NONE);
+        /* the branch's edge first, the fall-through's second */
+        if (b->hint >= 0 && f->blocks[from].term == T_BRIF && f->blocks[from].nsuccs == 2)
+          f->blocks[from].succs[b->hint ? 1 : 0].cold = true;
         break;
       }
 
@@ -2231,5 +2250,6 @@ done:
 IrFunc *ir_build(Module *m, uint32_t fi, const OptOpts *opt) {
   IrFunc *f = ir_build_unordered(m, fi, opt);
   ir_order(f);
+  if (m->funcs[fi].nbh) ir_mark_cold(f);
   return f;
 }

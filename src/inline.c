@@ -224,6 +224,7 @@ static void splice(IrFunc *f, IrFunc *g, uint32_t bi, uint32_t cont,
           }
           for (uint32_t j = 0; j < e->nargs; j++) tmp[j] = vmap[e->args[j]];
           ir_add_edge(f, nb, bmap[e->target], tmp, e->nargs);
+          f->blocks[nb].succs[f->blocks[nb].nsuccs - 1].cold = e->cold;
         }
         break;
       }
@@ -233,6 +234,12 @@ static void splice(IrFunc *f, IrFunc *g, uint32_t bi, uint32_t cont,
         break;
     }
 
+    /* a rare way of the callee's is one of the caller's.  (Not every way
+       of a callee called on a rare way: that moved the registers of
+       javabench/generic's hot loop, which ran 18% slower on the same
+       instructions -- held back in the core's execution, with no more cache
+       misses, mispredictions or memory-order restarts than before.) */
+    f->blocks[nb].cold = gb->cold;
     if (nehe && gb->ninsts && raises(g->insts[gb->insts[gb->ninsts - 1]].op))
       for (uint32_t e = 0; e < nehe; e++) {
         ir_add_edge(f, nb, ehe[e].target, ehe[e].args, ehe[e].nargs);

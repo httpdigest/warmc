@@ -273,6 +273,11 @@ typedef struct {
 
   const uint8_t *body;
   const uint8_t *body_end;
+  /* the body's first byte, its locals' vector's (branch hints count from
+     it), and its branch hints, by increasing offset: 1 for a br_if or if
+     likely taken, 0 for one likely not (metadata.code.branch_hint) */
+  const uint8_t *code_start;
+  uint32_t *bh_off; uint8_t *bh_val; uint32_t nbh;
   uint32_t nlocals;
   ValType *local_types;
   uint32_t ntotal_locals;

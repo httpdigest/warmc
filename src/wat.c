@@ -154,6 +154,10 @@ typedef struct {
   Arena *a;
   FuncAnnot *fnames;
   uint32_t nfnames, cap_fnames;
+  /* branch hints, (@metadata.code.branch_hint "\00" or "\01"), by the
+     index of the token kept after them: the br_if or the if (plain) or
+     the '(' that opens it (folded) */
+  uint32_t *hint_at; uint8_t *hint_val; uint32_t nhints, cap_hints;
 } Lex;
 
 __attribute__((noreturn, format(printf, 4, 5)))
@@ -473,6 +477,19 @@ static void strip_annotations(Lex *l) {
               (int)l->toks[i + 1].n, l->toks[i + 1].s);
     if (annotation_at(l, i) && !custom_annotation(&l->toks[i + 1])) {
       if (tok_is_word(&l->toks[i + 1], "@name")) note_name_annotation(l, i, out);
+      if (tok_is_word(&l->toks[i + 1], "@metadata.code.branch_hint")) {
+        const Tok *k = l->toks;
+        if (i + 3 >= l->ntoks || k[i + 2].kind != TK_STRING || k[i + 2].n != 1 ||
+            k[i + 3].kind != TK_RPAR || (uint8_t)k[i + 2].s[0] > 1)
+          pos_err(l->path, k[i].line, k[i].col, "a branch hint holds one byte, 0 or 1");
+        if (l->nhints == l->cap_hints) {
+          l->cap_hints = l->cap_hints ? l->cap_hints * 2 : 64;
+          l->hint_at = xrealloc(l->hint_at, l->cap_hints * sizeof(uint32_t));
+          l->hint_val = xrealloc(l->hint_val, l->cap_hints);
+        }
+        l->hint_at[l->nhints] = out;
+        l->hint_val[l->nhints++] = (uint8_t)k[i + 2].s[0];
+      }
       i = skip_annotation(l, i);
       continue;
     }
@@ -640,6 +657,8 @@ typedef struct {
   TokRange body;
   Bytes code;
   bool imported;
+  /* its branch hints: offsets into code, and the hint */
+  uint32_t *bh_off; uint8_t *bh_val; uint32_t nbh;
 } WFunc;
 
 typedef struct {
@@ -759,6 +778,10 @@ typedef struct {
   uint32_t *fn_open, cap_fn_open;
 
   WBuf scratch;
+
+  /* the lexer's branch hints, and the function being encoded's */
+  const uint32_t *hint_at; const uint8_t *hint_val; uint32_t nhints;
+  uint32_t *bh_off; uint8_t *bh_val; uint32_t nbh, cap_bh;
 
   const char **labels;
   size_t *label_lens;
@@ -2042,7 +2065,29 @@ static const OpInfo *find_op(P *p, const Tok *t, uint32_t *op_out) {
   return wasm_op_by_name(t->s, t->n, op_out) ? wasm_op_info(*op_out) : NULL;
 }
 
-static void parse_if(P *p, WBuf *b, bool folded) {
+/* the branch hint the token at t follows, or -1 */
+static int hint_for(const P *p, uint32_t t) {
+  uint32_t a = 0, z = p->nhints;
+  while (a < z) {
+    uint32_t m = (a + z) / 2;
+    if (p->hint_at[m] < t) a = m + 1; else z = m;
+  }
+  return a < p->nhints && p->hint_at[a] == t ? p->hint_val[a] : -1;
+}
+
+/* a hinted branch's opcode about to go at b's end */
+static void note_hint(P *p, WBuf *b, int hint) {
+  if (hint < 0 || !p->in_code) return;
+  if (p->nbh == p->cap_bh) {
+    p->cap_bh = p->cap_bh ? p->cap_bh * 2 : 32;
+    p->bh_off = xrealloc(p->bh_off, p->cap_bh * sizeof(uint32_t));
+    p->bh_val = xrealloc(p->bh_val, p->cap_bh);
+  }
+  p->bh_off[p->nbh] = (uint32_t)b->n;
+  p->bh_val[p->nbh++] = (uint8_t)hint;
+}
+
+static void parse_if_h(P *p, WBuf *b, bool folded, int hint) {
   const char *label;
   size_t llen;
   take_block_label(p, &label, &llen);
@@ -2058,6 +2103,7 @@ static void parse_if(P *p, WBuf *b, bool folded) {
       parse_instrs(p, b);
   }
 
+  note_hint(p, b, hint);
   wb_byte(b, 0x04);
   wb_raw(b, head.p, head.n);
   xfree(head.p);
@@ -2163,17 +2209,18 @@ static bool parse_cast(P *p, WBuf *b, const Tok *kw) {
 
 static void parse_instrs_body(P *p, WBuf *b) {
   if (at_lpar(p)) {
+    int hint = p->nhints ? hint_for(p, p->i) : -1;
     p->i++;
     const Tok *kw = tk(p);
     if (kw->kind != TK_WORD) perr(p, "expected an instruction");
     if (tok_is_word(kw, "block")) { p->i++; parse_block(p, b, 0x02, true); expect_rpar(p); return; }
     if (tok_is_word(kw, "loop"))  { p->i++; parse_block(p, b, 0x03, true); expect_rpar(p); return; }
     if (tok_is_word(kw, "try_table")) { p->i++; parse_block(p, b, 0x1f, true); expect_rpar(p); return; }
-    if (tok_is_word(kw, "if")) { p->i++; parse_if(p, b, true); expect_rpar(p); return; }
+    if (tok_is_word(kw, "if")) { p->i++; parse_if_h(p, b, true, hint); expect_rpar(p); return; }
 
     WBuf head = {0};
+    uint32_t op = 0;
     if (!parse_cast(p, &head, kw)) {
-      uint32_t op;
       const OpInfo *oi = find_op(p, kw, &op);
       if (!oi) perr(p, "unknown instruction '%.*s'", (int)kw->n, kw->s);
       p->i++;
@@ -2185,23 +2232,26 @@ static void parse_instrs_body(P *p, WBuf *b) {
       parse_instrs(p, b);
     }
     expect_rpar(p);
+    if (op == 0x0d) note_hint(p, b, hint);
     wb_raw(b, head.p, head.n);
     xfree(head.p);
     return;
   }
 
   const Tok *kw = tk(p);
+  int hint = p->nhints ? hint_for(p, p->i) : -1;
   if (kw->kind != TK_WORD) perr(p, "expected an instruction");
   if (tok_is_word(kw, "block")) { p->i++; parse_block(p, b, 0x02, false); return; }
   if (tok_is_word(kw, "loop"))  { p->i++; parse_block(p, b, 0x03, false); return; }
   if (tok_is_word(kw, "try_table")) { p->i++; parse_block(p, b, 0x1f, false); return; }
-  if (tok_is_word(kw, "if")) { p->i++; parse_if(p, b, false); return; }
+  if (tok_is_word(kw, "if")) { p->i++; parse_if_h(p, b, false, hint); return; }
   if (parse_cast(p, b, kw)) return;
 
   uint32_t op;
   const OpInfo *oi = find_op(p, kw, &op);
   if (!oi) perr(p, "unknown instruction '%.*s'", (int)kw->n, kw->s);
   p->i++;
+  if (op == 0x0d) note_hint(p, b, hint);
   write_instr_imm(p, b, op, oi);
 }
 
@@ -2958,9 +3008,17 @@ static void encode_expressions(P *p) {
         p->i = f->body.first;
         WBuf *b = &p->scratch;
         b->n = 0;
+        p->nbh = 0;
         while (p->i < f->body.end) parse_instrs(p, b);
         wb_byte(b, 0x0b);
         f->code = arena_take(p->a, b);
+        if (p->nbh) {
+          f->bh_off = xmalloc(p->nbh * sizeof(uint32_t));
+          f->bh_val = xmalloc(p->nbh);
+          memcpy(f->bh_off, p->bh_off, p->nbh * sizeof(uint32_t));
+          memcpy(f->bh_val, p->bh_val, p->nbh);
+          f->nbh = p->nbh;
+        }
         p->i = save;
         pop_label(p);
         p->locals = NULL;
@@ -3437,12 +3495,40 @@ static uint8_t *assemble(P *p, size_t *len_out) {
         write_valtype(&body, f->ltypes[j]);
         j = k;
       }
+      /* (the branch hints' offsets count from the body's start, its
+         locals' vector included) */
+      for (uint32_t h = 0; h < f->nbh; h++) f->bh_off[h] += (uint32_t)body.n;
       wb_bytes(&body, f->code);
       wb_u32(&sec, (uint32_t)body.n);
       wb_raw(&sec, body.p, body.n);
       xfree(body.p);
     }
     emit_section(&out, 10, &sec);
+    /* metadata.code.branch_hint: for each function with any, its index and
+       its hints -- offset, size 1, the hint byte */
+    uint32_t nhf = 0;
+    for (uint32_t i = 0; i < p->fn.n; i++) if (!p->fn.v[i].imported && p->fn.v[i].nbh) nhf++;
+    if (nhf) {
+      WBuf hs = {0};
+      static const char nm[] = "metadata.code.branch_hint";
+      wb_u32(&hs, (uint32_t)(sizeof nm - 1));
+      wb_raw(&hs, nm, sizeof nm - 1);
+      wb_u32(&hs, nhf);
+      for (uint32_t i = 0; i < p->fn.n; i++) {
+        WFunc *f = &p->fn.v[i];
+        if (f->imported || !f->nbh) continue;
+        wb_u32(&hs, i);
+        wb_u32(&hs, f->nbh);
+        for (uint32_t h = 0; h < f->nbh; h++) {
+          wb_u32(&hs, f->bh_off[h]);
+          wb_u32(&hs, 1);
+          wb_byte(&hs, f->bh_val[h]);
+        }
+        xfree(f->bh_off); xfree(f->bh_val);
+      }
+      emit_section(&out, 0, &hs);
+      xfree(hs.p);
+    }
   }
   emit_customs(&out, p, CU_AFTER, 10);
 
@@ -3495,6 +3581,9 @@ uint8_t *wat_assemble(const char *src, size_t len, const char *path,
   p.ntoks = l.ntoks;
   p.fnames = l.fnames;
   p.nfnames = l.nfnames;
+  p.hint_at = l.hint_at;
+  p.hint_val = l.hint_val;
+  p.nhints = l.nhints;
   take_customs(&p);
 
   uint32_t end = p.ntoks - 1;

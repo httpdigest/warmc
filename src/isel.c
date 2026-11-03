@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 
 #define REG_VMCTX   (s->vmctx_reg)
@@ -35,8 +36,59 @@ static const int FPR_ALLOC[] = { 0, 1, 2, 3, 4, 5, 6, 7,
 #define NGPR_ALLOC ((int)(sizeof GPR_ALLOC / sizeof GPR_ALLOC[0]))
 #define NFPR_ALLOC ((int)(sizeof FPR_ALLOC / sizeof FPR_ALLOC[0]))
 
-static bool gpr_is_callee_saved(int r) { return r >= R19 && r <= R30; }
-static bool fpr_is_callee_saved(int r) { return r >= 8 && r <= 15; }
+/* Wasm calls wasm by warmc's own convention, not the platform's: no
+   register is the callee's to preserve but x19 and x20, the instance and
+   memory 0's base, which every function leaves as it found them, and x29
+   and x30, the frame record a function that calls keeps.  x21-x28 and
+   v8-v15 are a callee's to use freely, so a function saves none of them --
+   its prologue is at most the frame record, its frame and the stack check
+   -- and a value a call must not take is the caller's to keep: in a slot,
+   or a register it saves and restores around that call (regalloc.inc's
+   csa), which on a call made only now and then keeps it in a register the
+   rest of the time.  C reaches wasm only through the runtime's entries
+   (rt/start.S warmc_invoke_s, warmc_fiber_invoke), which save what the
+   platform's convention asks of them; wasm calls C as the platform's
+   convention has it, C keeping more than wasm asks for.  Off by default
+   (WARMC_OWN_CALLS=1 turns it on): with no register a call keeps, what lives
+   across a call that runs often is saved around each one, where a
+   callee-saved register was saved once per call of the function -- luawasm's
+   nbody ran 35% slower, fib 17%, richards 10%, as only the calls branch hints
+   mark rare (metadata.code.branch_hint) are known to be rare. */
+/* an environment setting read once, by whichever compile thread asks first
+   (relaxed: each reads the same value, and an int is written whole) */
+static bool env_once(_Atomic int *c, bool (*read)(void)) {
+  int v = atomic_load_explicit(c, memory_order_relaxed);
+  if (v < 0) {
+    v = read();
+    atomic_store_explicit(c, v, memory_order_relaxed);
+  }
+  return v;
+}
+static bool icc_read(void) { return warmc_getenv("WARMC_OWN_CALLS") != NULL; }
+static bool icc_on(void) {
+  static _Atomic int on = -1;
+  return env_once(&on, icc_read);
+}
+static bool gpr_is_callee_saved(int r) {
+  if (icc_on()) return r == R19 || r == R20 || r == R29 || r == R30;
+  return r >= R19 && r <= R30;
+}
+static bool fpr_is_callee_saved(int r) { return !icc_on() && r >= 8 && r <= 15; }
+/* whether a reference may be saved around a call (regalloc.inc's csa),
+   its slot then the call's root (note_safepoint): under warmc's own
+   convention, where no register keeps one across a call */
+static bool csa_refs_read(void) { return icc_on() && !warmc_getenv("WARMC_NO_CSA_REFS"); }
+static bool isel_csa_refs(void) {
+  static _Atomic int on = -1;
+  return env_once(&on, csa_refs_read);
+}
+/* whether the barrier's stub keeps a calling-free function's x30
+   (emit_gc_load_stubs), so that its loads make it no caller */
+static bool keeps_lr_read(void) { return !warmc_getenv("WARMC_BARRIER_CALLS"); }
+static bool isel_barrier_keeps_lr(void) {
+  static _Atomic int on = -1;
+  return env_once(&on, keeps_lr_read);
+}
 
 #include "isel_core.inc"
 
@@ -422,6 +474,23 @@ static void piece_fill(Isel *s, const struct Piece *p) {
   if (r != p->reg) emit_reg_move(B, p->reg, r, fp, is64(s->f, v), vec);
 }
 
+/* A vacated value's register to its slot, at the end of a block that
+   enters the loop it is vacated from, and back at the start of a block the
+   loop leaves to (PC_VSAVE, PC_VREST). */
+static void vac_move(Isel *s, const struct Piece *p) {
+  Ref v = p->v;
+  uint32_t sl = (uint32_t)s->vac_slot[v];
+  int fp = is_fp_value(s->f, v), vec = is_vec_value(s->f, v);
+  if (p->kind == PC_VSAVE) {
+    rc_kill_slot(s, sl);
+    slot_store(s, B, fp, vec, p->reg, slot_off(s, sl));
+  } else {
+    if (fp) frc_kill_reg(s, p->reg); else rc_kill_reg(s, p->reg);
+    slot_load(s, B, fp, vec, p->reg, slot_off(s, sl));
+    g_stats.reloads++;
+  }
+}
+
 static void reload_size(Isel *s) {
   if (s->mem_valid || !s->needs_memsize) return;
   a64_ldr_imm(B, 3, REG_MEMSIZE, REG_VMCTX, VMCTX_MEM_SIZE);
@@ -666,9 +735,15 @@ static void emit_gc_load_stubs(Isel *s) {
       a64_mov_reg(B, SF64, S3, bf->base);
     }
     if (bf->dst != S2) a64_mov_reg(B, SF64, S2, bf->dst);
+    /* A function that makes no call keeps its return address in x30 --
+       the barrier is no call to it (analyse_function) -- and so the stub
+       keeps it for it, around its own bl. */
+    bool keep_lr = !s->has_call;
+    if (keep_lr) a64_stp(B, SF64, R30, RZR, RSP, -16, LSP_PRE);
     uint32_t sym = obj_intern_sym(s->o, "warmc_gc_load_stub", SYM_UNDEF_FUNC, -1, 0);
     isel_reloc(s, REL_CALL26, B->len, sym, 0);
     a64_bl(B, 0);
+    if (keep_lr) a64_ldp(B, SF64, R30, RZR, RSP, 16, LSP_POST);
     if (bf->dst != S2) a64_mov_reg(B, SF64, bf->dst, S2);
     size_t back = B->len;
     a64_b(B, 0);
@@ -3092,7 +3167,7 @@ static int cs_gpr_list(Isel *s, int *list) {
 
     if (r == R19) needed = !s->pin && s->needs_vmctx && s->vmctx_reg == R19;
     else if (r == R20) needed = !s->pin && s->needs_mem && s->membase_reg == R20;
-    else if (r == R21) needed = s->needs_memsize;
+    else if (r == R21) needed = s->needs_memsize && !icc_on();
     else needed = false;
     if (s->used_gpr_cs & (1u << r)) needed = true;
     if (needed) list[n++] = r;
@@ -3355,7 +3430,7 @@ static void analyse_wrap_alias(Isel *s) {
 typedef struct {
   int *loc;
   uint32_t nslots, used_gpr_cs, used_fpr_cs;
-  int32_t *csa_slot;
+  int32_t *csa_slot, *vac_slot;
   uint8_t *csa_on, *no_remat;
   uint32_t *csa_first, *csa_n;
   Ref *csa_vals;
@@ -3376,6 +3451,7 @@ typedef struct {
 static void ra_keep_drop(void *p) {
   RaKeep *k = p;
   xfree(k->loc); xfree(k->csa_slot); xfree(k->csa_on); xfree(k->no_remat);
+  xfree(k->vac_slot);
   xfree(k->csa_first); xfree(k->csa_n); xfree(k->csa_vals);
   xfree(k->pc); xfree(k->pc_bfirst); xfree(k->pc_bn); xfree(k->pc_head);
   xfree(k->pc_next); xfree(k->recomp);
@@ -3394,7 +3470,7 @@ static void stats_delta_add(OptStats *acc, const OptStats *base, const OptStats 
 static void ra_keep_save(Isel *s, const OptStats *added) {
   RaKeep *k = xcalloc(1, sizeof *k);
 #define MOVE(fld) do { k->fld = s->fld; s->fld = NULL; } while (0)
-  MOVE(loc); MOVE(csa_slot); MOVE(csa_on); MOVE(no_remat);
+  MOVE(loc); MOVE(csa_slot); MOVE(csa_on); MOVE(no_remat); MOVE(vac_slot);
   MOVE(csa_first); MOVE(csa_n); MOVE(csa_vals);
   MOVE(pc); MOVE(pc_bfirst); MOVE(pc_bn); MOVE(pc_head); MOVE(pc_next);
   MOVE(recomp);
@@ -3418,7 +3494,7 @@ static void ra_keep_take(Isel *s) {
   xfree(s->loc);
   xfree(s->no_remat);
 #define MOVE(fld) do { s->fld = k->fld; k->fld = NULL; } while (0)
-  MOVE(loc); MOVE(csa_slot); MOVE(csa_on); MOVE(no_remat);
+  MOVE(loc); MOVE(csa_slot); MOVE(csa_on); MOVE(no_remat); MOVE(vac_slot);
   MOVE(csa_first); MOVE(csa_n); MOVE(csa_vals);
   MOVE(pc); MOVE(pc_bfirst); MOVE(pc_bn); MOVE(pc_head); MOVE(pc_next);
   MOVE(recomp);
@@ -4554,7 +4630,7 @@ give_up:
   xfree(s->sites); xfree(s->clauses);
   xfree(s->gcsites); xfree(s->gcroots);
   xfree(s->sp_first); xfree(s->sp_n); xfree(s->sp_vals);
-  xfree(s->csa_slot); xfree(s->csa_on);
+  xfree(s->csa_slot); xfree(s->csa_on); xfree(s->vac_slot);
   xfree(s->csa_first); xfree(s->csa_n); xfree(s->csa_vals);
   xfree(s->lv_in); xfree(s->lv_out); xfree(s->lv_in_off); xfree(s->lv_out_off);
   if (split_ret) return split_ret;

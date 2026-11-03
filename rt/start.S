@@ -67,7 +67,10 @@ SYM(warmc_invoke):
    of exactly those slots, stk_bytes of it, a multiple of 16, and it is
    copied to the bottom of the cushion, which grows to hold it.  The cushion
    is 512 bytes at least, so a callee's reads of slots no image wrote stay
-   in memory that is ours.  The instance goes in x0 and, with memory 0's
+   in memory that is ours.  Wasm code keeps none of x21-x28 and v8-v15 for
+   its caller (warmc's own calling convention, isel.c icc_on), so they are
+   saved here for the C caller, whose convention keeps them, and the
+   result buffer's address waits in the frame, not in x21.  The instance goes in x0 and, with memory 0's
    base, in x19 and x20 too, where code that keeps them pinned there
    expects them (the compiler's isel.c). */
     .globl SYM(warmc_invoke_s)
@@ -77,6 +80,14 @@ SYM(warmc_invoke_s):
     mov     x29, sp
     stp     x19, x20, [sp, #-16]!
     stp     x21, x22, [sp, #-16]!
+    stp     x23, x24, [sp, #-16]!
+    stp     x25, x26, [sp, #-16]!
+    stp     x27, x28, [sp, #-16]!
+    stp     d8,  d9,  [sp, #-16]!
+    stp     d10, d11, [sp, #-16]!
+    stp     d12, d13, [sp, #-16]!
+    stp     d14, d15, [sp, #-16]!
+    stp     x4, xzr, [sp, #-16]!
 
     add     x9, x6, #15
     and     x9, x9, #-16
@@ -122,10 +133,18 @@ SYM(warmc_invoke_s):
 3:
     blr     x16
 
+    ldur    x21, [x29, #-160]
     str     x0, [x21, #0]
     str     q0, [x21, #16]
 
-    sub     sp, x29, #32
+    sub     sp, x29, #144
+    ldp     d14, d15, [sp], #16
+    ldp     d12, d13, [sp], #16
+    ldp     d10, d11, [sp], #16
+    ldp     d8,  d9,  [sp], #16
+    ldp     x27, x28, [sp], #16
+    ldp     x25, x26, [sp], #16
+    ldp     x23, x24, [sp], #16
     ldp     x21, x22, [sp], #16
     ldp     x19, x20, [sp], #16
     ldp     x29, x30, [sp], #16
@@ -673,7 +692,7 @@ SYM(warmc_fiber_entry):
 /* warmc_fiber_invoke: warmc_invoke_s for a fiber's function, whose call's
    return address, FIBER_RET_OFF bytes in, is where the collector's frame
    walk and the unwinder know a fiber's frames end by (rt/cont.inc) */
-#define FIBER_RET_OFF 164
+#define FIBER_RET_OFF 196
     .globl SYM(warmc_fiber_invoke)
     FUNC_DIRECTIVES(SYM(warmc_fiber_invoke))
 SYM(warmc_fiber_invoke):
@@ -681,6 +700,14 @@ SYM(warmc_fiber_invoke):
     mov     x29, sp
     stp     x19, x20, [sp, #-16]!
     stp     x21, x22, [sp, #-16]!
+    stp     x23, x24, [sp, #-16]!
+    stp     x25, x26, [sp, #-16]!
+    stp     x27, x28, [sp, #-16]!
+    stp     d8,  d9,  [sp, #-16]!
+    stp     d10, d11, [sp, #-16]!
+    stp     d12, d13, [sp, #-16]!
+    stp     d14, d15, [sp, #-16]!
+    stp     x4, xzr, [sp, #-16]!
 
     add     x9, x6, #15
     and     x9, x9, #-16
@@ -726,10 +753,18 @@ SYM(warmc_fiber_invoke):
 3:
     blr     x16
 LOCAL(fiber_ret):
+    ldur    x21, [x29, #-160]
     str     x0, [x21, #0]
     str     q0, [x21, #16]
 
-    sub     sp, x29, #32
+    sub     sp, x29, #144
+    ldp     d14, d15, [sp], #16
+    ldp     d12, d13, [sp], #16
+    ldp     d10, d11, [sp], #16
+    ldp     d8,  d9,  [sp], #16
+    ldp     x27, x28, [sp], #16
+    ldp     x25, x26, [sp], #16
+    ldp     x23, x24, [sp], #16
     ldp     x21, x22, [sp], #16
     ldp     x19, x20, [sp], #16
     ldp     x29, x30, [sp], #16
