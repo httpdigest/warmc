@@ -1522,6 +1522,14 @@ static void chain_fault(int sig, void *info, void *uc) {
   set_sigaction(sig, p, 0);
 }
 
+/* whether the host has a handler of its own for sig, which may take the
+   fault -- a JVM's implicit null checks are SIGSEGVs at address 0 it
+   resumes from */
+static int host_takes(int sig) {
+  SigAct *p = sig == 11 ? &g_prev_segv : &g_prev_bus;
+  return (uptr)SIGACT_FN(p) > 1;
+}
+
 /* What the embedder knows of the faulting thread, said after the
    runtime's own report (src/capi.c sets it): its stack's bounds and the
    limit wasm's frames run to there. */
@@ -1536,8 +1544,9 @@ static void eput_hex(u64 v) {
   sys_write(2, b + i, (usz)(20 - i));
 }
 
-/* A fault that is not the runtime's, said where it was before it is passed
-   on: a library's host would otherwise only see the process die of it --
+/* A fault that is not the runtime's and that no handler of the host's will
+   take, said where it was before it ends the process: the host would
+   otherwise only see it die --
    on Linux, of a stack overflowed with no stack of its own to report on
    (the handler runs on the thread's alternate stack, SA_ONSTACK, where the
    embedder gave the thread one). */
@@ -1583,7 +1592,7 @@ static void fault_handler(int sig, void *info, void *uc) {
   }
   if (addr_in_a_guard(addr)) warmc_trap(TRAP_MEM_OOB);
   if (g_library) {
-    fault_report(sig, addr, uc);
+    if (!host_takes(sig)) fault_report(sig, addr, uc);
     chain_fault(sig, info, uc);
     return;
   }
