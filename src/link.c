@@ -822,7 +822,10 @@ static void collect_globals(Linker *L, uint32_t oi) {
     uint32_t g = gs_intern(L, s->name);
     GSym *gs = &L->gsyms[g];
     bool defines = s->sec >= 0 || s->common;
-    if (!defines) continue;
+    if (!defines) {
+      if (!s->weak) gs->strong_ref = true;
+      continue;
+    }
     if (gs->defined && !gs->weak && !s->weak)
       warmc_fatal("link: %s defined twice (%s and %s)", s->name,
                   L->objs[gs->obj].name, o->name);
@@ -837,7 +840,7 @@ static void collect_globals(Linker *L, uint32_t oi) {
 
 static bool any_undefined(Linker *L) {
   for (uint32_t i = 0; i < L->ngsyms; i++)
-    if (!L->gsyms[i].defined && !L->gsyms[i].imported) return true;
+    if (!L->gsyms[i].defined && !L->gsyms[i].imported && L->gsyms[i].strong_ref) return true;
   return false;
 }
 
@@ -1321,6 +1324,12 @@ static void apply_relocs(Linker *L) {
 
       switch (ir->type) {
         case R_AARCH64_CALL26: case R_AARCH64_JUMP26:
+          if (sy->global) {
+            int32_t g = gs_find(L, sy->name);
+            if (g >= 0 && L->gsyms[g].imported)
+              warmc_fatal("link: %s branches to %s, which nothing defines: a "
+                          "weak function is called through a pointer", o->name, nm);
+          }
           patch_branch26(p, (int64_t)(S + (uint64_t)A) - (int64_t)pc, nm); break;
         case R_AARCH64_ADR_PREL_PG_HI21:
           patch_page21(p, S + (uint64_t)A, pc, nm); break;
@@ -1651,6 +1660,7 @@ static void write_elf_exec(Linker *L, const char *path, uint64_t entry) {
 #define SHT_DYNSYM_E  11
 #define SHF_WRITE_E   0x1
 #define R_AARCH64_RELATIVE 1027
+#define R_AARCH64_GLOB_DAT 1025
 
 static uint32_t elf_hash(const char *s) {
   uint32_t h = 0, g;
@@ -1671,7 +1681,10 @@ typedef struct { uint32_t name, type; uint64_t flags, addr, off, size;
    which glibc relocates in place on AArch64, so it is writable -- the
    exported symbols with their hash table, and a relative relocation for
    each absolute pointer.  There is no DT_NEEDED: the runtime asks nothing
-   of libc, so the library loads into whatever process opens it. */
+   of libc, so the library loads into whatever process opens it -- but for
+   what it may take from the process where it is there, a symbol it names
+   weakly alone (rt/lib.c's pthread_getattr_np): an undefined weak dynamic
+   symbol whose GOT slot the loader binds (GLOB_DAT), or leaves null. */
 static void write_elf_shared(Linker *L, const char *path) {
   const uint64_t hdr = 64 + ELF_SHARED_PHDRS * 56;
   const char *soname = strrchr(path, '/') ? strrchr(path, '/') + 1 : path;
@@ -1700,6 +1713,21 @@ static void write_elf_shared(Linker *L, const char *path) {
     buf_u64(&dsym, 0);
     nsym++;
   }
+  /* the weak imports, which only GOT slots name: STB_WEAK, undefined */
+  uint32_t *imp_sym = xcalloc(L->ngot ? L->ngot : 1, sizeof(uint32_t));
+  for (uint32_t i = 0; i < L->ngot; i++) {
+    GSym *g = &L->gsyms[L->got[i]];
+    if (!g->imported) continue;
+    imp_sym[i] = nsym;
+    buf_u32(&dsym, (uint32_t)dstr.len);
+    buf_bytes(&dstr, g->name, strlen(g->name) + 1);
+    buf_u8(&dsym, (2 << 4) | 2);
+    buf_u8(&dsym, 0);
+    buf_u16(&dsym, 0);
+    buf_u64(&dsym, 0);
+    buf_u64(&dsym, 0);
+    nsym++;
+  }
   while (dstr.len & 7) buf_u8(&dstr, 0);
 
   Buf hash; memset(&hash, 0, sizeof hash);
@@ -1722,20 +1750,30 @@ static void write_elf_shared(Linker *L, const char *path) {
     xfree(chain);
   }
 
-  /* the relative relocations: every GOT slot, all of them local, and every
-     absolute pointer apply_relocs recorded */
+  /* the relative relocations -- every GOT slot of the library's own, and
+     every absolute pointer apply_relocs recorded -- first, as DT_RELACOUNT
+     counts them, then a weak import's slot each */
   Buf rela; memset(&rela, 0, sizeof rela);
   uint32_t nrela = 0;
-  for (uint32_t i = 0; i < L->ngot; i++, nrela++) {
+  for (uint32_t i = 0; i < L->ngot; i++) {
+    if (L->gsyms[L->got[i]].imported) continue;
     buf_u64(&rela, L->got_addr + (uint64_t)i * 8);
     buf_u64(&rela, R_AARCH64_RELATIVE);
     buf_u64(&rela, L->gsyms[L->got[i]].addr);
+    nrela++;
   }
   for (uint32_t i = 0; i < L->nrebase; i++, nrela++) {
     buf_u64(&rela, L->rebase[i]);
     buf_u64(&rela, R_AARCH64_RELATIVE);
     buf_u64(&rela, L->rebase_val[i]);
   }
+  for (uint32_t i = 0; i < L->ngot; i++) {
+    if (!L->gsyms[L->got[i]].imported) continue;
+    buf_u64(&rela, L->got_addr + (uint64_t)i * 8);
+    buf_u64(&rela, ((uint64_t)imp_sym[i] << 32) | R_AARCH64_GLOB_DAT);
+    buf_u64(&rela, 0);
+  }
+  xfree(imp_sym);
 
   uint64_t dyn_addr = align_up(L->got_addr + rw_mem, ELF_PAGE);
   uint64_t dyn_off = align_up(rw_off + rw_file, ELF_PAGE);
@@ -1968,9 +2006,9 @@ static void link_image(TargetFmt fmt, const char *out, const char *objpath,
 
     uint32_t nu = 0;
     for (uint32_t i = 0; i < L.ngsyms; i++)
-      if (!L.gsyms[i].defined) nu++;
+      if (!L.gsyms[i].defined && L.gsyms[i].strong_ref) nu++;
     for (uint32_t i = 0, shown = 0; i < L.ngsyms && shown < 8; i++) {
-      if (L.gsyms[i].defined) continue;
+      if (L.gsyms[i].defined || !L.gsyms[i].strong_ref) continue;
       fprintf(stderr, "warmc: link: undefined symbol %s\n", L.gsyms[i].name);
       shown++;
     }

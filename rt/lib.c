@@ -113,13 +113,57 @@ u32 warmc_lib_last_trap(void) {
    budget below where the call came in. */
 #define LIB_STACK_BUDGET (1ull << 20)
 
+#if !defined(WARMC_DARWIN) && !defined(WARMC_WINDOWS)
+/* On Linux the runtime's reading of /proc/self/maps (warmc_rt_stack_bounds)
+   takes the mapping that holds the stack pointer, which is the thread's
+   stack only where its guard page is a mapping of its own -- on the Linux
+   arm64 runner it was not, two hundred threads' stacks one mapping of 58
+   MiB (src/capi.c thread_bounds_np).  The thread's library knows: the
+   process that loaded the library has one, whose pthread_getattr_np the
+   loader binds these to, weakly -- null where there is none, as the
+   library asks nothing of libc it cannot do without (src/link.c).  Called
+   through pointers loaded from the GOT, so that no branch needs to reach
+   a function that may not be there. */
+typedef struct { u64 w[16]; } PthreadAttr;  /* glibc's 64 bytes, musl's less */
+extern int pthread_getattr_np(unsigned long, PthreadAttr *) __attribute__((weak));
+extern int pthread_attr_getstack(const PthreadAttr *, void **, usz *) __attribute__((weak));
+extern int pthread_attr_destroy(PthreadAttr *) __attribute__((weak));
+extern unsigned long pthread_self(void) __attribute__((weak));
+
+static int libc_stack_bounds(u64 *lo, u64 *hi) {
+  int (*volatile getattr)(unsigned long, PthreadAttr *) = pthread_getattr_np;
+  int (*volatile getstack)(const PthreadAttr *, void **, usz *) = pthread_attr_getstack;
+  int (*volatile destroy)(PthreadAttr *) = pthread_attr_destroy;
+  unsigned long (*volatile self)(void) = pthread_self;
+  if (!getattr || !getstack || !destroy || !self) return 0;
+  PthreadAttr a;
+  if (getattr(self(), &a)) return 0;
+  void *addr = 0;
+  usz size = 0;
+  int ok = getstack(&a, &addr, &size) == 0 && addr && size;
+  destroy(&a);
+  if (!ok) return 0;
+  *lo = (u64)(uptr)addr;
+  *hi = *lo + size;
+  return 1;
+}
+#endif
+
+static void stack_bounds(u64 *lo, u64 *hi) {
+#if !defined(WARMC_DARWIN) && !defined(WARMC_WINDOWS)
+  u64 sp = (u64)(uptr)__builtin_frame_address(0);
+  if (libc_stack_bounds(lo, hi) && sp > *lo && sp <= *hi) return;
+#endif
+  warmc_rt_stack_bounds(lo, hi);
+}
+
 static u64 thread_stack_limit(void) {
   u64 sp = (u64)(uptr)__builtin_frame_address(0);
   u32 s = my_slot();
   /* A thread id outlives its thread, so the bounds kept for it hold only
      while the stack pointer is inside them. */
   if (sp <= lib_traps[s].lo || sp > lib_traps[s].hi)
-    warmc_rt_stack_bounds(&lib_traps[s].lo, &lib_traps[s].hi);
+    stack_bounds(&lib_traps[s].lo, &lib_traps[s].hi);
   u64 lo = lib_traps[s].lo, hi = lib_traps[s].hi;
   if (!lo || sp <= lo || sp > hi) return sp > LIB_STACK_BUDGET ? sp - LIB_STACK_BUDGET : 0;
   u64 margin = (hi - lo) / 8;

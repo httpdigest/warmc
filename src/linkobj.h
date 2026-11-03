@@ -52,6 +52,10 @@ typedef struct {
   uint64_t addr;
   bool defined, weak, imported;
   bool exported;             /* a shared library's dynamic symbol */
+  /* referenced by a symbol that is not weak: undefined, an error; referenced
+     weakly alone, an address of null (ELF), which a shared library asks the
+     loader for -- rt/lib.c's pthread_getattr_np */
+  bool strong_ref;
   uint32_t got_slot;
   uint32_t stub;
 } GSym;
