@@ -28,6 +28,9 @@
 
    stores [THREADS [ROUNDS]] prints one line and exits 0, or names what
    went wrong and exits 1. */
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE /* dladdr, for the fault report below */
+#endif
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdint.h>
@@ -38,6 +41,50 @@
 
 #include "wasm.h"
 #include "warm.h"
+
+#if defined(__linux__) && defined(__aarch64__)
+/* A fault that is not the runtime's own -- it passes those on to the
+   handler there was before it -- said where it was, before the process
+   ends of it as it would have. */
+#include <dlfcn.h>
+#include <signal.h>
+#include <ucontext.h>
+#define STORES_FAULT_REPORT 1
+static void fault_report(int sig, siginfo_t *si, void *ucv) {
+  ucontext_t *uc = ucv;
+  unsigned long pc = (unsigned long)uc->uc_mcontext.pc;
+  unsigned long lr = (unsigned long)uc->uc_mcontext.regs[30];
+  Dl_info d;
+  const char *obj = "?", *sym = "?";
+  unsigned long base = 0, off = 0;
+  if (dladdr((void *)pc, &d)) {
+    obj = d.dli_fname ? d.dli_fname : "?";
+    base = (unsigned long)d.dli_fbase;
+    if (d.dli_sname) { sym = d.dli_sname; off = pc - (unsigned long)d.dli_saddr; }
+  }
+  fprintf(stderr, "stores: signal %d at pc %#lx (%s+%#lx, %s+%#lx) lr %#lx sp %#lx, address %p\n",
+          sig, pc, obj, pc - base, sym, off, lr, (unsigned long)uc->uc_mcontext.sp, si->si_addr);
+  signal(sig, SIG_DFL);
+  raise(sig);
+}
+static void fault_report_install(void) {
+  struct sigaction sa;
+  memset(&sa, 0, sizeof sa);
+  sa.sa_sigaction = fault_report;
+  sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+  sigemptyset(&sa.sa_mask);
+  sigaction(SIGSEGV, &sa, NULL);
+  sigaction(SIGBUS, &sa, NULL);
+}
+/* each thread's own, for a fault that is its stack's overflow */
+static void fault_stack(void) {
+  stack_t ss;
+  ss.ss_sp = malloc(64 * 1024);
+  ss.ss_size = 64 * 1024;
+  ss.ss_flags = 0;
+  if (ss.ss_sp) sigaltstack(&ss, NULL);
+}
+#endif
 
 #ifdef _WIN32
 #include <windows.h>
@@ -244,16 +291,26 @@ typedef struct {
 
 /* waits until every thread is in one, or until ten seconds after the
    first came: 1 when all were.  The deadline is one for all, so that
-   threads let in one at a time fail in ten seconds, not ten each. */
-static atomic_int rendezvous_ms;
+   threads let in one at a time fail in ten seconds, not ten each -- ten
+   seconds of the clock: a count of the milliseconds each waiting thread
+   slept ran out after ten thousand of them shared among the waiters, 70 ms
+   with 141 waiting, on a runner that had not started the rest by then. */
+static atomic_llong rendezvous_t0;
+static long long mono_ms(void) {
+  struct timespec t;
+  clock_gettime(CLOCK_MONOTONIC, &t);
+  return (long long)t.tv_sec * 1000 + t.tv_nsec / 1000000;
+}
 static wasm_trap_t *rendezvous(void *env, const wasm_val_vec_t *args, wasm_val_vec_t *res) {
   (void)env;
   (void)args;
+  long long none = 0;
+  atomic_compare_exchange_strong(&rendezvous_t0, &none, mono_ms());
   atomic_fetch_add(&inside, 1);
   int ok = 0;
   for (;;) {
     if (atomic_load(&inside) >= nthreads) { ok = 1; break; }
-    if (atomic_fetch_add(&rendezvous_ms, 1) >= 10000) break;
+    if (mono_ms() - atomic_load(&rendezvous_t0) >= 10000) break;
     nap_ms(1);
   }
   res->data[0].kind = WASM_I32;
@@ -447,6 +504,9 @@ out:
 
 static void *thread_main(void *arg) {
   int tid = (int)(intptr_t)arg;
+#ifdef STORES_FAULT_REPORT
+  fault_stack();
+#endif
   for (int round = 0; round < nrounds; round++) one_round(tid, round);
   return NULL;
 }
@@ -456,6 +516,9 @@ int main(int argc, char **argv) {
   if (argc > 2) nrounds = atoi(argv[2]);
   /* collections early and often: every store's heap collects many times */
   env_set("WARMC_GC_MIN_KB", "256");
+#ifdef STORES_FAULT_REPORT
+  fault_report_install();
+#endif
   engine = wasm_engine_new();
   compile(WORK, &m_work);
   compile(GC, &m_gc);
