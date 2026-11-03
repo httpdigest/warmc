@@ -123,6 +123,25 @@ static void alt_free(void *p) {
   free(p);
 }
 static void alt_key(void) { pthread_key_create(&g_alt_key, alt_free); }
+
+/* The thread's stack as its library made it.  The runtime's reading of
+   /proc/self/maps (warmc_rt_stack_bounds) takes the mapping that holds the
+   stack pointer, which is the thread's stack only where its guard page is a
+   mapping of its own: on the Linux arm64 runner, guards that are not left
+   two hundred threads' stacks one mapping of 58 MiB, wasm's limit near its
+   bottom, and stores.c's deep recursion ran off the end of its 2 MiB. */
+static int thread_bounds_np(u64 *lo, u64 *hi) {
+  pthread_attr_t a;
+  if (pthread_getattr_np(pthread_self(), &a)) return 0;
+  void *addr = NULL;
+  size_t size = 0;
+  int ok = pthread_attr_getstack(&a, &addr, &size) == 0 && addr && size;
+  pthread_attr_destroy(&a);
+  if (!ok) return 0;
+  *lo = (u64)(uptr)addr;
+  *hi = *lo + size;
+  return 1;
+}
 static void thread_altstack(void) {
   stack_t cur;
   if (sigaltstack(NULL, &cur) == 0 && !(cur.ss_flags & SS_DISABLE)) return;
@@ -165,7 +184,12 @@ static u64 thread_limit(void) {
 #endif
   u64 sp = (u64)(uptr)__builtin_frame_address(0);
   u64 lo = 0, hi = 0;
+#if defined(__linux__)
+  if (!thread_bounds_np(&lo, &hi) || sp <= lo || sp > hi)
+    warmc_rt_stack_bounds(&lo, &hi);
+#else
   warmc_rt_stack_bounds(&lo, &hi);
+#endif
   g_stack_lo = lo;
   g_stack_hi = hi;
   if (!lo || sp <= lo || sp > hi) {
