@@ -1609,7 +1609,10 @@ and or or of compares that a select or branch tests, up to four compares, is
 a `cmp` and a `ccmp` (or `ccmn`) for each compare after the first, its
 flags read by the `csel` or `b.cond` where `cset`s, an `and` and a test of
 it would each take a cycle: musl's `strtod` carries its first limb round a
-loop by `k == a && !x[k]` (`cbench/strtod` takes 0.85 the time). The
+loop by `k == a && !x[k]` (`cbench/strtod` takes 0.85 the time). A
+`ref.is_null` is such a compare too, of the pointer with zero: luawasm's
+test for nil, a null reference and a zero payload, is a `cmp` and a `ccmp`
+where it was six instructions (`WARMC_NO_NULLCCMP=1` turns it off). The
 selects on a compare read its flags, not a `cset` of them, when only
 instructions that leave the flags as they are come between. An add of a
 compare's 0 or 1 -- for an i64, of its zero extension -- is the compare and
@@ -1635,7 +1638,23 @@ words. On arm64, a
 function whose entry block tests only what it is passed and what it loads
 from memory, and may return at once -- a destructor called on a null
 pointer -- makes that test, and that return with the block's stores, ahead
-of its prologue; a function with a loop small enough for one 64-byte fetch
+of its prologue; and a function that calls but whose start may return
+without -- TeaVM's `ArrayList.ensureCapacity` when its array is big enough,
+a tree walk's base case -- is shrink-wrapped: that start, the blocks on the
+ways to a return of at most 24 instructions with no call, loop or
+allocation, is a leaf of its own at the function's symbol, with no frame,
+saved register or stack check, and each way out of it into the rest jumps to
+the whole function, placed after it at `<sym>$full` and run from its start
+again, so the start may read and trap on the way to such a jump but not
+write -- a write it makes on the way to the branch that ends its last
+block, with nothing but arithmetic after it, it makes on the side of that
+branch that returns instead, where only that branch enters (luawasm's
+`self.count = self.count + 1` ahead of permute's `if n ~= 0`;
+`WARMC_NO_SW_SINK=1` turns that off); where what it would run twice, by the
+longest way that no branch hint calls rare, is more than the prologue and
+epilogue the short way saves, the function is left whole (`ktbench/fpmath`
+takes 0.79 the time, `ktbench/bintree` 0.82, luawasm's `awfy_permute` 0.94;
+`WARMC_NO_SHRINK_WRAP=1` turns it off); a function with a loop small enough for one 64-byte fetch
 block starts at the offset in its block that lets such loops fit with the
 least padding run on their entry, the rest of the block left ahead of it,
 where nothing runs; a loop's one latch, the jump or test back to its
@@ -1685,7 +1704,9 @@ Functions compile in parallel and are laid out deterministically.
 - Windows: a PE32+ whose DLL imports come from a curated table, so no SDK is
   needed.
 - With `--shared`: an ELF shared object with its own dynamic symbol table,
-  hash table and relative relocations; a Mach-O dylib with an export trie; or
+  hash table and relative relocations, and no `DT_NEEDED` -- what the runtime
+  takes from the process where it is there (the thread library's stack
+  bounds) is a weak import the loader binds or leaves null; a Mach-O dylib with an export trie; or
   a DLL with an export directory and base relocations. `src/shlib.c` adds a
   stub per export that enters the runtime through `rt/lib.c`, which reads the
   platform's C calling convention and makes the instance on the first call.
@@ -1774,7 +1795,31 @@ working memory when it ends.
     shaded, is handled in a few instructions with six registers saved; a
     reference to an object that may have moved, or one being born, goes to
     the runtime. A cycle that relocates nothing leaves the mark's colour
-    current, so the program's next loads take no barrier at all.
+    current, so the program's next loads take no barrier at all. The mask a
+    barrier tests is read once between safepoints: a block whose ways in all
+    bring the same one starts with it, and the register allocator reads it
+    again from the instance rather than keep a slot for it
+    (`WARMC_NO_MASKFLOW=1`, `WARMC_NO_MASKREMAT=1`).
+  - A cast inside the arm of a branch on the same `ref.test` -- `if
+    (ref.test $T x) (then (ref.cast $T x))`, the two sharing the test's
+    result -- has no trap left to make (`WARMC_NO_PASSEDCAST=1`; luawasm's
+    `nbody` takes 0.9 the time).
+  - An array access needs no bounds check where its index is proved in
+    `[0, length)` without an unsigned compare against the length: no array
+    is 2^31 elements long or longer (the runtime refuses one), so a signed
+    `i < a.length` -- Java's and Kotlin's -- is enough once `i` cannot be
+    negative, which a loop counting up from 0 gives where no way round
+    wraps.  The prover (`opt.c` `rp_inbounds`) takes the facts of the
+    branches over the access, the accesses made on the way and every
+    allocation's length, and the shape of the index: sums with constants,
+    masks, remainders, shifts, wraps of an i64, selects, and block params
+    on every way in, round a loop assuming what it proves.  A loop counting
+    down to `i >= 0`, `a[i - 1]` past `i >= 1`, `a[i + 1]` past
+    `i < n - 1`, `h & (n - 1)` once `n != 0`, `h % n`, a do-while's
+    `i != last` and a sieve's `i <= n` into an array of `n + 1` lose their
+    checks: of the accesses that kept one, a quarter in `ktbench` (5549 to
+    4107) and a fifth in `javabench` (13021 to 10117) no longer do
+    (`WARMC_NO_BCE_RANGE=1` turns it off; `--stats` counts `bce_ranges`).
   - Objects, and arrays of a constant length, are bumped inline from the
     program's allocation buffer, zeroed when their page was opened; on
     AArch64 so are arrays of a computed length.

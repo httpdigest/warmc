@@ -324,6 +324,10 @@ static int rd(Isel *s, Ref v, int scratch) {
       x64_lea(B, 1, scratch, mb, X64_NOIDX, 0, (int32_t)in->imm);
       return scratch;
     }
+    if (in->op == I_GC_BADMASK) {
+      x64_load64(B, scratch, REG_VMCTX, X64_NOIDX, 0, VMCTX_GC_BADMASK);
+      return scratch;
+    }
     if (in->op == I_GLOBAL_GET) {
       uint32_t off = VMCTX_GLOBALS + GLOBAL_SLOT_SIZE * (uint32_t)in->imm;
       if ((ValType)in->type == VT_V128)

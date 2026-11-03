@@ -16,7 +16,7 @@
 #define INLINE_ROUND2_GROWTH 600
 /* the most instructions a partial inline takes in: the start of a callee
    up to where it would call or loop (pinl_build) */
-#define PINLINE_MAX 20
+#define PINLINE_MAX 32
 
 /* Site scoring: the value of removing one call, before dividing by what the
    splice costs. A constant argument is worth more than the instructions it
@@ -996,12 +996,81 @@ static bool pinl_rerun_ok(IrFunc *g, Ref v) {
     case I_TRUNCS: case I_TRUNCU:
     case I_LOAD: case I_TABLE_GET: case I_MEM_SIZE: case I_TABLE_SIZE:
     case I_REF_SLOT:
+    /* the collector's bad mask; and a check, which traps where the callee
+       would first, nothing written before it on the way to a cut */
+    case I_GC_BADMASK: case I_TRAP_IF:
       return true;
     case I_CALL_REF:
       return opt_once_call(g, v);
     default:
       return false;
   }
+}
+
+/* What may stand between a write pinl_sink_to moves and where it goes: no
+   effect and no read of memory, which would see the write not yet made. */
+static bool pinl_sink_past(const Inst *in) {
+  switch (in->op) {
+    case I_FIELD_GET: case I_ARRAY_GET: case I_ARRAY_LEN: case I_LOAD: case I_GLOBAL_GET:
+    case I_MEM_SIZE: case I_TABLE_GET: case I_TABLE_SIZE:
+      return false;
+    default:
+      return ir_has_no_effect(in);
+  }
+}
+
+/* A write the start makes on its way to a cut, whose call of the callee
+   would make it again: where it can go instead -- past the rest of its
+   block, and the blocks after it that only it enters, all of no effect, to
+   the side of the branch that ends them which surely returns, the other
+   surely going on to the cut (mcut): that side's start, then.  luawasm's
+   permute, `self.count = self.count + 1` and then `if n ~= 0`: the leaf's
+   count is bumped where it returns, the call bumps its own.  (As
+   codegen.c's sw_sink_to for a shrink-wrapped start.)  REF_NONE where
+   there is no such place. */
+static uint32_t pinl_sink_to(IrFunc *g, const uint8_t *ret, const uint8_t *cut, const uint8_t *mcut,
+                             uint32_t bi, uint32_t at) {
+  const Inst *w = &g->insts[g->blocks[bi].insts[at]];
+  if (w->op != I_FIELD_SET && w->op != I_GLOBAL_SET && w->op != I_STORE && w->op != I_ARRAY_SET) return REF_NONE;
+  if (warmc_getenv("WARMC_NO_PINL_SINK")) return REF_NONE;
+  uint32_t b = bi, from = at + 1;
+  for (int hop = 0; hop < 8; hop++) {
+    const Block *B = &g->blocks[b];
+    for (uint32_t i = from; i < B->ninsts; i++)
+      if (!pinl_sink_past(&g->insts[B->insts[i]])) {
+        if (g_inl.dbg) fprintf(stderr, "pinl sink: b%u: %s in b%u\n", bi, ir_op_name(g->insts[B->insts[i]].op), b);
+        return REF_NONE;
+      }
+    uint32_t next;
+    if (B->term == T_JUMP && B->nsuccs == 1) {
+      next = B->succs[0].target;
+      if (!ret[next]) return REF_NONE;
+    } else if (B->term == T_BRIF && B->nsuccs == 2) {
+      uint32_t s0 = B->succs[0].target, s1 = B->succs[1].target;
+      bool on0 = !ret[s0] || mcut[s0], on1 = !ret[s1] || mcut[s1];
+      bool back0 = ret[s0] && !cut[s0], back1 = ret[s1] && !cut[s1];
+      if (on0 && back1) next = s1;
+      else if (on1 && back0) next = s0;
+      else {
+        if (g_inl.dbg) fprintf(stderr, "pinl sink: b%u: b%u's sides b%u (ret %d cut %d mcut %d) b%u (ret %d cut %d mcut %d)\n",
+                               bi, b, s0, ret[s0], cut[s0], mcut[s0], s1, ret[s1], cut[s1], mcut[s1]);
+        return REF_NONE;
+      }
+    } else {
+      return REF_NONE;
+    }
+    uint32_t kp = 0;
+    for (uint32_t p = 0; p < g->blocks[next].npreds; p++)
+      if (ret[g->blocks[next].preds[p]]) kp++;
+    if (kp != 1) {
+      if (g_inl.dbg) fprintf(stderr, "pinl sink: b%u: b%u has %u ways in\n", bi, next, kp);
+      return REF_NONE;
+    }
+    if (B->term == T_BRIF || !cut[next]) return next;
+    b = next;
+    from = 0;
+  }
+  return REF_NONE;
 }
 
 /* The callee fidx's warm start, as a body a splice takes in: built, its tail
@@ -1024,6 +1093,14 @@ static IrFunc *pinl_build(IrFunc *f, const OptOpts *o, uint32_t fidx,
   uint32_t nb = g->nblocks;
   uint8_t *bad = xcalloc(nb ? nb : 1, 1), *in_g = xcalloc(nb ? nb : 1, 1);
   uint8_t *ret = xcalloc(nb ? nb : 1, 1), *cut = xcalloc(nb ? nb : 1, 1);
+  /* a block every way from which goes on to a cut; per instruction, the
+     block a write the start moves goes to (pinl_sink_to) */
+  uint8_t *mcut = xcalloc(nb ? nb : 1, 1);
+  uint32_t *sink = xmalloc((g->ninsts ? g->ninsts : 1) * sizeof(uint32_t));
+  uint32_t nsink = 0;
+  uint32_t *psz = xmalloc((nb ? nb : 1) * sizeof(uint32_t));
+  uint32_t *pdin = xmalloc((nb ? nb : 1) * sizeof(uint32_t));
+  uint32_t *pdout = xmalloc((nb ? nb : 1) * sizeof(uint32_t));
   for (uint32_t oi = 0; oi < g->norder; oi++) {
     uint32_t bi = g->order[oi];
     Block *b = &g->blocks[bi];
@@ -1045,7 +1122,10 @@ static IrFunc *pinl_build(IrFunc *f, const OptOpts *o, uint32_t fidx,
   /* the warm start, made smaller while a block on the way to a cut does
      what may not run twice (each round marks one more block bad) */
   for (uint32_t round = 0; round <= g->norder; round++) {
-    if (bad[g->entry]) goto done;
+    if (bad[g->entry]) {
+      if (g_inl.dbg) fprintf(stderr, "pinl %s: no start: the entry calls, loops or writes on (round %u)\n", inl_name(&m->funcs[fidx]), round);
+      goto done;
+    }
     memset(in_g, 0, nb);
     in_g[g->entry] = 1;
     for (uint32_t oi = 0; oi < g->norder; oi++) {    /* reverse postorder */
@@ -1055,20 +1135,72 @@ static IrFunc *pinl_build(IrFunc *f, const OptOpts *o, uint32_t fidx,
       for (uint32_t s = 0; s < b->nsuccs; s++)
         if (!bad[b->succs[s].target]) in_g[b->succs[s].target] = 1;
     }
-    /* reaching a return or a trap within: the blocks taken in.  The region
-       has no loop, so successors come first in reverse of the order */
+    /* reaching a return within: the blocks taken in (a way only to a trap
+       is cut, the callee trapping there itself -- so that a way on that
+       may trap is no way back, and a write ahead of it can go to the way
+       that returns, pinl_sink_to).  The region has no loop, so successors
+       come first in reverse of the order */
     memset(ret, 0, nb);
+    bool trapback = warmc_getenv("WARMC_PINL_TRAPS") != NULL;
     for (uint32_t oi = g->norder; oi-- > 0;) {
       uint32_t bi = g->order[oi];
       if (!in_g[bi]) continue;
       const Block *b = &g->blocks[bi];
-      if (b->term == T_RETURN || b->term == T_TRAP) ret[bi] = 1;
+      if (b->term == T_RETURN || (trapback && b->term == T_TRAP)) ret[bi] = 1;
       for (uint32_t s = 0; s < b->nsuccs && !ret[bi]; s++)
         if (ret[b->succs[s].target]) ret[bi] = 1;
     }
-    if (!ret[g->entry]) goto done;
+    if (!ret[g->entry]) {
+      if (g_inl.dbg) fprintf(stderr, "pinl %s: no start: no return without a call (round %u)\n", inl_name(&m->funcs[fidx]), round);
+      goto done;
+    }
+    /* the short ways out only, as a shrink-wrapped start's (codegen.c
+       sw_start): a block on a way from the entry to a return of at most
+       partial_max instructions -- not every block that reaches a return
+       without a call, permute's whole `if n ~= 0` side, which may skip its
+       loop and return */
+    if (!warmc_getenv("WARMC_PINL_ALLWAYS")) {
+      for (uint32_t oi = 0; oi < g->norder; oi++) {
+        uint32_t bi = g->order[oi];
+        uint32_t k = 0;
+        for (uint32_t i = 0; i < g->blocks[bi].ninsts; i++) {
+          uint16_t op = g->insts[g->blocks[bi].insts[i]].op;
+          if (op != I_CONST && op != I_PARAM && op != I_NOP) k++;
+        }
+        psz[bi] = k;
+        pdin[bi] = pdout[bi] = UINT32_MAX / 4;
+      }
+      for (uint32_t oi = g->norder; oi-- > 0;) {
+        uint32_t bi = g->order[oi];
+        if (!ret[bi]) continue;
+        const Block *b = &g->blocks[bi];
+        uint32_t best = b->term == T_RETURN ? 0 : UINT32_MAX / 4;
+        for (uint32_t s = 0; s < b->nsuccs; s++)
+          if (ret[b->succs[s].target] && pdout[b->succs[s].target] < best) best = pdout[b->succs[s].target];
+        pdout[bi] = psz[bi] + best;
+      }
+      pdin[g->entry] = 0;
+      for (uint32_t oi = 0; oi < g->norder; oi++) {
+        uint32_t bi = g->order[oi];
+        if (!ret[bi] || pdin[bi] >= UINT32_MAX / 4) continue;
+        const Block *b = &g->blocks[bi];
+        for (uint32_t s = 0; s < b->nsuccs; s++) {
+          uint32_t t = b->succs[s].target;
+          if (ret[t] && pdin[bi] + psz[bi] < pdin[t]) pdin[t] = pdin[bi] + psz[bi];
+        }
+      }
+      for (uint32_t bi = 0; bi < nb; bi++)
+        if (ret[bi] && pdin[bi] + pdout[bi] > g_inl.partial_max) ret[bi] = 0;
+      if (!ret[g->entry]) {
+        if (g_inl.dbg) fprintf(stderr, "pinl %s: no start: no short way out (round %u)\n", inl_name(&m->funcs[fidx]), round);
+        goto done;
+      }
+    }
     /* reaching a cut, and the blocks on the way that may not run twice */
     memset(cut, 0, nb);
+    memset(mcut, 0, nb);
+    nsink = 0;
+    for (uint32_t i = 0; i < g->ninsts; i++) sink[i] = REF_NONE;
     bool again = false;
     n = ncut = 0;
     any_ret = false;
@@ -1077,21 +1209,64 @@ static IrFunc *pinl_build(IrFunc *f, const OptOpts *o, uint32_t fidx,
       if (!ret[bi]) continue;
       const Block *b = &g->blocks[bi];
       if (b->term == T_RETURN) any_ret = true;
+      bool all_on = b->nsuccs > 0 && b->term != T_RETURN && b->term != T_TRAP;
       for (uint32_t s = 0; s < b->nsuccs; s++) {
         uint32_t t = b->succs[s].target;
         if (!ret[t]) { cut[bi] = 1; ncut++; }
         else if (cut[t]) cut[bi] = 1;
+        if (ret[t] && !mcut[t]) all_on = false;
       }
+      mcut[bi] = all_on;
       for (uint32_t i = 0; i < b->ninsts; i++) {
         Ref v = b->insts[i];
         uint16_t op = g->insts[v].op;
         if (op != I_CONST && op != I_PARAM && op != I_NOP) n++;
-        if (cut[bi] && !pinl_rerun_ok(g, v)) { bad[bi] = 1; again = true; }
+        if (cut[bi] && !pinl_rerun_ok(g, v)) {
+          uint32_t to = pinl_sink_to(g, ret, cut, mcut, bi, i);
+          if (to != REF_NONE) { sink[v] = to; nsink++; continue; }
+          if (g_inl.dbg)
+            fprintf(stderr, "pinl %s: b%u %s on the way on (round %u)\n", inl_name(&m->funcs[fidx]), bi, ir_op_name(op), round);
+          bad[bi] = 1;
+          again = true;
+        }
       }
     }
     if (!again) break;
   }
-  if (!ncut || !any_ret || n > g_inl.partial_max) goto done;
+  if (!ncut || !any_ret || n > g_inl.partial_max) {
+    if (g_inl.dbg)
+      fprintf(stderr, "pinl %s: no start: %s (%u instructions, %u cuts)\n", inl_name(&m->funcs[fidx]),
+              !ncut ? "nothing cut" : !any_ret ? "no return" : "too big", n, ncut);
+    goto done;
+  }
+
+  /* the writes moved where they go, ahead of what is there, in order */
+  if (nsink) {
+    for (uint32_t oi = 0; oi < g->norder; oi++) {
+      uint32_t bi = g->order[oi];
+      Block *b = &g->blocks[bi];
+      uint32_t k = 0;
+      for (uint32_t i = 0; i < b->ninsts; i++)
+        if (sink[b->insts[i]] == REF_NONE) b->insts[k++] = b->insts[i];
+      b->ninsts = k;
+    }
+    for (uint32_t v = 0; v < g->ninsts; v++) {
+      if (sink[v] == REF_NONE) continue;
+      uint32_t t = sink[v];
+      Block *T = &g->blocks[t];
+      uint32_t lead = 0;
+      while (lead < T->ninsts && sink[T->insts[lead]] == t) lead++;
+      if (T->ninsts == T->cap_insts) {
+        uint32_t oc = T->cap_insts;
+        T->cap_insts = T->cap_insts ? T->cap_insts * 2 : 4;
+        T->insts = ir_grow(g, T->insts, oc * sizeof(uint32_t), T->cap_insts * sizeof(uint32_t));
+      }
+      memmove(&T->insts[lead + 1], &T->insts[lead], (T->ninsts - lead) * sizeof(uint32_t));
+      T->insts[lead] = v;
+      T->ninsts++;
+      g->insts[v].block = t;
+    }
+  }
 
   /* the call of the whole callee where the start is cut */
   {
@@ -1149,7 +1324,8 @@ static IrFunc *pinl_build(IrFunc *f, const OptOpts *o, uint32_t fidx,
     *size = n + 1;
   }
 done:
-  xfree(bad); xfree(in_g); xfree(ret); xfree(cut);
+  xfree(bad); xfree(in_g); xfree(ret); xfree(cut); xfree(mcut); xfree(sink);
+  xfree(psz); xfree(pdin); xfree(pdout);
   if (!out) ir_free(g);
   return out;
 }
@@ -1470,10 +1646,16 @@ static bool inl_score_partial(IrFunc *f, const OptOpts *o, InlMemos *memo,
   Inst *cin = &f->insts[call];
   if (cin->op != I_CALL || (cin->flags & IRF_PARTIAL_SLOW)) return false;
   uint32_t fidx = (uint32_t)cin->imm;
-  if (fidx == f->func_index || m->funcs[fidx].imported || !m->funcs[fidx].body)
+  /* (a function's own start too: the cut is the recursive call it was, and
+     never taken in again -- permute's leaves, most of its calls) */
+  if ((fidx == f->func_index && warmc_getenv("WARMC_NO_PINL_SELF")) || m->funcs[fidx].imported ||
+      !m->funcs[fidx].body)
     return false;
   uint32_t bi = cin->block;
   Block *b = &f->blocks[bi];
+  if (g_inl.dbg && fidx == f->func_index)
+    fprintf(stderr, "pinl %s: own call at b%u%s%s%s\n", inl_name(&m->funcs[fidx]), bi, b->diverges ? " diverges" : "",
+            b->cold ? " cold" : "", parent ? " in an inline" : "");
   if (b->diverges || b->cold) return false;
   uint16_t idepth = 0;
   if (parent) {

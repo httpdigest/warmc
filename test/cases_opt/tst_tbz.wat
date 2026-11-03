@@ -12,7 +12,9 @@
 ;; compares with 8, not 0, tb_teed's compare is returned too, and
 ;; sel_shift's and takes a shift in (no tst of it), and and_teed's and
 ;; is returned too.  The early returns ahead of the prologue add -5, 0x7000
-;; and -0x3000 (early_make).  Each branch
+;; and -0x3000 (early_make) -- each twice, the function's own and its
+;; self-call's, which takes that start in (inline.c, partial inlining of a
+;; function's own start).  Each branch
 ;; stores 70 at 0 or 9 at 4 and returns the sum, so that no if-conversion
 ;; takes it.
 ;;
@@ -28,8 +30,8 @@
 ;; shape: tb_teed \stb(n)?z\s=0
 ;; shape: sel_shift \stst\s=0
 ;; shape: and_teed \stb(n)?z\s=0
-;; shape: early_hi lsl #12=1
-;; shape: early_neg_hi lsl #12=1
+;; shape: early_hi lsl #12=2
+;; shape: early_neg_hi lsl #12=2
 ;; shape: tb_31 \stb(n)?z\s+w\d+, #0x1f=1
 ;; shape: tb_63 \stb(n)?z\s+x\d+, #0x3f=1
 ;; shape: shared \stb(n)?z\s=1

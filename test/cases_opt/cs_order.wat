@@ -3,12 +3,13 @@
 ;; loop in $run keeps its counter, its sum and its bound across each call of
 ;; $tri, which keeps its argument across its own call, at no loop: from the
 ;; same end, the two would share x22, and $tri's save and restore of it would
-;; put $run's counter through memory on every call.
+;; put $run's counter through memory on every call.  ($tri's own call takes
+;; its base case in -- partial inlining of a function's own start -- so its
+;; argument is saved around that call alone, in no callee-saved register.)
 ;;
 ;; shape: run \b[xw]2[2-6]\b=0
 ;; shape: run stp\tx28=1
 ;; shape: tri \b[xw]2[3-8]\b=0
-;; shape: tri stp\tx22=1
 ;;
 ;; run: run 10 => i32:85
 ;; run: run 0 => i32:0

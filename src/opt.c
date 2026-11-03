@@ -12267,17 +12267,113 @@ static bool gc_idx_wide(IrFunc *f, Ref fx, Ref flen, Ref idx, Ref *n32) {
   return true;
 }
 
+/* The pairs of bound and object a proof through block parameters
+   (gc_len_covers) is in the middle of: met again round a loop, they hold
+   (the way in proves them first, each way round keeps them). */
+#define GC_COV_MAX 24
+typedef struct { Ref L[GC_COV_MAX], obj[GC_COV_MAX]; int n; } GcCov;
+
+static int gc_param_index(const Block *b, Ref p) {
+  for (uint32_t k = 0; k < b->nparams; k++)
+    if (b->params[k] == p) return (int)k;
+  return -1;
+}
+
+static bool gc_is_null_const(IrFunc *f, Ref v) {
+  const Inst *in = &f->insts[v];
+  return (in->op == I_CONST && vt_is_ref((ValType)in->type) && in->imm == 0) || in->op == I_REF_NULL;
+}
+
+static bool gc_len_covers_in(IrFunc *f, Ref L, Ref obj, Ref alen, int depth, GcCov *cv);
+
+/* The one object a block's parameter is on every way in that gives it no
+   null (a null fails the access before its bounds matter), or the
+   parameter itself: luawasm's view of a table's array, merged after a slow
+   path with the same array or the null its first load left. */
+static Ref gc_phi_root(IrFunc *f, Ref obj, int depth) {
+  obj = gc_ref_root(f, ir_resolve(f, obj));
+  const Inst *oi = &f->insts[obj];
+  if (depth <= 0 || oi->op != I_PARAM || oi->block == f->entry || warmc_getenv("WARMC_NO_BCE_PHI")) return obj;
+  const Block *B = &f->blocks[oi->block];
+  if (B->is_pad || !B->npreds) return obj;
+  int k = gc_param_index(B, obj);
+  if (k < 0) return obj;
+  Ref one = REF_NONE;
+  for (uint32_t p = 0; p < B->npreds; p++) {
+    const Block *P = &f->blocks[B->preds[p]];
+    for (uint32_t s = 0; s < P->nsuccs; s++) {
+      const Edge *e = &P->succs[s];
+      if (e->target != oi->block) continue;
+      if (e->eh || (uint32_t)k >= e->nargs) return obj;
+      Ref a = gc_ref_root(f, ir_resolve(f, e->args[k]));
+      if (a == obj || gc_is_null_const(f, a)) continue;
+      a = gc_phi_root(f, a, depth - 1);
+      if (a == obj) continue;
+      if (one == REF_NONE) one = a;
+      else if (one != a) return obj;
+    }
+  }
+  return one != REF_NONE ? one : obj;
+}
+
+/* A bound that is a block's parameter: at most its object's length on
+   every way in -- the object the same parameter's argument there where it
+   is one of the block's own parameters too, and a way where that argument
+   is null no way to the access, which a null fails first.  luawasm's view
+   of a table's array part reaches each access as such a pair after every
+   slow path that rejoins (its border and its array, merged with the
+   values the way round the slow path kept). */
+static bool gc_len_covers_param(IrFunc *f, Ref L, Ref obj, int depth, GcCov *cv) {
+  const Inst *li = &f->insts[L];
+  if (li->op != I_PARAM || li->block == f->entry || warmc_getenv("WARMC_NO_BCE_PHI")) return false;
+  const Block *B = &f->blocks[li->block];
+  if (B->is_pad || !B->npreds) return false;
+  int kL = gc_param_index(B, L);
+  if (kL < 0) return false;
+  const Inst *oi = &f->insts[obj];
+  int kO = oi->op == I_PARAM && oi->block == li->block ? gc_param_index(B, obj) : -1;
+  for (int i = 0; i < cv->n; i++)
+    if (cv->L[i] == L && cv->obj[i] == obj) return true;
+  if (cv->n == GC_COV_MAX) return false;
+  cv->L[cv->n] = L;
+  cv->obj[cv->n] = obj;
+  cv->n++;
+  bool ok = true;
+  for (uint32_t p = 0; p < B->npreds && ok; p++) {
+    const Block *P = &f->blocks[B->preds[p]];
+    for (uint32_t s = 0; s < P->nsuccs && ok; s++) {
+      const Edge *e = &P->succs[s];
+      if (e->target != li->block) continue;
+      if (e->eh || (uint32_t)kL >= e->nargs || (kO >= 0 && (uint32_t)kO >= e->nargs)) { ok = false; break; }
+      Ref le = ir_resolve(f, e->args[kL]);
+      Ref oe = kO >= 0 ? gc_ref_root(f, ir_resolve(f, e->args[kO])) : obj;
+      if (gc_is_null_const(f, oe)) continue;
+      ok = gc_len_covers_in(f, le, oe, gc_array_len_value(f, oe), depth - 1, cv);
+    }
+  }
+  cv->n--;
+  return ok;
+}
+
 /* Is a bound L at most obj's length?  Its length itself (array.len of the
    same object, or the allocation's), or an unsigned min with one of those
    as an operand -- select(a, b, a <u b) and its spellings -- which luawasm
    makes of a table's used length and its array's, the first never above
-   the second, so that its own test of an index proves the access too. */
+   the second, so that its own test of an index proves the access too; or
+   a block's parameter that is so on every way in (gc_len_covers_param). */
 static bool gc_len_covers(IrFunc *f, Ref L, Ref obj, Ref alen, int depth) {
+  GcCov cv;
+  cv.n = 0;
+  return gc_len_covers_in(f, L, obj, alen, depth + 3, &cv);
+}
+
+static bool gc_len_covers_in(IrFunc *f, Ref L, Ref obj, Ref alen, int depth, GcCov *cv) {
   L = ir_resolve(f, L);
   Inst *li = &f->insts[L];
   if (li->op == I_ARRAY_LEN && li->nargs == 1 && gc_ref_root(f, ir_args(f, L)[0]) == obj)
     return true;
   if (alen != REF_NONE && alen == L) return true;
+  if (depth > 0 && li->op == I_PARAM) return gc_len_covers_param(f, L, obj, depth, cv);
   if (depth <= 0 || li->op != I_SELECT || li->nargs != 3) return false;
   Ref x = ir_resolve(f, ir_args(f, L)[0]), y = ir_resolve(f, ir_args(f, L)[1]);
   Ref c = ir_resolve(f, ir_args(f, L)[2]);
@@ -12299,7 +12395,939 @@ static bool gc_len_covers(IrFunc *f, Ref L, Ref obj, Ref alen, int depth) {
   if (inv) { Ref t = small; small = big; big = t; }
   /* (the other way round it is the max) */
   if (x != small || y != big) return false;
-  return gc_len_covers(f, x, obj, alen, depth - 1) || gc_len_covers(f, y, obj, alen, depth - 1);
+  return gc_len_covers_in(f, x, obj, alen, depth - 1, cv) || gc_len_covers_in(f, y, obj, alen, depth - 1, cv);
+}
+
+/* ---- Ranges: bounds checks no compare against the length answers ----
+
+   An access is in bounds where its index, read as signed in its width, is
+   at least 0 and at most its array's length less one.  No array is 2^31
+   elements long or longer (the runtime refuses one), so array.len is never
+   negative, and Java's and Kotlin's `i < a.length`, signed, says as much as
+   an unsigned test once i is known not to be negative: what a loop that
+   counts up from 0 gives, past any way round that cannot wrap.  So do a
+   loop that counts down to `i >= 0`, i - 1 past a test of i >= 1, a[i + 1]
+   past `i < n - 1`, h & (n - 1) once n > 0, x % n, an i64 index wrapped to
+   an i32, and a test against a bound tested against the length.
+
+   The facts are the conditions of the branches over a point (the arm
+   taken), each access made on the way there (its index below its array's
+   length, whatever happened to the access's own check: one this removes
+   was in bounds, by induction on the order things run in), a counted
+   loop's x <u B, and every array.len, which names its array's length.  A
+   fact on base + c also counts as one on base, where base + c cannot wrap.
+
+   The prover asks whether a value is at most a target plus k -- a
+   constant, another value, or an array's length -- or at least a constant,
+   through the facts and the value's shape: constants, sums with a
+   constant, masks, remainders, quotients, shifts, wraps and extensions,
+   selects (each arm under its condition) and block params, which hold on
+   every way in: round a loop assuming they do, which proves it -- the way
+   in proves the first time through, and each way round the next time from
+   the time before (coinduction; the target the same each time round). */
+
+#define RP_MAXLEN 0x7fffffffLL
+#define RP_DEPTH 18
+#define RP_BUDGET 1500
+
+enum { RF_LE, RF_GE, RF_ULT, RF_ULE, RF_NE, RF_ACC, RF_ACCO, RF_LENOF, RF_SQ };
+enum { TK_NUM, TK_VAL, TK_LEN };
+enum { RD_LE, RD_GE };
+
+/* a + off REL b + k, from the start of pos in blk on and in every block
+   blk dominates; b REF_NONE: the constant k alone; orig the value that is
+   a + off (mod 2^w) the fact was made of.  RF_ACC: a + off below the
+   length of the array b; RF_ACCO: the same keyed on the array a, b the
+   index; RF_LENOF: b is the array a's length; RF_SQ: b is a * a, an i32
+   widened and squared in an i64, which cannot wrap. */
+typedef struct {
+  Ref a, b, orig;
+  int64_t k, off;
+  uint32_t blk, pos;
+  int32_t next;
+  uint8_t rel;
+} RFact;
+
+/* a constant (TK_NUM: 0), a value s, or the length of obj -- pr being the
+   one object obj is wherever it is not null (gc_phi_root) */
+typedef struct { uint8_t kind; Ref s, obj, pr; } RTgt;
+
+/* a point: before instruction pos of blk (UINT32_MAX: its end), and the
+   facts true there alone, tmp[tlo, thi) */
+typedef struct { uint32_t blk, pos, tlo, thi; } RCtx;
+
+#define RP_TMP 128
+#define RP_ASM 24
+typedef struct {
+  IrFunc *f;
+  RFact *fs;
+  uint32_t nfs, cap;
+  int32_t *head;
+  RFact tmp[RP_TMP];
+  uint32_t ntmp;
+  struct { Ref x; RTgt t; int64_t k; uint8_t dir; } as[RP_ASM];
+  int nas;
+  int budget;
+} RP;
+
+static const RTgt RP_NUM = { TK_NUM, REF_NONE, REF_NONE, REF_NONE };
+
+static bool rp_le(RP *p, const RCtx *c, Ref x, const RTgt *t, int64_t k, int d);
+static bool rp_ge(RP *p, const RCtx *c, Ref x, int64_t k, int d);
+
+static bool rp_int(IrFunc *f, Ref x) {
+  ValType t = (ValType)f->insts[x].type;
+  return t == VT_I32 || t == VT_I64;
+}
+static int64_t rp_maxw(IrFunc *f, Ref x) {
+  return f->insts[x].type == VT_I64 ? INT64_MAX : INT32_MAX;
+}
+static int64_t rp_minw(IrFunc *f, Ref x) {
+  return f->insts[x].type == VT_I64 ? INT64_MIN : INT32_MIN;
+}
+static bool rp_isconst(IrFunc *f, Ref x, int64_t *c) {
+  const Inst *in = &f->insts[x];
+  if (in->op != I_CONST || !rp_int(f, x)) return false;
+  *c = in->type == VT_I64 ? (int64_t)in->imm : (int64_t)(int32_t)(uint32_t)in->imm;
+  return true;
+}
+/* v brought into an i64, or false where it does not fit */
+static bool rp_fit(__int128 v, int64_t *out) {
+  if (v < INT64_MIN || v > INT64_MAX) return false;
+  *out = (int64_t)v;
+  return true;
+}
+
+/* x as base + c in x's width, through sums with constants: equal mod 2^w,
+   and equal outright where base + c does not wrap (rp_exact) */
+static Ref rp_lin(IrFunc *f, Ref x, int64_t *c) {
+  x = ir_resolve(f, x);
+  ValType w = (ValType)f->insts[x].type;
+  uint64_t acc = 0;
+  for (int d = 0; d < 6; d++) {
+    const Inst *in = &f->insts[x];
+    if ((in->op != I_ADD && in->op != I_SUB) || in->nargs != 2 || in->type != w) break;
+    Ref a0 = ir_resolve(f, ir_args(f, x)[0]), a1 = ir_resolve(f, ir_args(f, x)[1]);
+    int64_t k;
+    if (rp_isconst(f, a1, &k)) {
+      acc += in->op == I_ADD ? (uint64_t)k : 0 - (uint64_t)k;
+      x = a0;
+    } else if (in->op == I_ADD && rp_isconst(f, a0, &k)) {
+      acc += (uint64_t)k;
+      x = a1;
+    } else {
+      break;
+    }
+  }
+  *c = w == VT_I64 ? (int64_t)acc : (int64_t)(int32_t)(uint32_t)acc;
+  return x;
+}
+
+/* x's bounds from its shape alone */
+static int64_t rp_num_hi(IrFunc *f, Ref x) {
+  int64_t c;
+  if (rp_isconst(f, x, &c)) return c;
+  const Inst *in = &f->insts[x];
+  if (in->op == I_ARRAY_LEN) return RP_MAXLEN;
+  if (in->op == I_EXTENDS && in->nargs == 1) {
+    Ref y = ir_resolve(f, ir_args(f, x)[0]);
+    return rp_int(f, y) ? rp_num_hi(f, y) : INT32_MAX;
+  }
+  int64_t maxw = rp_maxw(f, x);
+  uint64_t m = ir_value_max(f, x, 4);
+  return m <= (uint64_t)maxw ? (int64_t)m : maxw;
+}
+static int64_t rp_num_lo(IrFunc *f, Ref x) {
+  int64_t c;
+  if (rp_isconst(f, x, &c)) return c;
+  const Inst *in = &f->insts[x];
+  if (in->op == I_ARRAY_LEN) return 0;
+  if (in->op == I_EXTENDS && in->nargs == 1) {
+    Ref y = ir_resolve(f, ir_args(f, x)[0]);
+    return rp_int(f, y) ? rp_num_lo(f, y) : INT32_MIN;
+  }
+  bool w64 = in->type == VT_I64;
+  uint64_t sign = w64 ? 1ull << 63 : 1ull << 31;
+  if (!(ir_known_bits(f, x, 4) & sign)) return 0;
+  return rp_minw(f, x);
+}
+
+static bool rp_valid(RP *p, const RFact *q, const RCtx *c) {
+  if (q->blk == c->blk) return q->pos <= c->pos;
+  return dominates(p->f, q->blk, c->blk);
+}
+
+/* the facts on x true at c */
+#define RP_NF 32
+static uint32_t rp_facts(RP *p, const RCtx *c, Ref x, const RFact **out) {
+  uint32_t n = 0;
+  for (int32_t i = p->head[x]; i >= 0 && n < RP_NF; i = p->fs[i].next)
+    if (rp_valid(p, &p->fs[i], c)) out[n++] = &p->fs[i];
+  for (uint32_t i = c->tlo; i < c->thi && n < RP_NF; i++)
+    if (p->tmp[i].a == x) out[n++] = &p->tmp[i];
+  return n;
+}
+
+static void rp_put(RP *p, bool tmp, uint8_t rel, Ref a, Ref b, Ref orig, int64_t k,
+                   int64_t off, uint32_t blk, uint32_t pos) {
+  RFact q = { a, b, orig, k, off, blk, pos, -1, rel };
+  if (tmp) {
+    if (p->ntmp < RP_TMP) p->tmp[p->ntmp++] = q;
+    return;
+  }
+  if (p->nfs == p->cap) {
+    p->cap = p->cap ? p->cap * 2 : 256;
+    p->fs = xrealloc(p->fs, p->cap * sizeof(RFact));
+  }
+  q.next = p->head[a];
+  p->head[a] = (int32_t)p->nfs;
+  p->fs[p->nfs++] = q;
+}
+
+/* a fact on a, and the same on a's base where a is base + c */
+static void rp_add(RP *p, bool tmp, uint8_t rel, Ref a, Ref b, int64_t k,
+                   uint32_t blk, uint32_t pos) {
+  rp_put(p, tmp, rel, a, b, a, k, 0, blk, pos);
+  if (rel == RF_ULT || rel == RF_ULE || rel == RF_ACCO || rel == RF_LENOF || rel == RF_SQ)
+    return;
+  int64_t c;
+  Ref base = rp_lin(p->f, a, &c);
+  if (base != a && c != 0) rp_put(p, tmp, rel, base, b, a, k, c, blk, pos);
+}
+
+static bool rp_bool(IrFunc *f, Ref x) {
+  return rp_int(f, x) && ir_value_max(f, x, 2) <= 1;
+}
+
+/* What cond, known nonzero (taken) or zero, says: of the operands of an
+   integer compare, of the two of an and both hold or an or neither, or
+   else of cond itself. */
+static void rp_cond(RP *p, bool tmp, Ref cond, bool taken, uint32_t blk, uint32_t pos,
+                    int depth) {
+  IrFunc *f = p->f;
+  cond = ir_resolve(f, cond);
+  while (f->insts[cond].op == I_EQZ && f->insts[cond].nargs == 1) {
+    cond = ir_resolve(f, ir_args(f, cond)[0]);
+    taken = !taken;
+  }
+  const Inst *ci = &f->insts[cond];
+  if (!rp_int(f, cond)) return;
+  if (depth > 0 && ci->nargs == 2 &&
+      ((ci->op == I_AND && taken) || (ci->op == I_OR && !taken))) {
+    Ref x = ir_resolve(f, ir_args(f, cond)[0]), y = ir_resolve(f, ir_args(f, cond)[1]);
+    if (rp_bool(f, x) && rp_bool(f, y)) {
+      rp_cond(p, tmp, x, taken, blk, pos, depth - 1);
+      rp_cond(p, tmp, y, taken, blk, pos, depth - 1);
+      return;
+    }
+  }
+  int op = ci->op;
+  if (op < I_EQ || op > I_GEU || ci->nargs != 2) {
+    if (taken) {
+      rp_add(p, tmp, RF_NE, cond, REF_NONE, 0, blk, pos);
+    } else {
+      rp_add(p, tmp, RF_LE, cond, REF_NONE, 0, blk, pos);
+      rp_add(p, tmp, RF_GE, cond, REF_NONE, 0, blk, pos);
+    }
+    return;
+  }
+  Ref a = ir_resolve(f, ir_args(f, cond)[0]), b = ir_resolve(f, ir_args(f, cond)[1]);
+  if (!rp_int(f, a) || !rp_int(f, b)) return;
+  if (!taken) {
+    switch (op) {
+      case I_EQ: op = I_NE; break;   case I_NE: op = I_EQ; break;
+      case I_LTS: op = I_GES; break; case I_GES: op = I_LTS; break;
+      case I_GTS: op = I_LES; break; case I_LES: op = I_GTS; break;
+      case I_LTU: op = I_GEU; break; case I_GEU: op = I_LTU; break;
+      case I_GTU: op = I_LEU; break; case I_LEU: op = I_GTU; break;
+      default: return;
+    }
+  }
+  int64_t kc;
+  if (rp_isconst(f, a, &kc) && !rp_isconst(f, b, &kc)) {
+    Ref t = a; a = b; b = t;
+    switch (op) {
+      case I_LTS: op = I_GTS; break; case I_GTS: op = I_LTS; break;
+      case I_LES: op = I_GES; break; case I_GES: op = I_LES; break;
+      case I_LTU: op = I_GTU; break; case I_GTU: op = I_LTU; break;
+      case I_LEU: op = I_GEU; break; case I_GEU: op = I_LEU; break;
+      default: break;
+    }
+  }
+  bool bc = rp_isconst(f, b, &kc);
+  if (bc && rp_isconst(f, a, &kc)) return;
+  Ref bb = bc ? REF_NONE : b;
+  int64_t k0 = bc ? kc : 0;
+  /* a <= b + k is b >= a - k, kept on b too */
+  #define RP_LE2(A, K) do { rp_add(p, tmp, RF_LE, a, bb, k0 + (K), blk, pos); \
+    if (!bc) rp_add(p, tmp, RF_GE, b, a, -(K), blk, pos); } while (0)
+  #define RP_GE2(A, K) do { rp_add(p, tmp, RF_GE, a, bb, k0 + (K), blk, pos); \
+    if (!bc) rp_add(p, tmp, RF_LE, b, a, -(K), blk, pos); } while (0)
+  switch (op) {
+    case I_LTS: if (!bc || k0 > INT64_MIN) RP_LE2(a, -1); break;
+    case I_LES: RP_LE2(a, 0); break;
+    case I_GTS: if (!bc || k0 < INT64_MAX) RP_GE2(a, 1); break;
+    case I_GES: RP_GE2(a, 0); break;
+    case I_EQ: RP_LE2(a, 0); RP_GE2(a, 0); break;
+    case I_NE:
+      rp_add(p, tmp, RF_NE, a, bb, k0, blk, pos);
+      if (!bc) rp_add(p, tmp, RF_NE, b, a, 0, blk, pos);
+      break;
+    /* unsigned against a constant: one that is not negative bounds a on
+       both sides; above 0 is not 0 */
+    case I_LTU: case I_LEU:
+      if (!bc) {
+        rp_add(p, tmp, op == I_LTU ? RF_ULT : RF_ULE, a, b, 0, blk, pos);
+      } else if (k0 >= 0 && (op == I_LEU || k0 > 0)) {
+        rp_add(p, tmp, RF_GE, a, REF_NONE, 0, blk, pos);
+        rp_add(p, tmp, RF_LE, a, REF_NONE, op == I_LTU ? k0 - 1 : k0, blk, pos);
+      }
+      break;
+    case I_GTU: case I_GEU:
+      if (!bc) rp_add(p, tmp, op == I_GTU ? RF_ULT : RF_ULE, b, a, 0, blk, pos);
+      else if ((op == I_GTU && k0 == 0) || (op == I_GEU && k0 == 1))
+        rp_add(p, tmp, RF_NE, a, REF_NONE, 0, blk, pos);
+      break;
+    default: break;
+  }
+  #undef RP_LE2
+  #undef RP_GE2
+}
+
+static void rp_init(RP *p, IrFunc *f) {
+  memset(p, 0, sizeof *p);
+  p->f = f;
+  p->head = xmalloc((f->ninsts ? f->ninsts : 1) * sizeof(int32_t));
+  memset(p->head, 0xff, (f->ninsts ? f->ninsts : 1) * sizeof(int32_t));
+  for (uint32_t oi = 0; oi < f->norder; oi++) {
+    uint32_t bi = f->order[oi];
+    const Block *b = &f->blocks[bi];
+    if (b->npreds == 1) {
+      uint32_t pb = b->preds[0];
+      const Block *P = &f->blocks[pb];
+      if (P->term == T_BRIF && P->nsuccs >= 2 &&
+          P->succs[0].target != P->succs[1].target &&
+          (P->succs[0].target == bi || P->succs[1].target == bi)) {
+        bool taken = P->succs[0].target == bi;
+        rp_cond(p, false, P->term_arg, taken, bi, 0, 3);
+        Ref cond = ir_resolve(f, P->term_arg);
+        while (f->insts[cond].op == I_EQZ && f->insts[cond].nargs == 1) {
+          cond = ir_resolve(f, ir_args(f, cond)[0]);
+          taken = !taken;
+        }
+        Ref bidx, blen;
+        if (gc_counted_cond(f, pb, bi, cond, taken, &bidx, &blen) &&
+            rp_int(f, bidx) && rp_int(f, blen))
+          rp_add(p, false, RF_ULT, bidx, blen, 0, bi, 0);
+      }
+    }
+    for (uint32_t i = 0; i < b->ninsts; i++) {
+      Ref v = b->insts[i];
+      const Inst *in = &f->insts[v];
+      if ((in->op == I_ARRAY_GET || in->op == I_ARRAY_SET) && in->nargs >= 2) {
+        Ref idx = ir_resolve(f, ir_args(f, v)[1]);
+        Ref obj = gc_ref_root(f, ir_args(f, v)[0]);
+        Ref pr = gc_phi_root(f, obj, 4);
+        if (!rp_int(f, idx)) continue;
+        rp_add(p, false, RF_ACC, idx, pr, 0, bi, i + 1);
+        rp_add(p, false, RF_ACCO, pr, idx, 0, bi, i + 1);
+        if (pr != obj) {
+          rp_add(p, false, RF_ACC, idx, obj, 0, bi, i + 1);
+          rp_add(p, false, RF_ACCO, obj, idx, 0, bi, i + 1);
+        }
+      } else if (in->op == I_ARRAY_LEN && in->nargs == 1) {
+        Ref obj = gc_ref_root(f, ir_args(f, v)[0]);
+        Ref pr = gc_phi_root(f, obj, 4);
+        rp_add(p, false, RF_LENOF, obj, v, 0, f->entry, 0);
+        if (pr != obj) rp_add(p, false, RF_LENOF, pr, v, 0, f->entry, 0);
+      } else if (in->op == I_TRAP_IF && in->nargs == 1) {
+        /* past it, its operand was not zero */
+        rp_cond(p, false, ir_args(f, v)[0], true, bi, i + 1, 3);
+      } else if (in->op == I_ARRAY_NEW || in->op == I_ARRAY_NEW_SEG) {
+        /* past an allocation, the length it was given is one an array can
+           have */
+        Ref al = gc_array_len_value(f, v);
+        if (al != REF_NONE && rp_int(f, al) && f->insts[al].op != I_CONST) {
+          rp_add(p, false, RF_GE, al, REF_NONE, 0, bi, i + 1);
+          rp_add(p, false, RF_LE, al, REF_NONE, RP_MAXLEN, bi, i + 1);
+        }
+      } else if (in->op == I_MUL && in->nargs == 2 && in->type == VT_I64) {
+        /* (long) i * i: a square of an i32, which bounds i */
+        Ref y = ir_resolve(f, ir_args(f, v)[0]), z = ir_resolve(f, ir_args(f, v)[1]);
+        if (y == z && f->insts[y].op == I_EXTENDS && f->insts[y].nargs == 1) {
+          Ref x = ir_resolve(f, ir_args(f, y)[0]);
+          if (f->insts[x].type == VT_I32) {
+            rp_put(p, false, RF_SQ, x, v, x, 0, 0, f->entry, 0);
+            rp_put(p, false, RF_SQ, y, v, y, 0, 0, f->entry, 0);
+          }
+        }
+      }
+    }
+  }
+}
+
+static void rp_free(RP *p) {
+  xfree(p->fs);
+  xfree(p->head);
+}
+
+static bool rp_tick(RP *p, int d) { return d > 0 && --p->budget >= 0; }
+
+static bool rp_same_tgt(const RTgt *a, const RTgt *b) {
+  return a->kind == b->kind && a->s == b->s && a->obj == b->obj && a->pr == b->pr;
+}
+
+/* Is x at most obj's length (gc_len_covers), or exactly it? */
+static bool rp_covers(RP *p, Ref x, const RTgt *t) {
+  IrFunc *f = p->f;
+  if (gc_len_covers(f, x, t->obj, gc_array_len_value(f, t->obj), 3)) return true;
+  return t->pr != t->obj && gc_len_covers(f, x, t->pr, gc_array_len_value(f, t->pr), 3);
+}
+static bool rp_is_len(RP *p, Ref x, const RTgt *t) {
+  IrFunc *f = p->f;
+  x = ir_resolve(f, x);
+  const Inst *in = &f->insts[x];
+  for (int s = 0; s < 2; s++) {
+    Ref o = s ? t->pr : t->obj;
+    if (in->op == I_ARRAY_LEN && in->nargs == 1 && gc_ref_root(f, ir_args(f, x)[0]) == o)
+      return true;
+    if (x == gc_array_len_value(f, o)) return true;
+  }
+  return false;
+}
+
+/* base + off does not wrap in base's width */
+static bool rp_exact(RP *p, const RCtx *c, Ref base, int64_t off, int d) {
+  if (off == 0) return true;
+  IrFunc *f = p->f;
+  if (off < 0) return rp_ge(p, c, base, rp_minw(f, base) - off, d);
+  return rp_le(p, c, base, &RP_NUM, rp_maxw(f, base) - off, d);
+}
+
+static bool rp_le_known(RP *p, const RCtx *c, Ref x, const RTgt *t, int64_t k, int d);
+static bool rp_ge_known(RP *p, const RCtx *c, Ref x, int64_t k, int d);
+
+/* The same of v, which is base + off mod 2^w: also where what is known of
+   v puts it where a wrap could not -- a sum that wrapped up lands in
+   [minw, minw + off), one that wrapped down in (maxw + off, maxw]; an
+   allocation's length n + 1 is not negative, so n + 1 did not wrap.  Of v
+   only its facts: its shape is the sum asked about. */
+static bool rp_exact_v(RP *p, const RCtx *c, Ref v, Ref base, int64_t off, int d) {
+  if (off == 0) return true;
+  IrFunc *f = p->f;
+  v = ir_resolve(f, v);
+  if (v != base && rp_int(f, v) && f->insts[v].type == f->insts[base].type) {
+    if (off > 0 && rp_ge_known(p, c, v, rp_minw(f, base) + off, d)) return true;
+    if (off < 0 && rp_le_known(p, c, v, &RP_NUM, rp_maxw(f, base) + off, d)) return true;
+  }
+  return rp_exact(p, c, base, off, d);
+}
+
+/* Is b + kb the target plus kt, exactly? */
+static bool rp_same(RP *p, const RCtx *c, Ref b, int64_t kb, const RTgt *t, int64_t kt, int d) {
+  IrFunc *f = p->f;
+  if (b == REF_NONE) return t->kind == TK_NUM && kb == kt;
+  b = ir_resolve(f, b);
+  int64_t cb;
+  Ref bb = rp_lin(f, b, &cb);
+  __int128 want;
+  switch (t->kind) {
+    case TK_NUM: {
+      int64_t v;
+      return rp_isconst(f, b, &v) && (__int128)v + kb == kt;
+    }
+    case TK_VAL: {
+      Ref s = ir_resolve(f, t->s);
+      if (b == s) return kb == kt;
+      int64_t cs;
+      Ref sb = rp_lin(f, s, &cs);
+      if (bb != sb || f->insts[b].type != f->insts[s].type) return false;
+      want = (__int128)cs + kt;
+      return (__int128)cb + kb == want && rp_exact_v(p, c, b, bb, cb, d - 1) &&
+             rp_exact_v(p, c, s, bb, cs, d - 1);
+    }
+    default:
+      if (rp_is_len(p, b, t)) return kb == kt;
+      return cb != 0 && rp_is_len(p, bb, t) && (__int128)cb + kb == kt &&
+             rp_exact_v(p, c, b, bb, cb, d - 1);
+  }
+}
+
+/* Is the constant v at most the target plus k? */
+static bool rp_len_ge(RP *p, const RCtx *c, const RTgt *t, int64_t m, int d);
+static bool rp_num_le_tgt(RP *p, const RCtx *c, int64_t v, const RTgt *t, int64_t k, int d) {
+  int64_t need;
+  if (!rp_fit((__int128)v - k, &need)) return false;
+  switch (t->kind) {
+    case TK_NUM: return v <= k;
+    case TK_VAL: return rp_ge(p, c, t->s, need, d);
+    default: return rp_len_ge(p, c, t, need, d);
+  }
+}
+
+/* Is the length of t's array at least m? */
+static bool rp_len_ge(RP *p, const RCtx *c, const RTgt *t, int64_t m, int d) {
+  if (m <= 0) return true;
+  if (m > RP_MAXLEN || !rp_tick(p, d)) return false;
+  IrFunc *f = p->f;
+  for (int s = 0; s < 2; s++) {
+    Ref o = s ? t->pr : t->obj;
+    if (s && o == t->obj) break;
+    if ((int64_t)array_known_len(f, o, 4) >= m) return true;
+    Ref al = gc_array_len_value(f, o);
+    if (al != REF_NONE && rp_int(f, al) && rp_ge(p, c, al, m, d - 1)) return true;
+    const RFact *fv[RP_NF];
+    uint32_t n = rp_facts(p, c, o, fv);
+    for (uint32_t j = 0; j < n; j++) {
+      const RFact *q = fv[j];
+      if (q->rel == RF_LENOF && rp_ge(p, c, q->b, m, d - 1)) return true;
+      if (q->rel == RF_ACCO && rp_ge(p, c, q->b, m - 1, d - 1)) return true;
+    }
+  }
+  return false;
+}
+
+/* A block param: on every way in, the value it is given, where the way
+   leaves the block before it (and under the branch it takes there) --
+   assuming it of this param, which round a loop is what the way back
+   needs, and which holds by induction where every way in holds. */
+static bool rp_phi(RP *p, const RCtx *c, Ref x, int dir, const RTgt *t, int64_t k, int d) {
+  IrFunc *f = p->f;
+  uint32_t h = f->insts[x].block;
+  if (h >= f->nblocks || h == f->entry) return false;
+  const Block *B = &f->blocks[h];
+  if (B->is_pad || !B->npreds || B->npreds > 8) return false;
+  int kx = gc_param_index(B, x);
+  if (kx < 0) return false;
+  RTgt t2 = *t;
+  if (dir == RD_LE && t->kind == TK_VAL) {
+    Ref s = ir_resolve(f, t->s);
+    uint32_t sb = f->insts[s].block;
+    if (sb == h || !dominates(f, sb, h)) return false;
+    t2.s = s;
+  } else if (dir == RD_LE && t->kind == TK_LEN) {
+    /* the same array every time round */
+    uint32_t ob = f->insts[t->obj].block, pb = f->insts[t->pr].block;
+    bool okb = ob != h && dominates(f, ob, h), pkb = pb != h && dominates(f, pb, h);
+    if (!okb && !pkb) return false;
+    if (!okb) t2.obj = t2.pr;
+    if (!pkb) t2.pr = t2.obj;
+  }
+  for (int i = 0; i < p->nas; i++)
+    if (p->as[i].x == x && p->as[i].dir == dir && rp_same_tgt(&p->as[i].t, &t2) &&
+        (dir == RD_LE ? p->as[i].k <= k : p->as[i].k >= k))
+      return true;
+  if (p->nas == RP_ASM) return false;
+  p->as[p->nas].x = x;
+  p->as[p->nas].t = t2;
+  p->as[p->nas].k = k;
+  p->as[p->nas].dir = (uint8_t)dir;
+  p->nas++;
+  bool ok = true;
+  for (uint32_t pi = 0; pi < B->npreds && ok; pi++) {
+    uint32_t qb = B->preds[pi];
+    const Block *Q = &f->blocks[qb];
+    bool seen = false;
+    for (uint32_t s = 0; s < Q->nsuccs && ok; s++) {
+      const Edge *e = &Q->succs[s];
+      if (e->target != h) continue;
+      seen = true;
+      if (e->eh || (uint32_t)kx >= e->nargs) { ok = false; break; }
+      uint32_t saved = p->ntmp;
+      if (Q->term == T_BRIF && Q->nsuccs >= 2 && Q->succs[0].target != Q->succs[1].target)
+        rp_cond(p, true, Q->term_arg, s == 0, qb, UINT32_MAX, 3);
+      RCtx c2 = { qb, UINT32_MAX, saved, p->ntmp };
+      ok = dir == RD_LE ? rp_le(p, &c2, e->args[kx], &t2, k, d - 1)
+                        : rp_ge(p, &c2, e->args[kx], k, d - 1);
+      p->ntmp = saved;
+    }
+    if (!seen) ok = false;
+  }
+  p->nas--;
+  return ok;
+}
+
+/* A select: each arm under what its condition says there. */
+static bool rp_select(RP *p, const RCtx *c, Ref x, int dir, const RTgt *t, int64_t k, int d) {
+  IrFunc *f = p->f;
+  if (f->insts[x].nargs != 3) return false;
+  Ref *a = ir_args(f, x);
+  for (int s = 0; s < 2; s++) {
+    uint32_t saved = p->ntmp;
+    rp_cond(p, true, a[2], s == 0, c->blk, c->pos, 3);
+    RCtx c2 = { c->blk, c->pos, c->tlo, p->ntmp };
+    bool ok = dir == RD_LE ? rp_le(p, &c2, a[s], t, k, d - 1) : rp_ge(p, &c2, a[s], k, d - 1);
+    p->ntmp = saved;
+    if (!ok) return false;
+  }
+  return true;
+}
+
+static int64_t rp_tgt_max(RP *p, const RTgt *t) {
+  switch (t->kind) {
+    case TK_NUM: return 0;
+    case TK_VAL: return rp_num_hi(p->f, ir_resolve(p->f, t->s));
+    default: return RP_MAXLEN;
+  }
+}
+
+/* Is x at most the target plus k, by the target and the facts on x? */
+static bool rp_le_known(RP *p, const RCtx *c, Ref x, const RTgt *t, int64_t k, int d) {
+  IrFunc *f = p->f;
+  if (!rp_tick(p, d)) return false;
+  x = ir_resolve(f, x);
+  if (!rp_int(f, x)) return false;
+  int64_t cx, kk;
+  bool isc = rp_isconst(f, x, &cx);
+  switch (t->kind) {
+    case TK_NUM:
+      if (rp_num_hi(f, x) <= k) return true;
+      if (isc) return false;
+      break;
+    case TK_VAL:
+      if (x == ir_resolve(f, t->s) && k >= 0) return true;
+      if (isc) return rp_num_le_tgt(p, c, cx, t, k, d - 1);
+      break;
+    default:
+      if (k >= 0 && rp_covers(p, x, t)) return true;
+      if (isc) return rp_num_le_tgt(p, c, cx, t, k, d - 1);
+      break;
+  }
+
+  /* what is known of x here */
+  const RFact *fv[RP_NF];
+  uint32_t nf = rp_facts(p, c, x, fv);
+  for (uint32_t j = 0; j < nf; j++) {
+    const RFact *q = fv[j];
+    /* of x + off: x <= T + k where x + off <= T + k + off */
+    if (!rp_fit((__int128)k + q->off, &kk)) continue;
+    bool ok = false;
+    switch (q->rel) {
+      case RF_LE:
+        if (q->b == REF_NONE) ok = rp_num_le_tgt(p, c, q->k, t, kk, d - 1);
+        else {
+          int64_t k2;
+          ok = rp_fit((__int128)kk - q->k, &k2) && rp_le(p, c, q->b, t, k2, d - 1);
+        }
+        break;
+      case RF_ULT: case RF_ULE: {
+        int64_t one = q->rel == RF_ULT ? 1 : 0;
+        if (t->kind == TK_LEN && k >= -one && rp_covers(p, q->b, t)) return true;
+        ok = rp_ge(p, c, q->b, 0, d - 1) && rp_le(p, c, q->b, t, k + one, d - 1);
+        break;
+      }
+      case RF_ACC:
+        if (t->kind == TK_LEN) ok = (q->b == t->obj || q->b == t->pr) && kk >= -1;
+        else if (t->kind == TK_NUM) ok = RP_MAXLEN - 1 <= kk;
+        break;
+      case RF_NE:
+        /* below where it is not: x + off <= T + kk + 1 and not equal */
+        if (kk < INT64_MAX && rp_same(p, c, q->b, q->k, t, kk + 1, d - 1))
+          ok = k < INT64_MAX && rp_le(p, c, x, t, k + 1, d - 1);
+        break;
+      case RF_SQ:
+        /* x * x <= k * k */
+        if (t->kind == TK_NUM && k >= 0 && k <= 0xffffffffLL)
+          ok = rp_le(p, c, q->b, &RP_NUM, k * k, d - 1);
+        break;
+      default: break;
+    }
+    if (ok && rp_exact_v(p, c, q->orig, x, q->off, d - 1)) return true;
+  }
+  return false;
+}
+
+/* Is x at most the target plus k? */
+static bool rp_le(RP *p, const RCtx *c, Ref x, const RTgt *t, int64_t k, int d) {
+  IrFunc *f = p->f;
+  if (rp_le_known(p, c, x, t, k, d)) return true;
+  if (!rp_tick(p, d)) return false;
+  x = ir_resolve(f, x);
+  int64_t cx, kk;
+  if (!rp_int(f, x) || rp_isconst(f, x, &cx)) return false;
+  const Inst *in = &f->insts[x];
+
+  /* x's shape */
+  Ref *a = ir_args(f, x);
+  int64_t maxw = rp_maxw(f, x);
+  switch (in->op) {
+    case I_ADD: case I_SUB: {
+      if (in->nargs != 2) break;
+      int64_t cc;
+      Ref y = rp_lin(f, x, &cc);
+      if (y != x) {
+        /* x = y + cc, outright where that does not wrap */
+        if (!rp_fit((__int128)k - cc, &kk) || !rp_le(p, c, y, t, kk, d - 1)) break;
+        if (cc > 0 && (__int128)rp_tgt_max(p, t) + kk <= (__int128)maxw - cc) return true;
+        return rp_exact_v(p, c, x, y, cc, d - 1);
+      }
+      /* y + z with z <= 0, or y - z with z >= 0, of a y >= 0: at most y */
+      for (int s = 0; s < (in->op == I_ADD ? 2 : 1); s++) {
+        Ref yy = a[s], zz = a[1 - s];
+        bool zok = in->op == I_ADD ? rp_le(p, c, zz, &RP_NUM, 0, d - 1)
+                                   : rp_ge(p, c, zz, 0, d - 1);
+        if (zok && rp_ge(p, c, yy, 0, d - 1) && rp_le(p, c, yy, t, k, d - 1)) return true;
+      }
+      break;
+    }
+    case I_AND:
+      /* at most an operand that is not negative */
+      for (int s = 0; s < 2; s++)
+        if (rp_ge(p, c, a[s], 0, d - 1) && rp_le(p, c, a[s], t, k, d - 1)) return true;
+      break;
+    case I_REMU:
+      /* below a divisor that is not negative (0 traps), at most a dividend
+         that is not */
+      if (k < INT64_MAX && rp_ge(p, c, a[1], 0, d - 1) && rp_le(p, c, a[1], t, k + 1, d - 1))
+        return true;
+      if (rp_ge(p, c, a[0], 0, d - 1) && rp_le(p, c, a[0], t, k, d - 1)) return true;
+      break;
+    case I_REMS:
+      if (!rp_ge(p, c, a[0], 0, d - 1)) break;
+      /* (a divisor of 0 traps, so one not negative is above 0) */
+      if (k < INT64_MAX && rp_ge(p, c, a[1], 0, d - 1) && rp_le(p, c, a[1], t, k + 1, d - 1))
+        return true;
+      if (rp_le(p, c, a[0], t, k, d - 1)) return true;
+      break;
+    case I_DIVU: case I_DIVS: case I_SHRU: case I_SHRS:
+      /* of a y that is not negative, at most y */
+      if (rp_ge(p, c, a[0], 0, d - 1) && rp_le(p, c, a[0], t, k, d - 1)) return true;
+      break;
+    case I_WRAP: {
+      /* an i64 that fits is its own low half */
+      Ref y = ir_resolve(f, a[0]);
+      if (!rp_int(f, y) || !rp_le(p, c, y, t, k, d - 1)) break;
+      if ((__int128)rp_tgt_max(p, t) + k > INT32_MAX && !rp_le(p, c, y, &RP_NUM, INT32_MAX, d - 1))
+        break;
+      if (rp_ge(p, c, y, INT32_MIN, d - 1)) return true;
+      break;
+    }
+    case I_EXTENDS: {
+      Ref y = ir_resolve(f, a[0]);
+      if (rp_int(f, y) && rp_le(p, c, y, t, k, d - 1)) return true;
+      break;
+    }
+    case I_EXTENDU: {
+      Ref y = ir_resolve(f, a[0]);
+      if (rp_int(f, y) && rp_ge(p, c, y, 0, d - 1) && rp_le(p, c, y, t, k, d - 1)) return true;
+      break;
+    }
+    case I_SELECT:
+      if (rp_select(p, c, x, RD_LE, t, k, d)) return true;
+      break;
+    case I_PARAM:
+      if (rp_phi(p, c, x, RD_LE, t, k, d)) return true;
+      break;
+    default: break;
+  }
+
+  /* the target's own shape: the length an allocation was given, a value
+     that is another plus a constant */
+  if (t->kind == TK_LEN) {
+    for (int s = 0; s < 2; s++) {
+      Ref o = s ? t->pr : t->obj;
+      if (s && o == t->obj) break;
+      Ref al = gc_array_len_value(f, o);
+      if (al == REF_NONE || !rp_int(f, al)) continue;
+      RTgt t2 = { TK_VAL, ir_resolve(f, al), REF_NONE, REF_NONE };
+      if (rp_le(p, c, x, &t2, k, d - 1)) return true;
+    }
+  } else if (t->kind == TK_VAL) {
+    int64_t cs;
+    Ref s = ir_resolve(f, t->s);
+    Ref sb = rp_lin(f, s, &cs);
+    if (sb != s && cs != 0 && rp_fit((__int128)k + cs, &kk) && rp_exact_v(p, c, s, sb, cs, d - 1)) {
+      RTgt t2 = { TK_VAL, sb, REF_NONE, REF_NONE };
+      if (rp_le(p, c, x, &t2, kk, d - 1)) return true;
+    }
+  }
+  return false;
+}
+
+/* Is x at least k, by its shape alone and the facts on it? */
+static bool rp_ge_known(RP *p, const RCtx *c, Ref x, int64_t k, int d) {
+  IrFunc *f = p->f;
+  if (!rp_tick(p, d)) return false;
+  x = ir_resolve(f, x);
+  if (!rp_int(f, x)) return false;
+  if (rp_num_lo(f, x) >= k) return true;
+  int64_t cx, kk;
+  if (rp_isconst(f, x, &cx)) return false;
+
+  const RFact *fv[RP_NF];
+  uint32_t nf = rp_facts(p, c, x, fv);
+  for (uint32_t j = 0; j < nf; j++) {
+    const RFact *q = fv[j];
+    if (!rp_fit((__int128)k + q->off, &kk)) continue;
+    bool ok = false;
+    switch (q->rel) {
+      case RF_GE:
+        if (q->b == REF_NONE) ok = q->k >= kk;
+        else {
+          int64_t k2;
+          ok = rp_fit((__int128)kk - q->k, &k2) && rp_ge(p, c, q->b, k2, d - 1);
+        }
+        break;
+      case RF_ULT: case RF_ULE:
+        ok = kk <= 0 && rp_ge(p, c, q->b, 0, d - 1);
+        break;
+      case RF_ACC:
+        ok = kk <= 0;
+        break;
+      case RF_NE:
+        /* not below where it is not: x + off >= kk - 1 and not equal */
+        ok = q->b == REF_NONE && kk > INT64_MIN && q->k == kk - 1 && k > INT64_MIN &&
+             rp_ge(p, c, x, k - 1, d - 1);
+        break;
+      default: break;
+    }
+    if (ok && rp_exact_v(p, c, q->orig, x, q->off, d - 1)) return true;
+  }
+  return false;
+}
+
+/* Is x at least k? */
+static bool rp_ge(RP *p, const RCtx *c, Ref x, int64_t k, int d) {
+  IrFunc *f = p->f;
+  if (rp_ge_known(p, c, x, k, d)) return true;
+  if (!rp_tick(p, d)) return false;
+  x = ir_resolve(f, x);
+  int64_t cx, kk;
+  if (!rp_int(f, x) || rp_isconst(f, x, &cx)) return false;
+  const Inst *in = &f->insts[x];
+
+  Ref *a = ir_args(f, x);
+  int64_t maxw = rp_maxw(f, x);
+  switch (in->op) {
+    case I_ADD: case I_SUB: {
+      if (in->nargs != 2) break;
+      int64_t cc;
+      Ref y = rp_lin(f, x, &cc);
+      if (y != x) {
+        /* x = y + cc: y + cc >= k with no wrap; below, k >= minw, which
+           rp_num_lo answered */
+        if (!rp_fit((__int128)k - cc, &kk) || !rp_ge(p, c, y, kk, d - 1)) break;
+        if (cc > 0) return rp_le(p, c, y, &RP_NUM, maxw - cc, d - 1);
+        return true;
+      }
+      if (in->op == I_ADD) {
+        /* two that are not negative and not over half the range each */
+        for (int s = 0; s < 2; s++)
+          if (rp_ge(p, c, a[s], k, d - 1) && rp_ge(p, c, a[1 - s], 0, d - 1) &&
+              rp_le(p, c, a[s], &RP_NUM, maxw / 2, d - 1) &&
+              rp_le(p, c, a[1 - s], &RP_NUM, maxw / 2, d - 1))
+            return true;
+        break;
+      }
+      /* y - z where y is z + k' or more: of y = yb + cy, a fact
+         yb + off >= z + k' gives y - z >= k' - off + cy, for y and z not
+         negative (so that y - z cannot wrap) */
+      {
+        Ref z = ir_resolve(f, a[1]);
+        int64_t cy;
+        Ref yb = rp_lin(f, a[0], &cy);
+        const RFact *gv[RP_NF];
+        uint32_t ng = rp_facts(p, c, yb, gv);
+        for (uint32_t j = 0; j < ng; j++) {
+          const RFact *q = gv[j];
+          if (q->rel != RF_GE || q->b != z) continue;
+          if ((__int128)q->k - q->off + cy < k) continue;
+          if (rp_ge(p, c, a[0], 0, d - 1) && rp_ge(p, c, z, 0, d - 1) &&
+              rp_exact(p, c, yb, q->off, d - 1) && rp_exact(p, c, yb, cy, d - 1))
+            return true;
+        }
+      }
+      break;
+    }
+    case I_MUL: {
+      if (k > 0) break;
+      int64_t cm;
+      for (int s = 0; s < 2; s++) {
+        Ref y = ir_resolve(f, a[s]), z = ir_resolve(f, a[1 - s]);
+        if (rp_isconst(f, z, &cm) && cm >= 0)
+          return cm == 0 || (rp_ge(p, c, y, 0, d - 1) && rp_le(p, c, y, &RP_NUM, maxw / cm, d - 1));
+      }
+      if (rp_ge(p, c, a[0], 0, d - 1) && rp_ge(p, c, a[1], 0, d - 1) &&
+          (__int128)rp_num_hi(f, ir_resolve(f, a[0])) * rp_num_hi(f, ir_resolve(f, a[1])) <= maxw)
+        return true;
+      /* a square that cannot wrap */
+      if (ir_resolve(f, a[0]) == ir_resolve(f, a[1])) {
+        Ref y = ir_resolve(f, a[0]);
+        __int128 lo = rp_num_lo(f, y), hi = rp_num_hi(f, y);
+        __int128 m = -lo > hi ? -lo : hi;
+        if (m * m <= maxw) return true;
+      }
+      break;
+    }
+    case I_AND:
+      if (k <= 0 && (rp_ge(p, c, a[0], 0, d - 1) || rp_ge(p, c, a[1], 0, d - 1))) return true;
+      break;
+    case I_OR: case I_XOR:
+      if (k <= 0 && rp_ge(p, c, a[0], 0, d - 1) && rp_ge(p, c, a[1], 0, d - 1)) return true;
+      break;
+    case I_SHL: {
+      int64_t s;
+      Ref y = ir_resolve(f, a[0]);
+      if (k > 0 || !rp_isconst(f, ir_resolve(f, a[1]), &s)) break;
+      s &= in->type == VT_I64 ? 63 : 31;
+      if (rp_ge(p, c, y, 0, d - 1) && rp_le(p, c, y, &RP_NUM, maxw >> s, d - 1)) return true;
+      break;
+    }
+    case I_SHRS: case I_REMS:
+      if (k <= 0 && rp_ge(p, c, a[0], 0, d - 1)) return true;
+      break;
+    case I_REMU:
+      if (k <= 0 && rp_ge(p, c, a[1], 0, d - 1)) return true;
+      break;
+    case I_DIVS:
+      if (k <= 0 && rp_ge(p, c, a[0], 0, d - 1) && rp_ge(p, c, a[1], 1, d - 1)) return true;
+      break;
+    case I_DIVU: {
+      int64_t cm;
+      if (k <= 0 && (rp_ge(p, c, a[0], 0, d - 1) ||
+                     (rp_isconst(f, ir_resolve(f, a[1]), &cm) && (uint64_t)cm >= 2)))
+        return true;
+      break;
+    }
+    case I_WRAP: {
+      Ref y = ir_resolve(f, a[0]);
+      if (rp_int(f, y) && rp_ge(p, c, y, k, d - 1) && rp_le(p, c, y, &RP_NUM, INT32_MAX, d - 1))
+        return true;
+      break;
+    }
+    case I_EXTENDS: case I_EXTENDU: {
+      Ref y = ir_resolve(f, a[0]);
+      if (rp_int(f, y) && rp_ge(p, c, y, k, d - 1)) return true;
+      break;
+    }
+    case I_ARRAY_LEN: {
+      Ref obj = gc_ref_root(f, a[0]);
+      RTgt t = { TK_LEN, REF_NONE, obj, gc_phi_root(f, obj, 4) };
+      if (rp_len_ge(p, c, &t, k, d - 1)) return true;
+      break;
+    }
+    case I_SELECT:
+      if (rp_select(p, c, x, RD_GE, &RP_NUM, k, d)) return true;
+      break;
+    case I_PARAM:
+      if (rp_phi(p, c, x, RD_GE, &RP_NUM, k, d)) return true;
+      break;
+    default: break;
+  }
+  return false;
+}
+
+/* Is idx in bounds for obj (pr: gc_phi_root's) before instruction pos of
+   block bi? */
+static bool rp_inbounds(RP *p, uint32_t bi, uint32_t pos, Ref obj, Ref pr, Ref idx) {
+  RCtx c = { bi, pos, 0, 0 };
+  p->ntmp = 0;
+  p->nas = 0;
+  p->budget = RP_BUDGET;
+  if (!rp_ge(p, &c, idx, 0, RP_DEPTH)) return false;
+  RTgt t = { TK_LEN, REF_NONE, obj, pr };
+  p->budget = RP_BUDGET;
+  return rp_le(p, &c, idx, &t, -1, RP_DEPTH);
 }
 
 /* What a dominating test or cast proved of an object: that it is null or an
@@ -12629,6 +13657,14 @@ static bool pass_gc_nullchk(IrFunc *f) {
   uint32_t *bcounts = xcalloc(f->nblocks, sizeof(uint32_t));
   GcTy **tsets = xcalloc(f->nblocks, sizeof(GcTy *));
   uint32_t *tcounts = xcalloc(f->nblocks, sizeof(uint32_t));
+  /* the accesses made on the way: idx below the length of obj, which no
+     array's length ever changes (GcBnd's idx, len being obj here) */
+  GcBnd **asets = xcalloc(f->nblocks, sizeof(GcBnd *));
+  uint32_t *acounts = xcalloc(f->nblocks, sizeof(uint32_t));
+  bool acc_on = !warmc_getenv("WARMC_NO_BCE_ACCESS");
+  bool rp_on = !warmc_getenv("WARMC_NO_BCE_RANGE");
+  bool rp_built = false;
+  RP rp;
   GcFacts fx = { sets, counts, tsets, tcounts };
   const uint32_t CAP = 64;
   for (uint32_t oi = 0; oi < f->norder; oi++) {
@@ -12640,6 +13676,8 @@ static bool pass_gc_nullchk(IrFunc *f) {
     bcounts[bi] = 0;
     tsets[bi] = xmalloc(CAP * sizeof(GcTy));
     tcounts[bi] = 0;
+    asets[bi] = xmalloc(CAP * sizeof(GcBnd));
+    acounts[bi] = 0;
     uint32_t d = b->idom;
     if (bi != f->entry && d != REF_NONE && sets[d]) {
       counts[bi] = counts[d];
@@ -12648,6 +13686,8 @@ static bool pass_gc_nullchk(IrFunc *f) {
       memcpy(bsets[bi], bsets[d], bcounts[d] * sizeof(GcBnd));
       tcounts[bi] = tcounts[d];
       memcpy(tsets[bi], tsets[d], tcounts[d] * sizeof(GcTy));
+      acounts[bi] = acounts[d];
+      memcpy(asets[bi], asets[d], acounts[d] * sizeof(GcBnd));
     }
     /* where ways meet, what every one of them proves of an object */
     if (b->npreds >= 2) {
@@ -12718,20 +13758,50 @@ static bool pass_gc_nullchk(IrFunc *f) {
               g_stats.gc_nullchk_removed++;
             }
           }
-          if ((in->op == I_ARRAY_GET || in->op == I_ARRAY_SET) &&
-              !(in->imm2 & GCF_NOBOUND)) {
+          if (in->op == I_ARRAY_GET || in->op == I_ARRAY_SET) {
             Ref idx = ir_resolve(f, ir_args(f, v)[1]);
-            Ref alen = gc_array_len_value(f, obj);
-            for (uint32_t k = 0; k < bcounts[bi]; k++) {
-              Ref L = bsets[bi][k].len;
-              if (bsets[bi][k].idx != idx &&
-                  !gc_idx_wide(f, bsets[bi][k].idx, L, idx, &L))
-                continue;
-              if (!gc_len_covers(f, L, obj, alen, 3)) continue;
-              in->imm2 |= GCF_NOBOUND;
-              changed = true;
-              g_stats.checks_removed++;
-              break;
+            Ref pr = acc_on ? gc_phi_root(f, obj, 4) : obj;
+            if (!(in->imm2 & GCF_NOBOUND)) {
+              Ref alen = gc_array_len_value(f, obj);
+              bool done = false;
+              for (uint32_t k = 0; k < bcounts[bi] && !done; k++) {
+                Ref L = bsets[bi][k].len;
+                if (bsets[bi][k].idx != idx &&
+                    !gc_idx_wide(f, bsets[bi][k].idx, L, idx, &L))
+                  continue;
+                if (!gc_len_covers(f, L, obj, alen, 3) &&
+                    (pr == obj || !gc_len_covers(f, L, pr, gc_array_len_value(f, pr), 3)))
+                  continue;
+                done = true;
+              }
+              /* the same index into the same array, made before */
+              for (uint32_t k = 0; k < acounts[bi] && !done; k++)
+                if (asets[bi][k].len == pr && asets[bi][k].idx == idx) done = true;
+              /* or what the ranges of its index prove (rp_inbounds) */
+              if (!done && rp_on) {
+                if (!rp_built) {
+                  rp_init(&rp, f);
+                  rp_built = true;
+                }
+                done = rp_inbounds(&rp, bi, i, obj, gc_phi_root(f, obj, 4), idx);
+                if (done) g_stats.bce_ranges++;
+              }
+              if (done) {
+                in->imm2 |= GCF_NOBOUND;
+                changed = true;
+                g_stats.checks_removed++;
+              }
+            }
+            /* past it, its index is below the array's length */
+            if (acc_on && acounts[bi] < CAP) {
+              bool have = false;
+              for (uint32_t k = 0; k < acounts[bi] && !have; k++)
+                have = asets[bi][k].len == pr && asets[bi][k].idx == idx;
+              if (!have) {
+                asets[bi][acounts[bi]].idx = idx;
+                asets[bi][acounts[bi]].len = pr;
+                acounts[bi]++;
+              }
             }
           }
           break;
@@ -12743,9 +13813,25 @@ static bool pass_gc_nullchk(IrFunc *f) {
           }
           /* it traps on zero: past a cast's trap, its test passed */
           Ref t = ir_resolve(f, ir_args(f, v)[0]);
-          if (f->insts[t].op == I_REF_TEST && f->insts[t].nargs == 1)
+          if (f->insts[t].op == I_REF_TEST && f->insts[t].nargs == 1) {
+            /* a test that the way here already passed -- the arm of the
+               branch on it, its result shared with the cast in the arm
+               (luawasm's `if ref.test then struct.get (ref.cast)`): the
+               trap cannot fire */
+            Ref root = gc_ref_root(f, ir_args(f, t)[0]);
+            bool nonnull = false;
+            for (uint32_t k = 0; k < counts[bi] && !nonnull; k++)
+              nonnull = sets[bi][k] == root;
+            if (!warmc_getenv("WARMC_NO_PASSEDCAST") &&
+                gc_test_known(f, t, nonnull, tsets[bi], tcounts[bi]) == 1) {
+              ir_make_nop(in);
+              changed = true;
+              g_stats.checks_removed++;
+              break;
+            }
             gc_test_passed(f, t, sets[bi], &counts[bi], tsets[bi],
                            &tcounts[bi], CAP);
+          }
           break;
         }
         case I_REF_TEST: {
@@ -12773,7 +13859,11 @@ static bool pass_gc_nullchk(IrFunc *f) {
     xfree(sets[bi]);
     xfree(bsets[bi]);
     xfree(tsets[bi]);
+    xfree(asets[bi]);
   }
+  if (rp_built) rp_free(&rp);
+  xfree(asets);
+  xfree(acounts);
   xfree(sets);
   xfree(counts);
   xfree(bsets);
@@ -13581,11 +14671,31 @@ static bool pass_bar_elide(IrFunc *f) {
     changed = true;
   }
 
+  /* A block whose ways in all bring the same mask, with no safepoint since
+     it was read, starts with it: the slow paths a luawasm access rejoins
+     through, a block each, read it once (exit_mask: what a block ends
+     with; a way round a loop not yet seen brings none). */
+  Ref *exit_mask = xmalloc(f->nblocks * sizeof(Ref));
+  for (uint32_t i = 0; i < f->nblocks; i++) exit_mask[i] = REF_NONE;
+  bool across = !warmc_getenv("WARMC_NO_MASKFLOW");
+  uint8_t *seen = xcalloc(f->nblocks, 1);
   BarSlot *slots = xmalloc(f->ninsts * sizeof(BarSlot));
   for (uint32_t oi = 0; oi < f->norder; oi++) {
     uint32_t bi = f->order[oi];
     Block *b = &f->blocks[bi];
     Ref cur = entry_mask[bi];
+    /* (not a pad: the call that throws there is mid-block, before what a
+       way in read after it) */
+    if (cur == REF_NONE && across && bi != f->entry && b->npreds > 0 && !b->is_pad) {
+      Ref m = REF_NONE;
+      bool ok = true;
+      for (uint32_t k = 0; k < b->npreds && ok; k++) {
+        uint32_t p = b->preds[k];
+        if (!seen[p] || exit_mask[p] == REF_NONE || (m != REF_NONE && exit_mask[p] != m)) ok = false;
+        else m = exit_mask[p];
+      }
+      if (ok) cur = m;
+    }
     uint32_t nslot = 0;
     for (uint32_t i = 0; i < b->ninsts; i++) {
       Ref v = b->insts[i];
@@ -13618,8 +14728,12 @@ static bool pass_bar_elide(IrFunc *f) {
       bar_add_mask(f, v, cur);
       changed = true;
     }
+    /* (a call in the terminator -- a tail call -- ends the function) */
+    exit_mask[bi] = cur;
+    seen[bi] = 1;
   }
   xfree(slots);
+  xfree(exit_mask); xfree(seen);
   xfree(inloop); xfree(stack); xfree(entry_mask);
   return changed;
 }

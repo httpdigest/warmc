@@ -208,7 +208,7 @@ static void emit_compare_raw(Isel *s, Ref v) {
     else a64_tst_reg(B, csf, x, rd(s, ca[1], S1));
     return;
   }
-  if (in->op == I_EQZ) {
+  if (in->op == I_EQZ || in->op == I_REF_IS_NULL) {
     int x = rd(s, a[0], S0);
     a64_cmp_imm(B, is64(f, a[0]) ? SF64 : SF32, x, 0);
     return;
@@ -305,7 +305,7 @@ static bool sel_fuses(Isel *s, Ref v, uint64_t *imm) {
 static int cond_of(Isel *s, Ref v) {
   Inst *in = &s->f->insts[v];
   if (s->cchain && s->cchain[v]) return cond_of(s, ir_args(s->f, v)[s->cchain[v] - 1]);
-  if (in->op == I_EQZ) return CC_EQ;
+  if (in->op == I_EQZ || in->op == I_REF_IS_NULL) return CC_EQ;
   if (in->op == I_AND) return CC_NE;
   return cc_for(in->op);
 }
@@ -352,7 +352,7 @@ static void emit_cmp_chain(Isel *s, Ref v) {
   int sf = is64(f, ca[0]) ? SF64 : SF32;
   /* an immediate form's register 31 is the zero register, as in the other */
   int x = rd_zr(s, ca[0], S0);
-  if (f->insts[c].op == I_EQZ) { a64_ccmp_imm(B, sf, x, 0, nzcv, open); return; }
+  if (f->insts[c].op == I_EQZ || f->insts[c].op == I_REF_IS_NULL) { a64_ccmp_imm(B, sf, x, 0, nzcv, open); return; }
   if (f->insts[ca[1]].op == I_CONST) {
     uint64_t m = sf ? ~0ull : 0xffffffffu;
     uint64_t k = f->insts[ca[1]].imm & m;
@@ -647,7 +647,7 @@ static void emit_inst(Isel *s, Ref v) {
 
   if (s->loc[v] == LOC_NONE &&
       (is_imm(s, v) || in->op == I_CONST || in->op == I_MEM_BASE ||
-       in->op == I_GLOBAL_GET ||
+       in->op == I_GLOBAL_GET || in->op == I_GC_BADMASK ||
        (s->fused && s->fused[v]) || (s->folded && s->folded[v]) ||
        (s->walias && s->walias[v]))) return;
 
@@ -2336,6 +2336,15 @@ static void emit_inst(Isel *s, Ref v) {
       emit_teardown(s);
       if (target >= 0) {
         a64_br(B, target);
+      } else if (!indirect && (in->imm2 & RCALL_FULL)) {
+        /* a shrink-wrapped start's way on to the full body, which has no
+           symbol yet: the placing patches the branch */
+        if (s->nfull_br == s->cap_full_br) {
+          s->cap_full_br = s->cap_full_br ? s->cap_full_br * 2 : 4;
+          s->full_br = xrealloc(s->full_br, s->cap_full_br * sizeof(uint32_t));
+        }
+        s->full_br[s->nfull_br++] = (uint32_t)B->len;
+        a64_b(B, 0);
       } else {
         uint32_t sym = obj_intern_sym(s->o, m->funcs[in->imm].sym, SYM_LOCAL_FUNC, -1, 0);
         isel_reloc(s, REL_CALL26, B->len, sym, 0);

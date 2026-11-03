@@ -138,16 +138,29 @@ def shape_fails(name, dump, want):
     """Each (function, pattern, count, late) of want against the disassembly,
     where the case's functions are named CASE.FUNCTION"""
     fails = []
-    for fn, pat, n, late in want:
-        body = re.search(r"<_?%s\.%s>:\n(.*?)(?:\n\n|\Z)" % (re.escape(name), re.escape(fn)), dump, re.S)
+
+    def code(sym):
+        body = re.search(r"<_?%s>:\n(.*?)(?:\n\n|\Z)" % re.escape(sym), dump, re.S)
         if not body:
-            fails.append("%s -O2: no function %s in the code" % (name, fn))
-            continue
+            return None
         # nops after the function's last instruction are the padding the
         # next function starts after, not its own
         lines = body.group(1).split("\n")
         while lines and re.search(r"\snop$", lines[-1]):
             lines.pop()
+        return lines
+
+    for fn, pat, n, late in want:
+        lines = code("%s.%s" % (name, fn))
+        if lines is None:
+            fails.append("%s -O2: no function %s in the code" % (name, fn))
+            continue
+        # a shrink-wrapped function (src/codegen.c sw_start) is a start, which
+        # runs again in its full body, and the full body: the function as it
+        # is compiled whole, which the shapes are of
+        full = code("%s.%s$full" % (name, fn))
+        if full is not None:
+            lines = full
         if late:
             first = next((i for i, l in enumerate(lines) if re.search(r"\sret$", l)), len(lines))
             lines = lines[first + 1:]

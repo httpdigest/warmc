@@ -420,7 +420,7 @@ static void print_stats(void) {
           "             loads_fwd=%llu dead_stores=%llu checks_removed=%llu params=%llu\n"
           "             strength=%llu inlined=%llu rotated=%llu vectorised=%llu\n"
           "             self_tail=%llu acc_tail=%llu addr_nowrap=%llu ldcomb=%llu spills=%llu insts=%llu\n"
-          "             ldpairs=%llu stpairs=%llu cold_frames=%llu early_rets=%llu entry_checks=%llu loop_phases=%llu"
+          "             ldpairs=%llu stpairs=%llu cold_frames=%llu early_rets=%llu shrink_wrapped=%llu entry_checks=%llu loop_phases=%llu"
           " exact_store_checks=%llu exact_memop_checks=%llu\n"
           "             reloads=%llu caller_saves=%llu csa_restores=%llu"
           " v128_spills=%llu rb_trips=%llu split_cuts=%llu split_invs=%llu pieces=%llu"
@@ -438,7 +438,7 @@ static void print_stats(void) {
           " rej_score=%llu rej_depth=%llu rej_rec=%llu max_frame=%llu\n"
           "             unrolled=%llu unr_guarded=%llu unr_rej_shape=%llu"
           " unr_rej_body=%llu unr_rej_exit=%llu unr_rej_trip=%llu"
-          " unr_rej_escape=%llu unr_addr_folded=%llu gc_nullchk=%llu\n"
+          " unr_rej_escape=%llu unr_addr_folded=%llu gc_nullchk=%llu bce_ranges=%llu\n"
           "             slot_tests=%llu slot_nullchks=%llu once_dead=%llu once_dominated=%llu once_looped=%llu\n",
           (unsigned long long)g_stats.folded, (unsigned long long)g_stats.dce_removed,
           (unsigned long long)g_stats.cse_removed, (unsigned long long)g_stats.licm_hoisted,
@@ -461,6 +461,7 @@ static void print_stats(void) {
           (unsigned long long)g_stats.stpairs,
           (unsigned long long)g_stats.cold_frames,
           (unsigned long long)g_stats.early_rets,
+          (unsigned long long)g_stats.shrink_wrapped,
           (unsigned long long)g_stats.entry_checks,
           (unsigned long long)g_stats.loop_phases,
           (unsigned long long)g_stats.exact_store_checks,
@@ -540,6 +541,7 @@ static void print_stats(void) {
           (unsigned long long)g_stats.unr_rej_escape,
           (unsigned long long)g_stats.unr_addr_folded,
           (unsigned long long)g_stats.gc_nullchk_removed,
+          (unsigned long long)g_stats.bce_ranges,
           (unsigned long long)g_stats.slot_tests,
           (unsigned long long)g_stats.slot_nullchks,
           (unsigned long long)g_stats.once_dead,

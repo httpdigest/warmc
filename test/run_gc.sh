@@ -37,6 +37,7 @@ assemble test/cases_gc/arraycopy.wat arraycopy
 assemble test/cases_gc/arraynew.wat arraynew
 assemble test/cases_gc/tightheap.wat tightheap
 assemble test/cases_gc/activedata.wat activedata
+assemble test/cases_gc/shrinkwrap.wat shrinkwrap
 assemble "$WORK/gcgen.wat" gcgen
 
 [ "${1:-}" = --prepare ] && exit 0
@@ -58,7 +59,7 @@ BIN=()
 # checks on their first run, each row.  A module built with a flag of its
 # own has a program of its own.
 BUNDLED="gc gccollect constroot exnpayload devirt_vt ictab_sub escape castfacts brcast
-  arraycopy arraynew tightheap activedata gcgen"
+  arraycopy arraynew tightheap activedata shrinkwrap gcgen"
 BUNDLE="$WORK/gcall$FTAG"
 
 # compiled every time: warmc's cache (hostenv.sh) hands back by their
@@ -401,6 +402,20 @@ for t in 8 16 32 64; do expect array_copy_$t "OK"; done
 build_one activedata
 for t in in_memory empty_new empty_init empty_memory_init; do expect $t "OK"; done
 expect one_byte "out of bounds"
+
+# shrink-wrapped functions (codegen.c sw_start): collections with a full
+# body's frames below, an exception through one, recursion through many --
+# and again collecting at every allocation, what is freed poisoned, where a
+# full body's frame record filed under its start's symbol loses its roots
+build_one shrinkwrap
+expect push_many     "OK" 2000 1999000
+expect throw_through "OK" 1000 100 127
+expect deep          "OK" 1000 333833500
+expect bump_many     "OK" 4000 4000
+expect bump2_many    "OK" 4000 4000 3000
+WARMC_GC_VERIFY=1 WARMC_GC_STRESS=1 expect push_many     "OK" 2000 1999000
+WARMC_GC_VERIFY=1 WARMC_GC_STRESS=1 expect throw_through "OK" 1000 100 127
+WARMC_GC_VERIFY=1 WARMC_GC_STRESS=1 expect deep          "OK" 1000 333833500
 
 build_one arraynew
 for t in 8 16 32 64 f32 f64 v128 ref; do expect lengths_$t "OK"; done

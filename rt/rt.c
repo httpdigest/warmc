@@ -3977,7 +3977,10 @@ static void *gc_alloc(u32 type_id, const GcTypeInfo *ti, u64 payload, u64 len) {
 
   if (__atomic_load_n(&ST->gc_poll, __ATOMIC_RELAXED)) gc_service_round();
 
-  if (payload > ST->gc_heap_bytes) warmc_trap(TRAP_HEAP_OOM);
+  /* No array is 2^31 elements long or longer, so that array.len is never
+     negative read as signed -- what the compiler's bounds-check removal
+     takes of Java's and Kotlin's `i < a.length` (opt.c, RP_MAXLEN) */
+  if (payload > ST->gc_heap_bytes || len > 0x7fffffffu) warmc_trap(TRAP_HEAP_OOM);
   u64 total = ti->hdr_size + payload;
   if (total < GC_UNIT) total = GC_UNIT;
   total = (total + (GC_UNIT - 1)) & ~(u64)(GC_UNIT - 1);

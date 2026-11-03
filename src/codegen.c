@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdatomic.h>
 
 #define ALIGN_BYTES 64u
 static void split_edge_push_arg(IrFunc *f, uint32_t from, uint32_t si, Ref v) {
@@ -461,8 +462,8 @@ static int produce_once(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
   return r;
 }
 
-void ir_produce_function(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
-                         uint32_t out_bytes, FuncOut *fout) {
+static void produce_whole(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
+                          uint32_t out_bytes, FuncOut *fout) {
   SplitCtl sc;
   memset(&sc, 0, sizeof sc);
 
@@ -514,6 +515,543 @@ void ir_produce_function(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
   if (r == 1) return;
   warmc_fatal("function %u cannot be laid out: a conditional branch is still "
               "out of range after relaxation", f->func_index);
+}
+
+/* ---- shrink-wrapping ------------------------------------------------------
+
+   A function that calls saves the callee-saved registers it uses, makes its
+   frame record and checks the stack on every call, also on a way that
+   calls nothing: TeaVM's ArrayList.ensureCapacity returned, nearly every
+   time, after three loads and a compare, and saved six registers and x29
+   and x30 for it.  So such a function may be emitted twice: its start, the
+   blocks on the ways from its entry to a return of at most 24 instructions
+   with no call, loop or allocation, as a leaf of its own at the function's
+   symbol; and the whole function, as it is, after it at "<sym>$full".  Not
+   a function that already returns early ahead of its prologue (isel.c
+   early_ret_shape), to which this adds only a jump, nor one whose start
+   runs more again, by the longest way to a jump, than the way back saves:
+   without a profile both ways count alike, so a recursion's base case does
+   not pay for its other calls testing twice.  Each way out of the start
+   into the rest is a jump to the whole function with the arguments as they
+   came (RCALL_FULL), which runs the start again: so on its way to such a jump
+   the start may read and trap -- a trap there is the one the whole function
+   makes first -- but not write, and the blocks that only lead to a return
+   may store.  The start keeps only where it has no frame, no saved register
+   and no safepoint, and the whole function makes a frame; it is never
+   below another frame on the stack, so the runtime needs no record of it,
+   and the whole function's is found by its own symbol.  On arm64, in a
+   module whose functions take no check on the way in from another instance
+   (codegen_entry_off), and not for a later tier's patchable entry.
+   WARMC_NO_SHRINK_WRAP=1 turns it off; WARMC_SHRINK_WRAP_MAX is the most
+   instructions a start keeps (24); WARMC_SW_DEBUG=1 says what was taken and
+   why the rest was not. */
+
+static bool sw_bad_op(uint16_t op) {
+  switch (op) {
+    case I_CALL: case I_CALL_INDIRECT: case I_CALL_REF:
+    case I_RETURN_CALL: case I_RETURN_CALL_INDIRECT: case I_RETURN_CALL_REF:
+    case I_CONT_OP: case I_THROW: case I_THROW_REF:
+    case I_STRUCT_NEW: case I_ARRAY_NEW: case I_ARRAY_NEW_SEG: case I_ARRAY_OP:
+    case I_MEM_GROW: case I_MEM_COPY: case I_MEM_FILL: case I_MEM_INIT:
+    case I_DATA_DROP: case I_TABLE_GET: case I_TABLE_SET: case I_TABLE_GROW:
+    case I_TABLE_FILL: case I_TABLE_COPY: case I_TABLE_INIT: case I_ELEM_DROP:
+    case I_TABLE_SIZE: case I_ANY_OF_EXTERN: case I_EXTERN_OF_ANY:
+      return true;
+    default:
+      return false;
+  }
+}
+
+/* whether running it again, with nothing written in between, does nothing
+   the first run did not: it writes nothing */
+static bool sw_rerun_ok(const Inst *in) {
+  if (ir_has_no_effect(in)) return true;
+  switch (in->op) {
+    case I_FIELD_GET: case I_ARRAY_GET: case I_ARRAY_LEN: case I_I31_GET:
+    case I_DIVS: case I_DIVU: case I_REMS: case I_REMU:
+    case I_TRUNCS: case I_TRUNCU:
+    case I_LOAD: case I_MEM_SIZE: case I_REF_SLOT:
+    /* the collector's bad mask, which a load barrier tests a ref against */
+    case I_GC_BADMASK:
+    /* a check, which traps as the whole function's would first */
+    case I_TRAP_IF:
+      return true;
+    default:
+      return false;
+  }
+}
+
+/* What may stand between a write sw_sink_to moves and where it goes: no
+   effect, no read of memory -- that would see the write not yet made. */
+static bool sw_sink_past(const Inst *in) {
+  switch (in->op) {
+    case I_FIELD_GET: case I_ARRAY_GET: case I_ARRAY_LEN: case I_LOAD: case I_GLOBAL_GET:
+    case I_MEM_SIZE: case I_TABLE_GET: case I_TABLE_SIZE:
+      return false;
+    default:
+      return ir_has_no_effect(in);
+  }
+}
+
+/* A write the start makes on its way to a cut, which the whole would make
+   again: where it can go instead -- past the rest of its block and the
+   blocks after it that only it enters (in the start), all of no effect, to
+   the side of the branch that ends them which goes on to no cut, that
+   side's start then: permute's self.count = self.count + 1, then n ~= 0's
+   return.  REF_NONE where there is no such place. */
+static uint32_t sw_sink_to(IrFunc *f, const uint8_t *keep, const uint8_t *cut, const uint8_t *mcut,
+                           uint32_t bi, uint32_t at) {
+  const Inst *w = &f->insts[f->blocks[bi].insts[at]];
+  if (w->op != I_FIELD_SET && w->op != I_GLOBAL_SET && w->op != I_STORE && w->op != I_ARRAY_SET) return REF_NONE;
+  if (warmc_getenv("WARMC_NO_SW_SINK")) return REF_NONE;
+  uint32_t b = bi, from = at + 1;
+  for (int hop = 0; hop < 8; hop++) {
+    const Block *B = &f->blocks[b];
+    for (uint32_t i = from; i < B->ninsts; i++)
+      if (!sw_sink_past(&f->insts[B->insts[i]])) return REF_NONE;
+    uint32_t next = REF_NONE;
+    if (B->term == T_JUMP && B->nsuccs == 1) {
+      next = B->succs[0].target;
+      if (!keep[next] || cut[next] == 0) {
+        /* (a jump to the way out itself) */
+        if (!keep[next]) return REF_NONE;
+      }
+    } else if (B->term == T_BRIF && B->nsuccs == 2) {
+      /* one side surely goes on to the whole, which writes again; the other
+         surely returns, the write moved there */
+      uint32_t s0 = B->succs[0].target, s1 = B->succs[1].target;
+      bool on0 = !keep[s0] || mcut[s0], on1 = !keep[s1] || mcut[s1];
+      bool back0 = keep[s0] && !cut[s0], back1 = keep[s1] && !cut[s1];
+      if (on0 && back1) next = s1;
+      else if (on1 && back0) next = s0;
+      else return REF_NONE;
+    } else {
+      return REF_NONE;
+    }
+    /* the place: entered only from here within the start */
+    uint32_t kp = 0;
+    for (uint32_t p = 0; p < f->blocks[next].npreds; p++)
+      if (keep[f->blocks[next].preds[p]]) kp++;
+    if (kp != 1) return REF_NONE;
+    if (B->term == T_BRIF || !cut[next]) return next;
+    b = next;
+    from = 0;
+  }
+  return REF_NONE;
+}
+
+static uint32_t sw_max(void) {
+  static _Atomic int v = -1;
+  int x = atomic_load_explicit(&v, memory_order_relaxed);
+  if (x < 0) {
+    const char *e = warmc_getenv("WARMC_SHRINK_WRAP_MAX");
+    x = e ? atoi(e) : 24;
+    if (warmc_getenv("WARMC_NO_SHRINK_WRAP")) x = 0;
+    atomic_store_explicit(&v, x, memory_order_relaxed);
+  }
+  return (uint32_t)x;
+}
+
+/* The start of f, as a function of its own whose ways into the rest jump to
+   the whole; NULL where f has none worth one. */
+static IrFunc *sw_start(IrFunc *f, const OptOpts *opt, uint32_t *dup_out) {
+  Module *m = f->m;
+  uint32_t lim = sw_max();
+  if (!lim || g_target->is_x64 || !opt->regalloc || opt->patchable || opt->profile ||
+      codegen_entry_off(m, f->func_index) || f->sig->nresults > 1)
+    return NULL;
+  uint32_t ints = 0, flts = 0;
+  for (uint32_t i = 0; i < f->sig->nparams; i++) {
+    ValType t = f->sig->params[i];
+    if (vt_is_float(t) || t == VT_V128) flts++;
+    else ints++;
+  }
+  if (ints > 6 || flts > 8) return NULL;
+  ir_order(f);
+  uint32_t nb = f->nblocks;
+  bool calls = false;
+  uint8_t *bad = xcalloc(nb ? nb : 1, 1), *in_g = xcalloc(nb ? nb : 1, 1);
+  uint8_t *keep = xcalloc(nb ? nb : 1, 1), *cut = xcalloc(nb ? nb : 1, 1);
+  /* a block every way from which goes on to the whole (sw_sink_to) */
+  uint8_t *mcut = xcalloc(nb ? nb : 1, 1);
+  uint32_t *sz = xcalloc(nb ? nb : 1, sizeof(uint32_t));
+  uint32_t *din = xcalloc(nb ? nb : 1, sizeof(uint32_t));
+  uint32_t *dout = xcalloc(nb ? nb : 1, sizeof(uint32_t));
+  /* per instruction: the block a write the start moves goes to, or REF_NONE */
+  uint32_t *sink = xmalloc((f->ninsts ? f->ninsts : 1) * sizeof(uint32_t));
+  for (uint32_t oi = 0; oi < f->norder; oi++) {
+    uint32_t bi = f->order[oi];
+    Block *b = &f->blocks[bi];
+    if (b->loop_depth || b->is_pad) bad[bi] = 1;
+    for (uint32_t s = 0; s < b->nsuccs; s++)
+      if (b->succs[s].eh) bad[bi] = 1;
+    for (uint32_t i = 0; i < b->ninsts; i++) {
+      uint16_t op = f->insts[b->insts[i]].op;
+      if (sw_bad_op(op)) {
+        bad[bi] = 1;
+        if (op != I_THROW && op != I_THROW_REF) calls = true;
+      }
+    }
+  }
+  IrFunc *st = NULL;
+  uint32_t n = 0, ncut = 0;
+  bool any_ret = false;
+  const char *why = "no call";
+  if (!calls) goto done;
+  why = "entry calls or loops";
+  if (bad[f->entry]) goto done;
+  /* the start, made smaller while a block on the way to a jump writes */
+  for (uint32_t round = 0; round <= f->norder; round++) {
+    if (bad[f->entry]) goto done;
+    memset(in_g, 0, nb);
+    in_g[f->entry] = 1;
+    for (uint32_t oi = 0; oi < f->norder; oi++) {
+      uint32_t bi = f->order[oi];
+      if (!in_g[bi]) continue;
+      const Block *b = &f->blocks[bi];
+      for (uint32_t s = 0; s < b->nsuccs; s++)
+        if (!bad[b->succs[s].target]) in_g[b->succs[s].target] = 1;
+    }
+    /* the blocks on a way from the entry to a return or a trap of at most
+       lim instructions: the short ways out, not every block that reaches a
+       return without calling (a set closed under dominators: a block's
+       dominator is on every way through it) */
+    for (uint32_t oi = 0; oi < f->norder; oi++) {
+      uint32_t bi = f->order[oi];
+      uint32_t k = 0;
+      for (uint32_t i = 0; i < f->blocks[bi].ninsts; i++) {
+        uint16_t op = f->insts[f->blocks[bi].insts[i]].op;
+        if (op != I_CONST && op != I_PARAM && op != I_NOP) k++;
+      }
+      sz[bi] = k;
+      din[bi] = dout[bi] = UINT32_MAX / 4;
+    }
+    for (uint32_t oi = f->norder; oi-- > 0;) {
+      uint32_t bi = f->order[oi];
+      if (!in_g[bi]) continue;
+      const Block *b = &f->blocks[bi];
+      uint32_t best = b->term == T_RETURN || b->term == T_TRAP ? 0 : UINT32_MAX / 4;
+      for (uint32_t s = 0; s < b->nsuccs; s++)
+        if (in_g[b->succs[s].target] && dout[b->succs[s].target] < best)
+          best = dout[b->succs[s].target];
+      dout[bi] = sz[bi] + best;
+    }
+    din[f->entry] = 0;
+    for (uint32_t oi = 0; oi < f->norder; oi++) {
+      uint32_t bi = f->order[oi];
+      if (!in_g[bi] || din[bi] >= UINT32_MAX / 4) continue;
+      const Block *b = &f->blocks[bi];
+      for (uint32_t s = 0; s < b->nsuccs; s++) {
+        uint32_t t = b->succs[s].target;
+        if (in_g[t] && din[bi] + sz[bi] < din[t]) din[t] = din[bi] + sz[bi];
+      }
+    }
+    memset(keep, 0, nb);
+    for (uint32_t oi = 0; oi < f->norder; oi++) {
+      uint32_t bi = f->order[oi];
+      if (in_g[bi] && din[bi] + dout[bi] <= lim) keep[bi] = 1;
+    }
+    why = "no short way out";
+    if (!keep[f->entry]) goto done;
+    memset(cut, 0, nb);
+    memset(mcut, 0, nb);
+    for (uint32_t i = 0; i < f->ninsts; i++) sink[i] = REF_NONE;
+    bool again = false;
+    n = ncut = 0;
+    any_ret = false;
+    for (uint32_t oi = f->norder; oi-- > 0;) {
+      uint32_t bi = f->order[oi];
+      if (!keep[bi]) continue;
+      const Block *b = &f->blocks[bi];
+      if (b->term == T_RETURN) any_ret = true;
+      bool all_on = b->nsuccs > 0 && b->term != T_RETURN && b->term != T_TRAP;
+      for (uint32_t s = 0; s < b->nsuccs; s++) {
+        uint32_t t = b->succs[s].target;
+        if (!keep[t]) { cut[bi] = 1; ncut++; }
+        else if (cut[t]) cut[bi] = 1;
+        if (keep[t] && !mcut[t]) all_on = false;
+      }
+      mcut[bi] = all_on;
+      for (uint32_t i = 0; i < b->ninsts; i++) {
+        const Inst *in = &f->insts[b->insts[i]];
+        if (in->op != I_CONST && in->op != I_PARAM && in->op != I_NOP) n++;
+        if (cut[bi] && !sw_rerun_ok(in)) {
+          uint32_t to = sw_sink_to(f, keep, cut, mcut, bi, i);
+          if (to != REF_NONE) {
+            sink[b->insts[i]] = to;
+            continue;
+          }
+          if (warmc_getenv("WARMC_SW_DEBUG"))
+            fprintf(stderr, "sw %s: b%u writes (%s) on its way on\n",
+                    m->funcs[f->func_index].name ? m->funcs[f->func_index].name : m->funcs[f->func_index].sym,
+                    bi, ir_op_name(in->op));
+          bad[bi] = 1;
+          again = true;
+        }
+      }
+    }
+    if (!again) break;
+  }
+  why = !ncut ? "nothing cut" : !any_ret ? "no return" : "too big";
+  if (!ncut || !any_ret || n > lim) goto done;
+  why = NULL;
+  /* what a way on runs twice: the most machine instructions before a cut,
+     as many as each IR instruction takes about -- a GC access its null test
+     and its barrier's, a type test or cast the type's range */
+  uint32_t dup = 0;
+  for (uint32_t oi = 0; oi < f->norder; oi++) {
+    uint32_t bi = f->order[oi];
+    uint32_t w = 0;
+    for (uint32_t i = 0; i < f->blocks[bi].ninsts; i++) {
+      Ref u = f->blocks[bi].insts[i];
+      switch (f->insts[u].op) {
+        case I_CONST: case I_PARAM: case I_NOP: break;
+        case I_FIELD_GET: {
+          /* the load, the barrier's test of a ref, a nullable base's test */
+          ValType bt = (ValType)f->insts[ir_resolve(f, ir_args(f, u)[0])].type;
+          w += 1 + (vt_is_ref((ValType)f->insts[u].type) ? 2 : 0) + (!vt_is_ref(bt) || vt_nullable(bt) ? 1 : 0);
+          break;
+        }
+        case I_ARRAY_GET: w += 4; break;
+        case I_REF_TEST: case I_REF_CONVERT: w += 6; break;
+        default: w += 1; break;
+      }
+    }
+    sz[bi] = w;
+    din[bi] = 0;
+  }
+  /* by the longest way there: the shortest may go a way the test before
+     rules out (a null test's other side) -- but not a way a hint calls rare,
+     which is no way the function usually goes on by (luawasm's typed slot
+     store that finds the slot's sentinel) */
+  bool nocold = !warmc_getenv("WARMC_SW_COLDDUP");
+  for (uint32_t oi = 0; oi < f->norder; oi++) {
+    uint32_t bi = f->order[oi];
+    if (!keep[bi]) continue;
+    const Block *b = &f->blocks[bi];
+    if (nocold && b->cold && bi != f->entry) continue;
+    for (uint32_t s = 0; s < b->nsuccs; s++) {
+      if (nocold && b->succs[s].cold) continue;
+      uint32_t t = b->succs[s].target;
+      if (!keep[t]) { if (din[bi] + sz[bi] > dup) dup = din[bi] + sz[bi]; }
+      else if (din[bi] + sz[bi] > din[t]) din[t] = din[bi] + sz[bi];
+    }
+  }
+  *dup_out = dup;
+
+  {
+    if (warmc_getenv("WARMC_SW_DEBUG"))
+      fprintf(stderr, "sw %s: start of %u instructions, %u ways on\n",
+              m->funcs[f->func_index].name ? m->funcs[f->func_index].name : m->funcs[f->func_index].sym,
+              n, ncut);
+    st = ir_new(m, f->func_index);
+    uint32_t *bmap = xmalloc((nb ? nb : 1) * sizeof(uint32_t));
+    Ref *vmap = xmalloc((f->ninsts ? f->ninsts : 1) * sizeof(Ref));
+    for (uint32_t i = 0; i < nb; i++) bmap[i] = UINT32_MAX;
+    for (uint32_t i = 0; i < f->ninsts; i++) vmap[i] = REF_NONE;
+    for (uint32_t oi = 0; oi < f->norder; oi++) {
+      uint32_t bi = f->order[oi];
+      if (!keep[bi]) continue;
+      uint32_t nbk = ir_new_block(st);
+      bmap[bi] = nbk;
+      Block *k = &st->blocks[nbk];
+      k->sealed = k->filled = k->reachable = true;
+      k->cold = f->blocks[bi].cold;
+      for (uint32_t p = 0; p < f->blocks[bi].nparams; p++) {
+        Ref src = f->blocks[bi].params[p];
+        vmap[src] = ir_add_param(st, nbk, (ValType)f->insts[src].type);
+      }
+    }
+    st->entry = bmap[f->entry];
+    uint32_t sb = ir_new_block(st);
+    st->blocks[sb].sealed = st->blocks[sb].filled = st->blocks[sb].reachable = true;
+    Ref *tmp = NULL;
+    uint32_t tcap = 0;
+    bool ok = true;
+    for (uint32_t oi = 0; oi < f->norder && ok; oi++) {
+      uint32_t bi = f->order[oi];
+      if (!keep[bi]) continue;
+      const Block *b = &f->blocks[bi];
+      /* the writes moved here first, then the block's own but those moved
+         on (sw_sink_to) */
+      uint32_t nsunk = 0;
+      for (uint32_t pass = 0; pass < 2; pass++) {
+        uint32_t cnt = pass == 0 ? f->ninsts : b->ninsts;
+        for (uint32_t i = 0; i < cnt && ok; i++) {
+        Ref src = pass == 0 ? i : b->insts[i];
+        if (pass == 0 ? sink[src] != bi : sink[src] != REF_NONE) continue;
+        if (pass == 0) nsunk++;
+        const Inst *si = &f->insts[src];
+        if (si->op == I_PARAM) continue;
+        if (si->nargs > tcap) { tcap = si->nargs * 2 + 4; tmp = xrealloc(tmp, tcap * sizeof(Ref)); }
+        const Ref *a = ir_args(f, src);
+        for (uint32_t j = 0; j < si->nargs && ok; j++) {
+          tmp[j] = vmap[ir_resolve(f, a[j])];
+          if (tmp[j] == REF_NONE) ok = false;
+        }
+        if (!ok) break;
+        Ref nv = ir_emit(st, bmap[bi], (IrOp)si->op, (ValType)si->type, tmp, si->nargs,
+                         si->imm, si->imm2);
+        st->insts[nv].flags = si->flags;
+        vmap[src] = nv;
+        }
+      }
+      if (nsunk && warmc_getenv("WARMC_SW_DEBUG"))
+        fprintf(stderr, "sw %s: %u write(s) moved to b%u\n",
+                m->funcs[f->func_index].name ? m->funcs[f->func_index].name : m->funcs[f->func_index].sym, nsunk, bi);
+    }
+    for (uint32_t oi = 0; oi < f->norder && ok; oi++) {
+      uint32_t bi = f->order[oi];
+      if (!keep[bi]) continue;
+      const Block *b = &f->blocks[bi];
+      uint32_t kb = bmap[bi];
+      switch (b->term) {
+        case T_RETURN: {
+          Ref *rv = ir_alloc(st, (b->nret ? b->nret : 1) * sizeof(Ref));
+          for (uint32_t j = 0; j < b->nret && ok; j++) {
+            rv[j] = vmap[ir_resolve(f, b->ret_args[j])];
+            if (rv[j] == REF_NONE) ok = false;
+          }
+          Block *k = &st->blocks[kb];
+          k->term = T_RETURN;
+          k->nret = k->cap_ret = b->nret;
+          k->ret_args = rv;
+          break;
+        }
+        case T_TRAP:
+          st->blocks[kb].term = T_TRAP;
+          st->blocks[kb].term_imm = b->term_imm;
+          break;
+        case T_JUMP: case T_BRIF: case T_BRTABLE:
+          st->blocks[kb].term = b->term;
+          st->blocks[kb].term_imm = b->term_imm;
+          if (b->term != T_JUMP) {
+            st->blocks[kb].term_arg = vmap[ir_resolve(f, b->term_arg)];
+            if (st->blocks[kb].term_arg == REF_NONE) ok = false;
+          }
+          for (uint32_t s = 0; s < b->nsuccs && ok; s++) {
+            const Edge *e = &b->succs[s];
+            if (!keep[e->target]) {
+              ir_add_edge(st, kb, sb, NULL, 0);
+            } else {
+              if (e->nargs > tcap) { tcap = e->nargs * 2 + 4; tmp = xrealloc(tmp, tcap * sizeof(Ref)); }
+              for (uint32_t j = 0; j < e->nargs && ok; j++) {
+                tmp[j] = vmap[ir_resolve(f, e->args[j])];
+                if (tmp[j] == REF_NONE) ok = false;
+              }
+              ir_add_edge(st, kb, bmap[e->target], tmp, e->nargs);
+            }
+            st->blocks[kb].succs[st->blocks[kb].nsuccs - 1].cold = e->cold;
+          }
+          break;
+        default:
+          ok = false;
+          break;
+      }
+    }
+    if (ok) {
+      const Block *eb = &st->blocks[st->entry];
+      Ref *args = xmalloc((eb->nparams ? eb->nparams : 1) * sizeof(Ref));
+      memcpy(args, eb->params, eb->nparams * sizeof(Ref));
+      ir_emit(st, sb, I_RETURN_CALL, VT_BOT, args, eb->nparams, f->func_index, RCALL_FULL);
+      xfree(args);
+      st->blocks[sb].term = T_TRAP;
+      st->blocks[sb].term_imm = TRAP_UNREACHABLE;
+      ir_order(st);
+    } else {
+      if (warmc_getenv("WARMC_SW_DEBUG"))
+        fprintf(stderr, "sw %s: start not made: a value from outside it\n",
+                m->funcs[f->func_index].name ? m->funcs[f->func_index].name : m->funcs[f->func_index].sym);
+      ir_free(st);
+      st = NULL;
+    }
+    xfree(tmp); xfree(bmap); xfree(vmap);
+  }
+done:
+  if (why && warmc_getenv("WARMC_SW_DEBUG") && calls)
+    fprintf(stderr, "sw %s: none: %s (%u instructions)\n",
+            m->funcs[f->func_index].name ? m->funcs[f->func_index].name : m->funcs[f->func_index].sym,
+            why, n);
+  xfree(bad); xfree(in_g); xfree(keep); xfree(cut); xfree(mcut);
+  xfree(sz); xfree(din); xfree(dout); xfree(sink);
+  return st;
+}
+
+static void fout_free(FuncOut *fo) {
+  xfree(fo->uw.sites); xfree(fo->uw.clauses);
+  xfree(fo->uw.gcsites); xfree(fo->uw.gcroots);
+  xfree(fo->code); xfree(fo->relocs); xfree(fo->refs); xfree(fo->full_br);
+  if (fo->sym_owned) xfree((char *)fo->sym);
+  memset(fo, 0, sizeof *fo);
+}
+
+void ir_produce_function(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
+                         uint32_t out_bytes, FuncOut *fout) {
+  uint32_t dup = 0;
+  IrFunc *st = sw_start(f, opt, &dup);
+  produce_whole(f, obj, opt, out_bytes, fout);
+  if (!st) return;
+  /* worth it where the whole function makes a frame, and not again for a
+     function whose body itself jumps to a full body */
+  if (!(fout->uw.saved & UW_HAS_LR) || fout->nfull_br || fout->early_ret) {
+    if (warmc_getenv("WARMC_SW_DEBUG"))
+      fprintf(stderr, "sw %s: whole has %s\n", f->m->funcs[f->func_index].name ? f->m->funcs[f->func_index].name : fout->sym,
+              !(fout->uw.saved & UW_HAS_LR) ? "no frame record" : fout->nfull_br ? "a jump to a full body" : "an early return");
+    ir_free(st);
+    return;
+  }
+  /* What a way on runs again -- the instructions before its cut and the
+     jump -- against what the way back saves: the frame record,
+     the stack check, a register's save and restore, the frame's.  Without a
+     profile the two ways are as likely: ktbench/sealed's eval, nine
+     instructions of type tests before a cut and two registers saved, ran
+     15% slower, half its calls on each way. */
+  {
+    uint32_t regs = 0;
+    for (uint32_t k = UW_GPR_SHIFT; k < 32; k++) regs += (fout->uw.saved >> k) & 1;
+    uint32_t save = 6 + regs + (fout->uw.frame ? 2 : 0);
+    if (dup + 1 > save && !warmc_getenv("WARMC_SW_FORCE")) {
+      if (warmc_getenv("WARMC_SW_DEBUG"))
+        fprintf(stderr, "sw %s: not worth it: %u before a cut, %u saved\n",
+                f->m->funcs[f->func_index].name ? f->m->funcs[f->func_index].name : fout->sym, dup, save);
+      ir_free(st);
+      return;
+    }
+  }
+  FuncOut so;
+  memset(&so, 0, sizeof so);
+  produce_whole(st, obj, opt, out_bytes, &so);
+  ir_free(st);
+  if (so.uw.saved || so.uw.frame || so.uw.nsites || so.uw.ngcsites || so.entry_off ||
+      !so.nfull_br || so.code_len >= fout->code_len) {
+    if (warmc_getenv("WARMC_SW_DEBUG"))
+      fprintf(stderr, "sw %s: start refused: saved %#x frame %u sites %u gcsites %u br %u len %u of %u\n",
+              f->m->funcs[f->func_index].name ? f->m->funcs[f->func_index].name : fout->sym, so.uw.saved, so.uw.frame, so.uw.nsites, so.uw.ngcsites, so.nfull_br,
+              so.code_len, fout->code_len);
+    fout_free(&so);
+    return;
+  }
+  if (warmc_getenv("WARMC_SW_DEBUG")) {
+    uint32_t regs = 0;
+    for (uint32_t k = UW_GPR_SHIFT; k < 32; k++) regs += (fout->uw.saved >> k) & 1;
+    const Func *fn = &f->m->funcs[f->func_index];
+    fprintf(stderr, "sw %s: taken: start %u bytes, %u before a cut, full saves %u registers, frame %u, full %u bytes\n",
+            fn->name ? fn->name : fn->sym, so.code_len, dup, regs, fout->uw.frame, fout->code_len);
+  }
+  FuncOut *full = xmalloc(sizeof *full);
+  *full = *fout;
+  char *name = xmalloc(strlen(fout->sym) + 6);
+  sprintf(name, "%s$full", fout->sym);
+  full->sym = name;
+  full->sym_owned = true;
+  full->uw.full_body = 1;
+  /* what the whole function refers to is what keeps others alive */
+  xfree(so.refs);
+  so.refs = full->refs; so.nrefs = full->nrefs;
+  full->refs = NULL; full->nrefs = 0;
+  so.full = full;
+  *fout = so;
+  g_stats.shrink_wrapped++;
 }
 
 typedef struct {
@@ -672,6 +1210,12 @@ static uint64_t dead_stub(ObjBuilder *obj) {
 }
 
 void codegen_drop_function(ObjBuilder *obj, FuncOut *fo) {
+  if (fo->full) {
+    fout_free(fo->full);
+    xfree(fo->full);
+    fo->full = NULL;
+  }
+  xfree(fo->full_br); fo->full_br = NULL;
   uint64_t at = dead_stub(obj);
   obj_intern_sym(obj, fo->sym, SYM_LOCAL_FUNC, 0, at);
   uint32_t si = obj_find_sym(obj, fo->sym);
@@ -689,11 +1233,16 @@ void codegen_dead_stats(uint32_t *bodies, uint64_t *bytes) {
   *bytes = g_dead_bytes;
 }
 
-void codegen_commit_function(ObjBuilder *obj, FuncOut *fo) {
+/* One function's code into the text, at its symbol; with merge, onto an
+   identical body placed before; with seed, moved by WARMC_LAYOUT_SEED.
+   *placed is where its code starts. */
+static void commit_one(ObjBuilder *obj, FuncOut *fo, bool merge, bool seed,
+                       uint64_t *placed) {
   aux_build(&g_aux, fo);
   uint64_t h = mb_hash(fo->code, fo->code_len);
   h ^= mb_hash(g_aux.p, g_aux.len) * 1099511628211ull;
-  uint64_t at = g_merge_on ? mb_find(obj, fo, &g_aux, h) : UINT64_MAX;
+  uint64_t at = merge ? mb_find(obj, fo, &g_aux, h) : UINT64_MAX;
+  *placed = at;
   if (at != UINT64_MAX) {
 
     obj_intern_sym(obj, fo->sym, SYM_LOCAL_FUNC, 0, at + fo->entry_off);
@@ -708,6 +1257,7 @@ void codegen_commit_function(ObjBuilder *obj, FuncOut *fo) {
     xfree(fo->code); xfree(fo->relocs);
     return;
   }
+  if (!seed) goto placed_seed;
   /* WARMC_LAYOUT_SEED=s: up to 60 bytes of nops, as s and the function's
      name pick, ahead of each function that aligns no loop, which moves the
      code without changing it -- for timing a change over several layouts,
@@ -723,6 +1273,7 @@ void codegen_commit_function(ObjBuilder *obj, FuncOut *fo) {
         g_target->pad_nop(&obj->text);
     }
   }
+placed_seed:
   if (fo->want_align)
     while (((obj->text.len + fo->entry_off) & (ALIGN_BYTES - 1)) != fo->phase)
       g_target->pad_nop(&obj->text);
@@ -730,6 +1281,7 @@ void codegen_commit_function(ObjBuilder *obj, FuncOut *fo) {
     while ((obj->text.len + fo->entry_off) & 7)
       g_target->pad_nop(&obj->text);
   uint64_t base = obj->text.len;
+  *placed = base;
   buf_bytes(&obj->text, fo->code, fo->code_len);
   for (uint32_t i = 0; i < fo->nrelocs; i++)
     obj_add_reloc(obj, fo->relocs[i].kind, 0, base + fo->relocs[i].offset,
@@ -754,8 +1306,54 @@ void codegen_commit_function(ObjBuilder *obj, FuncOut *fo) {
   }
   g_stats.insts_emitted += fo->insts_emitted;
   codegen_note_unwind(&fo->uw);
-  if (g_merge_on) mb_add(base, fo, &g_aux, h);
+  if (merge) mb_add(base, fo, &g_aux, h);
   xfree(fo->uw.sites); xfree(fo->uw.clauses);
   xfree(fo->uw.gcsites); xfree(fo->uw.gcroots);
   xfree(fo->code); xfree(fo->relocs); xfree(fo->refs);
+}
+
+void codegen_commit_function(ObjBuilder *obj, FuncOut *fo) {
+  uint64_t at;
+  if (!fo->full) {
+    commit_one(obj, fo, g_merge_on, true, &at);
+    return;
+  }
+  /* A shrink-wrapped start, and its full body right after it: where the
+     body's symbol lands is known before either is placed, the start being
+     a leaf that aligns nothing, and the start's branches go there.  Neither
+     merges with another body, whose branches would go to another's. */
+  FuncOut *x = fo->full;
+  fo->full = NULL;
+  if (fo->want_align || fo->align8 || x->align8)
+    warmc_fatal("internal: shrink-wrapped %s wants an alignment", fo->sym);
+  uint64_t start = obj->text.len;
+  uint64_t p = start + fo->code_len;
+  if (x->want_align)
+    while (((p + x->entry_off) & (ALIGN_BYTES - 1)) != x->phase) p += 4;
+  uint64_t body = p + x->entry_off;
+  for (uint32_t i = 0; i < fo->nfull_br; i++) {
+    uint32_t off = fo->full_br[i];
+    int64_t d = (int64_t)body - (int64_t)(start + off);
+    if (d & 3 || d >= (1ll << 27) || d < -(1ll << 27))
+      warmc_fatal("internal: %s's start cannot reach its full body", fo->sym);
+    uint32_t insn = 0x14000000u | ((uint32_t)(d >> 2) & 0x03ffffffu);
+    memcpy(fo->code + off, &insn, 4);
+  }
+  xfree(fo->full_br); fo->full_br = NULL;
+  commit_one(obj, fo, false, false, &at);
+  if (at != start) warmc_fatal("internal: %s's start moved", fo->sym);
+  commit_one(obj, x, false, false, &at);
+  if (at + x->entry_off != body) warmc_fatal("internal: %s moved", x->sym);
+  /* the full body by the function's name too, for a disassembly or a profile */
+  {
+    uint32_t si = obj_find_sym(obj, fo->sym), xi = obj_find_sym(obj, x->sym);
+    if (si != UINT32_MAX && xi != UINT32_MAX && obj->syms[si].display && !obj->syms[xi].display) {
+      const char *d = obj->syms[si].display;
+      char *nm = xmalloc(strlen(d) + 6);
+      sprintf(nm, "%s$full", d);
+      obj->syms[xi].display = nm;
+    }
+  }
+  if (x->sym_owned) xfree((char *)x->sym);
+  xfree(x);
 }

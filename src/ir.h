@@ -250,6 +250,11 @@ static inline void ir_make_nop(Inst *in) { in->op = I_NOP; in->nargs = 0; }
    took in (inline.c pinl_build): taken in partially no more */
 #define IRF_PARTIAL_SLOW 4u
 
+/* an I_RETURN_CALL's imm2: the jump of a shrink-wrapped function's start
+   to its own full body (codegen.c sw_start), which codegen_commit_function
+   places after the start and points the branch at */
+#define RCALL_FULL 1u
+
 typedef struct {
   uint32_t target;
   Ref *args;
@@ -627,7 +632,7 @@ IrFunc *ir_build(Module *m, uint32_t func_index, const OptOpts *o);
 IrFunc *ir_build_unordered(Module *m, uint32_t func_index, const OptOpts *o);
 void ir_optimize(IrFunc *f, const OptOpts *o);
 
-typedef struct {
+typedef struct FuncOut {
   uint8_t *code; uint32_t code_len;
   Reloc *relocs; uint32_t nrelocs;
   bool want_align;
@@ -645,6 +650,17 @@ typedef struct {
   uint64_t insts_emitted;
 
   uint32_t *refs; uint32_t nrefs;
+
+  /* A shrink-wrapped function (codegen.c sw_start): this is its start, a
+     leaf, and full the whole function, placed right after it as
+     "<sym>$full"; full_br are the offsets of the start's branches to it,
+     which the placing patches.  sym_owned: sym is this FuncOut's to free. */
+  struct FuncOut *full;
+  uint32_t *full_br; uint32_t nfull_br;
+  bool sym_owned;
+  /* the function returns early ahead of its prologue (isel.c early_ret_shape),
+     which shrink-wrapping would only add a jump to */
+  bool early_ret;
 } FuncOut;
 
 void ir_produce_function(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
@@ -720,6 +736,8 @@ typedef struct {
   uint64_t unrolled, unr_guarded, unr_rej_shape, unr_rej_body, unr_rej_exit;
   uint64_t unr_rej_trip, unr_rej_escape, unr_addr_folded;
   uint64_t gc_nullchk_removed;
+  /* GC bounds checks the ranges of their indices removed (opt.c rp_inbounds) */
+  uint64_t bce_ranges;
   /* casts and type tests a sealed module's object slot decides inline, and
      the null checks of accesses after one that it makes instead */
   uint64_t slot_tests, slot_nullchks;
@@ -730,7 +748,7 @@ typedef struct {
      empty function */
   uint64_t once_looped;
   uint64_t ldpairs, stpairs;
-  uint64_t cold_frames, early_rets;
+  uint64_t cold_frames, early_rets, shrink_wrapped;
   /* functions given the check ahead that another instance's call passes
      (isel.c emit_entry_check) */
   uint64_t entry_checks;

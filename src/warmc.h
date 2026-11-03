@@ -693,6 +693,9 @@ typedef struct {
   UwClause *clauses; uint32_t nclauses;
   GcSite *gcsites; uint32_t ngcsites;
   uint32_t *gcroots; uint32_t ngcroots;
+  /* the function's full body, at "<sym>$full", the function's symbol being
+     its shrink-wrapped start's (codegen.c sw_start) */
+  uint8_t full_body;
 } FuncUnwind;
 
 void codegen_note_unwind(const FuncUnwind *u);

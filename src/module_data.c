@@ -1497,7 +1497,18 @@ void codegen_emit_module_data(Module *m, ObjBuilder *o) {
     const FuncUnwind *u = &g_unwind[i];
     if (!(u->saved & UW_HAS_LR)) continue;
     nunwind++;
-    func_ptr(o, m, u->func_index, 0);
+    if (u->full_body) {
+      /* a shrink-wrapped function's full body, whose own symbol it is */
+      const char *fs = m->funcs[u->func_index].sym;
+      char *name = xmalloc(strlen(fs) + 6);
+      sprintf(name, "%s$full", fs);
+      uint32_t sym = obj_intern_sym(o, name, SYM_UNDEF_FUNC, -1, 0);
+      xfree(name);
+      obj_add_reloc(o, REL_ABS64, 2, o->data.len, sym, 0);
+      buf_u64(&o->data, 0);
+    } else {
+      func_ptr(o, m, u->func_index, 0);
+    }
     buf_u32(&o->data, u->code_len);
     buf_u32(&o->data, u->frame);
     buf_u32(&o->data, u->saved_bytes);

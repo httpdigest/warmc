@@ -321,6 +321,10 @@ static int rd(Isel *s, Ref v, int scratch) {
       else a64_add_imm(B, SF64, scratch, mb, (uint32_t)(in->imm >> 12), 1);
       return scratch;
     }
+    if (in->op == I_GC_BADMASK) {
+      a64_ldr_imm(B, 3, scratch, REG_VMCTX, VMCTX_GC_BADMASK);
+      return scratch;
+    }
     if (in->op == I_GLOBAL_GET) {
       int size = (in->type == VT_I32 || in->type == VT_F32) ? 2 : 3;
       int asize = (in->type == VT_V128) ? 4 : size;
@@ -2270,7 +2274,10 @@ static bool cch_leaf(Isel *s, const uint32_t *uses, const uint8_t *blocked, Ref 
                      uint32_t bi, bool first) {
   IrFunc *f = s->f;
   uint16_t op = f->insts[c].op;
-  bool icmp = (op >= I_EQ && op <= I_GEU) || op == I_EQZ;
+  /* (ref.is_null is a compare of the pointer with 0: luawasm's nil test,
+     a null ref and a zero payload, is two) */
+  bool icmp = (op >= I_EQ && op <= I_GEU) || op == I_EQZ ||
+              (op == I_REF_IS_NULL && !warmc_getenv("WARMC_NO_NULLCCMP"));
   if (!icmp && !(first && op >= I_FEQ && op <= I_FGE)) return false;
   if (uses[c] != 1 || blocked[c] || !fa_own(s, c) || f->insts[c].block != bi) return false;
   Ref x = ir_args(f, c)[0];
@@ -2280,7 +2287,7 @@ static bool cch_leaf(Isel *s, const uint32_t *uses, const uint8_t *blocked, Ref 
 /* What the ccmp of compare c costs beyond itself: 1 where its constant takes
    a register, being no 5-bit one either way. */
 static int cch_cost(IrFunc *f, Ref c) {
-  if (f->insts[c].op == I_EQZ) return 0;
+  if (f->insts[c].op == I_EQZ || f->insts[c].op == I_REF_IS_NULL) return 0;
   Ref y = ir_args(f, c)[1];
   if (f->insts[y].op != I_CONST) return 0;
   uint64_t m = vt_is_64((ValType)f->insts[y].type) ? ~0ull : 0xffffffffu;
@@ -4514,6 +4521,7 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
   fout->phase = fout->want_align ? (uint8_t)phase : 0;
   if (fout->phase) g_stats.loop_phases++;
   fout->entry_off = (uint32_t)lead.len;
+  fout->early_ret = early;
   fout->code_len = (uint32_t)(lead.len + pro.len + s->body.len);
   fout->code = xmalloc_long(fout->code_len ? fout->code_len : 1);
   if (lead.len) memcpy(fout->code, lead.data, lead.len);
@@ -4531,6 +4539,12 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
     fout->relocs[i].offset = off + lead.len;
   }
   if (lead.len) fout->relocs[s->nrelocs] = lead_rel;
+  if (s->nfull_br) {
+    fout->nfull_br = s->nfull_br;
+    fout->full_br = xmalloc(s->nfull_br * sizeof(uint32_t));
+    for (uint32_t i = 0; i < s->nfull_br; i++)
+      fout->full_br[i] = s->full_br[i] + (uint32_t)(pro.len + lead.len);
+  }
   buf_free(&lead);
   const char *sym = f->m->funcs[f->func_index].sym;
   fout->sym = sym;
@@ -4609,6 +4623,7 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
   }
 
 give_up:
+  xfree(s->full_br); s->full_br = NULL; s->nfull_br = s->cap_full_br = 0;
   buf_free(&pro);
   buf_free(&s->body);
   xfree(s->relocs); xfree(s->loc); xfree(s->cls); xfree(s->block_off);

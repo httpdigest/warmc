@@ -3,7 +3,9 @@
 ;; there, so it neither copies x0 in nor saves the two, and a call or tail
 ;; call of one of the module's own functions passes no instance in x0; a call
 ;; of a C helper still does.  A function that calls one which reads memory
-;; keeps x20 for it, however short of registers ($hot).  An executable's
+;; keeps x20 for it, however short of registers ($hot): no value in it, no
+;; save of it -- a load of $rd's leaf, which partial inlining takes in, may
+;; still address memory through it.  An executable's
 ;; module is the only instance there is, so none of its functions has the
 ;; check of another instance's call ahead of it (emit_entry_check, which
 ;; test/run_link.sh sees in objects).
@@ -20,7 +22,7 @@
 ;; shape: grow mov\tx0, x19=1
 ;; shape: tailsum mov\tx0, x19=0
 ;; shape: tailsum b\t=1
-;; shape: hot \b[xw]20\b=0
+;; shape: hot \t[xw]20,=0
 ;;
 ;; run: fib 10 => i32:55
 ;; run: fib 1 => i32:1

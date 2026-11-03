@@ -791,7 +791,7 @@ static void emit_inst(Isel *s, Ref v) {
 
   if (s->loc[v] == LOC_NONE &&
       (is_imm(s, v) || in->op == I_CONST || in->op == I_MEM_BASE ||
-       in->op == I_GLOBAL_GET ||
+       in->op == I_GLOBAL_GET || in->op == I_GC_BADMASK ||
        (s->fused && s->fused[v]) || (s->folded && s->folded[v]))) return;
 
   switch (in->op) {

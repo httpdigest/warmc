@@ -82,6 +82,9 @@ typedef struct {
   bool split_collect;
 
   bool tail_done;
+  /* a shrink-wrapped start's branches to its full body (RCALL_FULL): their
+     offsets in the body, which codegen_commit_function patches */
+  uint32_t *full_br; uint32_t nfull_br, cap_full_br;
 
   bool has_call;
   /* has_call for something other than a wasm call */

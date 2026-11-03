@@ -152,6 +152,10 @@ static bool remat_ok(Isel *s, Ref v) {
   if (in->op == I_GLOBAL_GET)
     return s->remat_glob && !s->f->m->globals[in->imm].mutable_ &&
            !s->f->m->globals[in->imm].imported;
+  /* The load barrier's mask, one load from the instance: read again, it is
+     the mask now, which is what any barrier may test (pass_bar_elide only
+     shares one between safepoints to save the load) */
+  if (in->op == I_GC_BADMASK) return !warmc_getenv("WARMC_NO_MASKREMAT");
   if (in->op != I_CONST) return false;
   if ((ValType)in->type == VT_V128)
     return s->remat_v128 && ir_vconst_cost(in->imm, in->imm2) == 1;
