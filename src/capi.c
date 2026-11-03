@@ -95,8 +95,10 @@ static pthread_once_t g_rt_once = PTHREAD_ONCE_INIT;
 static bool g_rt_ok;
 static _Thread_local u64 g_limit, g_stack_lo, g_stack_hi;
 
+#if !defined(_WIN32)
 /* the runtime's fault report's last line (rt/rt.c fault_report): what this
-   thread's stack was taken to be, and wasm's limit on it */
+   thread's stack was taken to be, and wasm's limit on it.  (Windows's
+   runtime takes faults by a vectored handler, win.inc, which reports none.) */
 extern void (*warmc_rt_fault_note)(void);
 static void fault_note(void) {
   char b[160];
@@ -105,6 +107,7 @@ static void fault_note(void) {
                    (unsigned long long)g_limit);
   if (n > 0) fwrite(b, 1, (size_t)n < sizeof b ? (size_t)n : sizeof b - 1, stderr);
 }
+#endif
 
 #if defined(__linux__)
 #include <signal.h>
@@ -171,7 +174,9 @@ static void rt_init(void) {
      process may use (src/limits.c) */
   long n = warmc_host_cpus();
   warmc_rt_set_collectors(n > 0 ? (u32)n : 1);
+#if !defined(_WIN32)
   warmc_rt_fault_note = fault_note;
+#endif
 }
 
 /* The limit wasm's frames run to on this thread: its stack less a margin
