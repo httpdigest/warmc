@@ -64,7 +64,11 @@
   ;; More values carried round a loop than registers, the loop calling a
   ;; function that reads memory: the loop's function reads none itself, but
   ;; x20 is its callee's, and lent to one of the values it would break that.
+  ;; $rd writes a global before its test, so that a partial inline
+  ;; (inline.c pinl_build) cannot take its base case, the read, into $hot.
+  (global $seen (mut i32) (i32.const 0))
   (func $rd (param $i i32) (result i32)
+    (global.set $seen (local.get $i))
     (if (result i32) (i32.gt_u (local.get $i) (i32.const 1))
       (then (call $rd (i32.sub (local.get $i) (i32.const 2))))
       (else (i32.load8_u offset=8 (local.get $i)))))

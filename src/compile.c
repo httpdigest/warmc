@@ -833,6 +833,8 @@ void compile_module(Module *m, ObjBuilder *o, const OptOpts *opts) {
   m->gc_sealed = opts->sealed && module_gc_sealed(m);
   m->sole_instance = opts->sole_instance;
   module_escape_facts(m);
+  xfree(m->pinl);
+  m->pinl = xcalloc(m->nfuncs ? m->nfuncs : 1, 1);
   uint32_t out_bytes = codegen_tail_out_bytes(m);
   bool tm = warmc_getenv("WARMC_TIME") != NULL;
   module_table0_facts(m);

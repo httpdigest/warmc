@@ -503,6 +503,12 @@ typedef struct {
      use, or UINT32_MAX (NULL when there are none) */
   IcTable *ict; uint32_t nict;
   uint32_t *ict_of;
+
+  /* per function, whether a partial inline has a start of it to take in
+     (inline.c pinl_build): 0 not known yet, 1 yes, 2 no -- written by
+     whichever compile thread finds out first (__atomic, relaxed); NULL
+     where compile_module did not make it */
+  uint8_t *pinl;
 } Module;
 
 /* The threads compile_module uses for a module of nfuncs functions. */

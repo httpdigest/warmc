@@ -246,6 +246,9 @@ static inline void ir_make_nop(Inst *in) { in->op = I_NOP; in->nargs = 0; }
 /* a call through a class initializer's global in the copy of a loop that
    runs only until the initializer has run, which pass_once leaves */
 #define IRF_ONCE_SLOW 2u
+/* the call a partial inline's slow way makes of the function whose start it
+   took in (inline.c pinl_build): taken in partially no more */
+#define IRF_PARTIAL_SLOW 4u
 
 typedef struct {
   uint32_t target;
@@ -711,7 +714,7 @@ typedef struct {
   uint64_t devirt_ref, devirt_indirect, devirt_null_kept;
   uint64_t const_reads, throw_jumps, inl_more;
   uint64_t inl_flat, inl_spliced, inl_once_forced, inl_retcall_sites;
-  uint64_t inl_transitive, inl_escape;
+  uint64_t inl_transitive, inl_escape, inl_partial;
   uint64_t inl_rej_size, inl_rej_budget, inl_rej_tailcall, inl_rej_retcalls;
   uint64_t inl_rej_pads, inl_rej_score, inl_rej_depth, inl_rej_recursion;
   uint64_t unrolled, unr_guarded, unr_rej_shape, unr_rej_body, unr_rej_exit;

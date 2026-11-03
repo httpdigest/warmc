@@ -433,7 +433,7 @@ static void print_stats(void) {
           " devirt_null_kept=%llu const_reads=%llu throw_jumps=%llu"
           " inl_more=%llu\n"
           "             inl_flat=%llu inl_spliced=%llu inl_once=%llu"
-          " inl_retcall_sites=%llu inl_trans=%llu inl_escape=%llu rej_size=%llu"
+          " inl_retcall_sites=%llu inl_trans=%llu inl_escape=%llu inl_partial=%llu rej_size=%llu"
           " rej_budget=%llu rej_tail=%llu rej_retcalls=%llu rej_pads=%llu"
           " rej_score=%llu rej_depth=%llu rej_rec=%llu max_frame=%llu\n"
           "             unrolled=%llu unr_guarded=%llu unr_rej_shape=%llu"
@@ -521,6 +521,7 @@ static void print_stats(void) {
           (unsigned long long)g_stats.inl_retcall_sites,
           (unsigned long long)g_stats.inl_transitive,
           (unsigned long long)g_stats.inl_escape,
+          (unsigned long long)g_stats.inl_partial,
           (unsigned long long)g_stats.inl_rej_size,
           (unsigned long long)g_stats.inl_rej_budget,
           (unsigned long long)g_stats.inl_rej_tailcall,

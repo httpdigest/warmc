@@ -14,6 +14,9 @@
 #define INLINE_DEPTH 4
 #define INLINE_MAX_DEPTH 8
 #define INLINE_ROUND2_GROWTH 600
+/* the most instructions a partial inline takes in: the start of a callee
+   up to where it would call or loop (pinl_build) */
+#define PINLINE_MAX 20
 
 /* Site scoring: the value of removing one call, before dividing by what the
    splice costs. A constant argument is worth more than the instructions it
@@ -50,8 +53,9 @@ static pthread_once_t g_inl_once = PTHREAD_ONCE_INIT;
 static struct {
   uint32_t max_callee, growth, tiny;
   uint32_t retcalls, retcall_cost, retcall_total, depth, round2_growth;
+  uint32_t partial_max;
   long only, upto, max;
-  bool dbg, noscore, leafonly, notrans, notail, round2;
+  bool dbg, noscore, leafonly, notrans, notail, round2, nopartial;
 } g_inl;
 
 static void inl_init(void) {
@@ -88,13 +92,20 @@ static void inl_init(void) {
   /* the old gate: no callee that makes a tail call */
   g_inl.notail = warmc_getenv("WARMC_INLINE_NO_TAIL") != NULL;
   g_inl.round2 = warmc_getenv("WARMC_INLINE_ROUND2") != NULL;
+  g_inl.nopartial = warmc_getenv("WARMC_NO_PARTIAL_INLINE") != NULL;
+  g_inl.partial_max = (e = warmc_getenv("WARMC_PARTIAL_INLINE_MAX"))
+                          ? (uint32_t)atol(e)
+                          : PINLINE_MAX;
+}
+
+static const char *inl_name(const Func *fn) {
+  return fn->name ? fn->name : fn->sym ? fn->sym : "?";
 }
 
 static void inl_dbg(IrFunc *f, uint32_t fidx, uint32_t bi, const char *what) {
   if (!g_inl.dbg) return;
   fprintf(stderr, "inline %s: callee %s at block %u depth %u: %s\n",
-          f->m->funcs[f->func_index].sym ? f->m->funcs[f->func_index].sym : "?",
-          f->m->funcs[fidx].sym ? f->m->funcs[fidx].sym : "?", bi,
+          inl_name(&f->m->funcs[f->func_index]), inl_name(&f->m->funcs[fidx]), bi,
           f->blocks[bi].loop_depth, what);
 }
 
@@ -682,6 +693,15 @@ typedef struct {
   uint32_t disp_off[INL_DISP_PARAMS];
   InlPass *pass;
   uint32_t npass;
+  /* the callee's start as a partial inline takes it in (pinl_build), as
+     built and split at raising instructions, and its size: pverdict 1 when
+     there is one, 2 when not */
+  uint8_t pverdict;
+  IrFunc *pplain, *psplit;
+  uint32_t pninsts;
+  /* the callee as built, untailed and ordered, when the whole callee was
+     refused: the partial inline's to cut, so that it is not built twice */
+  IrFunc *refused;
 } InlMemo;
 
 /* The memo every inline run on a thread uses: an entry per callee the run
@@ -766,6 +786,9 @@ static void memo_end_run(InlMemos *ms) {
     InlMemo *e = memo_entry(ms, k);
     if (e->plain) ir_free(e->plain);
     if (e->split) ir_free(e->split);
+    if (e->pplain) ir_free(e->pplain);
+    if (e->psplit) ir_free(e->psplit);
+    if (e->refused) ir_free(e->refused);
     xfree(e->pass);
   }
   if (ms->n) memset(ms->key, 0xff, ms->cap * sizeof(uint32_t));
@@ -910,7 +933,7 @@ static IrFunc *inl_callee(IrFunc *f, const OptOpts *o, InlMemos *memo,
     if (g_inl.notail && has_tail_call(g)) {
       g_stats.inl_rej_tailcall++;
       inl_dbg(f, fidx, bi, "tail call");
-      ir_free(g);
+      e->refused = g;
     } else if (g_inl.leafonly ? !callee_calls_are_cold(g)
                               : r - e->nicall > (g_inl.retcalls > INL_ESC_RETCALLS
                                                  ? g_inl.retcalls : INL_ESC_RETCALLS)) {
@@ -918,11 +941,11 @@ static IrFunc *inl_callee(IrFunc *f, const OptOpts *o, InlMemos *memo,
          taken is the site's question, and only escape evidence says yes */
       g_stats.inl_rej_retcalls++;
       inl_dbg(f, fidx, bi, "returning calls");
-      ir_free(g);
+      e->refused = g;
     } else if (g->npads) {
       g_stats.inl_rej_pads++;
       inl_dbg(f, fidx, bi, "landing pads");
-      ir_free(g);
+      e->refused = g;
     } else {
       e->verdict = 1;
       ir_order(g);
@@ -942,6 +965,217 @@ static IrFunc *inl_callee(IrFunc *f, const OptOpts *o, InlMemos *memo,
     split_at_raising_sites(e->split);
   }
   return e->split;
+}
+
+/* Partial inlining.  A callee too big to take in, or one that makes calls,
+   often starts with a test that, most of the time, sends it straight back:
+   TeaVM's ArrayList.ensureCapacity returns when the array is big enough and
+   grows it otherwise, Integer.ensureIntegerCache when the cache is made.
+   Called, such a function saves its callee-saved registers, checks the
+   stack and makes a frame for the few loads and the compare of that test --
+   javabench/generic spent a fifth of its cycles in three of them.  So a
+   site may take in just that start: the blocks from the entry that reach a
+   return without a call or a loop (the warm way), where every way from them
+   into the rest of the callee becomes a call of the callee itself, with the
+   site's arguments, whose results are the site's.  That call runs the
+   callee from its start again, so the start may do nothing on the way to
+   such a cut that running it twice would see: it may read and trap -- a
+   trap there is the one the callee would make first -- and make a class
+   initializer's call (opt_once_call), which once made calls nothing; the
+   blocks that only lead to a return may store as well. */
+
+/* whether running v again, with nothing written in between, does nothing
+   the first run did not: no write, no allocation, no call but a class
+   initializer's */
+static bool pinl_rerun_ok(IrFunc *g, Ref v) {
+  const Inst *in = &g->insts[v];
+  if (ir_has_no_effect(in)) return true;
+  switch (in->op) {
+    case I_FIELD_GET: case I_ARRAY_GET: case I_ARRAY_LEN: case I_I31_GET:
+    case I_DIVS: case I_DIVU: case I_REMS: case I_REMU:
+    case I_TRUNCS: case I_TRUNCU:
+    case I_LOAD: case I_TABLE_GET: case I_MEM_SIZE: case I_TABLE_SIZE:
+    case I_REF_SLOT:
+      return true;
+    case I_CALL_REF:
+      return opt_once_call(g, v);
+    default:
+      return false;
+  }
+}
+
+/* The callee fidx's warm start, as a body a splice takes in: built, its tail
+   calls made calls, split at raising instructions when the site has handler
+   edges, and cut where it would call or loop -- the cut edges going to one
+   block that calls fidx with the entry's parameters and returns what that
+   returns.  NULL when the callee has no such start (its entry calls or
+   loops, no return is reached without, nothing is cut, or the start is over
+   g_inl.partial_max instructions); *size is the start's instruction count. */
+static IrFunc *pinl_build(IrFunc *f, const OptOpts *o, uint32_t fidx,
+                          bool split, uint32_t *size, IrFunc *built) {
+  Module *m = f->m;
+  IrFunc *g = built;
+  if (!g) {
+    g = ir_build(m, fidx, o);
+    if (!g_inl.notail) untail(g);
+  }
+  if (split) split_at_raising_sites(g);
+  ir_order(g);
+  uint32_t nb = g->nblocks;
+  uint8_t *bad = xcalloc(nb ? nb : 1, 1), *in_g = xcalloc(nb ? nb : 1, 1);
+  uint8_t *ret = xcalloc(nb ? nb : 1, 1), *cut = xcalloc(nb ? nb : 1, 1);
+  for (uint32_t oi = 0; oi < g->norder; oi++) {
+    uint32_t bi = g->order[oi];
+    Block *b = &g->blocks[bi];
+    if (b->loop_depth || b->is_pad) { bad[bi] = 1; continue; }
+    for (uint32_t s = 0; s < b->nsuccs; s++)
+      if (b->succs[s].eh) bad[bi] = 1;
+    for (uint32_t i = 0; i < b->ninsts && !bad[bi]; i++) {
+      Ref v = b->insts[i];
+      uint16_t op = g->insts[v].op;
+      if (op == I_CALL_REF && opt_once_call(g, v)) continue;
+      if (raises(op) || op == I_RETURN_CALL || op == I_RETURN_CALL_INDIRECT ||
+          op == I_RETURN_CALL_REF)
+        bad[bi] = 1;
+    }
+  }
+  IrFunc *out = NULL;
+  uint32_t n = 0, ncut = 0;
+  bool any_ret = false;
+  /* the warm start, made smaller while a block on the way to a cut does
+     what may not run twice (each round marks one more block bad) */
+  for (uint32_t round = 0; round <= g->norder; round++) {
+    if (bad[g->entry]) goto done;
+    memset(in_g, 0, nb);
+    in_g[g->entry] = 1;
+    for (uint32_t oi = 0; oi < g->norder; oi++) {    /* reverse postorder */
+      uint32_t bi = g->order[oi];
+      if (!in_g[bi]) continue;
+      const Block *b = &g->blocks[bi];
+      for (uint32_t s = 0; s < b->nsuccs; s++)
+        if (!bad[b->succs[s].target]) in_g[b->succs[s].target] = 1;
+    }
+    /* reaching a return or a trap within: the blocks taken in.  The region
+       has no loop, so successors come first in reverse of the order */
+    memset(ret, 0, nb);
+    for (uint32_t oi = g->norder; oi-- > 0;) {
+      uint32_t bi = g->order[oi];
+      if (!in_g[bi]) continue;
+      const Block *b = &g->blocks[bi];
+      if (b->term == T_RETURN || b->term == T_TRAP) ret[bi] = 1;
+      for (uint32_t s = 0; s < b->nsuccs && !ret[bi]; s++)
+        if (ret[b->succs[s].target]) ret[bi] = 1;
+    }
+    if (!ret[g->entry]) goto done;
+    /* reaching a cut, and the blocks on the way that may not run twice */
+    memset(cut, 0, nb);
+    bool again = false;
+    n = ncut = 0;
+    any_ret = false;
+    for (uint32_t oi = g->norder; oi-- > 0;) {
+      uint32_t bi = g->order[oi];
+      if (!ret[bi]) continue;
+      const Block *b = &g->blocks[bi];
+      if (b->term == T_RETURN) any_ret = true;
+      for (uint32_t s = 0; s < b->nsuccs; s++) {
+        uint32_t t = b->succs[s].target;
+        if (!ret[t]) { cut[bi] = 1; ncut++; }
+        else if (cut[t]) cut[bi] = 1;
+      }
+      for (uint32_t i = 0; i < b->ninsts; i++) {
+        Ref v = b->insts[i];
+        uint16_t op = g->insts[v].op;
+        if (op != I_CONST && op != I_PARAM && op != I_NOP) n++;
+        if (cut[bi] && !pinl_rerun_ok(g, v)) { bad[bi] = 1; again = true; }
+      }
+    }
+    if (!again) break;
+  }
+  if (!ncut || !any_ret || n > g_inl.partial_max) goto done;
+
+  /* the call of the whole callee where the start is cut */
+  {
+    CompType *sig = &m->types[m->funcs[fidx].type_index];
+    uint32_t nres = sig->nresults;
+    uint32_t sb = ir_new_block(g);
+    Block *S = &g->blocks[sb];
+    S->sealed = S->filled = S->reachable = true;
+    const Block *eb = &g->blocks[g->entry];
+    Ref *args = xmalloc((eb->nparams ? eb->nparams : 1) * sizeof(Ref));
+    memcpy(args, eb->params, eb->nparams * sizeof(Ref));
+    Ref call = ir_emit(g, sb, I_CALL, nres == 1 ? sig->results[0] : 0, args,
+                       eb->nparams, fidx, 0);
+    xfree(args);
+    uint32_t rb = sb;
+    if (nres > 1) {
+      rb = ir_new_block(g);
+      Block *R = &g->blocks[rb];
+      R->sealed = R->filled = R->reachable = true;
+      g->blocks[sb].term = T_JUMP;
+      ir_add_edge(g, sb, rb, NULL, 0);
+    }
+    Ref *rv = ir_alloc(g, (nres ? nres : 1) * sizeof(Ref));
+    if (nres == 1) rv[0] = call;
+    else
+      for (uint32_t i = 0; i < nres; i++) {
+        Ref a[1] = { call };
+        rv[i] = ir_emit(g, rb, I_RESULT, sig->results[i], a, 1, i, 0);
+      }
+    Block *R = &g->blocks[rb];
+    R->term = T_RETURN;
+    R->nret = R->cap_ret = nres;
+    R->ret_args = rv;
+    /* the cut edges to it; the rest of the callee emptied, so that the
+       splice copies nothing of it */
+    for (uint32_t bi = 0; bi < nb; bi++) {
+      Block *b = &g->blocks[bi];
+      if (ret[bi]) {
+        for (uint32_t s = 0; s < b->nsuccs; s++)
+          if (!ret[b->succs[s].target]) {
+            b->succs[s].target = sb;
+            b->succs[s].nargs = 0;
+          }
+        continue;
+      }
+      b->ninsts = 0;
+      b->nsuccs = 0;
+      b->nret = 0;
+      b->term = T_TRAP;
+      b->term_imm = TRAP_UNREACHABLE;
+      b->reachable = false;
+    }
+    ir_order(g);
+    out = g;
+    *size = n + 1;
+  }
+done:
+  xfree(bad); xfree(in_g); xfree(ret); xfree(cut);
+  if (!out) ir_free(g);
+  return out;
+}
+
+static IrFunc *inl_partial_callee(IrFunc *f, const OptOpts *o, InlMemos *memo,
+                                  uint32_t fidx, bool want_split) {
+  InlMemo *e = memo_at(memo, fidx);
+  if (e->pverdict == 0) {
+    /* most callees have no such start, which the module says once */
+    uint8_t *known = f->m->pinl && fidx < f->m->nfuncs ? &f->m->pinl[fidx] : NULL;
+    e->pverdict = 2;
+    if (known && __atomic_load_n(known, __ATOMIC_RELAXED) == 2) return NULL;
+    uint32_t size = 0;
+    IrFunc *built = e->refused;
+    e->refused = NULL;
+    e->pplain = pinl_build(f, o, fidx, false, &size, built);
+    if (e->pplain) { e->pverdict = 1; e->pninsts = size; }
+    if (known) __atomic_store_n(known, e->pplain ? 1 : 2, __ATOMIC_RELAXED);
+  }
+  if (e->pverdict != 1) return NULL;
+  if (!want_split) return e->pplain;
+  if (!e->psplit) {
+    uint32_t size = 0;
+    e->psplit = pinl_build(f, o, fidx, true, &size, NULL);
+  }
+  return e->psplit;
 }
 
 /* Whether callee fidx keeps reference parameter p to itself, the direct
@@ -1004,6 +1238,7 @@ typedef struct {
   bool once;
   bool escape;   /* the inline frees an allocation for pass_escape */
   bool every;    /* runs on every call, or in a loop: see inl_runs_every */
+  bool partial;  /* takes in the callee's warm start only (pinl_build) */
   uint16_t idepth;
   uint32_t anc[INLINE_MAX_DEPTH];
 } InlSite;
@@ -1223,6 +1458,52 @@ static bool inl_score_site(IrFunc *f, const OptOpts *o, InlMemos *memo,
   return true;
 }
 
+/* A site the whole callee was refused for, taking in its warm start: one
+   on a way that returns, not the call a partial inline left (which would
+   take the same start in again), scored as a splice of the start's size. */
+static bool inl_score_partial(IrFunc *f, const OptOpts *o, InlMemos *memo,
+                              Ref call, uint32_t ord1, uint32_t ord2,
+                              const InlSite *parent, InlSite *out) {
+  Module *m = f->m;
+  static const uint32_t w[4] = {1, 10, 100, 1000};
+  if (g_inl.nopartial) return false;
+  Inst *cin = &f->insts[call];
+  if (cin->op != I_CALL || (cin->flags & IRF_PARTIAL_SLOW)) return false;
+  uint32_t fidx = (uint32_t)cin->imm;
+  if (fidx == f->func_index || m->funcs[fidx].imported || !m->funcs[fidx].body)
+    return false;
+  uint32_t bi = cin->block;
+  Block *b = &f->blocks[bi];
+  if (b->diverges || b->cold) return false;
+  uint16_t idepth = 0;
+  if (parent) {
+    if ((uint32_t)parent->idepth + 1 > g_inl.depth || fidx == parent->fidx)
+      return false;
+    for (uint16_t j = 0; j < parent->idepth; j++)
+      if (parent->anc[j] == fidx) return false;
+    idepth = parent->idepth + 1;
+  }
+  if (!inl_partial_callee(f, o, memo, fidx, false)) return false;
+  uint32_t charged = memo_at(memo, fidx)->pninsts;
+  if (charged < 4) charged = 4;
+  uint32_t d = b->loop_depth > 3 ? 3 : b->loop_depth;
+  memset(out, 0, sizeof(*out));
+  out->call = call;
+  out->fidx = fidx;
+  out->charged = charged;
+  out->score = g_inl.noscore ? 1 : w[d] * INL_C_BASE * 16 / charged;
+  out->rpo = ord1;
+  out->idx = ord2;
+  out->every = inl_runs_every(f, bi, parent != NULL);
+  out->partial = true;
+  out->idepth = idepth;
+  if (parent) {
+    memcpy(out->anc, parent->anc, parent->idepth * sizeof(uint32_t));
+    out->anc[parent->idepth] = parent->fidx;
+  }
+  return true;
+}
+
 /* A later round takes only the calls pass_devirt has made since, and the
    calls an allocation leaves by. */
 static void inl_collect(IrFunc *f, const OptOpts *o, InlMemos *memo,
@@ -1237,7 +1518,8 @@ static void inl_collect(IrFunc *f, const OptOpts *o, InlMemos *memo,
       bool fresh = (in->flags & IRF_DEVIRT) != 0;
       in->flags &= (uint8_t)~IRF_DEVIRT;
       if (more && !fresh && !(ev && ev[v].args)) continue;
-      if (inl_score_site(f, o, memo, ev, v, oi, k, NULL, &s))
+      if (inl_score_site(f, o, memo, ev, v, oi, k, NULL, &s) ||
+          inl_score_partial(f, o, memo, v, oi, k, NULL, &s))
         inl_push(sites, &s);
     }
   }
@@ -1284,19 +1566,35 @@ static bool inl_apply(IrFunc *f, const OptOpts *o, InlMemos *memo,
       if (k + 1 == b->ninsts) nehe++;
     }
 
-  IrFunc *g = inl_callee(f, o, memo, fidx, bi, nehe > 0);
+  bool partial = site->partial;
+  IrFunc *g = partial ? inl_partial_callee(f, o, memo, fidx, nehe > 0)
+                      : inl_callee(f, o, memo, fidx, bi, nehe > 0);
   if (!g) return false;
-  if (site->charged > *budget) {
+  uint32_t charged = site->charged;
+
+  /* the frame-cap pressure valve: surviving calls a caller absorbs */
+  uint32_t rc = partial ? 0
+                : site->every ? memo_at(memo, fidx)->retcalls
+                              : memo_at(memo, fidx)->retcalls_built;
+  uint32_t rcap = g_inl.retcall_total + (site->escape ? INL_ESC_SLACK : 0);
+  /* a whole callee refused here may still have its warm start taken in,
+     which leaves the call it makes as it was, and is smaller */
+  if (!partial && (charged > *budget || (rc && *retsum + rc > rcap)) &&
+      !g_inl.nopartial && !(cin->flags & IRF_PARTIAL_SLOW) && !b->diverges &&
+      !b->cold) {
+    IrFunc *pg = inl_partial_callee(f, o, memo, fidx, nehe > 0);
+    if (pg) {
+      partial = true;
+      g = pg;
+      charged = memo_at(memo, fidx)->pninsts > 4 ? memo_at(memo, fidx)->pninsts : 4;
+      rc = 0;
+    }
+  }
+  if (charged > *budget) {
     g_stats.inl_rej_budget++;
     return false;
   }
-
-  /* the frame-cap pressure valve: surviving calls a caller absorbs */
-  uint32_t rc = site->every ? memo_at(memo, fidx)->retcalls
-                            : memo_at(memo, fidx)->retcalls_built;
-  if (rc &&
-      *retsum + rc >
-          g_inl.retcall_total + (site->escape ? INL_ESC_SLACK : 0)) {
+  if (rc && *retsum + rc > rcap) {
     g_stats.inl_rej_retcalls++;
     inl_dbg(f, fidx, bi, "caller absorbed enough calls");
     return false;
@@ -1311,13 +1609,13 @@ static bool inl_apply(IrFunc *f, const OptOpts *o, InlMemos *memo,
   if (site->once && memo_at(memo, fidx)->ninsts > g_inl.max_callee)
     g_stats.inl_once_forced++;
   if (rc) g_stats.inl_retcall_sites++;
-  if (site->escape) g_stats.inl_escape++;
+  if (site->escape && !partial) g_stats.inl_escape++;
   *retsum += rc;
 
-  if (!nehe && !any_eh && g->norder == 1 && g->order[0] == g->entry &&
+  if (!partial && !nehe && !any_eh && g->norder == 1 && g->order[0] == g->entry &&
       g->blocks[g->entry].term == T_RETURN &&
       inline_flat(f, g, bi, k, call, callargs, nargs, sig)) {
-    *budget -= site->charged;
+    *budget -= charged;
     g_stats.inlined++;
     g_stats.inl_flat++;
     inl_dbg(f, fidx, bi, "inlined flat");
@@ -1381,13 +1679,23 @@ static bool inl_apply(IrFunc *f, const OptOpts *o, InlMemos *memo,
   for (uint32_t oi = 0; oi < g->norder && !returns; oi++)
     returns = g->blocks[g->order[oi]].term == T_RETURN;
 
+  Ref first = (Ref)f->ninsts;
   splice(f, g, bi, cont, callargs, nargs, ehe, nehe);
 
   xfree(ehe);
-  *budget -= site->charged;
-  g_stats.inlined++;
-  g_stats.inl_spliced++;
-  inl_dbg(f, fidx, bi, "inlined spliced");
+  *budget -= charged;
+  if (partial) {
+    /* the cut's call of the whole callee: not taken in partially again */
+    for (Ref v = first; v < (Ref)f->ninsts; v++)
+      if (f->insts[v].op == I_CALL && (uint32_t)f->insts[v].imm == fidx)
+        f->insts[v].flags |= IRF_PARTIAL_SLOW;
+    g_stats.inl_partial++;
+    inl_dbg(f, fidx, bi, "inlined partially");
+  } else {
+    g_stats.inlined++;
+    g_stats.inl_spliced++;
+    inl_dbg(f, fidx, bi, "inlined spliced");
+  }
   xfree(callargs); xfree(contp);
   if (nehe || !returns) ir_mark_reachable(f);
   else f->blocks[cont].reachable = true;
@@ -1428,7 +1736,8 @@ static bool inl_run(IrFunc *f, const OptOpts *o, uint32_t budget0, bool more) {
       if (f->insts[v].op != I_CALL) continue;
       if (!depths) { ir_order_depths(f); depths = true; }
       InlSite ns;
-      if (inl_score_site(f, o, memo, NULL, v, f->insts[v].block, v, &site, &ns))
+      if (inl_score_site(f, o, memo, NULL, v, f->insts[v].block, v, &site, &ns) ||
+          inl_score_partial(f, o, memo, v, f->insts[v].block, v, &site, &ns))
         inl_push(&sites, &ns);
     }
     if (sites.n != had)
