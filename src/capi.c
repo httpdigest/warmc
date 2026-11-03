@@ -93,7 +93,51 @@ static char *xstrdup_n(const char *s, size_t n) {
 
 static pthread_once_t g_rt_once = PTHREAD_ONCE_INIT;
 static bool g_rt_ok;
-static _Thread_local u64 g_limit;
+static _Thread_local u64 g_limit, g_stack_lo, g_stack_hi;
+
+/* the runtime's fault report's last line (rt/rt.c fault_report): what this
+   thread's stack was taken to be, and wasm's limit on it */
+extern void (*warmc_rt_fault_note)(void);
+static void fault_note(void) {
+  char b[160];
+  int n = snprintf(b, sizeof b, "warmc: the thread's stack [%#llx, %#llx), wasm's limit %#llx\n",
+                   (unsigned long long)g_stack_lo, (unsigned long long)g_stack_hi,
+                   (unsigned long long)g_limit);
+  if (n > 0) fwrite(b, 1, (size_t)n < sizeof b ? (size_t)n : sizeof b - 1, stderr);
+}
+
+#if defined(__linux__)
+#include <signal.h>
+/* A stack of its own for the signals of a thread that runs wasm, where the
+   host gave it none: a fault that is the thread's stack overflowing --
+   past wasm's limit, in the runtime or in the host -- is then reported
+   (rt/rt.c fault_report) rather than ending the process unsaid.  Freed as
+   the thread ends. */
+static pthread_key_t g_alt_key;
+static pthread_once_t g_alt_once = PTHREAD_ONCE_INIT;
+static void alt_free(void *p) {
+  stack_t ss;
+  memset(&ss, 0, sizeof ss);
+  ss.ss_flags = SS_DISABLE;
+  sigaltstack(&ss, NULL);
+  free(p);
+}
+static void alt_key(void) { pthread_key_create(&g_alt_key, alt_free); }
+static void thread_altstack(void) {
+  stack_t cur;
+  if (sigaltstack(NULL, &cur) == 0 && !(cur.ss_flags & SS_DISABLE)) return;
+  size_t n = 64u << 10;
+  void *p = malloc(n);
+  if (!p) return;
+  stack_t ss;
+  memset(&ss, 0, sizeof ss);
+  ss.ss_sp = p;
+  ss.ss_size = n;
+  if (sigaltstack(&ss, NULL)) { free(p); return; }
+  pthread_once(&g_alt_once, alt_key);
+  pthread_setspecific(g_alt_key, p);
+}
+#endif
 
 static void *rt_malloc(u64 n) { return calloc(1, (size_t)n); }
 
@@ -108,6 +152,7 @@ static void rt_init(void) {
      process may use (src/limits.c) */
   long n = warmc_host_cpus();
   warmc_rt_set_collectors(n > 0 ? (u32)n : 1);
+  warmc_rt_fault_note = fault_note;
 }
 
 /* The limit wasm's frames run to on this thread: its stack less a margin
@@ -115,9 +160,14 @@ static void rt_init(void) {
    the platform does not say where the stack ends. */
 static u64 thread_limit(void) {
   if (g_limit) return g_limit;
+#if defined(__linux__)
+  thread_altstack();
+#endif
   u64 sp = (u64)(uptr)__builtin_frame_address(0);
   u64 lo = 0, hi = 0;
   warmc_rt_stack_bounds(&lo, &hi);
+  g_stack_lo = lo;
+  g_stack_hi = hi;
   if (!lo || sp <= lo || sp > hi) {
     g_limit = sp > (1ull << 20) ? sp - (1ull << 20) : 1;
   } else {

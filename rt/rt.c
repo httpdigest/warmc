@@ -1458,6 +1458,7 @@ static int addr_in_a_guard(const u8 *addr) {
 #define SA_RESTORER  0x04000000u
 
 #define SA_NODEFER   0x40000000u
+#define SA_ONSTACK   0x08000000u
 
 struct k_sigaction {
   void *handler;
@@ -1521,6 +1522,55 @@ static void chain_fault(int sig, void *info, void *uc) {
   set_sigaction(sig, p, 0);
 }
 
+/* What the embedder knows of the faulting thread, said after the
+   runtime's own report (src/capi.c sets it): its stack's bounds and the
+   limit wasm's frames run to there. */
+void (*warmc_rt_fault_note)(void);
+
+static void eput_hex(u64 v) {
+  char b[20];
+  int i = 20;
+  do { b[--i] = "0123456789abcdef"[v & 15]; v >>= 4; } while (v);
+  b[--i] = 'x';
+  b[--i] = '0';
+  sys_write(2, b + i, (usz)(20 - i));
+}
+
+/* A fault that is not the runtime's, said where it was before it is passed
+   on: a library's host would otherwise only see the process die of it --
+   on Linux, of a stack overflowed with no stack of its own to report on
+   (the handler runs on the thread's alternate stack, SA_ONSTACK, where the
+   embedder gave the thread one). */
+static void fault_report(int sig, u8 *addr, void *uc) {
+  eputs("warmc-rt: signal ");
+  put_u64_e((u64)sig);
+  eputs(" outside linear memory, address ");
+  eput_hex((u64)(uptr)addr);
+#if !defined(WARMC_DARWIN)
+  if (uc) {
+    /* aarch64's ucontext: uc_mcontext at 176, a sigcontext of
+       fault_address, regs[31], sp, pc */
+    const u8 *mc = (const u8 *)uc + 176;
+    eputs(", pc ");
+    eput_hex(*(const u64 *)(mc + 264));
+    eputs(", lr ");
+    eput_hex(*(const u64 *)(mc + 8 + 30 * 8));
+    eputs(", sp ");
+    eput_hex(*(const u64 *)(mc + 256));
+  }
+#else
+  (void)uc;
+#endif
+  eputs(", the store's stack limit ");
+#if defined(WARMC_JIT)
+  eput_hex(ST ? ST->g_stack_limit : 0);
+#else
+  eput_hex(ST->g_stack_limit);
+#endif
+  eputs("\n");
+  if (warmc_rt_fault_note) warmc_rt_fault_note();
+}
+
 static void fault_handler(int sig, void *info, void *uc) {
   u8 *addr = info ? *(u8 **)((u8 *)info + SI_ADDR_OFF) : 0;
 
@@ -1532,7 +1582,11 @@ static void fault_handler(int sig, void *info, void *uc) {
     sys_exit(139);
   }
   if (addr_in_a_guard(addr)) warmc_trap(TRAP_MEM_OOB);
-  if (g_library) { chain_fault(sig, info, uc); return; }
+  if (g_library) {
+    fault_report(sig, addr, uc);
+    chain_fault(sig, info, uc);
+    return;
+  }
   eputs("warmc-rt: fault outside linear memory\n");
   sys_exit(139);
 }
@@ -1546,7 +1600,7 @@ static void install_fault_handler(void) {
   act.flags = SIGACT_SIGINFO | 0x0010;
 #else
   act.handler = (void *)fault_handler;
-  act.flags = SA_SIGINFO | SA_RESTORER | SA_NODEFER;
+  act.flags = SA_SIGINFO | SA_RESTORER | SA_NODEFER | SA_ONSTACK;
   act.restorer = (void *)sig_restorer;
   act.mask = 0;
 #endif
