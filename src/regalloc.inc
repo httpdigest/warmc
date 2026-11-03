@@ -135,8 +135,12 @@ static bool remat_ok(Isel *s, Ref v) {
   Inst *in = &s->f->insts[v];
   if (s->no_remat[v]) return false;
 
+  /* The memory base plus a constant -- the address of a cell a module
+     keeps in linear memory, luawasm's inline caches at 0x20000 and up --
+     is remade where it is used whenever that is one instruction: an
+     invariant one hoisted out of a loop then spills no slot to reload. */
   if (in->op == I_MEM_BASE)
-    return !(in->imm2 != 0 && in->imm == 0) && in->imm <= 0xfff;
+    return !(in->imm2 != 0 && in->imm == 0) && RA_MEMBASE_ONE(in->imm);
 
   /* An immutable global's value can never change (validation refuses the
      global.set), so re-loading it IS the value: one vmctx load per use, no

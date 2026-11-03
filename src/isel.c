@@ -160,6 +160,9 @@ static IrOp recomp_shape(IrFunc *f, Ref v, Ref *x, Ref *y, uint64_t *c);
 #define RA_FMA_TIED 0
 /* a constant zero is read as wzr/xzr where it has no register (rd_zr) */
 #define RA_ZERO_REG 1
+/* the memory base plus an offset is one add when the offset is 12 bits,
+   shifted by 12 or not (the I_MEM_BASE case of isel_ops.inc) */
+#define RA_MEMBASE_ONE(off) ((off) <= 0xfff || (((off) & 0xfff) == 0 && ((off) >> 12) <= 0xfff))
 /* an extend of an i32 a w-register write made is no instruction in place */
 #define RA_EXTENDU_TIED 1
 /* memory.copy and memory.fill of memory 0 save nothing round them
@@ -260,8 +263,10 @@ static int rd(Isel *s, Ref v, int scratch) {
     Inst *in = &s->f->insts[v];
 
     if (in->op == I_MEM_BASE) {
+      /* one add (RA_MEMBASE_ONE): a 12-bit offset, or one shifted by 12 */
       int mb = mem_base_reg_fwd(s, in->imm2, TMP0);
-      a64_add_imm(B, SF64, scratch, mb, (uint32_t)in->imm, 0);
+      if (in->imm <= 0xfff) a64_add_imm(B, SF64, scratch, mb, (uint32_t)in->imm, 0);
+      else a64_add_imm(B, SF64, scratch, mb, (uint32_t)(in->imm >> 12), 1);
       return scratch;
     }
     if (in->op == I_GLOBAL_GET) {

@@ -117,6 +117,8 @@ static bool isel_fp_remat_ok(Isel *s, const Inst *in) {
 #define RA_HAVE_RECOMP 0
 #define RA_FMA_TIED 1
 #define RA_ZERO_REG 0
+/* the memory base plus an offset is one lea up to a 31-bit displacement */
+#define RA_MEMBASE_ONE(off) ((off) <= 0x7fffffffull)
 #define RA_EXTENDU_TIED 0
 #define RA_CS_TOP 0
 #define RA_MEMOP_PRESERVES 0

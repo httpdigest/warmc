@@ -915,6 +915,13 @@ static bool fold_int_unop(uint16_t op, ValType t, uint64_t a, uint64_t *out) {
     case I_EXT16S: r = (uint64_t)(int64_t)(int16_t)(uint16_t)ua & mask; break;
     case I_EXT32S: r = (uint64_t)(int64_t)(int32_t)(uint32_t)ua; break;
     case I_REF_IS_NULL: r = (ua == 0); break;
+    /* an i31 of a constant is a constant: the tagged word ref.i31 makes,
+       (low 31 bits << 1) | 1, which isel rematerialises like an integer
+       where it would be held and spilled -- luawasm's type tags */
+    case I_REF_I31:
+      if (w64) return false;
+      r = ((uint64_t)((uint32_t)a & 0x7fffffffu) << 1) | 1;
+      break;
     default: return false;
   }
 
@@ -13152,6 +13159,11 @@ static bool inst_hoistable(IrFunc *f, Ref v, bool reach_mem, bool reach_any,
      64-bit register through the whole of it, and zigbench/wordfreq's token
      loop has dozens. */
   if (in->op == I_MEM_ADDR) return false;
+  /* So does a constant one, the base plus a constant: an add next to its
+     access, where out of the loop it is one more value the loop holds all
+     the way round and spills -- luawasm's caches, a dozen cells at
+     base + 0x21000 and on, each access its own mem_ptr. */
+  if (in->op == I_MEM_PTR && in->nargs == 1 && f->insts[ir_args(f, v)[0]].op == I_CONST) return false;
   if (in->op == I_LOAD) {
 
     uint32_t lsz = (uint32_t)MEMF_SIZE(in->imm2);
@@ -14134,6 +14146,40 @@ static bool pass_invdiv(IrFunc *f) {
   }
   xfree(inloop); xfree(stack); xfree(lblk);
   if (changed) ir_apply_subst(f);
+  return changed;
+}
+
+/* A loop whose one way in is a conditional branch's -- the guard of a
+   rotated loop, or a test made just ahead of it, folded into the block
+   before -- takes nothing but constants out (pass_licm's guarded_pre): what
+   went to the end of that block would run on the way past the loop too.
+   Given a block of its own on that edge, the loop takes out what it may:
+   luawasm's fast loops, entered behind a test of each carried value's
+   type, read their tables' fields and array parts on every trip. */
+static bool licm_split_preheaders(IrFunc *f) {
+  if (warmc_getenv("WARMC_NO_LICM_SPLIT")) return false;
+  bool changed = false;
+  uint32_t n = f->norder;
+  for (uint32_t oi = 0; oi < n; oi++) {
+    uint32_t hb = f->order[oi];
+    Block *h = &f->blocks[hb];
+    bool is_header = false;
+    uint32_t pre = REF_NONE, nfwd = 0;
+    for (uint32_t p = 0; p < h->npreds; p++) {
+      uint32_t pb = h->preds[p];
+      if (f->blocks[pb].rpo >= h->rpo) is_header = true;
+      else { nfwd++; pre = pb; }
+    }
+    if (!is_header || nfwd != 1 || pre == REF_NONE) continue;
+    Block *pb = &f->blocks[pre];
+    if (pb->term != T_BRIF || pb->nsuccs != 2) continue;
+    if (pb->succs[0].target == pb->succs[1].target) continue;
+    if (pb->succs[0].eh || pb->succs[1].eh || ir_block_has_eh(f, pre)) continue;
+    uint32_t si = pb->succs[0].target == hb ? 0 : 1;
+    if (pb->succs[si].target != hb) continue;
+    gl_split_edge(f, pre, si);
+    changed = true;
+  }
   return changed;
 }
 
@@ -23118,6 +23164,7 @@ void ir_optimize(IrFunc *f, const OptOpts *o) {
   }
   if (o->addroff && TP("addr_offsets", pass_addr_offsets(f, o))) ir_order(f);
   if (o->licm) {
+    if (licm_split_preheaders(f)) ir_order(f);
     if (TP("licm", pass_licm(f, o))) {
       ir_order(f);
       if (o->dce) pass_dce(f);
