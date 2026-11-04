@@ -743,6 +743,8 @@ typedef struct {
   /* casts and type tests a sealed module's object slot decides inline, and
      the null checks of accesses after one that it makes instead */
   uint64_t slot_tests, slot_nullchks;
+  /* slot tests a branch makes itself, no 0 or 1 made (arm64 isel, T_BRIF) */
+  uint64_t slot_brs;
   /* calls through a class initializer's global pass_once dropped: through a
      dead one, and where the empty function was certain to be there */
   uint64_t once_dead, once_dominated;

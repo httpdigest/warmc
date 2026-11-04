@@ -24893,6 +24893,13 @@ void ir_optimize(IrFunc *f, const OptOpts *o) {
       ir_order(f);
       if (o->dce) pass_dce(f);
       if (o->cse) pass_cse(f, o);
+      /* the loads LICM took out of the blocks of a loop, each its own in
+         the preheader, where nothing writes between them: a fast copy's
+         array views, one a block, were ten copies of a table's ap, ar
+         and their lengths, each spilled, ahead of a loop of four trips */
+      if (o->cse && o->gcpure && !warmc_getenv("WARMC_NO_GCRLE") &&
+          !warmc_getenv("WARMC_NO_LICMRLE") && TP("licm_rle", pass_gc_rle(f)))
+        pass_cse(f, o);
       if (o->dce) pass_dce(f);
       ir_order(f);
     }

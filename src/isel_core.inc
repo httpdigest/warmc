@@ -251,6 +251,7 @@ typedef struct {
 
   struct EdgeStub {
     size_t site;
+    size_t xsite[2]; int nx; /* more b19 sites that go there: a fused slot test's */
     Move *mv; int n;
     uint32_t target;
     struct EdgeStub *next;

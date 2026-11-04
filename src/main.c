@@ -439,7 +439,7 @@ static void print_stats(void) {
           "             unrolled=%llu unr_guarded=%llu unr_rej_shape=%llu"
           " unr_rej_body=%llu unr_rej_exit=%llu unr_rej_trip=%llu"
           " unr_rej_escape=%llu unr_addr_folded=%llu gc_nullchk=%llu bce_ranges=%llu fields_promoted=%llu\n"
-          "             slot_tests=%llu slot_nullchks=%llu once_dead=%llu once_dominated=%llu once_looped=%llu\n",
+          "             slot_tests=%llu slot_nullchks=%llu slot_brs=%llu once_dead=%llu once_dominated=%llu once_looped=%llu\n",
           (unsigned long long)g_stats.folded, (unsigned long long)g_stats.dce_removed,
           (unsigned long long)g_stats.cse_removed, (unsigned long long)g_stats.licm_hoisted,
           (unsigned long long)g_stats.branch_simplified,
@@ -545,6 +545,7 @@ static void print_stats(void) {
           (unsigned long long)g_stats.fields_promoted,
           (unsigned long long)g_stats.slot_tests,
           (unsigned long long)g_stats.slot_nullchks,
+          (unsigned long long)g_stats.slot_brs,
           (unsigned long long)g_stats.once_dead,
           (unsigned long long)g_stats.once_dominated,
           (unsigned long long)g_stats.once_looped);

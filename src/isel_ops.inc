@@ -3357,6 +3357,50 @@ static void emit_block(Isel *s, uint32_t bi, uint32_t next_bi) {
       Edge *t = &b->succs[0], *e = &b->succs[1];
       Ref c = b->term_arg;
 
+      Ref sc = REF_NONE;
+      if (s->fused && s->fused[c]) {
+        if (f->insts[c].op == I_REF_SLOT) {
+          sc = c;
+        } else if (f->insts[c].op == I_EQZ && f->insts[ir_args(f, c)[0]].op == I_REF_SLOT &&
+                   s->folded[ir_args(f, c)[0]]) {
+          sc = ir_args(f, c)[0];
+          Edge *tmp = t; t = e; e = tmp;
+        }
+      }
+      if (sc != REF_NONE) {
+        /* the slot test, its failures to the false edge (of an eqz of it,
+           the true) -- through one stub out of line where the edge has
+           moves -- its pass into the other */
+        int x = rd(s, ir_args(f, sc)[0], S0);
+        size_t fail[3];
+        int nf = emit_slot_test(s, &f->insts[sc], x, -1, fail);
+        g_stats.slot_brs++;
+        uint32_t tcap = f->blocks[t->target].nparams + 1;
+        uint32_t ecap = f->blocks[e->target].nparams + 1;
+        Move *tm = xmalloc(tcap * sizeof(Move)), *em = xmalloc(ecap * sizeof(Move));
+        int tn = edge_moves(s, t, tm), en = edge_moves(s, e, em);
+        if (!en) {
+          for (int k = 0; k < nf; k++) add_fix(s, fail[k], 1, e->target);
+          xfree(em);
+        } else if (nf) {
+          struct EdgeStub *st = xmalloc(sizeof *st);
+          st->site = fail[0];
+          st->nx = nf - 1;
+          for (int k = 1; k < nf; k++) st->xsite[k - 1] = fail[k];
+          st->n = en;
+          st->mv = em;
+          st->target = e->target;
+          st->next = s->edge_stubs;
+          s->edge_stubs = st;
+        } else {
+          xfree(em);
+        }
+        parallel_copy(s, tm, tn);
+        if (t->target != next_bi) { add_fix(s, B->len, 0, t->target); a64_b(B, 0); }
+        xfree(tm);
+        break;
+      }
+
       int kind = 0, cc = CC_NE, zreg = 0, zsf = SF32;
       if (s->tbit && s->tbit[c]) {
         Ref and = f->insts[c].op == I_AND ? c : ir_args(f, c)[0];
@@ -3463,6 +3507,7 @@ static void emit_block(Isel *s, uint32_t bi, uint32_t next_bi) {
         }
         if (cold) {
           struct EdgeStub *st = xmalloc(sizeof *st);
+          st->nx = 0;
           st->n = cn;
           st->mv = xmalloc((cn ? (size_t)cn : 1) * sizeof(Move));
           memcpy(st->mv, cmv, (size_t)cn * sizeof(Move));

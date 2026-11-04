@@ -3103,6 +3103,20 @@ static void analyse_immediates(Isel *s) {
     uint16_t op = f->insts[c].op;
     bool cmpish = (op >= I_EQ && op <= I_EQZ) || (op >= I_FEQ && op <= I_FGE);
     if (cmpish && !warmc_getenv("WARMC_NO_FUSE")) s->fused[c] = 1;
+    /* a slot test the branch alone reads: its own branches go the false
+       way and its pass falls into the true one (T_BRIF), where a 0 or 1
+       made and tested again cost four instructions and a taken branch --
+       luawasm's every table and record test.  Its branches are b19s,
+       so not in a function whose branches are far. */
+    if (op == I_REF_SLOT && !s->far_br && !warmc_getenv("WARMC_NO_SLOTBR")) s->fused[c] = 1;
+    /* and the eqz of one, luawasm's br_if of a failed test: the same,
+       the ways swapped */
+    if (op == I_EQZ && s->fused[c] && !s->far_br && !warmc_getenv("WARMC_NO_SLOTBR")) {
+      Ref r = ir_args(f, c)[0];
+      if (f->insts[r].op == I_REF_SLOT && uses[r] == 1 && !blocked[r] && f->insts[r].block == bi &&
+          !s->folded[r])
+        s->folded[r] = 1;
+    }
   }
 
   /* A cast's slot test, which only its trap reads, branches to the trap
@@ -4433,6 +4447,7 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
     add_fix(s, B->len, 0, st->target);
     a64_b(B, 0);
     br_patch(s, st->site, at);
+    for (int k = 0; k < st->nx; k++) br_patch(s, st->xsite[k], at);
     xfree(st->mv); xfree(st);
     st = n;
   }
