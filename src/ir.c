@@ -1647,7 +1647,7 @@ const char *ir_op_name(uint16_t op) {
     N(I_ARRAY_NEW, "array.new"), N(I_ARRAY_NEW_SEG, "array.new_seg"),
     N(I_ARRAY_OP, "array.op"),
     N(I_ARRAY_GET, "array.get"), N(I_ARRAY_SET, "array.set"),
-    N(I_ARRAY_LEN, "array.len"),
+    N(I_ARRAY_LEN, "array.len"), N(I_ARRAY_DATA, "array.data"),
     N(I_GC_LAB_OPEN, "gc.lab_open"), N(I_GC_LAB_FLUSH, "gc.lab_flush"),
     N(I_GC_BADMASK, "gc.badmask"),
     N(I_REF_TEST, "ref.test"), N(I_REF_SLOT, "ref.test.slot"), N(I_REF_CONVERT, "ref.convert"), N(I_REF_I31, "ref.i31"), N(I_I31_GET, "i31.get"),

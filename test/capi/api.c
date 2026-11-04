@@ -1208,6 +1208,106 @@ static void test_tiers(void) {
 
 #define RUN(t) do { if (wanted(#t)) { if (g_verbose) printf("%s\n", #t); t(); } } while (0)
 
+
+/* ---- native imports: C functions the module is compiled to call --------- */
+
+static int32_t nt_add(int32_t a, int32_t b) { return a * 100 + b; }
+static int64_t nt_sum(const uint8_t *p, size_t n) {
+  int64_t t = 0;
+  for (size_t i = 0; i < n; i++) t += p[i];
+  return t;
+}
+static void nt_fill(uint8_t *p, size_t n, int32_t c) {
+  for (size_t i = 0; i < n; i++) p[i] = (uint8_t)(c + (int32_t)i);
+}
+static double nt_mix(int64_t a, const uint8_t *p, size_t n, double x) {
+  return (double)a + (double)nt_sum(p, n) + x + (double)n * 1000;
+}
+static wasm_trap_t *nt_host(const wasm_val_vec_t *args, wasm_val_vec_t *res) {
+  res->data[0].kind = WASM_I32;
+  res->data[0].of.i32 = args->data[0].of.i32 * 3;
+  return NULL;
+}
+
+static void test_native(void) {
+#if defined(__aarch64__) && !defined(_WIN32)
+  wasm_config_t *c = wasm_config_new();
+  warm_config_native_module_add(c, "c");
+  CHECK(warm_config_native_function_add(c, "nt_add", (void *)nt_add));
+  CHECK(warm_config_native_function_add(c, "nt_sum", (void *)nt_sum));
+  CHECK(warm_config_native_function_add(c, "nt_fill", (void *)nt_fill));
+  CHECK(warm_config_native_function_add(c, "nt_mix", (void *)nt_mix));
+  /* the runtime's own names are the runtime's */
+  CHECK(!warm_config_native_function_add(c, "warmc_trap", (void *)nt_add));
+  CHECK(!warm_config_native_function_add(c, "", (void *)nt_add));
+  wasm_engine_t *e = wasm_engine_new_with_config(c);
+  wasm_store_t *s = wasm_store_new(e);
+  wasm_module_t *m = module(s,
+    "(module (type $ro (array i8)) (type $rw (array (mut i8)))"
+    " (import \"c\" \"nt_add\" (func $add (param i32 i32) (result i32)))"
+    " (import \"env\" \"host\" (func $host (param i32) (result i32)))"
+    " (import \"c\" \"nt_sum\" (func $sum (param (ref $ro)) (result i64)))"
+    " (import \"c\" \"nt_fill\" (func $fill (param (ref $rw) i32)))"
+    " (import \"c\" \"nt_mix\" (func $mix (param i64 (ref null $ro) f64) (result f64)))"
+    " (func (export \"add\") (param i32 i32) (result i32) (call $add (local.get 0) (local.get 1)))"
+    " (func (export \"sum\") (param i32 i32) (result i64) (call $sum (array.new $ro (local.get 0) (local.get 1))))"
+    " (func (export \"fill\") (param i32) (result i32) (local $a (ref null $rw))"
+    "   (local.set $a (array.new_default $rw (i32.const 8)))"
+    "   (call $fill (ref.as_non_null (local.get $a)) (local.get 0))"
+    "   (i32.add (array.get_u $rw (local.get $a) (i32.const 0)) (array.get_u $rw (local.get $a) (i32.const 7))))"
+    " (func (export \"mix\") (result f64)"
+    "   (call $mix (i64.const 5) (array.new $ro (i32.const 2) (i32.const 3)) (f64.const 0.5)))"
+    " (func (export \"host\") (param i32) (result i32) (call $host (local.get 0)))"
+    " (func (export \"null\") (result f64) (call $mix (i64.const 0) (ref.null $ro) (f64.const 0))))");
+  if (m) {
+    /* the host import alone is the C API's */
+    wasm_importtype_vec_t its;
+    wasm_module_imports(m, &its);
+    CHECK(its.size == 1);
+    if (its.size == 1) {
+      const wasm_name_t *nm = wasm_importtype_name(its.data[0]);
+      CHECK(nm->size == 4 && !memcmp(nm->data, "host", 4));
+    }
+    wasm_importtype_vec_delete(&its);
+    wasm_byte_vec_t ser;
+    wasm_module_serialize(m, &ser);
+    CHECK(ser.size == 0);
+    wasm_byte_vec_delete(&ser);
+  }
+  wasm_functype_t *ft = wasm_functype_new_1_1(wasm_valtype_new_i32(), wasm_valtype_new_i32());
+  wasm_func_t *h = wasm_func_new(s, ft, nt_host);
+  wasm_functype_delete(ft);
+  wasm_extern_t *imp[1] = { wasm_func_as_extern(h) };
+  wasm_instance_t *in = instance(s, m, imp, 1);
+  if (in) {
+    wasm_val_t a[2] = { WASM_I32_VAL(3), WASM_I32_VAL(4) }, r[1] = { WASM_INIT_VAL };
+    wasm_val_vec_t av = WASM_ARRAY_VEC(a), rv = WASM_ARRAY_VEC(r);
+    CHECK(wasm_func_call(func(in, 0), &av, &rv) == NULL && r[0].of.i32 == 304);
+    a[0] = (wasm_val_t)WASM_I32_VAL(7); a[1] = (wasm_val_t)WASM_I32_VAL(10);
+    CHECK(wasm_func_call(func(in, 1), &av, &rv) == NULL && r[0].of.i64 == 70);
+    wasm_val_vec_t a1 = { 1, a };
+    a[0] = (wasm_val_t)WASM_I32_VAL(5);
+    CHECK(wasm_func_call(func(in, 2), &a1, &rv) == NULL && r[0].of.i32 == 17);
+    wasm_val_vec_t none = WASM_EMPTY_VEC;
+    CHECK(wasm_func_call(func(in, 3), &none, &rv) == NULL && r[0].of.f64 == 3011.5);
+    a[0] = (wasm_val_t)WASM_I32_VAL(2);
+    CHECK(wasm_func_call(func(in, 4), &a1, &rv) == NULL && r[0].of.i32 == 6);
+    wasm_trap_t *t = wasm_func_call(func(in, 5), &none, &rv);
+    CHECK(t != NULL && strstr(trap_msg(t), "null") != NULL);
+    if (t) wasm_trap_delete(t);
+  }
+  /* a native import no C function was given for: the compile says which */
+  char err[512];
+  wasm_module_t *bad = module_err(s, "(module (import \"c\" \"nt_missing\" (func)) (func (export \"f\") (call 0)))",
+                                  err, sizeof err);
+  CHECK(bad == NULL && strstr(err, "nt_missing") != NULL);
+  if (bad) wasm_module_delete(bad);
+  if (m) wasm_module_delete(m);
+  wasm_store_delete(s);
+  wasm_engine_delete(e);
+#endif
+}
+
 int main(int argc, char **argv) {
   g_argc = argc;
   g_argv = argv;
@@ -1229,6 +1329,7 @@ int main(int argc, char **argv) {
   RUN(test_wasi);
   RUN(test_custom);
   RUN(test_tiers);
+  RUN(test_native);
   wasm_engine_delete(engine);
   printf("capi: %d checks, %d failed\n", nchecks, nfails);
   return nfails ? 1 : 0;

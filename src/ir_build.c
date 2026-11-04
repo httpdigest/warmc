@@ -68,6 +68,89 @@ static inline BlockType rd_bt(Bld *b) { return rd_blocktype(&b->rd); }
 static inline uint32_t rd_f32bits(Bld *b) { return rd_u32le(&b->rd); }
 static inline uint64_t rd_f64bits(Bld *b) { return rd_u64le(&b->rd); }
 
+/* A native import's parameter of a byte array type, (ref null? $t) of an
+   (array i8) or (array (mut i8)): its C function takes the address of the
+   array's bytes and their count (mark_native_imports) */
+bool native_bytes_param(const Module *m, ValType t) {
+  if (!vt_is_ref(t) || !vt_concrete(t)) return false;
+  uint32_t ti = vt_type_index(t);
+  return ti < m->ntypes && m->types[ti].kind == CT_ARRAY && m->types[ti].nfields == 1 &&
+         m->types[ti].fields[0].type == VT_I8;
+}
+
+/* Every function import of a --native-module becomes a call of the C function
+   of its name: the module asks for it by name, and the system linker finds it
+   in what --link gives it.  Only calls: C has no wasm function to hand back
+   for ref.func, a table or an export, and only the values C passes in
+   registers as wasm has them.  How many there are. */
+uint32_t mark_native_imports(Module *m, const char *const *mods, uint32_t nmods) {
+  uint32_t n = 0;
+  for (uint32_t fi = 0; fi < m->nfuncs; fi++) {
+    Func *fn = &m->funcs[fi];
+    if (!fn->imported) continue;
+    const Import *im = &m->imports[fn->import_index];
+    bool native = false;
+    for (uint32_t k = 0; k < nmods && !native; k++)
+      native = strlen(mods[k]) == im->module_len && !memcmp(mods[k], im->module, im->module_len);
+    if (!native) continue;
+    const CompType *t = &m->types[fn->type_index];
+    bool ok = t->nresults <= 1;
+    /* a byte array, (array i8) or (array (mut i8)), as the address of its
+       bytes and their count: two of C's arguments */
+    for (uint32_t k = 0; k < t->nparams && ok; k++)
+      ok = t->params[k] == VT_I32 || t->params[k] == VT_I64 ||
+           t->params[k] == VT_F32 || t->params[k] == VT_F64 || native_bytes_param(m, t->params[k]);
+    for (uint32_t k = 0; k < t->nresults && ok; k++)
+      ok = t->results[k] == VT_I32 || t->results[k] == VT_I64 ||
+           t->results[k] == VT_F32 || t->results[k] == VT_F64;
+    if (!ok)
+      warmc_fatal("native import %.*s.%.*s: a C function is called with i32, i64, f32, "
+                  "f64 and byte arrays alone, and returns at most one of the four numbers",
+                  (int)im->module_len, im->module, (int)im->name_len, im->name);
+    if (!strcmp(im->name, "warmc_memory_base")) {
+      if (t->nparams || t->nresults != 1 || t->results[0] != VT_I64 || !m->nmemories)
+        warmc_fatal("native import %.*s.warmc_memory_base: memory 0's base, an i64 of a "
+                    "module with a memory, and takes no arguments",
+                    (int)im->module_len, im->module);
+      fn->native_memory_base = true;
+    } else if (!strcmp(im->name, "warmc_call") || !strncmp(im->name, "warmc_call.", 11)) {
+      if (!t->nparams || t->params[t->nparams - 1] != VT_I64)
+        warmc_fatal("native import %.*s.%s: a call of the C function at the address its "
+                    "last argument, an i64, gives",
+                    (int)im->module_len, im->module, im->name);
+      fn->native_indirect = true;
+    } else if (!im->name_len || strlen(im->name) != im->name_len) {
+      warmc_fatal("native import %.*s: a C function's name, not empty and without a NUL",
+                  (int)im->module_len, im->module);
+    }
+    fn->native = true;
+    n++;
+  }
+  if (!n) return 0;
+  for (uint32_t e = 0; e < m->nexports; e++)
+    if (m->exports[e].kind == EK_FUNC && m->funcs[m->exports[e].index].native)
+      warmc_fatal("export %.*s is a native import: a native import can only be called",
+                  (int)m->exports[e].name_len, m->exports[e].name);
+  if (m->has_start && m->funcs[m->start_func].native)
+    warmc_fatal("the start function is a native import: a native import can only be called");
+  for (uint32_t g = 0; g < m->nglobals; g++)
+    for (uint32_t k = 0; k < m->globals[g].init.n; k++) {
+      const InitInsn *x = &m->globals[g].init.ins[k];
+      if (x->op == IOP_REF_FUNC && x->lo < m->nfuncs && m->funcs[x->lo].native)
+        warmc_fatal("global %u holds native import %u: a native import can only be called",
+                    g, (uint32_t)x->lo);
+    }
+  for (uint32_t e = 0; e < m->nelems; e++)
+    for (uint32_t i = 0; i < m->elems[e].n; i++)
+      for (uint32_t k = 0; k < m->elems[e].items[i].n; k++) {
+        const InitInsn *x = &m->elems[e].items[i].ins[k];
+        if (x->op == IOP_REF_FUNC && x->lo < m->nfuncs && m->funcs[x->lo].native)
+          warmc_fatal("element segment %u holds native import %u: a native import can only "
+                      "be called", e, (uint32_t)x->lo);
+      }
+  return n;
+}
+
 static void push(Bld *b, Ref r) {
   if (b->sp == b->cap_stack) {
     b->cap_stack = b->cap_stack ? b->cap_stack * 2 : 32;
@@ -75,6 +158,41 @@ static void push(Bld *b, Ref r) {
   }
   b->stack[b->sp++] = r;
 }
+static Ref pop(Bld *b);
+
+/* A native call's arguments as its C function takes them, n of them: each
+   byte array its count, then -- made last, just ahead of the call, as
+   I_ARRAY_DATA must be -- the address of its bytes, an i64 each, in the
+   order address, count; a null traps as its array.len would.  NULL where
+   the call takes no byte array, its arguments as they are. */
+static Ref *native_args(Bld *b, const CompType *sig, const Ref *args, uint32_t *n) {
+  IrFunc *f = b->f;
+  uint32_t nb = 0;
+  for (uint32_t i = 0; i < sig->nparams; i++) nb += native_bytes_param(b->m, sig->params[i]);
+  if (!nb) { *n = sig->nparams; return NULL; }
+  Ref *out = xmalloc((sig->nparams + nb) * sizeof(Ref));
+  Ref *lens = xmalloc(sig->nparams * sizeof(Ref));
+  for (uint32_t i = 0; i < sig->nparams; i++) {
+    lens[i] = REF_NONE;
+    if (!native_bytes_param(b->m, sig->params[i])) continue;
+    Ref o = args[i];
+    uint64_t fl = vt_nullable(sig->params[i]) ? GCF_NULLCHK : 0u;
+    Ref len = ir_emit(f, b->cur, I_ARRAY_LEN, VT_I32, &o, 1, 0, fl);
+    lens[i] = ir_emit(f, b->cur, I_EXTENDU, VT_I64, &len, 1, 0, 0);
+  }
+  uint32_t k = 0;
+  for (uint32_t i = 0; i < sig->nparams; i++) {
+    if (lens[i] == REF_NONE) { out[k++] = args[i]; continue; }
+    Ref o = args[i];
+    uint32_t ti = vt_type_index(sig->params[i]);
+    out[k++] = ir_emit(f, b->cur, I_ARRAY_DATA, VT_I64, &o, 1, b->m->types[ti].hdr_size, 0);
+    out[k++] = lens[i];
+  }
+  xfree(lens);
+  *n = k;
+  return out;
+}
+
 static Ref pop(Bld *b) {
   if (b->sp == 0) warmc_fatal("operand stack underflow while building IR");
   return b->stack[--b->sp];
@@ -1836,9 +1954,12 @@ IrFunc *ir_build_unordered(Module *m, uint32_t fi, const OptOpts *opt) {
           break;
         }
         uint32_t base = b->sp - sig->nparams;
+        uint32_t nargs = sig->nparams;
+        Ref *nat = m->funcs[idx].native ? native_args(b, sig, &b->stack[base], &nargs) : NULL;
         Ref call = ir_emit(f, b->cur, I_CALL,
                            sig->nresults == 1 ? sig->results[0] : 0,
-                           &b->stack[base], sig->nparams, idx, 0);
+                           nat ? nat : &b->stack[base], nargs, idx, 0);
+        xfree(nat);
         b->sp = base;
         eh_split(b);
         if (sig->nresults == 1) push(b, call);
@@ -1886,10 +2007,13 @@ IrFunc *ir_build_unordered(Module *m, uint32_t fi, const OptOpts *opt) {
           if (m->funcs[imm].native) {
             /* C has no tail call on wasm's terms: a call, then the return */
             uint32_t base = b->sp - sig->nparams;
+            uint32_t nargs = sig->nparams;
+            Ref *nat = m->funcs[imm].native_memory_base ? NULL : native_args(b, sig, &b->stack[base], &nargs);
             Ref call = m->funcs[imm].native_memory_base
                 ? ir_emit(f, b->cur, I_MEM_BASE, VT_I64, NULL, 0, 0, 0)
                 : ir_emit(f, b->cur, I_CALL, sig->nresults == 1 ? sig->results[0] : 0,
-                          &b->stack[base], sig->nparams, imm, 0);
+                          nat ? nat : &b->stack[base], nargs, imm, 0);
+            xfree(nat);
             b->sp = base;
             Block *blk = &f->blocks[b->cur];
             set_term(b, b->cur, T_RETURN);

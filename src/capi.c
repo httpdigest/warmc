@@ -704,6 +704,11 @@ struct wasm_config_t {
   size_t nflags;
   uint32_t threads;
   bool tiered;
+  /* warm_config_native_module_add's and warm_config_native_function_add's */
+  char **native_mods;
+  size_t nnative_mods;
+  JitNative *natives;
+  size_t nnatives;
 };
 
 own wasm_config_t *wasm_config_new(void) {
@@ -716,6 +721,10 @@ void wasm_config_delete(own wasm_config_t *c) {
   if (!c) return;
   for (size_t i = 0; i < c->nflags; i++) free(c->flags[i]);
   free(c->flags);
+  for (size_t i = 0; i < c->nnative_mods; i++) free(c->native_mods[i]);
+  free(c->native_mods);
+  for (size_t i = 0; i < c->nnatives; i++) free((char *)c->natives[i].name);
+  free(c->natives);
   free(c);
 }
 
@@ -733,6 +742,25 @@ void warm_config_flag_add(wasm_config_t *c, const char *flag) {
   c->flags = realloc(c->flags, (c->nflags + 1) * sizeof(char *));
   if (!c->flags) oom();
   c->flags[c->nflags++] = xstrdup_n(flag, strlen(flag));
+}
+
+void warm_config_native_module_add(wasm_config_t *c, const char *module) {
+  c->native_mods = realloc(c->native_mods, (c->nnative_mods + 1) * sizeof(char *));
+  if (!c->native_mods) oom();
+  c->native_mods[c->nnative_mods++] = xstrdup_n(module, strlen(module));
+}
+
+bool warm_config_native_function_add(wasm_config_t *c, const char *name, void *fn) {
+  /* a name of the runtime's is the runtime's: the module's code calls both
+     by name, and could not tell them apart */
+  if (!name || !*name || !fn || jit_rt_has(name)) return false;
+  for (size_t i = 0; i < c->nnatives; i++)
+    if (!strcmp(c->natives[i].name, name)) { c->natives[i].fn = fn; return true; }
+  c->natives = realloc(c->natives, (c->nnatives + 1) * sizeof *c->natives);
+  if (!c->natives) oom();
+  c->natives[c->nnatives].name = xstrdup_n(name, strlen(name));
+  c->natives[c->nnatives++].fn = fn;
+  return true;
 }
 
 typedef struct ModuleRec ModuleRec;
@@ -760,6 +788,10 @@ own wasm_engine_t *wasm_engine_new_with_config(own wasm_config_t *c) {
   e->opts.nflags = (uint32_t)e->config->nflags;
   e->opts.threads = e->config->threads;
   e->opts.tiered = e->config->tiered || tier_mode() != TIER_ENV_OFF;
+  e->opts.native_modules = (const char *const *)e->config->native_mods;
+  e->opts.nnative_modules = (uint32_t)e->config->nnative_mods;
+  e->opts.natives = e->config->natives;
+  e->opts.nnatives = (uint32_t)e->config->nnatives;
   pthread_mutex_init(&e->lock, NULL);
   return e;
 }
@@ -1372,15 +1404,25 @@ bool warm_module_optimized(const wasm_module_t *m, bool wait) {
   return jit_module_optimized(((const ModuleEnt *)m)->mod->jm, wait);
 }
 
+/* How many of the module's imports the C API has: a native import is a call
+   of a C function the module was compiled to make, nothing an
+   instantiation binds */
+static uint32_t visible_imports(const JitModule *jm) {
+  uint32_t n = 0;
+  for (uint32_t i = 0; i < jm->nimports; i++) n += !jm->imports[i].native;
+  return n;
+}
+
 void wasm_module_imports(const wasm_module_t *m, own wasm_importtype_vec_t *out) {
   const JitModule *jm = jm_of(m);
-  wasm_importtype_vec_new_uninitialized(out, jm->nimports);
-  for (uint32_t i = 0; i < jm->nimports; i++) {
+  wasm_importtype_vec_new_uninitialized(out, visible_imports(jm));
+  for (uint32_t i = 0, k = 0; i < jm->nimports; i++) {
     const JitExtern *x = &jm->imports[i];
+    if (x->native) continue;
     wasm_name_t mod, name;
     wasm_byte_vec_new(&mod, x->module_len, x->module);
     wasm_byte_vec_new(&name, x->name_len, x->name);
-    out->data[i] = wasm_importtype_new(&mod, &name, externtype_of(x));
+    out->data[k++] = wasm_importtype_new(&mod, &name, externtype_of(x));
   }
 }
 
@@ -1397,6 +1439,8 @@ void wasm_module_exports(const wasm_module_t *m, own wasm_exporttype_vec_t *out)
 
 void wasm_module_serialize(const wasm_module_t *m, own wasm_byte_vec_t *out) {
   size_t n = 0;
+  /* (where a native import's C function is no serialised module can say) */
+  if (jit_has_natives(jm_of(m))) { wasm_byte_vec_new_empty(out); return; }
   uint8_t *p = jit_serialize(jm_of(m), &n);
   if (!p) { wasm_byte_vec_new_empty(out); return; }
   wasm_byte_vec_new(out, n, (const wasm_byte_t *)p);
@@ -2255,9 +2299,13 @@ own wasm_instance_t *warm_instance_new(wasm_store_t *s, const wasm_module_t *mod
   const ModuleDesc *md = mr->md;
   WarmBinding *b = xzalloc((jm->nimports ? jm->nimports : 1) * sizeof *b);
   char *why = NULL;
-  for (uint32_t i = 0; i < jm->nimports && !why; i++) {
+  /* the externs given are of the imports the C API has: a native import's
+     binding is none, its call made straight (WARMC_IMPORT_NATIVE) */
+  for (uint32_t i = 0, k = 0; i < jm->nimports && !why; i++) {
     const JitExtern *x = &jm->imports[i];
-    const Ent *e = imports && i < imports->size ? (const Ent *)imports->data[i] : NULL;
+    if (x->native) continue;
+    uint32_t at = k++;
+    const Ent *e = imports && at < imports->size ? (const Ent *)imports->data[at] : NULL;
     if (!e) { why = msgf("no import given for \"%s\".\"%s\"%s", x, ""); break; }
     /* a store's wasm reaches its own store's alone: another's runs in the
        other store's runtime, on whatever thread that one is entered by */
@@ -2566,9 +2614,11 @@ bool warm_wasi_imports(wasm_store_t *s, const wasm_module_t *module,
     return false;
   }
 
-  wasm_extern_vec_new_uninitialized(out, jm->nimports);
-  for (uint32_t i = 0; i < jm->nimports; i++) {
+  wasm_extern_vec_new_uninitialized(out, visible_imports(jm));
+  for (uint32_t i = 0, k = 0; i < jm->nimports; i++) {
     const JitExtern *x = &jm->imports[i];
+    if (x->native) continue;
+    uint32_t at = k++;
     if (x->kind != JIT_EXT_FUNC || x->module_len != 22 ||
         memcmp(x->module, "wasi_snapshot_preview1", 22))
       continue;
@@ -2584,7 +2634,7 @@ bool warm_wasi_imports(wasm_store_t *s, const wasm_module_t *module,
         want->ft.nresults != x->ft.nresults ||
         memcmp(want->ft.types, x->ft.types, x->ft.nparams + x->ft.nresults))
       continue;
-    out->data[i] = (wasm_extern_t *)wasi_func(s, fn, &want->ft);
+    out->data[at] = (wasm_extern_t *)wasi_func(s, fn, &want->ft);
   }
   return true;
 }

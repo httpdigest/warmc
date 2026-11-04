@@ -293,6 +293,7 @@ static void read_types(const Module *m, JitModule *jm) {
     switch (im->kind) {
       case EK_FUNC:
         x->kind = JIT_EXT_FUNC;
+        x->native = m->funcs[fi].native;
         func_type(m, m->funcs[fi++].type_index, &x->ft);
         break;
       case EK_TABLE:
@@ -503,7 +504,7 @@ static JitImage *image_of(ObjBuilder *o) {
 /* ---- compiling ---------------------------------------------------------- */
 
 static JitCode *load(const JitImage *im, const uint8_t *const sec[NSEC],
-                     void *near, char **err);
+                     void *near, const JitOpts *o, char **err);
 static uint64_t code_text(const JitCode *c);
 
 /* Where each function's code starts in the object's text, by the
@@ -578,6 +579,12 @@ static void do_compile(CompileJob *job) {
   Module *m = wasm_parse(job->bin, job->len);
   job->m = m;
   wasm_validate(m);
+  if (job->opts && job->opts->nnative_modules) {
+#if !defined(__aarch64__)
+    warmc_fatal("native modules: C functions are called from AArch64 code alone");
+#endif
+    mark_native_imports(m, job->opts->native_modules, job->opts->nnative_modules);
+  }
 
   JitModule *jm = NULL;
   if (job->tier != 2) {
@@ -599,7 +606,7 @@ static void do_compile(CompileJob *job) {
   JitImage *im = image_of(&o);
   const uint8_t *sec[NSEC] = { o.text.data, o.rodata.data, o.data.data, o.custom.data };
   char *lerr = NULL;
-  JitCode *code = load(im, sec, job->near, &lerr);
+  JitCode *code = load(im, sec, job->near, job->opts, &lerr);
   if (!code) {
     char msg[512];
     snprintf(msg, sizeof msg, "%s", lerr ? lerr : "the module cannot be placed");
@@ -708,6 +715,8 @@ static void *rt_sym(const char *name) {
   }
   return NULL;
 }
+
+bool jit_rt_has(const char *name) { return rt_sym(name) != NULL; }
 
 /* ---- code memory ---------------------------------------------------------
    Arenas reserved beside the runtime, in pairs: one for text, within branch
@@ -1204,11 +1213,17 @@ static bool veneers_always(void) {
    relocations against where they landed; NULL with *err set when there is
    no room within reach of the runtime. */
 static JitCode *load(const JitImage *im, const uint8_t *const sec[NSEC],
-                     void *near, char **err) {
+                     void *near, const JitOpts *o, char **err) {
   void **ext = malloc(sizeof(void *) * (im->next ? im->next : 1));
   if (!ext) { *err = fmt_err("out of memory"); return NULL; }
   for (uint32_t i = 0; i < im->next; i++) {
-    ext[i] = rt_sym(im->ext[i]);
+    /* a native import's C function, by the name it was given under, else
+       the runtime's (a name of the runtime's is refused as a native's:
+       warm_config_native_function_add) */
+    ext[i] = NULL;
+    for (uint32_t k = 0; o && k < o->nnatives && !ext[i]; k++)
+      if (!strcmp(o->natives[k].name, im->ext[i])) ext[i] = o->natives[k].fn;
+    if (!ext[i]) ext[i] = rt_sym(im->ext[i]);
     if (!ext[i]) {
       *err = fmt_err("the module refers to %s, which the runtime does not have",
                      im->ext[i]);
@@ -1348,6 +1363,11 @@ struct JitTier {
   int level;
   char **flags;
   uint32_t nflags, threads;
+  /* the engine's, which outlives the module */
+  const char *const *native_modules;
+  uint32_t nnative_modules;
+  const JitNative *natives;
+  uint32_t nnatives;
   uint64_t *entry0;           /* each function's -O0 code, or UINT64_MAX */
   uint32_t nentry0;
   JitCode *code2;
@@ -1446,6 +1466,10 @@ static void tier_run(JitTier *t) {
   o.flags = (const char *const *)t->flags;
   o.nflags = t->nflags;
   o.threads = t->threads;
+  o.native_modules = t->native_modules;
+  o.nnative_modules = t->nnative_modules;
+  o.natives = t->natives;
+  o.nnatives = t->nnatives;
   CompileJob job;
   memset(&job, 0, sizeof job);
   job.bin = t->bin;
@@ -1551,6 +1575,10 @@ static void tier_start(JitModule *jm, const uint8_t *bin, size_t len, const JitO
   t->flags = fl;
   t->nflags = o->nflags;
   t->threads = o->threads;
+  t->native_modules = o->native_modules;
+  t->nnative_modules = o->nnative_modules;
+  t->natives = o->natives;
+  t->nnatives = o->nnatives;
   t->entry0 = entries;
   t->nentry0 = nentries;
   t->state = TIER_QUEUED;
@@ -1643,6 +1671,12 @@ static void put_extern(Buf *b, const JitExtern *x, bool imp) {
   put64(b, x->ft.nparams);
   put64(b, x->ft.nresults);
   buf_bytes(b, x->ft.types, x->ft.nparams + x->ft.nresults);
+}
+
+bool jit_has_natives(const JitModule *m) {
+  for (uint32_t i = 0; i < m->nimports; i++)
+    if (m->imports[i].native) return true;
+  return false;
 }
 
 uint8_t *jit_serialize(const JitModule *m, size_t *len) {
@@ -1844,7 +1878,7 @@ JitModule *jit_deserialize(const uint8_t *p, size_t len, char **err) {
     *err = fmt_err("a serialised module that is cut short or damaged");
     return NULL;
   }
-  m->code = load(im, sec, NULL, err);
+  m->code = load(im, sec, NULL, NULL, err);
   if (!m->code) {
     jit_module_free(m, false);
     return NULL;

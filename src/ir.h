@@ -137,6 +137,12 @@ typedef enum {
   I_ARRAY_GET,
   I_ARRAY_SET,
   I_ARRAY_LEN,
+  /* args: an array -> the native address of its element 0, imm past its
+     header: a byte array's bytes for a native import's C function, which
+     reads or writes them where they are (ir_build.c native_args).  Valid
+     until the next safepoint -- the collector may move the array then --
+     so it has an effect: nothing moves it from just before its call. */
+  I_ARRAY_DATA,
 
   I_GC_LAB_OPEN,
   I_GC_LAB_FLUSH,

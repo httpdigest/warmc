@@ -547,6 +547,12 @@ static inline bool vt_ref_collectable(const Module *m, ValType t) {
 }
 
 Module *wasm_parse(const uint8_t *bin, size_t len);
+/* a --native-module import's parameter of a byte array type, which its C
+   function takes as the address of the bytes and their count (ir_build.c) */
+bool native_bytes_param(const Module *m, ValType t);
+/* marks the function imports of the modules named native (Func.native),
+   refusing what a C function cannot be called as; how many (ir_build.c) */
+uint32_t mark_native_imports(Module *m, const char *const *mods, uint32_t nmods);
 /* Decodes every body of m, validating none, and raises the first that does
    not decode as malformed: the spec decodes a whole module before it
    validates any of it, so this runs before a verdict of invalid is given. */

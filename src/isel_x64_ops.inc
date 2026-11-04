@@ -2718,6 +2718,9 @@ static void emit_inst(Isel *s, Ref v) {
       break;
     }
 
+    case I_ARRAY_DATA:
+      warmc_fatal("internal: array.data, a native import's, on x86-64");
+
     case I_ARRAY_LEN: {
       int x = rd(s, a[0], S0);
       if (in->imm2 & GCF_NULLCHK) trap_if_zero(s, 1, x, TRAP_NULL_REF);

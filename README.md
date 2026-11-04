@@ -990,10 +990,19 @@ build/warmc --target macos --rt build/warmrt-macos.a --wasi \
   --native-module c --link "gl.o -framework OpenGL" -o app app.wasm
 ```
 
-- A native import takes and returns `i32`, `i64`, `f32` and `f64` alone, at
-  most one result, and can only be called: one exported, in a table, taken
+- A native import takes and returns `i32`, `i64`, `f32` and `f64`, at most
+  one result, and takes byte arrays too: an `(array i8)` or `(array (mut i8))`
+  parameter is two of C's arguments, `uint8_t *bytes, size_t count`, the
+  array's own bytes, which C reads and writes in place while the call runs
+  (a collection waits for it; the array may be elsewhere at the next call),
+  and a null traps. It can only be called: one exported, in a table, taken
   by `ref.func` or used as the start function is refused. A tail call of one
   is a call and a return.
+- The JIT makes the same calls: `warm_config_native_module_add` names a
+  native module and `warm_config_native_function_add` the C function of
+  each name (include/warm.h). Such an import is none of the C API's: no
+  instantiation binds it. A call costs what a C call does, 0.7 ns, where a
+  `wasm_func_new` host function's costs 11.
 - A pointer is an `i64` native address. `warmc_memory_base`, of type
   `() -> i64` in a native module, is not a C function but memory 0's base,
   the native address of offset 0, read from the register warmc keeps it in;

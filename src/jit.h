@@ -35,6 +35,12 @@ typedef struct {
   uint8_t *types;               /* the parameters' kinds, then the results' */
 } JitFuncType;
 
+/* A C function a native import calls: the import's name, its address */
+typedef struct {
+  const char *name;
+  void *fn;
+} JitNative;
+
 /* An import or export and its type as the module declares it */
 typedef struct {
   char *module;                 /* an import's module name, else NULL */
@@ -47,6 +53,10 @@ typedef struct {
   bool has_max;
   uint64_t min, max;            /* a memory's (in pages) or a table's limits */
   JitFuncType ft;               /* a function's or a tag's */
+  /* a function import of a native module (JitOpts.native_modules): a call
+     of a C function, bound when the module is compiled, no import of the
+     C API's */
+  bool native;
 } JitExtern;
 
 /* A function type and the id the compiler gives it, which a function
@@ -88,6 +98,12 @@ typedef struct {
      behind it, on a thread of its own, sending each function's calls to
      its optimised code once that is in place */
   bool tiered;
+  /* modules whose function imports are calls of C functions, as warmc's
+     --native-module makes them, and the C functions they call by name */
+  const char *const *native_modules;
+  uint32_t nnative_modules;
+  const JitNative *natives;
+  uint32_t nnatives;
 } JitOpts;
 
 /* Compiles a binary module and places it; NULL with *err set (to a message
@@ -112,6 +128,11 @@ const void *jit_module_desc(const JitModule *m);
 /* The module as bytes, and back, placed again: what wasm_module_serialize
    and wasm_module_deserialize trade in. */
 uint8_t *jit_serialize(const JitModule *m, size_t *len);
+/* Whether the module calls C functions as native imports: a serialised
+   module cannot say where they are */
+bool jit_has_natives(const JitModule *m);
+/* Whether the runtime has a symbol of this name */
+bool jit_rt_has(const char *name);
 JitModule *jit_deserialize(const uint8_t *p, size_t len, char **err);
 
 /* Whether a tiered module's optimised code is in place (any other

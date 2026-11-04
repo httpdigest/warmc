@@ -131,27 +131,58 @@ def run_refusals(work, target, rt):
         fail("-c: warmc_call is a symbol of the object, not a call through an address")
 
 
+# each program, its C, and what it prints when every check holds: bytes.wat
+# hands C byte arrays, the address of their bytes and their count
+PROGRAMS = (("natives", "native: ok\n"), ("bytes", "bytes: ok\n"))
+
+
 def run_calls(work, target, rt, cflags):
-    obj = os.path.join(work, "natives.o")
-    r = subprocess.run(["clang", "-O2", "-c"] + cflags + ["-I", os.path.join(ROOT, "rt"), "-o", obj,
-                        os.path.join(NATIVE, "natives.c")], capture_output=True, text=True)
-    if r.returncode != 0:
-        fail("clang natives.c: %s" % r.stderr[:400])
-        return 0
     runs = 0
-    for level in ("-O0", "-O1", "-O2", "-O3"):
-        exe = os.path.join(work, "natives" + level)
-        r = warmc(["--target", target, "--rt", rt, "--wasi", level, "--native-module", "c", "--link", obj,
-                   "-o", exe, os.path.join(NATIVE, "natives.wat")])
+    for name, ok in PROGRAMS:
+        obj = os.path.join(work, name + ".o")
+        r = subprocess.run(["clang", "-O2", "-c"] + cflags + ["-I", os.path.join(ROOT, "rt"), "-o", obj,
+                            os.path.join(NATIVE, name + ".c")], capture_output=True, text=True)
         if r.returncode != 0:
-            fail("natives.wat %s: warmc: %s" % (level, r.stderr.strip()[:400]))
+            fail("clang %s.c: %s" % (name, r.stderr[:400]))
             continue
-        got = subprocess.run([exe], capture_output=True, text=True)
-        runs += 1
-        if got.returncode != 0 or got.stdout != "native: ok\n":
-            fail("natives.wat %s: exit %d (the check that failed), stdout %r"
-                 % (level, got.returncode, got.stdout[:200]))
+        for level in ("-O0", "-O1", "-O2", "-O3"):
+            exe = os.path.join(work, name + level)
+            r = warmc(["--target", target, "--rt", rt, "--wasi", level, "--native-module", "c", "--link", obj,
+                       "-o", exe, os.path.join(NATIVE, name + ".wat")])
+            if r.returncode != 0:
+                fail("%s.wat %s: warmc: %s" % (name, level, r.stderr.strip()[:400]))
+                continue
+            got = subprocess.run([exe], capture_output=True, text=True)
+            runs += 1
+            if got.returncode != 0 or got.stdout != ok:
+                fail("%s.wat %s: exit %d (the check that failed), stdout %r"
+                     % (name, level, got.returncode, got.stdout[:200]))
+        if name == "bytes":
+            run_null(work, target, rt, obj)
     return runs
+
+
+# a null passed for a nullable byte array traps, as its array.len would
+NULL_BYTES = '''(module
+  (type $ro (array i8))
+  (import "c" "nb_count" (func $count (param (ref null $ro) i32) (result i32)))
+  (memory 1)
+  (func (export "_start") (drop (call $count (ref.null $ro) (i32.const 0)))))'''
+
+
+def run_null(work, target, rt, obj):
+    src = os.path.join(work, "null.wat")
+    with open(src, "w") as f:
+        f.write(NULL_BYTES)
+    exe = os.path.join(work, "null")
+    r = warmc(["--target", target, "--rt", rt, "--wasi", "-O2", "--native-module", "c", "--link", obj,
+               "-o", exe, src])
+    if r.returncode != 0:
+        fail("null bytes: warmc: %s" % r.stderr.strip()[:300])
+        return
+    got = subprocess.run([exe], capture_output=True, text=True)
+    if got.returncode == 0 or "null" not in got.stderr:
+        fail("null bytes: exit %d, stderr %r: no null trap" % (got.returncode, got.stderr[:200]))
 
 
 SHAPE = '''(module

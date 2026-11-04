@@ -34,6 +34,22 @@ WASM_API_EXTERN bool warm_config_opt_level_set(wasm_config_t*, int level);
    the order they were added, after the level.  An unknown one makes every
    compile with the config fail, saying which. */
 WASM_API_EXTERN void warm_config_flag_add(wasm_config_t*, const char* flag);
+/* Every function import of `module` is a call of a C function, as warmc's
+   --native-module makes it: no host function, no thunk, the arguments in
+   the registers and stack slots C's convention has them in, the C function
+   the one warm_config_native_function_add names after the import.  Such an
+   import takes i32, i64, f32, f64 and byte arrays -- (array i8) or (array
+   (mut i8)), each two of C's arguments, `uint8_t *bytes, size_t count`,
+   valid while the call runs and written in place by a C function that
+   writes them; a null traps -- and returns at most one of the four numbers;
+   it can only be called (no ref.func, table, export or start of one).  It
+   is no import of the C API's: wasm_module_imports does not list it, and
+   an instantiation binds nothing to it.  A module that has one cannot be
+   serialised.  AArch64's alone, as warmc's. */
+WASM_API_EXTERN void warm_config_native_module_add(wasm_config_t*, const char* module);
+/* The C function native imports named `name` call.  false where the name is
+   empty or the runtime's own (the module's code reaches both by name). */
+WASM_API_EXTERN bool warm_config_native_function_add(wasm_config_t*, const char* name, void* fn);
 
 /* How many threads compile a module's functions at once: each holds the
    code of the function it compiles, so fewer use less memory at the peak

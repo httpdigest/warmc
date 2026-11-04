@@ -2662,6 +2662,15 @@ static void emit_inst(Isel *s, Ref v) {
       break;
     }
 
+    case I_ARRAY_DATA: {
+      int x = rd(s, a[0], S0);
+      if (in->imm2 & GCF_NULLCHK) trap_if_zero(s, SF64, x, TRAP_NULL_REF);
+      int d = wr(s, v, S0);
+      a64_add_imm(B, SF64, d, x, (uint32_t)in->imm, 0);
+      commit(s, v, d);
+      break;
+    }
+
     case I_REF_TEST: {
 
       /* The run-time id answers for this module's own objects: the header id
