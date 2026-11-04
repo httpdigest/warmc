@@ -1855,16 +1855,19 @@ working memory when it ends.
     `start + cmin >= 0`, and start passing the test of one at the end --
     enter the copy, whose accesses the ranges then prove, and where one
     fails the original, which keeps its checks and traps where it would
-    have, marked cold and not unrolled.  Java's and Kotlin's
-    `for (i = 0; i < count; i++) dst[i] = src[i]`, whose `count` is a field
-    no length is known to bound, and luawasm's i64 counters indexing at
+    have, marked cold and not unrolled.  A counter stepping down, tested
+    `i + c0 >= m` (or `>`), is copied behind `start + cmax < len` and
+    `m >= c0 - cmin` (one less for `>`), the second left out where `m` is a
+    constant that says it -- Java's `for (i = n - 1; i >= 0; i--)`.  Java's
+    and Kotlin's `for (i = 0; i < count; i++) dst[i] = src[i]`, whose
+    `count` is a field no length is known to bound, and luawasm's i64 counters indexing at
     their wrap: a signed compare of a widening that keeps its value -- a
     sign extension, a zero extension of what is not negative -- says the
     same of what it widens (`rp_unext`, `WARMC_NO_BCE_UNEXT=1`).  Of loops
     of at most 400 instructions with no landing pad, at `-O2`
     (`WARMC_NO_BCE_VERSION=1` copies none; `WARMC_BV_DEBUG=1` says why a
     loop is left; `--stats` counts `bce_versioned`): javabench's accesses
-    with a check go from 9987 to 6584, 639 loops copied.
+    with a check go from 9987 to 6311, 853 loops copied.
   - Objects, and arrays of a constant length, are bumped inline from the
     program's allocation buffer, zeroed when their page was opened; on
     AArch64 so are arrays of a computed length.

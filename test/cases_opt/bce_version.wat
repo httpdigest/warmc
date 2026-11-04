@@ -9,8 +9,11 @@
 ;; stores are made: copy's destination is read back after a trap no more,
 ;; but its sum is, so each m past the end must trap and each m within must
 ;; not.  A do-while entered with start past m runs once, through the
-;; original.  The count is of the loops copied.
-;; stats -O2: bce_versioned=10
+;; original.  A counter stepping down from start, tested i >= m or i > m:
+;; start + cmax below the length and m + cmin, less what the test adds, not
+;; negative -- Java's for (i = n - 1; i >= 0; i--), its m a constant that
+;; needs no test.  The count is of the loops copied.
+;; stats -O2: bce_versioned=16
 ;; run: sum 10 10 => i32:45
 ;; run: sum 10 4 => i32:6
 ;; run: sum 10 0 => i32:0
@@ -31,6 +34,24 @@
 ;; run: unsigned 10 -1 => trap: out of bounds array access
 ;; run: wide 10 10 => i64:45
 ;; run: wide 10 11 => trap: out of bounds array access
+;; run: rsum 10 9 => i32:45
+;; run: rsum 10 4 => i32:10
+;; run: rsum 10 -1 => i32:0
+;; run: rsum 10 10 => trap: out of bounds array access
+;; run: rsum_m 10 9 3 => i32:42
+;; run: rsum_m 10 9 10 => i32:0
+;; run: rsum_m 10 9 -1 => trap: out of bounds array access
+;; run: rwindow 10 9 => i32:81
+;; run: rwindow 10 0 => i32:0
+;; run: rwindow 10 10 => trap: out of bounds array access
+;; run: rdowhile 10 9 0 => i32:45
+;; run: rdowhile 10 3 5 => i32:3
+;; run: rdowhile 10 10 0 => trap: out of bounds array access
+;; run: rdowhile 10 2 -1 => trap: out of bounds array access
+;; run: rwide 10 9 => i64:45
+;; run: rwide 10 10 => trap: out of bounds array access
+;; run: rstep2 10 9 => i32:25
+;; run: rstep2 10 10 => trap: out of bounds array access
 (module
   (type $B (array (mut i32)))
   (func $mk (param $n i32) (result (ref $B))
@@ -118,6 +139,80 @@
       (br_if $d (i32.ge_u (local.get $i) (local.get $m)))
       (local.set $s (i32.add (local.get $s) (array.get $B (local.get $a) (local.get $i))))
       (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br $l)))
+    (local.get $s))
+
+  ;; for (i = start; i >= 0; i--) s += a[i]
+  (func (export "rsum") (param $n i32) (param $start i32) (result i32)
+    (local $a (ref $B)) (local $i i32) (local $s i32)
+    (local.set $a (call $mk (local.get $n)))
+    (local.set $i (local.get $start))
+    (block $d (loop $l
+      (br_if $d (i32.lt_s (local.get $i) (i32.const 0)))
+      (local.set $s (i32.add (local.get $s) (array.get $B (local.get $a) (local.get $i))))
+      (local.set $i (i32.sub (local.get $i) (i32.const 1)))
+      (br $l)))
+    (local.get $s))
+
+  ;; down to an m of either sign
+  (func (export "rsum_m") (param $n i32) (param $start i32) (param $m i32) (result i32)
+    (local $a (ref $B)) (local $i i32) (local $s i32)
+    (local.set $a (call $mk (local.get $n)))
+    (local.set $i (local.get $start))
+    (block $d (loop $l
+      (br_if $d (i32.lt_s (local.get $i) (local.get $m)))
+      (local.set $s (i32.add (local.get $s) (array.get $B (local.get $a) (local.get $i))))
+      (local.set $i (i32.sub (local.get $i) (i32.const 1)))
+      (br $l)))
+    (local.get $s))
+
+  ;; a[i] + a[i - 1] while i > 0
+  (func (export "rwindow") (param $n i32) (param $start i32) (result i32)
+    (local $a (ref $B)) (local $i i32) (local $s i32)
+    (local.set $a (call $mk (local.get $n)))
+    (local.set $i (local.get $start))
+    (block $d (loop $l
+      (br_if $d (i32.le_s (local.get $i) (i32.const 0)))
+      (local.set $s (i32.add (local.get $s)
+        (i32.add (array.get $B (local.get $a) (local.get $i))
+                 (array.get $B (local.get $a) (i32.sub (local.get $i) (i32.const 1))))))
+      (local.set $i (i32.sub (local.get $i) (i32.const 1)))
+      (br $l)))
+    (local.get $s))
+
+  ;; do { s += a[i]; i-- } while (i >= m)
+  (func (export "rdowhile") (param $n i32) (param $start i32) (param $m i32) (result i32)
+    (local $a (ref $B)) (local $i i32) (local $s i32)
+    (local.set $a (call $mk (local.get $n)))
+    (local.set $i (local.get $start))
+    (loop $l
+      (local.set $s (i32.add (local.get $s) (array.get $B (local.get $a) (local.get $i))))
+      (local.set $i (i32.sub (local.get $i) (i32.const 1)))
+      (br_if $l (i32.ge_s (local.get $i) (local.get $m))))
+    (local.get $s))
+
+  ;; an i64 counter down to 0
+  (func (export "rwide") (param $n i32) (param $start i32) (result i64)
+    (local $a (ref $B)) (local $i i64) (local $s i64)
+    (local.set $a (call $mk (local.get $n)))
+    (local.set $i (i64.extend_i32_s (local.get $start)))
+    (block $d (loop $l
+      (br_if $d (i64.lt_s (local.get $i) (i64.const 0)))
+      (local.set $s (i64.add (local.get $s)
+        (i64.extend_i32_s (array.get $B (local.get $a) (i32.wrap_i64 (local.get $i))))))
+      (local.set $i (i64.sub (local.get $i) (i64.const 1)))
+      (br $l)))
+    (local.get $s))
+
+  ;; two at a time
+  (func (export "rstep2") (param $n i32) (param $start i32) (result i32)
+    (local $a (ref $B)) (local $i i32) (local $s i32)
+    (local.set $a (call $mk (local.get $n)))
+    (local.set $i (local.get $start))
+    (block $d (loop $l
+      (br_if $d (i32.lt_s (local.get $i) (i32.const 0)))
+      (local.set $s (i32.add (local.get $s) (array.get $B (local.get $a) (local.get $i))))
+      (local.set $i (i32.sub (local.get $i) (i32.const 2)))
       (br $l)))
     (local.get $s))
 

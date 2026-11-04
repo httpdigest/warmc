@@ -13796,7 +13796,10 @@ static void gc_way_add(const GcWay *w, Ref y, Ref *set, uint32_t *n,
    not change, and indexes arrays the loop does not change at i + c, is
    copied, and entered by tests of each array that it is no null and
    m <= len - (cmax - c0) (one less for <=), of start + cmin >= 0, and of
-   m >= 0 for an unsigned test: the copy, entered where they hold, is one
+   m >= 0 for an unsigned test -- or, stepping down, tested i + c0 >= m (or
+   >, signed), by tests that start + cmax < len and m >= c0 - cmin (one
+   less for >), the second left out where m is a constant that says it, as
+   of Java's for (i = n - 1; i >= 0; i--): the copy, entered where they hold, is one
    the ranges (rp_inbounds) prove every such access of -- the tests' facts
    and the loop's own -- and the original, entered where one fails, keeps
    its checks, and traps where it would have.  Java's and Kotlin's
@@ -13869,7 +13872,9 @@ static bool bv_loop(IrFunc *f, uint32_t hb, uint8_t *inloop, uint32_t *stack) {
     ValType pt = (ValType)f->insts[p].type;
     if (pt != VT_I32 && pt != VT_I64) continue;
     int64_t step;
-    if (rp_lin(f, back->args[pi], &step) != p || step <= 0 || step > 64) continue;
+    if (rp_lin(f, back->args[pi], &step) != p || step == 0 || step > 64 || step < -64) continue;
+    /* stepping down: the first time round the greatest, the test the least */
+    bool down = step < 0;
     Ref start = pe->args[pi];
     for (uint32_t tb = 0; tb < nb0; tb++) {
       if (!inloop[tb]) continue;
@@ -13904,7 +13909,9 @@ static bool bv_loop(IrFunc *f, uint32_t hb, uint8_t *inloop, uint32_t *stack) {
         Ref t = a; a = b; b = t;
         rel = bv_mirror(rel);
       }
-      if (rel != I_LTS && rel != I_LES && rel != I_LTU && rel != I_LEU) continue;
+      if (down ? rel != I_GES && rel != I_GTS
+               : rel != I_LTS && rel != I_LES && rel != I_LTU && rel != I_LEU)
+        continue;
       if (bottom) {
         /* the next value, p + step: the counter's own c0 is c0 - step */
         c0 -= step;
@@ -14014,24 +14021,40 @@ static bool bv_loop(IrFunc *f, uint32_t hb, uint8_t *inloop, uint32_t *stack) {
         lens[j] = ir_emit(f, g, I_ARRAY_LEN, VT_I32, &arr[j], 1, 0, 0);
         Ref L = lens[j];
         if (pt == VT_I64) L = ir_emit(f, g, I_EXTENDU, VT_I64, &L, 1, 0, 0);
-        int64_t K = cmax[j] - c0;
+        /* up: m <= len - (cmax - c0), one less for <=; down: start + cmax
+           below the length, start < len - cmax */
+        int64_t K = down ? cmax[j] : cmax[j] - c0;
         if (K < 0) K = 0;
-        if (rel == I_LES || rel == I_LEU) K++;
+        if (!down && (rel == I_LES || rel == I_LEU)) K++;
         if (K) {
           Ref kc = ir_emit(f, g, I_CONST, pt, NULL, 0, (uint64_t)K, 0);
           Ref sa[2] = { L, kc };
           L = ir_emit(f, g, I_SUB, pt, sa, 2, 0, 0);
         }
-        Ref ca[2] = { m, L };
-        Ref le = ir_emit(f, g, I_LES, VT_I32, ca, 2, 0, 0);
+        Ref ca[2] = { down ? start : m, L };
+        Ref le = ir_emit(f, g, down ? I_LTS : I_LES, VT_I32, ca, 2, 0, 0);
         BV_TEST(g, le, 0);
         tests[ntests++] = g;
       }
       int64_t lo = cmin[0];
       for (uint32_t j = 1; j < narr; j++) if (cmin[j] < lo) lo = cmin[j];
       uint64_t sv;
-      bool start_ok = is_const(f, start, &sv) &&
-                      (pt == VT_I64 ? (int64_t)sv : (int64_t)(int32_t)(uint32_t)sv) + lo >= 0;
+      /* the least index: up, start's; down, the test's -- i + c0 >= m (or
+         > m) puts i + cmin at least 0 where m >= c0 - cmin (less 1) */
+      int64_t kl = c0 - lo - (rel == I_GTS ? 1 : 0);
+      if (down) {
+        bool m_ok = is_const(f, m, &sv) && (pt == VT_I64 ? (int64_t)sv : (int64_t)(int32_t)(uint32_t)sv) >= kl;
+        if (!m_ok) {
+          uint32_t g = ir_new_block(f);
+          Ref kc = ir_emit(f, g, I_CONST, pt, NULL, 0, (uint64_t)kl, 0);
+          Ref ca[2] = { m, kc };
+          Ref ge = ir_emit(f, g, I_GES, VT_I32, ca, 2, 0, 0);
+          BV_TEST(g, ge, 0);
+          tests[ntests++] = g;
+        }
+      }
+      bool start_ok = down || (is_const(f, start, &sv) &&
+                      (pt == VT_I64 ? (int64_t)sv : (int64_t)(int32_t)(uint32_t)sv) + lo >= 0);
       if (!start_ok) {
         uint32_t g = ir_new_block(f);
         Ref kc = ir_emit(f, g, I_CONST, pt, NULL, 0, (uint64_t)(0 - lo), 0);
@@ -14046,7 +14069,8 @@ static bool bv_loop(IrFunc *f, uint32_t hb, uint8_t *inloop, uint32_t *stack) {
            (a guard decides which copy runs, the same either way) */
         uint32_t g = ir_new_block(f);
         Ref ca[2] = { start, m };
-        Ref t = ir_emit(f, g, rel == I_LTS || rel == I_LTU ? I_LTS : I_LES, VT_I32, ca, 2, 0, 0);
+        IrOp srel = down ? rel : rel == I_LTS || rel == I_LTU ? I_LTS : I_LES;
+        Ref t = ir_emit(f, g, srel, VT_I32, ca, 2, 0, 0);
         BV_TEST(g, t, 0);
         tests[ntests++] = g;
       }
