@@ -3503,9 +3503,10 @@ static uint8_t *assemble(P *p, size_t *len_out) {
       wb_raw(&sec, body.p, body.n);
       xfree(body.p);
     }
-    emit_section(&out, 10, &sec);
     /* metadata.code.branch_hint: for each function with any, its index and
-       its hints -- offset, size 1, the hint byte */
+       its hints -- offset, size 1, the hint byte -- ahead of the code
+       section, as the proposal has it (the bodies made first, in sec, for
+       the hints' offsets) */
     uint32_t nhf = 0;
     for (uint32_t i = 0; i < p->fn.n; i++) if (!p->fn.v[i].imported && p->fn.v[i].nbh) nhf++;
     if (nhf) {
@@ -3529,6 +3530,7 @@ static uint8_t *assemble(P *p, size_t *len_out) {
       emit_section(&out, 0, &hs);
       xfree(hs.p);
     }
+    emit_section(&out, 10, &sec);
   }
   emit_customs(&out, p, CU_AFTER, 10);
 

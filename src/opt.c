@@ -12497,6 +12497,9 @@ typedef struct {
   uint32_t ntmp;
   struct { Ref x; RTgt t; int64_t k; uint8_t dir; } as[RP_ASM];
   int nas;
+  /* rp_aligned's: the parameters assumed multiples of 2^s round a loop */
+  struct { Ref x; int s; } aln[16];
+  int naln;
   int budget;
 } RP;
 
@@ -12614,12 +12617,14 @@ static void rp_put(RP *p, bool tmp, uint8_t rel, Ref a, Ref b, Ref orig, int64_t
   p->fs[p->nfs++] = q;
 }
 
-/* a fact on a, and the same on a's base where a is base + c */
+/* a fact on a, and the same on a's base where a is base + c -- an unsigned
+   one too (i + 4 <=u n says i + 4 is in [0, n], and of i what that does
+   where i + 4 did not wrap, which rp_exact_v asks where it is used) */
 static void rp_add(RP *p, bool tmp, uint8_t rel, Ref a, Ref b, int64_t k,
                    uint32_t blk, uint32_t pos) {
   rp_put(p, tmp, rel, a, b, a, k, 0, blk, pos);
-  if (rel == RF_ULT || rel == RF_ULE || rel == RF_ACCO || rel == RF_LENOF || rel == RF_SQ)
-    return;
+  if (rel == RF_ACCO || rel == RF_LENOF || rel == RF_SQ) return;
+  if ((rel == RF_ULT || rel == RF_ULE) && warmc_getenv("WARMC_NO_BCE_UBASE")) return;
   int64_t c;
   Ref base = rp_lin(p->f, a, &c);
   if (base != a && c != 0) rp_put(p, tmp, rel, base, b, a, k, c, blk, pos);
@@ -13002,6 +13007,89 @@ static int64_t rp_tgt_max(RP *p, const RTgt *t) {
 }
 
 /* Is x at most the target plus k, by the target and the facts on x? */
+/* ---- Alignment: whether a value is a multiple of 2^s.  Its known bits,
+   a constant, an and with one that is, sums and differences of two that
+   are, a product with one, a shift left by s or more, either arm of a
+   select, a widening, and a loop's parameter whose every way in hands it
+   one -- round the loop assuming it does, as rp_phi does. */
+#define RP_ALN 16
+
+static bool rp_aligned(RP *p, Ref x, int s, int d) {
+  IrFunc *f = p->f;
+  x = ir_resolve(f, x);
+  if (s <= 0) return true;
+  if (!rp_int(f, x) || !rp_tick(p, d)) return false;
+  int w = f->insts[x].type == VT_I64 ? 64 : 32;
+  if (s >= w) return false;
+  uint64_t low = (1ull << s) - 1;
+  int64_t cv;
+  if (rp_isconst(f, x, &cv)) return ((uint64_t)cv & low) == 0;
+  /* (the bits that may be one: none of the low s) */
+  if ((ir_known_bits(f, x, 4) & low) == 0) return true;
+  const Inst *in = &f->insts[x];
+  Ref *a = ir_args(f, x);
+  switch (in->op) {
+    case I_AND:
+      return in->nargs == 2 && (rp_aligned(p, a[0], s, d - 1) || rp_aligned(p, a[1], s, d - 1));
+    case I_ADD: case I_SUB: case I_OR: case I_XOR:
+      return in->nargs == 2 && rp_aligned(p, a[0], s, d - 1) && rp_aligned(p, a[1], s, d - 1);
+    case I_MUL:
+      if (in->nargs != 2) return false;
+      for (int k = 0; k <= s; k++)
+        if (rp_aligned(p, a[0], k, d - 1) && rp_aligned(p, a[1], s - k, d - 1)) return true;
+      return false;
+    case I_SHL: {
+      int64_t sh;
+      if (in->nargs != 2 || !rp_isconst(f, ir_resolve(f, a[1]), &sh)) return false;
+      sh &= w - 1;
+      return sh >= s || rp_aligned(p, a[0], s - (int)sh, d - 1);
+    }
+    case I_SELECT:
+      return in->nargs == 3 && rp_aligned(p, a[0], s, d - 1) && rp_aligned(p, a[1], s, d - 1);
+    case I_EXTENDS: case I_EXTENDU: case I_WRAP:
+      return in->nargs == 1 && rp_int(f, ir_resolve(f, a[0])) && rp_aligned(p, a[0], s, d - 1);
+    case I_PARAM: {
+      uint32_t h = in->block;
+      if (h >= f->nblocks || h == f->entry) return false;
+      const Block *B = &f->blocks[h];
+      if (B->is_pad || !B->npreds || B->npreds > 8) return false;
+      int kx = gc_param_index(B, x);
+      if (kx < 0) return false;
+      for (int i = 0; i < p->naln; i++)
+        if (p->aln[i].x == x && p->aln[i].s >= s) return true;
+      if (p->naln == RP_ALN) return false;
+      p->aln[p->naln].x = x;
+      p->aln[p->naln].s = s;
+      p->naln++;
+      bool ok = true;
+      for (uint32_t pi = 0; pi < B->npreds && ok; pi++) {
+        const Block *Q = &f->blocks[B->preds[pi]];
+        bool seen = false;
+        for (uint32_t e = 0; e < Q->nsuccs && ok; e++) {
+          const Edge *ed = &Q->succs[e];
+          if (ed->target != h) continue;
+          seen = true;
+          ok = !ed->eh && (uint32_t)kx < ed->nargs && rp_aligned(p, ed->args[kx], s, d - 1);
+        }
+        if (!seen) ok = false;
+      }
+      p->naln--;
+      return ok;
+    }
+    default: return false;
+  }
+}
+
+/* the largest power of 2, to 2^6, of which x and b (b none: 0) are both
+   multiples -- 1 where none above 1 is, which most values say at once */
+static int64_t rp_step(RP *p, const RCtx *c, Ref x, Ref b, int d) {
+  (void)c;
+  if (warmc_getenv("WARMC_NO_BCE_ALIGN") || x == REF_NONE) return 1;
+  int s = 0;
+  while (s < 6 && rp_aligned(p, x, s + 1, d) && (b == REF_NONE || rp_aligned(p, b, s + 1, d))) s++;
+  return 1ll << s;
+}
+
 static bool rp_le_known(RP *p, const RCtx *c, Ref x, const RTgt *t, int64_t k, int d) {
   IrFunc *f = p->f;
   if (!rp_tick(p, d)) return false;
@@ -13034,18 +13122,39 @@ static bool rp_le_known(RP *p, const RCtx *c, Ref x, const RTgt *t, int64_t k, i
     bool ok = false;
     switch (q->rel) {
       case RF_LE:
-        if (q->b == REF_NONE) ok = rp_num_le_tgt(p, c, q->k, t, kk, d - 1);
-        else {
-          int64_t k2;
-          ok = rp_fit((__int128)kk - q->k, &k2) && rp_le(p, c, q->b, t, k2, d - 1);
+        /* x + off <= b + k'; of two multiples of m, at most the multiple
+           of m that b + k' rounds down to (i < e of an i and an e = n & -4
+           that are multiples of 4: i <= e - 4) -- asked where the bound
+           as it is says too little */
+        for (int pass = 0; pass < 2 && !ok; pass++) {
+          int64_t qk = q->k;
+          if (pass) {
+            int64_t m = rp_step(p, c, q->orig, q->b, d - 1);
+            if (m == 1 || qk % m == 0) break;
+            qk = qk >= 0 ? qk / m * m : -((-qk + m - 1) / m) * m;
+          }
+          if (q->b == REF_NONE) ok = rp_num_le_tgt(p, c, qk, t, kk, d - 1);
+          else {
+            int64_t k2;
+            ok = rp_fit((__int128)kk - qk, &k2) && rp_le(p, c, q->b, t, k2, d - 1);
+          }
         }
         break;
-      case RF_ULT: case RF_ULE: {
-        int64_t one = q->rel == RF_ULT ? 1 : 0;
-        if (t->kind == TK_LEN && k >= -one && rp_covers(p, q->b, t)) return true;
-        ok = rp_ge(p, c, q->b, 0, d - 1) && rp_le(p, c, q->b, t, k + one, d - 1);
+      case RF_ULT: case RF_ULE:
+        /* x + off in [0, b] or [0, b): x <= T + k where b <= T + k + off,
+           or that plus one; of two multiples of m below b, plus m */
+        for (int pass = 0; pass < 2 && !ok; pass++) {
+          int64_t one = q->rel == RF_ULT ? 1 : 0, k2;
+          if (pass) {
+            if (q->rel != RF_ULT) break;
+            one = rp_step(p, c, q->orig, q->b, d - 1);
+            if (one == 1) break;
+          }
+          if (t->kind == TK_LEN && kk >= -one && rp_covers(p, q->b, t)) ok = true;
+          else ok = rp_fit((__int128)kk + one, &k2) && rp_ge(p, c, q->b, 0, d - 1) &&
+                    rp_le(p, c, q->b, t, k2, d - 1);
+        }
         break;
-      }
       case RF_ACC:
         if (t->kind == TK_LEN) ok = (q->b == t->obj || q->b == t->pr) && kk >= -1;
         else if (t->kind == TK_NUM) ok = RP_MAXLEN - 1 <= kk;
@@ -13658,6 +13767,132 @@ static void gc_way_add(const GcWay *w, Ref y, Ref *set, uint32_t *n,
    sets copy from the idom in RPO, so membership means a strictly
    dominating (or earlier same-block) proof; branch facts ride single-pred
    edges. */
+/* ---- Smearing: a run of checked reads of one array at base + c_1 ..
+   base + c_n, with nothing between them that writes, calls or can trap but
+   as they do (out of bounds, the same trap: a null check, a division or a
+   cast would trap otherwise), needs only the checks of the greatest and
+   the least: those two read first, the facts their accesses leave (RF_ACC)
+   put every index between in bounds, and pass_gc_nullchk takes the others'
+   checks off -- the least's too where base + c_1 >= 0 is known.  A read
+   has no effect but its trap, which then comes a few reads earlier, the
+   same trap.  Java's s[i], s[i + 1], s[i + 2], s[i + 3]; luawasm's hash
+   slot's key and value.  WARMC_NO_BCE_SMEAR=1 leaves the reads in place. */
+
+/* one a read may move up past: no write, no call, no trap but an array's
+   bounds' */
+static bool smear_transparent(const IrFunc *f, const Inst *in) {
+  (void)f;
+  if (ir_has_no_effect(in)) return true;
+  switch (in->op) {
+    case I_FIELD_GET: case I_ARRAY_LEN: case I_ARRAY_GET:
+      return !(in->imm2 & GCF_NULLCHK);
+    default: return false;
+  }
+}
+
+/* moves the reading of b->insts[from], and what it needs that is made in
+   (to, from), up to position to; false (nothing moved) where any of that
+   could not move */
+static bool smear_move(IrFunc *f, Block *b, uint32_t to, uint32_t from) {
+  uint32_t n = from - to;
+  if (n > 64) return false;
+  bool need[65] = { false };
+  need[n] = true;
+  /* back from the read: an instruction of the span it reads, it needs */
+  for (int32_t k = (int32_t)n; k >= 0; k--) {
+    if (!need[k]) continue;
+    Ref v = b->insts[to + (uint32_t)k];
+    const Inst *in = &f->insts[v];
+    if (k != (int32_t)n && !ir_has_no_effect(in)) return false;
+    Ref *a = ir_args(f, v);
+    for (uint32_t i = 0; i < in->nargs; i++) {
+      Ref x = a[i];
+      for (uint32_t j = 0; j < (uint32_t)k; j++)
+        if (b->insts[to + j] == x) need[j] = true;
+    }
+  }
+  if (need[0]) return false;  /* (the first of the run, which it cannot pass) */
+  Ref moved[65], kept[65];
+  uint32_t nm = 0, nk = 0;
+  for (uint32_t k = 0; k <= n; k++) {
+    Ref v = b->insts[to + k];
+    if (need[k]) moved[nm++] = v;
+    else kept[nk++] = v;
+  }
+  for (uint32_t k = 0; k < nm; k++) b->insts[to + k] = moved[k];
+  for (uint32_t k = 0; k < nk; k++) b->insts[to + nm + k] = kept[k];
+  return true;
+}
+
+static bool gc_smear(IrFunc *f) {
+  if (warmc_getenv("WARMC_NO_BCE_SMEAR")) return false;
+  bool changed = false;
+  for (uint32_t oi = 0; oi < f->norder; oi++) {
+    Block *b = &f->blocks[f->order[oi]];
+    uint32_t start = 0;
+    for (uint32_t i = 0; i <= b->ninsts; i++) {
+      bool barrier = i == b->ninsts || !smear_transparent(f, &f->insts[b->insts[i]]);
+      if (!barrier) continue;
+      /* the run [start, i): its checked reads, by array and base */
+      for (uint32_t x = start; x < i; x++) {
+        const Inst *xi = &f->insts[b->insts[x]];
+        if (xi->op != I_ARRAY_GET || (xi->imm2 & GCF_NOBOUND) || xi->nargs < 2) continue;
+        Ref obj = ir_resolve(f, ir_args(f, b->insts[x])[0]);
+        int64_t cx;
+        Ref base = rp_lin(f, ir_args(f, b->insts[x])[1], &cx);
+        /* the first of its group in the run: the greatest and least after */
+        bool first = true;
+        for (uint32_t y = start; y < x && first; y++) {
+          const Inst *yi = &f->insts[b->insts[y]];
+          int64_t cy;
+          if (yi->op == I_ARRAY_GET && !(yi->imm2 & GCF_NOBOUND) && yi->nargs >= 2 &&
+              ir_resolve(f, ir_args(f, b->insts[y])[0]) == obj &&
+              rp_lin(f, ir_args(f, b->insts[y])[1], &cy) == base)
+            first = false;
+        }
+        if (!first) continue;
+        uint32_t hi = x, lo = x, members = 0;
+        int64_t chi = cx, clo = cx;
+        for (uint32_t y = x; y < i; y++) {
+          const Inst *yi = &f->insts[b->insts[y]];
+          int64_t cy;
+          if (yi->op != I_ARRAY_GET || (yi->imm2 & GCF_NOBOUND) || yi->nargs < 2 ||
+              ir_resolve(f, ir_args(f, b->insts[y])[0]) != obj ||
+              rp_lin(f, ir_args(f, b->insts[y])[1], &cy) != base)
+            continue;
+          members++;
+          if (cy > chi) { chi = cy; hi = y; }
+          if (cy < clo) { clo = cy; lo = y; }
+        }
+        if (members < 2 || chi == clo) continue;
+        /* the greatest first, then the least (each moved up only where
+           what it needs can come along) */
+        bool moved = hi != x && smear_move(f, b, x, hi);
+        for (uint32_t y = x; y < i; y++)
+          if (f->insts[b->insts[y]].op == I_ARRAY_GET) {
+            int64_t cy;
+            if (ir_resolve(f, ir_args(f, b->insts[y])[0]) == obj &&
+                rp_lin(f, ir_args(f, b->insts[y])[1], &cy) == base && cy == clo) {
+              lo = y;
+              break;
+            }
+          }
+        uint32_t after = x;
+        while (after < i && !(f->insts[b->insts[after]].op == I_ARRAY_GET &&
+                              ir_resolve(f, ir_args(f, b->insts[after])[0]) == obj))
+          after++;
+        if (lo > after + 1 && smear_move(f, b, after + 1, lo)) moved = true;
+        if (moved) {
+          changed = true;
+          g_stats.bce_smeared++;
+        }
+      }
+      start = i + 1;
+    }
+  }
+  return changed;
+}
+
 static bool pass_gc_nullchk(IrFunc *f) {
   /* Only an access, an i31.get or a ref.test can change, so without one --
      every function of a module in linear memory -- there is nothing to do,
@@ -13680,7 +13915,7 @@ static bool pass_gc_nullchk(IrFunc *f) {
   }
   if (!any) return false;
 
-  bool changed = false;
+  bool changed = gc_smear(f);
   Ref **sets = xcalloc(f->nblocks, sizeof(Ref *));
   uint32_t *counts = xcalloc(f->nblocks, sizeof(uint32_t));
   GcBnd **bsets = xcalloc(f->nblocks, sizeof(GcBnd *));
@@ -24764,6 +24999,45 @@ static bool devirt_round(IrFunc *f, const OptOpts *o) {
   return changed;
 }
 
+/* WARMC_BCE_REPORT=1: each GC array access whose bounds check is left, on
+   stderr -- its function and its index's shape, a few levels deep -- for
+   finding what the ranges (rp_inbounds) do not prove */
+static void bce_shape(IrFunc *f, Ref x, int d, char *buf, size_t n) {
+  x = ir_resolve(f, x);
+  const Inst *in = &f->insts[x];
+  int64_t c;
+  if (rp_isconst(f, x, &c)) { snprintf(buf, n, "%lld", (long long)c); return; }
+  if (in->op == I_PARAM) {
+    snprintf(buf, n, in->block == f->entry ? "arg" : "phi");
+    return;
+  }
+  if (d <= 0 || !in->nargs || in->nargs > 3) { snprintf(buf, n, "%s", ir_op_name(in->op)); return; }
+  size_t k = (size_t)snprintf(buf, n, "%s(", ir_op_name(in->op));
+  for (uint32_t i = 0; i < in->nargs && k < n; i++) {
+    if (i) k += (size_t)snprintf(buf + k, n - k, ", ");
+    if (k >= n) break;
+    bce_shape(f, ir_args(f, x)[i], d - 1, buf + k, n - k);
+    k += strlen(buf + k);
+  }
+  if (k < n) snprintf(buf + k, n - k, ")");
+}
+
+static void bce_report(IrFunc *f) {
+  const Func *fn = &f->m->funcs[f->func_index];
+  for (uint32_t oi = 0; oi < f->norder; oi++) {
+    const Block *b = &f->blocks[f->order[oi]];
+    for (uint32_t i = 0; i < b->ninsts; i++) {
+      Ref v = b->insts[i];
+      const Inst *in = &f->insts[v];
+      if ((in->op != I_ARRAY_GET && in->op != I_ARRAY_SET) || (in->imm2 & GCF_NOBOUND) || in->nargs < 2) continue;
+      char shape[256];
+      bce_shape(f, ir_args(f, v)[1], 3, shape, sizeof shape);
+      fprintf(stderr, "bce: %s: %s %s\n", fn->name ? fn->name : fn->sym ? fn->sym : "?",
+              in->op == I_ARRAY_GET ? "get" : "set", shape);
+    }
+  }
+}
+
 void ir_optimize(IrFunc *f, const OptOpts *o) {
   pthread_once(&g_pt_once, pt_init);
   if (o->level == 0) return;
@@ -25028,5 +25302,6 @@ void ir_optimize(IrFunc *f, const OptOpts *o) {
   if (o->fma && TP("fma", pass_fma(f)) && o->dce) pass_dce(f);
   if (o->wrap_params) TP("wrap_params", pass_wrap_params(f));
   if (o->print_ir) ir_print(f, "optimised");
+  if (warmc_getenv("WARMC_BCE_REPORT")) bce_report(f);
   ir_verify(f, "post-opt");
 }

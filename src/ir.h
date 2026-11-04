@@ -744,6 +744,9 @@ typedef struct {
   uint64_t gc_nullchk_removed;
   /* GC bounds checks the ranges of their indices removed (opt.c rp_inbounds) */
   uint64_t bce_ranges;
+  /* runs of reads of one array at base + c whose greatest and least were
+     moved first, for the others' checks to go (opt.c gc_smear) */
+  uint64_t bce_smeared;
   /* GC fields carried through a loop as a value (opt.c pass_field_promote) */
   uint64_t fields_promoted;
   /* casts and type tests a sealed module's object slot decides inline, and

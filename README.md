@@ -1829,6 +1829,24 @@ working memory when it ends.
     checks: of the accesses that kept one, a quarter in `ktbench` (5549 to
     4107) and a fifth in `javabench` (13021 to 10117) no longer do
     (`WARMC_NO_BCE_RANGE=1` turns it off; `--stats` counts `bce_ranges`).
+    A fact on `i + c` is one on `i`, unsigned ones too, so `i + 4 <=u n`
+    and `i + 3 <u n` put `a[i]` .. `a[i + 3]` in bounds
+    (`WARMC_NO_BCE_UBASE=1`); and of two multiples of `2^s` the lesser is
+    at least `2^s` below the other, so `i <u n & -4`, of an `i` that counts
+    up by 4 from 0, does too -- a value is such a multiple by its known
+    bits, its shape, and round a loop by what every way in hands it
+    (`rp_aligned`, `WARMC_NO_BCE_ALIGN=1`).
+  - A run of reads of one array at `base + c`, with nothing between them
+    that writes, calls or traps otherwise than they would, keeps the checks
+    of its greatest and least alone: those two are read first, and the
+    others are in bounds by what they leave known -- the least's check
+    goes too where `base` cannot be negative.  A read has no effect but
+    its trap, which then comes a few reads earlier, the same trap
+    (`opt.c` `gc_smear`, `WARMC_NO_BCE_SMEAR=1`; `--stats` counts
+    `bce_smeared`).  A store between reads ends a run, as the store must
+    be made before a later read traps.  `WARMC_BCE_REPORT=1` lists, on
+    stderr, every array access whose check is left, by function and the
+    shape of its index.
   - Objects, and arrays of a constant length, are bumped inline from the
     program's allocation buffer, zeroed when their page was opened; on
     AArch64 so are arrays of a computed length.
