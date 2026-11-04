@@ -2633,6 +2633,31 @@ static Ref narrow_free(IrFunc *f, uint32_t bi, uint32_t *idx, Ref r) {
   return REF_NONE;
 }
 
+/* Whether the same i64 op of the same operands as w is made in block bi or
+   a few of the blocks over it: CSE makes the two one, and then the wrap of
+   it is free -- luawasm's (i64.sub k 1) that a bounds test compares and an
+   index wraps, which narrowed apart were two subtractions and two live
+   values in the loop. */
+static bool fold_narrow_twin(IrFunc *f, uint32_t bi, Ref w) {
+  const Inst *wi = &f->insts[w];
+  Ref x = ir_resolve(f, ir_args(f, w)[0]), y = ir_resolve(f, ir_args(f, w)[1]);
+  for (int up = 0; up < 4 && bi < f->nblocks; up++) {
+    const Block *b = &f->blocks[bi];
+    for (uint32_t i = 0; i < b->ninsts; i++) {
+      Ref u = b->insts[i];
+      const Inst *ui = &f->insts[u];
+      if (u == w || ui->op != wi->op || ui->type != VT_I64 || ui->nargs != 2) continue;
+      Ref ux = ir_resolve(f, ir_args(f, u)[0]), uy = ir_resolve(f, ir_args(f, u)[1]);
+      if (ux == x && uy == y) return true;
+      uint64_t c1, c2;
+      if (ux == x && is_const(f, uy, &c1) && is_const(f, y, &c2) && c1 == c2) return true;
+    }
+    if (bi == f->entry || b->idom == REF_NONE || b->idom == bi) break;
+    bi = b->idom;
+  }
+  return false;
+}
+
 static bool fold_narrow(IrFunc *f, uint32_t bi, uint32_t *idx, Ref v) {
   Ref w = ir_args(f, v)[0];
   const Inst *wi = &f->insts[w];
@@ -2640,6 +2665,7 @@ static bool fold_narrow(IrFunc *f, uint32_t bi, uint32_t *idx, Ref v) {
   if (wi->nargs != 2 || wi->type != VT_I64) return false;
   if (op != I_ADD && op != I_SUB && op != I_MUL && op != I_AND && op != I_OR &&
       op != I_XOR && op != I_SHL) return false;
+  if (!warmc_getenv("WARMC_NO_NARROWTWIN") && fold_narrow_twin(f, bi, w)) return false;
   Ref x = ir_args(f, w)[0], y = ir_args(f, w)[1];
   uint64_t c;
   if (op == I_SHL) {
@@ -15250,6 +15276,333 @@ static bool pass_divrem(IrFunc *f) {
 }
 
 #define ID_MAX 8
+/* ---- GC fields carried through a loop (pass_field_promote) ----
+
+   A field of an object fixed for the whole loop, read in it, is read once
+   ahead of the loop and carried round it as a value: its loads become that
+   value, its stores the value stored, and a write that may reach it --
+   another object's store to the same offset, a call whose effects may
+   write the field -- reads it again after.  LICM cannot take such a load
+   out where the loop writes the field or calls what may: luawasm's fill
+   loop stores a table's length every time round and read it back every
+   time, a store-to-load latency an iteration; and a loop whose rare way
+   calls the runtime -- luawasm's slow paths, which rejoin -- read a table's
+   fields and tested their barriers every time round.  Taken here only
+   where every such write is on a way the code calls rare (a cold block),
+   so that what was a load on the way round becomes a register.
+
+   The read ahead of the loop must not trap where the loop's would not:
+   the object is shown there to be one of the type the loop reads it as --
+   by its own type, or by a passed ref.test or cast above the preheader
+   (luawasm's fast loop tests that what it indexes is a table on the way
+   in). */
+
+#define FP_MAXG 12
+typedef struct {
+  Ref root, opnd;
+  uint64_t off, key;
+  uint64_t imm2;
+  ValType ty;
+  uint32_t nloads, nstores, hot;
+  bool bad;
+} FpGroup;
+
+/* Whether root is a non-null object of heap type need (or below) at the end
+   of block pre: of that type by its own type or a passed test, and not null
+   by its type, a non-nullable test, a null check's trap or a branch on
+   ref.is_null over pre (ref.as_non_null of a global). */
+static bool fp_proven(IrFunc *f, Ref root, HeapType need, uint32_t pre) {
+  const Module *m = f->m;
+  ValType rt = (ValType)f->insts[root].type;
+  bool typed = vt_is_ref(rt) && heap_subtype(m, vt_heap(rt), need);
+  bool nonnull = vt_is_ref(rt) && !vt_nullable(rt);
+  uint32_t b = pre;
+  for (int up = 0; up < 32 && b < f->nblocks && !(typed && nonnull); up++) {
+    const Block *B = &f->blocks[b];
+    for (uint32_t i = 0; i < B->ninsts; i++) {
+      Ref v = B->insts[i];
+      const Inst *in = &f->insts[v];
+      if (in->op != I_TRAP_IF || in->nargs != 1) continue;
+      Ref t = ir_resolve(f, ir_args(f, v)[0]);
+      const Inst *ti = &f->insts[t];
+      if (in->imm == TRAP_NULL_REF && gc_ref_root(f, t) == root) nonnull = true;
+      if (ti->op == I_REF_TEST && ti->nargs == 1 && gc_ref_root(f, ir_args(f, t)[0]) == root &&
+          heap_subtype(m, RTEST_HEAP(ti->imm), need)) {
+        typed = true;
+        if (!(RTEST_KIND(ti->imm) & RTK_NULLABLE)) nonnull = true;
+      }
+    }
+    if (B->npreds == 1) {
+      const Block *Q = &f->blocks[B->preds[0]];
+      if (Q->term == T_BRIF && Q->nsuccs >= 2 && Q->succs[0].target != Q->succs[1].target) {
+        bool taken = Q->succs[0].target == b;
+        Ref c = ir_resolve(f, Q->term_arg);
+        while (f->insts[c].op == I_EQZ && f->insts[c].nargs == 1) {
+          c = ir_resolve(f, ir_args(f, c)[0]);
+          taken = !taken;
+        }
+        const Inst *ci = &f->insts[c];
+        if (ci->nargs == 1 && gc_ref_root(f, ir_args(f, c)[0]) == root) {
+          if (ci->op == I_REF_IS_NULL && !taken) nonnull = true;
+          if (ci->op == I_REF_TEST && taken && heap_subtype(m, RTEST_HEAP(ci->imm), need)) {
+            typed = true;
+            if (!(RTEST_KIND(ci->imm) & RTK_NULLABLE)) nonnull = true;
+          }
+        }
+      }
+    }
+    if (b == f->entry || B->idom == REF_NONE || B->idom == b) break;
+    b = B->idom;
+  }
+  return typed && nonnull;
+}
+
+/* Whether call v may write the field at off. */
+static bool fp_call_writes(IrFunc *f, const OptOpts *o, Ref v, uint64_t off) {
+  if (f->insts[v].op == I_CONT_OP) return true;
+  const CallFx *fx = site_effects(f, o, v);
+  if (!fx || fx->gany || !o->gcpure) return true;
+  return (fx->gc_field_mask & gc_off_bit(off)) != 0;
+}
+
+static bool fp_ret_call(uint16_t op) {
+  return op == I_RETURN_CALL || op == I_RETURN_CALL_INDIRECT || op == I_RETURN_CALL_REF;
+}
+
+/* a full-width read of a field: a packed one's read extends what was stored */
+static bool fp_full(const Inst *in) {
+  return (in->imm2 & 7u) >= 2;
+}
+
+static uint64_t fp_key(const Inst *in) {
+  return (in->imm2 & (7u | GCF_SIGNED)) | ((uint64_t)in->type << 8);
+}
+
+/* WARMC_FP_RANGE=a:b: only the a-th to b-th promotions (with -j1, in the
+   order the compile makes them) -- to bisect what one of them does */
+static bool fp_take(void) {
+  static _Atomic unsigned n;
+  const char *s = warmc_getenv("WARMC_FP_RANGE");
+  if (!s) return true;
+  unsigned a = 0, b = ~0u;
+  sscanf(s, "%u:%u", &a, &b);
+  unsigned k = n++;
+  return k >= a && k <= b;
+}
+
+/* WARMC_FP_MAXBLOCKS=n: only in loops of n blocks or fewer.  None by
+   default: in fannkuch's main, a function of 7000 instructions that spills
+   throughout, every limit tried (48, 64, 100, 128) moved its spills about
+   and lost more than taking every loop, which costs it 3% */
+static uint32_t fp_maxblocks(void) {
+  const char *s = warmc_getenv("WARMC_FP_MAXBLOCKS");
+  return s ? (uint32_t)atoi(s) : UINT32_MAX;
+}
+
+static bool pass_field_promote(IrFunc *f, const OptOpts *o) {
+  if (warmc_getenv("WARMC_NO_FIELDPROMOTE")) return false;
+  bool any = false;
+  for (uint32_t oi = 0; oi < f->norder && !any; oi++) {
+    const Block *b = &f->blocks[f->order[oi]];
+    if (!b->loop_depth) continue;
+    for (uint32_t i = 0; i < b->ninsts && !any; i++)
+      any = f->insts[b->insts[i]].op == I_FIELD_GET;
+  }
+  if (!any) return false;
+  /* the blocks made since the build -- inlined, threaded -- that only rare
+     ways reach: cold too (ir_mark_cold reads the edges' hints) */
+  ir_mark_cold(f);
+  uint32_t nb = f->nblocks;
+  uint8_t *inloop = xmalloc(nb);
+  uint32_t *stack = xmalloc(nb * sizeof(uint32_t));
+  uint32_t *lord = xmalloc(nb * sizeof(uint32_t));
+  Ref *cur_end = xmalloc(nb * sizeof(Ref));
+  Ref *bparam = xmalloc(nb * sizeof(Ref));
+  bool changed = false;
+  for (uint32_t oi = 0; oi < f->norder; oi++) {
+    uint32_t hb = f->order[oi];
+    uint32_t pre = loop_body(f, hb, inloop, stack);
+    if (pre == REF_NONE) continue;
+    /* (a rotated loop's preheader is its guard: read there, the field is
+       read where the loop is not entered too, which the proof allows) */
+    const Block *P = &f->blocks[pre];
+    if ((P->term != T_JUMP && P->term != T_BRIF) || P->is_pad) continue;
+    /* the loop's blocks in order, all of them after its header, entered
+       only by it */
+    uint32_t nl = 0, total = 0;
+    bool ok = true;
+    for (uint32_t bi = 0; bi < nb; bi++) total += inloop[bi];
+    for (uint32_t k = oi; k < f->norder; k++)
+      if (inloop[f->order[k]]) lord[nl++] = f->order[k];
+    if (nl != total) ok = false;
+    for (uint32_t k = 0; k < nl && ok; k++) {
+      const Block *b = &f->blocks[lord[k]];
+      if (b->is_pad || ir_block_has_eh(f, lord[k])) ok = false;
+      for (uint32_t p = 0; p < b->npreds && ok; p++)
+        if (lord[k] != hb && !inloop[b->preds[p]]) ok = false;
+    }
+    if (!ok) continue;
+
+    FpGroup g[FP_MAXG];
+    uint32_t ng = 0;
+    for (uint32_t k = 0; k < nl; k++) {
+      const Block *b = &f->blocks[lord[k]];
+      for (uint32_t i = 0; i < b->ninsts; i++) {
+        Ref v = b->insts[i];
+        const Inst *in = &f->insts[v];
+        if (in->op != I_FIELD_GET || in->nargs != 1 || !fp_full(in)) continue;
+        Ref root = gc_ref_root(f, ir_args(f, v)[0]);
+        if (inloop[f->insts[root].block] || !vt_is_ref((ValType)f->insts[root].type)) continue;
+        uint32_t j = 0;
+        while (j < ng && !(g[j].root == root && g[j].off == in->imm && g[j].key == fp_key(in))) j++;
+        if (j == ng) {
+          if (ng == FP_MAXG) continue;
+          g[ng] = (FpGroup){ root, ir_resolve(f, ir_args(f, v)[0]), in->imm, fp_key(in),
+                             in->imm2 & ~(uint64_t)GCF_NULLCHK, (ValType)in->type, 0, 0, 0, false };
+          ng++;
+        }
+        g[j].nloads++;
+        /* a read in this loop itself, not only in one nested in it: kept
+           live through this loop only for that, as LICM takes a value out
+           only as far as its shallowest use (fannkuch's main, its loops in
+           one function, spilled 5% more cycles with every read taken out
+           to the outermost loop) */
+        if (!b->cold && (b->loop_depth == f->blocks[hb].loop_depth || warmc_getenv("WARMC_FP_ANYDEPTH")))
+          g[j].hot++;
+      }
+    }
+    if (!ng) continue;
+    /* what writes each: its own stores, and other writes on a cold way only */
+    for (uint32_t k = 0; k < nl; k++) {
+      const Block *b = &f->blocks[lord[k]];
+      for (uint32_t i = 0; i < b->ninsts; i++) {
+        Ref v = b->insts[i];
+        const Inst *in = &f->insts[v];
+        if (in->op == I_FIELD_SET) {
+          Ref root = gc_ref_root(f, ir_args(f, v)[0]);
+          for (uint32_t j = 0; j < ng; j++) {
+            if (g[j].off != in->imm) continue;
+            if (root == g[j].root) {
+              Ref sv = ir_resolve(f, ir_args(f, v)[1]);
+              ValType st = (ValType)f->insts[sv].type;
+              if ((in->imm2 & 7u) != (g[j].imm2 & 7u) ||
+                  !(st == g[j].ty || (vt_is_ref(st) && vt_is_ref(g[j].ty))))
+                g[j].bad = true;
+              g[j].nstores++;
+            } else if (!b->cold) {
+              g[j].bad = true;
+            }
+          }
+        } else if (is_call_op(in->op) && !fp_ret_call(in->op)) {
+          for (uint32_t j = 0; j < ng; j++)
+            if (!g[j].bad && fp_call_writes(f, o, v, g[j].off) && (!b->cold || in->op == I_CONT_OP))
+              g[j].bad = true;
+        }
+      }
+    }
+    /* A field the loop stores loses a store-to-load latency each time
+       round; one it only reads, a load and its barrier. */
+    const char *dbg = warmc_getenv("WARMC_FP_DEBUG");
+    for (uint32_t j = 0; j < ng; j++) {
+      FpGroup *G = &g[j];
+      const char *why = G->bad ? "written on a common way" : !G->hot ? "no read at this depth" : NULL;
+      ValType ot = (ValType)f->insts[G->opnd].type;
+      if (!why && nl > fp_maxblocks()) why = "loop too big";
+      if (!why && (!vt_is_ref(ot) || !fp_proven(f, G->root, vt_heap(ot), pre))) why = "object not proven";
+      if (!why && !fp_take()) why = "WARMC_FP_RANGE";
+      if (why) {
+        if (dbg && dbg[0] == '2')
+          fprintf(stderr, "field_promote: %s loop b%u (depth %u, %u blocks) off %llu not taken: %s\n",
+                  f->m->funcs[f->func_index].sym ? f->m->funcs[f->func_index].sym : "?", hb,
+                  f->blocks[hb].loop_depth, nl, (unsigned long long)G->off, why);
+        continue;
+      }
+      /* ahead of the loop: the object as the type it is read as, and the field */
+      Ref base = G->root;
+      if ((ValType)f->insts[base].type != vt_ref(false, vt_heap(ot))) {
+        Ref r0 = G->root;
+        base = ir_emit(f, pre, I_REF_CONVERT, vt_ref(false, vt_heap(ot)), &r0, 1, 0, 0);
+      }
+      Ref h0 = ir_emit(f, pre, I_FIELD_GET, G->ty, &base, 1, G->off, G->imm2);
+      for (uint32_t k = 0; k < nl; k++) bparam[lord[k]] = cur_end[lord[k]] = REF_NONE;
+      bparam[hb] = ir_add_param(f, hb, G->ty);
+      edge_push_arg(f, pre, hb, h0);
+      for (uint32_t k = 0; k < nl; k++) {
+        uint32_t bi = lord[k];
+        Ref cur;
+        if (bi == hb) {
+          cur = bparam[hb];
+        } else {
+          const Block *b = &f->blocks[bi];
+          Ref same = REF_NONE;
+          bool need = false;
+          for (uint32_t p = 0; p < b->npreds && !need; p++) {
+            uint32_t q = b->preds[p];
+            if (f->blocks[q].rpo >= b->rpo || cur_end[q] == REF_NONE) need = true;
+            else if (same == REF_NONE) same = cur_end[q];
+            else if (same != cur_end[q]) need = true;
+          }
+          cur = (need || same == REF_NONE) ? (bparam[bi] = ir_add_param(f, bi, G->ty)) : same;
+        }
+        for (uint32_t i = 0; i < f->blocks[bi].ninsts; i++) {
+          Ref v = f->blocks[bi].insts[i];
+          Inst *in = &f->insts[v];
+          bool reload = false;
+          if (in->op == I_FIELD_GET && in->nargs == 1 && in->imm == G->off &&
+              fp_key(in) == G->key && gc_ref_root(f, ir_args(f, v)[0]) == G->root) {
+            ir_replace(f, v, cur);
+            ir_make_nop(in);
+            continue;
+          }
+          if (in->op == I_FIELD_SET && in->imm == G->off) {
+            if (gc_ref_root(f, ir_args(f, v)[0]) == G->root) {
+              cur = ir_resolve(f, ir_args(f, v)[1]);
+              continue;
+            }
+            reload = true;
+          } else if (is_call_op(in->op) && !fp_ret_call(in->op)) {
+            reload = fp_call_writes(f, o, v, G->off);
+          }
+          if (!reload) continue;
+          /* read again past the write: past a call's results */
+          uint32_t at = i + 1;
+          while (at < f->blocks[bi].ninsts && f->insts[f->blocks[bi].insts[at]].op == I_RESULT &&
+                 ir_args(f, f->blocks[bi].insts[at])[0] == v)
+            at++;
+          Ref r = ir_emit(f, bi, I_FIELD_GET, G->ty, &base, 1, G->off, G->imm2);
+          Block *B = &f->blocks[bi];
+          memmove(&B->insts[at + 1], &B->insts[at], (B->ninsts - 1 - at) * sizeof(uint32_t));
+          B->insts[at] = r;
+          i = at;
+          cur = r;
+        }
+        cur_end[bi] = cur;
+      }
+      for (uint32_t k = 0; k < nl; k++) {
+        uint32_t bi = lord[k];
+        const Block *b = &f->blocks[bi];
+        for (uint32_t s = 0; s < b->nsuccs; s++) {
+          uint32_t t = b->succs[s].target;
+          if (inloop[t] && bparam[t] != REF_NONE) edge_push_arg_at(f, bi, s, cur_end[bi]);
+        }
+      }
+      if (warmc_getenv("WARMC_FP_DEBUG"))
+        fprintf(stderr, "field_promote: %s loop b%u (depth %u, %u blocks) off %llu: %u loads, %u hot, %u stores\n",
+                f->m->funcs[f->func_index].sym ? f->m->funcs[f->func_index].sym : "?", hb,
+                f->blocks[hb].loop_depth, nl, (unsigned long long)G->off, G->nloads, G->hot, G->nstores);
+      g_stats.fields_promoted++;
+      changed = true;
+    }
+  }
+  xfree(inloop);
+  xfree(stack);
+  xfree(lord);
+  xfree(cur_end);
+  xfree(bparam);
+  if (changed) ir_apply_subst(f);
+  return changed;
+}
+
 static bool pass_invdiv(IrFunc *f) {
   bool changed = false;
   uint8_t *inloop = xcalloc(f->nblocks, 1);
@@ -24542,6 +24895,16 @@ void ir_optimize(IrFunc *f, const OptOpts *o) {
       if (o->cse) pass_cse(f, o);
       if (o->dce) pass_dce(f);
       ir_order(f);
+    }
+    if (TP("field_promote", pass_field_promote(f, o))) {
+      prune_params(f);
+      ir_order(f);
+      if (o->dce) pass_dce(f);
+      if (o->cse) pass_cse(f, o);
+      if (o->dce) pass_dce(f);
+      prune_params(f);
+      ir_order(f);
+      ir_verify(f, "post-field-promote");
     }
   }
   if (o->strength && TP("invdiv", pass_invdiv(f))) {
