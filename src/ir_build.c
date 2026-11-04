@@ -2074,13 +2074,28 @@ IrFunc *ir_build_unordered(Module *m, uint32_t fi, const OptOpts *opt) {
 
       case 0x1a: pop(b); break;
       case 0x1b: case 0x1c: {
+        ValType st = VT_BOT;
         if (op == 0x1c) {
           uint32_t n = rdu32(b);
-          for (uint32_t i = 0; i < n; i++) (void)rd_valtype(&b->rd);
+          for (uint32_t i = 0; i < n; i++) {
+            ValType vt = rd_valtype(&b->rd);
+            if (i == 0) st = vt;
+          }
         }
         Ref cond = pop(b), y = pop(b), x = pop(b);
         Ref args[3] = { x, y, cond };
-        push(b, ir_emit(f, b->cur, I_SELECT, (ValType)f->insts[x].type, args, 3, 0, 0));
+        /* a reference either operand may be: the type both have, null if
+           either may be, else the select's own -- typed by x alone,
+           select (ref.i31 3) (ref.null) c had no null, and a test of its
+           being null was folded or threaded as never (luawasm's awfy_cd) */
+        ValType tx = (ValType)f->insts[x].type, ty = (ValType)f->insts[y].type, t = tx;
+        if (vt_is_ref(tx)) {
+          if ((tx & ~VT_NULLABLE) == (ty & ~VT_NULLABLE) || st == VT_BOT)
+            t = (ValType)(tx | (ty & VT_NULLABLE));
+          else
+            t = st;
+        }
+        push(b, ir_emit(f, b->cur, I_SELECT, t, args, 3, 0, 0));
         break;
       }
 

@@ -18,10 +18,13 @@
 ;; cases to one block (KS_SAME); loopy, whose tests after a loop no copy
 ;; reaches; big, whose copy would be over KS_COPY instructions, where mid's
 ;; is under.
-;; Made by test/gen_keysplit.py, which works the answers out.
+;; Made by test/gen_keysplit.py, which works the answers out.  (Jump
+;; threading decides some of the tests first, by what every way into a
+;; merge says of the value -- opt.c kt_way -- and the code is the same
+;; with fewer copies: 25 and 44 where it took only blocks of one way in.)
 ;;
-;; stats -O1: key_splits=25
-;; stats -O2: key_splits=44
+;; stats -O1: key_splits=22
+;; stats -O2: key_splits=38
 ;;
 ;; run: chain_w 0 => i32:3001
 ;; run: disp_w 0 => i32:1

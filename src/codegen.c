@@ -374,7 +374,8 @@ static bool lc_wants(IrFunc *f, Ref c) {
    too big for one register to hold it from end to end, is made again at
    each read: zigbench/wordfreq's tokenizer built the text's base, mov and
    movk, for every byte it scanned.  A copy no register takes is made
-   again at its reads as the constant was. */
+   again at its reads as the constant was.  A read in a cold block keeps
+   the constant (WARMC_LOOP_CONSTS_COLD copies it too). */
 static void loop_consts(IrFunc *f) {
   if (g_target != &warmc_target_a64 || warmc_getenv("WARMC_NO_LOOP_CONSTS")) return;
   uint32_t nb = f->nblocks;
@@ -419,6 +420,11 @@ static void loop_consts(IrFunc *f) {
   for (uint32_t oi = 0; any && oi < f->norder; oi++) {
     uint32_t x = f->order[oi], h = inner[x];
     if (h == UINT32_MAX) continue;
+    /* a read on a rare way keeps its constant, made there: a copy over the
+       loop for a slow path's call -- luawasm's key hashes and cache
+       addresses -- lived through the loop, and was made again every time
+       round where the slow path's calls left it no register */
+    if (f->blocks[x].cold && !warmc_getenv("WARMC_LOOP_CONSTS_COLD")) continue;
     uint32_t d = f->blocks[h].idom;
     if (d == UINT32_MAX || d == h) continue;
     for (uint32_t k = 0; k < f->blocks[x].ninsts; k++) {

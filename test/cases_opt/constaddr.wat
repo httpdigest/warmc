@@ -11,9 +11,12 @@
 ;; either memory, a page reached by one add included ($page_trap).
 ;;
 ;; lone makes no access through an address in a register; its pointers are
-;; adds of pages, one an access (its load of 0x10f50 is the store's value):
+;; adds of pages, one an access -- its stores' alone: the second if goes
+;; the first's way (jump threading takes what a branch on its local says
+;; of it past the merge, opt.c kt_test), and each way's loads are its
+;; stores' values:
 ;; shape: lone \[x\d+, x\d+\]=0
-;; shape: lone add\s+x\d+, x\d+, #0x1[01], lsl #12=5
+;; shape: lone add\s+x\d+, x\d+, #0x1[01], lsl #12=3
 ;;
 ;; run: datum 0 => i32:305419896
 ;; run: datum 1 => i32:-1430532899

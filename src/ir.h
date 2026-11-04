@@ -722,6 +722,8 @@ typedef struct {
   uint64_t bitrevs;      /* bit reversals written as swaps made one (I_BITREV) */
   uint64_t common_factors; /* x * c + y * c made (x + y) * c */
   uint64_t threaded_known; /* edges past a test their way in decided */
+  uint64_t threaded_eval; /* edges past a test worked out from their values, the block copied */
+  uint64_t threaded_path; /* ways of two blocks past a test, both copied */
   uint64_t param_compares; /* parameters found to be a compare, made again */
   uint64_t key_splits;   /* regions copied below an edge that fixes a value */
   uint64_t bfi_apart;    /* bfi results kept from the parameter of their field */
@@ -750,6 +752,9 @@ typedef struct {
   /* runs of reads of one array at base + c whose greatest and least were
      moved first, for the others' checks to go (opt.c gc_smear) */
   uint64_t bce_smeared;
+  /* field reads made on a merge's cold ways in for one after it to go
+     (opt.c rle_pre) */
+  uint64_t gc_loads_pre;
   /* loops copied behind a test of their bounds, the copy's checks then
      taken off (opt.c pass_bce_version) */
   uint64_t bce_versioned;

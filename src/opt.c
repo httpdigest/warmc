@@ -6358,11 +6358,49 @@ static bool td_param_ok(ValType t) {
    is the block's one instruction and its branch the one reader (uses[], as
    counted before the pass), so an edge that bypasses the block leaves
    nothing undefined. */
+/* The constants of block B ahead of its last instruction moved to the end
+   of its immediate dominator, which dominates every read of them as B
+   does: a constant has no effect and needs nothing, and where it stands
+   is no matter but to a way that bypasses B -- luawasm's tags, i31
+   constants made where each test reads them, in the block of the test a
+   way round a merge would be threaded past.  Whether B is then one
+   instruction. */
+static bool thread_consts_out(IrFunc *f, uint32_t B) {
+  Block *b = &f->blocks[B];
+  if (b->ninsts < 2 || warmc_getenv("WARMC_NO_TD_CONSTS")) return b->ninsts == 1;
+  uint32_t d = b->idom;
+  if (d == UINT32_MAX || d == B || d >= f->nblocks) return false;
+  for (uint32_t i = 0; i + 1 < b->ninsts; i++)
+    if (f->insts[b->insts[i]].op != I_CONST) return false;
+  Block *db = &f->blocks[d];
+  for (uint32_t i = 0; i + 1 < b->ninsts; i++) {
+    Ref v = b->insts[i];
+    if (db->ninsts == db->cap_insts) {
+      uint32_t oc = db->cap_insts;
+      db->cap_insts = oc ? 2 * oc : 8;
+      db->insts = ir_grow(f, db->insts, (size_t)oc * sizeof *db->insts, (size_t)db->cap_insts * sizeof *db->insts);
+    }
+    db->insts[db->ninsts++] = v;
+    f->insts[v].block = d;
+  }
+  b->insts[0] = b->insts[b->ninsts - 1];
+  b->ninsts = 1;
+  return true;
+}
+
 static bool thread_test(IrFunc *f, uint32_t B, const uint32_t *uses,
                         uint32_t nuses, uint16_t *op, uint64_t *k) {
   Block *b = &f->blocks[B];
   Ref c = b->term_arg;
-  if (b->term != T_BRIF || b->ninsts != 1 || b->insts[0] != c) return false;
+  if (b->term != T_BRIF || b->ninsts < 1 || b->insts[b->ninsts - 1] != c) return false;
+  if (b->ninsts > 1) {
+    /* (only where the test would thread: a compare of a parameter) */
+    Inst *ci0 = &f->insts[c];
+    if (ci0->nargs < 1 || f->insts[ir_args(f, c)[0]].op != I_PARAM || f->insts[ir_args(f, c)[0]].block != B ||
+        !thread_consts_out(f, B))
+      return false;
+  }
+  if (b->ninsts != 1 || b->insts[0] != c) return false;
   if (c >= nuses || uses[c] != 1) return false;
   Inst *ci = &f->insts[c];
   Ref *ca = ir_args(f, c);
@@ -6418,7 +6456,9 @@ static bool thread_dispatch(IrFunc *f, uint32_t B, const uint32_t *nread,
   uint64_t tk = 0;
   Ref sw = b->term_arg;
   if (b->ninsts) {
-    if (!thread_test(f, B, nread, nnread, &top, &tk)) return false;
+    if (!thread_test(f, B, nread, nnread, &top, &tk)) {
+      return false;
+    }
     sw = ir_args(f, b->term_arg)[0];
   }
   uint32_t k = UINT32_MAX;
@@ -6514,6 +6554,131 @@ static void thread_repair(IrFunc *f, uint32_t B, TdVec *mv) {
   for (uint32_t q = 0; q < np; q++) xfree(uses[q].v);
   xfree(uses);
   xfree(fresh); xfree(need); xfree(made.v);
+}
+
+/* Blocks copied for jump threading (thread_edge_copy, thread_path): each
+   group an original block, the copies made of it, and a row of the
+   copies of its instructions to a copy. */
+typedef struct { uint32_t orig, nin; TdVec made, cps; } TeGroup;
+
+/* every parameter and instruction of a group's original that is read
+   anywhere but in it and its copies, made by each of them, put back into
+   SSA form as thread_repair does B's parameters */
+static void thread_repair_groups(IrFunc *f, TeGroup *g, uint32_t ng) {
+  ir_order(f);
+  uint32_t nb = f->nblocks, nv = 0;
+  for (uint32_t k = 0; k < ng; k++) nv += f->blocks[g[k].orig].nparams + g[k].nin;
+  Ref *vals = xmalloc((nv ? nv : 1) * sizeof(Ref));
+  uint32_t *vg = xmalloc((nv ? nv : 1) * sizeof(uint32_t)), *vi = xmalloc((nv ? nv : 1) * sizeof(uint32_t));
+  uint32_t w = 0;
+  for (uint32_t k = 0; k < ng; k++) {
+    const Block *ob = &f->blocks[g[k].orig];
+    for (uint32_t q = 0; q < ob->nparams; q++) { vals[w] = ob->params[q]; vg[w] = k; vi[w++] = q; }
+    for (uint32_t i = 0; i < g[k].nin; i++) { vals[w] = ob->insts[i]; vg[w] = k; vi[w++] = ob->nparams + i; }
+  }
+  /* a block's group, if it is an original or a copy */
+  uint32_t *bg = xmalloc((nb ? nb : 1) * sizeof(uint32_t));
+  for (uint32_t x = 0; x < nb; x++) bg[x] = UINT32_MAX;
+  for (uint32_t k = 0; k < ng; k++) {
+    bg[g[k].orig] = k;
+    for (uint32_t j = 0; j < g[k].made.n; j++) bg[g[k].made.v[j]] = k;
+  }
+  uint8_t *need = xcalloc(nv ? nv : 1, 1);
+  TdVec *uses = xcalloc(nv ? nv : 1, sizeof(TdVec));
+  bool any = false;
+#define TE_READ(r) do {                                                       \
+    Ref r_ = (r);                                                             \
+    if (r_ != REF_NONE && r_ < f->ninsts) {                                   \
+      uint32_t ob_ = f->insts[r_].block;                                      \
+      if (ob_ < nb && bg[ob_] != UINT32_MAX && g[bg[ob_]].orig == ob_ && bg[x] != bg[ob_]) \
+        for (uint32_t k_ = 0; k_ < nv; k_++)                                  \
+          if (vals[k_] == r_) {                                               \
+            need[k_] = 1; any = true;                                         \
+            if (!uses[k_].n || uses[k_].v[uses[k_].n - 1] != x) td_push(&uses[k_], x); \
+            break;                                                            \
+          }                                                                   \
+    }                                                                         \
+  } while (0)
+  for (uint32_t x = 0; x < nb; x++) {
+    Block *xb = &f->blocks[x];
+    if (!xb->reachable) continue;
+    for (uint32_t i = 0; i < xb->ninsts; i++) {
+      const Ref *a = ir_args(f, xb->insts[i]);
+      for (uint32_t q = 0; q < f->insts[xb->insts[i]].nargs; q++) TE_READ(a[q]);
+    }
+    if (xb->term == T_BRIF || xb->term == T_BRTABLE) TE_READ(xb->term_arg);
+    for (uint32_t q = 0; q < xb->nret; q++) TE_READ(xb->ret_args[q]);
+    for (uint32_t s = 0; s < xb->nsuccs; s++)
+      for (uint32_t q = 0; q < xb->succs[s].nargs; q++) TE_READ(xb->succs[s].args[q]);
+  }
+#undef TE_READ
+  if (any) {
+    TdDom d;
+    td_dom_build(f, &d);
+    uint32_t mx = 1;
+    for (uint32_t k = 0; k < ng; k++) if (g[k].made.n + 1 > mx) mx = g[k].made.n + 1;
+    uint32_t *defb = xmalloc(mx * sizeof(uint32_t));
+    Ref *defv = xmalloc(mx * sizeof(Ref));
+    for (uint32_t k = 0; k < nv; k++) {
+      if (!need[k]) continue;
+      const TeGroup *gk = &g[vg[k]];
+      uint32_t np = f->blocks[gk->orig].nparams, nd = 0;
+      defb[nd] = gk->orig;
+      defv[nd++] = vals[k];
+      for (uint32_t j = 0; j < gk->made.n; j++) {
+        Ref c = vi[k] < np ? f->blocks[gk->made.v[j]].params[vi[k]]
+                           : gk->cps.v[(size_t)j * gk->nin + (vi[k] - np)];
+        if (c == REF_NONE) continue;
+        defb[nd] = gk->made.v[j];
+        defv[nd++] = c;
+      }
+      td_repair(f, vals[k], defb, defv, nd, uses[k].v, uses[k].n, &d);
+    }
+    xfree(defb); xfree(defv);
+    td_dom_free(&d);
+  }
+  for (uint32_t k = 0; k < nv; k++) xfree(uses[k].v);
+  xfree(uses); xfree(vals); xfree(vg); xfree(vi); xfree(bg); xfree(need);
+}
+
+/* thread_repair for copies of B (thread_edge_copy): cps a row of B's
+   instructions' copies to a made block */
+static void thread_repair_copies(IrFunc *f, uint32_t B, TdVec *mv, const Ref *cps) {
+  TeGroup g = { B, f->blocks[B].ninsts, *mv, { (Ref *)cps, mv->n * f->blocks[B].ninsts, 0 } };
+  thread_repair_groups(f, &g, 1);
+  xfree(mv->v);
+}
+
+/* B's constants moved to the end of its immediate dominator, which
+   dominates every read of them as B does (thread_consts_out): a copy of B
+   then reads them where they are */
+static bool consts_to_idom(IrFunc *f, uint32_t B) {
+  Block *b = &f->blocks[B];
+  uint32_t d = b->idom, nk = 0;
+  /* not into a block that only hands B its parameters, which a way
+     threaded through it bypasses (a copy reached from above it reads
+     them): above it, where B's idom is one (mandelbrot_float's f1) */
+  if (d < f->nblocks && d != B && d != f->entry && !f->blocks[d].ninsts && f->blocks[d].term == T_JUMP &&
+      f->blocks[d].nsuccs == 1 && f->blocks[d].succs[0].target == B)
+    d = f->blocks[d].idom;
+  for (uint32_t i = 0; i < b->ninsts; i++) nk += f->insts[b->insts[i]].op == I_CONST;
+  if (!nk) return true;
+  if (d == UINT32_MAX || d == B || d >= f->nblocks) return false;
+  uint32_t w = 0;
+  for (uint32_t i = 0; i < f->blocks[B].ninsts; i++) {
+    Ref v = f->blocks[B].insts[i];
+    if (f->insts[v].op != I_CONST) { f->blocks[B].insts[w++] = v; continue; }
+    Block *db = &f->blocks[d];
+    if (db->ninsts == db->cap_insts) {
+      uint32_t oc = db->cap_insts;
+      db->cap_insts = oc ? 2 * oc : 8;
+      db->insts = ir_grow(f, db->insts, (size_t)oc * sizeof *db->insts, (size_t)db->cap_insts * sizeof *db->insts);
+    }
+    db->insts[db->ninsts++] = v;
+    f->insts[v].block = d;
+  }
+  f->blocks[B].ninsts = w;
+  return true;
 }
 
 /* ---- threading on what the way into a block knows ----------------------
@@ -6617,11 +6782,40 @@ static bool ks_rel(KSet *r, uint16_t op, uint64_t k, bool truth, uint64_t mask) 
 
 /* y as x plus *d (mod 2^n): y itself, or its sum with or difference from a
    constant */
+/* y is x, or computes what x does: a pure instruction of the same
+   operands (WARMC_NO_KT_SAME) -- a merge's test made again past it, of the
+   values its ways had tested */
+/* the same value: a constant of the same bits, or a pure instruction of
+   operands that are (to depth d) -- a test made again of values made again */
+static bool kt_equiv(IrFunc *f, Ref y, Ref x, int d) {
+  if (y == x) return true;
+  const Inst *a = &f->insts[y], *b = &f->insts[x];
+  if (a->op != b->op || a->type != b->type || a->imm != b->imm || a->nargs != b->nargs) return false;
+  if (a->op == I_CONST) return (ValType)a->type != VT_V128;
+  if (a->op == I_PARAM || a->imm2 != b->imm2 || d <= 0 || !cse_candidate(f, y, false)) return false;
+  const Ref *aa = ir_args(f, y), *ba = ir_args(f, x);
+  for (uint32_t j = 0; j < a->nargs; j++)
+    if (!kt_equiv(f, aa[j], ba[j], d - 1)) return false;
+  return true;
+}
+
+static bool kt_same(IrFunc *f, Ref y, Ref x) {
+  if (y == x) return true;
+  if (f->insts[y].op == I_PARAM || f->insts[y].op == I_CONST) return false;
+  static _Atomic int on = -1;
+  int o = atomic_load_explicit(&on, memory_order_relaxed);
+  if (o < 0) {
+    o = warmc_getenv("WARMC_NO_KT_SAME") == NULL;
+    atomic_store_explicit(&on, o, memory_order_relaxed);
+  }
+  return o && kt_equiv(f, y, x, 3);
+}
+
 static bool kt_offset(IrFunc *f, Ref y, Ref x, uint64_t *d) {
-  if (y == x) { *d = 0; return true; }
+  if (kt_same(f, y, x)) { *d = 0; return true; }
   const Inst *yi = &f->insts[y];
   uint64_t c;
-  if ((yi->op == I_ADD || yi->op == I_SUB) && yi->nargs == 2 && ir_args(f, y)[0] == x &&
+  if ((yi->op == I_ADD || yi->op == I_SUB) && yi->nargs == 2 && kt_same(f, ir_args(f, y)[0], x) &&
       is_const(f, ir_args(f, y)[1], &c)) {
     *d = yi->op == I_ADD ? c : 0 - c;
     return true;
@@ -6637,6 +6831,13 @@ static bool kt_test(IrFunc *f, Ref c, Ref x, bool truth, uint64_t mask, KSet *r)
   Ref y;
   uint16_t op;
   uint64_t k;
+  /* a branch on x itself: on its not being 0 (WARMC_NO_KT_SELF) -- an if
+     on a flag, tested again past the merge of its arms */
+  if (ci->type == VT_I32 && kt_same(f, c, x) && !warmc_getenv("WARMC_NO_KT_SELF")) {
+    if (truth) ks_range(r, 1, mask, mask);
+    else ks_range(r, 0, 0, mask);
+    return true;
+  }
   if (ci->op == I_EQZ && ci->nargs == 1) { y = ir_args(f, c)[0]; op = I_EQ; k = 0; }
   else if (ci->op >= I_EQ && ci->op <= I_GEU && ci->nargs == 2 &&
            is_const(f, ir_args(f, c)[1], &k)) {
@@ -6668,9 +6869,114 @@ static bool kt_edge(IrFunc *f, uint32_t q, uint32_t s, Ref x, uint64_t mask, KSe
   return ks_shift(r, (0 - d) & mask, mask);
 }
 
+/* r or t, the ranges merged where they meet: false, and r as it was,
+   where that takes more than KS_MAX */
+static bool ks_union(KSet *r, const KSet *t, uint64_t mask) {
+  KSet o = {0};
+  for (uint32_t i = 0, j = 0; i < r->n || j < t->n;) {
+    uint64_t lo, hi;
+    if (j >= t->n || (i < r->n && r->lo[i] <= t->lo[j])) { lo = r->lo[i]; hi = r->hi[i]; i++; }
+    else { lo = t->lo[j]; hi = t->hi[j]; j++; }
+    if (o.n && (lo <= o.hi[o.n - 1] || (o.hi[o.n - 1] != mask && lo == o.hi[o.n - 1] + 1))) {
+      if (hi > o.hi[o.n - 1]) o.hi[o.n - 1] = hi;
+      continue;
+    }
+    if (o.n == KS_MAX) return false;
+    o.lo[o.n] = lo; o.hi[o.n++] = hi;
+  }
+  *r = o;
+  return true;
+}
+
 /* What the way into B by p's s-th edge says of x: that edge's branch, and
-   those of the blocks above it each entered by one edge. */
+   those of the blocks above it back to the one that makes x -- through a
+   merge too, where it is what each way into the merge says, all of them
+   together (WARMC_NO_KT_MERGE: only blocks each entered by one edge).  A
+   way round a loop, a block asked again before it is known, says nothing,
+   and so does every block past the first KW_BUDGET: what is known is
+   always true.  luawasm's array views: a store's ways meet past the
+   value's tests, which decided on each the view's ref.is_null that the
+   next access makes again. */
+#define KW_BUDGET 64
+#define KW_HASH 256
+typedef struct {
+  IrFunc *f;
+  Ref x;
+  uint64_t mask;
+  uint32_t def, left, nsets;
+  uint32_t key[KW_HASH]; /* a block plus one, 0 a free slot */
+  uint8_t st[KW_HASH];   /* 1 asked, 2 known */
+  uint8_t idx[KW_HASH];  /* a known one's set in sets[] */
+  KSet sets[KW_BUDGET];
+} KWay;
+
+static void kw_edge(KWay *w, uint32_t q, uint32_t s, KSet *r);
+
+/* what x is wherever y is entered */
+static void kw_in(KWay *w, uint32_t y, KSet *r) {
+  IrFunc *f = w->f;
+  ks_range(r, 0, w->mask, w->mask);
+  const Block *yb = &f->blocks[y];
+  /* x is made in y, or y has no way in that is known */
+  if (y == w->def || y == f->entry || yb->is_pad || !yb->npreds) return;
+  uint32_t h = (y * 2654435761u) & (KW_HASH - 1);
+  while (w->key[h] && w->key[h] != y + 1) h = (h + 1) & (KW_HASH - 1);
+  if (w->key[h]) {
+    if (w->st[h] == 2) *r = w->sets[w->idx[h]];
+    return;
+  }
+  if (!w->left) return;
+  w->left--;
+  w->key[h] = y + 1;
+  w->st[h] = 1;
+  KSet acc = {0}, e;
+  bool ok = true;
+  for (uint32_t pk = 0; pk < f->blocks[y].npreds && ok; pk++) {
+    uint32_t q = f->blocks[y].preds[pk];
+    bool seen = false;
+    for (uint32_t pj = 0; pj < pk; pj++) seen |= f->blocks[y].preds[pj] == q;
+    if (seen || q >= f->nblocks || !f->blocks[q].reachable) continue;
+    for (uint32_t s = 0; s < f->blocks[q].nsuccs && ok; s++) {
+      if (f->blocks[q].succs[s].target != y) continue;
+      kw_edge(w, q, s, &e);
+      ok = ks_union(&acc, &e, w->mask);
+    }
+  }
+  if (ok) *r = acc;
+  w->st[h] = 2;
+  w->idx[h] = (uint8_t)w->nsets;
+  w->sets[w->nsets++] = *r;
+}
+
+/* what x is where q's s-th edge is taken */
+static void kw_edge(KWay *w, uint32_t q, uint32_t s, KSet *r) {
+  KSet e, t;
+  kw_in(w, q, r);
+  if (kt_edge(w->f, q, s, w->x, w->mask, &e) && ks_inter(r, &e, &t)) *r = t;
+}
+
+/* kt_way, the search ended at block def instead of x's: for an x made
+   after the way (in B), its operands' deepest -- the way's tests of the same
+   values made of them are of what x is made of. */
+static void kt_way_d(IrFunc *f, uint32_t p, uint32_t s, Ref x, uint64_t mask, uint32_t def, KSet *r);
 static void kt_way(IrFunc *f, uint32_t p, uint32_t s, Ref x, uint64_t mask, KSet *r) {
+  kt_way_d(f, p, s, x, mask, f->insts[x].block, r);
+}
+
+static void kt_way_d(IrFunc *f, uint32_t p, uint32_t s, Ref x, uint64_t mask, uint32_t def, KSet *r) {
+  if (!warmc_getenv("WARMC_NO_KT_MERGE")) {
+    KWay *w = xmalloc(sizeof *w);
+    w->f = f;
+    w->x = x;
+    w->mask = mask;
+    w->def = def;
+    w->left = KW_BUDGET;
+    w->nsets = 0;
+    memset(w->key, 0, sizeof w->key);
+    kw_edge(w, p, s, r);
+    xfree(w);
+    return;
+  }
   ks_range(r, 0, mask, mask);
   KSet e, t;
   if (kt_edge(f, p, s, x, mask, &e) && ks_inter(r, &e, &t)) *r = t;
@@ -6757,7 +7063,63 @@ static bool kt_forwarder(IrFunc *f, uint32_t F, uint32_t B, const uint32_t *nrea
   return true;
 }
 
-static bool thread_known(IrFunc *f, uint32_t B, const uint32_t *nread, uint32_t nnread) {
+/* Each value's ref.is_null tests, made once a pass: first[a] one of them,
+   next[c] the one after c, REF_NONE ending the list. */
+typedef struct { Ref *first, *next; uint32_t n; } KtNulls;
+
+static void kt_nulls_make(IrFunc *f, KtNulls *ni) {
+  ni->n = f->ninsts;
+  ni->first = xmalloc((ni->n ? ni->n : 1) * sizeof(Ref));
+  ni->next = xmalloc((ni->n ? ni->n : 1) * sizeof(Ref));
+  for (uint32_t i = 0; i < ni->n; i++) ni->first[i] = ni->next[i] = REF_NONE;
+  for (uint32_t bi = 0; bi < f->nblocks; bi++) {
+    const Block *bb = &f->blocks[bi];
+    if (!bb->reachable) continue;
+    for (uint32_t i = 0; i < bb->ninsts; i++) {
+      Ref c = bb->insts[i];
+      if (f->insts[c].op != I_REF_IS_NULL || f->insts[c].nargs != 1) continue;
+      Ref a = ir_args(f, c)[0];
+      if (a >= ni->n || c >= ni->n) continue;
+      ni->next[c] = ni->first[a];
+      ni->first[a] = c;
+    }
+  }
+}
+
+/* Whether a, handed on by p's s-th edge, is null there: 1 it is, 0 it is
+   not, -1 the way leaves it open -- a null constant, a type that has no
+   null, or a test of its being null that the way's branches decided. */
+static int kt_isnull(IrFunc *f, const KtNulls *ni, Ref a, uint32_t p, uint32_t s) {
+  ValType t = (ValType)f->insts[a].type;
+  if (!vt_is_ref(t)) return -1;
+  /* (a constant first: the zero td_repair hands a way that reads nothing
+     has a type with no null) */
+  uint64_t c;
+  if (is_const(f, a, &c)) return c == 0;
+  if (!vt_nullable(t)) return 0;
+  if (!ni || a >= ni->n) return -1;
+  for (Ref n = ni->first[a]; n != REF_NONE; n = ni->next[n]) {
+    KSet way;
+    kt_way(f, p, s, n, 0xffffffffu, &way);
+    if (!way.n) continue;
+    if (way.n == 1 && way.lo[0] == 0 && way.hi[0] == 0) return 0;
+    if (way.lo[0] != 0) return 1;
+  }
+  return -1;
+}
+
+/* kt_pick, or for a test of a reference's being null (nul 1, or 2 where B
+   branches on its not being null) the way the edge's value decides */
+static uint32_t kt_pick_n(IrFunc *f, uint32_t B, int nul, const KtNulls *ni, uint32_t xq, Ref x,
+                          Ref a, uint64_t mask, const KSet *yes, uint64_t d, uint32_t p, uint32_t s) {
+  if (!nul) return kt_pick(f, B, xq, x, a, mask, yes, d, p, s);
+  int n = kt_isnull(f, ni, xq == UINT32_MAX ? x : a, p, s);
+  if (n < 0) return UINT32_MAX;
+  return (nul == 2 ? !n : n) ? 0 : 1;
+}
+
+static bool thread_known(IrFunc *f, uint32_t B, const uint32_t *nread, uint32_t nnread,
+                         const KtNulls *ni) {
   Block *b = &f->blocks[B];
   if (!b->reachable || b->is_pad || B == f->entry || ir_block_has_eh(f, B)) return false;
   if (b->term != T_BRIF && b->term != T_BRTABLE) return false;
@@ -6769,23 +7131,37 @@ static bool thread_known(IrFunc *f, uint32_t B, const uint32_t *nread, uint32_t 
   /* x, the value the test is of, made before B */
   Ref y = b->term_arg, x = REF_NONE;
   if (y >= nnread) return false;
+  int nul = 0;
   if (b->term == T_BRIF) {
     /* the compare B's, or one made before it that B branches on */
     const Inst *ci = &f->insts[y];
     uint64_t k;
-    if (ci->op == I_EQZ && ci->nargs == 1) y = ir_args(f, y)[0];
+    Ref y0 = ci->op == I_EQZ && ci->nargs == 1 ? ir_args(f, y)[0] : y;
+    /* a test of a reference's being null, or not: the way in decides it
+       where the edge hands B a null or a value of a type without one, or
+       its way has branched on that value's being null -- luawasm's array
+       view, tested again past the merge of a store's ways that kept it
+       and of those that dropped it (WARMC_NO_TNULL) */
+    if (ni && y0 < nnread && f->insts[y0].op == I_REF_IS_NULL && f->insts[y0].nargs == 1) {
+      nul = y0 == y ? 1 : 2;
+      y = y0;
+    } else if (ci->op == I_EQZ && ci->nargs == 1) y = ir_args(f, y)[0];
     else if (ci->op >= I_EQ && ci->op <= I_GEU && ci->nargs == 2 &&
              is_const(f, ir_args(f, y)[1], &k))
       y = ir_args(f, y)[0];
-    /* a branch on a parameter itself: on its not being 0 */
-    else if (ci->op != I_PARAM || ci->block != B) return false;
+    /* a branch on a parameter itself, or on a value made before B, which
+       is a merge's of ways that branched on it already (WARMC_NO_TOUTER):
+       on its not being 0 */
+    else if (ci->op == I_PARAM && ci->block == B) {}
+    else if (ci->block == B || ci->type != VT_I32 || warmc_getenv("WARMC_NO_TOUTER")) return false;
   }
   /* the value tested, less what is added to it: a fact on the way of the
      length, and a switch on the length less 4 */
   const Inst *yi = &f->insts[y];
   uint64_t c0;
-  x = (yi->op == I_ADD || yi->op == I_SUB) && yi->nargs == 2 &&
-      is_const(f, ir_args(f, y)[1], &c0) ? ir_args(f, y)[0] : y;
+  x = nul ? ir_args(f, y)[0]
+          : (yi->op == I_ADD || yi->op == I_SUB) && yi->nargs == 2 &&
+            is_const(f, ir_args(f, y)[1], &c0) ? ir_args(f, y)[0] : y;
   /* x is made before B, or is a parameter of B's, which each edge hands its
      value: TinyGo keeps each case's length test in a local, which reaches
      the next cases' tests as a parameter */
@@ -6797,7 +7173,7 @@ static bool thread_known(IrFunc *f, uint32_t B, const uint32_t *nread, uint32_t 
     if (xq == UINT32_MAX) return false;
   }
   ValType t = (ValType)f->insts[x].type;
-  if (t != VT_I32 && t != VT_I64) return false;
+  if (nul ? !vt_is_ref(t) : t != VT_I32 && t != VT_I64) return false;
   uint64_t mask = t == VT_I64 ? ~0ull : 0xffffffffu;
   /* B makes nothing that is read beyond it: constants, x plus one, the
      compare */
@@ -6818,7 +7194,8 @@ static bool thread_known(IrFunc *f, uint32_t B, const uint32_t *nread, uint32_t 
     if (!td_param_ok((ValType)f->insts[b->params[q]].type)) return false;
   /* where the test is true: B's way 0 */
   KSet yes = {0};
-  if (b->term == T_BRIF && b->term_arg == x) ks_range(&yes, 1, mask, mask);
+  if (nul) {}
+  else if (b->term == T_BRIF && b->term_arg == x) ks_range(&yes, 1, mask, mask);
   else if (b->term == T_BRIF && !kt_test(f, b->term_arg, x, true, mask, &yes)) return false;
   uint64_t d = 0;
   if (b->term == T_BRTABLE && !kt_offset(f, b->term_arg, x, &d)) return false;
@@ -6857,8 +7234,8 @@ static bool thread_known(IrFunc *f, uint32_t B, const uint32_t *nread, uint32_t 
               if (fb->params[q] == r) { r = e->args[q]; break; }
             ba[j] = r;
           }
-          uint32_t pick = kt_pick(f, B, xq, x, xq == UINT32_MAX ? REF_NONE : ba[xq], mask,
-                                  &yes, d, qi, s);
+          uint32_t pick = kt_pick_n(f, B, nul, ni, xq, x, xq == UINT32_MAX ? REF_NONE : ba[xq], mask,
+                                    &yes, d, qi, s);
           if (pick == UINT32_MAX) continue;
           /* the edge straight to B, then on past it */
           e = &f->blocks[qi].succs[s];
@@ -6876,8 +7253,8 @@ static bool thread_known(IrFunc *f, uint32_t B, const uint32_t *nread, uint32_t 
     for (uint32_t s = 0; s < f->blocks[pi].nsuccs; s++) {
       Edge *e = &f->blocks[pi].succs[s];
       if (e->target != B || e->eh || e->nargs != f->blocks[B].nparams) continue;
-      uint32_t pick = kt_pick(f, B, xq, x, xq == UINT32_MAX ? REF_NONE : e->args[xq], mask,
-                              &yes, d, pi, s);
+      uint32_t pick = kt_pick_n(f, B, nul, ni, xq, x, xq == UINT32_MAX ? REF_NONE : e->args[xq], mask,
+                                &yes, d, pi, s);
       if (pick == UINT32_MAX) continue;
       thread_edge(f, B, pi, s, pick, &made);
     }
@@ -6891,6 +7268,678 @@ static bool thread_known(IrFunc *f, uint32_t B, const uint32_t *nread, uint32_t 
   g_stats.threaded_known += made.n;
   thread_repair(f, B, &made);
   return true;
+}
+
+/* ---- threading on what B's test makes of each edge's values ------------
+
+   A block of a few instructions whose test is decided where an edge hands
+   it the values it does, and the way in has branched as it did: the test
+   worked out for the edge from its arguments -- constants folded, a value
+   made before B judged by what the way's branches say of it (kt_way), a
+   reference's being null by kt_isnull -- through B's own instructions, an
+   and of two tests, a compare of one with a constant.  The edge goes to a
+   copy of B that jumps where the test goes, and what B makes and is read
+   beyond it is put back into SSA form as B's parameters are (luawasm: an
+   access past a store's ways, whose view's null B tests and a later merge
+   reads again; its tests, an i32.and of a kind's and a tag's).  At most
+   TE_COPY instructions to a block, TE_BUDGET to a function and pass
+   (WARMC_NO_TEVAL). */
+#define TE_COPY 8
+#define TE_BUDGET 512
+enum { KE_NONE, KE_CONST, KE_VAL, KE_NZ };
+/* a value: a constant k, a value r made before B (KE_VAL; where def is
+   not UINT32_MAX, r is B's own, made of values made before it, whose way's
+   facts end at block def), or not 0 */
+typedef struct { int kind; uint64_t k; Ref r; uint32_t def; } KeV;
+typedef struct {
+  IrFunc *f;
+  uint32_t B, p, s;  /* the edge whose way's facts are taken: into B, or into Y */
+  const Ref *args;   /* what that edge hands its block */
+  const KtNulls *ni;
+  uint32_t Y, sy;    /* a block B's test is worked out through, by its sy-th edge
+                        into B, or UINT32_MAX: thread_path */
+} KtEv;
+
+/* what the way says of x -- the edge's, then Y's branch into B */
+static void ke_way(const KtEv *e, Ref x, uint64_t mask, uint32_t def, KSet *r) {
+  kt_way_d(e->f, e->p, e->s, x, mask, def == UINT32_MAX ? e->f->insts[x].block : def, r);
+  KSet t, u;
+  if (e->Y != UINT32_MAX && kt_edge(e->f, e->Y, e->sy, x, mask, &t) && ks_inter(r, &t, &u)) *r = u;
+}
+
+/* kt_isnull, by the way of ev */
+static int ke_isnull(const KtEv *e, Ref a) {
+  IrFunc *f = e->f;
+  ValType t = (ValType)f->insts[a].type;
+  if (!vt_is_ref(t)) return -1;
+  uint64_t c;
+  if (is_const(f, a, &c)) return c == 0;
+  if (!vt_nullable(t)) return 0;
+  if (!e->ni || a >= e->ni->n) return -1;
+  for (Ref n = e->ni->first[a]; n != REF_NONE; n = e->ni->next[n]) {
+    KSet way;
+    ke_way(e, n, 0xffffffffu, UINT32_MAX, &way);
+    if (!way.n) continue;
+    if (way.n == 1 && way.lo[0] == 0 && way.hi[0] == 0) return 0;
+    if (way.lo[0] != 0) return 1;
+  }
+  return -1;
+}
+
+static KeV ke_mk(int kind, uint64_t k, Ref r) { KeV v = { kind, k, r, UINT32_MAX }; return v; }
+
+static uint16_t cmp_swap(uint16_t op) {
+  switch (op) {
+    case I_EQ: case I_NE: return op;
+    case I_LTS: return I_GTS; case I_GTS: return I_LTS;
+    case I_LES: return I_GES; case I_GES: return I_LES;
+    case I_LTU: return I_GTU; case I_GTU: return I_LTU;
+    case I_LEU: return I_GEU; case I_GEU: return I_LEU;
+    default: return 0;
+  }
+}
+
+/* what the way says of the integer r: 1 it is not 0, 0 it is, -1 open */
+static int ke_truth(KtEv *e, Ref r, uint32_t def) {
+  ValType t = (ValType)e->f->insts[r].type;
+  if (t != VT_I32 && t != VT_I64) return -1;
+  uint64_t mask = t == VT_I64 ? ~0ull : 0xffffffffu;
+  KSet way;
+  ke_way(e, r, mask, def, &way);
+  if (!way.n) return -1;
+  if (way.n == 1 && way.lo[0] == 0 && way.hi[0] == 0) return 0;
+  return way.lo[0] != 0 ? 1 : -1;
+}
+
+/* r op k, r made before B: 1, 0, or -1 where the way leaves it open */
+static int ke_rel(KtEv *e, uint16_t op, Ref r, uint32_t def, uint64_t k) {
+  ValType t = (ValType)e->f->insts[r].type;
+  if (t != VT_I32 && t != VT_I64) return -1;
+  uint64_t mask = t == VT_I64 ? ~0ull : 0xffffffffu;
+  KSet way, yes, both;
+  if (!ks_rel(&yes, op, k & mask, true, mask)) return -1;
+  ke_way(e, r, mask, def, &way);
+  if (!way.n || !ks_inter(&way, &yes, &both)) return -1;
+  if (!both.n) return 0;
+  return ks_size(&both) == ks_size(&way) ? 1 : -1;
+}
+
+/* v, B's own pure instruction, whose operands are values made before B
+   (or are such instructions, or constants): v itself, its facts those of
+   the same values made before it, the search ended at the deepest block of
+   its operands -- a test B makes again of what each way in had tested */
+static KeV ke_self(KtEv *e, Ref v, const Ref *ops, const KeV *ev, uint32_t n) {
+  IrFunc *f = e->f;
+  if (!cse_candidate(f, v, false) || warmc_getenv("WARMC_NO_KE_SELF")) return ke_mk(KE_NONE, 0, REF_NONE);
+  uint32_t blk[2], nb = 0;
+  for (uint32_t i = 0; i < n && i < 2; i++) {
+    Ref o = ops[i];
+    if (ev[i].kind == KE_CONST && f->insts[o].op == I_CONST) continue;
+    if (ev[i].kind != KE_VAL || ev[i].r != o) return ke_mk(KE_NONE, 0, REF_NONE);
+    blk[nb++] = ev[i].def != UINT32_MAX ? ev[i].def : f->insts[o].block;
+  }
+  if (!nb) return ke_mk(KE_NONE, 0, REF_NONE);
+  uint32_t y = f->blocks[e->Y != UINT32_MAX ? e->Y : e->B].idom;
+  for (int k = 0; k < 256 && y < f->nblocks; k++) {
+    for (uint32_t j = 0; j < nb; j++)
+      if (blk[j] == y) {
+        KeV r = ke_mk(KE_VAL, 0, v);
+        r.def = y;
+        return r;
+      }
+    if (y == f->entry || f->blocks[y].idom == y) break;
+    y = f->blocks[y].idom;
+  }
+  return ke_mk(KE_NONE, 0, REF_NONE);
+}
+
+/* v on the way: made by B, by Y (inY: an instruction of Y's, which reads
+   B's values as they were before), or before them */
+static KeV kt_ev_in(KtEv *e, Ref v, int depth, bool inY);
+static KeV kt_ev(KtEv *e, Ref v, int depth) { return kt_ev_in(e, v, depth, false); }
+
+static KeV kt_ev_in(KtEv *e, Ref v, int depth, bool inY) {
+  IrFunc *f = e->f;
+  const Inst *in = &f->insts[v];
+  uint64_t c;
+  if (is_const(f, v, &c)) return ke_mk(KE_CONST, c, REF_NONE);
+  bool atY = e->Y != UINT32_MAX && in->block == e->Y;
+  if (!atY && (in->block != e->B || inY)) return ke_mk(KE_VAL, 0, v);
+  if (atY) inY = true;
+  if (in->op == I_PARAM) {
+    const Block *b = &f->blocks[in->block];
+    for (uint32_t q = 0; q < b->nparams; q++)
+      if (b->params[q] == v) {
+        /* B's from Y's edge into it, Y's (or B's alone) from the way's edge */
+        Ref a = !atY && e->Y != UINT32_MAX ? f->blocks[e->Y].succs[e->sy].args[q] : e->args[q];
+        if (is_const(f, a, &c)) return ke_mk(KE_CONST, c, REF_NONE);
+        if (!atY && e->Y != UINT32_MAX && f->insts[a].block == e->Y && depth < 8)
+          return kt_ev_in(e, a, depth + 1, true);
+        return ke_mk(KE_VAL, 0, a);
+      }
+    return ke_mk(KE_NONE, 0, REF_NONE);
+  }
+  if (depth > 6 || (ValType)in->type == VT_V128) return ke_mk(KE_NONE, 0, REF_NONE);
+  uint16_t op = in->op;
+  if (in->nargs == 1) {
+    Ref a0 = ir_args(f, v)[0];
+    ValType ot = (ValType)f->insts[a0].type;
+    KeV a = kt_ev_in(e, a0, depth + 1, inY);
+    if (op == I_REF_IS_NULL) {
+      if (a.kind == KE_CONST) return ke_mk(KE_CONST, a.k == 0, REF_NONE);
+      int n = a.kind == KE_VAL && a.def == UINT32_MAX ? ke_isnull(e, a.r) : -1;
+      return n < 0 ? ke_mk(KE_NONE, 0, REF_NONE) : ke_mk(KE_CONST, (uint64_t)n, REF_NONE);
+    }
+    if (vt_is_float(ot) || ot == VT_V128 || vt_is_ref(ot)) return ke_mk(KE_NONE, 0, REF_NONE);
+    uint64_t r;
+    if (a.kind == KE_CONST && fold_int_unop(op, ot, a.k, &r)) return ke_mk(KE_CONST, r, REF_NONE);
+    if (op == I_EQZ && a.kind == KE_NZ) return ke_mk(KE_CONST, 0, REF_NONE);
+    if (op == I_EQZ && a.kind == KE_VAL) {
+      int t = ke_truth(e, a.r, a.def);
+      if (t >= 0) return ke_mk(KE_CONST, (uint64_t)!t, REF_NONE);
+    }
+    return ke_self(e, v, &a0, &a, 1);
+  }
+  if (in->nargs != 2) return ke_mk(KE_NONE, 0, REF_NONE);
+  Ref a0 = ir_args(f, v)[0], a1 = ir_args(f, v)[1];
+  ValType ot = (ValType)f->insts[a0].type;
+  if (vt_is_float(ot) || ot == VT_V128) return ke_mk(KE_NONE, 0, REF_NONE);
+  KeV a = kt_ev_in(e, a0, depth + 1, inY);
+  if (op == I_AND && a.kind == KE_CONST && (a.k & 0xffffffffu) == 0 && in->type == VT_I32)
+    return ke_mk(KE_CONST, 0, REF_NONE);
+  if (op == I_OR && in->type == VT_I32 && ((a.kind == KE_CONST && (a.k & 0xffffffffu)) || a.kind == KE_NZ))
+    return ke_mk(KE_NZ, 0, REF_NONE);
+  KeV b = kt_ev_in(e, a1, depth + 1, inY);
+  uint64_t r;
+  if (a.kind == KE_CONST && b.kind == KE_CONST && fold_int_binop(op, ot, a.k, b.k, &r))
+    return ke_mk(KE_CONST, r, REF_NONE);
+  if (in->type == VT_I32 && (op == I_AND || op == I_OR)) {
+    if (op == I_AND && b.kind == KE_CONST && (b.k & 0xffffffffu) == 0) return ke_mk(KE_CONST, 0, REF_NONE);
+    if (op == I_OR && ((b.kind == KE_CONST && (b.k & 0xffffffffu)) || b.kind == KE_NZ))
+      return ke_mk(KE_NZ, 0, REF_NONE);
+    /* two tests both true: 1, each a compare's 0 or 1 */
+    if (op == I_AND && a.kind == KE_CONST && b.kind == KE_CONST) return ke_mk(KE_CONST, a.k & b.k, REF_NONE);
+  }
+  const Ref ops[2] = { a0, a1 };
+  const KeV evs[2] = { a, b };
+  if (op < I_EQ || op > I_GEU) return ke_self(e, v, ops, evs, 2);
+  /* a compare of a value made before B with a constant */
+  if (b.kind == KE_CONST && a.kind == KE_VAL) {}
+  else if (a.kind == KE_CONST && b.kind == KE_VAL) {
+    KeV t = a; a = b; b = t;
+    op = cmp_swap(op);
+    if (!op) return ke_mk(KE_NONE, 0, REF_NONE);
+  } else return ke_self(e, v, ops, evs, 2);
+  if (vt_is_ref(ot)) {
+    /* a reference against null is its test of being null */
+    if ((op != I_EQ && op != I_NE) || b.k != 0 || a.def != UINT32_MAX) return ke_mk(KE_NONE, 0, REF_NONE);
+    int n = ke_isnull(e, a.r);
+    if (n < 0) return ke_mk(KE_NONE, 0, REF_NONE);
+    return ke_mk(KE_CONST, (uint64_t)(op == I_EQ ? n : !n), REF_NONE);
+  }
+  int t = ke_rel(e, op, a.r, a.def, b.k);
+  return t < 0 ? ke_self(e, v, ops, evs, 2) : ke_mk(KE_CONST, (uint64_t)t, REF_NONE);
+}
+
+/* The edge pi's s-th, into B, sent to a copy of B -- its parameters and
+   instructions -- that jumps where B's pick-th edge goes; each copied
+   instruction pushed onto cps, REF_NONE for a nop, B's order kept. */
+static bool thread_edge_copy(IrFunc *f, uint32_t B, uint32_t pi, uint32_t s, uint32_t pick,
+                             TdVec *made, TdVec *cps) {
+  {
+    const Block *bb = &f->blocks[B];
+    uint32_t t = bb->succs[pick].target;
+    if (t == B || bb->succs[pick].eh || f->blocks[t].is_pad) return false;
+  }
+  uint32_t x = ir_new_block(f);
+  uint32_t np = f->blocks[B].nparams, ni = f->blocks[B].ninsts;
+  Ref *from = xmalloc((np + ni + 1) * sizeof(Ref)), *to = xmalloc((np + ni + 1) * sizeof(Ref));
+  uint32_t nm = 0;
+  for (uint32_t q = 0; q < np; q++) {
+    Ref op = f->blocks[B].params[q];
+    from[nm] = op;
+    to[nm++] = ir_add_param(f, x, (ValType)f->insts[op].type);
+  }
+#define TE_MAP(r) ({ Ref r_ = (r); for (uint32_t m_ = 0; m_ < nm; m_++) if (from[m_] == r_) { r_ = to[m_]; break; } r_; })
+  Ref tmp[16];
+  for (uint32_t i = 0; i < ni; i++) {
+    Ref v = f->blocks[B].insts[i];
+    Inst src = f->insts[v];
+    if (src.op == I_NOP) { td_push(cps, REF_NONE); continue; }
+    Ref *heap = src.nargs > 16 ? xmalloc(src.nargs * sizeof(Ref)) : NULL;
+    Ref *args = heap ? heap : tmp;
+    const Ref *sa = ir_args(f, v);
+    for (uint32_t j = 0; j < src.nargs; j++) args[j] = TE_MAP(sa[j]);
+    Ref nv = ir_emit(f, x, (IrOp)src.op, (ValType)src.type, args, src.nargs, src.imm, src.imm2);
+    f->insts[nv].flags = src.flags;
+    xfree(heap);
+    from[nm] = v;
+    to[nm++] = nv;
+    td_push(cps, nv);
+  }
+  const Edge *ce = &f->blocks[B].succs[pick];
+  uint32_t t = ce->target, na = ce->nargs;
+  Ref *ea = na ? xmalloc(na * sizeof(Ref)) : NULL;
+  for (uint32_t a = 0; a < na; a++) ea[a] = TE_MAP(f->blocks[B].succs[pick].args[a]);
+#undef TE_MAP
+  f->blocks[x].term = T_JUMP;
+  ir_add_edge(f, x, t, ea, na);
+  xfree(ea); xfree(from); xfree(to);
+  f->blocks[x].reachable = true;
+  f->blocks[x].cold = f->blocks[pi].cold;
+  f->blocks[pi].succs[s].target = x;
+  td_push(made, x);
+  g_stats.branch_simplified++;
+  return true;
+}
+
+/* What a copied block may make that is read beyond it, which the repair
+   then merges from the original and the copies: a value of a parameter's
+   type.  (WARMC_TE_NOARITH=1: not arithmetic of the block's parameters,
+   only tests, reads, and arithmetic of what was made before it -- a copy
+   makes such arithmetic of its way's values, often constants, and a merge
+   of the copies is what an analysis after may not see into as it saw into
+   the arithmetic of a merge: addr64's n << 2 of n = min(n, 1024), which
+   te_diamond now leaves to if-conversion.  The 32 luawasm kernels: nbody
+   and awfy_nbody 15% fewer cycles with it all.) */
+static bool te_test(IrFunc *f, Ref v, int d) {
+  const Inst *in = &f->insts[v];
+  if (in->type != VT_I32) return false;
+  switch (in->op) {
+    case I_EQ: case I_NE: case I_LTS: case I_LTU: case I_GTS: case I_GTU:
+    case I_LES: case I_LEU: case I_GES: case I_GEU: case I_EQZ:
+    case I_REF_IS_NULL: case I_REF_TEST:
+      return true;
+    case I_AND: case I_OR:
+      return d < 4 && in->nargs == 2 && te_test(f, ir_args(f, v)[0], d + 1) &&
+             te_test(f, ir_args(f, v)[1], d + 1);
+    default:
+      return false;
+  }
+}
+
+static bool te_read(uint16_t op) {
+  return op == I_LOAD || op == I_FIELD_GET || op == I_ARRAY_GET || op == I_ARRAY_LEN ||
+         op == I_GLOBAL_GET || op == I_RESULT || op == I_CALL;
+}
+
+/* whether v, of block B, is arithmetic of one of B's parameters -- what it
+   reads of memory or the heap ending the search: the analyses see into
+   neither copy of a read */
+static bool te_of_param(IrFunc *f, Ref v, uint32_t B, int d) {
+  const Inst *in = &f->insts[v];
+  if (in->block != B || te_read(in->op)) return false;
+  if (in->op == I_PARAM) return true;
+  if (d > 8) return true;
+  const Ref *a = ir_args(f, v);
+  for (uint32_t j = 0; j < in->nargs; j++)
+    if (te_of_param(f, a[j], B, d + 1)) return true;
+  return false;
+}
+
+static bool te_beyond(IrFunc *f, Ref v) {
+  static _Atomic int any = -1;
+  int a = atomic_load_explicit(&any, memory_order_relaxed);
+  if (a < 0) {
+    a = warmc_getenv("WARMC_TE_NOARITH") == NULL;
+    atomic_store_explicit(&any, a, memory_order_relaxed);
+  }
+  if (!td_param_ok((ValType)f->insts[v].type)) return false;
+  if (a || te_test(f, v, 0)) return true;
+  uint16_t op = f->insts[v].op;
+  bool ok = !te_of_param(f, v, f->insts[v].block, 0);
+  if (!ok && warmc_getenv("WARMC_TE_DEBUG"))
+    fprintf(stderr, "te_beyond: %s v%u:%s b%u %s\n", ir_op_name(op), v, vt_name((ValType)f->insts[v].type),
+            f->insts[v].block, f->m->funcs[f->func_index].name ? f->m->funcs[f->func_index].name : "?");
+  return ok;
+}
+
+/* A block of at most four pure instructions with one way in, from D, and
+   one out, to B: an arm of an if that if-conversion makes a select of. */
+static bool te_pure_arm(IrFunc *f, uint32_t P, uint32_t B, uint32_t *D) {
+  const Block *pb = &f->blocks[P];
+  if (pb->npreds != 1 || pb->term != T_JUMP || pb->nsuccs != 1 || pb->succs[0].target != B ||
+      pb->ninsts > 4 || pb->is_pad)
+    return false;
+  for (uint32_t i = 0; i < pb->ninsts; i++)
+    if (!ir_is_pure(&f->insts[pb->insts[i]])) return false;
+  *D = pb->preds[0];
+  return *D != P && *D != B;
+}
+
+/* Whether P's way into B is one of an if's whose arms are pure arms (or
+   none) into B -- a diamond or triangle that if-conversion makes selects
+   of, which a threaded way would break up: addr64's n = min(n, 1024),
+   whose select bounds its loops' accesses (a merge of n << 2 and 4096
+   made of it, no check went; WARMC_TE_DIAMONDS=1 threads it). */
+static bool te_diamond(IrFunc *f, uint32_t P, uint32_t B) {
+  static _Atomic int on = -1;
+  int o = atomic_load_explicit(&on, memory_order_relaxed);
+  if (o < 0) {
+    o = warmc_getenv("WARMC_TE_DIAMONDS") == NULL;
+    atomic_store_explicit(&on, o, memory_order_relaxed);
+  }
+  if (!o) return false;
+  uint32_t D = UINT32_MAX, D2;
+  if (!te_pure_arm(f, P, B, &D)) D = P;
+  const Block *db = &f->blocks[D];
+  if (db->term != T_BRIF || db->nsuccs != 2) return false;
+  for (uint32_t k = 0; k < 2; k++) {
+    uint32_t t = db->succs[k].target;
+    if (t == B) continue;
+    if (!te_pure_arm(f, t, B, &D2) || D2 != D) return false;
+  }
+  return D != P || db->succs[0].target != db->succs[1].target;
+}
+
+/* where B's test goes for the edge ev names: B's way, or UINT32_MAX */
+static uint32_t te_pick(KtEv *ev) {
+  KeV r = kt_ev(ev, ev->f->blocks[ev->B].term_arg, 0);
+  if (r.kind == KE_CONST) return (r.k & 0xffffffffu) ? 0 : 1;
+  if (r.kind == KE_NZ) return 0;
+  if (r.kind == KE_VAL) {
+    int t = ke_truth(ev, r.r, r.def);
+    return t < 0 ? UINT32_MAX : t ? 0 : 1;
+  }
+  return UINT32_MAX;
+}
+
+static bool thread_eval(IrFunc *f, uint32_t B, const uint32_t *nread, uint32_t nnread,
+                        const KtNulls *ni, uint32_t *budget) {
+  Block *b = &f->blocks[B];
+  if (!b->reachable || b->is_pad || B == f->entry || b->term != T_BRIF || ir_block_has_eh(f, B))
+    return false;
+  if (b->term_arg >= nnread) return false;
+  for (uint32_t p = 0; p < b->npreds; p++)
+    if (f->blocks[b->preds[p]].rpo >= b->rpo) return false;
+  uint32_t nc = 0;
+  for (uint32_t i = 0; i < b->ninsts; i++) {
+    Ref v = b->insts[i];
+    const Inst *in = &f->insts[v];
+    if (v >= nnread) return false;
+    if (in->op == I_NOP || in->op == I_CONST) continue;
+    nc++;
+    /* what is read beyond B has a parameter's type, which the repair makes
+       merges of */
+    uint32_t here = 0;
+    for (uint32_t j = 0; j < b->ninsts; j++) {
+      const Ref *a = ir_args(f, b->insts[j]);
+      for (uint32_t q = 0; q < f->insts[b->insts[j]].nargs; q++) here += a[q] == v;
+    }
+    if (b->term_arg == v) here++;
+    for (uint32_t s = 0; s < b->nsuccs; s++)
+      for (uint32_t q = 0; q < b->succs[s].nargs; q++) here += b->succs[s].args[q] == v;
+    if (nread[v] != here && !te_beyond(f, v)) return false;
+  }
+  if (nc > TE_COPY || nc > *budget) return false;
+  for (uint32_t q = 0; q < b->nparams; q++)
+    if (!td_param_ok((ValType)f->insts[b->params[q]].type)) return false;
+
+  TdVec made = {0}, cps = {0};
+  uint32_t np0 = f->blocks[B].npreds;
+  uint32_t *preds = xmalloc((np0 ? np0 : 1) * sizeof(uint32_t));
+  memcpy(preds, f->blocks[B].preds, np0 * sizeof(uint32_t));
+  bool stop = false;
+  for (uint32_t pk = 0; pk < np0 && !stop; pk++) {
+    uint32_t pi = preds[pk];
+    if (pi == B || !f->blocks[pi].reachable) continue;
+    bool seen = false;
+    for (uint32_t pj = 0; pj < pk; pj++) seen |= preds[pj] == pi;
+    if (seen) continue;
+    if (te_diamond(f, pi, B)) continue;
+    /* a block that only hands its parameters on to B: each edge into it,
+       with what it hands B, as thread_known takes them (an if's merge of
+       the values its arms made, ahead of the next merge's test) */
+    if (kt_forwarder(f, pi, B, nread, nnread)) {
+      uint32_t nf = f->blocks[pi].npreds;
+      uint32_t *fp = xmalloc((nf ? nf : 1) * sizeof(uint32_t));
+      memcpy(fp, f->blocks[pi].preds, nf * sizeof(uint32_t));
+      for (uint32_t fk = 0; fk < nf && !stop; fk++) {
+        uint32_t qi = fp[fk];
+        bool dup = qi == pi || qi == B;
+        for (uint32_t fj = 0; fj < fk; fj++) dup |= fp[fj] == qi;
+        if (dup || !f->blocks[qi].reachable || te_diamond(f, qi, pi)) continue;
+        for (uint32_t s = 0; s < f->blocks[qi].nsuccs; s++) {
+          const Edge *e = &f->blocks[qi].succs[s];
+          const Block *fb = &f->blocks[pi];
+          if (e->target != pi || e->eh || e->nargs != fb->nparams) continue;
+          if (nc > *budget) { stop = true; break; }
+          uint32_t nb = fb->succs[0].nargs;
+          Ref *ba = ir_alloc(f, (nb ? nb : 1) * sizeof(Ref));
+          for (uint32_t j = 0; j < nb; j++) {
+            Ref r = fb->succs[0].args[j];
+            for (uint32_t q = 0; q < fb->nparams; q++)
+              if (fb->params[q] == r) { r = e->args[q]; break; }
+            ba[j] = r;
+          }
+          KtEv ev = { f, B, qi, s, ba, ni, UINT32_MAX, 0 };
+          uint32_t pick = te_pick(&ev);
+          if (pick == UINT32_MAX) continue;
+          if (!made.n && !consts_to_idom(f, B)) { stop = true; break; }
+          /* the edge straight to B, then on to a copy of it */
+          Edge *ee = &f->blocks[qi].succs[s];
+          Edge was = *ee;
+          ee->target = B;
+          ee->args = ba;
+          ee->nargs = ee->cap = nb;
+          if (thread_edge_copy(f, B, qi, s, pick, &made, &cps)) *budget -= nc;
+          else f->blocks[qi].succs[s] = was;
+        }
+      }
+      xfree(fp);
+      continue;
+    }
+    for (uint32_t s = 0; s < f->blocks[pi].nsuccs; s++) {
+      const Edge *e = &f->blocks[pi].succs[s];
+      if (e->target != B || e->eh || e->nargs != f->blocks[B].nparams) continue;
+      if (nc > *budget) { stop = true; break; }
+      KtEv ev = { f, B, pi, s, e->args, ni, UINT32_MAX, 0 };
+      uint32_t pick = te_pick(&ev);
+      if (pick == UINT32_MAX) continue;
+      if (!made.n && !consts_to_idom(f, B)) { stop = true; break; }
+      if (thread_edge_copy(f, B, pi, s, pick, &made, &cps)) *budget -= nc;
+    }
+  }
+  xfree(preds);
+  if (!made.n) { xfree(cps.v); return false; }
+  if (warmc_getenv("WARMC_THREAD_STATS"))
+    fprintf(stderr, "thread %s b%u: brif worked out on the way in, %u edge(s)\n",
+            f->m->funcs[f->func_index].sym ? f->m->funcs[f->func_index].sym : "?", B, made.n);
+  g_stats.threaded_eval += made.n;
+  thread_repair_copies(f, B, &made, cps.v);
+  xfree(cps.v);
+  return true;
+}
+
+/* Whether block X can be copied for threading -- no landing pad, no
+   exception's way, not the entry nor a loop's header, its terminator a
+   jump or a branch, what it makes and is read beyond it of a parameter's
+   type -- and the instructions it would copy (*nc, its constants left). */
+static bool te_copyable(IrFunc *f, uint32_t X, const uint32_t *nread, uint32_t nnread, uint32_t *nc) {
+  const Block *b = &f->blocks[X];
+  if (!b->reachable || b->is_pad || X == f->entry || ir_block_has_eh(f, X)) return false;
+  if (b->term != T_BRIF && b->term != T_JUMP) return false;
+  for (uint32_t p = 0; p < b->npreds; p++)
+    if (f->blocks[b->preds[p]].rpo >= b->rpo) return false;
+  for (uint32_t q = 0; q < b->nparams; q++)
+    if (!td_param_ok((ValType)f->insts[b->params[q]].type)) return false;
+  *nc = 0;
+  for (uint32_t i = 0; i < b->ninsts; i++) {
+    Ref v = b->insts[i];
+    const Inst *in = &f->insts[v];
+    if (v >= nnread) return false;
+    if (in->op == I_NOP || in->op == I_CONST) continue;
+    (*nc)++;
+    uint32_t here = 0;
+    for (uint32_t j = 0; j < b->ninsts; j++) {
+      const Ref *a = ir_args(f, b->insts[j]);
+      for (uint32_t q = 0; q < f->insts[b->insts[j]].nargs; q++) here += a[q] == v;
+    }
+    if (b->term == T_BRIF && b->term_arg == v) here++;
+    for (uint32_t s = 0; s < b->nsuccs; s++)
+      for (uint32_t q = 0; q < b->succs[s].nargs; q++) here += b->succs[s].args[q] == v;
+    if (nread[v] != here && !te_beyond(f, v)) return false;
+  }
+  return true;
+}
+
+/* Y's parameters and instructions copied into fresh block y2, and B's into
+   b2 -- each read mapped to its copy -- y2 ending as Y does but for its
+   way to B, which goes to b2, and b2 jumping where B's pick-th edge goes;
+   P's s-th edge then goes to y2. */
+static bool thread_path_copy(IrFunc *f, uint32_t Y, uint32_t sy, uint32_t B, uint32_t P, uint32_t s,
+                             uint32_t pick, TeGroup *gy, TeGroup *gb) {
+  {
+    const Edge *pe = &f->blocks[B].succs[pick];
+    if (pe->target == B || pe->target == Y || pe->eh || f->blocks[pe->target].is_pad) return false;
+  }
+  uint32_t y2 = ir_new_block(f), b2 = ir_new_block(f);
+  uint32_t npy = f->blocks[Y].nparams, niy = f->blocks[Y].ninsts;
+  uint32_t npb = f->blocks[B].nparams, nib = f->blocks[B].ninsts;
+  uint32_t cap = npy + niy + npb + nib + 1, nm = 0;
+  Ref *from = xmalloc(cap * sizeof(Ref)), *to = xmalloc(cap * sizeof(Ref));
+#define TP_MAP(r) ({ Ref r_ = (r); for (uint32_t m_ = 0; m_ < nm; m_++) if (from[m_] == r_) { r_ = to[m_]; break; } r_; })
+  Ref tmp[16];
+  for (int pass = 0; pass < 2; pass++) {
+    uint32_t X = pass ? B : Y, x2 = pass ? b2 : y2;
+    TeGroup *g = pass ? gb : gy;
+    for (uint32_t q = 0; q < f->blocks[X].nparams; q++) {
+      Ref op = f->blocks[X].params[q];
+      from[nm] = op;
+      to[nm++] = ir_add_param(f, x2, (ValType)f->insts[op].type);
+    }
+    for (uint32_t i = 0; i < f->blocks[X].ninsts; i++) {
+      Ref v = f->blocks[X].insts[i];
+      Inst src = f->insts[v];
+      if (src.op == I_NOP) { td_push(&g->cps, REF_NONE); continue; }
+      Ref *heap = src.nargs > 16 ? xmalloc(src.nargs * sizeof(Ref)) : NULL;
+      Ref *args = heap ? heap : tmp;
+      const Ref *sa = ir_args(f, v);
+      for (uint32_t j = 0; j < src.nargs; j++) args[j] = TP_MAP(sa[j]);
+      Ref nv = ir_emit(f, x2, (IrOp)src.op, (ValType)src.type, args, src.nargs, src.imm, src.imm2);
+      f->insts[nv].flags = src.flags;
+      xfree(heap);
+      from[nm] = v;
+      to[nm++] = nv;
+      td_push(&g->cps, nv);
+    }
+    if (!pass) {
+      /* y2 ends as Y does, its way into B going to b2 */
+      Block *yb = &f->blocks[Y];
+      f->blocks[y2].term = yb->term;
+      f->blocks[y2].term_arg = yb->term == T_BRIF ? TP_MAP(yb->term_arg) : yb->term_arg;
+      f->blocks[y2].term_imm = yb->term_imm;
+      for (uint32_t k = 0; k < f->blocks[Y].nsuccs; k++) {
+        const Edge *ye = &f->blocks[Y].succs[k];
+        uint32_t na = ye->nargs;
+        Ref *ea = na ? xmalloc(na * sizeof(Ref)) : NULL;
+        for (uint32_t a = 0; a < na; a++) ea[a] = TP_MAP(f->blocks[Y].succs[k].args[a]);
+        bool eh = f->blocks[Y].succs[k].eh;
+        uint32_t tg = k == sy ? b2 : f->blocks[Y].succs[k].target;
+        ir_add_edge(f, y2, tg, ea, na);
+        f->blocks[y2].succs[f->blocks[y2].nsuccs - 1].eh = eh;
+        xfree(ea);
+      }
+    }
+  }
+  const Edge *ce = &f->blocks[B].succs[pick];
+  uint32_t t = ce->target, na = ce->nargs;
+  Ref *ea = na ? xmalloc(na * sizeof(Ref)) : NULL;
+  for (uint32_t a = 0; a < na; a++) ea[a] = TP_MAP(f->blocks[B].succs[pick].args[a]);
+#undef TP_MAP
+  f->blocks[b2].term = T_JUMP;
+  ir_add_edge(f, b2, t, ea, na);
+  xfree(ea); xfree(from); xfree(to);
+  f->blocks[y2].reachable = f->blocks[b2].reachable = true;
+  f->blocks[y2].cold = f->blocks[b2].cold = f->blocks[P].cold;
+  f->blocks[P].succs[s].target = y2;
+  td_push(&gy->made, y2);
+  td_push(&gb->made, b2);
+  g_stats.branch_simplified++;
+  return true;
+}
+
+/* B's test worked out along a way of two blocks, P's edge into Y and Y's
+   into B (B's test reads what Y made or was handed): both copied for the
+   way, which then goes past the test -- luawasm's store of what the access
+   before it read, whose tag and kind that access's way into the store's
+   test had decided, a block of the access's merge between.  At most
+   TP_COPY instructions of the two (WARMC_NO_TPATH). */
+#define TP_COPY 16
+static bool thread_path(IrFunc *f, uint32_t B, const uint32_t *nread, uint32_t nnread,
+                        const KtNulls *ni, uint32_t *budget) {
+  uint32_t nc;
+  if (f->blocks[B].term != T_BRIF || !te_copyable(f, B, nread, nnread, &nc) || nc > TE_COPY ||
+      f->blocks[B].term_arg >= nnread)
+    return false;
+  uint32_t np0 = f->blocks[B].npreds;
+  uint32_t *preds = xmalloc((np0 ? np0 : 1) * sizeof(uint32_t));
+  memcpy(preds, f->blocks[B].preds, np0 * sizeof(uint32_t));
+  TeGroup *gs = xcalloc(np0 + 1, sizeof(TeGroup));
+  uint32_t ng = 1;
+  gs[0].orig = B;
+  bool stop = false, moved = false;
+  for (uint32_t pk = 0; pk < np0 && !stop; pk++) {
+    uint32_t Y = preds[pk];
+    if (Y == B || !f->blocks[Y].reachable) continue;
+    bool seen = false;
+    for (uint32_t pj = 0; pj < pk; pj++) seen |= preds[pj] == Y;
+    if (seen) continue;
+    uint32_t ncy, sy = UINT32_MAX, nto = 0;
+    if (te_diamond(f, Y, B) || !te_copyable(f, Y, nread, nnread, &ncy) || nc + ncy > TP_COPY) continue;
+    for (uint32_t k = 0; k < f->blocks[Y].nsuccs; k++)
+      if (f->blocks[Y].succs[k].target == B) { sy = k; nto++; }
+    if (nto != 1 || f->blocks[Y].succs[sy].eh || f->blocks[Y].succs[sy].nargs != f->blocks[B].nparams) continue;
+    uint32_t gi = UINT32_MAX;
+    uint32_t nq0 = f->blocks[Y].npreds;
+    uint32_t *qs = xmalloc((nq0 ? nq0 : 1) * sizeof(uint32_t));
+    memcpy(qs, f->blocks[Y].preds, nq0 * sizeof(uint32_t));
+    for (uint32_t qk = 0; qk < nq0 && !stop; qk++) {
+      uint32_t P = qs[qk];
+      if (P == Y || P == B || !f->blocks[P].reachable || te_diamond(f, P, Y)) continue;
+      bool dup = false;
+      for (uint32_t qj = 0; qj < qk; qj++) dup |= qs[qj] == P;
+      if (dup) continue;
+      for (uint32_t s = 0; s < f->blocks[P].nsuccs; s++) {
+        const Edge *e = &f->blocks[P].succs[s];
+        if (e->target != Y || e->eh || e->nargs != f->blocks[Y].nparams) continue;
+        if (nc + ncy > *budget) { stop = true; break; }
+        KtEv ev = { f, B, P, s, e->args, ni, Y, sy };
+        uint32_t pick = te_pick(&ev);
+        if (pick == UINT32_MAX) continue;
+        if (!moved) {
+          if (!consts_to_idom(f, B)) { stop = true; break; }
+          moved = true;
+        }
+        if (gi == UINT32_MAX) {
+          /* (the dominators anew where a copy made already has changed
+             them: a copy of another of B's predecessors may be a new way
+             into Y -- rstests/intarith, b543 reached from a copy of b540,
+             its constant put in b540) */
+          if (ng > 1 || gs[0].made.n) ir_order(f);
+          if (!consts_to_idom(f, Y)) break;
+          gi = ng++;
+          gs[gi].orig = Y;
+          gs[gi].nin = f->blocks[Y].ninsts;
+        }
+        gs[0].nin = f->blocks[B].ninsts;
+        if (thread_path_copy(f, Y, sy, B, P, s, pick, &gs[gi], &gs[0])) *budget -= nc + ncy;
+      }
+    }
+    xfree(qs);
+  }
+  xfree(preds);
+  uint32_t nmade = gs[0].made.n;
+  if (nmade) {
+    if (warmc_getenv("WARMC_THREAD_STATS"))
+      fprintf(stderr, "thread %s b%u: brif worked out along two blocks, %u way(s)\n",
+              f->m->funcs[f->func_index].sym ? f->m->funcs[f->func_index].sym : "?", B, nmade);
+    g_stats.threaded_path += nmade;
+    thread_repair_groups(f, gs, ng);
+  }
+  for (uint32_t k = 0; k < ng; k++) { xfree(gs[k].made.v); xfree(gs[k].cps.v); }
+  xfree(gs);
+  return nmade != 0;
 }
 
 /* A parameter every edge hands one compare of a value made before the
@@ -6984,6 +8033,8 @@ static bool param_compares(IrFunc *f) {
 
 static bool pass_thread(IrFunc *f) {
   if (f->npads) return false;
+  /* (the threadings move constants to a block's idom: up to date) */
+  ir_order(f);
   bool changed = !warmc_getenv("WARMC_NO_PCMP") && param_compares(f);
   if (changed) prune_params(f);
   uint32_t *nread = changed ? count_uses(f) : count_uses_shared(f, UC_THREAD);
@@ -6992,12 +8043,36 @@ static bool pass_thread(IrFunc *f) {
      compile's time */
   bool known = !warmc_getenv("WARMC_NO_TKNOWN");
   bool debug = warmc_getenv("WARMC_THREAD_DEBUG") != NULL;
+  /* (WARMC_THREAD_VERIFY: the IR checked after each threading, with
+     WARMC_VERIFY_SSA its SSA form too) */
+  bool tverify = warmc_getenv("WARMC_THREAD_VERIFY") != NULL;
+  KtNulls nulls = {0};
+  bool tnull = known && !warmc_getenv("WARMC_NO_TNULL");
+  bool teval = known && !warmc_getenv("WARMC_NO_TEVAL");
+  {
+    /* (debugging: WARMC_TE_FUNCS=LO-HI, the functions by index the new
+       threadings take) */
+    const char *r = warmc_getenv("WARMC_TE_FUNCS");
+    unsigned lo = 0, hi = 0;
+    if (r && sscanf(r, "%u-%u", &lo, &hi) == 2 && (f->func_index < lo || f->func_index > hi)) {
+      teval = false;
+      tnull = false;
+    }
+  }
+  bool tpath = teval && !warmc_getenv("WARMC_NO_TPATH");
+  if (tnull) kt_nulls_make(f, &nulls);
+  uint32_t budget = TE_BUDGET;
   for (uint32_t bi = 0, n = f->nblocks; bi < n; bi++)
     if (thread_dispatch(f, bi, nread, nnread) ||
-        (known && thread_known(f, bi, nread, nnread))) {
+        (known && thread_known(f, bi, nread, nnread, tnull ? &nulls : NULL)) ||
+        (teval && thread_eval(f, bi, nread, nnread, tnull ? &nulls : NULL, &budget)) ||
+        (tpath && thread_path(f, bi, nread, nnread, tnull ? &nulls : NULL, &budget))) {
       changed = true;
       if (debug) { ir_print(f, "thread"); ir_verify(f, "thread"); }
+      else if (tverify) { ir_order(f); ir_verify(f, "thread"); }
     }
+  xfree(nulls.first);
+  xfree(nulls.next);
   xfree(nread);
   if (changed) {
     prune_params(f);
@@ -10589,10 +11664,15 @@ static bool gc_fold_known(IrFunc *f, Ref v) {
       replace_with_const(f, v, (uint64_t)r);
       return true;
     }
-    case I_REF_IS_NULL:
-      if (in->nargs != 1 || !gc_exact_type(f, ir_args(f, v)[0], &ti)) return false;
+    case I_REF_IS_NULL: {
+      if (in->nargs != 1) return false;
+      /* of a value whose type has no null too: a merge's parameter that
+         jump threading made of a value tested before it */
+      ValType at = (ValType)f->insts[ir_args(f, v)[0]].type;
+      if (!(vt_is_ref(at) && !vt_nullable(at)) && !gc_exact_type(f, ir_args(f, v)[0], &ti)) return false;
       replace_with_const(f, v, 0);
       return true;
+    }
     case I_TRAP_IF: {
       if (in->nargs != 1) return false;
       uint64_t c;
@@ -25035,6 +26115,80 @@ static void rle_put(RleSet *st, RleEnt e) {
   st->e[st->n++] = e;
 }
 
+/* whether nothing of block b before its instruction i writes a field or
+   calls: what the ways in held is still so there */
+static bool i_first_effect(IrFunc *f, const Block *b, uint32_t i) {
+  for (uint32_t k = 0; k < i; k++) {
+    uint16_t op = f->insts[b->insts[k]].op;
+    if (op == I_FIELD_SET || rle_kills_all(op)) return false;
+  }
+  return true;
+}
+
+/* A field read at a merge that some ways in have read (or written) and the
+   others are cold ways that do not have: read on each of those at its end,
+   where it goes to the merge alone, and the merge given the value as a
+   parameter (partial redundancy, the load made where it was missing): a
+   slow path that calls the runtime and rejoins -- luawasm's tables' and
+   records' fields, read again after every access whose slow path calls --
+   pays a load after its call, the hot way none.  The value at the read on
+   each way in, or REF_NONE where some way can have it neither way. */
+static Ref rle_pre(IrFunc *f, uint32_t bi, Ref v, Ref root, uint32_t size, const RleSet *out) {
+  if (warmc_getenv("WARMC_NO_RLEPRE")) return REF_NONE;
+  Block *b = &f->blocks[bi];
+  const Inst *in = &f->insts[v];
+  Ref *a = ir_args(f, v);
+  /* the object made before the merge; a barrier's mask made again where
+     the read is */
+  Ref obj = a[0];
+  uint32_t ob = f->insts[obj].block;
+  if (ob == bi || !dominates(f, ob, bi)) return REF_NONE;
+  if (in->nargs > 2 || (in->nargs == 2 && f->insts[a[1]].op != I_GC_BADMASK)) return REF_NONE;
+  uint32_t np = b->npreds;
+  if (np < 2 || np > 16) return REF_NONE;
+  Ref val[16];
+  uint32_t have = 0;
+  for (uint32_t p = 0; p < np; p++) {
+    uint32_t pb = b->preds[p];
+    val[p] = REF_NONE;
+    if (!f->blocks[pb].reachable) return REF_NONE;
+    const RleSet *o = &out[pb];
+    for (uint32_t q = 0; q < o->n && val[p] == REF_NONE; q++) {
+      const RleEnt *e = &o->e[q];
+      if (e->root != root || e->off != in->imm || e->size != size) continue;
+      if (e->ty == (ValType)in->type || (vt_is_ref(e->ty) && vt_is_ref((ValType)in->type))) val[p] = e->value;
+    }
+    if (val[p] != REF_NONE) { have++; continue; }
+    /* missing: only a cold way that goes nowhere else */
+    const Block *P = &f->blocks[pb];
+    if (!P->cold || P->is_pad || P->nsuccs != 1 || P->succs[0].target != bi || P->succs[0].eh) return REF_NONE;
+  }
+  if (!have) return REF_NONE;
+  /* (a block listed twice is one way in, read once) */
+  for (uint32_t p = 0; p < np; p++) {
+    if (val[p] != REF_NONE) continue;
+    uint32_t pb = b->preds[p];
+    for (uint32_t q = 0; q < p; q++)
+      if (b->preds[q] == pb) val[p] = val[q];
+    if (val[p] != REF_NONE) continue;
+    Ref na[2] = { obj, REF_NONE };
+    if (in->nargs == 2) na[1] = ir_emit(f, pb, I_GC_BADMASK, VT_I64, NULL, 0, 0, 0);
+    val[p] = ir_emit(f, pb, I_FIELD_GET, (ValType)in->type, na, in->nargs, in->imm, in->imm2);
+    f->insts[val[p]].flags = f->insts[v].flags;
+    g_stats.gc_loads_pre++;
+  }
+  b = &f->blocks[bi];
+  Ref par = ir_add_param(f, bi, (ValType)f->insts[v].type);
+  b = &f->blocks[bi];
+  for (uint32_t p = 0; p < b->npreds; p++) {
+    uint32_t pb = b->preds[p];
+    bool dup = false;
+    for (uint32_t q = 0; q < p; q++) dup |= b->preds[q] == pb;
+    if (!dup) edge_push_arg(f, pb, bi, val[p]);
+  }
+  return par;
+}
+
 static bool pass_gc_rle(IrFunc *f) {
   static const uint16_t gets[] = { I_FIELD_GET };
   if (round_lacks(f, 15, gets, 1)) return false;
@@ -25115,11 +26269,20 @@ static bool pass_gc_rle(IrFunc *f) {
               (vt_is_ref(e->ty) && vt_is_ref((ValType)in->type)))
             hit = e->value;
         }
+        /* at a merge's top, before anything it does: what the hot ways in
+           read, made on the cold ones */
+        if (hit == REF_NONE && fwd >= 2 && !back && !b->is_pad && bi != f->entry && i_first_effect(f, b, i)) {
+          hit = rle_pre(f, bi, v, root, size, out);
+          b = &f->blocks[bi];
+          in = &f->insts[v];
+        }
         if (hit != REF_NONE) {
+          uint64_t at = in->imm;
           ir_replace(f, v, hit);
           ir_make_nop(in);
           g_stats.gc_loads_reused++;
           changed = true;
+          rle_put(&cur, (RleEnt){ root, hit, at, size, (ValType)f->insts[hit].type });
           continue;
         }
         rle_put(&cur, (RleEnt){ root, v, in->imm, size, (ValType)in->type });
@@ -25176,15 +26339,25 @@ void opt_passtime_report(void) {
     fprintf(stderr, "%-22s %9.1f %9lu %9lu\n",
             g_pt[i].nm, g_pt[i].ms, g_pt[i].calls, g_pt[i].hits);
 }
+/* WARMC_PRINT_FN=NAME: the IR of the function of that name (or symbol)
+   after each pass that changed it, on stderr */
+static const char *g_print_fn;
+static bool pt_print_fn(IrFunc *f) {
+  if (!g_print_fn) return false;
+  const Func *fn = &f->m->funcs[f->func_index];
+  return (fn->name && !strcmp(fn->name, g_print_fn)) || (fn->sym && !strcmp(fn->sym, g_print_fn));
+}
 #define TP(nm, call) ({ bool _r; if (g_pt_on) { \
     double _t = pt_now(); _r = (call); double _d = pt_now() - _t; \
     pthread_mutex_lock(&g_pt_lock); int _s = pt_slot(nm); \
     if (_s >= 0) { g_pt[_s].ms += _d; g_pt[_s].calls++; if (_r) g_pt[_s].hits++; } \
-    pthread_mutex_unlock(&g_pt_lock); } else _r = (call); _r; })
+    pthread_mutex_unlock(&g_pt_lock); } else _r = (call); \
+    if (_r && pt_print_fn(f)) ir_print(f, nm); _r; })
 
 static pthread_once_t g_pt_once = PTHREAD_ONCE_INIT;
 static void pt_init(void) {
   g_pt_on = warmc_getenv("WARMC_PASSTIME") != NULL;
+  g_print_fn = warmc_getenv("WARMC_PRINT_FN");
 }
 
 /* The cleanup rounds every inline is followed by: folding, forwarding and
