@@ -6335,14 +6335,18 @@ static bool td_numeric(ValType t) {
    repair hands a zero (td_repair): a number, or a reference, whose zero is
    null -- read on no way that reaches a use, so a non-nullable one's type
    is never asked of it (luawasm's merges of a value pair, an i64 and an
-   eqref, ahead of the test of the flag its try-ops set).  WARMC_TD_REFS=1:
-   it made luawasm's bounce 12% and methodcall 5% faster, but its nbodies
-   12% and 17% slower, the threaded edges' values spilling in their loops. */
+   eqref, ahead of the test of the flag its try-ops set), and its type
+   tags, i31 constants handed to the merges that test them.  Off at first
+   (then WARMC_TD_REFS=1), when luawasm's nbodies ran 12% and 17% slower
+   for it, the threaded edges' values spilling in their loops; once its
+   typed loads no longer went round its loops, fannkuch 21%, bounce 12%,
+   deltablue 11%, sieve and spectralnorm 10%, nbody 5% fewer cycles
+   (WARMC_NO_TD_REFS=1 the old way). */
 static bool td_param_ok(ValType t) {
   static _Atomic int refs = -1;
   int r = atomic_load_explicit(&refs, memory_order_relaxed);
   if (r < 0) {
-    r = warmc_getenv("WARMC_TD_REFS") != NULL;
+    r = warmc_getenv("WARMC_NO_TD_REFS") == NULL;
     atomic_store_explicit(&refs, r, memory_order_relaxed);
   }
   return td_numeric(t) || (r && vt_is_ref(t));
