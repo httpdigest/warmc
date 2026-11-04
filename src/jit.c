@@ -170,9 +170,13 @@ typedef struct {
   size_t len;
   const JitOpts *opts;
   const char *text;
-  /* what a diagnostic leaves for the catcher to free */
+  /* what a diagnostic leaves for the catcher to free: o is obj, or NULL --
+     the object lives here, in the frame of the compile's caller, as a
+     diagnostic longjmps out of do_compile's own, which the catcher's calls
+     then write over */
   Module *m;
   ObjBuilder *o;
+  ObjBuilder obj;
   JitModule *partial;
   /* which tier the compile is of: 0 untiered, 1 the first, 2 the second,
      placed near the first's code (near) */
@@ -595,16 +599,16 @@ static void do_compile(CompileJob *job) {
     read_types(m, jm);
   }
 
-  ObjBuilder o;
-  memset(&o, 0, sizeof o);
-  job->o = &o;
-  compile_module(m, &o, &opt);
-  if (job->tier) job->entries = func_entries(m, &o, &job->nentries);
+  ObjBuilder *o = &job->obj;
+  memset(o, 0, sizeof *o);
+  job->o = o;
+  compile_module(m, o, &opt);
+  if (job->tier) job->entries = func_entries(m, o, &job->nentries);
   /* the module first: what is left is the object */
   module_free(m);
   job->m = NULL;
-  JitImage *im = image_of(&o);
-  const uint8_t *sec[NSEC] = { o.text.data, o.rodata.data, o.data.data, o.custom.data };
+  JitImage *im = image_of(o);
+  const uint8_t *sec[NSEC] = { o->text.data, o->rodata.data, o->data.data, o->custom.data };
   char *lerr = NULL;
   JitCode *code = load(im, sec, job->near, job->opts, &lerr);
   if (!code) {
@@ -614,7 +618,7 @@ static void do_compile(CompileJob *job) {
     image_free(im);
     warmc_fatal("%s", msg);
   }
-  obj_free(&o);
+  obj_free(o);
   job->o = NULL;
   for (uint32_t k = 0; job->tier && k < job->nentries; k++)
     if (job->entries[k] != UINT64_MAX) job->entries[k] += code_text(code);
