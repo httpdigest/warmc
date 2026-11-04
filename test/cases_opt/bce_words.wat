@@ -8,7 +8,7 @@
 ;; mask too narrow for the step, a step that leaves i a multiple of 2 alone
 ;; -- whose read past the end traps at every level.  The count is of the
 ;; checks taken off, before -O2's unrolling copies a loop's reads.
-;; stats -O2: bce_ranges=26
+;; stats -O2: bce_ranges=32
 ;; run: mask4 16 => i32:120
 ;; run: mask4 7 => i32:6
 ;; run: mask4 3 => i32:0

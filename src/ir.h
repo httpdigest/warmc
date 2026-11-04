@@ -299,6 +299,9 @@ typedef struct {
   bool outline;
 
   bool is_pad;
+  /* a loop versioned for its bounds checks (opt.c pass_bce_version), the
+     original or the copy: versioned no more */
+  bool bver;
   uint8_t pad_kind;
   uint32_t pad_tag;
   uint32_t rpo;
@@ -747,6 +750,9 @@ typedef struct {
   /* runs of reads of one array at base + c whose greatest and least were
      moved first, for the others' checks to go (opt.c gc_smear) */
   uint64_t bce_smeared;
+  /* loops copied behind a test of their bounds, the copy's checks then
+     taken off (opt.c pass_bce_version) */
+  uint64_t bce_versioned;
   /* GC fields carried through a loop as a value (opt.c pass_field_promote) */
   uint64_t fields_promoted;
   /* casts and type tests a sealed module's object slot decides inline, and

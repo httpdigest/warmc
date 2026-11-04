@@ -6,8 +6,9 @@
 ;; an array of n + 1, a select's clamp, a length tested above a constant.
 ;; Each has a twin one step off whose check must stay, so the read past the
 ;; end traps at every level.  The count is of the checks taken off, before
-;; -O2's unrolling copies a loop's read with its flags.
-;; stats -O2: bce_ranges=17
+;; -O2's unrolling copies a loop's read with its flags, a loop copied behind
+;; a test of its bounds (pass_bce_version) counting its copy's too.
+;; stats -O2: bce_ranges=20
 ;; run: up 10 => i32:45
 ;; run: up 0 => i32:0
 ;; run: up_le 10 => trap: out of bounds array access
