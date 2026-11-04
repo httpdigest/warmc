@@ -12,9 +12,13 @@
 ;; loop's header, which an edge past its test would enter in the middle,
 ;; nor where the way does not decide it.  Answers worked out in Python.
 ;;
+;; (At -O2 loophead's loop, whose header tests a value made before it, is
+;; unswitched first -- opt.c pass_unswitch -- and the test ahead of its
+;; copies is one more the way in decides.)
+;;
 ;; stats -O1: threaded_known=26 param_compares=1
-;; stats -O2: threaded_known=26 param_compares=1
-;; stats -O3: threaded_known=26 param_compares=1
+;; stats -O2: threaded_known=27 param_compares=1
+;; stats -O3: threaded_known=27 param_compares=1
 ;;
 ;; run: eqway 0 0 => i32:0
 ;; run: rangeway 0 0 => i32:0

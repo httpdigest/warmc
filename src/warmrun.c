@@ -93,17 +93,26 @@ static void print_val(wasm_valkind_t k, const warm_val_raw_t *v) {
   }
 }
 
+/* the module's export types, made once: made again for each export a run
+   calls, every one of them with its function type, a module of 2576
+   exports (test/cases/vector.wat) took a million allocations a launch of
+   400 calls, and inside make check's load ran past its timeout */
+static wasm_exporttype_vec_t g_types;
+static const wasm_module_t *g_types_of;
+
 static const wasm_extern_t *find_export(const wasm_module_t *m, const wasm_extern_vec_t *ex,
                                         const char *name) {
-  wasm_exporttype_vec_t types;
-  wasm_module_exports(m, &types);
-  const wasm_extern_t *found = NULL;
-  for (size_t i = 0; i < types.size && !found; i++) {
-    const wasm_name_t *n = wasm_exporttype_name(types.data[i]);
-    if (n->size == strlen(name) && !memcmp(n->data, name, n->size)) found = ex->data[i];
+  if (g_types_of != m) {
+    if (g_types_of) wasm_exporttype_vec_delete(&g_types);
+    wasm_module_exports(m, &g_types);
+    g_types_of = m;
   }
-  wasm_exporttype_vec_delete(&types);
-  return found;
+  size_t len = strlen(name);
+  for (size_t i = 0; i < g_types.size && i < ex->size; i++) {
+    const wasm_name_t *n = wasm_exporttype_name(g_types.data[i]);
+    if (n->size == len && !memcmp(n->data, name, n->size)) return ex->data[i];
+  }
+  return NULL;
 }
 
 /* trap, as the program warmc links reports it; never returns */
@@ -306,6 +315,10 @@ int main(int argc, char **argv) {
     }
   }
   fflush(stdout);
+  if (g_types_of) {
+    wasm_exporttype_vec_delete(&g_types);
+    g_types_of = NULL;
+  }
   wasm_extern_vec_delete(&ex);
   wasm_instance_delete(instance);
   wasm_module_delete(module);

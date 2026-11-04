@@ -6352,6 +6352,19 @@ static bool td_param_ok(ValType t) {
   return td_numeric(t) || (r && vt_is_ref(t));
 }
 
+/* Whether a value a copy defines too may be merged with its copy where
+   both reach: of a type a merge can take (refs too where refs), and not a
+   pointer into linear memory -- mem_ptr's base and the addresses made of
+   it are an access's alone, which isel folds into it and refuses merged
+   ("mem_base pointer escapes an access"; asbench/mapstr's loop, unswitched,
+   read a merge of two such addresses as an address of its own and faulted
+   outside its memory). */
+static bool copy_mergeable(IrFunc *f, Ref v, bool refs) {
+  const Inst *in = &f->insts[v];
+  if (in->op == I_MEM_ADDR || in->op == I_MEM_BASE || in->op == I_MEM_PTR) return false;
+  return refs ? td_param_ok((ValType)in->type) : td_numeric((ValType)in->type);
+}
+
 /* The test of a block that branches on nothing but a compare of one of its
    parameters with a constant -- binaryen's `c ? x : 1` merged into the block
    whose `if` tests it -- as the opcode and constant, or false.  The compare
@@ -7584,7 +7597,7 @@ static bool te_beyond(IrFunc *f, Ref v) {
     a = warmc_getenv("WARMC_TE_NOARITH") == NULL;
     atomic_store_explicit(&any, a, memory_order_relaxed);
   }
-  if (!td_param_ok((ValType)f->insts[v].type)) return false;
+  if (!copy_mergeable(f, v, true)) return false;
   if (a || te_test(f, v, 0)) return true;
   uint16_t op = f->insts[v].op;
   bool ok = !te_of_param(f, v, f->insts[v].block, 0);
@@ -8119,6 +8132,12 @@ static void clone_blocks(IrFunc *f, const uint8_t *in, uint32_t nb0, uint32_t ni
     yb->sealed = xb->sealed;
     yb->filled = xb->filled;
     yb->reachable = true;
+    /* a slow path copied is as cold as the original (WARMC_CLONE_NO_COLD:
+       hot, as copies were): a copy whose hints were gone took its slow
+       paths' calls for hot ones and spilled round them -- an unswitched
+       copy of luawasm's swap loop ran 100 instructions where it ran 81 */
+    bool keep_cold = !warmc_getenv("WARMC_CLONE_NO_COLD");
+    if (keep_cold) yb->cold = xb->cold;
     if (xb->nret) {
       yb->ret_args = ir_alloc(f, xb->nret * sizeof(Ref));
       memcpy(yb->ret_args, xb->ret_args, xb->nret * sizeof(Ref));
@@ -8129,6 +8148,7 @@ static void clone_blocks(IrFunc *f, const uint8_t *in, uint32_t nb0, uint32_t ni
       uint32_t t = e.target < nb0 && in[e.target] ? bcopy[e.target] : e.target;
       ir_add_edge(f, y, t, e.args, e.nargs);
       f->blocks[y].succs[f->blocks[y].nsuccs - 1].eh = e.eh;
+      if (keep_cold) f->blocks[y].succs[f->blocks[y].nsuccs - 1].cold = e.cold;
     }
   }
 #define CB_MAP(r) ((r) != REF_NONE && (r) < ni0 && map[r] != REF_NONE ? map[r] : (r))
@@ -8382,7 +8402,7 @@ static bool pass_nodesplit_whole(IrFunc *f) {
     eslot = xmalloc((ni0 ? ni0 : 1) * sizeof(uint32_t));
     nesc = escaping_values(f, inR, nb0, ni0, false, esc, eslot, &euse);
     for (uint32_t v = 0; v < ni0 && any; v++)
-      if (esc[v] && !td_numeric((ValType)f->insts[v].type)) any = false;
+      if (esc[v] && !copy_mergeable(f, v, false)) any = false;
   }
   if (!any) {
     for (uint32_t i = 0; i < nesc; i++) xfree(euse[i].v);
@@ -8657,7 +8677,7 @@ static bool pass_key_split(IrFunc *f) {
     uint32_t nesc = escaping_values(f, keep, nb0, ni0, true, esc, eslot, &euse);
     bool ok = true;
     for (uint32_t v = 0; v < ni0 && ok; v++)
-      if (esc[v] && !td_numeric((ValType)f->insts[v].type)) ok = false;
+      if (esc[v] && !copy_mergeable(f, v, false)) ok = false;
     if (!ok) {
       for (uint32_t i = 0; i < nesc; i++) xfree(euse[i].v);
       xfree(esc); xfree(eslot); xfree(euse); xfree(keep); xfree(reach); xfree(way);
@@ -12284,7 +12304,7 @@ static bool once_split_loop(IrFunc *f, uint32_t hb, uint8_t *inloop, uint32_t *s
   uint32_t nesc = escaping_values(f, inloop, nb0, ni0, false, esc, eslot, &euse);
   bool ok = true;
   for (uint32_t v = 0; v < ni0 && ok; v++)
-    if (esc[v] && !td_numeric((ValType)f->insts[v].type)) ok = false;
+    if (esc[v] && !copy_mergeable(f, v, false)) ok = false;
   if (!ok) {
     for (uint32_t i = 0; i < nesc; i++) xfree(euse[i].v);
     xfree(esc); xfree(eslot); xfree(euse);
@@ -12379,6 +12399,184 @@ static bool once_split_loop(IrFunc *f, uint32_t hb, uint8_t *inloop, uint32_t *s
   prune_params(f);
   ir_order(f);
   return true;
+}
+
+/* ---- loop unswitching -------------------------------------------------
+
+   A loop with a branch on a value made before it -- a guard of an inline
+   cache or of an inlined method, a table's kind tested at every access --
+   is copied, the original taking the branch's first way every time round
+   and the copy its second, and a test ahead of the loop picks the one to
+   run: the guard's slow way, and every value merged from it, gone from the
+   loop that runs.  A branch with a cold way (a branch hint's) is taken
+   first; where neither way is, only a loop of US_PLAIN_MAX instructions is
+   copied.  An innermost loop only (WARMC_US_OUTER=1: any), of at most
+   US_LOOP_MAX instructions (WARMC_US_MAX), US_BUDGET of a function's, and
+   none with an exception's way (WARMC_NO_UNSWITCH).  luawasm: `for i = 1, n do
+   s = s + obj:f(i) end` reloaded and tested its spilled guard every time
+   round, its call's merge keeping the sum's type unknown. */
+#define US_LOOP_MAX 600
+#define US_PLAIN_MAX 200
+#define US_BUDGET 3000
+#define US_ROUNDS 4
+
+/* the block of the loop whose branch to unswitch on, or UINT32_MAX: a
+   branch on a value made before the loop, one way cold if any is */
+static uint32_t us_pick(IrFunc *f, const uint8_t *inloop, uint32_t nb0, uint32_t pre, uint32_t size,
+                        bool *cold_way, uint32_t *cold_k) {
+  uint32_t best = UINT32_MAX;
+  int bscore = 0;
+  for (uint32_t bi = 0; bi < nb0; bi++) {
+    if (!inloop[bi]) continue;
+    const Block *b = &f->blocks[bi];
+    if (b->term != T_BRIF || b->nsuccs != 2 || b->succs[0].target == b->succs[1].target) continue;
+    if (b->succs[0].eh || b->succs[1].eh) continue;
+    Ref c = b->term_arg;
+    uint64_t k;
+    if (c == REF_NONE || is_const(f, c, &k)) continue;
+    uint32_t cb = f->insts[c].block;
+    if (cb >= f->nblocks || (cb < nb0 && inloop[cb]) || !dominates(f, cb, pre)) continue;
+    int cw = b->succs[0].cold ? 0 : b->succs[1].cold ? 1 : -1;
+    if (cw < 0 && f->blocks[b->succs[0].target].cold != f->blocks[b->succs[1].target].cold)
+      cw = f->blocks[b->succs[0].target].cold ? 0 : 1;
+    int score = cw >= 0 ? 2 : 1;
+    if (cw < 0 && size > US_PLAIN_MAX) continue;
+    if (score > bscore) {
+      bscore = score;
+      best = bi;
+      *cold_way = cw >= 0;
+      *cold_k = cw >= 0 ? (uint32_t)cw : 0;
+    }
+  }
+  return best;
+}
+
+/* X's branch made a jump down its k-th way */
+static void us_take(IrFunc *f, uint32_t X, uint32_t k) {
+  Block *b = &f->blocks[X];
+  Edge keep = b->succs[k];
+  b->succs[0] = keep;
+  b->nsuccs = 1;
+  b->term = T_JUMP;
+  b->term_arg = REF_NONE;
+}
+
+static bool us_loop(IrFunc *f, uint32_t hb, uint8_t *inloop, uint32_t *stack, uint32_t *budget) {
+  uint32_t pre = loop_body(f, hb, inloop, stack);
+  if (pre == REF_NONE) return false;
+  uint32_t nb0 = f->nblocks, ni0 = f->ninsts, size = 0;
+  bool inner = !warmc_getenv("WARMC_US_OUTER");
+  for (uint32_t bi = 0; bi < nb0; bi++) {
+    if (!inloop[bi]) continue;
+    const Block *b = &f->blocks[bi];
+    if (b->is_pad || ir_block_has_eh(f, bi) || b->term == T_BRTABLE) return false;
+    /* an innermost loop only: an outer one's copy is a copy of its inner
+       loops too, which spectralnorm's ran 12% more instructions in */
+    if (inner && b->loop_depth > f->blocks[hb].loop_depth) return false;
+    size += b->ninsts + b->nparams;
+  }
+  static _Atomic int lmax = -1;
+  int lm = atomic_load_explicit(&lmax, memory_order_relaxed);
+  if (lm < 0) {
+    const char *e = warmc_getenv("WARMC_US_MAX");
+    lm = e ? atoi(e) : US_LOOP_MAX;
+    atomic_store_explicit(&lmax, lm, memory_order_relaxed);
+  }
+  if (size > (uint32_t)lm || size > *budget) return false;
+  bool cold_way = false;
+  uint32_t cold_k = 0;
+  uint32_t B = us_pick(f, inloop, nb0, pre, size, &cold_way, &cold_k);
+  if (B == UINT32_MAX) return false;
+  Ref c = f->blocks[B].term_arg;
+
+  uint8_t *esc = xcalloc(ni0 ? ni0 : 1, 1);
+  uint32_t *eslot = xmalloc((ni0 ? ni0 : 1) * sizeof(uint32_t));
+  TdVec *euse = NULL;
+  uint32_t nesc = escaping_values(f, inloop, nb0, ni0, false, esc, eslot, &euse);
+  bool ok = true;
+  for (uint32_t v = 0; v < ni0 && ok; v++)
+    if (esc[v] && !copy_mergeable(f, v, true)) ok = false;
+  if (!ok) {
+    for (uint32_t i = 0; i < nesc; i++) xfree(euse[i].v);
+    xfree(esc); xfree(eslot); xfree(euse);
+    return false;
+  }
+  Ref *map = xmalloc(ni0 * sizeof(Ref));
+  uint32_t *bcopy = xmalloc(nb0 * sizeof(uint32_t));
+  clone_blocks(f, inloop, nb0, ni0, bcopy, map);
+  /* the original down the branch's first way, the copy its second */
+  us_take(f, B, 0);
+  us_take(f, bcopy[B], 1);
+  /* the copy that takes the cold way left as hot as its blocks were
+     (WARMC_US_COLDMARK=1: all of it cold, the way into it a cold edge --
+     sieve_array's loops then spilled where they had not, 11% more
+     cycles: the allocator weighed the values both copies hold by the
+     cold one) */
+  bool mark = cold_way && warmc_getenv("WARMC_US_COLDMARK");
+  if (mark)
+    for (uint32_t bi = 0; bi < nb0; bi++)
+      if (inloop[bi]) f->blocks[cold_k ? bcopy[bi] : bi].cold = true;
+
+  /* the ways in from before the loop, through the test */
+  Block *h = &f->blocks[hb];
+  uint32_t np = h->nparams;
+  ValType *pt = xmalloc((np ? np : 1) * sizeof(ValType));
+  for (uint32_t q = 0; q < np; q++) pt[q] = (ValType)f->insts[h->params[q]].type;
+  Ref *pv = xmalloc((np ? np : 1) * sizeof(Ref));
+  for (uint32_t sx = 0; sx < f->blocks[pre].nsuccs; sx++) {
+    if (f->blocks[pre].succs[sx].target != hb) continue;
+    uint32_t t = ir_new_block(f);
+    for (uint32_t q = 0; q < np; q++) pv[q] = ir_add_param(f, t, pt[q]);
+    Block *tb = &f->blocks[t];
+    tb->term = T_BRIF;
+    tb->term_arg = c;
+    tb->reachable = true;
+    tb->cold = f->blocks[pre].cold;
+    ir_add_edge(f, t, hb, pv, np);
+    ir_add_edge(f, t, bcopy[hb], pv, np);
+    if (mark) f->blocks[t].succs[cold_k].cold = true;
+    f->blocks[pre].succs[sx].target = t;
+  }
+  xfree(pv); xfree(pt);
+
+  ir_recompute_preds(f);
+  ir_order(f);
+  repair_copies(f, ni0, esc, eslot, euse, bcopy, map);
+  for (uint32_t i = 0; i < nesc; i++) xfree(euse[i].v);
+  xfree(esc); xfree(eslot); xfree(euse); xfree(map); xfree(bcopy);
+  prune_params(f);
+  ir_order(f);
+  *budget -= size;
+  g_stats.unswitched++;
+  if (warmc_getenv("WARMC_US_DEBUG"))
+    fprintf(stderr, "unswitch %s: loop b%u of %u instructions on b%u's branch%s\n",
+            f->m->funcs[f->func_index].name ? f->m->funcs[f->func_index].name : "?", hb, size, B,
+            cold_way ? ", one way cold" : "");
+  return true;
+}
+
+static bool pass_unswitch(IrFunc *f) {
+  if (f->npads || warmc_getenv("WARMC_NO_UNSWITCH")) return false;
+  {
+    /* (debugging: WARMC_US_FUNCS=LO-HI, the functions by index it takes) */
+    const char *r = warmc_getenv("WARMC_US_FUNCS");
+    unsigned lo = 0, hi = 0;
+    if (r && sscanf(r, "%u-%u", &lo, &hi) == 2 && (f->func_index < lo || f->func_index > hi)) return false;
+  }
+  bool changed = false;
+  uint32_t budget = US_BUDGET;
+  int rounds = warmc_getenv("WARMC_US_ROUNDS") ? atoi(warmc_getenv("WARMC_US_ROUNDS")) : US_ROUNDS;
+  for (int n = 0; n < rounds; n++) {
+    uint8_t *inloop = xmalloc(f->nblocks);
+    uint32_t *stack = xmalloc(f->nblocks * sizeof(uint32_t));
+    bool done = false;
+    for (uint32_t oi = 0; oi < f->norder && !done; oi++)
+      done = us_loop(f, f->order[oi], inloop, stack, &budget);
+    xfree(inloop); xfree(stack);
+    if (!done) break;
+    changed = true;
+  }
+  return changed;
 }
 
 #define ONCE_LOOPS 8
@@ -15042,7 +15240,7 @@ static bool bv_loop(IrFunc *f, uint32_t hb, uint8_t *inloop, uint32_t *stack) {
       uint32_t nesc = escaping_values(f, inloop, nb0, ni0, false, esc, eslot, &euse);
       bool ok = true;
       for (uint32_t v = 0; v < ni0 && ok; v++)
-        if (esc[v] && !td_numeric((ValType)f->insts[v].type)) ok = false;
+        if (esc[v] && !copy_mergeable(f, v, false)) ok = false;
       if (!ok) {
         for (uint32_t i = 0; i < nesc; i++) xfree(euse[i].v);
         xfree(esc); xfree(eslot); xfree(euse);
@@ -26156,6 +26354,8 @@ static Ref rle_pre(IrFunc *f, uint32_t bi, Ref v, Ref root, uint32_t size, const
     for (uint32_t q = 0; q < o->n && val[p] == REF_NONE; q++) {
       const RleEnt *e = &o->e[q];
       if (e->root != root || e->off != in->imm || e->size != size) continue;
+      /* (a pending read is no value yet: RLE_PEND, below) */
+      if ((e->value & 0xC0000000u) == 0xC0000000u && e->value != REF_NONE) continue;
       if (e->ty == (ValType)in->type || (vt_is_ref(e->ty) && vt_is_ref((ValType)in->type))) val[p] = e->value;
     }
     if (val[p] != REF_NONE) { have++; continue; }
@@ -26189,6 +26389,79 @@ static Ref rle_pre(IrFunc *f, uint32_t bi, Ref v, Ref root, uint32_t size, const
   return par;
 }
 
+/* A read every hot way into merge M has made, of the same value, and only
+   cold ways -- each a block that goes nowhere but M, a slow path's call
+   back to the fast path -- have lost: pending, passed on as any read is,
+   and made real where a read after finds it (rle_pend_get): read again at
+   the end of each of those cold ways and merged at M.  Only where that
+   read's object is one that has no null and is there on each cold way, so
+   the read made again can neither trap nor read what was not made
+   (WARMC_NO_RLEPEND).  luawasm: what an access reads of a table, and a
+   table of self's, after the slow path of the access before it rejoined
+   (awfy_queens, towers, permute). */
+#define RLE_PEND(i) (0xC0000000u | (uint32_t)(i))
+#define RLE_IS_PEND(v) (((v) & 0xC0000000u) == 0xC0000000u && (v) != REF_NONE)
+#define RLE_PMAX 256
+#define RLE_PCOLD 8
+typedef struct {
+  uint32_t M;
+  Ref value, phi;
+  uint32_t ncold, cold[RLE_PCOLD];
+  bool failed;
+} RlePend;
+
+/* the pending read idx made real for read v (its form copied on the cold
+   ways): M's new parameter, or REF_NONE */
+static Ref rle_pend_get(IrFunc *f, RlePend *pd, uint32_t idx, Ref v) {
+  RlePend *p = &pd[idx];
+  if (p->phi != REF_NONE) return p->phi;
+  if (p->failed) return REF_NONE;
+  const Inst *in = &f->insts[v];
+  Ref obj = ir_args(f, v)[0];
+  ValType ot = (ValType)f->insts[obj].type;
+  bool ok = vt_is_ref(ot) && !vt_nullable(ot) &&
+            (in->nargs == 1 || (in->nargs == 2 && f->insts[ir_args(f, v)[1]].op == I_GC_BADMASK));
+  for (uint32_t c = 0; c < p->ncold && ok; c++) {
+    uint32_t ob = f->insts[obj].block;
+    ok = ob < f->nblocks && dominates(f, ob, p->cold[c]) &&
+         (ob != p->cold[c] || true);
+  }
+  if (!ok) { p->failed = true; return REF_NONE; }
+  uint32_t M = p->M;
+  Block *mb = &f->blocks[M];
+  uint32_t np = mb->npreds;
+  Ref *val = xmalloc((np ? np : 1) * sizeof(Ref));
+  for (uint32_t q = 0; q < np; q++) {
+    uint32_t pb = f->blocks[M].preds[q];
+    val[q] = p->value;
+    for (uint32_t c = 0; c < p->ncold; c++)
+      if (p->cold[c] == pb) val[q] = REF_NONE;
+  }
+  for (uint32_t q = 0; q < np; q++) {
+    if (val[q] != REF_NONE) continue;
+    uint32_t pb = f->blocks[M].preds[q];
+    for (uint32_t r = 0; r < q; r++)
+      if (f->blocks[M].preds[r] == pb) val[q] = val[r];
+    if (val[q] != REF_NONE) continue;
+    Ref na[2] = { obj, REF_NONE };
+    if (in->nargs == 2) na[1] = ir_emit(f, pb, I_GC_BADMASK, VT_I64, NULL, 0, 0, 0);
+    in = &f->insts[v];
+    val[q] = ir_emit(f, pb, I_FIELD_GET, (ValType)in->type, na, in->nargs, in->imm, in->imm2);
+    f->insts[val[q]].flags = f->insts[v].flags;
+    g_stats.gc_loads_pre++;
+  }
+  Ref par = ir_add_param(f, M, (ValType)f->insts[v].type);
+  for (uint32_t q = 0; q < f->blocks[M].npreds; q++) {
+    uint32_t pb = f->blocks[M].preds[q];
+    bool dup = false;
+    for (uint32_t r = 0; r < q; r++) dup |= f->blocks[M].preds[r] == pb;
+    if (!dup) edge_push_arg(f, pb, M, val[q]);
+  }
+  xfree(val);
+  p->phi = par;
+  return par;
+}
+
 static bool pass_gc_rle(IrFunc *f) {
   static const uint16_t gets[] = { I_FIELD_GET };
   if (round_lacks(f, 15, gets, 1)) return false;
@@ -26209,7 +26482,11 @@ static bool pass_gc_rle(IrFunc *f) {
     }
   }
   bool changed = false;
+  RlePend *pd = NULL;
+  uint32_t npd = 0;
+  bool pend_on = !warmc_getenv("WARMC_NO_RLEPEND");
   if (!any_get) goto done;
+  pd = xmalloc(RLE_PMAX * sizeof(RlePend));
   uint8_t *inloop = xmalloc(nb ? nb : 1);
   uint32_t *stack = xmalloc((nb ? nb : 1) * sizeof(uint32_t));
   RleSet cur;
@@ -26244,6 +26521,55 @@ static bool pass_gc_rle(IrFunc *f) {
         }
         if (all) cur.e[cur.n++] = e;
       }
+      /* what the hot ways agree on and only cold ones lost: pending */
+      uint32_t cold[RLE_PCOLD], nc = 0, hot = UINT32_MAX;
+      bool can = pend_on && fwd >= 2;
+      for (uint32_t p = 0; p < b->npreds && can; p++) {
+        uint32_t pb = b->preds[p];
+        if (!f->blocks[pb].reachable) continue;
+        const Block *P = &f->blocks[pb];
+        if (P->cold && !P->is_pad && P->nsuccs == 1 && P->succs[0].target == bi && !P->succs[0].eh) {
+          bool seen = false;
+          for (uint32_t c = 0; c < nc; c++) seen |= cold[c] == pb;
+          if (!seen) { if (nc == RLE_PCOLD) can = false; else cold[nc++] = pb; }
+        } else if (hot == UINT32_MAX) hot = pb;
+      }
+      if (can && nc && hot != UINT32_MAX) {
+        const RleSet *a = &out[hot];
+        for (uint32_t j = 0; j < a->n && cur.n < RLE_MAX && npd < RLE_PMAX; j++) {
+          RleEnt e = a->e[j];
+          if (RLE_IS_PEND(e.value)) continue;
+          bool have = false;
+          for (uint32_t q = 0; q < cur.n && !have; q++)
+            have = cur.e[q].root == e.root && cur.e[q].off == e.off;
+          if (have) continue;
+          bool all = true;
+          for (uint32_t p = 0; p < b->npreds && all; p++) {
+            uint32_t pb = b->preds[p];
+            if (pb == hot || !f->blocks[pb].reachable) continue;
+            bool iscold = false;
+            for (uint32_t c = 0; c < nc; c++) iscold |= cold[c] == pb;
+            if (iscold) continue;
+            const RleSet *o = &out[pb];
+            bool found = false;
+            for (uint32_t q = 0; q < o->n && !found; q++)
+              found = o->e[q].root == e.root && o->e[q].off == e.off && o->e[q].value == e.value &&
+                      o->e[q].size == e.size;
+            all = found;
+          }
+          if (!all) continue;
+          RlePend *pp = &pd[npd];
+          pp->M = bi;
+          pp->value = e.value;
+          pp->phi = REF_NONE;
+          pp->failed = false;
+          pp->ncold = nc;
+          memcpy(pp->cold, cold, nc * sizeof(uint32_t));
+          e.value = RLE_PEND(npd);
+          npd++;
+          cur.e[cur.n++] = e;
+        }
+      }
     } else if (fwd == 1 && loop_body(f, bi, inloop, stack) == first) {
       uint64_t m = 0;
       bool killed = false;
@@ -26268,6 +26594,20 @@ static bool pass_gc_rle(IrFunc *f) {
           if (e->ty == (ValType)in->type ||
               (vt_is_ref(e->ty) && vt_is_ref((ValType)in->type)))
             hit = e->value;
+        }
+        if (hit != REF_NONE && RLE_IS_PEND(hit)) {
+          uint32_t pidx = hit & 0x3fffffffu;
+          hit = rle_pend_get(f, pd, pidx, v);
+          b = &f->blocks[bi];
+          in = &f->insts[v];
+          /* a pending read a read could not take: no read of it here on */
+          if (hit == REF_NONE) {
+            uint32_t k = 0;
+            for (uint32_t j = 0; j < cur.n; j++)
+              if (!(cur.e[j].root == root && cur.e[j].off == in->imm && RLE_IS_PEND(cur.e[j].value)))
+                cur.e[k++] = cur.e[j];
+            cur.n = k;
+          }
         }
         /* at a merge's top, before anything it does: what the hot ways in
            read, made on the cold ones */
@@ -26307,7 +26647,9 @@ static bool pass_gc_rle(IrFunc *f) {
     out[bi] = cur;
   }
   xfree(inloop); xfree(stack);
+  for (uint32_t i = 0; i < npd; i++) if (pd[i].phi != REF_NONE) changed = true;
 done:
+  xfree(pd);
   xfree(out); xfree(wmask); xfree(wall);
   if (changed) ir_apply_subst(f);
   return changed;
@@ -26718,6 +27060,21 @@ void ir_optimize(IrFunc *f, const OptOpts *o) {
         pass_cse(f, o);
       if (o->dce) pass_dce(f);
       ir_order(f);
+    }
+    /* after LICM, which makes a guard's operands values from before the
+       loop; then LICM again, for what a copy no longer writes or calls */
+    if (o->unroll && TP("unswitch", pass_unswitch(f))) {
+      opt_cleanup(f, o);
+      ir_order(f);
+      if (licm_split_preheaders(f)) ir_order(f);
+      if (!warmc_getenv("WARMC_NO_US_LICM") && TP("licm2", pass_licm(f, o))) {
+        ir_order(f);
+        if (o->dce) pass_dce(f);
+        if (o->cse) pass_cse(f, o);
+        if (o->dce) pass_dce(f);
+        ir_order(f);
+      }
+      ir_verify(f, "post-unswitch");
     }
     if (TP("field_promote", pass_field_promote(f, o))) {
       prune_params(f);
