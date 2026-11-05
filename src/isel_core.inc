@@ -279,6 +279,7 @@ typedef struct {
      condition, one more than the bit; and whether one of them did not reach
      its target. */
   uint8_t *tbit;
+  Ref *tsrc; /* the value a tbz or tbnz at a condition tests (find_tbits) */
   bool tbz_far;
 
   int fl_kind;

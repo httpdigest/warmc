@@ -3412,10 +3412,10 @@ static void emit_block(Isel *s, uint32_t bi, uint32_t next_bi) {
 
       int kind = 0, cc = CC_NE, zreg = 0, zsf = SF32;
       if (s->tbit && s->tbit[c]) {
-        Ref and = f->insts[c].op == I_AND ? c : ir_args(f, c)[0];
+        /* the value find_tbits found the bit of */
         kind = (s->tbit[c] & TBIT_SET) ? 4 : 3;
         cc = (s->tbit[c] & ~TBIT_SET) - 1;
-        zreg = rd(s, ir_args(f, and)[0], S0);
+        zreg = rd(s, s->tsrc[c], S0);
       } else if (s->fused && s->fused[c] && is_condition(s, c)) {
         Inst *ci = &f->insts[c];
         Ref *ca = ir_args(f, c);

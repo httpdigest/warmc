@@ -7006,6 +7006,382 @@ static void kt_way_d(IrFunc *f, uint32_t p, uint32_t s, Ref x, uint64_t mask, ui
   }
 }
 
+/* ---- bit tests, and what the ways in decide ----------------------------
+
+   A test of one bit, 1 << n and-ed with a value -- a set of characters as
+   a mask, Rust's char::is_whitespace among them, or a word of flags --
+   read only as a truth value (a branch's, a select's condition, an eqz's,
+   an eq or ne of 0) is a test of bit 0 of the value shifted down by n:
+   lsr and tbnz, a constant left in its register, where a 1 was shifted up
+   and tested against the value (WARMC_NO_BIT_TESTS).  Both shifts take n
+   modulo the width, so the bit is the same, and the and's value changes
+   only from 1 << n to 1, which none of its readers tells apart.
+
+   An instruction whose operand the ways into its block bound so that its
+   result is that operand, or a constant, is that (WARMC_NO_WAY_FOLDS):
+   an and with a constant that clears no bit the operand can have set (or
+   every one), an or that sets none it can have clear (or every one), an
+   integer compare with a constant or an eqz the values decide, a sign
+   extension of a value already its own, a shift down past every bit; and
+   where the operand has one value, whatever the instruction makes of it
+   (fold_int_unop, fold_int_binop) -- a quotient or remainder among them,
+   which by a constant fold's strength reduction has made multiplies by
+   now.  A byte loaded
+   with its sign and found not negative, masked again to the byte, is the
+   byte -- what a UTF-8 decoder does with an ASCII one -- and a test of a
+   value that a test above it decided is decided.  What the operand can be
+   is what its shape leaves it (ir_value_max, and a signed narrow load's
+   or extension's two ranges) and what the branches on every way into the
+   block say (kw_in, through merges; jump threading's facts) -- of the
+   value, or, for one the block makes again of values made before it, of
+   the same value made the same way on the ways in (bf_def).  The ways are
+   walked only for a value some branch tests, the same value or one made
+   the same way, and at most BF_WALKS times a function.  Each
+   decision is an equality in the program as it was, so all of them hold
+   together. */
+
+#define BF_WALKS 4096
+#define BF_BLOOM 4096
+
+/* the bits some value of r has set, and those all of them have */
+static uint64_t ks_or_bits(const KSet *r) {
+  uint64_t m = 0;
+  for (uint32_t i = 0; i < r->n; i++) {
+    uint64_t d = r->lo[i] ^ r->hi[i];
+    d |= d >> 1; d |= d >> 2; d |= d >> 4; d |= d >> 8; d |= d >> 16; d |= d >> 32;
+    m |= r->hi[i] | d;
+  }
+  return m;
+}
+static uint64_t ks_and_bits(const KSet *r, uint64_t mask) {
+  uint64_t m = mask;
+  for (uint32_t i = 0; i < r->n; i++) {
+    uint64_t d = r->lo[i] ^ r->hi[i];
+    d |= d >> 1; d |= d >> 2; d |= d >> 4; d |= d >> 8; d |= d >> 16; d |= d >> 32;
+    m &= r->lo[i] & r->hi[i] & ~d;
+  }
+  return m;
+}
+
+/* r within t */
+static bool ks_within(const KSet *r, const KSet *t) {
+  KSet both;
+  return ks_inter((KSet *)r, t, &both) && ks_size(&both) == ks_size(r);
+}
+
+/* the values of an n-bit signed number in a width of mask */
+static void ks_signed(KSet *r, uint32_t bits, uint64_t mask) {
+  uint64_t half = 1ull << (bits - 1);
+  r->n = 2;
+  r->lo[0] = 0; r->hi[0] = half - 1;
+  r->lo[1] = (mask - half + 1) & mask; r->hi[1] = mask;
+}
+
+/* the values x can have for its shape alone */
+static void bf_own_set(IrFunc *f, Ref x, uint64_t mask, KSet *r) {
+  const Inst *xi = &f->insts[x];
+  uint32_t bits = 0;
+  if (xi->op == I_LOAD && (xi->imm2 & MEMF_SIGNED) && MEMF_SIZE(xi->imm2) < 3)
+    bits = 8u << MEMF_SIZE(xi->imm2);
+  else if (xi->op == I_EXT8S) bits = 8;
+  else if (xi->op == I_EXT16S) bits = 16;
+  else if (xi->op == I_EXT32S || (xi->op == I_EXTENDS && xi->type == VT_I64)) bits = 32;
+  if (bits && bits < (mask == ~0ull ? 64u : 32u)) { ks_signed(r, bits, mask); return; }
+  ks_range(r, 0, ir_value_max(f, x, 6) & mask, mask);
+}
+
+/* a key for the values made the same way as v (kt_equiv's first step) */
+static uint32_t bf_key(const IrFunc *f, Ref v) {
+  const Inst *in = &f->insts[v];
+  uint64_t h = (uint64_t)in->op * 0x9e3779b97f4a7c15ull ^ (uint64_t)in->type * 0xc2b2ae3d27d4eb4full ^
+               in->imm * 0x165667b19e3779f9ull ^ in->imm2 ^ (uint64_t)in->nargs << 40;
+  return (uint32_t)(h ^ h >> 29) & (BF_BLOOM - 1);
+}
+
+/* the values some branch's way can say something of: what a branch tests,
+   or tests plus a constant (kt_test, kt_edge) */
+static void bf_mark(IrFunc *f, uint8_t *tested, uint8_t *bloom, Ref y) {
+  for (int k = 0; k < 2 && y != REF_NONE; k++) {
+    tested[y] = 1;
+    if (f->insts[y].op != I_PARAM && f->insts[y].op != I_CONST) bloom[bf_key(f, y)] = 1;
+    const Inst *yi = &f->insts[y];
+    uint64_t c;
+    if ((yi->op == I_ADD || yi->op == I_SUB) && yi->nargs == 2 && is_const(f, ir_args(f, y)[1], &c))
+      y = ir_args(f, y)[0];
+    else break;
+  }
+}
+
+/* where the search for facts of x, made in block bi, ends: the deepest of
+   the blocks its operands are made in, each a pure instruction of bi's own
+   (to depth d) or made before it -- UINT32_MAX where there is none */
+static uint32_t bf_def(IrFunc *f, Ref x, uint32_t bi, int d) {
+  const Inst *xi = &f->insts[x];
+  if (xi->block != bi) return xi->block;
+  if (d <= 0 || xi->op == I_PARAM || xi->nargs > 2 || !cse_candidate(f, x, false)) return UINT32_MAX;
+  uint32_t blk[2], nb = 0;
+  for (uint32_t j = 0; j < xi->nargs; j++) {
+    Ref o = ir_args(f, x)[j];
+    if (f->insts[o].op == I_CONST) continue;
+    uint32_t b = bf_def(f, o, bi, d - 1);
+    if (b == UINT32_MAX) return UINT32_MAX;
+    blk[nb++] = b;
+  }
+  if (!nb) return UINT32_MAX;
+  uint32_t y = f->blocks[bi].idom;
+  for (int k = 0; k < 256 && y < f->nblocks; k++) {
+    for (uint32_t j = 0; j < nb; j++)
+      if (blk[j] == y) return y;
+    if (y == f->entry || f->blocks[y].idom == y) break;
+    y = f->blocks[y].idom;
+  }
+  return UINT32_MAX;
+}
+
+/* an integer instruction the ways into its block may decide: one
+   fold_int_unop or fold_int_binop works out */
+static bool bf_int_op(uint16_t op, uint32_t nargs) {
+  if (nargs == 1)
+    switch (op) {
+      case I_EQZ: case I_CLZ: case I_CTZ: case I_POPCNT: case I_WRAP: case I_EXTENDS:
+      case I_EXTENDU: case I_EXT8S: case I_EXT16S: case I_EXT32S: return true;
+      default: return false;
+    }
+  if (nargs != 2) return false;
+  switch (op) {
+    case I_ADD: case I_SUB: case I_MUL: case I_AND: case I_OR: case I_XOR: case I_SHL:
+    case I_SHRU: case I_SHRS: case I_ROTL: case I_ROTR: case I_DIVS: case I_DIVU:
+    case I_REMS: case I_REMU:
+      return true;
+    default: return op >= I_EQ && op <= I_GEU;
+  }
+}
+
+static bool pass_bit_facts(IrFunc *f) {
+  bool bits = !warmc_getenv("WARMC_NO_BIT_TESTS"), ways = !warmc_getenv("WARMC_NO_WAY_FOLDS");
+  if (!bits && !ways) return false;
+  bool changed = false;
+  uint32_t n0 = f->ninsts;
+
+  if (bits) {
+    /* the values read as something other than a truth value */
+    uint32_t *uses = count_uses(f);
+    uint8_t *other = xcalloc(n0 ? n0 : 1, 1);
+    for (uint32_t oi = 0; oi < f->norder; oi++) {
+      const Block *b = &f->blocks[f->order[oi]];
+      for (uint32_t i = 0; i < b->ninsts; i++) {
+        Ref u = b->insts[i];
+        const Inst *ui = &f->insts[u];
+        const Ref *ua = ir_args(f, u);
+        uint64_t k;
+        for (uint32_t j = 0; j < ui->nargs; j++) {
+          bool truth = ui->op == I_EQZ ||
+                       (ui->op == I_SELECT && j == 2) ||
+                       ((ui->op == I_EQ || ui->op == I_NE) && ui->nargs == 2 &&
+                        is_const(f, ua[1 - j], &k) && trunc_to((ValType)f->insts[ua[j]].type, k) == 0);
+          if (!truth) other[ua[j]] = 1;
+        }
+      }
+      if (b->term == T_BRTABLE) other[b->term_arg] = 1;
+      for (uint32_t r = 0; r < b->nret; r++) other[b->ret_args[r]] = 1;
+      for (uint32_t s = 0; s < b->nsuccs; s++)
+        for (uint32_t j = 0; j < b->succs[s].nargs; j++) other[b->succs[s].args[j]] = 1;
+    }
+    for (uint32_t oi = 0; oi < f->norder; oi++) {
+      uint32_t bi = f->order[oi];
+      for (uint32_t i = 0; i < f->blocks[bi].ninsts; i++) {
+        Ref v = f->blocks[bi].insts[i];
+        if (v >= n0 || other[v] || !uses[v]) continue;
+        const Inst *in = &f->insts[v];
+        ValType t = (ValType)in->type;
+        if (in->op != I_AND || in->nargs != 2 || (t != VT_I32 && t != VT_I64)) continue;
+        const Ref *a = ir_args(f, v);
+        int k = 0;
+        for (; k < 2; k++) {
+          const Inst *si = &f->insts[a[k]];
+          uint64_t one;
+          if (si->op == I_SHL && si->nargs == 2 && is_const(f, ir_args(f, a[k])[0], &one) &&
+              trunc_to(t, one) == 1 && f->insts[ir_args(f, a[k])[1]].op != I_CONST)
+            break;
+        }
+        if (k == 2) continue;
+        Ref sa[2] = { a[1 - k], ir_args(f, a[k])[1] };
+        Ref sh = emit_before(f, bi, &i, I_SHRU, t, sa, 2, 0);
+        Ref one = emit_before(f, bi, &i, I_CONST, t, NULL, 0, 1);
+        Ref *na = ir_args(f, v);
+        na[0] = sh;
+        na[1] = one;
+        g_stats.bit_tests++;
+        changed = true;
+      }
+    }
+    xfree(other);
+    xfree(uses);
+  }
+
+  if (ways) {
+    bool one = !warmc_getenv("WARMC_NO_WAY_ONE");
+    uint32_t n1 = f->ninsts;
+    uint8_t *tested = xcalloc(n1 ? n1 : 1, 1), *bloom = xcalloc(BF_BLOOM, 1);
+    bool any = false;
+    for (uint32_t oi = 0; oi < f->norder; oi++) {
+      const Block *b = &f->blocks[f->order[oi]];
+      if (b->term == T_BRTABLE) { bf_mark(f, tested, bloom, b->term_arg); any = true; }
+      if (b->term != T_BRIF) continue;
+      Ref c = b->term_arg;
+      const Inst *ci = &f->insts[c];
+      any = true;
+      bf_mark(f, tested, bloom, c);
+      uint64_t k;
+      if (ci->op == I_EQZ && ci->nargs == 1) bf_mark(f, tested, bloom, ir_args(f, c)[0]);
+      else if (ci->op >= I_EQ && ci->op <= I_GEU && ci->nargs == 2 && is_const(f, ir_args(f, c)[1], &k))
+        bf_mark(f, tested, bloom, ir_args(f, c)[0]);
+    }
+    /* decisions first, made on the function as it is, then applied */
+    typedef struct { Ref v, to; uint64_t k; } BfFold;
+    BfFold *fl = NULL;
+    uint32_t nfl = 0, cfl = 0, walks = 0;
+    KWay *kw = any ? xmalloc(sizeof *kw) : NULL;
+    Ref lx = REF_NONE;
+    uint32_t lb = UINT32_MAX;
+    KSet ls = {0};
+    for (uint32_t oi = 0; any && oi < f->norder; oi++) {
+      uint32_t bi = f->order[oi];
+      if (bi == f->entry || f->blocks[bi].is_pad || !f->blocks[bi].npreds) continue;
+      for (uint32_t i = 0; i < f->blocks[bi].ninsts; i++) {
+        Ref v = f->blocks[bi].insts[i];
+        const Inst *in = &f->insts[v];
+        uint16_t op = in->op;
+        if (!bf_int_op(op, in->nargs)) continue;
+        const Ref *a = ir_args(f, v);
+        Ref x = a[0];
+        uint64_t c = 0;
+        /* x first, or a constant first: then only x's one value decides */
+        bool xfirst = true;
+        if (in->nargs == 2 && !is_const(f, a[1], &c)) {
+          if (!is_const(f, a[0], &c)) continue;
+          x = a[1];
+          xfirst = false;
+        }
+        ValType xt = (ValType)f->insts[x].type;
+        if ((xt != VT_I32 && xt != VT_I64) || f->insts[x].op == I_CONST || x >= n1) continue;
+        if (!tested[x] && (f->insts[x].op == I_PARAM || !bloom[bf_key(f, x)])) continue;
+        /* x made in the block itself, of values made before it: the ways'
+           facts of the same values made the same way (kt_same), the search
+           ended where its operands are made */
+        uint32_t def = f->insts[x].block;
+        if (def == bi && (def = bf_def(f, x, bi, 3)) == UINT32_MAX) continue;
+        uint64_t mask = xt == VT_I64 ? ~0ull : 0xffffffffu, w = xt == VT_I64 ? 64 : 32;
+        c &= mask;
+        KSet sx;
+        if (x == lx && bi == lb) sx = ls;
+        else {
+          if (walks >= BF_WALKS) continue;
+          walks++;
+          KSet way, own;
+          kw->f = f;
+          kw->x = x;
+          kw->mask = mask;
+          kw->def = def;
+          kw->left = KW_BUDGET;
+          kw->nsets = 0;
+          memset(kw->key, 0, sizeof kw->key);
+          kw_in(kw, bi, &way);
+          bf_own_set(f, x, mask, &own);
+          if (!ks_inter(&way, &own, &sx)) sx = way;
+          lx = x; lb = bi; ls = sx;
+        }
+        /* no value: a way no run takes -- left to what removes it */
+        if (!sx.n) continue;
+        uint64_t lo = sx.lo[0], hi = sx.hi[sx.n - 1], ob = ks_or_bits(&sx);
+        Ref to = REF_NONE;
+        bool isk = false; /* the result the constant kv */
+        uint64_t kv = 0;
+        KSet t1, t2, r;
+        #define BF_K(K) (isk = true, kv = (K))
+        /* x has one value: the instruction's, worked out (WARMC_NO_WAY_ONE) */
+        if (sx.n == 1 && lo == hi && one) {
+          if (in->nargs == 1) isk = fold_int_unop(op, xt, lo, &kv);
+          else isk = fold_int_binop(op, xt, xfirst ? lo : c, xfirst ? c : lo, &kv);
+        }
+        if (isk || !xfirst) op = I_NOP;
+        switch (op) {
+          case I_NOP: break;
+          case I_AND:
+            if (!(ob & ~c)) to = x;
+            else if (!(ob & c)) BF_K(0);
+            break;
+          case I_OR:
+            if ((ks_and_bits(&sx, mask) & c) == c) to = x;
+            else if (!(ob & ~c)) BF_K(c);
+            break;
+          case I_EQZ:
+            if (lo) BF_K(0);
+            else if (!hi) BF_K(1);
+            break;
+          case I_EXT8S: case I_EXT16S: case I_EXT32S: {
+            uint32_t nb = op == I_EXT8S ? 8 : op == I_EXT16S ? 16 : 32;
+            if (nb >= w) break;
+            ks_signed(&r, nb, mask);
+            if (ks_within(&sx, &r)) to = x;
+            break;
+          }
+          case I_SHRU:
+            if (c % w && !(hi >> (c % w))) BF_K(0);
+            break;
+          case I_SHRS: {
+            uint64_t s = c % w;
+            if (!s) break;
+            ks_range(&r, 0, (1ull << s) - 1, mask);
+            if (ks_within(&sx, &r)) { BF_K(0); break; }
+            ks_range(&r, (mask - (1ull << s) + 1) & mask, mask, mask);
+            if (ks_within(&sx, &r)) BF_K(mask);
+            break;
+          }
+          default:
+            /* a compare: no value of x makes it truth, or none false */
+            if (!ks_rel(&t1, op, c, true, mask) || !ks_rel(&t2, op, c, false, mask)) break;
+            if (!ks_inter(&sx, &t1, &r)) break;
+            if (!r.n) { BF_K(0); break; }
+            if (!ks_inter(&sx, &t2, &r)) break;
+            if (!r.n) BF_K(1);
+            break;
+        }
+        #undef BF_K
+        if (to == REF_NONE && !isk) continue;
+        if (nfl == cfl) { cfl = cfl ? cfl * 2 : 16; fl = xrealloc(fl, cfl * sizeof *fl); }
+        fl[nfl].v = v;
+        fl[nfl].to = to;
+        fl[nfl].k = kv;
+        nfl++;
+      }
+    }
+    xfree(kw);
+    static _Atomic int dbg = -1;
+    if (dbg < 0) dbg = warmc_getenv("WARMC_BF_DEBUG") != NULL;
+    for (uint32_t j = 0; j < nfl; j++) {
+      Inst *in = &f->insts[fl[j].v];
+      if (dbg)
+        fprintf(stderr, "bf: %s v%u op %s -> %s%llu\n", f->m->funcs[f->func_index].sym, fl[j].v,
+                ir_op_name(in->op), fl[j].to != REF_NONE ? "v" : "const ",
+                (unsigned long long)(fl[j].to != REF_NONE ? fl[j].to : fl[j].k));
+      if (fl[j].to != REF_NONE) {
+        ir_replace(f, fl[j].v, fl[j].to);
+        ir_make_nop(in);
+      } else {
+        replace_with_const(f, fl[j].v, fl[j].k);
+      }
+      g_stats.way_folds++;
+      changed = true;
+    }
+    xfree(fl);
+    xfree(tested);
+    xfree(bloom);
+    if (nfl) ir_apply_subst(f);
+  }
+  return changed;
+}
+
 /* The one value a, handed to B by p's s-th edge, has there: a constant, or
    a compare of a value with one that the way decides. */
 static bool kt_value(IrFunc *f, uint32_t p, uint32_t s, Ref a, uint64_t mask, KSet *r) {
@@ -27118,6 +27494,14 @@ void ir_optimize(IrFunc *f, const OptOpts *o) {
     ir_verify(f, "post-iv");
   }
   if (o->dce) pass_dce(f);
+
+  /* tests of 1 << n against a constant, and masks the ways in show do
+     nothing */
+  if (o->fold && TP("bit_facts", pass_bit_facts(f))) {
+    if (o->dce) pass_dce(f);
+    ir_order(f);
+    ir_verify(f, "post-bit-facts");
+  }
 
   /* the bounds checks rotation leaves decided behind a loop's own exit
      test, which are body exits to the vectoriser */

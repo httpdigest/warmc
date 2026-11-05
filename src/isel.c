@@ -2381,41 +2381,184 @@ static int one_bit(IrFunc *f, Ref c, int sf) {
    eq 0 or ne 0 of such an and -- is tbz or tbnz on the value, the and no
    instruction and its constant in no register: s->tbit at the condition
    is one more than the bit, with TBIT_SET where the branch is taken on a
-   set bit. */
+   set bit.  So is a branch on a value's sign -- x < 0, x <= -1, unsigned
+   x >= 2^(w-1) or x > 2^(w-1) - 1 its sign bit set, the others clear --
+   the compare no instruction either (tbit_sign; WARMC_NO_SIGNBR): Rust's
+   test of a byte for ASCII, cmn and b.le where LLVM makes one tbnz.  The bit tested is followed back through
+   the instructions made for the test alone, each no instruction then
+   (tbit_chain; WARMC_NO_TBIT_CHAIN): a shift by a constant, a rotate, a
+   sign or zero extension, a wrap -- (y >> 5) & 1 is bit 5 of y, and
+   extend8_s(y) < 0 its bit 7.  s->tsrc at the condition is the value
+   tested. */
 #define TBIT_SET 0x80
+static bool tbit_sign(const IrFunc *f, Ref c, bool *set) {
+  const Inst *ci = &f->insts[c];
+  uint16_t op = ci->op;
+  if (op < I_LTS || op > I_GEU || ci->nargs != 2 || f->insts[ir_args((IrFunc *)f, c)[1]].op != I_CONST)
+    return false;
+  bool w64 = vt_is_64((ValType)f->insts[ir_args((IrFunc *)f, c)[0]].type);
+  uint64_t m = w64 ? ~0ull : 0xffffffffu, h = (m >> 1) + 1;
+  uint64_t k = f->insts[ir_args((IrFunc *)f, c)[1]].imm & m;
+  if ((op == I_LTS && k == 0) || (op == I_LES && k == m) ||
+      (op == I_GEU && k == h) || (op == I_GTU && k == h - 1))
+    *set = true;
+  else if ((op == I_GES && k == 0) || (op == I_GTS && k == m) ||
+           (op == I_LTU && k == h) || (op == I_LEU && k == h - 1))
+    *set = false;
+  else return false;
+  return true;
+}
+/* fa_own but for a bitfield extract, which a chain may take apart */
+static bool tbit_own(Isel *s, Ref v) {
+  return !s->folded[v] && !s->fused[v] && !s->imm_fold[v] && !s->addr_fuse[v] &&
+         !s->ptr_fuse[v] && !s->zx_fuse[v] && !s->csinc[v] && !s->fa[v] &&
+         !(s->walias && s->walias[v]);
+}
+
+/* the value whose bit *bit is bit *bit of x, through instructions of block
+   bi that x's test alone reads, each marked folded -- a bitfield extract
+   among them, its bits those of its source the field takes */
+static Ref tbit_chain(Isel *s, const uint32_t *uses, uint32_t bi, Ref x, int *bit) {
+  IrFunc *f = s->f;
+  static _Atomic int on = -1;
+  if (on < 0) on = warmc_getenv("WARMC_NO_TBIT_CHAIN") == NULL;
+  for (int d = 0; on && d < 4; d++) {
+    const Inst *xi = &f->insts[x];
+    if (xi->block != bi || uses[x] != 1 || !tbit_own(s, x)) break;
+    if (xi->nargs < 1 || xi->nargs > 2) break;
+    Ref y = ir_args(f, x)[0];
+    int w = vt_is_64((ValType)xi->type) ? 64 : 32, b = *bit, nb;
+    bool bf = s->bfx[x].ok;
+    if (bf) {
+      /* ubfx/sbfx: bits immr..imms down to 0, the rest 0, or the field's
+         top bit for a signed one (an insert in zeros, ubfiz, is an and of a
+         shift, which no test of one of its bits reaches: the folder makes
+         one and of the two) */
+      struct Bfx bx = s->bfx[x];
+      if (bx.imms < bx.immr) return x;
+      if (b <= bx.imms - bx.immr) nb = bx.immr + b;
+      else if (bx.sign) nb = bx.imms;
+      else return x;
+      y = bx.src;
+    } else {
+      bool kc = xi->nargs == 2 && f->insts[ir_args(f, x)[1]].op == I_CONST;
+      int k = kc ? (int)(f->insts[ir_args(f, x)[1]].imm % (uint64_t)w) : 0;
+      switch (xi->op) {
+        case I_SHRU: if (!kc || b + k >= w) return x; nb = b + k; break;
+        case I_SHRS: if (!kc) return x; nb = b + k < w ? b + k : w - 1; break;
+        case I_SHL: if (!kc || b < k) return x; nb = b - k; break;
+        case I_ROTL: if (!kc) return x; nb = (b - k + w) % w; break;
+        case I_ROTR: if (!kc) return x; nb = (b + k) % w; break;
+        case I_EXT8S: nb = b < 7 ? b : 7; break;
+        case I_EXT16S: nb = b < 15 ? b : 15; break;
+        case I_EXT32S: case I_EXTENDS: nb = b < 31 ? b : 31; break;
+        case I_EXTENDU: if (b >= 32) return x; nb = b; break;
+        case I_WRAP: nb = b; break;
+        default: return x;
+      }
+    }
+    ValType yt = (ValType)f->insts[y].type;
+    if ((yt != VT_I32 && yt != VT_I64) || f->insts[y].op == I_CONST || s->folded[y]) break;
+    /* an extract's own operand is folded into it already: its source is
+       the value read */
+    if (bf) s->bfx[x].ok = false;
+    s->folded[x] = 1;
+    *bit = nb;
+    x = y;
+  }
+  return x;
+}
+
+/* WARMC_BF_DEBUG: each branch made a test of a sign, or of a bit through a
+   chain, on stderr */
+static bool tbit_debug(void) {
+  static _Atomic int on = -1;
+  if (on < 0) on = warmc_getenv("WARMC_BF_DEBUG") != NULL;
+  return on;
+}
+
 static void find_tbits(Isel *s, const uint32_t *uses, uint32_t bi) {
   IrFunc *f = s->f;
   Block *b = &f->blocks[bi];
   if (b->term != T_BRIF || warmc_getenv("WARMC_NO_TBZ")) return;
-  Ref c = b->term_arg, and = c;
+  Ref c = b->term_arg, v = c;
   Inst *ci = &f->insts[c];
   bool set = true;
+  static _Atomic int signbr = -1;
+  if (signbr < 0) signbr = warmc_getenv("WARMC_NO_SIGNBR") == NULL;
+  if (signbr && s->fused[c] && tbit_sign(f, c, &set)) {
+    Ref x = ir_args(f, c)[0];
+    if (s->folded[x] || f->insts[x].op == I_CONST) return;
+    int bit = vt_is_64((ValType)f->insts[x].type) ? 63 : 31;
+    s->tsrc[c] = tbit_chain(s, uses, bi, x, &bit);
+    s->tbit[c] = (uint8_t)((bit + 1) | (set ? TBIT_SET : 0));
+    g_stats.bit_brs++;
+    if (tbit_debug())
+      fprintf(stderr, "tbit: sign%s bit %d\n", s->tsrc[c] != x ? " chain" : "", bit);
+    return;
+  }
+  /* v, the value the branch tests against 0 */
   if (ci->op == I_EQZ || ((ci->op == I_EQ || ci->op == I_NE) && ci->nargs == 2 &&
                           f->insts[ir_args(f, c)[1]].op == I_CONST &&
                           (f->insts[ir_args(f, c)[1]].imm &
                            (vt_is_64((ValType)f->insts[ir_args(f, c)[0]].type) ? ~0ull : 0xffffffffu)) == 0)) {
     if (!s->fused[c]) return;
-    and = ir_args(f, c)[0];
+    v = ir_args(f, c)[0];
     set = ci->op == I_NE;
-  } else if (ci->op != I_AND || !s->fused[c]) {
+  }
+  Inst *vi = &f->insts[v];
+  if (vi->block != bi) return;
+  int bit = -1;
+  if (vi->op == I_AND && vi->nargs == 2 &&
+      (bit = one_bit(f, ir_args(f, v)[1], vt_is_64((ValType)vi->type) ? SF64 : SF32)) >= 0) {
+    Ref x = ir_args(f, v)[0];
+    /* an and a bitfield extract took (of a shift) is a test of its bit
+       still: the shift left to the chain (WARMC_NO_TBIT_CHAIN keeps it) */
+    static _Atomic int unbfx = -1;
+    if (unbfx < 0) unbfx = warmc_getenv("WARMC_NO_TBIT_CHAIN") == NULL;
+    bool bf = s->bfx[v].ok && unbfx && uses[v] == 1 && tbit_own(s, v);
+    if (v == c ? !s->fused[c] && !bf
+               : !s->folded[v] && (uses[v] != 1 || !(fa_own(s, v) || bf)))
+      return;
+    if (f->insts[x].op == I_CONST || (s->folded[x] && !bf)) return;
+    if (bf) {
+      s->bfx[v].ok = false;
+      s->folded[x] = 0;
+    }
+    if (v == c) s->fused[c] = 1;
+    else s->folded[v] = 1;
+    Ref src = tbit_chain(s, uses, bi, x, &bit);
+    if (src != x) {
+      g_stats.bit_brs++;
+      if (tbit_debug()) fprintf(stderr, "tbit: and chain bit %d\n", bit);
+    }
+    s->tsrc[c] = src;
+    s->tbit[c] = (uint8_t)((bit + 1) | (set ? TBIT_SET : 0));
     return;
   }
-  Inst *ai = &f->insts[and];
-  if (ai->op != I_AND || ai->nargs != 2 || ai->block != bi) return;
-  Ref *aa = ir_args(f, and);
-  int bit = one_bit(f, aa[1], vt_is_64((ValType)ai->type) ? SF64 : SF32);
-  if (bit < 0 || s->folded[aa[0]] || f->insts[aa[0]].op == I_CONST) return;
-  if (and != c) {
-    /* the and is the compare's alone, made by nothing else */
-    if (!s->folded[and] && (uses[and] != 1 || !fa_own(s, and))) return;
-    s->folded[and] = 1;
+  /* a value of one bit, the rest known 0 -- y >> 31, a one-bit field --
+     is a test of that bit, worth it where the chain takes what makes it */
+  if (vi->op == I_CONST || (vi->type != VT_I32 && vi->type != VT_I64)) return;
+  uint64_t pb = ir_known_bits(f, v, 4);
+  if (!pb || (pb & (pb - 1))) return;
+  if (v == c && (s->fused[c] || s->folded[c])) return;
+  bit = __builtin_ctzll(pb);
+  Ref src = tbit_chain(s, uses, bi, v, &bit);
+  if (src == v) return;
+  if (v == c) {
+    s->folded[c] = 0;
+    s->fused[c] = 1;
   }
+  g_stats.bit_brs++;
+  if (tbit_debug()) fprintf(stderr, "tbit: one-bit chain bit %d\n", bit);
+  s->tsrc[c] = src;
   s->tbit[c] = (uint8_t)((bit + 1) | (set ? TBIT_SET : 0));
 }
 
 static void find_tst_conds(Isel *s, const uint32_t *uses) {
   IrFunc *f = s->f;
   s->tbit = xcalloc(f->ninsts ? f->ninsts : 1, 1);
+  s->tsrc = xcalloc(f->ninsts ? f->ninsts : 1, sizeof(Ref));
   if (warmc_getenv("WARMC_NO_TSTCOND")) goto bits;
   for (uint32_t oi = 0; oi < f->norder; oi++) {
     uint32_t bi = f->order[oi];
@@ -4660,6 +4803,7 @@ give_up:
   xfree(s->fa); s->fa = NULL;
   xfree(s->cchain); s->cchain = NULL;
   xfree(s->tbit); s->tbit = NULL;
+  xfree(s->tsrc); s->tsrc = NULL;
   xfree(s->imm_fold); xfree(s->fused); xfree(s->addr_fuse); xfree(s->ptr_fuse);
   xfree(s->zx_fuse); xfree(s->no_remat); xfree(s->paired); xfree(s->nl); xfree(s->pool);
   xfree(s->folded); xfree(s->uses); xfree(s->bfx); xfree(s->pinned); xfree(s->csinc);

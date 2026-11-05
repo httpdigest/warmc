@@ -766,6 +766,11 @@ typedef struct {
   uint64_t slot_tests, slot_nullchks;
   /* slot tests a branch makes itself, no 0 or 1 made (arm64 isel, T_BRIF) */
   uint64_t slot_brs;
+  /* tests of a bit 1 << n made shifts of the value tested (opt.c
+     pass_bit_facts), instructions the ways into their blocks decided made
+     their operand or a constant, and branches on a sign, or on a bit
+     through shifts and extensions, made tbz or tbnz (arm64 isel) */
+  uint64_t bit_tests, way_folds, bit_brs;
   /* calls through a class initializer's global pass_once dropped: through a
      dead one, and where the empty function was certain to be there */
   uint64_t once_dead, once_dominated;
