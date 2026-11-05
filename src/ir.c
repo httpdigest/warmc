@@ -140,6 +140,7 @@ void ir_free(IrFunc *f) {
   xfree(f->kb_epoch);
   xfree(f->kb_bits);
   xfree(f->ord_tmp);
+  xfree(f->loop_head);
   struct IrChunk *c = f->chunks;
   while (c) {
     struct IrChunk *n = c->next;
@@ -437,9 +438,49 @@ static int layout_score_of(const IrFunc *f, const Block *b, uint32_t si) {
   return score;
 }
 
+/* With defer, a loop's exit is not taken to a block that another way out
+   of the same loop also reaches -- a block outside the loop whose one
+   predecessor is in it, not yet reached by the search: it is taken from
+   that one, so that the layout puts the block after it, which falls into
+   it (WARMC_NO_EXIT_DEFER).  rsbench/btreemap's search of a node leaves its scan
+   for the block that goes down to a child both when the keys run out and
+   when the key is not the one it stopped at; taken from the first exit, the
+   block came after the whole of the scan's other way, the found key's
+   block in line between, and every way down a level took two branches
+   where it takes one (0.87 the time).  Not for another test in the loop,
+   whose exits to one block lay out as they did -- deferring those cost
+   gobench/strswitch 8% and javabench/generic 7% -- nor for a way out of
+   another loop of the same depth (asbench/mapint's two hash chains, 5%):
+   the loop is the innermost one by its header (f->loop_head, which the
+   first search's loop walk records).  A forward predecessor is one before
+   the block in the first search's order (defer is for the second, which
+   keeps the first's loops; the first numbers rpo). */
+static bool dfs_defer_exit(IrFunc *f, const uint8_t *seen, uint32_t b, uint32_t t) {
+  const Block *tb = &f->blocks[t];
+  uint32_t d = f->blocks[b].loop_depth;
+  if (tb->loop_depth >= d || t == b || b >= f->cap_loop_head || f->loop_head[b] == UINT32_MAX)
+    return false;
+  for (uint32_t p = 0; p < tb->npreds; p++) {
+    uint32_t q = tb->preds[p];
+    if (q == b || q >= f->nblocks || seen[q] || !f->blocks[q].reachable ||
+        f->blocks[q].rpo >= tb->rpo)
+      continue;
+    /* the other way out of the same loop: a block outside it whose one
+       predecessor is in it -- not another test in the loop, whose exits
+       to one block lay out as they did, nor a way out of another loop */
+    const Block *qb = &f->blocks[q];
+    if (qb->loop_depth < d && qb->npreds == 1 && qb->preds[0] < f->cap_loop_head &&
+        f->loop_head[qb->preds[0]] == f->loop_head[b]) {
+      f->ord_defers++;
+      return true;
+    }
+  }
+  return false;
+}
+
 /* stk0 holds cap entries; a search that needs more moves to the heap */
 static void dfs_post(IrFunc *f, uint32_t entry, uint8_t *seen, uint32_t *post,
-                     uint32_t *n, bool by_score, uint32_t *stk0, uint32_t cap) {
+                     uint32_t *n, bool by_score, bool defer, uint32_t *stk0, uint32_t cap) {
   uint32_t sp = 0;
   uint32_t *stk = stk0;
 
@@ -481,7 +522,12 @@ static void dfs_post(IrFunc *f, uint32_t entry, uint8_t *seen, uint32_t *post,
         }
 
     for (uint32_t i = b->nsuccs; i-- > ns;) DFS_PUSH(b->succs[i].target, 0);
-    for (uint32_t i = ns; i-- > 0;) DFS_PUSH(b->succs[idx[i]].target, 0);
+    /* (a block of one successor in a loop does not leave it: it would
+       not be in the loop) */
+    for (uint32_t i = ns; i-- > 0;) {
+      uint32_t t = b->succs[idx[i]].target;
+      if (!defer || !dfs_defer_exit(f, seen, bi, t)) DFS_PUSH(t, 0);
+    }
   }
 #undef DFS_PUSH
   if (stk != stk0) xfree(stk);
@@ -522,7 +568,13 @@ static bool order_once(IrFunc *f, bool by_score, bool keep) {
   uint8_t *fwd = (uint8_t *)w;
   memset(seen, 0, nb);
   uint32_t n = 0;
-  dfs_post(f, f->entry, seen, post, &n, by_score, dstk, nb + 8);
+  static _Atomic int defer_on = -1;
+  if (defer_on < 0) defer_on = warmc_getenv("WARMC_NO_EXIT_DEFER") == NULL;
+  /* a deferred block is taken from its other predecessor, which the
+     search always comes to: the forward edges, the first search's, order
+     the blocks, and the block, outside the loop, does not lead to it */
+  f->ord_defers = 0;
+  dfs_post(f, f->entry, seen, post, &n, by_score, by_score && defer_on, dstk, nb + 8);
 
   if (n > f->cap_order) {
     f->order = ir_grow(f, f->order, (size_t)f->cap_order * sizeof(uint32_t),
@@ -625,6 +677,12 @@ static bool order_once(IrFunc *f, bool by_score, bool keep) {
   if (keep) return true;
   memset(inloop, 0, nb);
   memset(fwd, 0, nb);
+  if (f->cap_loop_head < nb) {
+    xfree(f->loop_head);
+    f->cap_loop_head = nb + nb / 2 + 8;
+    f->loop_head = xmalloc(f->cap_loop_head * sizeof(uint32_t));
+  }
+  for (uint32_t i = 0; i < nb; i++) f->loop_head[i] = UINT32_MAX;
   uint32_t *stack = lstack;
   for (uint32_t i = 0; i < n; i++) {
     uint32_t bi = f->order[i];
@@ -677,6 +735,9 @@ static bool order_once(IrFunc *f, bool by_score, bool keep) {
           warmc_fatal("internal: block %u is in the loop headed by %u but "
                       "is not dominated by it", k, t);
         f->blocks[k].loop_depth++;
+        /* the innermost: an inner loop's header comes after the outer's */
+        if (f->loop_head[k] == UINT32_MAX || f->blocks[t].rpo > f->blocks[f->loop_head[k]].rpo)
+          f->loop_head[k] = t;
       }
     }
   }
@@ -909,6 +970,7 @@ const uint32_t *ir_emit_order(IrFunc *f, uint32_t skip, uint32_t *n) {
     }
   *n = k;
   rotate_loops(f, eo, k, late);
+  g_stats.exit_defers += f->ord_defers;
   return eo;
 }
 

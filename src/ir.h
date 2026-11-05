@@ -326,6 +326,13 @@ typedef struct {
   /* order_once's working arrays, kept from one ordering to the next */
   uint32_t *ord_tmp;
   size_t ord_tmp_cap;
+  /* each block's innermost loop's header (UINT32_MAX outside every loop),
+     as the last ordering's loop walk found it: for its second ordering's
+     layout (ir.c dfs_defer_exit) */
+  uint32_t *loop_head;
+  uint32_t cap_loop_head;
+  /* the exits the last ordering deferred */
+  uint32_t ord_defers;
   uint64_t *kb_bits;
   size_t kb_cap;
   uint32_t kb_gen;
@@ -771,6 +778,9 @@ typedef struct {
      their operand or a constant, and branches on a sign, or on a bit
      through shifts and extensions, made tbz or tbnz (arm64 isel) */
   uint64_t bit_tests, way_folds, bit_brs;
+  /* loop exits the final layout took from the loop's other way out (ir.c
+     dfs_defer_exit) */
+  uint64_t exit_defers;
   /* calls through a class initializer's global pass_once dropped: through a
      dead one, and where the empty function was certain to be there */
   uint64_t once_dead, once_dominated;

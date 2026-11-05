@@ -1680,7 +1680,13 @@ where nothing runs; a loop's one latch, the jump or test back to its
 header, is laid out above the header where no block falls into it or three
 or more reach it, so that a way round which branched to the latch falls
 from it into the header, one taken branch where it took two
-(`rsbench/utf8scan` takes 0.66 the time, `rsbench/chunks` 0.75); a wrap whose readers take the low half only -- an indirect
+(`rsbench/utf8scan` takes 0.66 the time, `rsbench/chunks` 0.75); a block
+that two ways out of one loop reach -- the test that ends the loop and a
+block after another way out -- comes after that block, which falls into
+it, where it came after all the code the loop's other way reaches, a rare
+block in line between: a B-tree's search of a node goes down a level with
+one taken branch, not two (`rsbench/btreemap` takes 0.87 the time;
+`WARMC_NO_EXIT_DEFER=1` turns it off); a wrap whose readers take the low half only -- an indirect
 call's table index among them -- is no instruction, they read the i64's
 register; and an i32 extended to i64 where a w-register write made it, its
 high half zero already, is no instruction either, as in the return of every
