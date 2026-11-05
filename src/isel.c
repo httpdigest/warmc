@@ -76,11 +76,25 @@ static bool gpr_is_callee_saved(int r) {
 static bool fpr_is_callee_saved(int r) { return !icc_on() && r >= 8 && r <= 15; }
 /* whether a reference may be saved around a call (regalloc.inc's csa),
    its slot then the call's root (note_safepoint): under warmc's own
-   convention, where no register keeps one across a call */
-static bool csa_refs_read(void) { return icc_on() && !warmc_getenv("WARMC_NO_CSA_REFS"); }
+   convention, where no register keeps one across a call, around any call
+   (WARMC_CSA_REFS=1 under the platform's too); under the platform's, one
+   that crosses no call but those on cold ways -- luawasm's slow paths,
+   whose calls made every reference live across them a callee-saved
+   register's or a slot's, reloaded at each use: awfy_permute 5% and nbody
+   5% faster, awfy_list 2% slower on the same instructions (around hot
+   calls too, as the cost model prices them, fib_local and queens lost 1.5%
+   as well).  WARMC_NO_CSA_REFS=1: neither. */
+static bool csa_refs_read(void) {
+  return (icc_on() || warmc_getenv("WARMC_CSA_REFS")) && !warmc_getenv("WARMC_NO_CSA_REFS");
+}
 static bool isel_csa_refs(void) {
   static _Atomic int on = -1;
   return env_once(&on, csa_refs_read);
+}
+static bool csa_refs_cold_read(void) { return !warmc_getenv("WARMC_NO_CSA_REFS"); }
+static bool isel_csa_refs_cold(void) {
+  static _Atomic int on = -1;
+  return env_once(&on, csa_refs_cold_read);
 }
 /* whether the barrier's stub keeps a calling-free function's x30
    (emit_gc_load_stubs), so that its loads make it no caller */

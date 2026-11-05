@@ -17627,6 +17627,7 @@ static bool licm_split_preheaders(IrFunc *f) {
 
 static bool pass_licm(IrFunc *f, const OptOpts *o) {
   bool changed = false;
+  bool licm_nocold = !warmc_getenv("WARMC_LICM_COLD");
   uint8_t *inloop = xcalloc(f->nblocks, 1);
   uint8_t *reach = xmalloc(f->nblocks);
   uint32_t *stack = xmalloc(f->nblocks * sizeof(uint32_t));
@@ -17730,6 +17731,13 @@ static bool pass_licm(IrFunc *f, const OptOpts *o) {
     for (uint32_t bo = 0; bo < nlbl; bo++) {
       uint32_t bi = (uint32_t)lord[bo];
       Block *b = &f->blocks[bi];
+      /* nothing out of a cold block: what only a slow path reads would run
+         on every way into the loop and hold a register through all of it
+         (luawasm's integer-key hashes and their constant, made ahead of
+         permute's loops of six trips and spilled; awfy_list, permute and
+         deltablue 1.5% faster, nbody 2% slower on the same instructions,
+         the corpora the same; WARMC_LICM_COLD=1 takes them out too) */
+      if (licm_nocold && b->cold && bi != hb) continue;
 
       bool reach_mem = (bi == hb), reach_any = (bi == hb);
       uint32_t k = 0;

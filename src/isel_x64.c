@@ -63,6 +63,7 @@ static bool fpr_is_callee_saved(int r) { return r >= 8 && r <= 15; }
 
 static bool isel_barrier_keeps_lr(void) { return false; }
 static bool isel_csa_refs(void) { return false; }
+static bool isel_csa_refs_cold(void) { return false; }
 #include "isel_core.inc"
 
 static void slot_load(Isel *s, Buf *bf, int fp, int vec, int reg, uint32_t off) {

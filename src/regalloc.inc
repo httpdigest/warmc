@@ -407,8 +407,9 @@ static void spill_debug(Isel *s, const char *kind, const Interval *cur,
   if (in->op == I_CONST && !vt_is_float((ValType)in->type) &&
       (ValType)in->type != VT_V128)
     cost = ir_const_cost(in->imm, vt_is_64((ValType)in->type));
-  fprintf(stderr, "%s[%u] v%u %s len=%d w=%.0f xcall=%d ref=%d cost=%d nr=%d",
-          kind, s->f->func_index, cur->value, ir_op_name(in->op), cur->end - cur->start, w,
+  const char *sym = s->f->m->funcs[s->f->func_index].sym;
+  fprintf(stderr, "%s[%u %s] v%u %s len=%d w=%.0f xcall=%d ref=%d cost=%d nr=%d",
+          kind, s->f->func_index, sym ? sym : "?", cur->value, ir_op_name(in->op), cur->end - cur->start, w,
           cur->crosses_call, vt_is_ref((ValType)in->type), cost,
           s->no_remat[cur->value]);
   if (in->op == I_GLOBAL_GET) {
@@ -583,6 +584,27 @@ static double csa_crossing_cost(const Interval *cur, const Range *R,
     }
   }
   return c;
+}
+
+/* Whether the interval is live across a call on a way that is not cold */
+static bool csa_crosses_hot(const Interval *cur, const Range *R, int32_t def_pos,
+                            const int32_t *call_pos, const uint8_t *call_cold,
+                            uint32_t ncalls) {
+  Range span = { cur->start, cur->end };
+  uint32_t nr = cur->rcount ? cur->rcount : 1;
+  for (uint32_t i = 0; i < nr; i++) {
+    const Range *r = cur->rcount ? &R[cur->rfirst + i] : &span;
+    int32_t lo = r->lo, hi = r->hi - 1;
+    if (hi < lo) continue;
+    uint32_t a = 0, b = ncalls;
+    while (a < b) {
+      uint32_t m = (a + b) / 2;
+      if (call_pos[m] < lo) a = m + 1; else b = m;
+    }
+    for (; a < ncalls && call_pos[a] <= hi; a++)
+      if (call_pos[a] != def_pos && !call_cold[a]) return true;
+  }
+  return false;
 }
 
 typedef struct {
@@ -2793,8 +2815,8 @@ static void regalloc_linear(Isel *s) {
   uint8_t *inelig = xcalloc(n ? n : 1, 1);
   if (csa_ok) {
     /* (a reference saved around a call is in its slot there, which the
-       call's stack map then names: note_safepoint) */
-    if (!isel_csa_refs())
+       call's stack map then names: note_safepoint; isel.c isel_csa_refs) */
+    if (!isel_csa_refs() && !isel_csa_refs_cold())
       for (uint32_t i = 0; i < n; i++)
         if (iv[i].end >= 0 && vt_is_ref((ValType)f->insts[i].type))
           inelig[web[i]] = 1;
@@ -3018,7 +3040,11 @@ static void regalloc_linear(Isel *s) {
           csa_cost = csa_crossing_cost(cur, R, num[cur->value], call_pos,
                                        call_depth, call_cold, NULL, ncalls,
                                        csa_cold_div, &csa_work, NULL);
-          if (csa_cost * csa_margin < price || warmc_getenv("WARMC_CSA_FORCE"))
+          /* (a reference under the platform's convention: only one that
+             crosses cold calls alone, isel.c isel_csa_refs_cold) */
+          bool hot_ref = !isel_csa_refs() && vt_is_ref((ValType)f->insts[cur->value].type) &&
+                         csa_crosses_hot(cur, R, num[cur->value], call_pos, call_cold, ncalls);
+          if (!hot_ref && (csa_cost * csa_margin < price || warmc_getenv("WARMC_CSA_FORCE")))
             for (int k = 0; k < npool; k++) {
               int rr = pool[k];
 
