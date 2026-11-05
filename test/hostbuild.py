@@ -283,6 +283,12 @@ def stack_of(pid, path):
     none.  Under make check's load, twice a compile that takes a
     tenth of a second (test/cases/vector.wat) ran past thirty in two rows at
     once, and neither did again alone."""
+    # an earlier timeout's file must not stand in for this one's when sample
+    # writes none
+    try:
+        os.remove(path)
+    except OSError:
+        pass
     try:
         r = subprocess.run(["sample", str(pid), "1", "-mayDie", "-file", path],
                            capture_output=True, text=True, timeout=30)
