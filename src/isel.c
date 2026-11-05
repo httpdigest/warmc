@@ -4234,6 +4234,7 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
   s->split_collect = split_collect;
   s->out_bytes = call_out_bytes(f, out_bytes);
   s->far_br = far || warmc_getenv("WARMC_FAR_BRANCH") != NULL;
+  s->no_stub_out = warmc_getenv("WARMC_NO_STUB_OUT") != NULL;
   s->naive = !opt->regalloc;
   s->one_rule = opt->ra_one_rule;
 

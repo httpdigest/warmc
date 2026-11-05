@@ -453,8 +453,8 @@ static int layout_score_of(const IrFunc *f, const Block *b, uint32_t si) {
    another loop of the same depth (asbench/mapint's two hash chains, 5%):
    the loop is the innermost one by its header (f->loop_head, which the
    first search's loop walk records).  A forward predecessor is one before
-   the block in the first search's order (defer is for the second, which
-   keeps the first's loops; the first numbers rpo). */
+   the block in the last ordering's (rpo): ir_emit_order searches again with
+   defer, for the layout alone. */
 static bool dfs_defer_exit(IrFunc *f, const uint8_t *seen, uint32_t b, uint32_t t) {
   const Block *tb = &f->blocks[t];
   uint32_t d = f->blocks[b].loop_depth;
@@ -568,13 +568,7 @@ static bool order_once(IrFunc *f, bool by_score, bool keep) {
   uint8_t *fwd = (uint8_t *)w;
   memset(seen, 0, nb);
   uint32_t n = 0;
-  static _Atomic int defer_on = -1;
-  if (defer_on < 0) defer_on = warmc_getenv("WARMC_NO_EXIT_DEFER") == NULL;
-  /* a deferred block is taken from its other predecessor, which the
-     search always comes to: the forward edges, the first search's, order
-     the blocks, and the block, outside the loop, does not lead to it */
-  f->ord_defers = 0;
-  dfs_post(f, f->entry, seen, post, &n, by_score, by_score && defer_on, dstk, nb + 8);
+  dfs_post(f, f->entry, seen, post, &n, by_score, false, dstk, nb + 8);
 
   if (n > f->cap_order) {
     f->order = ir_grow(f, f->order, (size_t)f->cap_order * sizeof(uint32_t),
@@ -945,6 +939,33 @@ uint32_t ir_loop_header_at(const IrFunc *f, uint32_t t) {
 }
 
 const uint32_t *ir_emit_order(IrFunc *f, uint32_t skip, uint32_t *n) {
+  /* The layout's order: the scored search again with loops' exits
+     deferred (dfs_defer_exit), into an order of its own.  f->order, which
+     every pass and the allocator read, stays as it was: with the deferral
+     in it their choices followed it -- luawasm's fannkuch spilled 1141
+     values where it spills 1006, 7% slower, and spectralnorm and nbody 5%.
+     The deferred block is taken from its other predecessor, which the
+     search always comes to: the forward edges order the blocks, and the
+     block, outside the loop, does not lead to that one. */
+  static _Atomic int defer_on = -1;
+  if (defer_on < 0) defer_on = warmc_getenv("WARMC_NO_EXIT_DEFER") == NULL;
+  const uint32_t *order = f->order;
+  f->ord_defers = 0;
+  if (defer_on && f->reducible && f->cap_loop_head >= f->nblocks && f->norder) {
+    uint32_t nb = f->nblocks, m = 0;
+    uint8_t *seen = xcalloc(nb, 1);
+    uint32_t *post = xmalloc(nb * sizeof(uint32_t));
+    uint32_t *stk = xmalloc(2 * ((size_t)nb + 8) * sizeof(uint32_t));
+    dfs_post(f, f->entry, seen, post, &m, true, true, stk, nb + 8);
+    if (f->ord_defers && m == f->norder) {
+      uint32_t *deferred = ir_alloc(f, m * sizeof(uint32_t));
+      for (uint32_t i = 0; i < m; i++) deferred[i] = post[m - 1 - i];
+      order = deferred;
+    }
+    xfree(seen);
+    xfree(post);
+    xfree(stk);
+  }
   uint32_t *eo = ir_alloc(f, (f->norder ? f->norder : 1) * sizeof(uint32_t));
   /* late: the outline blocks and the call arms, and what only they lead
      to, as the trap of Go's pruned resume cases; the order has a block's
@@ -965,7 +986,7 @@ const uint32_t *ir_emit_order(IrFunc *f, uint32_t skip, uint32_t *n) {
   uint32_t k = 0;
   for (uint8_t pass = 0; pass < 2; pass++)
     for (uint32_t oi = 0; oi < f->norder; oi++) {
-      uint32_t bi = f->order[oi];
+      uint32_t bi = order[oi];
       if (bi != skip && late[bi] == pass) eo[k++] = bi;
     }
   *n = k;

@@ -3543,6 +3543,37 @@ static void emit_block(Isel *s, uint32_t bi, uint32_t next_bi) {
         add_fix(s, bsite, !s->far_br, e->target);
         parallel_copy(s, tm, tn);
         if (t->target != next_bi) { add_fix(s, B->len, 0, t->target); a64_b(B, 0); }
+      } else if ((t->target == next_bi || e->target == next_bi) && !s->no_stub_out &&
+                 /* the way that falls in at least as likely as the other */
+                 (t->target == next_bi
+                      ? ir_succ_score(f, b, (uint32_t)(t - b->succs)) >= ir_succ_score(f, b, (uint32_t)(e - b->succs))
+                      : ir_succ_score(f, b, (uint32_t)(e - b->succs)) >= ir_succ_score(f, b, (uint32_t)(t - b->succs)))) {
+        /* Moves both ways, one into the next block and at least as likely
+           (ir_succ_score) as the other: the other's moves in a stub out of
+           line, the branch to it, and this way's falling in -- where the
+           stub in line had this way branch over it to the block after it
+           (rsbench/btreemap's search, the found key's register moves
+           between its way down and the block that goes down;
+           WARMC_NO_STUB_OUT).  Not where the next block is the less likely
+           way's, a loop's exit: the way round would branch out and back. */
+        if (t->target == next_bi) {
+          Edge *tmp = t; t = e; e = tmp;
+          if (kind == 0) cc = cc_invert(cc);
+          else kind = br_kind_invert(kind);
+          Move *mtmp = tm; tm = em; em = mtmp;
+          int ntmp = tn; tn = en; en = ntmp;
+        }
+        struct EdgeStub *st = xmalloc(sizeof *st);
+        st->nx = 0;
+        st->n = tn;
+        st->mv = xmalloc((size_t)tn * sizeof(Move));
+        memcpy(st->mv, tm, (size_t)tn * sizeof(Move));
+        st->target = t->target;
+        st->next = s->edge_stubs;
+        s->edge_stubs = st;
+        st->site = br_cc(s, kind, cc, zsf, zreg);
+        parallel_copy(s, em, en);
+        g_stats.stubs_out++;
       } else {
 
         size_t site = br_cc(s, kind, cc, zsf, zreg);

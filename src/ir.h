@@ -331,7 +331,7 @@ typedef struct {
      layout (ir.c dfs_defer_exit) */
   uint32_t *loop_head;
   uint32_t cap_loop_head;
-  /* the exits the last ordering deferred */
+  /* the exits the layout's order deferred (ir_emit_order) */
   uint32_t ord_defers;
   uint64_t *kb_bits;
   size_t kb_cap;
@@ -781,6 +781,9 @@ typedef struct {
   /* loop exits the final layout took from the loop's other way out (ir.c
      dfs_defer_exit) */
   uint64_t exit_defers;
+  /* two-way branches whose taken edge's moves went to a stub out of line,
+     the other way falling into the next block (arm64) */
+  uint64_t stubs_out;
   /* calls through a class initializer's global pass_once dropped: through a
      dead one, and where the empty function was certain to be there */
   uint64_t once_dead, once_dominated;

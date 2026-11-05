@@ -1684,9 +1684,13 @@ from it into the header, one taken branch where it took two
 that two ways out of one loop reach -- the test that ends the loop and a
 block after another way out -- comes after that block, which falls into
 it, where it came after all the code the loop's other way reaches, a rare
-block in line between: a B-tree's search of a node goes down a level with
-one taken branch, not two (`rsbench/btreemap` takes 0.87 the time;
-`WARMC_NO_EXIT_DEFER=1` turns it off); a wrap whose readers take the low half only -- an indirect
+block in line between, in the layout alone, the order the passes and the
+allocator take as it was; and a branch with register moves both ways, one
+of them into the next block and at least as likely as the other, puts the
+other's moves out of line, where that way branched over them: a B-tree's
+search of a node goes down a level with one taken branch, not two
+(`rsbench/btreemap` takes 0.88 the time; `WARMC_NO_EXIT_DEFER=1` and
+`WARMC_NO_STUB_OUT=1` turn them off); a wrap whose readers take the low half only -- an indirect
 call's table index among them -- is no instruction, they read the i64's
 register; and an i32 extended to i64 where a w-register write made it, its
 high half zero already, is no instruction either, as in the return of every

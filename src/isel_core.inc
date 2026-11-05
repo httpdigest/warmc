@@ -248,6 +248,7 @@ typedef struct {
   int remat_cost;
   double remat2_w, remat2_seg;
   bool far_br, far_br_needed;
+  bool no_stub_out; /* WARMC_NO_STUB_OUT: both edges' moves in line */
 
   struct EdgeStub {
     size_t site;

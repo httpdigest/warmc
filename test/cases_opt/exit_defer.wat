@@ -6,6 +6,10 @@
 ;; block came after the scan's other way and the found block in line took
 ;; two.  rsbench/btreemap's search.  near: the same scan whose second way
 ;; out leaves another loop -- a second scan's -- which keeps its layout.
+;; near's way into its second scan, unrolled, has moves both ways, and the
+;; way into the copy, as likely, falls into it, the other way's moves in a
+;; stub out of line (isel_ops.inc; stubs_out), where the way in branched
+;; over the other's moves: four unconditional branches, not six.
 ;; twoexit: a scan whose second way out is a test in the loop, and twopred:
 ;; one whose second way out is a block two tests in the loop reach -- no
 ;; exit taken from either (the count of those taken, exit_defers, is
@@ -13,6 +17,8 @@
 ;;
 ;; late: find \smadd\s=1
 ;; late: near \smadd\s=0
+;; shape: near \sb\s=4
+;; stats -O2 a64: stubs_out=2
 ;; stats -O2: exit_defers=3
 ;;
 ;; run: find -1 => i32:-1
