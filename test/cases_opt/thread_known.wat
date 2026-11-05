@@ -14,11 +14,13 @@
 ;;
 ;; (At -O2 loophead's loop, whose header tests a value made before it, is
 ;; unswitched first -- opt.c pass_unswitch -- and the test ahead of its
-;; copies is one more the way in decides.)
+;; copies is one more the way in decides; at -O2 and -O3 one edge whose
+;; blocks merge_blocks makes one is threaded by thread_eval, which works it
+;; out along the way in, and not counted here.)
 ;;
 ;; stats -O1: threaded_known=26 param_compares=1
-;; stats -O2: threaded_known=27 param_compares=1
-;; stats -O3: threaded_known=27 param_compares=1
+;; stats -O2: threaded_known=26 param_compares=1
+;; stats -O3: threaded_known=26 param_compares=1
 ;;
 ;; run: eqway 0 0 => i32:0
 ;; run: rangeway 0 0 => i32:0

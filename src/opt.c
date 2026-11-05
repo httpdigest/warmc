@@ -1234,10 +1234,11 @@ static bool pass_brtable_tree(IrFunc *f, bool *jumped) {
    prints each conversion and =2 each branch turned down too, with why;
    WARMC_IFC_ARM, _CRIT and _SEL set the three limits. */
 static pthread_once_t g_ifc_once = PTHREAD_ONCE_INIT;
-static struct { bool off; int dbg, arm, crit, sel; long only; } g_ifc;
+static struct { bool off, counter_sel; int dbg, arm, crit, sel; long only; } g_ifc;
 
 static void ifc_init(void) {
   g_ifc.off = warmc_getenv("WARMC_NO_IFCONV") != NULL;
+  g_ifc.counter_sel = warmc_getenv("WARMC_IFC_COUNTER_SEL") != NULL;
   const char *d = warmc_getenv("WARMC_IFC_DEBUG");
   g_ifc.dbg = d ? (d[0] == '2' ? 2 : 1) : 0;
   const char *e = warmc_getenv("WARMC_IFC_ARM");
@@ -1499,6 +1500,97 @@ static bool ifc_recurrence(IrFunc *f, uint32_t ji, uint32_t p, Ref cond) {
   return n && ifc_reaches(f, cond, hp, n, 8);
 }
 
+/* Whether what join ji's parameter p receives goes round a loop into a
+   header parameter: the select is on the loop's recurrence (ifc_recurrence
+   without the condition) -- from ji's own edges, or from those of the
+   blocks after it that only it leads to, a loop's latch among them */
+static bool ifc_carried(IrFunc *f, uint32_t ji, uint32_t p) {
+  Block *jb = &f->blocks[ji];
+  for (uint32_t i = 0; i < jb->npreds; i++)
+    if (f->blocks[jb->preds[i]].rpo >= jb->rpo) return true;
+  Ref der[16];
+  uint32_t nd = 0, cur = ji;
+  der[nd++] = jb->params[p];
+  for (int step = 0; step < 4; step++) {
+    Block *cb = &f->blocks[cur];
+    for (uint32_t i = 0; i < cb->ninsts && nd < 16; i++) {
+      Ref v = cb->insts[i];
+      Inst *in = &f->insts[v];
+      for (uint32_t j = 0; j < in->nargs; j++) {
+        Ref a = ir_resolve(f, ir_args(f, v)[j]);
+        uint32_t k = 0;
+        while (k < nd && der[k] != a) k++;
+        if (k < nd) { der[nd++] = v; break; }
+      }
+    }
+    uint32_t next = UINT32_MAX;
+    for (uint32_t s = 0; s < cb->nsuccs; s++) {
+      Block *tb = &f->blocks[cb->succs[s].target];
+      if (tb->rpo > cb->rpo) {
+        if (tb->npreds == 1) next = cb->succs[s].target;
+        continue;
+      }
+      for (uint32_t a = 0; a < cb->succs[s].nargs && a < tb->nparams; a++) {
+        Ref v = ir_resolve(f, cb->succs[s].args[a]);
+        for (uint32_t k = 0; k < nd; k++)
+          if (der[k] == v) return true;
+      }
+    }
+    if (next == UINT32_MAX) break;
+    cur = next;
+  }
+  return false;
+}
+
+/* A loop's counter: a header parameter that every way round hands itself
+   plus or minus a constant */
+static bool ifc_counter(IrFunc *f, Ref x) {
+  const Inst *xi = &f->insts[x];
+  if (xi->op != I_PARAM || xi->block >= f->nblocks) return false;
+  Block *hb = &f->blocks[xi->block];
+  uint32_t k = hb->nparams, back = 0;
+  for (uint32_t i = 0; i < hb->nparams; i++) if (hb->params[i] == x) k = i;
+  if (k == hb->nparams) return false;
+  for (uint32_t i = 0; i < hb->npreds; i++) {
+    uint32_t q = hb->preds[i];
+    if (f->blocks[q].rpo < hb->rpo) continue;
+    for (uint32_t s = 0; s < f->blocks[q].nsuccs; s++) {
+      Edge *e = &f->blocks[q].succs[s];
+      if (e->target != xi->block || k >= e->nargs) continue;
+      Ref a = ir_resolve(f, e->args[k]);
+      const Inst *ai = &f->insts[a];
+      uint64_t c;
+      if ((ai->op != I_ADD && ai->op != I_SUB) || ai->nargs != 2 ||
+          ir_resolve(f, ir_args(f, a)[0]) != x || !is_const(f, ir_args(f, a)[1], &c))
+        return false;
+      back++;
+    }
+  }
+  return back > 0;
+}
+
+/* A condition made of one loop counter and constants alone -- (i & 15) ==
+   0, i < 100 -- which repeats with the count: a branch guesses it */
+static bool ifc_counter_cond(IrFunc *f, Ref c, int d) {
+  c = ir_resolve(f, c);
+  const Inst *in = &f->insts[c];
+  if (in->op == I_CONST) return true;
+  if (in->op == I_PARAM) return ifc_counter(f, c);
+  if (d <= 0) return false;
+  switch (in->op) {
+    case I_AND: case I_OR: case I_XOR: case I_SHL: case I_SHRU: case I_SHRS:
+    case I_ADD: case I_SUB: case I_EQZ: case I_WRAP: case I_EXTENDU: case I_EXTENDS:
+    case I_EQ: case I_NE: case I_LTS: case I_LTU: case I_GTS: case I_GTU:
+    case I_LES: case I_LEU: case I_GES: case I_GEU:
+      break;
+    default: return false;
+  }
+  /* (constants alone fold before if-conversion) */
+  for (uint32_t j = 0; j < in->nargs; j++)
+    if (!ifc_counter_cond(f, ir_resolve(f, ir_args(f, c)[j]), d - 1)) return false;
+  return true;
+}
+
 /* A test of one bit of a value: x & 2^k against 0 or 2^k, or the bare and */
 static bool ifc_one_bit(IrFunc *f, Ref c) {
   const Inst *in = &f->insts[c];
@@ -1600,6 +1692,14 @@ static bool ifc_try(IrFunc *f, uint32_t bi, IfcCtx *cx) {
        : 3n + 1, whose parity test is four of the cycles each step */
     if (b->loop_depth && dc > hi && ifc_recurrence(f, ji, p, cond))
       IFC_REJ("condition is the loop's own");
+    /* a condition of the loop's counter alone, which repeats with the count
+       and a branch guesses, picking a value that goes round the loop: the
+       select would add its latency to every time round, where the guessed
+       branch adds nothing -- ktbench/exn's count of every sixteenth step,
+       1.4x as two selects on its sums (WARMC_IFC_COUNTER_SEL takes them) */
+    if (b->loop_depth && ifc_counter_cond(f, cond, 4) && ifc_carried(f, ji, p) &&
+        !g_ifc.counter_sel)
+      IFC_REJ("a counter's test on the loop's recurrence");
     if (dc > hi) hi = dc;
     /* In a loop, a test of one bit of a value it computes, not loads --
        hashed or mixed bits, which a branch guesses wrong half the time --
@@ -5860,6 +5960,71 @@ static bool pass_cse(IrFunc *f, const OptOpts *o) {
   return changed;
 }
 
+/* A block that jumps to one whose only way in it is becomes one block with
+   it: the other's instructions and branch after its own, the other's
+   parameters the values the jump handed them (WARMC_NO_BLOCK_MERGE).  A
+   dispatch reached through a block that only jumps to it -- cbench/lexer's
+   label variable, LLVM's way round an irreducible loop: a block of the
+   label's parameter jumping to the br_table on it -- is a switch on a
+   parameter of its own then, which thread_dispatch takes the constant
+   labels of each edge through.  The calls of a block with exception edges
+   take them along. */
+static bool merge_blocks(IrFunc *f) {
+  static _Atomic int on = -1;
+  if (on < 0) on = warmc_getenv("WARMC_NO_BLOCK_MERGE") == NULL;
+  if (!on) return false;
+  bool merged = false, subst = false;
+  for (uint32_t oi = 0; oi < f->norder; oi++) {
+    uint32_t pi = f->order[oi];
+    for (int guard = 0; guard < 64; guard++) {
+      Block *p = &f->blocks[pi];
+      /* (the entry has no way in, a pad none but an exception's, and a
+         block whose one way in is its own jump is not reached) */
+      if (p->term != T_JUMP || p->nsuccs != 1) break;
+      uint32_t si = p->succs[0].target;
+      Block *sb = &f->blocks[si];
+      if (sb->npreds != 1 || sb->preds[0] != pi) break;
+      for (uint32_t i = 0; i < sb->nparams; i++)
+        if (sb->params[i] != p->succs[0].args[i]) {
+          ir_replace(f, sb->params[i], p->succs[0].args[i]);
+          subst = true;
+        }
+      if (p->ninsts + sb->ninsts > p->cap_insts) {
+        uint32_t cap = p->ninsts + sb->ninsts;
+        p->insts = ir_grow(f, p->insts, (size_t)p->cap_insts * sizeof(uint32_t),
+                           (size_t)cap * sizeof(uint32_t));
+        p->cap_insts = cap;
+      }
+      for (uint32_t i = 0; i < sb->ninsts; i++) {
+        f->insts[sb->insts[i]].block = pi;
+        p->insts[p->ninsts++] = sb->insts[i];
+      }
+      p->term = sb->term;
+      p->term_arg = sb->term_arg;
+      p->term_imm = sb->term_imm;
+      p->succs = sb->succs; p->nsuccs = sb->nsuccs; p->cap_succs = sb->cap_succs;
+      p->ret_args = sb->ret_args; p->nret = sb->nret; p->cap_ret = sb->cap_ret;
+      sb->succs = NULL; sb->nsuccs = sb->cap_succs = 0;
+      sb->ret_args = NULL; sb->nret = sb->cap_ret = 0;
+      sb->ninsts = 0;
+      sb->nparams = 0;
+      sb->npreds = 0;
+      sb->term = T_TRAP;
+      sb->reachable = false;
+      for (uint32_t s = 0; s < p->nsuccs; s++) {
+        Block *tb = &f->blocks[p->succs[s].target];
+        for (uint32_t q = 0; q < tb->npreds; q++)
+          if (tb->preds[q] == si) tb->preds[q] = pi;
+      }
+      g_stats.blocks_merged++;
+      merged = true;
+    }
+  }
+  if (subst) ir_apply_subst(f);
+  if (merged) ir_recompute_preds(f);
+  return merged;
+}
+
 static bool pass_branch(IrFunc *f) {
   bool changed = false;
   for (uint32_t oi = 0; oi < f->norder; oi++) {
@@ -5947,6 +6112,7 @@ static bool pass_branch(IrFunc *f) {
     }
   }
   if (changed) ir_recompute_preds(f);
+  if (merge_blocks(f)) changed = true;
   if (changed) { ir_order(f); }
   return changed;
 }

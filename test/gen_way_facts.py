@@ -524,7 +524,7 @@ def main():
     w(";; traps are called alone.  Made by test/gen_way_facts.py, which works out")
     w(";; every answer.")
     w(";;")
-    w(";; stats -O2: bit_tests=%s way_folds=%s" % (BIT_TESTS, WAY_FOLDS))
+    w(";; stats -O2: bit_tests=%s way_folds=%s blocks_merged=%s" % (BIT_TESTS, WAY_FOLDS, BLOCKS_MERGED))
     w(";;")
     for sh in shapes:
         w(";; shape: %s" % sh)
@@ -559,6 +559,8 @@ BYTES = [0x41, 0xc3, 0x7f, 0x80, 0x00, 0xff, 0x20, 0xe2]
 
 # what warmc's --stats says at -O2: the bits tested and the folds made
 BIT_TESTS = 1380
-WAY_FOLDS = 2780
+WAY_FOLDS = 3124
+# and the blocks merge_blocks makes one with the block that jumps to them
+BLOCKS_MERGED = 29377
 
 main()

@@ -781,6 +781,8 @@ typedef struct {
   /* loop exits the final layout took from the loop's other way out (ir.c
      dfs_defer_exit) */
   uint64_t exit_defers;
+  /* blocks merged into the one block that jumps to them (opt.c merge_blocks) */
+  uint64_t blocks_merged;
   /* two-way branches whose taken edge's moves went to a stub out of line,
      the other way falling into the next block (arm64) */
   uint64_t stubs_out;

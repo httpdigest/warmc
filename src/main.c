@@ -369,7 +369,7 @@ static void print_stats(void) {
           " unr_rej_body=%llu unr_rej_exit=%llu unr_rej_trip=%llu"
           " unr_rej_escape=%llu unr_addr_folded=%llu gc_nullchk=%llu bce_ranges=%llu bce_smeared=%llu bce_versioned=%llu gc_loads_pre=%llu fields_promoted=%llu\n"
           "             slot_tests=%llu slot_nullchks=%llu slot_brs=%llu once_dead=%llu once_dominated=%llu once_looped=%llu\n"
-          "             bit_tests=%llu way_folds=%llu bit_brs=%llu exit_defers=%llu stubs_out=%llu\n",
+          "             bit_tests=%llu way_folds=%llu bit_brs=%llu exit_defers=%llu stubs_out=%llu blocks_merged=%llu\n",
           (unsigned long long)g_stats.folded, (unsigned long long)g_stats.dce_removed,
           (unsigned long long)g_stats.cse_removed, (unsigned long long)g_stats.licm_hoisted,
           (unsigned long long)g_stats.branch_simplified,
@@ -487,7 +487,8 @@ static void print_stats(void) {
           (unsigned long long)g_stats.way_folds,
           (unsigned long long)g_stats.bit_brs,
           (unsigned long long)g_stats.exit_defers,
-          (unsigned long long)g_stats.stubs_out);
+          (unsigned long long)g_stats.stubs_out,
+          (unsigned long long)g_stats.blocks_merged);
 }
 
 /* --validate-only given several inputs: each one's verdict, a line apiece

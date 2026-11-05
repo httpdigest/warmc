@@ -9,7 +9,7 @@
 ;; traps are called alone.  Made by test/gen_way_facts.py, which works out
 ;; every answer.
 ;;
-;; stats -O2: bit_tests=1380 way_folds=2780
+;; stats -O2: bit_tests=1380 way_folds=3124 blocks_merged=29377
 ;;
 ;; shape: bt_i32_br_c \slsr\s+[wx]\d=1
 ;; shape: bt_i32_br_c \slsl\s+[wx]\d=0
