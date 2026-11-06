@@ -198,6 +198,9 @@ enum {
 /* an I_REF_SLOT that traps on null as a null dereference does, in place of
    the access after it that would have (codegen.c seal_tests) */
 #define RTK_NULLTRAP 0x40u
+/* an I_REF_SLOT of a reference known to be no null, which tests none
+   (codegen.c seal_tests) */
+#define RTK_NONNULL 0x20u
 
 #define GC_HDR_BYTES 8u
 #define GC_HDR_WIDE  16u

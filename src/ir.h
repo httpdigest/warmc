@@ -509,6 +509,9 @@ bool ir_has_bitrev(void);
 bool ir_vec_mul_one(uint32_t lane);
 
 bool ir_imm_ok(IrFunc *f, Ref user, uint32_t idx, uint64_t cval, ValType ct);
+/* whether reference x is no null where instruction pos of block bi runs
+   (opt.c gc_nonnull_in), on dominators the optimiser left current */
+bool gc_nonnull_at(IrFunc *f, Ref x, uint32_t bi, uint32_t pos);
 bool ir_mem_disp_ok(uint64_t off, uint32_t size_log2);
 
 uint64_t ir_value_max(IrFunc *f, Ref v, int depth);
@@ -794,6 +797,13 @@ typedef struct {
   /* accesses at a counter plus an invariant, or at a second counter, that
      a versioned loop's copy proves in bounds itself (opt.c bv_sym_index) */
   uint64_t bce_version_sym;
+  /* block params no way in brings a null to (opt.c gc_nonnull_params), and
+     slot tests of a reference known to be none, which test no null
+     (codegen.c seal_tests, RTK_NONNULL) */
+  uint64_t gc_nonnull_params, slot_nonnull;
+  /* ref.as_non_null traps of what is known to be no null, dropped (opt.c
+     pass_gc_nullchk) */
+  uint64_t gc_nulltraps;
   /* two-way branches whose taken edge's moves went to a stub out of line,
      the other way falling into the next block (arm64) */
   uint64_t stubs_out;

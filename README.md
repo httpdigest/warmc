@@ -1841,6 +1841,23 @@ working memory when it ends.
     (ref.test $T x) (then (ref.cast $T x))`, the two sharing the test's
     result -- has no trap left to make (`WARMC_NO_PASSEDCAST=1`; luawasm's
     `nbody` takes 0.9 the time).
+  - A block param that no way in brings a null to -- each way's value of a
+    type that takes none, or one its block already knows is none -- is
+    none, so reads of it check none: luawasm's casts of one object, a way
+    a test of each kind, meet at one (`opt.c` `gc_nonnull_params`,
+    `WARMC_NO_NULL_PARAMS=1`; `--stats` counts `gc_nonnull_params`).  In a
+    sealed module a type test of a reference known to be no null -- past a
+    branch on its null test, a test null fails or a non-nullable one
+    passed, an access of it or a `ref.as_non_null`, or such a param -- makes
+    no null test of its own: luawasm tests each value for nil before it
+    tests its kind, two or three kinds in a row (`codegen.c` `seal_tests`,
+    `WARMC_NO_SLOT_NONNULL=1`; `--stats` counts `slot_nonnull`).  A
+    `ref.as_non_null` of what its type or the way to it says is no null
+    makes no trap: luawasm's of a metatable it has just tested for nil, to
+    the type a call takes, and of `self` (`WARMC_NO_NULLTRAP_DROP=1`;
+    `--stats` counts `gc_nulltraps`).  With the
+    null branches' `cbz` and the constant indices, luawasm's kernels take
+    0.99 the time (`awfy_queens` 0.96, `awfy_richards` 0.97).
   - An array access needs no bounds check where its index is proved in
     `[0, length)` without an unsigned compare against the length: no array
     is 2^31 elements long or longer (the runtime refuses one), so a signed

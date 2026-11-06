@@ -275,6 +275,7 @@ static bool null_checks(const IrFunc *f, Ref u, Ref x) {
 
 static void seal_tests(IrFunc *f) {
   if (!f->m->gc_sealed) return;
+  bool any = false;
   for (Ref v = 0; v < f->ninsts; v++) {
     Inst *in = &f->insts[v];
     if (in->op != I_REF_TEST) continue;
@@ -284,8 +285,31 @@ static void seal_tests(IrFunc *f) {
     if (codegen_rtest_slots(f->m, in->imm, in->imm2, &lo, &hi, &exact, &nslots) && exact) {
       in->op = I_REF_SLOT;
       g_stats.slot_tests++;
+      any = true;
     }
   }
+  if (!any) return;
+
+  /* A test of a reference known to be no null -- a branch on its null test
+     before, an access of it, a param no way in brings one to -- tests no
+     null: luawasm tests each value for nil before it tests its kind, two
+     or three kinds in a row (WARMC_NO_SLOT_NONNULL tests it each time).
+     The dominators are the optimiser's, or at -O0 the builder's, which
+     nothing has changed since. */
+  static _Atomic int nn_on = -1;
+  if (nn_on < 0) nn_on = warmc_getenv("WARMC_NO_SLOT_NONNULL") == NULL;
+  if (nn_on)
+    for (uint32_t oi = 0; oi < f->norder; oi++) {
+      uint32_t bi = f->order[oi];
+      Block *b = &f->blocks[bi];
+      for (uint32_t i = 0; i < b->ninsts; i++) {
+        Inst *in = &f->insts[b->insts[i]];
+        if (in->op != I_REF_SLOT || in->nargs != 1) continue;
+        if (!gc_nonnull_at(f, ir_args(f, b->insts[i])[0], bi, i)) continue;
+        in->imm = (in->imm & ~(uint64_t)RTK_NULLABLE) | RTK_NONNULL;
+        g_stats.slot_nonnull++;
+      }
+    }
 
   /* A test that null passes, of an object that an access then checks for
      null -- a nullable cast of an element of a Java array and a read of a

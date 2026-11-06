@@ -649,7 +649,9 @@ static int emit_slot_test(Isel *s, const Inst *in, int x, int trap, size_t *fail
   int nf = 0;
   bool nullable = (RTEST_KIND(in->imm) & RTK_NULLABLE) != 0;
   size_t to_pass = 0;
-  if (RTEST_KIND(in->imm) & RTK_NULLTRAP) {
+  if (RTEST_KIND(in->imm) & RTK_NONNULL) {
+    /* known to be no null (codegen.c seal_tests): none tested */
+  } else if (RTEST_KIND(in->imm) & RTK_NULLTRAP) {
     trap_if_zero(s, SF64, x, TRAP_NULL_REF);
   } else if (nullable) {
     to_pass = B->len;

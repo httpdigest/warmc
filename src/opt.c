@@ -15634,6 +15634,68 @@ static uint32_t gc_join_ways(IrFunc *f, const GcFacts *fx, uint32_t bi,
   return n;
 }
 
+/* Whether q's branch says object r is no null on its edge e: the way a null
+   test of r does not take, or the way a test null fails or a non-nullable
+   one passes */
+static bool gc_edge_nonnull(IrFunc *f, uint32_t q, const Edge *e, Ref r) {
+  Block *p = &f->blocks[q];
+  if (p->term != T_BRIF || p->nsuccs < 2 || p->succs[0].target == p->succs[1].target)
+    return false;
+  bool taken = e == &p->succs[0];
+  Ref cond = ir_resolve(f, p->term_arg);
+  while (f->insts[cond].op == I_EQZ && f->insts[cond].nargs == 1) {
+    cond = ir_resolve(f, ir_args(f, cond)[0]);
+    taken = !taken;
+  }
+  Inst *ci = &f->insts[cond];
+  if ((ci->op != I_REF_IS_NULL && ci->op != I_REF_TEST && ci->op != I_REF_SLOT) ||
+      ci->nargs != 1 || gc_ref_root(f, ir_args(f, cond)[0]) != r)
+    return false;
+  if (ci->op == I_REF_IS_NULL) return !taken;
+  return taken != ((RTEST_KIND(ci->imm) & RTK_NULLABLE) != 0);
+}
+
+/* Whether a, the argument of q's edge e, is no null: by its type, by q's
+   branch, or as an object q's set says is none (sets[q] there only once q
+   is done, which a block before bi in the order is, a back edge's not) */
+static bool gc_arg_nonnull(IrFunc *f, Ref a, uint32_t q, const Edge *e, Ref **sets,
+                           const uint32_t *counts) {
+  ValType at = (ValType)f->insts[a].type;
+  if (vt_is_ref(at) && !vt_nullable(at)) return true;
+  Ref r = gc_ref_root(f, a);
+  if (gc_edge_nonnull(f, q, e, r)) return true;
+  if (!sets[q]) return false;
+  for (uint32_t k = 0; k < counts[q]; k++)
+    if (sets[q][k] == r) return true;
+  return false;
+}
+
+/* The params of block bi that no way in brings a null to: each brings one
+   its type or its block says is none.  luawasm's ways to a record's read
+   are its casts of one object, a way a test of each kind, which meet at a
+   param the read checked for null again (WARMC_NO_NULL_PARAMS keeps the
+   check). */
+static void gc_nonnull_params(IrFunc *f, uint32_t bi, Ref **sets,
+                              uint32_t *counts, uint32_t cap) {
+  Block *b = &f->blocks[bi];
+  for (uint32_t pi = 0; pi < b->nparams; pi++) {
+    Ref p = b->params[pi];
+    ValType pt = (ValType)f->insts[p].type;
+    if (!vt_is_ref(pt) || !vt_nullable(pt)) continue;
+    bool ok = true;
+    for (uint32_t k = 0; k < b->npreds && ok; k++) {
+      uint32_t q = b->preds[k];
+      Edge *e = iv_edge(f, q, bi);
+      if (!e || pi >= e->nargs) { ok = false; break; }
+      ok = gc_arg_nonnull(f, ir_resolve(f, e->args[pi]), q, e, sets, counts);
+    }
+    if (ok) {
+      gc_root_add(sets[bi], &counts[bi], cap, p);
+      g_stats.gc_nonnull_params++;
+    }
+  }
+}
+
 static void gc_way_add(const GcWay *w, Ref y, Ref *set, uint32_t *n,
                        GcTy *ty, uint32_t *nty, uint32_t cap) {
   if (w->nonnull) gc_root_add(set, n, cap, y);
@@ -16451,6 +16513,8 @@ static bool pass_gc_nullchk(IrFunc *f) {
   GcBnd **asets = xcalloc(f->nblocks, sizeof(GcBnd *));
   uint32_t *acounts = xcalloc(f->nblocks, sizeof(uint32_t));
   bool acc_on = !warmc_getenv("WARMC_NO_BCE_ACCESS");
+  bool np_on = !warmc_getenv("WARMC_NO_NULL_PARAMS");
+  bool nt_on = !warmc_getenv("WARMC_NO_NULLTRAP_DROP");
   bool rp_on = !warmc_getenv("WARMC_NO_BCE_RANGE");
   bool rp_built = false;
   RP rp;
@@ -16487,6 +16551,7 @@ static bool pass_gc_nullchk(IrFunc *f) {
         gc_way_add(&ws[k], ys[k], sets[bi], &counts[bi], tsets[bi],
                    &tcounts[bi], CAP);
     }
+    if (np_on && b->nparams && b->npreds) gc_nonnull_params(f, bi, sets, counts, CAP);
     /* branch facts: the non-null arm of a br_on_null, both arms of a
        ref.test, a branch on a merge of them (gc_merge_cond), and the
        in-bounds arm of an index-below-length test */
@@ -16598,6 +16663,18 @@ static bool pass_gc_nullchk(IrFunc *f) {
           if (in->nargs != 1) break;
           if (in->imm == TRAP_NULL_REF) {
             obj = gc_ref_root(f, ir_args(f, v)[0]);
+            /* a ref.as_non_null of what its type or the way here says is
+               no null cannot trap: luawasm's of a metatable it has just
+               tested for nil, to the type a call takes, and of `self` */
+            ValType xt = (ValType)f->insts[ir_resolve(f, ir_args(f, v)[0])].type;
+            bool known = vt_is_ref(xt) && !vt_nullable(xt);
+            for (uint32_t k = 0; k < counts[bi] && !known; k++)
+              known = sets[bi][k] == obj;
+            if (known && nt_on) {
+              ir_make_nop(in);
+              changed = true;
+              g_stats.gc_nulltraps++;
+            }
             break;
           }
           /* it traps on zero: past a cast's trap, its test passed */
@@ -17058,6 +17135,68 @@ static bool gc_types_hold_at(IrFunc *f, Ref v, uint32_t target) {
     r = ir_resolve(f, ir_args(f, r)[0]);
   }
   return false;
+}
+
+/* Whether reference x is no null where instruction pos of block bi runs:
+   by its type; past an access of the object or a null
+   trap of it, in a block that dominates bi or earlier in bi, which trapped
+   on a null or was proven of none; on the way a null test, or a test null
+   fails or a non-nullable one passes, sends through a block's one way in;
+   or as a param no way in brings a null to (depth: params deep, budget:
+   instructions looked at). */
+static bool gc_nonnull_in(IrFunc *f, Ref x, uint32_t bi, uint32_t pos, int depth,
+                          uint32_t *budget) {
+  ValType t = (ValType)f->insts[x].type;
+  if (vt_is_ref(t) && !vt_nullable(t)) return true;
+  Ref r = gc_ref_root(f, x);
+  for (uint32_t d = bi; d != REF_NONE && d < f->nblocks; d = f->blocks[d].idom) {
+    Block *b = &f->blocks[d];
+    uint32_t end = d == bi ? pos : b->ninsts;
+    for (uint32_t i = 0; i < end && i < b->ninsts; i++) {
+      if (!*budget) return false;
+      (*budget)--;
+      Ref u = b->insts[i];
+      Inst *ui = &f->insts[u];
+      bool on = false;
+      switch (ui->op) {
+        case I_FIELD_GET: case I_FIELD_SET: case I_ARRAY_GET: case I_ARRAY_SET:
+        case I_ARRAY_LEN: case I_I31_GET:
+          on = ui->nargs >= 1;
+          break;
+        case I_TRAP_IF:
+          on = ui->imm == TRAP_NULL_REF && ui->nargs == 1;
+          break;
+        default: break;
+      }
+      if (on && gc_ref_root(f, ir_args(f, u)[0]) == r) return true;
+    }
+    if (b->npreds == 1) {
+      Edge *e = iv_edge(f, b->preds[0], d);
+      if (e && gc_edge_nonnull(f, b->preds[0], e, r)) return true;
+    }
+    if (d == f->entry) break;
+  }
+  if (depth <= 0 || f->insts[r].op != I_PARAM) return false;
+  uint32_t pb = f->insts[r].block;
+  if (pb >= f->nblocks || pb == f->entry || !f->blocks[pb].npreds) return false;
+  Block *b = &f->blocks[pb];
+  uint32_t pi = 0;
+  while (pi < b->nparams && b->params[pi] != r) pi++;
+  if (pi == b->nparams) return false;
+  for (uint32_t k = 0; k < b->npreds; k++) {
+    uint32_t q = b->preds[k];
+    Edge *e = iv_edge(f, q, pb);
+    if (!e || pi >= e->nargs) return false;
+    Ref a = ir_resolve(f, e->args[pi]);
+    if (gc_edge_nonnull(f, q, e, gc_ref_root(f, a))) continue;
+    if (!gc_nonnull_in(f, a, q, f->blocks[q].ninsts, depth - 1, budget)) return false;
+  }
+  return true;
+}
+
+bool gc_nonnull_at(IrFunc *f, Ref x, uint32_t bi, uint32_t pos) {
+  uint32_t budget = 2048;
+  return gc_nonnull_in(f, x, bi, pos, 2, &budget);
 }
 
 static bool gc_checks_hold_at(IrFunc *f, Ref v, uint32_t target) {
