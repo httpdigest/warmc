@@ -1,14 +1,14 @@
-"""codegen.c loop_consts: on arm64, a constant of two or more instructions a
-natural loop reads, read from a copy made in the header's immediate
-dominator.  Killed by test/cases_opt/loop_consts.wat -- its answers and how
+"""codegen.c loop_consts: on arm64, a constant of two instructions a natural
+loop reads, read from a copy made in the header's immediate dominator.  Killed by test/cases_opt/loop_consts.wat -- its answers and how
 many copies -O2 makes."""
 C = 'src/codegen.c'
 def m(old, new, path=C): return (path, [(old, new)])
 M = {
  'off': m('  if (g_target != &warmc_target_a64 || warmc_getenv("WARMC_NO_LOOP_CONSTS")) return;', '  return;'),
  'natural': m('    if (!loop || !natural) continue;', '    if (!loop) continue;\n    (void)natural;'),
- 'cost': m('         ir_const_cost(ci->imm, ci->type == VT_I64) >= 2;', '         ir_const_cost(ci->imm, ci->type == VT_I64) >= 1;'),
- 'cost3': m('         ir_const_cost(ci->imm, ci->type == VT_I64) >= 2;', '         ir_const_cost(ci->imm, ci->type == VT_I64) >= 3;'),
+ 'cost': m('         ir_const_cost(ci->imm, ci->type == VT_I64) == 2;', '         ir_const_cost(ci->imm, ci->type == VT_I64) >= 1;'),
+ 'cost3': m('         ir_const_cost(ci->imm, ci->type == VT_I64) == 2;', '         ir_const_cost(ci->imm, ci->type == VT_I64) == 3;'),
+ 'cost_long': m('         ir_const_cost(ci->imm, ci->type == VT_I64) == 2;', '         ir_const_cost(ci->imm, ci->type == VT_I64) >= 2;'),
  'i64_off': m('  return ci->op == I_CONST && (ci->type == VT_I32 || ci->type == VT_I64) &&',
               '  return ci->op == I_CONST && ci->type == VT_I32 &&'),
  'floats': m('  return ci->op == I_CONST && (ci->type == VT_I32 || ci->type == VT_I64) &&',

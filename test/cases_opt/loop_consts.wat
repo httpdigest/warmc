@@ -1,5 +1,5 @@
-;; On arm64 a constant two or more instructions make that a loop reads is
-;; read there from a copy made in the block over the loop, the header's
+;; On arm64 a constant two instructions make that a loop reads is read
+;; there from a copy made in the block over the loop, the header's
 ;; immediate dominator (codegen.c loop_consts), so that the copy, live only
 ;; where the loop is, can have a register of its own.  scan's xor of
 ;; 0x12345 has one copy in each loop the unroller leaves; cheap's 0x1235 is
@@ -8,7 +8,10 @@
 ;; loop; irred's three states are a cycle with three ways in, no natural
 ;; loop, whose header would not dominate the states that read the
 ;; constants -- none; edge's 0x60011 reaches the loop's join as an edge's
-;; argument and has a copy; wide's i64 0x123456789 has one in each loop;
+;; argument and has a copy; wide's i64 0x123456789, three instructions,
+;; has none -- not made again at its reads, a copy no register took would
+;; be stored where it is made -- and wide2's 0x100000007, two, one in each
+;; loop;
 ;; flt's float constant has none (-O3 sums its floats in another order, the
 ;; last bit of one answer apart).
 ;;
@@ -34,6 +37,9 @@
 ;; run: wide 1 => i64:4886718345
 ;; run: wide 5 => i64:4886718355
 ;; run: wide 100 => i64:3414
+;; run: wide2 1 => i64:4294967303
+;; run: wide2 5 => i64:4294967321
+;; run: wide2 100 => i64:4962
 ;; run: flt 1 => f64:0x0000000000000000
 ;; run: flt 5 => f64:0x402400014f8b638c
 ;; run -O3: flt 5 => f64:0x402400014f8b638d
@@ -103,6 +109,13 @@
     (local $i i32) (local $s i64)
     (loop $l
       (local.set $s (i64.add (i64.xor (local.get $s) (i64.const 0x123456789)) (i64.extend_i32_u (local.get $i))))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br_if $l (i32.lt_u (local.get $i) (local.get $n))))
+    (local.get $s))
+  (func $wide2 (export "wide2") (param $n i32) (result i64)
+    (local $i i32) (local $s i64)
+    (loop $l
+      (local.set $s (i64.add (i64.xor (local.get $s) (i64.const 0x100000007)) (i64.extend_i32_u (local.get $i))))
       (local.set $i (i32.add (local.get $i) (i32.const 1)))
       (br_if $l (i32.lt_u (local.get $i) (local.get $n))))
     (local.get $s))

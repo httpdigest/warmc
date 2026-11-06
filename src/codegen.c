@@ -363,19 +363,24 @@ static Ref lc_copy(IrFunc *f, LcMap *m, uint32_t h, Ref c) {
 static bool lc_wants(IrFunc *f, Ref c) {
   const Inst *ci = &f->insts[c];
   return ci->op == I_CONST && (ci->type == VT_I32 || ci->type == VT_I64) &&
-         ir_const_cost(ci->imm, ci->type == VT_I64) >= 2;
+         ir_const_cost(ci->imm, ci->type == VT_I64) == 2;
 }
 
-/* On arm64, a constant two or more instructions make that a loop reads is
-   read there from a copy made in the block over the loop, its header's
+/* On arm64, a constant two instructions make that a loop reads is read
+   there from a copy made in the block over the loop, its header's
    immediate dominator: made once a run of the loop, the copy lives only
    where the loop does and gets a register where the loop has one free.
    The constant itself, defined at the entry and read all over a function
    too big for one register to hold it from end to end, is made again at
    each read: zigbench/wordfreq's tokenizer built the text's base, mov and
    movk, for every byte it scanned.  A copy no register takes is made
-   again at its reads as the constant was.  A read in a cold block keeps
-   the constant (WARMC_LOOP_CONSTS_COLD copies it too). */
+   again at its reads as the constant was.  Not one of three or four
+   instructions, which is not made again (remat_ok): its copy, where no
+   register took it, was stored to a slot each time round the loop the
+   block over the loop is in -- fannkuch's key hash multiplier, made and
+   stored in its permutation loop for reads on its slow paths, 6% of its
+   instructions.  A read in a cold block keeps the constant
+   (WARMC_LOOP_CONSTS_COLD copies it too). */
 static void loop_consts(IrFunc *f) {
   if (g_target != &warmc_target_a64 || warmc_getenv("WARMC_NO_LOOP_CONSTS")) return;
   uint32_t nb = f->nblocks;
@@ -427,6 +432,7 @@ static void loop_consts(IrFunc *f) {
     if (f->blocks[x].cold && !warmc_getenv("WARMC_LOOP_CONSTS_COLD")) continue;
     uint32_t d = f->blocks[h].idom;
     if (d == UINT32_MAX || d == h) continue;
+
     for (uint32_t k = 0; k < f->blocks[x].ninsts; k++) {
       Ref u = f->blocks[x].insts[k];
       for (uint32_t j = 0; j < f->insts[u].nargs; j++) {
