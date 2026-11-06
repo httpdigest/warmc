@@ -74,7 +74,7 @@ typedef struct {
   /* the params the pass added, to drop the trivial ones */
   Ref *added;
   uint32_t nadded, capadded;
-  uint64_t nreload, nspill, nremat, nparam, ncallsplit, nwhole, ndeadparam;
+  uint64_t nreload, nspill, nremat, nparam, ncallsplit, nwhole, ndeadparam, nconstparam;
   /* per block the most values of each class live at once; the loop walk's
      marks and stack */
   int (*maxp)[2];
@@ -1104,7 +1104,13 @@ static void ra2_block(Ra2 *R, uint32_t b, Ra2Uses *uses, Ref *touched, uint32_t 
           for (int k = 0; k < W.n[c]; k++) {
             Ra2W *w = &W.w[c][k];
             if (R->res[w->v]) continue;
-            Ref cp = ra2_new(R, b, I_COPY, (ValType)f->insts[w->v].type, &w->ver, 1, 0, 0);
+            /* a constant is made again, not copied: a constant still to the
+               selection's forms and to ra2_const_params */
+            Inst wc = f->insts[w->v];
+            bool cst = R->rem[w->v] && wc.op == I_CONST && warmc_getenv("WARMC_RA2_CLONE_CONSTS");
+            Ref cp = cst ? ra2_new(R, b, I_CONST, (ValType)wc.type, NULL, 0, wc.imm, wc.imm2)
+                         : ra2_new(R, b, I_COPY, (ValType)f->insts[w->v].type, &w->ver, 1, 0, 0);
+            if (cst) R->slotv[cp] = 3;
             /* ahead of the call, which is the list's last */
             ra2_out(R, cp);
             R->out[R->nout - 1] = u;
@@ -1212,6 +1218,141 @@ static void ra2_block(Ra2 *R, uint32_t b, Ra2Uses *uses, Ref *touched, uint32_t 
 
 /* A param the pass added whose ways in all bring one value besides itself
    is that value: its reads take it, its slot in the edges goes. */
+/* A param the pass added for a constant -- every way in brings that
+   constant, made again or held -- where a way back makes it again at its
+   end (ra2_edge_arg: the loop did not keep it) makes it on every trip for
+   whichever of the loop's reads comes next: each of its reads instead
+   takes the constant made where it reads, made only when that read runs
+   (cbench/switch: three per trip on the way back for its cases' compares),
+   and the param, read by nothing then, goes (ra2_trivial_params). */
+static void ra2_const_params(Ra2 *R) {
+  IrFunc *f = R->f;
+  /* which added params are constants: every way in brings the one constant
+     -- made, or a param already found to be it -- or the param itself,
+     found to a fixpoint (a loop's param fed by an outer loop's) */
+  uint32_t na = R->nadded;
+  uint8_t *isc = xcalloc(na ? na : 1, 1);
+  uint64_t *cimm = xcalloc(na ? na : 1, sizeof(uint64_t)), *cimm2 = xcalloc(na ? na : 1, sizeof(uint64_t));
+  uint8_t *rem = xcalloc(na ? na : 1, 1);
+  int32_t *idx = xmalloc((f->ninsts ? f->ninsts : 1) * sizeof(int32_t));
+  for (uint32_t v = 0; v < f->ninsts; v++) idx[v] = -1;
+  for (uint32_t k = 0; k < na; k++) { idx[R->added[k]] = (int32_t)k; isc[k] = 1; }
+  for (bool changed = true; changed;) {
+    changed = false;
+    for (uint32_t k = 0; k < na; k++) {
+      if (!isc[k]) continue;
+      Ref p = R->added[k];
+      uint32_t b = f->insts[p].block;
+      Block *bb = &f->blocks[b];
+      uint32_t pi = 0;
+      while (pi < bb->nparams && bb->params[pi] != p) pi++;
+      bool ok = pi < bb->nparams, any = false, remade = false;
+      uint64_t imm = 0, imm2 = 0;
+      ValType ty = (ValType)f->insts[p].type;
+      for (uint32_t q = 0; q < bb->npreds && ok; q++) {
+        Block *pb = &f->blocks[bb->preds[q]];
+        for (uint32_t si = 0; si < pb->nsuccs && ok; si++) {
+          Edge *e = &pb->succs[si];
+          if (e->target != b || pi >= e->nargs) continue;
+          Ref a = e->args[pi];
+          if (a == p) continue;
+          /* a copy of a constant -- one made ahead of a call -- is it */
+          for (int hop = 0; hop < 8 && f->insts[a].op == I_COPY && f->insts[a].nargs == 1 &&
+                            !(a < R->nslotv && R->slotv[a] == 1); hop++)
+            a = ir_args(f, a)[0];
+          uint64_t ai, ai2;
+          if (f->insts[a].op == I_CONST && (ValType)f->insts[a].type == ty) {
+            ai = f->insts[a].imm;
+            ai2 = f->insts[a].imm2;
+            if (pb->rpo >= bb->rpo && a < R->nslotv && R->slotv[a] == 2) remade = true;
+          } else if (idx[a] >= 0 && isc[idx[a]] && (ValType)f->insts[a].type == ty) {
+            ai = cimm[idx[a]];
+            ai2 = cimm2[idx[a]];
+            /* still being found: taken as it stands, undone below if not */
+            if (!any && idx[a] > (int32_t)k) { ai = cimm[idx[a]]; }
+          } else {
+            ok = false;
+            break;
+          }
+          if (any && (ai != imm || ai2 != imm2)) { ok = false; break; }
+          any = true;
+          imm = ai;
+          imm2 = ai2;
+        }
+      }
+      if (!ok || !any) { isc[k] = 0; changed = true; continue; }
+      if (cimm[k] != imm || cimm2[k] != imm2 || rem[k] != (remade || rem[k])) changed = true;
+      cimm[k] = imm;
+      cimm2[k] = imm2;
+      rem[k] |= remade;
+    }
+  }
+  /* grounded: some way in brings the constant made, or a param grounded */
+  uint8_t *gnd = xcalloc(na ? na : 1, 1);
+  for (bool changed = true; changed;) {
+    changed = false;
+    for (uint32_t k = 0; k < na; k++) {
+      if (!isc[k] || gnd[k]) continue;
+      Ref p = R->added[k];
+      uint32_t b = f->insts[p].block;
+      Block *bb = &f->blocks[b];
+      uint32_t pi = 0;
+      while (pi < bb->nparams && bb->params[pi] != p) pi++;
+      for (uint32_t q = 0; q < bb->npreds && !gnd[k]; q++) {
+        Block *pb = &f->blocks[bb->preds[q]];
+        for (uint32_t si = 0; si < pb->nsuccs && !gnd[k]; si++) {
+          Edge *e = &pb->succs[si];
+          if (e->target != b || pi >= e->nargs || e->args[pi] == p) continue;
+          Ref a = e->args[pi];
+          for (int hop = 0; hop < 8 && f->insts[a].op == I_COPY && f->insts[a].nargs == 1 &&
+                            !(a < R->nslotv && R->slotv[a] == 1); hop++)
+            a = ir_args(f, a)[0];
+          if (f->insts[a].op == I_CONST || (idx[a] >= 0 && gnd[idx[a]])) { gnd[k] = 1; changed = true; }
+        }
+      }
+    }
+  }
+  for (uint32_t k = 0; k < na; k++) {
+    Ref p = R->added[k];
+    if (!isc[k] || !gnd[k] || !rem[k] || warmc_getenv("WARMC_RA2_NO_CONSTPARAM")) continue;
+    ValType ty = (ValType)f->insts[p].type;
+    uint64_t imm = cimm[k], imm2 = cimm2[k];
+    /* each read of p: the constant made just ahead of it */
+    for (uint32_t bi = 0; bi < f->nblocks; bi++) {
+      Block *xb = &f->blocks[bi];
+      for (uint32_t i = 0; i < xb->ninsts; i++) {
+        Ref u = xb->insts[i];
+        Ref *ua = ir_args(f, u);
+        bool reads = false;
+        for (uint32_t j = 0; j < f->insts[u].nargs && !reads; j++) reads = ua[j] == p;
+        if (!reads) continue;
+        Ref c = ra2_new(R, bi, I_CONST, ty, NULL, 0, imm, imm2);
+        ra2_insert(f, bi, i, c);
+        i++;
+        ua = ir_args(f, u);
+        for (uint32_t j = 0; j < f->insts[u].nargs; j++) if (ua[j] == p) ua[j] = c;
+      }
+      bool at_end = (xb->term == T_BRIF || xb->term == T_BRTABLE) && xb->term_arg == p;
+      for (uint32_t i = 0; i < xb->nret && !at_end; i++) at_end = xb->ret_args[i] == p;
+      for (uint32_t si = 0; si < xb->nsuccs && !at_end; si++)
+        for (uint32_t j = 0; j < xb->succs[si].nargs && !at_end; j++) at_end = xb->succs[si].args[j] == p;
+      if (!at_end) continue;
+      Ref c = ra2_new(R, bi, I_CONST, ty, NULL, 0, imm, imm2);
+      ra2_insert(f, bi, xb->ninsts, c);
+      if ((xb->term == T_BRIF || xb->term == T_BRTABLE) && xb->term_arg == p) xb->term_arg = c;
+      bool edge_only = true;
+      if (xb->term_arg == c) edge_only = false;
+      for (uint32_t i = 0; i < xb->nret; i++) if (xb->ret_args[i] == p) xb->ret_args[i] = c;
+      for (uint32_t si = 0; si < xb->nsuccs; si++)
+        for (uint32_t j = 0; j < xb->succs[si].nargs; j++)
+          if (xb->succs[si].args[j] == p) xb->succs[si].args[j] = c;
+      if (edge_only) R->slotv[c] = 2;
+    }
+    R->nconstparam++;
+  }
+  xfree(isc); xfree(cimm); xfree(cimm2); xfree(rem); xfree(idx); xfree(gnd);
+}
+
 static void ra2_trivial_params(Ra2 *R) {
   IrFunc *f = R->f;
   bool changed = true;
@@ -1475,6 +1616,17 @@ static void ra2_spill(Isel *s, const int *gpool, int ngpool) {
     /* what takes no register of its own: an immediate, a fused or folded
        instruction, a zero, a value made again where it is read */
     if (skip_location(s, v) || ra_zero_const(s, v, s->cls[v])) continue;
+    /* the barrier's mask, one load to make, held where it is live as the
+       scan holds it: read at every barrier (javabench/iface: twice a trip) */
+    /* (the barrier's mask, held as a resident -- one load where the scan
+       holds it in a register -- cost javabench/treemap 14% in spills
+       elsewhere; and a load takes it as the instruction itself, which no
+       version may stand in for: made again at each read, as remat_ok
+       says) */
+    if (in->op == I_GC_BADMASK && warmc_getenv("WARMC_RA2_RESKEEP")) {
+      R.res[v] = 1;
+      continue;
+    }
     /* A constant competes for a register like any value, made again where
        it is out of them: a loop's constant made on every way round costs
        that on every way round (rsbench/vecgrow's hash multiplier,
@@ -1505,6 +1657,12 @@ static void ra2_spill(Isel *s, const int *gpool, int ngpool) {
          (in->op == I_GLOBAL_GET && !f->m->globals[in->imm].mutable_ &&
           !f->m->globals[in->imm].imported)))
       R.rem[v] = !warmc_getenv("WARMC_RA2_NO_CREM");
+    /* -- but an integer one of three instructions or more goes to a slot
+       like any value and comes back with one load, as the scan's do
+       (hsbench/bits' hash multipliers, made again on every way round) */
+    if (R.rem[v] && in->op == I_CONST && !vt_is_float((ValType)in->type) && (ValType)in->type != VT_V128 &&
+        ir_const_cost(in->imm, vt_is_64((ValType)in->type)) >= 3 && !warmc_getenv("WARMC_RA2_REM_ALL"))
+      R.rem[v] = 0;
     if (warmc_getenv("WARMC_RA2_NO_CREM") && in->nargs == 0 &&
         (in->op == I_CONST ||
          (in->op == I_GLOBAL_GET && !f->m->globals[in->imm].mutable_ &&
@@ -1544,6 +1702,7 @@ static void ra2_spill(Isel *s, const int *gpool, int ngpool) {
   xfree(uses);
   xfree(touched);
 
+  if (!warmc_getenv("WARMC_RA2_NO_CONSTPARAM")) ra2_const_params(&R);
   ra2_trivial_params(&R);
   /* a folded instruction several read that each now reads a copy of: gone */
   {
@@ -1588,8 +1747,14 @@ static void ra2_spill(Isel *s, const int *gpool, int ngpool) {
   f->ra2_nmem = f->ninsts;
   f->ra2_mem = xcalloc(f->ninsts ? f->ninsts : 1, 1);
   for (uint32_t v = 0; v < f->ninsts && v < R.nslotv; v++) f->ra2_mem[v] = R.slotv[v];
-  /* the constants the pass kept in registers: kept there (ra2_assign) */
+  /* the constants the pass kept in registers: kept there (ra2_assign);
+     and the residents it counted as holding registers -- the barrier's
+     mask, which the assignment would otherwise load again at every read
+     (javabench/iface: twice a trip) */
   for (uint32_t v = 0; v < n0; v++) if (R.rem[v] && R.need[v] && !f->ra2_mem[v]) f->ra2_mem[v] = 3;
+  for (uint32_t v = 0; v < n0; v++)
+    if (R.res[v] && !f->ra2_mem[v] && f->insts[v].op == I_GC_BADMASK) f->ra2_mem[v] = 3;
+
   if (warmc_getenv("WARMC_RA2_DEBUG_FB")) {
     xfree(f->ra2_dbg);
     f->ra2_dbg = xcalloc(f->ninsts ? f->ninsts : 1, 1);
