@@ -12,14 +12,18 @@ copy proves an access at the counter plus an invariant, or at a second
 counter, itself (bv_loop's symbolic groups, bv_sym_index); a counter that
 steps up or stays (bv_mono) is versioned with the others in one copy, and
 an array read anew from a field of an invariant object (bv_field_array)
-that no struct.set writes (compile.c module_field_writes).  Killed by
+that no struct.set writes (compile.c module_field_writes); and, in the
+register allocator, a constant does not take the callee-saved registers
+from the top, which a loop's own values crossing its calls need
+(regalloc.inc cs_top).  Killed by
 test/cases_opt/cse_chain.wat (its shapes), gc_range_bounds.wat (bce_ranges,
 the near misses' traps), bce_version_nested.wat (bce_versioned, the short
 rows' traps), bound_lens.wat (its counts, its traps, the IR verified as
 SSA, irr's irreducible loop among them), cse_memptr.wat (two adds),
 bce_version_sym.wat (its counts, shape and near misses' traps),
 known_len_merge.wat (a merge's lengths), bce_version_merge.wat (its count:
-which loops are copied) and the answers of the cases."""
+which loops are copied), cs_order.wat (run2's sum off x22, x23) and the
+answers of the cases."""
 O = 'src/opt.c'
 def m(old, new, path=O): return (path, [(old, new)])
 M = {
@@ -71,6 +75,8 @@ M = {
  'field_writes_mark': m('        w[base[root] + k] = 1;', '        (void)root;', path='src/compile.c'),
  'field_root_super': m('    uint32_t s = canon[c->super];', '    uint32_t s = canon[c->super]; break;', path='src/compile.c'),
  'field_root_canon': m('  uint32_t t = canon[ti];', '  uint32_t t = ti;', path='src/compile.c'),
+
+ 'cs_top_const': m('          f->insts[cur->value].op != I_CONST) {', '          1) {', path='src/regalloc.inc'),
 
  'bl_off': m('  if (on < 0) on = warmc_getenv("WARMC_NO_BOUND_LENS") == NULL;', '  on = 0;'),
  'bl_known': m('      if (k && k <= 0xfff) {', '      if (0) {'),
