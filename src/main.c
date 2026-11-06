@@ -370,7 +370,8 @@ static void print_stats(void) {
           " unr_rej_escape=%llu unr_addr_folded=%llu gc_nullchk=%llu bce_ranges=%llu bce_smeared=%llu bce_versioned=%llu gc_loads_pre=%llu fields_promoted=%llu\n"
           "             slot_tests=%llu slot_nullchks=%llu slot_brs=%llu once_dead=%llu once_dominated=%llu once_looped=%llu\n"
           "             bit_tests=%llu way_folds=%llu bit_brs=%llu exit_defers=%llu stubs_out=%llu blocks_merged=%llu\n"
-          "             bound_lens=%llu bound_lens_hoisted=%llu bce_version_sym=%llu gc_nonnull_params=%llu slot_nonnull=%llu gc_nulltraps=%llu\n",
+          "             bound_lens=%llu bound_lens_hoisted=%llu bce_version_sym=%llu gc_nonnull_params=%llu slot_nonnull=%llu gc_nulltraps=%llu\n"
+          "             ra2_reloads=%llu ra2_spills=%llu ra2_remats=%llu ra2_params=%llu ra2_fallback=%llu ra2_csa_hot=%llu ra2_callsplits=%llu ra2_whole=%llu ra2_tried=%llu ra2_picked=%llu\n",
           (unsigned long long)g_stats.folded, (unsigned long long)g_stats.dce_removed,
           (unsigned long long)g_stats.cse_removed, (unsigned long long)g_stats.licm_hoisted,
           (unsigned long long)g_stats.branch_simplified,
@@ -494,7 +495,12 @@ static void print_stats(void) {
           (unsigned long long)g_stats.bce_version_sym,
           (unsigned long long)g_stats.gc_nonnull_params,
           (unsigned long long)g_stats.slot_nonnull,
-          (unsigned long long)g_stats.gc_nulltraps);
+          (unsigned long long)g_stats.gc_nulltraps,
+          (unsigned long long)g_stats.ra2_reloads, (unsigned long long)g_stats.ra2_spills,
+          (unsigned long long)g_stats.ra2_remats, (unsigned long long)g_stats.ra2_params,
+          (unsigned long long)g_stats.ra2_fallback, (unsigned long long)g_stats.ra2_csa_hot,
+          (unsigned long long)g_stats.ra2_callsplits, (unsigned long long)g_stats.ra2_whole,
+          (unsigned long long)g_stats.ra2_tried, (unsigned long long)g_stats.ra2_picked);
 }
 
 /* --validate-only given several inputs: each one's verdict, a line apiece

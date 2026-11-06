@@ -2864,6 +2864,17 @@ static void emit_inst(Isel *s, Ref v) {
       break;
     }
 
+    case I_COPY: {
+      bool fp = is_fp_value(f, v), vec = is_vec_value(f, v);
+      int d = wr(s, v, fp || vec ? F0 : S0);
+      int x = rd(s, a[0], d);
+      /* into a slot from the operand's register itself */
+      if (IS_SLOT(s->loc[v])) { commit(s, v, x); break; }
+      if (x != d) emit_reg_move(B, d, x, fp, is64(f, v), vec);
+      commit(s, v, d);
+      break;
+    }
+
     case I_ANY_OF_EXTERN: case I_EXTERN_OF_ANY: {
       int d = wr(s, v, S1);
       csa_save(s, v);
@@ -3073,6 +3084,7 @@ static void emit_block(Isel *s, uint32_t bi, uint32_t next_bi) {
         }
         if (cold) {
           struct EdgeStub *est = xmalloc(sizeof *est);
+          est->from = s->cur_block;
           est->n = cn;
           est->mv = xmalloc((cn ? (size_t)cn : 1) * sizeof(Move));
           memcpy(est->mv, cmv, (size_t)cn * sizeof(Move));

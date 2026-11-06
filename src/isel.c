@@ -3653,6 +3653,18 @@ static void ra_keep_drop(void *p) {
 }
 
 /* The counters src added since base, added to acc. */
+/* What a run of code costs, for comparing two allocations of a function:
+   an instruction 1, a load or store of the frame (its base sp) 2. */
+static double a64_code_cost(const uint8_t *p, size_t len) {
+  double c = 0;
+  for (size_t i = 0; i + 4 <= len; i += 4) {
+    uint32_t w;
+    memcpy(&w, p + i, 4);
+    c += ((w >> 25) & 5u) == 4u && ((w >> 5) & 31u) == 31u ? 2.0 : 1.0;
+  }
+  return c;
+}
+
 static void stats_delta_add(OptStats *acc, const OptStats *base, const OptStats *now) {
   uint64_t *a = (uint64_t *)acc;
   const uint64_t *b = (const uint64_t *)base, *c = (const uint64_t *)now;
@@ -4370,9 +4382,32 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
 
   analyse_immediates(s);
   compute_mem_validity(s);
+
+  /* The spiller (regalloc.inc's ra_spill.inc, WARMC_RA2): the function
+     rewritten into values that live in registers and copies in slots, and
+     then selected again from the start, its copies pinned to their slots.
+     It runs where the selection knows what takes no register -- an
+     immediate, a constant made where it is read, an instruction folded into
+     the one that reads it -- but before a wrap is made its operand's alias,
+     which a value of its own would no longer be.  Not where values live
+     into a landing pad or a continuation's handler, which take theirs from
+     slots of their own. */
+  if ((ra2_on() || f->ra2_try) && !s->naive && !f->ra2_done && !f->npads && !ra2_has_cont(f)) {
+    int gp[NGPR_ALLOC + 16];
+    int ng = ra_gpr_pool(s, gp);
+    ng += isel_spare_gprs(s, gp + ng);
+    ra2_spill(s, gp, ng);
+    split_ret = 5;
+    goto give_up;
+  }
+
   analyse_wrap_alias(s);
 
   s->pinned = xcalloc(f->ninsts ? f->ninsts : 1, 1);
+  /* the spiller's copies in slots */
+  if (f->ra2_mem)
+    for (uint32_t v = 0; v < f->ninsts && v < f->ra2_nmem; v++)
+      if (f->ra2_mem[v]) s->pinned[v] = 1;
   if (s->has_pads)
     for (uint32_t bi = 0; bi < f->nblocks; bi++) {
       Block *b = &f->blocks[bi];
@@ -4385,7 +4420,11 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
   bool ra_taken = false;
   if (s->naive) regalloc_naive(s);
   else if (f->ra_keep) { ra_keep_take(s); ra_taken = true; }
-  else {
+  else if (f->ra2_done && (f->ra2_try || warmc_getenv("WARMC_RA2_ASSIGN"))) {
+    ra_base = g_stats;
+    ra2_assign(s);
+    stats_delta_add(&ra_added, &ra_base, &g_stats);
+  } else {
     ra_base = g_stats;
     regalloc_linear(s);
     stats_delta_add(&ra_added, &ra_base, &g_stats);
@@ -4557,6 +4596,8 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
     }
     emit_block(s, bi, oi + 1 < neo ? eo[oi + 1] : 0xffffffffu);
     s->prev_bi = bi;
+    s->ra_cost += a64_code_cost(B->data + s->block_off[bi], B->len - s->block_off[bi]) *
+                  blk_freq(&f->blocks[bi]);
     if (blk_end) blk_end[bi] = (uint32_t)B->len;
     if (opt->profile) {
       uint32_t w = (uint32_t)((B->len - s->prof_start[bi]) / 4);
@@ -4618,6 +4659,7 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
     parallel_copy(s, st->mv, st->n);
     add_fix(s, B->len, 0, st->target);
     a64_b(B, 0);
+    s->ra_cost += a64_code_cost(B->data + at, B->len - at) * blk_freq(&f->blocks[st->from]);
     br_patch(s, st->site, at);
     for (int k = 0; k < st->nx; k++) br_patch(s, st->xsite[k], at);
     xfree(st->mv); xfree(st);
@@ -4709,6 +4751,7 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
   if (fout->phase) g_stats.loop_phases++;
   fout->entry_off = (uint32_t)lead.len;
   fout->early_ret = early;
+  fout->ra_cost = s->ra_cost + a64_code_cost(pro.data, pro.len);
   fout->code_len = (uint32_t)(lead.len + pro.len + s->body.len);
   fout->code = xmalloc_long(fout->code_len ? fout->code_len : 1);
   if (lead.len) memcpy(fout->code, lead.data, lead.len);

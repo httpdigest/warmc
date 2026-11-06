@@ -258,8 +258,13 @@ typedef struct {
     size_t xsite[2]; int nx; /* more b19 sites that go there: a fused slot test's */
     Move *mv; int n;
     uint32_t target;
+    uint32_t from;  /* the block whose branch takes it */
     struct EdgeStub *next;
   } *edge_stubs;
+  /* the code's cost: its instructions, a load or store of the frame twice,
+     each by its block's estimated frequency (regalloc.inc blk_freq) -- what the
+     allocations a function is tried with are compared by */
+  double ra_cost;
   uint8_t trap_used[TRAP_CODE_COUNT];
 
   int lab_reg;

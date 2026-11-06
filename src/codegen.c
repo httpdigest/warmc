@@ -484,6 +484,8 @@ static int produce_once(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
                         uint32_t out_bytes, FuncOut *fout, bool far,
                         SplitCtl *sc, bool collect) {
   int r = g_target->produce_body(f, obj, opt, out_bytes, fout, far, sc, collect);
+  /* again where the spiller rewrote the function (regalloc.inc ra2_spill) */
+  if (r == 5) r = g_target->produce_body(f, obj, opt, out_bytes, fout, far, sc, collect);
   /* again with the loops measured, and once more where a test-bit branch
      that reached before the loops moved no longer does */
   for (int k = 0; r == 4 && k < 2; k++)
@@ -498,10 +500,54 @@ static int produce_once(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
   return r;
 }
 
+static void fout_free(FuncOut *fo);
+
+/* The function allocated again by the spiller and its own assignment
+   (regalloc.inc's ra_spill.inc, ra2_assign.inc), the scan's code in fout
+   kept unless the new one costs less (FuncOut.ra_cost); the statistics
+   are the code's that is kept.  Not where values live into a landing pad
+   or a continuation's handler, which the spiller leaves to the scan. */
+static void ra2_portfolio(IrFunc *f, ObjBuilder *obj, const OptOpts *opt, uint32_t out_bytes,
+                          FuncOut *fout, const OptStats *before) {
+  if (f->npads) return;
+  for (uint32_t v = 0; v < f->ninsts; v++)
+    if (f->insts[v].op == I_CONT_OP || f->insts[v].op == I_CONT_GET) return;
+  OptStats scan = g_stats;
+  FuncOut fo;
+  memset(&fo, 0, sizeof fo);
+  SplitCtl sc;
+  memset(&sc, 0, sizeof sc);
+  f->ra2_try = true;
+  int r = produce_once(f, obj, opt, out_bytes, &fo, false, &sc, false);
+  if (r == 0) r = produce_once(f, obj, opt, out_bytes, &fo, true, &sc, false);
+  f->ra2_try = false;
+  g_stats.ra2_tried++;
+  if (warmc_getenv("WARMC_RA2_PICK_DEBUG"))
+    fprintf(stderr, "ra2 pick f%u %s: scan %.1f new %.1f%s\n", f->func_index,
+            f->m->funcs[f->func_index].sym ? f->m->funcs[f->func_index].sym : "?", fout->ra_cost, fo.ra_cost,
+            r == 1 && fo.ra_cost < fout->ra_cost ? " NEW" : "");
+  if (r == 1 && fo.ra_cost < fout->ra_cost) {
+    OptStats now = g_stats;
+    g_stats = *before;
+    uint64_t *a = (uint64_t *)&g_stats;
+    const uint64_t *b = (const uint64_t *)&scan, *c = (const uint64_t *)&now;
+    for (size_t i = 0; i < sizeof g_stats / sizeof(uint64_t); i++) a[i] += c[i] - b[i];
+    g_stats.ra2_picked++;
+    fout_free(fout);
+    *fout = fo;
+  } else {
+    uint64_t tried = g_stats.ra2_tried;
+    g_stats = scan;
+    g_stats.ra2_tried = tried;
+    fout_free(&fo);
+  }
+}
+
 static void produce_whole(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
                           uint32_t out_bytes, FuncOut *fout) {
   SplitCtl sc;
   memset(&sc, 0, sizeof sc);
+  OptStats before = g_stats;
 
   /* Loop-boundary live-range splitting.  The whole plan is opt-in
      (WARMC_SPLIT): the prune loop below rolls every failed grant out of
@@ -523,7 +569,7 @@ static void produce_whole(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
   seal_tests(f);
   if (opt->regalloc) loop_consts(f);
   sc.full = warmc_getenv("WARMC_SPLIT") != NULL;
-  bool collect = opt->regalloc && (opt->split || sc.full);
+  bool collect = opt->regalloc && (opt->split || sc.full) && !warmc_getenv("WARMC_RA2");
   int r = produce_once(f, obj, opt, out_bytes, fout, false, &sc, collect);
   if (r == 2) {
     split_apply_adds(f, &sc);
@@ -548,7 +594,10 @@ static void produce_whole(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
   xfree(sc.veto); xfree(sc.addv); xfree(sc.addhdr); xfree(sc.addp);
   xfree(sc.cutp); xfree(sc.inv_fail); xfree(sc.cut_fail);
   xfree(sc.xcutp); xfree(sc.xcut_hdr);
-  if (r == 1) return;
+  if (r == 1) {
+    if (opt->regalloc && warmc_getenv("WARMC_RA2_PICK")) ra2_portfolio(f, obj, opt, out_bytes, fout, &before);
+    return;
+  }
   warmc_fatal("function %u cannot be laid out: a conditional branch is still "
               "out of range after relaxation", f->func_index);
 }

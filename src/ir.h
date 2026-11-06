@@ -174,6 +174,13 @@ typedef enum {
      dispatch goes to. */
   I_CONT_OP, I_CONT_GET,
 
+  /* The value of its operand, in a location of its own: what the spiller
+     makes (regalloc.inc ra2_spill, -fra2) for a value's copy in a slot,
+     a reload of it into a register, or a constant made again near its
+     use.  Instruction selection moves, loads or stores as the two
+     locations say; nothing before it makes one. */
+  I_COPY,
+
   I_NOP,
   I_OP_COUNT
 } IrOp;
@@ -416,6 +423,17 @@ typedef struct {
   size_t bump_left;
   /* the size of the last chunk started for filling, which the next doubles */
   size_t bump_cap;
+
+  /* The spiller (regalloc.inc ra2_spill) has rewritten the function, and
+     which of its values are copies in a slot, which the allocator then
+     takes no register for (ra2_mem, ra2_nmem long) */
+  bool ra2_done;
+  /* the spiller and its own assignment are tried on it (codegen.c's
+     portfolio, produce_whole) */
+  bool ra2_try;
+  uint8_t *ra2_mem;
+  uint32_t ra2_nmem;
+  uint8_t *ra2_dbg;
 } IrFunc;
 
 void *ir_alloc(IrFunc *f, size_t n);
@@ -672,6 +690,8 @@ typedef struct FuncOut {
   const char *sym;
   FuncUnwind uw;
   uint64_t insts_emitted;
+  /* the code's estimated cost (Isel.ra_cost) */
+  double ra_cost;
 
   uint32_t *refs; uint32_t nrefs;
 
@@ -804,6 +824,15 @@ typedef struct {
   /* ref.as_non_null traps of what is known to be no null, dropped (opt.c
      pass_gc_nullchk) */
   uint64_t gc_nulltraps;
+  /* the spiller's (regalloc.inc ra2_spill): reloads and spills it made,
+     values made again, and params it added */
+  uint64_t ra2_reloads, ra2_spills, ra2_remats, ra2_params;
+  /* its own assignment's (ra2_assign.inc): values it found no register
+     for, and caller-saved ones saved around a hot call */
+  uint64_t ra2_fallback, ra2_csa_hot, ra2_callsplits, ra2_whole;
+  /* the functions the portfolio tried the two on, and those whose new
+     code it kept (codegen.c ra2_portfolio) */
+  uint64_t ra2_tried, ra2_picked;
   /* two-way branches whose taken edge's moves went to a stub out of line,
      the other way falling into the next block (arm64) */
   uint64_t stubs_out;

@@ -1867,7 +1867,9 @@ static int produce_body_x64(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
       s->prof_start[bi] = B->ninstr;
       s->prof_skip = 0;
     }
+    uint32_t ni0 = B->ninstr;
     emit_block(s, bi, oi + 1 < neo ? eo[oi + 1] : 0xffffffffu);
+    s->ra_cost += (double)(B->ninstr - ni0) * blk_freq(&f->blocks[bi]);
     if (opt->profile) {
       uint32_t w = (uint32_t)(B->ninstr - s->prof_start[bi]);
       w = (w > s->prof_skip) ? w - s->prof_skip : 0;
@@ -1882,8 +1884,10 @@ static int produce_body_x64(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
   for (struct EdgeStub *est = s->edge_stubs; est;) {
     struct EdgeStub *n = est->next;
     size_t at = B->len;
+    uint32_t ni0 = B->ninstr;
     parallel_copy(s, est->mv, est->n);
     x64_jmp_rel32(B);
+    s->ra_cost += (double)(B->ninstr - ni0) * blk_freq(&f->blocks[est->from]);
     add_fix(s, B->len, 0, est->target);
     br_patch(s, est->site, at);
     xfree(est->mv); xfree(est);
@@ -1953,6 +1957,7 @@ static int produce_body_x64(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
   memset(fout, 0, sizeof *fout);
   fout->want_align = opt->align && has_loop;
   fout->align8 = opt->patchable;
+  fout->ra_cost = s->ra_cost + pro.ninstr;
   fout->code_len = (uint32_t)(pro.len + s->body.len);
   fout->code = xmalloc_long(fout->code_len ? fout->code_len : 1);
   memcpy(fout->code, pro.data, pro.len);

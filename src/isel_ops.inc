@@ -2821,6 +2821,20 @@ static void emit_inst(Isel *s, Ref v) {
       break;
     }
 
+    case I_COPY: {
+      /* the operand read straight into the copy's register, where it has
+         one: a reload is one load, a register's copy one move, and a copy
+         in a slot one store (commit) */
+      bool fp = is_fp_value(f, v), vec = is_vec_value(f, v);
+      int d = wr(s, v, fp || vec ? F0 : S0);
+      int x = rd(s, a[0], d);
+      /* into a slot from the operand's register itself */
+      if (IS_SLOT(s->loc[v])) { commit(s, v, x); break; }
+      if (x != d) emit_reg_move(B, d, x, fp, is64(f, v), vec);
+      commit(s, v, d);
+      break;
+    }
+
     case I_REF_CONVERT: {
 
       int x = rd(s, a[0], S0);
@@ -3434,6 +3448,7 @@ static void emit_block(Isel *s, uint32_t bi, uint32_t next_bi) {
           xfree(em);
         } else if (nf) {
           struct EdgeStub *st = xmalloc(sizeof *st);
+          st->from = s->cur_block;
           st->site = fail[0];
           st->nx = nf - 1;
           for (int k = 1; k < nf; k++) st->xsite[k - 1] = fail[k];
@@ -3561,6 +3576,7 @@ static void emit_block(Isel *s, uint32_t bi, uint32_t next_bi) {
         }
         if (cold) {
           struct EdgeStub *st = xmalloc(sizeof *st);
+          st->from = s->cur_block;
           st->nx = 0;
           st->n = cn;
           st->mv = xmalloc((cn ? (size_t)cn : 1) * sizeof(Move));
@@ -3609,6 +3625,7 @@ static void emit_block(Isel *s, uint32_t bi, uint32_t next_bi) {
           int ntmp = tn; tn = en; en = ntmp;
         }
         struct EdgeStub *st = xmalloc(sizeof *st);
+          st->from = s->cur_block;
         st->nx = 0;
         st->n = tn;
         st->mv = xmalloc((size_t)tn * sizeof(Move));

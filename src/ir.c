@@ -141,6 +141,8 @@ void ir_free(IrFunc *f) {
   xfree(f->kb_bits);
   xfree(f->ord_tmp);
   xfree(f->loop_head);
+  xfree(f->ra2_mem);
+  xfree(f->ra2_dbg);
   struct IrChunk *c = f->chunks;
   while (c) {
     struct IrChunk *n = c->next;
@@ -1524,7 +1526,7 @@ const Target *g_target = &warmc_target_a64;
 
 bool ir_has_no_effect(const Inst *in) {
   switch (in->op) {
-    case I_PARAM: case I_CONST:
+    case I_PARAM: case I_CONST: case I_COPY:
     case I_ADD: case I_SUB: case I_MUL: case I_MULHU: case I_MULHS:
     case I_AND: case I_OR: case I_XOR:
     case I_SHL: case I_SHRS: case I_SHRU: case I_ROTL: case I_ROTR:
@@ -1735,6 +1737,7 @@ const char *ir_op_name(uint16_t op) {
     N(I_GC_BADMASK, "gc.badmask"),
     N(I_REF_TEST, "ref.test"), N(I_REF_SLOT, "ref.test.slot"), N(I_REF_CONVERT, "ref.convert"), N(I_REF_I31, "ref.i31"), N(I_I31_GET, "i31.get"),
     N(I_ANY_OF_EXTERN, "any.convert_extern"), N(I_EXTERN_OF_ANY, "extern.convert_any"),
+    N(I_COPY, "copy"),
     N(I_NOP, "nop"),
   };
 #undef N

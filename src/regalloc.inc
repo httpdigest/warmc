@@ -231,6 +231,9 @@ static void regalloc_naive(Isel *s) {
 static int op_tied_arg(uint16_t op) {
   switch (op) {
     case I_VSEL: return 0;
+    /* the spiller's copy of a value that dies at it (ra_spill.inc): in the
+       value's register, none made */
+    case I_COPY: return warmc_getenv("WARMC_RA2_NO_COPYTIE") ? -1 : 0;
     /* A wrap whose source dies here can stay in the source's register,
        where it costs nothing when the high half is already zero -- the
        count of a clz or popcnt, the 32-bit result Go and TinyGo keep in an
@@ -2203,6 +2206,25 @@ static void web_merge(const Interval *iv, uint32_t *head, uint32_t *tail,
   *tail = t;
 }
 
+/* The general registers the scan gives out, in its order, the ones the back
+   end lends besides (isel_spare_gprs) not among them */
+static int ra_gpr_pool(Isel *s, int *gpool) {
+  IrFunc *f = s->f;
+  int ngpool = 0;
+  for (int i = 0; i < NGPR_ALLOC; i++) {
+
+    if (s->lab_reg && GPR_ALLOC[i] == s->lab_reg) continue;
+    if (s->tid_reg && GPR_ALLOC[i] == s->tid_reg) continue;
+
+    if (GPR_ALLOC[i] == s->vmctx_reg || GPR_ALLOC[i] == s->membase_reg) continue;
+    gpool[ngpool++] = GPR_ALLOC[i];
+  }
+  if (!s->needs_memsize) gpool[ngpool++] = REG_MEMSIZE;
+  if (RA_HAVE_RETAREA_REUSE && !s->needs_retarea && f->sig->nresults <= 1)
+    gpool[ngpool++] = RA_RETAREA_REG;
+  return ngpool;
+}
+
 static void regalloc_linear(Isel *s) {
   IrFunc *f = s->f;
   uint32_t n = f->ninsts;
@@ -2718,18 +2740,7 @@ static void regalloc_linear(Isel *s) {
   }
 
   int gpool[NGPR_ALLOC + 8];
-  int ngpool = 0;
-  for (int i = 0; i < NGPR_ALLOC; i++) {
-
-    if (s->lab_reg && GPR_ALLOC[i] == s->lab_reg) continue;
-    if (s->tid_reg && GPR_ALLOC[i] == s->tid_reg) continue;
-
-    if (GPR_ALLOC[i] == s->vmctx_reg || GPR_ALLOC[i] == s->membase_reg) continue;
-    gpool[ngpool++] = GPR_ALLOC[i];
-  }
-  if (!s->needs_memsize) gpool[ngpool++] = REG_MEMSIZE;
-  if (RA_HAVE_RETAREA_REUSE && !s->needs_retarea && f->sig->nresults <= 1)
-    gpool[ngpool++] = RA_RETAREA_REG;
+  int ngpool = ra_gpr_pool(s, gpool);
   /* The registers the back end lends besides (isel_spare_gprs) cost a save
      and a restore on every call, on the entry path, whichever way the call
      then goes, so they are a last resort: a value takes one only when no
@@ -4211,3 +4222,6 @@ static void compute_safepoints(Isel *s) {
 
   for_each_live_site(s, f, inst_is_safepoint, list_safepoint, NULL);
 }
+
+#include "ra_spill.inc"
+#include "ra2_assign.inc"
