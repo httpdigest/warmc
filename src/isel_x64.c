@@ -124,6 +124,8 @@ static bool isel_fp_remat_ok(Isel *s, const Inst *in) {
 #define RA_MEMBASE_ONE(off) ((off) <= 0x7fffffffull)
 #define RA_EXTENDU_TIED 0
 #define RA_CS_TOP 0
+#define RA_CS_LATE_A (-1)
+#define RA_CS_LATE_B (-1)
 #define RA_MEMOP_PRESERVES 0
 #define RA_BFI 0
 

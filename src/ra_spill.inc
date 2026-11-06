@@ -80,6 +80,9 @@ typedef struct {
   int (*maxp)[2];
   uint32_t *lstamp, *lstack, lgen;
   uint32_t *vuse, *vlv, vgen;
+  /* per block, how often it runs by the static estimate (ra2_freqs) */
+  double *freq;
+  bool expdist;
   /* each value's copies in slots: where one dominates, a reload reads it
      (mhead per value, through mnext) */
   uint32_t *mhead, *mnext, *mblk, nmc, capmc;
@@ -228,7 +231,7 @@ static Ref ra2_mem_for(Ra2 *R, Ref x, uint32_t blk) {
 static Ref ra2_mem(Ra2 *R, Ref x) { return ra2_mem_for(R, x, R->cur_b); }
 
 /* x's distance at block b's entry, RA2_INF where it is not live there */
-static int32_t ra2_din(Ra2 *R, uint32_t b, Ref x) {
+static int32_t ra2_din_live(Ra2 *R, uint32_t b, Ref x, bool *live) {
   Isel *s = R->s;
   uint32_t lo = s->lv_in_off[b], hi = s->lv_in_off[b + 1];
   while (lo < hi) {
@@ -236,16 +239,59 @@ static int32_t ra2_din(Ra2 *R, uint32_t b, Ref x) {
     if (s->lv_in[mid] < x) lo = mid + 1;
     else hi = mid;
   }
-  if (lo < s->lv_in_off[b + 1] && s->lv_in[lo] == x) return R->din[lo];
+  if (lo < s->lv_in_off[b + 1] && s->lv_in[lo] == x) { *live = true; return R->din[lo]; }
+  *live = false;
   return RA2_INF;
+}
+
+static int32_t ra2_din(Ra2 *R, uint32_t b, Ref x) {
+  bool live;
+  return ra2_din_live(R, b, x, &live);
 }
 
 /* x's distance from block b's end: through each way out, a way out of a
    loop RA2_LOOPX further */
+static double ra2_edge_w(const IrFunc *f, const Block *p, const Edge *e);
+
 static int32_t ra2_dout(Ra2 *R, uint32_t b, Ref x) {
   IrFunc *f = R->f;
   Block *bb = &f->blocks[b];
   int32_t best = RA2_INF;
+  /* Expected, the ways out weighted as ra2_freqs weighs them: a way on
+     which x is read no more counts as one out of the loop -- a value one
+     arm reads is as far as half its distance there and half that, where
+     the nearest way had it as near as the arm (WARMC_RA2_NO_EXPDIST) */
+  if (R->expdist) {
+    double tot = 0, sum = 0;
+    bool live = false;
+    for (uint32_t k = 0; k < bb->nsuccs; k++) {
+      double w = ra2_edge_w(f, bb, &bb->succs[k]);
+      if (w <= 0) continue;
+      uint32_t t = bb->succs[k].target;
+      bool lv;
+      int32_t d = ra2_din_live(R, t, x, &lv);
+      double dd;
+      /* not read on that way any more; or not found yet (the fixpoint
+         brings it down from there) */
+      if (!lv) dd = RA2_LOOPX;
+      else {
+        live = true;
+        dd = d >= RA2_INF ? 4.0 * RA2_LOOPX : d + (f->blocks[t].loop_depth < bb->loop_depth ? RA2_LOOPX : 0);
+      }
+      tot += w;
+      sum += w * dd;
+    }
+    if (!live || tot <= 0) {
+      /* read only on ways the weights leave out (a handler's): nearest */
+      for (uint32_t k = 0; k < bb->nsuccs; k++) {
+        int32_t d = ra2_din(R, bb->succs[k].target, x);
+        if (d < best) best = d;
+      }
+      return best;
+    }
+    double e = sum / tot;
+    return e >= RA2_INF ? RA2_INF - 1 : (int32_t)e;
+  }
   for (uint32_t k = 0; k < bb->nsuccs; k++) {
     uint32_t t = bb->succs[k].target;
     int32_t d = ra2_din(R, t, x);
@@ -265,6 +311,64 @@ static int32_t ra2_dout(Ra2 *R, uint32_t b, Ref x) {
 static bool ra2_imm_use(Ra2 *R, Ref u, uint32_t j, Ref x) {
   return x < R->n0 && R->rem[x] && R->f->insts[x].op == I_CONST && is_imm_at(R->s, u, j, x) &&
          !warmc_getenv("WARMC_RA2_NO_IMMUSE");
+}
+
+/* How often each block runs, by the estimate that needs no profile: the
+   entry once; a block what its ways in bring, each way a share of its
+   source's runs -- the ways out of a block split them evenly, a cold or
+   diverging target taking a hundredth, a way out of a loop a tenth -- and
+   a loop's header ten times what enters it.  So a loop's arms run half as
+   often as its header each, where loop depths alone count them as often. */
+static double ra2_edge_w(const IrFunc *f, const Block *p, const Edge *e) {
+  const Block *t = &f->blocks[e->target];
+  if (e->eh || t->is_pad) return 0;
+  if (t->cold || t->diverges) return 0.01;
+  if (t->loop_depth < p->loop_depth) return 0.1;
+  return 1;
+}
+
+static void ra2_freqs(Ra2 *R) {
+  IrFunc *f = R->f;
+  uint32_t nb = f->nblocks;
+  R->freq = xcalloc(nb ? nb : 1, sizeof(double));
+  uint32_t *by = xmalloc((f->norder ? f->norder : 1) * sizeof(uint32_t));
+  uint32_t n = 0;
+  for (uint32_t oi = 0; oi < f->norder; oi++) by[n++] = f->order[oi];
+  /* by rpo: an insertion sort is too slow for big functions -- counting */
+  uint32_t maxr = 0;
+  for (uint32_t i = 0; i < n; i++) if (f->blocks[by[i]].rpo > maxr) maxr = f->blocks[by[i]].rpo;
+  uint32_t *slot = xmalloc(((size_t)maxr + 1) * sizeof(uint32_t));
+  for (uint32_t r = 0; r <= maxr; r++) slot[r] = UINT32_MAX;
+  for (uint32_t i = 0; i < n; i++) slot[f->blocks[by[i]].rpo] = by[i];
+  n = 0;
+  for (uint32_t r = 0; r <= maxr; r++) if (slot[r] != UINT32_MAX) by[n++] = slot[r];
+  xfree(slot);
+  for (uint32_t i = 0; i < n; i++) {
+    uint32_t b = by[i];
+    Block *bb = &f->blocks[b];
+    if (b == f->entry) { R->freq[b] = 1; continue; }
+    double in = 0;
+    bool header = false;
+    for (uint32_t q = 0; q < bb->npreds; q++) {
+      uint32_t pb = bb->preds[q];
+      const Block *p = &f->blocks[pb];
+      if (p->rpo >= bb->rpo) { header = true; continue; }
+      bool dup = false;
+      for (uint32_t z = 0; z < q && !dup; z++) dup = bb->preds[z] == pb;
+      if (dup) continue;
+      double tot = 0, to = 0;
+      for (uint32_t k = 0; k < p->nsuccs; k++) {
+        double w = ra2_edge_w(f, p, &p->succs[k]);
+        tot += w;
+        if (p->succs[k].target == b) to += w;
+      }
+      if (tot > 0) in += R->freq[pb] * to / tot;
+    }
+    if (header) in *= 10;
+    if (in > 1e12) in = 1e12;
+    R->freq[b] = in;
+  }
+  xfree(by);
 }
 
 /* The reads of instruction u as the distances count them, into rb: through
@@ -391,6 +495,66 @@ static void ra2_block_pressure(Ra2 *R) {
   xfree(live);
   xfree(lst);
   xfree(rb);
+}
+
+/* How often, by ra2_freqs, the loop headed by h reads each of the values
+   v[0..n): its blocks those that reach a way back to h without passing it. */
+static double *ra2_loop_uses(Ra2 *R, uint32_t h, const Ref *v, uint32_t n) {
+  IrFunc *f = R->f;
+  uint32_t nb = f->nblocks;
+  double *uw = xcalloc(n ? n : 1, sizeof(double));
+  if (!R->lstamp) R->lstamp = xcalloc(nb ? nb : 1, sizeof(uint32_t));
+  if (!R->lstack) R->lstack = xmalloc((nb ? nb : 1) * sizeof(uint32_t));
+  if (!R->vuse) { R->vuse = xcalloc(R->n0 ? R->n0 : 1, sizeof(uint32_t)); R->vlv = xcalloc(R->n0 ? R->n0 : 1, sizeof(uint32_t)); }
+  /* the candidates' indices, through vlv as a stamp-tagged map */
+  uint32_t us = ++R->vgen;
+  for (uint32_t i = 0; i < n; i++) if (v[i] < R->n0) { R->vuse[v[i]] = us; R->vlv[v[i]] = i; }
+  uint32_t st = ++R->lgen;
+  R->lstamp[h] = st;
+  uint32_t sp = 0;
+  uint32_t *lb = xmalloc((nb ? nb : 1) * sizeof(uint32_t));
+  uint32_t nl = 0;
+  lb[nl++] = h;
+  Block *hb = &f->blocks[h];
+  for (uint32_t p = 0; p < hb->npreds; p++) {
+    uint32_t q = hb->preds[p];
+    if (R->done[q] || R->lstamp[q] == st) continue;
+    R->lstamp[q] = st;
+    R->lstack[sp++] = q;
+  }
+  while (sp) {
+    uint32_t x = R->lstack[--sp];
+    lb[nl++] = x;
+    Block *xb = &f->blocks[x];
+    for (uint32_t p = 0; p < xb->npreds; p++) {
+      uint32_t q = xb->preds[p];
+      if (R->lstamp[q] == st || !f->blocks[q].reachable) continue;
+      R->lstamp[q] = st;
+      R->lstack[sp++] = q;
+    }
+  }
+  Ref *rb = NULL;
+  uint32_t caprb = 0;
+#define RA2_UW(x, w) do { Ref x_ = (x); if (x_ < R->n0 && R->vuse[x_] == us) uw[R->vlv[x_]] += (w); } while (0)
+  for (uint32_t k = 0; k < nl; k++) {
+    Block *bb = &f->blocks[lb[k]];
+    double w = R->freq[lb[k]];
+    for (uint32_t i = 0; i < bb->ninsts; i++) {
+      uint32_t na = ra2_reads(R, bb->insts[i], &rb, &caprb);
+      for (uint32_t j = 0; j < na; j++) RA2_UW(rb[j], w);
+    }
+    if (bb->term == T_BRIF || bb->term == T_BRTABLE) RA2_UW(bb->term_arg, w);
+    for (uint32_t e = 0; e < bb->nsuccs; e++) {
+      /* an argument on a way round is read there, one on a way out
+         after the loop */
+      if (R->lstamp[bb->succs[e].target] != st) continue;
+      for (uint32_t j = 0; j < bb->succs[e].nargs; j++) RA2_UW(bb->succs[e].args[j], w);
+    }
+  }
+#undef RA2_UW
+  xfree(rb);
+  xfree(lb);
+  return uw;
 }
 
 /* The most values live at once in the loop headed by h: its blocks, those
@@ -893,15 +1057,32 @@ static void ra2_block(Ra2 *R, uint32_t b, Ra2Uses *uses, Ref *touched, uint32_t 
       cv[m] = x;
       ck[m++] = key;
     }
-    /* by key, a few dozen at most: an insertion sort */
+    /* by key, a few dozen at most: an insertion sort -- on a loop's header,
+       the values the loop reads by how often it reads them (ra2_freqs)
+       first, the nearest read only among equals: a value one arm of the
+       loop's switch reads is no more wanted than one each trip reads,
+       which held, had to go to a slot (cbench/switch's counter) */
+    double *sk = xmalloc((m ? m : 1) * sizeof(double));
+    bool byfreq = nproc < bb->npreds && R->freq && !warmc_getenv("WARMC_RA2_NO_FREQ");
+    if (byfreq) {
+      double *uw = ra2_loop_uses(R, b, cv, m);
+      for (uint32_t i = 0; i < m; i++)
+        sk[i] = ck[i] / 4 >= RA2_LOOPX ? 1e30 + (double)ck[i] : -uw[i] * 1e6 + (double)ck[i];
+      xfree(uw);
+    } else {
+      for (uint32_t i = 0; i < m; i++) sk[i] = (double)ck[i];
+    }
     for (uint32_t i = 1; i < m; i++) {
       Ref x = cv[i];
       int64_t kx = ck[i];
+      double sx = sk[i];
       uint32_t j = i;
-      while (j > 0 && ck[j - 1] > kx) { cv[j] = cv[j - 1]; ck[j] = ck[j - 1]; j--; }
+      while (j > 0 && sk[j - 1] > sx) { cv[j] = cv[j - 1]; ck[j] = ck[j - 1]; sk[j] = sk[j - 1]; j--; }
       cv[j] = x;
       ck[j] = kx;
+      sk[j] = sx;
     }
+    xfree(sk);
     /* On a loop's header, a value the loop only carries keeps a register
        only where the loop's own values leave one free at its fullest
        point: kept and then pushed out inside, it would be loaded back on
@@ -922,6 +1103,13 @@ static void ra2_block(Ra2 *R, uint32_t b, Ra2Uses *uses, Ref *touched, uint32_t 
         /* the loop's pressure counts what it reads only, the carried
            values none (ra2_loop_pressure) */
         lt_room[c] = warmc_getenv("WARMC_RA2_OLD_LP") ? R->K[c] - (lp[c] - nlt[c]) : R->K[c] - lp[c];
+        /* -- nor the residents it carries, which hold theirs throughout
+           (gobench/typeswitch: two native pointers across its switch,
+           which let in two carried values too many, pushed out in every
+           arm and loaded back on the way round) */
+        if (!warmc_getenv("WARMC_RA2_NO_RESROOM"))
+          for (int k = 0; k < W.n[c]; k++)
+            if (W.w[c][k].nu >= RA2_LOOPX) lt_room[c]--;
         if (lt_room[c] < 0) lt_room[c] = 0;
         {
           const char *de = warmc_getenv("WARMC_RA2_DEBUG_EV");
@@ -1387,6 +1575,11 @@ static void ra2_trivial_params(Ra2 *R) {
         }
       }
       if (!ok || one == REF_NONE) continue;
+      /* not a param in a register for the copy in a slot it is loaded from
+         on the way into its loop: every read would load it again
+         (gobench/typeswitch's array base, on every trip) */
+      bool pslot = p < R->nslotv && R->slotv[p] == 1, oslot = one < R->nslotv && R->slotv[one] == 1;
+      if (oslot && !pslot && !warmc_getenv("WARMC_RA2_TRIV_SLOT")) continue;
       repl[p] = one;
       gone[p] = 1;
       changed = true;
@@ -1594,6 +1787,98 @@ static void ra2_fold_order(Ra2 *R) {
   R->fmoved = NULL;
 }
 
+/* Of the copies and params, those that are versions of a mem_base or of
+   the barrier's mask, which the selection takes by their op (IrFunc's
+   ra2_of): a copy that of its operand, a param that of its arguments
+   where all of them are versions of one -- copies of it made apart, or
+   made again where it ran out of registers, make the same -- the way round
+   a loop, a version of the param itself, left out of the count until it
+   turns out otherwise. */
+__attribute__((unused))
+static bool ra2_same_source(const IrFunc *f, Ref a, Ref b) {
+  const Inst *x = &f->insts[a], *y = &f->insts[b];
+  return x->op == y->op && x->imm == y->imm && x->imm2 == y->imm2 && x->type == y->type;
+}
+
+__attribute__((unused))
+static void ra2_versions(IrFunc *f) {
+  uint32_t n = f->ninsts;
+  xfree(f->ra2_of);
+  f->ra2_of = NULL;
+  f->ra2_nof = 0;
+  bool any = false;
+  for (uint32_t v = 0; v < n && !any; v++)
+    any = f->insts[v].op == I_MEM_BASE || f->insts[v].op == I_GC_BADMASK;
+  if (!any || warmc_getenv("WARMC_RA2_NO_VERSIONS")) return;
+  /* 0 not known yet, 1 a version of of[v], 2 none */
+  uint8_t *st = xcalloc(n, 1);
+  Ref *of = xmalloc(n * sizeof(Ref));
+  for (uint32_t v = 0; v < n; v++) {
+    uint16_t op = f->insts[v].op;
+    of[v] = REF_NONE;
+    if (op == I_MEM_BASE || op == I_GC_BADMASK) { st[v] = 1; of[v] = v; }
+    else if (!(op == I_COPY && f->insts[v].nargs == 1) && op != I_PARAM) st[v] = 2;
+  }
+  /* a meet of what is known: none where two disagree or one is none */
+#define RA2_MEET(a) do { Ref a_ = (a); \
+    if (st[a_] == 2) { ns = 2; } \
+    else if (st[a_] == 1 && ns != 2) { \
+      if (ns == 0) { ns = 1; no = of[a_]; } \
+      else if (!ra2_same_source(f, no, of[a_])) ns = 2; } } while (0)
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    for (uint32_t oi = 0; oi < f->norder; oi++) {
+      uint32_t b = f->order[oi];
+      Block *bb = &f->blocks[b];
+      for (uint32_t pi = 0; pi < bb->nparams; pi++) {
+        Ref p = bb->params[pi];
+        if (st[p] == 2) continue;
+        uint8_t ns = 0;
+        Ref no = REF_NONE;
+        if (bb->is_pad || b == f->entry) ns = 2;
+        for (uint32_t q = 0; q < bb->npreds && ns != 2; q++) {
+          Block *pb = &f->blocks[bb->preds[q]];
+          for (uint32_t si = 0; si < pb->nsuccs && ns != 2; si++) {
+            Edge *e = &pb->succs[si];
+            if (e->target != b) continue;
+            if (e->eh || pi >= e->nargs) { ns = 2; break; }
+            if (e->args[pi] != p) RA2_MEET(e->args[pi]);
+          }
+        }
+        if (ns != 0 && (ns != st[p] || (ns == 1 && of[p] == REF_NONE))) {
+          if (ns == 1 && st[p] == 1) continue;
+          st[p] = ns;
+          if (ns == 1) of[p] = no;
+          changed = true;
+        }
+      }
+      for (uint32_t i = 0; i < bb->ninsts; i++) {
+        Ref u = bb->insts[i];
+        if (st[u] == 2 || f->insts[u].op != I_COPY) continue;
+        uint8_t ns = 0;
+        Ref no = REF_NONE;
+        RA2_MEET(ir_args(f, u)[0]);
+        if (ns != 0 && ns != st[u]) {
+          st[u] = ns;
+          if (ns == 1) of[u] = no;
+          changed = true;
+        }
+      }
+    }
+  }
+#undef RA2_MEET
+  bool some = false;
+  for (uint32_t v = 0; v < n; v++) {
+    if (st[v] != 1 || of[v] == v) of[v] = REF_NONE;
+    else some = true;
+  }
+  xfree(st);
+  if (!some) { xfree(of); return; }
+  f->ra2_of = of;
+  f->ra2_nof = n;
+}
+
 /* The function rewritten: its pieces of values in registers and copies in
    slots (IrFunc.ra2_mem), for instruction selection to start over on. */
 __attribute__((unused))
@@ -1616,17 +1901,24 @@ static void ra2_spill(Isel *s, const int *gpool, int ngpool) {
     /* what takes no register of its own: an immediate, a fused or folded
        instruction, a zero, a value made again where it is read */
     if (skip_location(s, v) || ra_zero_const(s, v, s->cls[v])) continue;
-    /* the barrier's mask, one load to make, held where it is live as the
-       scan holds it: read at every barrier (javabench/iface: twice a trip) */
     /* (the barrier's mask, held as a resident -- one load where the scan
        holds it in a register -- cost javabench/treemap 14% in spills
-       elsewhere; and a load takes it as the instruction itself, which no
-       version may stand in for: made again at each read, as remat_ok
-       says) */
+       elsewhere) */
     if (in->op == I_GC_BADMASK && warmc_getenv("WARMC_RA2_RESKEEP")) {
       R.res[v] = 1;
       continue;
     }
+    /* The barrier's mask competes for a register like a constant, made
+       again where it is out of them: made at every read, a loop of
+       barriers loads it at each (javabench/list: four a trip, where the
+       scan holds it in a register); a load reads it through any version
+       (load_barrier_mask) */
+    bool mask = in->op == I_GC_BADMASK && !warmc_getenv("WARMC_RA2_MASK_PERREAD");
+    /* -- and so does the memory base plus an offset of one add, which an
+       access reads through any version too (ra2_versions): made at every
+       read, asbench's loops made theirs twice a trip, where the scan holds
+       it in a register (asbench/virtual, staticarr, stdgo/iface) */
+    bool mbase = in->op == I_MEM_BASE && remat_ok(s, v) && !warmc_getenv("WARMC_RA2_MBASE_PERREAD");
     /* A constant competes for a register like any value, made again where
        it is out of them: a loop's constant made on every way round costs
        that on every way round (rsbench/vecgrow's hash multiplier,
@@ -1634,17 +1926,17 @@ static void ra2_spill(Isel *s, const int *gpool, int ngpool) {
     /* (a scalar float constant one fmov or a load from the pool makes is
        left to be made where it is read: held, those of asbench/mathf's
        libm took the callee-saved vector registers round its calls) */
-    if (remat_ok(s, v) &&
+    if (remat_ok(s, v) && !mask && !mbase &&
         !(in->op == I_CONST && !warmc_getenv("WARMC_RA2_NO_CONST1") &&
           (!vt_is_float((ValType)in->type) || !warmc_getenv("WARMC_RA2_NO_FPCONST"))))
       continue;
-    /* left as they are: the barrier's mask, which a load takes as itself
-       (load_barrier_mask); the memory base and an address made of it,
-       which only an access may read (analyse_immediates); and a native
+    /* left as they are: the barrier's mask, made at each read (or held,
+       above); a memory base of more than one add and an address made of
+       it, which only an access may read (analyse_immediates); and a native
        pointer, which an access takes for one only as the mem_ptr itself --
        a copy of it would be taken for an address in the memory */
-    if (in->op == I_MEM_PTR || in->op == I_GC_BADMASK || in->op == I_MEM_BASE ||
-        in->op == I_MEM_ADDR) {
+    if (in->op == I_MEM_PTR || (in->op == I_GC_BADMASK && !mask) ||
+        (in->op == I_MEM_BASE && !mbase) || in->op == I_MEM_ADDR) {
       R.res[v] = 1;
       continue;
     }
@@ -1653,7 +1945,7 @@ static void ra2_spill(Isel *s, const int *gpool, int ngpool) {
        too long to make at every read -- is made again where it is out of
        the registers, the copy a value of its own */
     if (in->nargs == 0 &&
-        (in->op == I_CONST ||
+        (in->op == I_CONST || mask || mbase ||
          (in->op == I_GLOBAL_GET && !f->m->globals[in->imm].mutable_ &&
           !f->m->globals[in->imm].imported)))
       R.rem[v] = !warmc_getenv("WARMC_RA2_NO_CREM");
@@ -1691,7 +1983,9 @@ static void ra2_spill(Isel *s, const int *gpool, int ngpool) {
 
   ra2_fold_order(&R);
   compute_liveness(s);
+  R.expdist = !warmc_getenv("WARMC_RA2_NO_EXPDIST");
   ra2_distances(&R);
+  ra2_freqs(&R);
   ra2_block_pressure(&R);
 
   Ra2Uses *uses = xcalloc(n0 ? n0 : 1, sizeof(Ra2Uses));
@@ -1743,14 +2037,15 @@ static void ra2_spill(Isel *s, const int *gpool, int ngpool) {
   if (warmc_getenv("WARMC_RA2_DEBUG")) ir_print(f, "ra2");
 
   f->ra2_done = true;
+  ra2_versions(f);
   xfree(f->ra2_mem);
   f->ra2_nmem = f->ninsts;
   f->ra2_mem = xcalloc(f->ninsts ? f->ninsts : 1, 1);
   for (uint32_t v = 0; v < f->ninsts && v < R.nslotv; v++) f->ra2_mem[v] = R.slotv[v];
   /* the constants the pass kept in registers: kept there (ra2_assign);
-     and the residents it counted as holding registers -- the barrier's
-     mask, which the assignment would otherwise load again at every read
-     (javabench/iface: twice a trip) */
+     and the barrier's mask, where it is held as a resident
+     (WARMC_RA2_RESKEEP), which the assignment would otherwise load again
+     at every read (javabench/iface: twice a trip) */
   for (uint32_t v = 0; v < n0; v++) if (R.rem[v] && R.need[v] && !f->ra2_mem[v]) f->ra2_mem[v] = 3;
   for (uint32_t v = 0; v < n0; v++)
     if (R.res[v] && !f->ra2_mem[v] && f->insts[v].op == I_GC_BADMASK) f->ra2_mem[v] = 3;
@@ -1773,7 +2068,7 @@ static void ra2_spill(Isel *s, const int *gpool, int ngpool) {
   xfree(R.added);
   xfree(R.shared);
   xfree(R.maxp); xfree(R.lstamp); xfree(R.lstack); xfree(R.vuse); xfree(R.vlv);
-  xfree(R.mhead); xfree(R.mnext); xfree(R.mblk); xfree(R.mcp);
+  xfree(R.mhead); xfree(R.mnext); xfree(R.mblk); xfree(R.mcp); xfree(R.freq);
   /* the liveness made for the pass is of the function before it */
   xfree(s->lv_in); xfree(s->lv_out); xfree(s->lv_in_off); xfree(s->lv_out_off);
   s->lv_in = s->lv_out = NULL;

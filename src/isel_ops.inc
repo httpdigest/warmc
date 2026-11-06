@@ -2842,7 +2842,9 @@ static void emit_inst(Isel *s, Ref v) {
 
       int x = rd(s, a[0], S0);
       int d = wr(s, v, S0);
-      a64_mov_reg(B, SF64, d, x);
+      /* none where the reference is in the result's register already, as
+         x64's (RA2 gives it the dying operand's: javabench/maphash) */
+      if (d != x) a64_mov_reg(B, SF64, d, x);
       commit(s, v, d);
       break;
     }

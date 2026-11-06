@@ -433,6 +433,12 @@ typedef struct {
   bool ra2_try;
   uint8_t *ra2_mem;
   uint32_t ra2_nmem;
+  /* of a copy or a block's param the spiller's renaming made of a value
+     the selection takes by its op -- a mem_base, the barrier's mask -- that
+     value (one of its copies, which all make the same), REF_NONE for the
+     rest (ra2_of, ra2_nof long; isel_core.inc ra2_source) */
+  Ref *ra2_of;
+  uint32_t ra2_nof;
   uint8_t *ra2_dbg;
 } IrFunc;
 

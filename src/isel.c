@@ -240,6 +240,11 @@ static IrOp recomp_shape(IrFunc *f, Ref v, Ref *x, Ref *y, uint64_t *c);
 /* a value live across a call in a loop takes callee-saved registers from
    x28 down (regalloc_linear's cs_top) */
 #define RA_CS_TOP 1
+/* the callee-saved registers callees take first for their own loops'
+   values crossing calls (RA_CS_TOP's), which a caller's from the top take
+   last (ra2_assign.inc ra2a_pick) */
+#define RA_CS_LATE_A R28
+#define RA_CS_LATE_B R27
 
 #define A64_IDX_UXTW 2
 #define A64_IDX_LSL  3
@@ -1635,18 +1640,38 @@ static bool block_calls(IrFunc *f, const Block *b) {
   return false;
 }
 
+/* the instructions of a block that make code where they stand: not a
+   constant with no register (made where it is read, or an immediate), nor
+   an instruction folded into its reader -- of which the spiller's
+   rewriting leaves many in a loop (ra_spill.inc), where the IR's own
+   constants sit outside it */
+static uint32_t block_emits(Isel *s, IrFunc *f, const Block *b) {
+  uint32_t n = 0;
+  for (uint32_t i = 0; i < b->ninsts; i++) {
+    Ref u = b->insts[i];
+    const Inst *in = &f->insts[u];
+    if (skip_location(s, u) || (in->op == I_CONST && s->loc[u] == LOC_NONE)) continue;
+    n++;
+  }
+  return n;
+}
+
 /* Whether the natural loop headed by h is small: its blocks, found back
    from the latches, hold at most SMALL_LOOP_INSTS IR instructions and
-   terminators -- about what fits in 64 bytes once lowered -- and no call.
+   terminators -- after the spiller, of those that make code (block_emits;
+   gobench/utf8scan's loop, counted with its constants' copies, went
+   unaligned across a fetch block, 1.55x) -- about what fits in 64 bytes
+   once lowered -- and no call.
    A loop that calls waits on the call, not on fetching itself: the branch
    over its padding was gobench/recurse's whole gap to clang. */
-static bool small_loop(IrFunc *f, uint32_t h) {
+static bool small_loop(Isel *s, IrFunc *f, uint32_t h) {
   uint32_t nb = f->nblocks, n = 0, sp = 0;
   uint8_t *in = xcalloc(nb ? nb : 1, 1);
   uint32_t *stk = xmalloc((nb ? nb : 1) * sizeof(uint32_t));
   Block *hb = &f->blocks[h];
+  bool exact = f->ra2_done && !warmc_getenv("WARMC_NO_EMIT_COUNT");
   in[h] = 1;
-  n += hb->ninsts + 1;
+  n += (exact ? block_emits(s, f, hb) : hb->ninsts) + 1;
   for (uint32_t p = 0; p < hb->npreds; p++) {
     uint32_t l = hb->preds[p];
     if (f->blocks[l].rpo >= hb->rpo && !in[l]) { in[l] = 1; stk[sp++] = l; }
@@ -1655,7 +1680,7 @@ static bool small_loop(IrFunc *f, uint32_t h) {
   while (sp && ok) {
     uint32_t x = stk[--sp];
     Block *xb = &f->blocks[x];
-    n += xb->ninsts + 1;
+    n += (exact ? block_emits(s, f, xb) : xb->ninsts) + 1;
     if (n > SMALL_LOOP_INSTS || x == f->entry || block_calls(f, xb)) ok = false;
     for (uint32_t p = 0; p < xb->npreds && ok; p++) {
       uint32_t q = xb->preds[p];
@@ -2736,7 +2761,7 @@ static void analyse_immediates(Isel *s) {
   for (uint32_t i = 0; i < n; i++) {
     Inst *ai = &f->insts[i];
     if (ai->op != I_MEM_ADDR || ai->nargs != 2) continue;
-    if (f->insts[ir_args(f, i)[1]].op != I_MEM_BASE) continue;
+    if (ra2_source(f, ir_args(f, i)[1], I_MEM_BASE) == REF_NONE) continue;
     if (blocked[i]) warmc_fatal("internal: mem_base pointer escapes an access");
     s->ptr_fuse[i] = 1;
     s->folded[i] = 1;
@@ -2782,7 +2807,7 @@ static void analyse_immediates(Isel *s) {
         if (j != 0 || (in->op != I_LOAD && in->op != I_STORE) || in->imm != 0)
           warmc_fatal("internal: mem_base pointer used outside an access");
 
-        if (f->insts[ir_args(f, a[j])[1]].imm2 != MEMF_MEM(in->imm2))
+        if (f->insts[ra2_source(f, ir_args(f, a[j])[1], I_MEM_BASE)].imm2 != MEMF_MEM(in->imm2))
           warmc_fatal("internal: mem_base pointer used on the wrong memory");
       }
     }
@@ -4012,13 +4037,13 @@ static bool early_access_ok(IrFunc *f, const EarlyRet *er, const Edge *ed, Ref v
   /* the address, or the pointer pass_mem_ptr gives accesses at offsets from
      one base, the memory base plus the same index */
   uint64_t at = ai->imm;
+  Ref mb = ai->op == I_MEM_ADDR && ai->nargs == 2 ? ra2_source(f, ir_args(f, a0)[1], I_MEM_BASE) : REF_NONE;
   if ((ai->op == I_MEM_ADDR || (ai->op == I_MEM_PTR && ai->imm2 == 0)) && ai->nargs == 1) {
     *idx = ir_args(f, a0)[0];
-  } else if (ai->op == I_MEM_ADDR && ai->nargs == 2 &&
-             f->insts[ir_args(f, a0)[1]].op == I_MEM_BASE && f->insts[ir_args(f, a0)[1]].imm2 == 0) {
+  } else if (mb != REF_NONE && f->insts[mb].imm2 == 0) {
     /* the index on a pointer to the offset (the ptr_fuse form) */
     *idx = ir_args(f, a0)[0];
-    at = f->insts[ir_args(f, a0)[1]].imm;
+    at = f->insts[mb].imm;
   } else if (ai->op == I_CONST) {
     *idx = REF_NONE;
   } else {
@@ -4572,7 +4597,7 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
     if (lalign && opt->align && f->blocks[bi].loop_depth) {
       uint32_t lh = ir_loop_header_at(f, bi);
       bool header = lh != UINT32_MAX;
-      bool small = header && small_align && small_loop(f, lh);
+      bool small = header && small_align && small_loop(s, f, lh);
       if (small) nsmall++;
       uint32_t want = small ? 64 : lalign;
       if (header) {

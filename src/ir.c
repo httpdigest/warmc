@@ -142,6 +142,7 @@ void ir_free(IrFunc *f) {
   xfree(f->ord_tmp);
   xfree(f->loop_head);
   xfree(f->ra2_mem);
+  xfree(f->ra2_of);
   xfree(f->ra2_dbg);
   struct IrChunk *c = f->chunks;
   while (c) {

@@ -647,12 +647,24 @@ static bool load_needs_barrier(const IrFunc *f, const Inst *in) {
   return warmc_load_barrier && vt_ref_collectable(f->m, (ValType)in->type);
 }
 
+/* x where it is an instruction of op op, or the one of op op that x, a
+   version the spiller made (IrFunc's ra2_of), stands for: a copy or a
+   block's param of a mem_base holds the same address in its register;
+   REF_NONE for anything else */
+static Ref ra2_source(const IrFunc *f, Ref x, IrOp op) {
+  if (f->insts[x].op == op) return x;
+  if (f->ra2_of && x < f->ra2_nof && f->ra2_of[x] != REF_NONE && f->insts[f->ra2_of[x]].op == op)
+    return f->ra2_of[x];
+  return REF_NONE;
+}
+
 static Ref load_barrier_mask(const IrFunc *f, Ref v) {
   const Inst *in = &f->insts[v];
   if (!(in->imm2 & GCF_MASKARG)) return REF_NONE;
   /* before the length, where a bounds check takes one (GCF_LENARG) */
   Ref m = ir_args((IrFunc *)f, v)[in->nargs - 1 - ((in->imm2 & GCF_LENARG) != 0)];
-  if (f->insts[m].op != I_GC_BADMASK)
+  /* or a version of one, read in its register (ra2_source) */
+  if (ra2_source(f, m, I_GC_BADMASK) == REF_NONE)
     warmc_fatal("internal: v%u's barrier mask v%u is no gc.badmask", v, m);
   return m;
 }

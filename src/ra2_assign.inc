@@ -117,6 +117,25 @@ static void ra2a_scan_block(Isel *s, uint32_t b, uint8_t *live, Ref *lst, uint32
    (thread's own: functions compile on several threads) */
 static _Thread_local uint64_t ra2a_usedcs[2];
 
+/* The pool's indices from its top, the registers callees take first for
+   their own loops' values (RA_CS_LATE_A, _B) after the rest, into order:
+   its length, 0 where that order is off (WARMC_RA2_NO_TOP_LAST).  The plan
+   gives the heaviest group first the first of them: javabench/maphash's
+   loop counter took x28, which putImpl, called every trip, saves and
+   restores for its own loop's -- the counter through memory every time
+   round, the whole program 23% slower */
+static int ra2a_top_order(const int *pool, int np, int *order) {
+  if (warmc_getenv("WARMC_RA2_NO_TOP_LAST") || np > 64) return 0;
+  int no = 0;
+  for (int pass = 0; pass < 2; pass++)
+    for (int kk = 0; kk < np; kk++) {
+      int r = pool[np - 1 - kk];
+      bool late = r == RA_CS_LATE_A || r == RA_CS_LATE_B;
+      if (late == (pass == 1)) order[no++] = np - 1 - kk;
+    }
+  return no;
+}
+
 static int ra2a_pick(Isel *s, Ref x, int c, const Ref *own, const int *pool, int np, int hint,
                      const uint8_t *xhot, const uint8_t *xalloc, const uint32_t *claimed, uint8_t ghotv,
                      uint64_t avoid) {
@@ -137,9 +156,11 @@ static int ra2a_pick(Isel *s, Ref x, int c, const Ref *own, const int *pool, int
   /* a callee-saved register the function saves already before one it
      would save for this value alone (pass -2.5, as -2 with it) */
   bool reuse = want_cs && !warmc_getenv("WARMC_RA2_NO_CSREUSE");
+  int order[64];
+  int no = top ? ra2a_top_order(pool, np, order) : 0;
   for (int pass = -4; pass < 2; pass++)
     for (int kk = 0; kk < np; kk++) {
-      int k = top ? np - 1 - kk : kk;
+      int k = no == np ? order[kk] : top ? np - 1 - kk : kk;
       int r = pool[k];
       if (pass == -4 && r != hint) continue;
       if (r < 0 || r >= 64 || own[r] != REF_NONE) continue;
@@ -169,6 +190,24 @@ static Ref ra2a_bfi_field(Isel *s, Ref v) {
 #endif
 }
 
+/* The operand instruction v reads after it has written its result, which
+   may not share the result's register though v reads it last: a bfi's
+   field source (the field built in a scratch register and moved back), and
+   a barriered load's mask, tested against the reference loaded
+   (emit_gc_load_barrier) -- which in the loaded reference's register made
+   the test of it against itself, so the slow path on every non-null load
+   (javabench/treemap) */
+static Ref ra2a_late_read(Isel *s, Ref v) {
+  Ref fx = ra2a_bfi_field(s, v);
+  if (fx != REF_NONE) return fx;
+  IrFunc *f = s->f;
+  const Inst *in = &f->insts[v];
+  if ((in->op == I_FIELD_GET || in->op == I_ARRAY_GET || in->op == I_EXN_PAYLOAD) &&
+      !vt_is_float((ValType)in->type) && (ValType)in->type != VT_V128 && load_needs_barrier(f, in))
+    return load_barrier_mask(f, v);
+  return REF_NONE;
+}
+
 /* Coalescing.  The affinities -- a param and the argument an edge passes
    it, a copy and its operand, a result and the operand it is tied to --
    by how often their move would run, heaviest first; two groups become one
@@ -179,7 +218,9 @@ static Ref ra2a_bfi_field(Isel *s, Ref v) {
    of its first wherever it is free and leave the others to whatever was
    left, crossing groups over and moving their values round on every way
    between them. */
-typedef struct { Ref a, b; double w; uint32_t span; } Ra2Aff;
+/* (split: an edge's move that needs a block of its own, the edge leaving a
+   branch for a merge -- the move and a branch) */
+typedef struct { Ref a, b; double w; uint32_t span; bool split; } Ra2Aff;
 
 /* by weight, then the shorter lives first: of the arguments a merge's param
    is passed, one live everywhere -- the function's own param -- taken in
@@ -236,14 +277,34 @@ static bool ra2a_live_after(Ra2Int *I, Ref x, uint32_t bi, int32_t p) {
 }
 
 static bool ra2a_interfere(Ra2Int *I, Ref a, Ref b) {
-  /* a bfi's result and the value its field is taken from: in one register
-     the field is built in a scratch register and moved back */
-  if (ra2a_bfi_field(I->s, a) == b || ra2a_bfi_field(I->s, b) == a) return true;
+  /* a result and what its instruction reads after writing it */
+  if (ra2a_late_read(I->s, a) == b || ra2a_late_read(I->s, b) == a) return true;
   if (I->val[a] == I->val[b]) return false;
   return ra2a_live_after(I, a, I->blk[b], I->num[b]) || ra2a_live_after(I, b, I->blk[a], I->num[a]);
 }
 
+/* the fixed registers a group's values are wanted in (ra2_assign's
+   fhint), by weight: the heaviest one, its weight in *best -- none for a
+   group live across a call, which goes to a callee-saved register, not to
+   the argument and result registers the hints name (asbench/recurse's
+   fib(n-1), across the second call: kept apart from n-1 for its x0, it put
+   a move and a branch on every way that made no call) */
+static int ra2a_hint_best(const int *fhint, const double *fhw, const uint8_t *xhot,
+                          const uint32_t *mnext, uint32_t g, const uint32_t *also, double *best) {
+  double hw[64] = { 0 };
+  *best = 0;
+  for (int pass = 0; pass < 2; pass++)
+    for (uint32_t x = pass ? (also ? *also : UINT32_MAX) : g; x != UINT32_MAX; x = mnext[x]) {
+      if (xhot[x] && !warmc_getenv("WARMC_RA2_HINTCO_HOT")) return -1;
+      if (fhint[x] >= 0 && fhint[x] < 64) hw[fhint[x]] += fhw[x];
+    }
+  int r = -1;
+  for (int q = 0; q < 64; q++) if (hw[q] > *best) { *best = hw[q]; r = q; }
+  return r;
+}
+
 static void ra2a_coalesce(Isel *s, const bool *wants, uint32_t *grp, Ref *eu, uint32_t eucap, double *gw,
+                          const int *fhint, const double *fhw, const uint8_t *xhot,
                           Ref **valout, Ra2Aff **affout, uint32_t *naffout) {
   IrFunc *f = s->f;
   uint32_t n = f->ninsts;
@@ -257,9 +318,9 @@ static void ra2a_coalesce(Isel *s, const bool *wants, uint32_t *grp, Ref *eu, ui
   for (uint32_t b = 0; b < f->nblocks; b++)
     for (uint32_t k = s->lv_in_off[b]; k < s->lv_in_off[b + 1]; k++) span[s->lv_in[k]]++;
   bool use_span = !warmc_getenv("WARMC_RA2_NO_SPAN");
-#define RA2A_AFF(x, y, w_) do { if (naff == capaff) { capaff = capaff ? capaff * 2 : 64; \
+#define RA2A_AFF(x, y, w_, sp_) do { if (naff == capaff) { capaff = capaff ? capaff * 2 : 64; \
     aff = xrealloc(aff, capaff * sizeof(Ra2Aff)); } \
-    aff[naff++] = (Ra2Aff){ (x), (y), (w_), use_span ? span[x] + span[y] : 0 }; } while (0)
+    aff[naff++] = (Ra2Aff){ (x), (y), (w_), use_span ? span[x] + span[y] : 0, (sp_) }; } while (0)
   for (uint32_t oi = 0; oi < f->norder; oi++) {
     uint32_t bi = f->order[oi];
     Block *bb = &f->blocks[bi];
@@ -284,9 +345,10 @@ static void ra2a_coalesce(Isel *s, const bool *wants, uint32_t *grp, Ref *eu, ui
       Block *tb = &f->blocks[e->target];
       /* an edge's moves run as often as the less often run of its ends */
       double we = blk_freq(tb) < w ? blk_freq(tb) : w;
+      bool split = bb->nsuccs > 1 && tb->npreds > 1;
       for (uint32_t j = 0; j < e->nargs && j < tb->nparams; j++) {
         Ref x = e->args[j], y = tb->params[j];
-        if (wants[x] && wants[y] && (bool)s->cls[x] == (bool)s->cls[y]) RA2A_AFF(x, y, we);
+        if (wants[x] && wants[y] && (bool)s->cls[x] == (bool)s->cls[y]) RA2A_AFF(x, y, we, split);
       }
     }
     for (uint32_t i = 0; i < bb->ninsts; i++) {
@@ -295,12 +357,13 @@ static void ra2a_coalesce(Isel *s, const bool *wants, uint32_t *grp, Ref *eu, ui
       Ref t = f->insts[u].op == I_COPY ? ir_args(f, u)[0] : tied_operand_of(f, u);
       /* a bfi inserts its field into its other operand in place */
       if (t == REF_NONE && ra2a_bfi_field(s, u) != REF_NONE) t = ir_args(f, u)[(s->bfi[u] - 1) ^ 1];
-      if (t != REF_NONE && wants[t] && (bool)s->cls[u] == (bool)s->cls[t]) RA2A_AFF(u, t, w);
+      if (t != REF_NONE && wants[t] && (bool)s->cls[u] == (bool)s->cls[t]) RA2A_AFF(u, t, w, false);
     }
   }
 #undef RA2A_AFF
   xfree(span);
   qsort(aff, naff, sizeof(Ra2Aff), ra2a_aff_cmp);
+  bool hintco = fhint && !warmc_getenv("WARMC_RA2_NO_HINTCO");
   /* each group's members, as lists through mnext from its root */
   uint32_t *mnext = xmalloc((n ? n : 1) * sizeof(uint32_t));
   uint32_t *mtail = xmalloc((n ? n : 1) * sizeof(uint32_t));
@@ -323,6 +386,24 @@ static void ra2a_coalesce(Isel *s, const bool *wants, uint32_t *grp, Ref *eu, ui
         fprintf(stderr, "co reject v%u-v%u w=%g: v%u(b%u) vs v%u(b%u)\n", aff[k].a, aff[k].b, aff[k].w,
                 cx, I.blk[cx], cy, I.blk[cy]);
       continue;
+    }
+    /* Nor where the two are wanted in fixed registers apart, for at least
+       as much as the move saves: one register for both meets one of them
+       only -- rsbench/recurse's n-1, a call's argument in x1 and passed on
+       the other way to the merge the call's result in x0 joins, took x0 and
+       a move to x1 before every call.  A move an edge needs a block of its
+       own for costs that block's branch too: kept apart for its hint,
+       asbench/recurse's n-2 put a move and two branches on every way that
+       made no call, where the call's way had made one move. */
+    if (hintco) {
+      double ba, bb, bm;
+      int ra = ra2a_hint_best(fhint, fhw, xhot, mnext, ga, NULL, &ba);
+      int rb = ra2a_hint_best(fhint, fhw, xhot, mnext, gb, NULL, &bb);
+      if (ra >= 0 && rb >= 0 && ra != rb) {
+        ra2a_hint_best(fhint, fhw, xhot, mnext, ga, &gb, &bm);
+        double save = aff[k].w * (aff[k].split && !warmc_getenv("WARMC_RA2_HINTCO_NOSPLIT") ? 2 : 1);
+        if (ba + bb - save >= bm) continue;
+      }
     }
     /* gb's members join ga's */
     grp[gb] = ga;
@@ -512,9 +593,11 @@ static void ra2a_plan(Isel *s, const bool *wants, uint32_t *grp, const uint32_t 
     bool ref = vt_is_ref((ValType)f->insts[g].type);
     int pick = -1;
     bool top = want_cs && ghot[g] == 2 && c == 0 && f->insts[g].op != I_CONST && !warmc_getenv("WARMC_RA2_NO_CSTOP");
+    int order[64];
+    int no = top ? ra2a_top_order(pool, np, order) : 0;
     for (int pass = 0; pass < 2 && pick < 0; pass++)
       for (int qq = 0; qq < np && pick < 0; qq++) {
-        int r = pool[top ? np - 1 - qq : qq];
+        int r = pool[no == np ? order[qq] : top ? np - 1 - qq : qq];
         if (r < 0 || r >= 64 || (forb >> r & 1)) continue;
         if (!c && galloc[g] && r == RA_ALLOC_RES_REG) continue;
         bool cs = c ? fpr_is_callee_saved(r) : gpr_is_callee_saved(r);
@@ -914,7 +997,7 @@ static void ra2a_recolor(Isel *s, const bool *wants, uint32_t *grp, const double
             Ref x = lst[k];
             if (live[x] && x != u) RA2R_EDGE(u, x);
           }
-          Ref fx = ra2a_bfi_field(s, u);
+          Ref fx = ra2a_late_read(s, u);
           if (fx != REF_NONE && wants[fx] && RA2R_REG(fx)) {
             if (nve == capve) { capve = capve ? capve * 2 : 1024; ve = xrealloc(ve, capve * sizeof(Ra2VE)); }
             ve[nve++] = (Ra2VE){ u < fx ? u : fx, u < fx ? fx : u };
@@ -1277,7 +1360,8 @@ static void ra2_assign(Isel *s) {
   Ref *val = NULL;
   Ra2Aff *affs = NULL;
   uint32_t naffs = 0;
-  if (affin && !warmc_getenv("WARMC_RA2_BLIND_AFFIN")) ra2a_coalesce(s, wants, grp, eu, eucap, gw, &val, &affs, &naffs);
+  if (affin && !warmc_getenv("WARMC_RA2_BLIND_AFFIN"))
+    ra2a_coalesce(s, wants, grp, eu, eucap, gw, fhint, fhw, xhot, &val, &affs, &naffs);
   /* the groups of more than one value, and the registers they took */
   uint32_t *gsize = xcalloc(n ? n : 1, sizeof(uint32_t));
   for (uint32_t v = 0; v < n; v++) if (wants[v]) gsize[RA2A_FIND(v)]++;
