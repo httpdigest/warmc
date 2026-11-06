@@ -371,7 +371,7 @@ static void print_stats(void) {
           "             slot_tests=%llu slot_nullchks=%llu slot_brs=%llu once_dead=%llu once_dominated=%llu once_looped=%llu\n"
           "             bit_tests=%llu way_folds=%llu bit_brs=%llu exit_defers=%llu stubs_out=%llu blocks_merged=%llu\n"
           "             bound_lens=%llu bound_lens_hoisted=%llu bce_version_sym=%llu gc_nonnull_params=%llu slot_nonnull=%llu gc_nulltraps=%llu\n"
-          "             ra2_reloads=%llu ra2_spills=%llu ra2_remats=%llu ra2_params=%llu ra2_fallback=%llu ra2_csa_hot=%llu ra2_callsplits=%llu ra2_whole=%llu ra2_tried=%llu ra2_picked=%llu\n",
+          "             ra2_reloads=%llu ra2_spills=%llu ra2_remats=%llu ra2_params=%llu ra2_fallback=%llu ra2_csa_hot=%llu ra2_callsplits=%llu ra2_whole=%llu ra2_tried=%llu ra2_picked=%llu ra2_recolored=%llu\n",
           (unsigned long long)g_stats.folded, (unsigned long long)g_stats.dce_removed,
           (unsigned long long)g_stats.cse_removed, (unsigned long long)g_stats.licm_hoisted,
           (unsigned long long)g_stats.branch_simplified,
@@ -500,7 +500,8 @@ static void print_stats(void) {
           (unsigned long long)g_stats.ra2_remats, (unsigned long long)g_stats.ra2_params,
           (unsigned long long)g_stats.ra2_fallback, (unsigned long long)g_stats.ra2_csa_hot,
           (unsigned long long)g_stats.ra2_callsplits, (unsigned long long)g_stats.ra2_whole,
-          (unsigned long long)g_stats.ra2_tried, (unsigned long long)g_stats.ra2_picked);
+          (unsigned long long)g_stats.ra2_tried, (unsigned long long)g_stats.ra2_picked,
+          (unsigned long long)g_stats.ra2_recolored);
 }
 
 /* --validate-only given several inputs: each one's verdict, a line apiece

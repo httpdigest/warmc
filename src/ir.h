@@ -829,7 +829,7 @@ typedef struct {
   uint64_t ra2_reloads, ra2_spills, ra2_remats, ra2_params;
   /* its own assignment's (ra2_assign.inc): values it found no register
      for, and caller-saved ones saved around a hot call */
-  uint64_t ra2_fallback, ra2_csa_hot, ra2_callsplits, ra2_whole;
+  uint64_t ra2_fallback, ra2_csa_hot, ra2_callsplits, ra2_whole, ra2_recolored;
   /* the functions the portfolio tried the two on, and those whose new
      code it kept (codegen.c ra2_portfolio) */
   uint64_t ra2_tried, ra2_picked;

@@ -4392,7 +4392,19 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
      which a value of its own would no longer be.  Not where values live
      into a landing pad or a continuation's handler, which take theirs from
      slots of their own. */
-  if ((ra2_on() || f->ra2_try) && !s->naive && !f->ra2_done && !f->npads && !ra2_has_cont(f)) {
+  bool ra2_this = true;
+  {
+    const char *only = warmc_getenv("WARMC_RA2_ONLY");
+    if (only) {
+      ra2_this = false;
+      for (const char *q = only; *q;) {
+        if ((uint32_t)atoi(q) == f->func_index) ra2_this = true;
+        while (*q && *q != ',') q++;
+        if (*q == ',') q++;
+      }
+    }
+  }
+  if ((ra2_on() || f->ra2_try) && ra2_this && !s->naive && !f->ra2_done && !f->npads && !ra2_has_cont(f)) {
     int gp[NGPR_ALLOC + 16];
     int ng = ra_gpr_pool(s, gp);
     ng += isel_spare_gprs(s, gp + ng);
@@ -4407,7 +4419,7 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
   /* the spiller's copies in slots */
   if (f->ra2_mem)
     for (uint32_t v = 0; v < f->ninsts && v < f->ra2_nmem; v++)
-      if (f->ra2_mem[v]) s->pinned[v] = 1;
+      if (f->ra2_mem[v] == 1) s->pinned[v] = 1;
   if (s->has_pads)
     for (uint32_t bi = 0; bi < f->nblocks; bi++) {
       Block *b = &f->blocks[bi];

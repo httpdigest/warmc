@@ -74,12 +74,16 @@ typedef struct {
   /* the params the pass added, to drop the trivial ones */
   Ref *added;
   uint32_t nadded, capadded;
-  uint64_t nreload, nspill, nremat, nparam, ncallsplit, nwhole;
+  uint64_t nreload, nspill, nremat, nparam, ncallsplit, nwhole, ndeadparam;
   /* per block the most values of each class live at once; the loop walk's
      marks and stack */
   int (*maxp)[2];
   uint32_t *lstamp, *lstack, lgen;
   uint8_t *inblk;
+  /* folded instructions not moved to their one reader (ra2_fold_order): an
+     address several accesses fold, each its own -- made again at each
+     reader, its operands the reader's (ra2_unshare) */
+  uint8_t *fmoved, *shared;
 } Ra2;
 
 __attribute__((unused))
@@ -197,9 +201,36 @@ static int32_t ra2_dout(Ra2 *R, uint32_t b, Ref x) {
   return best;
 }
 
-static void ra2_uses_of(IrFunc *f, Ref u, Ref **a, uint32_t *n) {
-  *a = ir_args(f, u);
-  *n = f->insts[u].nargs;
+/* An operand the selection takes as an immediate: a constant that holds no
+   register for it, nor counts as a read the distances see -- the reader
+   gets a constant of its own, made where it reads it, which takes no
+   location (analyse_immediates), where a version the pass made of the
+   constant -- a block's param -- would take a register and the immediate's
+   form with it (a compare with zero, a test of the sign bit). */
+static bool ra2_imm_use(Ra2 *R, Ref u, uint32_t j, Ref x) {
+  return x < R->n0 && R->rem[x] && R->f->insts[x].op == I_CONST && is_imm_at(R->s, u, j, x) &&
+         !warmc_getenv("WARMC_RA2_NO_IMMUSE");
+}
+
+/* The reads of instruction u as the distances count them, into rb: through
+   the folded instructions several read (each reader reads their operands),
+   none of a constant taken as an immediate; none at all for such a folded
+   instruction itself */
+static uint32_t ra2_reads_in(Ra2 *R, Ref u, Ref **rb, uint32_t *cap, uint32_t n) {
+  IrFunc *f = R->f;
+  for (uint32_t j = 0; j < f->insts[u].nargs; j++) {
+    Ref y = ir_args(f, u)[j];
+    if (y < R->n0 && R->shared && R->shared[y]) { n = ra2_reads_in(R, y, rb, cap, n); continue; }
+    if (ra2_imm_use(R, u, j, y)) continue;
+    if (n == *cap) { *cap = *cap ? *cap * 2 : 16; *rb = xrealloc(*rb, *cap * sizeof(Ref)); }
+    (*rb)[n++] = y;
+  }
+  return n;
+}
+
+static uint32_t ra2_reads(Ra2 *R, Ref u, Ref **rb, uint32_t *cap) {
+  if (u < R->n0 && R->shared && R->shared[u]) return 0;
+  return ra2_reads_in(R, u, rb, cap, 0);
 }
 
 /* The first use of each live-in in its block, then the distances to a
@@ -214,6 +245,8 @@ static void ra2_distances(Ra2 *R) {
   int32_t *fu = xmalloc((tot ? tot : 1) * sizeof(int32_t));
   int32_t *first = xmalloc((R->n0 ? R->n0 : 1) * sizeof(int32_t));
   for (uint32_t i = 0; i < R->n0; i++) first[i] = -1;
+  Ref *rb = NULL;
+  uint32_t caprb = 0;
   for (uint32_t k = 0; k < tot; k++) R->din[k] = RA2_INF;
   for (uint32_t oi = 0; oi < f->norder; oi++) {
     uint32_t b = f->order[oi];
@@ -224,10 +257,8 @@ static void ra2_distances(Ra2 *R) {
       if (nt == ct) { ct = ct ? ct * 2 : 32; touched = xrealloc(touched, ct * sizeof(Ref)); } \
       touched[nt++] = x_; } } while (0)
     for (uint32_t i = 0; i < bb->ninsts; i++) {
-      Ref *a;
-      uint32_t na;
-      ra2_uses_of(f, bb->insts[i], &a, &na);
-      for (uint32_t j = 0; j < na; j++) RA2_SEEN(a[j], (int32_t)i + 1);
+      uint32_t na = ra2_reads(R, bb->insts[i], &rb, &caprb);
+      for (uint32_t j = 0; j < na; j++) RA2_SEEN(rb[j], (int32_t)i + 1);
     }
     int32_t te = (int32_t)bb->ninsts + 1;
     if (bb->term == T_BRIF || bb->term == T_BRTABLE) RA2_SEEN(bb->term_arg, te);
@@ -262,6 +293,7 @@ static void ra2_distances(Ra2 *R) {
   }
   xfree(fu);
   xfree(first);
+  xfree(rb);
 }
 
 static int ra2_cls(Ra2 *R, Ref x) { return R->s->cls[x] ? 1 : 0; }
@@ -274,6 +306,8 @@ static void ra2_block_pressure(Ra2 *R) {
   R->maxp = xcalloc(f->nblocks ? f->nblocks : 1, sizeof(*R->maxp));
   uint8_t *live = xcalloc(R->n0 ? R->n0 : 1, 1);
   Ref *lst = xmalloc((R->n0 ? R->n0 : 1) * sizeof(Ref));
+  Ref *rb = NULL;
+  uint32_t caprb = 0;
   for (uint32_t oi = 0; oi < f->norder; oi++) {
     uint32_t b = f->order[oi];
     Block *bb = &f->blocks[b];
@@ -290,8 +324,8 @@ static void ra2_block_pressure(Ra2 *R) {
     for (uint32_t i = bb->ninsts; i-- > 0;) {
       Ref u = bb->insts[i];
       if (u < R->n0 && (R->need[u] || R->res[u]) && live[u]) { live[u] = 0; cnt[ra2_cls(R, u)]--; }
-      Ref *a = ir_args(f, u);
-      for (uint32_t j = 0; j < f->insts[u].nargs; j++) RA2_LIVE(a[j]);
+      uint32_t na = ra2_reads(R, u, &rb, &caprb);
+      for (uint32_t j = 0; j < na; j++) RA2_LIVE(rb[j]);
       for (int c = 0; c < 2; c++) if (cnt[c] > mx[c]) mx[c] = cnt[c];
     }
 #undef RA2_LIVE
@@ -301,6 +335,7 @@ static void ra2_block_pressure(Ra2 *R) {
   }
   xfree(live);
   xfree(lst);
+  xfree(rb);
 }
 
 /* The most values live at once in the loop headed by h: its blocks, those
@@ -355,6 +390,9 @@ static Ref ra2_edge_arg(Ra2 *R, uint32_t p, Ref x) {
     if (p == R->cur_b) ra2_out(R, r);
     else ra2_insert(f, p, f->blocks[p].ninsts, r);
     R->nremat++;
+    /* read by the edge alone: its move makes it in its target's place, in
+       no register of its own (ra2_assign) */
+    R->slotv[r] = 2;
     return r;
   }
   return ra2_mem(R, x);
@@ -392,6 +430,19 @@ static void ra2_evict(Ra2 *R, Ref x, int32_t nu) {
   if (nu < RA2_INF && !R->rem[x]) ra2_mem(R, x);
 }
 
+/* How much further ahead than it is a value made again where it is out of
+   the registers counts, for which goes: the constant costs its making at
+   the next read, where another value costs a store once and a load there.
+   Taken in at a block's start by the same measure.  Tracked as values,
+   one-instruction constants had pushed asbench/arrpush's push loop's
+   length into a slot, stored on every push. */
+static int64_t ra2_remw(Ra2 *R, Ref x) {
+  if (!R->rem[x]) return 1;
+  static int w = -1;
+  if (w < 0) { const char *e = getenv("WARMC_RA2_REMW"); w = e ? atoi(e) : 1; if (w < 1) w = 1; }
+  return w;
+}
+
 /* Room for need more values of class c: the ones used furthest ahead go,
    a value made again sooner than one that would need a reload, and none
    that this instruction reads (keep). */
@@ -404,7 +455,7 @@ static void ra2_room(Ra2 *R, Ra2Set *W, int c, int need, const Ref *keep, uint32
       bool kept = false;
       for (uint32_t j = 0; j < nkeep && !kept; j++) kept = keep[j] == x;
       if (kept) continue;
-      int64_t key = (int64_t)W->w[c][k].nu * 2 + (R->rem[x] ? 1 : 0);
+      int64_t key = (int64_t)W->w[c][k].nu * 2 * ra2_remw(R, x) + (R->rem[x] ? 1 : 0);
       if (key > best) { best = key; vic = k; }
     }
     if (vic < 0) return;
@@ -448,6 +499,144 @@ static int32_t ra2_next(Ra2 *R, uint32_t b, const Ra2Uses *u, Ref x, int32_t p, 
 }
 
 
+/* One instruction's operands as the walk takes them in: its block's
+   registers, where it is, what its reads keep, and the versions it reads */
+typedef struct {
+  Ra2Set *W;
+  Ra2Uses *uses;
+  uint32_t b;
+  int32_t p, blen, ncall;
+  bool call;
+  const Ref *keep;
+  uint32_t nkeep;
+  Ref *rd;
+  uint32_t nrd, caprd;
+} Ra2Op;
+
+static void ra2_note_read(Ra2Op *o, Ref v) {
+  if (o->nrd == o->caprd) {
+    o->caprd = o->caprd ? o->caprd * 2 : 8;
+    o->rd = xrealloc(o->rd, o->caprd * sizeof(Ref));
+  }
+  o->rd[o->nrd++] = v;
+}
+
+/* what an instruction reads, through the folded instructions several read
+   (each reader reads their operands) */
+static void ra2_keep_add(Ra2 *R, Ref u, Ref **kp, uint32_t *nk, uint32_t *ck, Ref *inl) {
+  IrFunc *f = R->f;
+  for (uint32_t j = 0; j < f->insts[u].nargs; j++) {
+    Ref y = ir_args(f, u)[j];
+    if (y < R->n0 && R->shared[y]) { ra2_keep_add(R, y, kp, nk, ck, inl); continue; }
+    if (*nk == *ck) {
+      *ck *= 2;
+      if (*kp == inl) { Ref *n = xmalloc(*ck * sizeof(Ref)); memcpy(n, inl, *nk * sizeof(Ref)); *kp = n; }
+      else *kp = xrealloc(*kp, *ck * sizeof(Ref));
+    }
+    (*kp)[(*nk)++] = y;
+  }
+}
+
+static Ref ra2_operand(Ra2 *R, Ra2Op *o, Ref user, uint32_t j, Ref x);
+
+/* A folded instruction several read, as this reader reads it: itself where
+   its operands are the versions the reader has, else a copy of it made
+   right here of those -- which folds into this reader alone, as the
+   selection folds it into each (analyse_immediates) */
+static Ref ra2_unshare(Ra2 *R, Ra2Op *o, Ref x) {
+  IrFunc *f = R->f;
+  uint32_t na = f->insts[x].nargs;
+  Ref buf[8];
+  Ref *nv = na <= 8 ? buf : xmalloc(na * sizeof(Ref));
+  bool same = true;
+  for (uint32_t j = 0; j < na; j++) {
+    Ref y = ir_args(f, x)[j];
+    nv[j] = ra2_operand(R, o, x, j, y);
+    if (nv[j] != y) same = false;
+  }
+  Ref r = x;
+  if (!same) {
+    Inst xc = f->insts[x];
+    r = ra2_new(R, o->b, (IrOp)xc.op, (ValType)xc.type, nv, na, xc.imm, xc.imm2);
+    ra2_out(R, r);
+  }
+  if (nv != buf) xfree(nv);
+  return r;
+}
+
+/* Operand j of user, x, as the user reads it: the version in a register, a
+   constant made again, a reload, or the copy in a slot */
+static Ref ra2_operand(Ra2 *R, Ra2Op *o, Ref user, uint32_t j, Ref x) {
+  IrFunc *f = R->f;
+  if (x < R->n0 && R->shared[x]) return ra2_unshare(R, o, x);
+  if (x >= R->n0 || !R->need[x]) return x;
+  if (ra2_imm_use(R, user, j, x)) {
+    Inst xc = f->insts[x];
+    Ref r = ra2_new(R, o->b, (IrOp)xc.op, (ValType)xc.type, NULL, 0, xc.imm, xc.imm2);
+    ra2_out(R, r);
+    return r;
+  }
+  Ra2Set *W = o->W;
+  int c = ra2_cls(R, x);
+  int k = ra2_find(W, c, x);
+  if (k >= 0) {
+    /* A constant held as a block's param is no constant to the selection,
+       whose forms test the operand's instruction (a call to the allocator
+       for an array of constant length): one that is one instruction to make
+       is made again here for a reader that takes its operands by moves --
+       a call, an allocation -- which costs that instruction anyway; the
+       value the register holds from here on. */
+    Ref ver = W->w[c][k].ver;
+    Inst *xi = &f->insts[x];
+    uint16_t uop = f->insts[user].op;
+    bool moved = uop == I_CALL || uop == I_CALL_INDIRECT || uop == I_CALL_REF || uop == I_RETURN_CALL ||
+                 uop == I_RETURN_CALL_INDIRECT || uop == I_RETURN_CALL_REF || uop == I_MEM_GROW ||
+                 uop == I_MEM_COPY || uop == I_MEM_FILL || uop == I_MEM_INIT || uop == I_TABLE_GET ||
+                 uop == I_TABLE_SET || uop == I_TABLE_GROW || uop == I_TABLE_FILL || uop == I_TABLE_COPY ||
+                 uop == I_TABLE_INIT || uop == I_STRUCT_NEW || uop == I_ARRAY_NEW || uop == I_ARRAY_NEW_SEG ||
+                 uop == I_ARRAY_OP || uop == I_REF_TEST || uop == I_ANY_OF_EXTERN || uop == I_EXTERN_OF_ANY;
+    if (moved && R->rem[x] && xi->op == I_CONST && f->insts[ver].op != I_CONST && !vt_is_float((ValType)xi->type) &&
+        (ValType)xi->type != VT_V128 && ir_const_cost(xi->imm, vt_is_64((ValType)xi->type)) <= 1 &&
+        !warmc_getenv("WARMC_RA2_NO_CONSTUSE")) {
+      Inst xc = *xi;
+      Ref r = ra2_new(R, o->b, (IrOp)xc.op, (ValType)xc.type, NULL, 0, xc.imm, xc.imm2);
+      ra2_out(R, r);
+      R->slotv[r] = 3;
+      W->w[c][k].ver = r;
+      ver = r;
+    }
+    ra2_note_read(o, ver);
+    return ver;
+  }
+  int32_t nu = ra2_next(R, o->b, &o->uses[x], x, o->p, o->blen);
+  if (R->rem[x]) {
+    ra2_room(R, W, c, 1, o->keep, o->nkeep);
+    Inst xc = f->insts[x];
+    Ref r = ra2_new(R, o->b, (IrOp)xc.op, (ValType)xc.type, NULL, 0, xc.imm, xc.imm2);
+    ra2_out(R, r);
+    R->nremat++;
+    R->slotv[r] = 3;
+    if (nu < RA2_INF && W->n[c] < R->K[c] && W->n[c] < 64) W->w[c][W->n[c]++] = (Ra2W){ x, r, nu };
+    ra2_note_read(o, r);
+    return r;
+  }
+  Ref m = ra2_mem(R, x);
+  /* loaded into a register where it is read again before the next call
+     that would take it (or the block's end) -- the load then serves both
+     -- or soon */
+  bool again = nu - o->p < RA2_REUSE || (nu <= o->blen && nu < o->ncall);
+  if (!o->call && again) {
+    ra2_room(R, W, c, 1, o->keep, o->nkeep);
+    Ref r = ra2_new(R, o->b, I_COPY, (ValType)f->insts[x].type, &m, 1, 0, 0);
+    ra2_out(R, r);
+    R->nreload++;
+    if (W->n[c] < R->K[c] && W->n[c] < 64) W->w[c][W->n[c]++] = (Ra2W){ x, r, nu };
+    ra2_note_read(o, r);
+    return r;
+  }
+  return m;
+}
+
 static void ra2_block(Ra2 *R, uint32_t b, Ra2Uses *uses, Ref *touched, uint32_t *ntouched) {
   IrFunc *f = R->f;
   Isel *s = R->s;
@@ -463,12 +652,13 @@ static void ra2_block(Ra2 *R, uint32_t b, Ra2Uses *uses, Ref *touched, uint32_t 
       if (!U->n) touched[(*ntouched)++] = x_; \
       if (U->n == U->cap) { U->cap = U->cap ? U->cap * 2 : 4; U->pos = xrealloc(U->pos, U->cap * sizeof(int32_t)); } \
       U->pos[U->n++] = (p); } } while (0)
+  Ref *rb = NULL;
+  uint32_t caprb = 0;
   for (uint32_t i = 0; i < nb; i++) {
-    Ref *a;
-    uint32_t na;
-    ra2_uses_of(f, orig[i], &a, &na);
-    for (uint32_t j = 0; j < na; j++) RA2_USE(a[j], (int32_t)i + 1);
+    uint32_t na = ra2_reads(R, orig[i], &rb, &caprb);
+    for (uint32_t j = 0; j < na; j++) RA2_USE(rb[j], (int32_t)i + 1);
   }
+  xfree(rb);
   if (bb->term == T_BRIF || bb->term == T_BRTABLE) RA2_USE(bb->term_arg, blen);
   for (uint32_t i = 0; i < bb->nret; i++) RA2_USE(bb->ret_args[i], blen);
   for (uint32_t k = 0; k < bb->nsuccs; k++)
@@ -530,7 +720,8 @@ static void ra2_block(Ra2 *R, uint32_t b, Ra2Uses *uses, Ref *touched, uint32_t 
       if (!own && nproc && !held && !(header && nu < RA2_LOOPX) &&
           !warmc_getenv("WARMC_RA2_ENTRY_ALL"))
         continue;
-      int64_t key = (int64_t)nu * 4 + (held == nproc && nproc ? 0 : held ? 1 : 2);
+      int64_t key = (int64_t)(nu < RA2_LOOPX ? nu * ra2_remw(R, x) : nu) * 4 +
+                    (held == nproc && nproc ? 0 : held ? 1 : 2);
       cv[m] = x;
       ck[m++] = key;
     }
@@ -652,49 +843,26 @@ static void ra2_block(Ra2 *R, uint32_t b, Ra2Uses *uses, Ref *touched, uint32_t 
     }
     Inst *in = &f->insts[u];
     int32_t p = (int32_t)i + 1;
-    Ref *a = ir_args(f, u);
+    /* a folded instruction several read is made at each of them */
+    if (u < R->n0 && R->shared[u]) {
+      R->outpos[u] = (int32_t)R->nout;
+      ra2_out(R, u);
+      continue;
+    }
     uint32_t na = in->nargs;
     bool call = ra2_is_call(in->op);
-    /* the instruction's operands as they were: what the evictions keep */
+    /* the instruction's operands as they were, through what folds into it:
+       what the evictions keep */
     Ref keep[16];
-    Ref *kp = na <= 16 ? keep : xmalloc(na * sizeof(Ref));
-    memcpy(kp, a, na * sizeof(Ref));
+    Ref *kp = keep;
+    uint32_t nk = 0, ck = 16;
+    ra2_keep_add(R, u, &kp, &nk, &ck, keep);
     /* its operands into registers, or read from their slots */
+    Ra2Op o = { &W, uses, b, p, blen, ncall[i], call, kp, nk, NULL, 0, 0 };
     for (uint32_t j = 0; j < na; j++) {
-      Ref x = a[j];
-      if (x >= R->n0 || !R->need[x]) continue;
-      int c = ra2_cls(R, x);
-      int k = ra2_find(&W, c, x);
-      if (k >= 0) { a[j] = W.w[c][k].ver; continue; }
-      int32_t nu = ra2_next(R, b, &uses[x], x, p, blen);
-      if (R->rem[x]) {
-        ra2_room(R, &W, c, 1, kp, na);
-        Inst xc = f->insts[x];
-        Ref r = ra2_new(R, b, (IrOp)xc.op, (ValType)xc.type, NULL, 0, xc.imm, xc.imm2);
-        ra2_out(R, r);
-        R->nremat++;
-        if (nu < RA2_INF && W.n[c] < R->K[c] && W.n[c] < 64) W.w[c][W.n[c]++] = (Ra2W){ x, r, nu };
-        a = ir_args(f, u);
-        a[j] = r;
-        continue;
-      }
-      Ref m = ra2_mem(R, x);
-      a = ir_args(f, u);
-      /* loaded into a register where it is read again before the next call
-         that would take it (or the block's end) -- the load then serves
-         both -- or soon */
-      bool again = nu - p < RA2_REUSE || (nu <= blen && nu < ncall[i]);
-      if (!call && again) {
-        ra2_room(R, &W, c, 1, kp, na);
-        Ref r = ra2_new(R, b, I_COPY, (ValType)f->insts[x].type, &m, 1, 0, 0);
-        ra2_out(R, r);
-        R->nreload++;
-        if (W.n[c] < R->K[c] && W.n[c] < 64) W.w[c][W.n[c]++] = (Ra2W){ x, r, nu };
-        a = ir_args(f, u);
-        a[j] = r;
-      } else {
-        a[j] = m;
-      }
+      Ref x = ir_args(f, u)[j];
+      Ref r = ra2_operand(R, &o, u, j, x);
+      ir_args(f, u)[j] = r;
     }
     /* the operands' next uses; the dead ones leave only once the result
        has its register, which the allocation gives no operand's */
@@ -702,9 +870,10 @@ static void ra2_block(Ra2 *R, uint32_t b, Ra2Uses *uses, Ref *touched, uint32_t 
       for (int k = 0; k < W.n[c]; k++) {
         Ra2W *w = &W.w[c][k];
         bool read = false;
-        for (uint32_t j = 0; j < na && !read; j++) read = a[j] == w->ver;
+        for (uint32_t j = 0; j < o.nrd && !read; j++) read = o.rd[j] == w->ver;
         if (read) w->nu = ra2_next(R, b, &uses[w->v], w->v, p, blen);
       }
+    xfree(o.rd);
     R->outpos[u] = (int32_t)R->nout;
     ra2_out(R, u);
     if (ra2_hot_call(R, b, u)) {
@@ -766,7 +935,7 @@ static void ra2_block(Ra2 *R, uint32_t b, Ra2Uses *uses, Ref *touched, uint32_t 
       int32_t nu = ra2_next(R, b, &uses[u], u, p, blen);
       if (nu < RA2_INF) {
         int c = ra2_cls(R, u);
-        ra2_room(R, &W, c, 1, kp, na);
+        ra2_room(R, &W, c, 1, kp, nk);
         if (W.n[c] < 64) W.w[c][W.n[c]++] = (Ra2W){ u, u, nu };
       }
     }
@@ -892,6 +1061,53 @@ static void ra2_trivial_params(Ra2 *R) {
       changed = true;
     }
   }
+  /* A param the pass added that nothing reads but the edges into the
+     params of its kind that nothing reads either -- a value it held a
+     register for on entry and later let go to its slot -- goes too: kept,
+     it would hold a register to the end of its block for nothing. */
+  if (!warmc_getenv("WARMC_RA2_NO_DEADPARAM")) {
+    uint8_t *added = xcalloc(f->ninsts ? f->ninsts : 1, 1);
+    uint8_t *live = xcalloc(f->ninsts ? f->ninsts : 1, 1);
+    Ref *wl = xmalloc((R->nadded ? R->nadded : 1) * sizeof(Ref));
+    uint32_t nwl = 0;
+    for (uint32_t k = 0; k < R->nadded; k++) if (!gone[R->added[k]]) added[R->added[k]] = 1;
+#define RA2_RES(x) ({ Ref r_ = (x); while (repl[r_] != r_) r_ = repl[r_]; r_; })
+#define RA2_MARK(x) do { Ref m_ = RA2_RES(x); if (added[m_] && !live[m_]) { live[m_] = 1; wl[nwl++] = m_; } } while (0)
+    for (uint32_t oi = 0; oi < f->norder; oi++) {
+      Block *bb = &f->blocks[f->order[oi]];
+      for (uint32_t i = 0; i < bb->ninsts; i++)
+        for (uint32_t j = 0; j < f->insts[bb->insts[i]].nargs; j++) RA2_MARK(ir_args(f, bb->insts[i])[j]);
+      if (bb->term == T_BRIF || bb->term == T_BRTABLE) RA2_MARK(bb->term_arg);
+      for (uint32_t i = 0; i < bb->nret; i++) RA2_MARK(bb->ret_args[i]);
+      for (uint32_t si = 0; si < bb->nsuccs; si++) {
+        Edge *e = &bb->succs[si];
+        Block *tb = &f->blocks[e->target];
+        for (uint32_t j = 0; j < e->nargs; j++)
+          if (j >= tb->nparams || !added[tb->params[j]]) RA2_MARK(e->args[j]);
+      }
+    }
+    while (nwl) {
+      Ref p = wl[--nwl];
+      uint32_t b = f->insts[p].block;
+      Block *bb = &f->blocks[b];
+      uint32_t pi = 0;
+      while (pi < bb->nparams && bb->params[pi] != p) pi++;
+      for (uint32_t pq = 0; pq < bb->npreds; pq++) {
+        Block *pb = &f->blocks[bb->preds[pq]];
+        for (uint32_t si = 0; si < pb->nsuccs; si++)
+          if (pb->succs[si].target == b && pi < pb->succs[si].nargs) RA2_MARK(pb->succs[si].args[pi]);
+      }
+    }
+#undef RA2_MARK
+#undef RA2_RES
+    for (uint32_t k = 0; k < R->nadded; k++) {
+      Ref p = R->added[k];
+      if (added[p] && !live[p]) { gone[p] = 1; R->ndeadparam++; }
+    }
+    xfree(added);
+    xfree(live);
+    xfree(wl);
+  }
   /* the reads renamed, the gone params and their edges' slots dropped */
   bool any = false;
   for (uint32_t k = 0; k < R->nadded; k++) any |= gone[R->added[k]];
@@ -961,6 +1177,7 @@ static void ra2_fold_emit(Ra2 *R, uint32_t b, Ref u, Ref *outl, uint32_t *no, ui
     if (!((s->folded && s->folded[x]) || (s->fused && s->fused[x]))) continue;
     if (s->uses && s->uses[x] != 1) continue;
     placed[x] = 1;
+    R->fmoved[x] = 1;
     ra2_fold_emit(R, b, x, outl, no, placed);
     outl[(*no)++] = x;
   }
@@ -972,6 +1189,7 @@ static void ra2_fold_order(Ra2 *R) {
   uint8_t *placed = xcalloc(R->n0 ? R->n0 : 1, 1);
   uint8_t *here = xcalloc(R->n0 ? R->n0 : 1, 1);
   R->inblk = xcalloc(R->n0 ? R->n0 : 1, 1);
+  R->fmoved = xcalloc(R->n0 ? R->n0 : 1, 1);
   for (uint32_t oi = 0; oi < f->norder; oi++) {
     uint32_t b = f->order[oi];
     Block *bb = &f->blocks[b];
@@ -1030,6 +1248,19 @@ static void ra2_fold_order(Ra2 *R) {
   xfree(here);
   xfree(R->inblk);
   R->inblk = NULL;
+  /* what is folded and stays where it is: read where its readers are */
+  R->shared = xcalloc(R->n0 ? R->n0 : 1, 1);
+  if (s->folded && !warmc_getenv("WARMC_RA2_NO_UNSHARE"))
+    for (uint32_t oi = 0; oi < f->norder; oi++) {
+      Block *bb = &f->blocks[f->order[oi]];
+      for (uint32_t i = 0; i < bb->ninsts; i++) {
+        Ref x = bb->insts[i];
+        if (x < R->n0 && s->folded[x] && (!R->fmoved[x] || !warmc_getenv("WARMC_RA2_MOVED_OWN")))
+          R->shared[x] = 1;
+      }
+    }
+  xfree(R->fmoved);
+  R->fmoved = NULL;
 }
 
 /* The function rewritten: its pieces of values in registers and copies in
@@ -1053,7 +1284,13 @@ static void ra2_spill(Isel *s, const int *gpool, int ngpool) {
     if (!value_needs_location(f, v) || in->op == I_NOP) continue;
     /* what takes no register of its own: an immediate, a fused or folded
        instruction, a zero, a value made again where it is read */
-    if (skip_location(s, v) || ra_zero_const(s, v, s->cls[v]) || remat_ok(s, v)) continue;
+    if (skip_location(s, v) || ra_zero_const(s, v, s->cls[v])) continue;
+    /* A constant competes for a register like any value, made again where
+       it is out of them: a loop's constant made on every way round costs
+       that on every way round (rsbench/vecgrow's hash multiplier,
+       rsbench/enummatch's element size, zigbench/simdsum's vector mask). */
+    if (remat_ok(s, v) && !(in->op == I_CONST && !warmc_getenv("WARMC_RA2_NO_CONST1")))
+      continue;
     /* left as they are: the barrier's mask, which a load takes as itself
        (load_barrier_mask); the memory base and an address made of it,
        which only an access may read (analyse_immediates); and a native
@@ -1113,6 +1350,41 @@ static void ra2_spill(Isel *s, const int *gpool, int ngpool) {
   xfree(touched);
 
   ra2_trivial_params(&R);
+  /* a folded instruction several read that each now reads a copy of: gone */
+  {
+    uint32_t *cnt = xcalloc(f->ninsts ? f->ninsts : 1, sizeof(uint32_t));
+    for (uint32_t oi = 0; oi < f->norder; oi++) {
+      Block *bb = &f->blocks[f->order[oi]];
+      for (uint32_t i = 0; i < bb->ninsts; i++) {
+        Ref u = bb->insts[i];
+        for (uint32_t j = 0; j < f->insts[u].nargs; j++) cnt[ir_args(f, u)[j]]++;
+      }
+      if (bb->term == T_BRIF || bb->term == T_BRTABLE) cnt[bb->term_arg]++;
+      for (uint32_t i = 0; i < bb->nret; i++) cnt[bb->ret_args[i]]++;
+      for (uint32_t k = 0; k < bb->nsuccs; k++)
+        for (uint32_t j = 0; j < bb->succs[k].nargs; j++) cnt[bb->succs[k].args[j]]++;
+    }
+    /* the copies' own operands read nothing once they go: from the last
+       made back, a copy no one reads drops its reads of its operands */
+    for (uint32_t oi = f->norder; oi-- > 0;) {
+      Block *bb = &f->blocks[f->order[oi]];
+      uint32_t m = 0;
+      for (uint32_t i = bb->ninsts; i-- > 0;) {
+        Ref u = bb->insts[i];
+        bool gone = u < n0 && R.shared[u] && !cnt[u];
+        if (gone)
+          for (uint32_t j = 0; j < f->insts[u].nargs; j++) cnt[ir_args(f, u)[j]]--;
+        (void)m;
+      }
+      for (uint32_t i = 0; i < bb->ninsts; i++) {
+        Ref u = bb->insts[i];
+        if (u < n0 && R.shared[u] && !cnt[u]) continue;
+        bb->insts[m++] = u;
+      }
+      bb->ninsts = m;
+    }
+    xfree(cnt);
+  }
   ir_verify(f, "ra2");
   if (warmc_getenv("WARMC_RA2_DEBUG")) ir_print(f, "ra2");
 
@@ -1121,6 +1393,8 @@ static void ra2_spill(Isel *s, const int *gpool, int ngpool) {
   f->ra2_nmem = f->ninsts;
   f->ra2_mem = xcalloc(f->ninsts ? f->ninsts : 1, 1);
   for (uint32_t v = 0; v < f->ninsts && v < R.nslotv; v++) f->ra2_mem[v] = R.slotv[v];
+  /* the constants the pass kept in registers: kept there (ra2_assign) */
+  for (uint32_t v = 0; v < n0; v++) if (R.rem[v] && R.need[v] && !f->ra2_mem[v]) f->ra2_mem[v] = 3;
   if (warmc_getenv("WARMC_RA2_DEBUG_FB")) {
     xfree(f->ra2_dbg);
     f->ra2_dbg = xcalloc(f->ninsts ? f->ninsts : 1, 1);
@@ -1137,6 +1411,7 @@ static void ra2_spill(Isel *s, const int *gpool, int ngpool) {
   xfree(R.need); xfree(R.rem); xfree(R.res); xfree(R.mem); xfree(R.xoff); xfree(R.xn); xfree(R.xw);
   xfree(R.done); xfree(R.din); xfree(R.pend); xfree(R.slotv); xfree(R.out); xfree(R.outpos);
   xfree(R.added);
+  xfree(R.shared);
   xfree(R.maxp); xfree(R.lstamp); xfree(R.lstack);
   /* the liveness made for the pass is of the function before it */
   xfree(s->lv_in); xfree(s->lv_out); xfree(s->lv_in_off); xfree(s->lv_out_off);
