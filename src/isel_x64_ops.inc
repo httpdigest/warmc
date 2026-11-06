@@ -2650,8 +2650,21 @@ static void emit_inst(Isel *s, Ref v) {
       if (in->imm2 & GCF_NULLCHK) trap_if_zero(s, 1, x, TRAP_NULL_REF);
       emit_gc_canon(s, TMP1, x);
       int size = (int)GCF_SIZE(in->imm2);
-      int idx = rd(s, a[1], S1);
-      if (!(in->imm2 & GCF_NOBOUND)) {
+      /* a constant index: the element's offset an immediate (arr_imm_index) */
+      uint32_t koff = 0;
+      bool kidx = is_imm_at(s, v, 1, a[1]) &&
+                  arr_imm_index(f, in, imm_of(s, a[1]) & 0xffffffffu, &koff, false);
+      int idx = kidx ? -1 : rd(s, a[1], S1);
+      if (!(in->imm2 & GCF_NOBOUND) && kidx) {
+        /* out of bounds where the length is at most the index */
+        int L = TMP0;
+        if (!(in->imm2 & GCF_LENARG)) x64_load32(B, TMP0, TMP1, X64_NOIDX, 0, 4);
+        else if (is_imm_at(s, v, in->nargs - 1, a[in->nargs - 1]))
+          x64_mov_ri(B, 0, TMP0, imm_of(s, a[in->nargs - 1]) & 0xffffffffu);
+        else L = rd(s, a[in->nargs - 1], TMP0);
+        x64_cmp_ri(B, 0, L, (int32_t)(uint32_t)(imm_of(s, a[1]) & 0xffffffu));
+        trap_if_cc(s, XCC_BE, TRAP_ARRAY_OOB);
+      } else if (!(in->imm2 & GCF_NOBOUND)) {
         if (in->imm2 & GCF_LENARG) {
           /* the length an operand: a constant, or a register a block
              before made it in */
@@ -2677,7 +2690,19 @@ static void emit_inst(Isel *s, Ref v) {
         y = rd(s, a[2], yt == VT_V128 || vt_is_float(yt) ? F0 : S0);
       }
       int32_t off = (int32_t)f->m->types[in->imm].hdr_size;
-      if (size <= 3) {
+      int ea = TMP0;
+      if (kidx) {
+        /* the canonical reference in TMP1 the base; a barrier's mask goes
+           to TMP1, so the slot of a reference it checks is made in TMP0 */
+        ea = TMP1;
+        off = (int32_t)koff;
+        if (in->op == I_ARRAY_GET && load_needs_barrier(f, in) &&
+            !vt_is_float((ValType)in->type) && in->type != VT_V128) {
+          x64_lea(B, 1, TMP0, TMP1, X64_NOIDX, 0, off);
+          ea = TMP0;
+          off = 0;
+        }
+      } else if (size <= 3) {
         x64_lea(B, 1, TMP0, TMP1, idx, size, 0);
       } else {
         x64_mov_rr(B, 0, TMP0, idx);
@@ -2689,24 +2714,24 @@ static void emit_inst(Isel *s, Ref v) {
         ValType t = (ValType)in->type;
         if (t == VT_V128) {
           int d = wr(s, v, F0);
-          x64_vmovdqu_load(B, d, TMP0, X64_NOIDX, 0, off);
+          x64_vmovdqu_load(B, d, ea, X64_NOIDX, 0, off);
           commit(s, v, d);
         } else if (vt_is_float(t)) {
           int d = wr(s, v, F0);
-          x64_vmovs_load(B, size == 3, d, TMP0, X64_NOIDX, 0, off);
+          x64_vmovs_load(B, size == 3, d, ea, X64_NOIDX, 0, off);
           commit(s, v, d);
         } else {
           int d = wr(s, v, S0);
-          gload(B, size, sgn, wide, d, TMP0, X64_NOIDX, 0, off);
+          gload(B, size, sgn, wide, d, ea, X64_NOIDX, 0, off);
           if (load_needs_barrier(f, in))
-            emit_gc_load_barrier(s, d, TMP0, -1, (uint32_t)off,
+            emit_gc_load_barrier(s, d, ea, -1, (uint32_t)off,
                                  load_barrier_mask(f, v));
           commit(s, v, d);
         }
       } else {
-        if (yt == VT_V128) x64_vmovdqu_store(B, y, TMP0, X64_NOIDX, 0, off);
-        else if (vt_is_float(yt)) x64_vmovs_store(B, size == 3, y, TMP0, X64_NOIDX, 0, off);
-        else gstore(B, size, y, TMP0, X64_NOIDX, 0, off);
+        if (yt == VT_V128) x64_vmovdqu_store(B, y, ea, X64_NOIDX, 0, off);
+        else if (vt_is_float(yt)) x64_vmovs_store(B, size == 3, y, ea, X64_NOIDX, 0, off);
+        else gstore(B, size, y, ea, X64_NOIDX, 0, off);
       }
       break;
     }

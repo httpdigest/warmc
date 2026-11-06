@@ -1888,6 +1888,12 @@ working memory when it ends.
     not change, one `array.len` in the block over it in the fewest loops, a
     register through them -- javabench/enumvm's interpreter, `op[pc]`,
     `a[pc]` and `r[a[pc]]` of an `r` of 8, 5% fewer cycles.
+  - An access at a constant index takes the element's offset, its array's
+    header and the elements before it, as its load's or store's immediate
+    -- AArch64's scaled 12 bits, x86-64's 32 -- and a bounds check compares
+    the length with the index, `cmp len, #k` and a `b.ls` to the trap,
+    where the index made in a register and an add of it took two more:
+    luawasm's reads of its table of globals (`WARMC_NO_ARR_KIDX=1`).
   - A loop whose counter, stepping up from `start`, is tested `i + c0 < m`
     (or `<=`, signed or unsigned, at its top or its end) against an `m`
     the loop does not change, and that reads or writes arrays the loop

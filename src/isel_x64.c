@@ -2058,9 +2058,11 @@ static bool imm_ok_x64(IrFunc *f, Ref user, uint32_t idx, uint64_t cval,
   int sf = vt_is_64(ct) ? 1 : 0;
   uint64_t masked = sf ? cval : (cval & 0xffffffffu);
   switch (in->op) {
-    /* a bounds check's constant length (no array is 2^31 long) */
+    /* a bounds check's constant length (no array is 2^31 long); a constant
+       index, the element's offset in the load or store (arr_imm_index) */
     case I_ARRAY_GET: case I_ARRAY_SET:
-      return (in->imm2 & GCF_LENARG) && idx == in->nargs - 1u && masked <= 0x7fffffffu;
+      if ((in->imm2 & GCF_LENARG) && idx == in->nargs - 1u) return masked <= 0x7fffffffu;
+      return idx == 1 && arr_imm_index(f, in, masked, NULL, false);
     case I_ADD: case I_SUB: case I_MUL:
     case I_AND: case I_OR: case I_XOR:
     case I_EQ: case I_NE: case I_LTS: case I_LTU: case I_GTS: case I_GTU:

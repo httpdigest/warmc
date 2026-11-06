@@ -2598,9 +2598,22 @@ static void emit_inst(Isel *s, Ref v) {
       int x = rd(s, a[0], S0);
       if (in->imm2 & GCF_NULLCHK) trap_if_zero(s, SF64, x, TRAP_NULL_REF);
       int size = (int)GCF_SIZE(in->imm2);
-      int idx = rd(s, a[1], S1);
+      /* a constant index: the element's offset an immediate (arr_imm_index) */
+      uint32_t koff = 0;
+      bool kidx = is_imm_at(s, v, 1, a[1]) &&
+                  arr_imm_index(f, in, imm_of(s, a[1]) & 0xffffffffu, &koff, true);
+      int idx = kidx ? -1 : rd(s, a[1], S1);
 
-      if (!(in->imm2 & GCF_NOBOUND)) {
+      if (!(in->imm2 & GCF_NOBOUND) && kidx) {
+        /* out of bounds where the length is at most the index */
+        int L = TMP0;
+        if (!(in->imm2 & GCF_LENARG)) a64_ldr_imm(B, 2, TMP0, x, 4);
+        else if (is_imm_at(s, v, in->nargs - 1, a[in->nargs - 1]))
+          a64_load_imm(B, SF32, TMP0, imm_of(s, a[in->nargs - 1]) & 0xffffffffu);
+        else L = rd(s, a[in->nargs - 1], TMP0);
+        a64_cmp_imm(B, SF32, L, (uint32_t)(imm_of(s, a[1]) & 0xfff));
+        trap_if_cc(s, CC_LS, TRAP_ARRAY_OOB);
+      } else if (!(in->imm2 & GCF_NOBOUND)) {
         if (in->imm2 & GCF_LENARG) {
           /* the length an operand: a constant, or a register a block
              before made it in */
@@ -2624,24 +2637,28 @@ static void emit_inst(Isel *s, Ref v) {
         y = rd(s, a[2], yt == VT_V128 || vt_is_float(yt) ? F0 : S2);
       }
       uint32_t off = f->m->types[in->imm].hdr_size;
-      a64_add_uxtw(B, TMP0, x, idx, size);
+      int ea = TMP0;
+      if (kidx) { ea = x; off = koff; }
+      else a64_add_uxtw(B, TMP0, x, idx, size);
       if (in->op == I_ARRAY_GET) {
         bool sgn = (in->imm2 & GCF_SIGNED) != 0;
         ValType t = (ValType)in->type;
-        if (t == VT_V128) { int d = wr(s, v, F0); a64_ldr_q(B, d, TMP0, off); commit(s, v, d); }
-        else if (vt_is_float(t)) { int d = wr(s, v, F0); a64_fldr_imm(B, size, d, TMP0, off); commit(s, v, d); }
+        if (t == VT_V128) { int d = wr(s, v, F0); a64_ldr_q(B, d, ea, off); commit(s, v, d); }
+        else if (vt_is_float(t)) { int d = wr(s, v, F0); a64_fldr_imm(B, size, d, ea, off); commit(s, v, d); }
         else {
           int d = wr(s, v, S0);
-          if (sgn) a64_ldrs_imm(B, size, wide, d, TMP0, off);
-          else a64_ldr_imm(B, size, d, TMP0, off);
-          if (load_needs_barrier(f, in))
-            emit_gc_load_barrier(s, d, TMP0, -1, off, load_barrier_mask(f, v));
+          bool bar = load_needs_barrier(f, in);
+          /* the element's address kept where the load overwrites x */
+          int sbase = bar ? emit_gc_load_barrier_pre(s, d, ea) : ea;
+          if (sgn) a64_ldrs_imm(B, size, wide, d, ea, off);
+          else a64_ldr_imm(B, size, d, ea, off);
+          if (bar) emit_gc_load_barrier(s, d, sbase, -1, off, load_barrier_mask(f, v));
           commit(s, v, d);
         }
       } else {
-        if (yt == VT_V128) a64_str_q(B, y, TMP0, off);
-        else if (vt_is_float(yt)) a64_fstr_imm(B, size, y, TMP0, off);
-        else a64_str_imm(B, size, y, TMP0, off);
+        if (yt == VT_V128) a64_str_q(B, y, ea, off);
+        else if (vt_is_float(yt)) a64_fstr_imm(B, size, y, ea, off);
+        else a64_str_imm(B, size, y, ea, off);
       }
       break;
     }

@@ -38,6 +38,8 @@ assemble test/cases_gc/arraynew.wat arraynew
 assemble test/cases_gc/tightheap.wat tightheap
 assemble test/cases_gc/activedata.wat activedata
 assemble test/cases_gc/shrinkwrap.wat shrinkwrap
+assemble test/cases_gc/kidx.wat kidx
+assemble test/cases_gc/kidx.wat kidx_nr
 assemble "$WORK/gcgen.wat" gcgen
 
 [ "${1:-}" = --prepare ] && exit 0
@@ -59,7 +61,7 @@ BIN=()
 # checks on their first run, each row.  A module built with a flag of its
 # own has a program of its own.
 BUNDLED="gc gccollect constroot exnpayload devirt_vt ictab_sub escape castfacts brcast
-  arraycopy arraynew tightheap activedata shrinkwrap gcgen"
+  arraycopy arraynew tightheap activedata shrinkwrap kidx gcgen"
 BUNDLE="$WORK/gcall$FTAG"
 
 # compiled every time: warmc's cache (hostenv.sh) hands back by their
@@ -93,6 +95,7 @@ build_one() {
 # WARMC_NO_TESTCACHE=1 runs it anyway).
 WARMC_FLAGS="${WARMC_FLAGS:-} -fno-inline" build_one tailcast
 WARMC_FLAGS="${WARMC_FLAGS:-} -fno-thread" build_one castfacts_nt
+WARMC_FLAGS="${WARMC_FLAGS:-} -fno-regalloc" build_one kidx_nr
 ESCAPE_IR="$WORK/escape_ir$FTAG.txt"
 : >"$ESCAPE_IR"
 escape_rc=0
@@ -101,7 +104,7 @@ if [ -z "${WARMC_FLAGS:-}" ] || [ "${WARMC_FLAGS:-}" = -O2 ]; then
     "$WORK/escape.wasm" >/dev/null 2>"$ESCAPE_IR" || escape_rc=$?
 fi
 ROWKEY=$(python3 test/testcache.py key --file test/run_gc.sh --file test/hostenv.sh \
-  --file "$ESCAPE_IR" --str "$escape_rc" --file "$BUNDLE" --file "$WORK/tailcast$FTAG" --file "$WORK/castfacts_nt$FTAG" \
+  --file "$ESCAPE_IR" --str "$escape_rc" --file "$BUNDLE" --file "$WORK/tailcast$FTAG" --file "$WORK/castfacts_nt$FTAG" --file "$WORK/kidx_nr$FTAG" \
   --file "$WT" --file "$WORK/escape.wasm" --env WARMC_ --env GC_ --str "$*")
 if python3 test/testcache.py get row "$ROWKEY"; then exit 0; fi
 
@@ -416,6 +419,19 @@ expect bump2_many    "OK" 4000 4000 3000
 WARMC_GC_VERIFY=1 WARMC_GC_STRESS=1 expect push_many     "OK" 2000 1999000
 WARMC_GC_VERIFY=1 WARMC_GC_STRESS=1 expect throw_through "OK" 1000 100 127
 WARMC_GC_VERIFY=1 WARMC_GC_STRESS=1 expect deep          "OK" 1000 333833500
+
+# reads of references at constant indices, every one after a collection
+# through the barrier's slow path, which heals the slot the read made
+build_one kidx
+expect chains "OK" 300
+expect swaps  "OK" 300
+WARMC_GC_VERIFY=1 WARMC_GC_STRESS=1 WARMC_GC_RELOCATE_ALL=1 expect chains "OK" 300
+WARMC_GC_VERIFY=1 WARMC_GC_STRESS=1 WARMC_GC_RELOCATE_ALL=1 expect swaps  "OK" 300
+# every value in a stack slot, the array and the element it reads are one
+# scratch register: the slot made before the load overwrites the array
+WARMC_FLAGS="${WARMC_FLAGS:-} -fno-regalloc" build_one kidx_nr
+WARMC_GC_VERIFY=1 WARMC_GC_STRESS=1 WARMC_GC_RELOCATE_ALL=1 expect chains "OK" 300
+WARMC_GC_VERIFY=1 WARMC_GC_STRESS=1 WARMC_GC_RELOCATE_ALL=1 expect swaps  "OK" 300
 
 build_one arraynew
 for t in 8 16 32 64 f32 f64 v128 ref; do expect lengths_$t "OK"; done

@@ -581,6 +581,26 @@ static void trap_defer(Isel *s, size_t site, bool is19, int code) {
   s->trap_used[code] = 1;
 }
 
+/* Whether array access in, at the constant index k, takes the element's
+   offset -- its header and k elements -- as the immediate of its load or
+   store (*off, where given), and its bounds check, if it has one, compares
+   the length with k: on AArch64 (a64) a load's or store's scaled 12 bits,
+   which keep k in cmp's 12 too, on x86-64 32 bits both.  luawasm's every
+   read of its globals' table, where the index made in a register and an
+   add of it took two more (WARMC_NO_ARR_KIDX: no such index). */
+static bool arr_imm_index(const IrFunc *f, const Inst *in, uint64_t k, uint32_t *off,
+                          bool a64) {
+  static _Atomic int on = -1;
+  if (on < 0) on = warmc_getenv("WARMC_NO_ARR_KIDX") == NULL;
+  if (!on || k > 0xffffffu) return false;
+  uint32_t size = GCF_SIZE(in->imm2);
+  uint64_t tot = f->m->types[in->imm].hdr_size + (k << size);
+  if (a64 && ((tot >> size) > 0xfff || (tot & ((1u << size) - 1u)))) return false;
+  if (tot > 0x7fffffffu) return false;
+  if (off) *off = (uint32_t)tot;
+  return true;
+}
+
 /* Whether a branch on a null test tests the reference itself
    (WARMC_NO_NULLBR: makes the 0 or 1 and tests that) */
 static bool null_br(void) {
