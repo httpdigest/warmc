@@ -8,7 +8,7 @@
 ;; end traps at every level.  The count is of the checks taken off, before
 ;; -O2's unrolling copies a loop's read with its flags, a loop copied behind
 ;; a test of its bounds (pass_bce_version) counting its copy's too.
-;; stats -O2: bce_ranges=21
+;; stats -O2: bce_ranges=29
 ;; run: up 10 => i32:45
 ;; run: up 0 => i32:0
 ;; run: up_le 10 => trap: out of bounds array access
@@ -55,6 +55,22 @@
 ;; run: two 5 => trap: out of bounds array access
 ;; run: wrap_up 5 0 10 => i32:5
 ;; run: wrap_up 5 2147483632 -2147483643 => trap: out of bounds array access
+;; run: len_gtu 4 => i32:4
+;; run: len_gtu 3 => i32:0
+;; run: len_gtu 9 => i32:4
+;; run: len_gtu_over 5 => i32:1
+;; run: len_gtu_over 4 => trap: out of bounds array access
+;; run: len_geu 2 => i32:2
+;; run: len_geu 1 => i32:0
+;; run: len_geu_over 3 => i32:1
+;; run: len_geu_over 2 => trap: out of bounds array access
+;; run: len_gtu_n 4 => i32:4
+;; run: len_gtu_n 3 => i32:0
+;; run: len_gtu_n -1 => i32:-1
+;; run: len_gtu_n_over 5 => i32:1
+;; run: len_gtu_n_over 4 => trap: out of bounds array access
+;; run: uge_neg 10 5 => i32:1
+;; run: uge_neg 10 -1 => trap: out of bounds array access
 (module
   (type $a (array (mut i32)))
 
@@ -383,4 +399,71 @@
       (local.set $i (i32.add (local.get $i) (i32.const 1)))
       (br_if $l (i32.ne (local.get $i) (local.get $stop))))
     (local.get $s))
+
+  ;; a length tested above a constant unsigned, of an array whose length
+  ;; nothing else tells (from a global): a length is not negative, so
+  ;; len >u 3 puts it at 4 or more, len >=u 2 at 2 or more
+  (global $g (mut (ref null $a)) (ref.null $a))
+  (func $from_g (param $n i32) (result (ref $a))
+    (global.set $g (array.new $a (i32.const 1) (local.get $n)))
+    (ref.as_non_null (global.get $g)))
+  (func (export "len_gtu") (param $n i32) (result i32)
+    (local $a (ref $a))
+    (local.set $a (call $from_g (local.get $n)))
+    (if (result i32) (i32.gt_u (array.len (local.get $a)) (i32.const 3))
+      (then (i32.add (i32.add (array.get $a (local.get $a) (i32.const 0))
+                              (array.get $a (local.get $a) (i32.const 1)))
+                     (i32.add (array.get $a (local.get $a) (i32.const 2))
+                              (array.get $a (local.get $a) (i32.const 3)))))
+      (else (i32.const 0))))
+  ;; one past: a[4] past len >u 3
+  (func (export "len_gtu_over") (param $n i32) (result i32)
+    (local $a (ref $a))
+    (local.set $a (call $from_g (local.get $n)))
+    (if (result i32) (i32.gt_u (array.len (local.get $a)) (i32.const 3))
+      (then (array.get $a (local.get $a) (i32.const 4)))
+      (else (i32.const 0))))
+  (func (export "len_geu") (param $n i32) (result i32)
+    (local $a (ref $a))
+    (local.set $a (call $from_g (local.get $n)))
+    (if (result i32) (i32.ge_u (array.len (local.get $a)) (i32.const 2))
+      (then (i32.add (array.get $a (local.get $a) (i32.const 0))
+                     (array.get $a (local.get $a) (i32.const 1))))
+      (else (i32.const 0))))
+  ;; n tested above 3 unsigned, the array n long: n not negative by the
+  ;; test before, not by its shape
+  (func (export "len_gtu_n") (param $n i32) (result i32)
+    (local $a (ref $a))
+    (if (i32.lt_s (local.get $n) (i32.const 0)) (then (return (i32.const -1))))
+    (local.set $a (array.new $a (i32.const 1) (local.get $n)))
+    (if (result i32) (i32.gt_u (local.get $n) (i32.const 3))
+      (then (i32.add (i32.add (array.get $a (local.get $a) (i32.const 0))
+                              (array.get $a (local.get $a) (i32.const 1)))
+                     (i32.add (array.get $a (local.get $a) (i32.const 2))
+                              (array.get $a (local.get $a) (i32.const 3)))))
+      (else (i32.const 0))))
+  ;; one past: a[4] past n >u 3
+  (func (export "len_gtu_n_over") (param $n i32) (result i32)
+    (local $a (ref $a))
+    (if (i32.lt_s (local.get $n) (i32.const 0)) (then (return (i32.const -1))))
+    (local.set $a (array.new $a (i32.const 1) (local.get $n)))
+    (if (result i32) (i32.gt_u (local.get $n) (i32.const 3))
+      (then (array.get $a (local.get $a) (i32.const 4)))
+      (else (i32.const 0))))
+  ;; an index tested above 3 unsigned, and below the length signed: -1
+  ;; passes both, so i >=u 4 says i >= 4 only where i is not negative
+  (func (export "uge_neg") (param $n i32) (param $i i32) (result i32)
+    (local $a (ref $a))
+    (local.set $a (array.new $a (i32.const 1) (local.get $n)))
+    (if (result i32) (i32.and (i32.gt_u (local.get $i) (i32.const 3))
+                              (i32.lt_s (local.get $i) (array.len (local.get $a))))
+      (then (array.get $a (local.get $a) (local.get $i)))
+      (else (i32.const 0))))
+  ;; one past: a[2] past len >=u 2
+  (func (export "len_geu_over") (param $n i32) (result i32)
+    (local $a (ref $a))
+    (local.set $a (call $from_g (local.get $n)))
+    (if (result i32) (i32.ge_u (array.len (local.get $a)) (i32.const 2))
+      (then (array.get $a (local.get $a) (i32.const 2)))
+      (else (i32.const 0))))
 )

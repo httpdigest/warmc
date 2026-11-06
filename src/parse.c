@@ -1198,6 +1198,7 @@ void module_free(Module *m) {
   if (m->t0) { xfree(m->t0->entry); xfree(m->t0->sites); xfree(m->t0); }
   xfree(m->ict); xfree(m->ict_of);
   xfree(m->escapes);
+  xfree(m->fld_written); xfree(m->fld_base); xfree(m->fld_canon);
   xfree(m->pinl);
   /* what compile_module worked out of it: reach, the functions' new
      numbering, and Go's facts */

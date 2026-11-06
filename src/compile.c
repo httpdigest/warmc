@@ -786,6 +786,70 @@ static bool module_gc_sealed(const Module *m) {
   return true;
 }
 
+/* The topmost type up ti's supertypes, canonical, that has field k: one
+   field for every type that shares it */
+static uint32_t field_root(const Module *m, const uint32_t *canon, uint32_t ti, uint32_t k) {
+  uint32_t t = canon[ti];
+  for (uint32_t guard = 0; guard < m->ntypes; guard++) {
+    const CompType *c = &m->types[t];
+    if (!c->has_super || c->super >= m->ntypes) break;
+    uint32_t s = canon[c->super];
+    if (m->types[s].kind != CT_STRUCT || k >= m->types[s].nfields) break;
+    t = s;
+  }
+  return t;
+}
+
+/* Module.fld_written: the fields some struct.set of the module's writes.
+   In a sealed module no code outside it meets its objects, and struct.set
+   is all that writes a field after struct.new, so a field none writes
+   keeps its value: opt.c's gc_field_immutable takes it as immutable --
+   TeaVM's Java arrays' data, a mutable field nothing sets, read anew past
+   a loop's tests (pass_bce_version's bv_field_array).  A write of a
+   field counts for every type that shares it by subtyping or by being
+   canonically the same type (field_root); a body that does not decode
+   leaves nothing known (WARMC_NO_FIELD_WRITES: nothing known). */
+static void module_field_writes(Module *m) {
+  xfree(m->fld_written); xfree(m->fld_base); xfree(m->fld_canon);
+  m->fld_written = NULL; m->fld_base = NULL; m->fld_canon = NULL;
+  if (!m->gc_sealed || !m->ntypes || warmc_getenv("WARMC_NO_FIELD_WRITES")) return;
+  uint32_t *base = xmalloc(m->ntypes * sizeof(uint32_t)), n = 0;
+  for (uint32_t t = 0; t < m->ntypes; t++) {
+    base[t] = n;
+    if (m->types[t].kind == CT_STRUCT) n += m->types[t].nfields;
+  }
+  uint32_t *canon = module_type_canon(m);
+  uint8_t *w = xcalloc(n ? n : 1, 1);
+  for (uint32_t fi = 0; fi < m->nfuncs; fi++) {
+    const Func *f = &m->funcs[fi];
+    if (f->imported || !f->body || f->body_end <= f->body) continue;
+    Rd r = rd_make(f->body, f->body_end, m->bin);
+    while (!rd_eof(&r)) {
+      uint32_t op = wasm_read_op(&r);
+      if (op == OP_PREFIXED(0xfb, 5)) {
+        uint32_t ti = rd_u32(&r), k = rd_u32(&r);
+        if (ti >= m->ntypes || m->types[ti].kind != CT_STRUCT || k >= m->types[ti].nfields) goto unknown;
+        uint32_t root = field_root(m, canon, ti, k);
+        w[base[root] + k] = 1;
+      } else if (!wasm_walk_imm(&r, op, NULL, NULL)) {
+        goto unknown;
+      }
+    }
+  }
+  m->fld_written = w; m->fld_base = base; m->fld_canon = canon;
+  return;
+unknown:
+  xfree(w); xfree(base); xfree(canon);
+}
+
+bool module_field_unwritten(const Module *m, uint32_t ti, uint32_t k) {
+  if (!m->fld_written || ti >= m->ntypes || m->types[ti].kind != CT_STRUCT ||
+      k >= m->types[ti].nfields)
+    return false;
+  uint32_t root = field_root(m, m->fld_canon, ti, k);
+  return !m->fld_written[m->fld_base[root] + k];
+}
+
 static void escape_init(Module *m, const InitExpr *e) {
   for (uint32_t i = 0; i < e->n; i++)
     if (e->ins[i].op == IOP_REF_FUNC && e->ins[i].lo < m->nfuncs)
@@ -831,6 +895,7 @@ void compile_module(Module *m, ObjBuilder *o, const OptOpts *opts) {
     }
   }
   m->gc_sealed = opts->sealed && module_gc_sealed(m);
+  module_field_writes(m);
   m->sole_instance = opts->sole_instance;
   module_escape_facts(m);
   xfree(m->pinl);

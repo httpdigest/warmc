@@ -372,7 +372,9 @@ static bool gc_field_immutable(IrFunc *f, Ref access) {
   ValType t = (ValType)f->insts[ir_resolve(f, ir_args(f, access)[0])].type;
   uint32_t j = gc_field_of_offset(f->m, t, in->imm);
   if (j == UINT32_MAX) return false;
-  return !f->m->types[vt_type_index(t)].fields[j].mutable_;
+  /* or a field no struct.set of the sealed module writes */
+  return !f->m->types[vt_type_index(t)].fields[j].mutable_ ||
+         module_field_unwritten(f->m, vt_type_index(t), j);
 }
 
 static bool gc_array_elem_immutable(const Module *m, uint32_t ti) {
@@ -5934,6 +5936,20 @@ static bool pass_cse(IrFunc *f, const OptOpts *o) {
       Ref v = b->insts[i];
       Inst *in = &f->insts[v];
       if (!cse_candidate(f, v, o->gcpure)) continue;
+      /* its operands taken to the twins that replace them, found before
+         it in the walk (they are defined in blocks that dominate it).
+         Keyed on the operands as they were, an instruction of two twins'
+         operands was a twin itself only once the walk had applied the
+         replacements, left to a CSE after it: once LICM had put the
+         copies from a loop's arms in one preheader, the four eqz of four
+         twin ref.tests in luawasm's permute stayed four.  Not a mem_ptr's,
+         the memory base plus a value, which pass_mem_ptr makes one a block
+         by the accesses whose address modes fold it: shared through its
+         twin operands it held a register between the blocks, spilling
+         others (cppbench/uniqtree's split, 3.5% more instructions) */
+      Ref *a = ir_args(f, v);
+      if (in->op != I_MEM_PTR)
+        for (uint32_t j = 0; j < in->nargs; j++) a[j] = ir_resolve(f, a[j]);
       uint64_t h = hash_inst(f, v);
       uint32_t s = (uint32_t)((h * 0x9E3779B97F4A7C15ull) >> 32) & (cap - 1);
       bool found = false;
@@ -13892,7 +13908,8 @@ static Edge *iv_edge(IrFunc *f, uint32_t from, uint32_t to);
 /* The length r's array is known to have at least (0: none known) -- or,
    exact, the length it has: where ways meet with arrays of lengths that
    differ, the least is a bound a proof may take, not the length, and
-   array.len folded to it was wrong for the longer (array_exact_len) */
+   array.len folded to it, or a check made against it, was wrong for the
+   longer (array_exact_len) */
 static uint64_t array_len_of(IrFunc *f, Ref r, int depth, bool exact);
 static uint64_t array_known_len(IrFunc *f, Ref r, int depth) { return array_len_of(f, r, depth, false); }
 static uint64_t array_exact_len(IrFunc *f, Ref r, int depth) { return array_len_of(f, r, depth, true); }
@@ -13911,6 +13928,21 @@ static uint64_t array_len_of(IrFunc *f, Ref r, int depth, bool exact) {
 
     case I_REF_CONVERT:
       return array_len_of(f, a[0], depth - 1, exact);
+    case I_GLOBAL_GET: {
+      /* an immutable global's array, made by its initialiser at a length
+         the initialiser says: Kotlin's pool of string literals, an
+         array.new_default of 661 read at each literal's index */
+      if (in->imm >= f->m->nglobals) return 0;
+      const Global *g = &f->m->globals[in->imm];
+      if (g->mutable_ || g->imported || !g->init.n) return 0;
+      const InitInsn *e = g->init.ins;
+      uint32_t n = g->init.n;
+      if (e[n - 1].op == IOP_ARRAY_NEW_FIXED) return (uint32_t)e[n - 1].hi;
+      if ((e[n - 1].op == IOP_ARRAY_NEW_DEFAULT || e[n - 1].op == IOP_ARRAY_NEW) && n >= 2 &&
+          e[n - 2].op == IOP_I32_CONST)
+        return (uint32_t)e[n - 2].lo;
+      return 0;
+    }
     case I_PARAM: {
       /* an array flowing through a merge is at least as long as the
          shortest any pred supplies -- min, where ir_value_max meets with
@@ -14288,7 +14320,7 @@ static bool gc_len_covers_in(IrFunc *f, Ref L, Ref obj, Ref alen, int depth, GcC
 #define RP_DEPTH 18
 #define RP_BUDGET 1500
 
-enum { RF_LE, RF_GE, RF_ULT, RF_ULE, RF_NE, RF_ACC, RF_ACCO, RF_LENOF, RF_SQ };
+enum { RF_LE, RF_GE, RF_ULT, RF_ULE, RF_NE, RF_ACC, RF_ACCO, RF_LENOF, RF_SQ, RF_UGE };
 enum { TK_NUM, TK_VAL, TK_LEN };
 enum { RD_LE, RD_GE };
 
@@ -14297,7 +14329,8 @@ enum { RD_LE, RD_GE };
    a + off (mod 2^w) the fact was made of.  RF_ACC: a + off below the
    length of the array b; RF_ACCO: the same keyed on the array a, b the
    index; RF_LENOF: b is the array a's length; RF_SQ: b is a * a, an i32
-   widened and squared in an i64, which cannot wrap. */
+   widened and squared in an i64, which cannot wrap; RF_UGE: a + off at
+   least the constant k, unsigned. */
 typedef struct {
   Ref a, b, orig;
   int64_t k, off;
@@ -14569,10 +14602,17 @@ static void rp_cond(RP *p, bool tmp, Ref cond, bool taken, uint32_t blk, uint32_
         rp_add(p, tmp, RF_LE, a, REF_NONE, op == I_LTU ? k0 - 1 : k0, blk, pos);
       }
       break;
+    /* unsigned at least a constant that is not negative: as much signed
+       where a is not negative (RF_UGE) -- luawasm's n > 3 ahead of its
+       reads of items 0, 1 and 2, an n a length or tested >= 0 */
     case I_GTU: case I_GEU:
       if (!bc) rp_add(p, tmp, op == I_GTU ? RF_ULT : RF_ULE, b, a, 0, blk, pos);
-      else if ((op == I_GTU && k0 == 0) || (op == I_GEU && k0 == 1))
-        rp_add(p, tmp, RF_NE, a, REF_NONE, 0, blk, pos);
+      else {
+        if ((op == I_GTU && k0 == 0) || (op == I_GEU && k0 == 1))
+          rp_add(p, tmp, RF_NE, a, REF_NONE, 0, blk, pos);
+        if (k0 >= 0 && (op == I_GEU ? k0 > 1 : k0 > 0 && k0 < rp_maxw(f, a)))
+          rp_add(p, tmp, RF_UGE, a, REF_NONE, op == I_GTU ? k0 + 1 : k0, blk, pos);
+      }
       break;
     default: break;
   }
@@ -15165,6 +15205,11 @@ static bool rp_ge_known(RP *p, const RCtx *c, Ref x, int64_t k, int d) {
       case RF_ACC:
         ok = kk <= 0;
         break;
+      case RF_UGE:
+        /* x + off at least q->k unsigned: as much signed, where it is not
+           negative */
+        ok = q->b == REF_NONE && q->k >= kk && rp_ge(p, c, q->orig, 0, d - 1);
+        break;
       case RF_NE:
         /* not below where it is not: x + off >= kk - 1 and not equal */
         ok = q->b == REF_NONE && kk > INT64_MIN && q->k == kk - 1 && k > INT64_MIN &&
@@ -15638,6 +15683,8 @@ static void gc_way_add(const GcWay *w, Ref y, Ref *set, uint32_t *n,
    are numbers, at -O2 (WARMC_NO_BCE_VERSION=1: none). */
 #define BV_MAX 400
 #define BV_ARRS 4
+#define BV_SYMS 8
+#define BV_SACC 64
 
 /* idx as base + c of the counter p: p + c of its width, or an i64 p + c
    wrapped */
@@ -15648,6 +15695,68 @@ static bool bv_index(IrFunc *f, Ref idx, Ref p, int64_t *c) {
   if (in->op == I_WRAP && in->nargs == 1 && f->insts[p].type == VT_I64)
     return rp_lin(f, ir_args(f, idx)[0], c) == p;
   return false;
+}
+
+/* idx, of an i32 counter p, as another counter q of the header that steps
+   as p does, plus c (*V q, *qi its parameter's index), or as p + c plus a
+   value V the loop does not change (*qi -1): the accesses a copy proves in
+   bounds itself, by the counters' ranges (bv_loop's symbolic groups).  Its
+   value is that sum mod 2^32, the sum itself where that is in [0, 2^31) */
+static bool bv_sym_index(IrFunc *f, Ref idx, Ref p, const uint8_t *inloop, uint32_t nb0,
+                         const Block *h, const Edge *back, int64_t step,
+                         Ref *V, int *qi, int64_t *c) {
+  idx = ir_resolve(f, idx);
+  if (f->insts[idx].type != VT_I32) return false;
+  for (uint32_t k = 0; k < h->nparams; k++) {
+    Ref q = h->params[k];
+    int64_t sq;
+    if (q == p || f->insts[q].type != VT_I32) continue;
+    if (rp_lin(f, back->args[k], &sq) != q || sq != step) continue;
+    if (bv_index(f, idx, q, c)) { *V = q; *qi = (int)k; return true; }
+  }
+  int64_t c1;
+  Ref base = rp_lin(f, idx, &c1);
+  const Inst *bi = &f->insts[base];
+  if (bi->op != I_ADD || bi->nargs != 2 || bi->type != VT_I32) return false;
+  for (int s = 0; s < 2; s++) {
+    Ref x = ir_resolve(f, ir_args(f, base)[s]), y = ir_resolve(f, ir_args(f, base)[1 - s]);
+    int64_t cx;
+    if (!bv_index(f, x, p, &cx)) continue;
+    uint32_t yb = f->insts[y].block;
+    if ((yb < nb0 && inloop[yb]) || f->insts[y].op == I_CONST) continue;
+    *V = y;
+    *qi = -1;
+    *c = c1 + cx;
+    return true;
+  }
+  return false;
+}
+
+/* An array the loop reads anew each time round that is the same array
+   every time: an immutable field of an object the loop does not change --
+   a Java array's data, read past the loop's tests, where its object's null
+   check keeps LICM from taking it out (mergeSort's while (i < mid && j <
+   hi)).  The guard reads it once itself, past a test of the object's null
+   (bv_guard_array); in the copy the null check goes and CSE makes the
+   copy's read the guard's, whose length the tests bound.  o itself, or
+   REF_NONE */
+static Ref bv_field_array(IrFunc *f, Ref o, const uint8_t *inloop, uint32_t nb0) {
+  const Inst *in = &f->insts[o];
+  if (in->op != I_FIELD_GET || in->nargs != 1 || !vt_is_ref((ValType)in->type)) return REF_NONE;
+  Ref x = ir_resolve(f, ir_args(f, o)[0]);
+  uint32_t xb = f->insts[x].block;
+  if ((xb < nb0 && inloop[xb]) || !gc_field_immutable(f, o)) return REF_NONE;
+  return o;
+}
+
+/* the same array: one value, or two reads of one immutable field of one
+   object (bv_field_array's) */
+static bool bv_same_array(IrFunc *f, Ref a, Ref b) {
+  if (a == b) return true;
+  const Inst *x = &f->insts[a], *y = &f->insts[b];
+  return x->op == I_FIELD_GET && y->op == I_FIELD_GET && x->nargs == 1 && y->nargs == 1 &&
+         x->imm == y->imm && x->type == y->type &&
+         ir_resolve(f, ir_args(f, a)[0]) == ir_resolve(f, ir_args(f, b)[0]);
 }
 
 static IrOp bv_negate(IrOp op) {
@@ -15669,11 +15778,63 @@ static IrOp bv_mirror(IrOp op) {
   }
 }
 
+/* x, the value a way round gives the header's param p, as p stepped up by
+   a constant of at most 64, or p itself, or a param of a block of the loop
+   (not the header) whose every way in gives one: a counter that steps up,
+   or stays, each way round (mergeSort's i, i + 1 in one arm, i in the
+   other) */
+#define BV_MONO_DEPTH 4
+static bool bv_mono(IrFunc *f, Ref x, Ref p, uint32_t hb, const uint8_t *inloop, uint32_t nb0,
+                    int depth) {
+  x = ir_resolve(f, x);
+  int64_t c;
+  if (rp_lin(f, x, &c) == p && c >= 0 && c <= 64) return true;
+  const Inst *in = &f->insts[x];
+  if (depth <= 0 || in->op != I_PARAM || in->block == hb || in->block >= nb0 ||
+      !inloop[in->block])
+    return false;
+  const Block *B = &f->blocks[in->block];
+  int k = gc_param_index(B, x);
+  if (k < 0 || !B->npreds) return false;
+  for (uint32_t q = 0; q < B->npreds; q++) {
+    uint32_t pb = B->preds[q];
+    if (pb >= nb0 || !inloop[pb]) return false;
+    const Block *P = &f->blocks[pb];
+    for (uint32_t s = 0; s < P->nsuccs; s++) {
+      const Edge *e = &P->succs[s];
+      if (e->target != in->block) continue;
+      if (e->eh || (uint32_t)k >= e->nargs ||
+          !bv_mono(f, e->args[k], p, hb, inloop, nb0, depth - 1))
+        return false;
+    }
+  }
+  return true;
+}
+
+/* a symbolic group (bv_sym_index), and a counter's job: its test's m, rel
+   and c0, start, and the arrays and groups behind the test */
+typedef struct { Ref arr, V; int qi; int64_t cmin, cmax; } BvSym;
+#define BV_JOBS 4
+typedef struct {
+  Ref start, m;
+  IrOp rel;
+  int64_t c0, step;
+  bool bottom, down;
+  ValType pt;
+  uint32_t narr, nsym, nsacc, nacc;
+  Ref arr[BV_ARRS];
+  int64_t cmin[BV_ARRS], cmax[BV_ARRS];
+  BvSym sym[BV_SYMS];
+  Ref sacc[BV_SACC];
+} BvJob;
+
 #define BV_REJ(why) do { if (warmc_getenv("WARMC_BV_DEBUG")) \
     fprintf(stderr, "bce_version %s b%u: %s\n", f->m->funcs[f->func_index].sym, hb, why); \
     return false; } while (0)
 static bool bv_loop(IrFunc *f, uint32_t hb, uint8_t *inloop, uint32_t *stack) {
-  if (f->blocks[hb].bver) return false;
+  /* a loop versioned already, or one on a rare way: the original of one
+     versioned, whose loops inside stay as they are */
+  if (f->blocks[hb].bver || f->blocks[hb].cold) return false;
   uint32_t pre = loop_body(f, hb, inloop, stack);
   if (pre == REF_NONE) return false;
   uint32_t nb0 = f->nblocks, ni0 = f->ninsts, size = 0;
@@ -15685,7 +15846,7 @@ static bool bv_loop(IrFunc *f, uint32_t hb, uint8_t *inloop, uint32_t *stack) {
   for (uint32_t bi = 0; bi < nb0; bi++) {
     if (!inloop[bi]) continue;
     Block *b = &f->blocks[bi];
-    if (b->is_pad || b->bver) BV_REJ("a pad, or versioned");
+    if (b->is_pad || b->bver) BV_REJ("a pad, or a loop inside versioned");
     for (uint32_t s2 = 0; s2 < b->nsuccs; s2++)
       if (b->succs[s2].eh) BV_REJ("an exception edge");
     size += b->ninsts + b->nparams;
@@ -15694,13 +15855,27 @@ static bool bv_loop(IrFunc *f, uint32_t hb, uint8_t *inloop, uint32_t *stack) {
   Edge *pe = iv_edge(f, pre, hb), *back = iv_edge(f, latch, hb);
   if (!pe || !back || pe->nargs != h->nparams || back->nargs != h->nparams) BV_REJ("edges");
 
-  /* a counter, its test, and the accesses behind the test */
-  for (uint32_t pi = 0; pi < h->nparams; pi++) {
+  /* each counter's job: its test, and the accesses behind the test -- one
+     copy for them all, entered where every job's tests pass (Java's merge,
+     while (i < mid && j < hi), each counter stepped in an arm of its own) */
+  BvJob jobs[BV_JOBS];
+  uint32_t njobs = 0;
+  for (uint32_t pi = 0; pi < h->nparams && njobs < BV_JOBS; pi++) {
     Ref p = h->params[pi];
     ValType pt = (ValType)f->insts[p].type;
     if (pt != VT_I32 && pt != VT_I64) continue;
     int64_t step;
-    if (rp_lin(f, back->args[pi], &step) != p || step == 0 || step > 64 || step < -64) continue;
+    bool mono = false;
+    if (rp_lin(f, back->args[pi], &step) != p || step == 0 || step > 64 || step < -64) {
+      /* or one each way round steps up by a constant, or leaves, that is
+         tested at the loop's top (bv_mono): the prover takes its range
+         round the loop itself, from the copy's tests */
+      if (warmc_getenv("WARMC_NO_BV_MONO") ||
+          !bv_mono(f, back->args[pi], p, hb, inloop, nb0, BV_MONO_DEPTH))
+        continue;
+      mono = true;
+      step = 1;
+    }
     /* stepping down: the first time round the greatest, the test the least */
     bool down = step < 0;
     Ref start = pe->args[pi];
@@ -15716,7 +15891,7 @@ static bool bv_loop(IrFunc *f, uint32_t hb, uint8_t *inloop, uint32_t *stack) {
          (the first, start, tested too) */
       bool bottom = false;
       if (f->blocks[on].npreds != 1) {
-        if (tb != latch || on != hb) continue;
+        if (mono || tb != latch || on != hb) continue;
         bottom = true;
       }
       bool cont_true = on == t0;
@@ -15755,6 +15930,19 @@ static bool bv_loop(IrFunc *f, uint32_t hb, uint8_t *inloop, uint32_t *stack) {
       int64_t cmin[BV_ARRS], cmax[BV_ARRS];
       uint32_t narr = 0, nacc = 0;
       bool full = false;
+      /* and at the counter plus a value the loop does not change, or at a
+         second counter that steps with it (bv_sym_index): Java's
+         StringBuilder.insert shifting value[i + n] = value[i], a copy's
+         dst[k++] = src[i++].  The prover sees no tie between i and the
+         sum, so the copy's accesses are proven here, by the counter's
+         range: in [start, m - 1] (m, for <=) at every access -- behind the
+         test, or a test at the loop's end with start tested as it -- where
+         it steps up and no step passes 2^31 - 1, a test of its own.  An i32
+         counter up, tested i < m or i <= m (WARMC_NO_BV_SYM: none). */
+      BvSym sym[BV_SYMS];
+      Ref sacc[BV_SACC];
+      uint32_t nsym = 0, nsacc = 0;
+      bool sym_on = !mono && !down && pt == VT_I32 && c0 == 0 && !warmc_getenv("WARMC_NO_BV_SYM");
       for (uint32_t bi = 0; bi < nb0 && !full; bi++) {
         if (!inloop[bi] || (!bottom && !dominates(f, on, bi))) continue;
         Block *B = &f->blocks[bi];
@@ -15764,12 +15952,33 @@ static bool bv_loop(IrFunc *f, uint32_t hb, uint8_t *inloop, uint32_t *stack) {
           if ((in->op != I_ARRAY_GET && in->op != I_ARRAY_SET) || (in->imm2 & GCF_NOBOUND) || in->nargs < 2)
             continue;
           int64_t c;
-          if (!bv_index(f, ir_args(f, v)[1], p, &c)) continue;
           Ref o = ir_resolve(f, ir_args(f, v)[0]);
           uint32_t ob = f->insts[o].block;
-          if (ob < nb0 && inloop[ob]) continue;
+          if (ob < nb0 && inloop[ob] && bv_field_array(f, o, inloop, nb0) == REF_NONE) continue;
+          if (!bv_index(f, ir_args(f, v)[1], p, &c)) {
+            Ref V;
+            int qi;
+            if (!sym_on || nsacc == BV_SACC ||
+                !bv_sym_index(f, ir_args(f, v)[1], p, inloop, nb0, h, back, step, &V, &qi, &c))
+              continue;
+            uint32_t g = 0;
+            while (g < nsym && !(bv_same_array(f, sym[g].arr, o) && sym[g].V == V)) g++;
+            if (g == nsym) {
+              if (nsym == BV_SYMS) continue;
+              sym[nsym].arr = o;
+              sym[nsym].V = V;
+              sym[nsym].qi = qi;
+              sym[nsym].cmin = sym[nsym].cmax = c;
+              nsym++;
+            }
+            if (c < sym[g].cmin) sym[g].cmin = c;
+            if (c > sym[g].cmax) sym[g].cmax = c;
+            sacc[nsacc++] = v;
+            nacc++;
+            continue;
+          }
           uint32_t j = 0;
-          while (j < narr && arr[j] != o) j++;
+          while (j < narr && !bv_same_array(f, arr[j], o)) j++;
           if (j == narr) {
             if (narr == BV_ARRS) { full = true; break; }
             arr[narr] = o;
@@ -15782,43 +15991,60 @@ static bool bv_loop(IrFunc *f, uint32_t hb, uint8_t *inloop, uint32_t *stack) {
         }
       }
       if (full || !nacc) continue;
-      /* the values read after the loop, which the copy makes too: numbers
-         alone (repair_copies) */
-      uint8_t *esc = xcalloc(ni0 ? ni0 : 1, 1);
-      uint32_t *eslot = xmalloc((ni0 ? ni0 : 1) * sizeof(uint32_t));
-      TdVec *euse = NULL;
-      uint32_t nesc = escaping_values(f, inloop, nb0, ni0, false, esc, eslot, &euse);
-      bool ok = true;
-      for (uint32_t v = 0; v < ni0 && ok; v++)
-        if (esc[v] && !copy_mergeable(f, v, false)) ok = false;
-      if (!ok) {
-        for (uint32_t i = 0; i < nesc; i++) xfree(euse[i].v);
-        xfree(esc); xfree(eslot); xfree(euse);
-        BV_REJ("a value read after it is no number");
-      }
+      BvJob *J = &jobs[njobs++];
+      J->start = start; J->m = m; J->rel = rel; J->c0 = c0; J->step = step;
+      J->bottom = bottom; J->down = down; J->pt = pt;
+      J->narr = narr; J->nsym = nsym; J->nsacc = nsacc; J->nacc = nacc;
+      memcpy(J->arr, arr, narr * sizeof(Ref));
+      memcpy(J->cmin, cmin, narr * sizeof(int64_t));
+      memcpy(J->cmax, cmax, narr * sizeof(int64_t));
+      memcpy(J->sym, sym, nsym * sizeof(BvSym));
+      memcpy(J->sacc, sacc, nsacc * sizeof(Ref));
+      break;
+    }
+  }
+  if (!njobs) BV_REJ("no counter tested against a bound with accesses behind the test");
+  /* the values read after the loop, which the copy makes too: numbers
+     alone (repair_copies) */
+  uint8_t *esc = xcalloc(ni0 ? ni0 : 1, 1);
+  uint32_t *eslot = xmalloc((ni0 ? ni0 : 1) * sizeof(uint32_t));
+  TdVec *euse = NULL;
+  uint32_t nesc = escaping_values(f, inloop, nb0, ni0, false, esc, eslot, &euse);
+  bool ok = true;
+  for (uint32_t v = 0; v < ni0 && ok; v++)
+    if (esc[v] && !copy_mergeable(f, v, false)) ok = false;
+  if (!ok) {
+    for (uint32_t i = 0; i < nesc; i++) xfree(euse[i].v);
+    xfree(esc); xfree(eslot); xfree(euse);
+    BV_REJ("a value read after it is no number");
+  }
 
-      Ref *map = xmalloc(ni0 * sizeof(Ref));
-      uint32_t *bcopy = xmalloc(nb0 * sizeof(uint32_t));
-      clone_blocks(f, inloop, nb0, ni0, bcopy, map);
-      /* the original runs where a test fails -- a null, a bound past the
-         end that traps, a start below 0 -- rare, as once_split_loop's is */
-      for (uint32_t bi = 0; bi < nb0; bi++)
-        if (inloop[bi]) {
-          f->blocks[bi].bver = f->blocks[bcopy[bi]].bver = true;
-          f->blocks[bi].cold = true;
-          f->blocks[bcopy[bi]].cold = false;
-        }
-      /* the header's arguments from the preheader, which every test passes
-         on to the copy or the original (h read again: the copies' blocks
-         may have moved the function's) */
-      h = &f->blocks[hb];
-      uint32_t np = h->nparams;
-      Ref *eargs = xmalloc((np ? np : 1) * sizeof(Ref));
-      memcpy(eargs, pe->args, np * sizeof(Ref));
-      uint32_t copyh = bcopy[hb];
-      /* the tests, one a block, each going on to the next or to the
-         original: the last to the copy */
-      uint32_t first = REF_NONE, last = REF_NONE;
+  Ref *map = xmalloc(ni0 * sizeof(Ref));
+  uint32_t *bcopy = xmalloc(nb0 * sizeof(uint32_t));
+  clone_blocks(f, inloop, nb0, ni0, bcopy, map);
+  /* the original runs where a test fails -- a null, a bound past the
+     end that traps, a start below 0 -- rare, as once_split_loop's is */
+  for (uint32_t bi = 0; bi < nb0; bi++)
+    if (inloop[bi]) {
+      f->blocks[bi].cold = true;
+      f->blocks[bcopy[bi]].cold = false;
+    }
+  /* the two headers versioned: a loop inside the copy, whose own
+     counter the tests say nothing of, is versioned in turn (Java's
+     matrix multiply: the rows' loop, then the columns' inside it), a
+     loop around them not (it would copy them again) */
+  f->blocks[hb].bver = f->blocks[bcopy[hb]].bver = true;
+  /* the header's arguments from the preheader, which every test passes
+     on to the copy or the original (h read again: the copies' blocks
+     may have moved the function's) */
+  h = &f->blocks[hb];
+  uint32_t np = h->nparams;
+  Ref *eargs = xmalloc((np ? np : 1) * sizeof(Ref));
+  memcpy(eargs, pe->args, np * sizeof(Ref));
+  uint32_t copyh = bcopy[hb];
+  /* the tests, one a block, each going on to the next or to the
+     original: the last to the copy */
+  uint32_t first = REF_NONE, last = REF_NONE;
 #define BV_TEST(blk, condv, onwhen) do {                                       \
       Block *tb_ = &f->blocks[blk];                                            \
       tb_->term = T_BRIF;                                                      \
@@ -15829,118 +16055,226 @@ static bool bv_loop(IrFunc *f, uint32_t hb, uint8_t *inloop, uint32_t *stack) {
       last = blk;                                                              \
       (void)(onwhen);                                                          \
     } while (0)
-      /* each test block: succs[0] the way on (taken where the condition
-         holds), succs[1] the original; the way on added as the next block
-         is made, the last's to the copy */
-      uint32_t ntests = 0, tests[2 * BV_ARRS + 4];
-      Ref lens[BV_ARRS];
-      for (uint32_t j = 0; j < narr; j++) {
-        bool nullable = true;
-        ValType at = (ValType)f->insts[arr[j]].type;
-        if (vt_is_ref(at) && !vt_nullable(at)) nullable = false;
-        if (nullable) {
-          uint32_t g = ir_new_block(f);
-          Ref isn = ir_emit(f, g, I_REF_IS_NULL, VT_I32, &arr[j], 1, 0, 0);
-          Ref nn = ir_emit(f, g, I_EQZ, VT_I32, &isn, 1, 0, 0);
-          BV_TEST(g, nn, 0);
-          tests[ntests++] = g;
-        }
-        uint32_t g = ir_new_block(f);
-        lens[j] = ir_emit(f, g, I_ARRAY_LEN, VT_I32, &arr[j], 1, 0, 0);
-        Ref L = lens[j];
-        if (pt == VT_I64) L = ir_emit(f, g, I_EXTENDU, VT_I64, &L, 1, 0, 0);
-        /* up: m <= len - (cmax - c0), one less for <=; down: start + cmax
-           below the length, start < len - cmax */
-        int64_t K = down ? cmax[j] : cmax[j] - c0;
-        if (K < 0) K = 0;
-        if (!down && (rel == I_LES || rel == I_LEU)) K++;
-        if (K) {
-          Ref kc = ir_emit(f, g, I_CONST, pt, NULL, 0, (uint64_t)K, 0);
-          Ref sa[2] = { L, kc };
-          L = ir_emit(f, g, I_SUB, pt, sa, 2, 0, 0);
-        }
-        Ref ca[2] = { down ? start : m, L };
-        Ref le = ir_emit(f, g, down ? I_LTS : I_LES, VT_I32, ca, 2, 0, 0);
-        BV_TEST(g, le, 0);
+  /* each test block: succs[0] the way on (taken where the condition
+     holds), succs[1] the original; the way on added as the next block
+     is made, the last's to the copy */
+  uint32_t ntests = 0, tests[BV_JOBS * (4 * BV_ARRS + 5 * BV_SYMS + 6)];
+  uint32_t nacc = 0;
+  for (uint32_t jj = 0; jj < njobs; jj++) {
+    BvJob *J = &jobs[jj];
+    Ref start = J->start, m = J->m;
+    IrOp rel = J->rel;
+    int64_t c0 = J->c0, step = J->step;
+    bool bottom = J->bottom, down = J->down;
+    ValType pt = J->pt;
+    uint32_t narr = J->narr, nsym = J->nsym;
+    Ref *arr = J->arr;
+    int64_t *cmin = J->cmin, *cmax = J->cmax;
+    BvSym *sym = J->sym;
+    nacc += J->nacc;
+    Ref lens[BV_ARRS];
+    /* the arrays the loop reads anew each time round (bv_field_array),
+       read here once: past a test of the object's null where it may be
+       null, without the null check, a block of its own (its test always
+       true); the tests below are of that read */
+    for (uint32_t j = 0; j < narr + nsym; j++) {
+      Ref *ap = j < narr ? &arr[j] : &sym[j - narr].arr;
+      uint32_t ab = f->insts[*ap].block;
+      if (!(ab < nb0 && inloop[ab])) continue;
+      Ref x = ir_resolve(f, ir_args(f, *ap)[0]);
+      ValType xt = (ValType)f->insts[x].type;
+      uint32_t g;
+      if (!(vt_is_ref(xt) && !vt_nullable(xt))) {
+        g = ir_new_block(f);
+        Ref isn = ir_emit(f, g, I_REF_IS_NULL, VT_I32, &x, 1, 0, 0);
+        BV_TEST(g, ir_emit(f, g, I_EQZ, VT_I32, &isn, 1, 0, 0), 0);
         tests[ntests++] = g;
       }
-      int64_t lo = cmin[0];
-      for (uint32_t j = 1; j < narr; j++) if (cmin[j] < lo) lo = cmin[j];
-      uint64_t sv;
-      /* the least index: up, start's; down, the test's -- i + c0 >= m (or
-         > m) puts i + cmin at least 0 where m >= c0 - cmin (less 1) */
-      int64_t kl = c0 - lo - (rel == I_GTS ? 1 : 0);
-      if (down) {
-        bool m_ok = is_const(f, m, &sv) && (pt == VT_I64 ? (int64_t)sv : (int64_t)(int32_t)(uint32_t)sv) >= kl;
-        if (!m_ok) {
-          uint32_t g = ir_new_block(f);
-          Ref kc = ir_emit(f, g, I_CONST, pt, NULL, 0, (uint64_t)kl, 0);
-          Ref ca[2] = { m, kc };
-          Ref ge = ir_emit(f, g, I_GES, VT_I32, ca, 2, 0, 0);
-          BV_TEST(g, ge, 0);
-          tests[ntests++] = g;
-        }
-      }
-      bool start_ok = down || (is_const(f, start, &sv) &&
-                      (pt == VT_I64 ? (int64_t)sv : (int64_t)(int32_t)(uint32_t)sv) + lo >= 0);
-      if (!start_ok) {
+      g = ir_new_block(f);
+      const Inst *fi = &f->insts[*ap];
+      ValType ft = (ValType)fi->type;
+      uint64_t fimm = fi->imm, fimm2 = fi->imm2 & ~(uint64_t)GCF_NULLCHK;
+      uint8_t fflags = fi->flags;
+      Ref o2 = ir_emit(f, g, I_FIELD_GET, ft, &x, 1, fimm, fimm2);
+      f->insts[o2].flags = fflags;
+      *ap = o2;
+      BV_TEST(g, ir_emit(f, g, I_CONST, VT_I32, NULL, 0, 1, 0), 0);
+      tests[ntests++] = g;
+    }
+    for (uint32_t j = 0; j < narr; j++) {
+      bool nullable = true;
+      ValType at = (ValType)f->insts[arr[j]].type;
+      if (vt_is_ref(at) && !vt_nullable(at)) nullable = false;
+      if (nullable) {
         uint32_t g = ir_new_block(f);
-        Ref kc = ir_emit(f, g, I_CONST, pt, NULL, 0, (uint64_t)(0 - lo), 0);
-        Ref ca[2] = { start, kc };
+        Ref isn = ir_emit(f, g, I_REF_IS_NULL, VT_I32, &arr[j], 1, 0, 0);
+        Ref nn = ir_emit(f, g, I_EQZ, VT_I32, &isn, 1, 0, 0);
+        BV_TEST(g, nn, 0);
+        tests[ntests++] = g;
+      }
+      uint32_t g = ir_new_block(f);
+      lens[j] = ir_emit(f, g, I_ARRAY_LEN, VT_I32, &arr[j], 1, 0, 0);
+      Ref L = lens[j];
+      if (pt == VT_I64) L = ir_emit(f, g, I_EXTENDU, VT_I64, &L, 1, 0, 0);
+      /* up: m <= len - (cmax - c0), one less for <=; down: start + cmax
+         below the length, start < len - cmax */
+      int64_t K = down ? cmax[j] : cmax[j] - c0;
+      if (K < 0) K = 0;
+      if (!down && (rel == I_LES || rel == I_LEU)) K++;
+      if (K) {
+        Ref kc = ir_emit(f, g, I_CONST, pt, NULL, 0, (uint64_t)K, 0);
+        Ref sa[2] = { L, kc };
+        L = ir_emit(f, g, I_SUB, pt, sa, 2, 0, 0);
+      }
+      Ref ca[2] = { down ? start : m, L };
+      Ref le = ir_emit(f, g, down ? I_LTS : I_LES, VT_I32, ca, 2, 0, 0);
+      BV_TEST(g, le, 0);
+      tests[ntests++] = g;
+    }
+    int64_t lo = narr ? cmin[0] : 0;
+    for (uint32_t j = 1; j < narr; j++) if (cmin[j] < lo) lo = cmin[j];
+    uint64_t sv;
+    /* the least index: up, start's; down, the test's -- i + c0 >= m (or
+       > m) puts i + cmin at least 0 where m >= c0 - cmin (less 1) */
+    int64_t kl = c0 - lo - (rel == I_GTS ? 1 : 0);
+    if (down && narr) {
+      bool m_ok = is_const(f, m, &sv) && (pt == VT_I64 ? (int64_t)sv : (int64_t)(int32_t)(uint32_t)sv) >= kl;
+      if (!m_ok) {
+        uint32_t g = ir_new_block(f);
+        Ref kc = ir_emit(f, g, I_CONST, pt, NULL, 0, (uint64_t)kl, 0);
+        Ref ca[2] = { m, kc };
         Ref ge = ir_emit(f, g, I_GES, VT_I32, ca, 2, 0, 0);
         BV_TEST(g, ge, 0);
         tests[ntests++] = g;
       }
-      if (bottom) {
-        /* start passes the test as the next values do -- signed: of an m
-           and a start not negative the same, and what the ranges take
-           (a guard decides which copy runs, the same either way) */
-        uint32_t g = ir_new_block(f);
-        Ref ca[2] = { start, m };
-        IrOp srel = down ? rel : rel == I_LTS || rel == I_LTU ? I_LTS : I_LES;
-        Ref t = ir_emit(f, g, srel, VT_I32, ca, 2, 0, 0);
-        BV_TEST(g, t, 0);
+    }
+    bool start_ok = down || !narr || (is_const(f, start, &sv) &&
+                    (pt == VT_I64 ? (int64_t)sv : (int64_t)(int32_t)(uint32_t)sv) + lo >= 0);
+    if (!start_ok) {
+      uint32_t g = ir_new_block(f);
+      Ref kc = ir_emit(f, g, I_CONST, pt, NULL, 0, (uint64_t)(0 - lo), 0);
+      Ref ca[2] = { start, kc };
+      Ref ge = ir_emit(f, g, I_GES, VT_I32, ca, 2, 0, 0);
+      BV_TEST(g, ge, 0);
+      tests[ntests++] = g;
+    }
+    if (nsym) {
+      /* in i64: the counter's greatest value at an access, hp, m - 1
+         (m for <=), the next past it not over 2^31 - 1; of each group,
+         the least index start + V + cmin (a second counter's start q0 +
+         cmin) not negative, the greatest hp + V + cmax (V q0 - start)
+         below the length */
+      uint32_t g = ir_new_block(f);
+      Ref M = ir_emit(f, g, I_EXTENDS, VT_I64, &m, 1, 0, 0);
+      Ref S = ir_emit(f, g, I_EXTENDS, VT_I64, &start, 1, 0, 0);
+      Ref one = ir_emit(f, g, I_CONST, VT_I64, NULL, 0,
+                        (uint64_t)(rel == I_LES || rel == I_LEU ? 0 : -1), 0);
+      Ref ha[2] = { M, one };
+      Ref hp = ir_emit(f, g, I_ADD, VT_I64, ha, 2, 0, 0);
+      Ref sk = ir_emit(f, g, I_CONST, VT_I64, NULL, 0, (uint64_t)step, 0);
+      Ref na[2] = { hp, sk };
+      Ref nx = ir_emit(f, g, I_ADD, VT_I64, na, 2, 0, 0);
+      Ref mx = ir_emit(f, g, I_CONST, VT_I64, NULL, 0, (uint64_t)INT32_MAX, 0);
+      Ref xa[2] = { nx, mx };
+      BV_TEST(g, ir_emit(f, g, I_LES, VT_I32, xa, 2, 0, 0), 0);
+      tests[ntests++] = g;
+      for (uint32_t s = 0; s < nsym; s++) {
+        ValType at = (ValType)f->insts[sym[s].arr].type;
+        if (!(vt_is_ref(at) && !vt_nullable(at))) {
+          g = ir_new_block(f);
+          Ref isn = ir_emit(f, g, I_REF_IS_NULL, VT_I32, &sym[s].arr, 1, 0, 0);
+          BV_TEST(g, ir_emit(f, g, I_EQZ, VT_I32, &isn, 1, 0, 0), 0);
+          tests[ntests++] = g;
+        }
+        g = ir_new_block(f);
+        Ref Voff, lo0;
+        if (sym[s].qi >= 0) {
+          lo0 = ir_emit(f, g, I_EXTENDS, VT_I64, &eargs[sym[s].qi], 1, 0, 0);
+          Ref da[2] = { lo0, S };
+          Voff = ir_emit(f, g, I_SUB, VT_I64, da, 2, 0, 0);
+        } else {
+          Voff = ir_emit(f, g, I_EXTENDS, VT_I64, &sym[s].V, 1, 0, 0);
+          Ref sa[2] = { S, Voff };
+          lo0 = ir_emit(f, g, I_ADD, VT_I64, sa, 2, 0, 0);
+        }
+        Ref kmin = ir_emit(f, g, I_CONST, VT_I64, NULL, 0, (uint64_t)sym[s].cmin, 0);
+        Ref la[2] = { lo0, kmin };
+        Ref lov = ir_emit(f, g, I_ADD, VT_I64, la, 2, 0, 0);
+        Ref z = ir_emit(f, g, I_CONST, VT_I64, NULL, 0, 0, 0);
+        Ref ga[2] = { lov, z };
+        BV_TEST(g, ir_emit(f, g, I_GES, VT_I32, ga, 2, 0, 0), 0);
+        tests[ntests++] = g;
+        g = ir_new_block(f);
+        Ref L = ir_emit(f, g, I_ARRAY_LEN, VT_I32, &sym[s].arr, 1, 0, 0);
+        L = ir_emit(f, g, I_EXTENDU, VT_I64, &L, 1, 0, 0);
+        Ref hv[2] = { hp, Voff };
+        Ref hi = ir_emit(f, g, I_ADD, VT_I64, hv, 2, 0, 0);
+        Ref kmax = ir_emit(f, g, I_CONST, VT_I64, NULL, 0, (uint64_t)sym[s].cmax, 0);
+        Ref hk[2] = { hi, kmax };
+        hi = ir_emit(f, g, I_ADD, VT_I64, hk, 2, 0, 0);
+        Ref lt[2] = { hi, L };
+        BV_TEST(g, ir_emit(f, g, I_LTS, VT_I32, lt, 2, 0, 0), 0);
         tests[ntests++] = g;
       }
-      if (rel == I_LTU || rel == I_LEU) {
-        uint32_t g = ir_new_block(f);
-        Ref z = ir_emit(f, g, I_CONST, pt, NULL, 0, 0, 0);
-        Ref ca[2] = { m, z };
-        Ref ge = ir_emit(f, g, I_GES, VT_I32, ca, 2, 0, 0);
-        BV_TEST(g, ge, 0);
-        tests[ntests++] = g;
-      }
-#undef BV_TEST
-      /* the edges: on (succs[0]) and the original (succs[1]) of each; the
-         chain's ways on were added in order, so each block has its way on
-         to the next first, the last's to the copy */
-      for (uint32_t t = 0; t < ntests; t++) {
-        uint32_t g = tests[t];
-        if (t + 1 == ntests) ir_add_edge(f, g, copyh, eargs, np);
-        ir_add_edge(f, g, hb, eargs, np);
-      }
-      pe->target = first;
-      pe->nargs = 0;
-      xfree(eargs);
-
-      ir_recompute_preds(f);
-      ir_order(f);
-      repair_copies(f, ni0, esc, eslot, euse, bcopy, map);
-      for (uint32_t i = 0; i < nesc; i++) xfree(euse[i].v);
-      xfree(esc); xfree(eslot); xfree(euse); xfree(map); xfree(bcopy);
-      prune_params(f);
-      ir_order(f);
-      g_stats.bce_versioned++;
-      if (warmc_getenv("WARMC_BV_DEBUG"))
-        fprintf(stderr, "bce_version %s b%u: copied, %u accesses of %u arrays, %u tests\n",
-                f->m->funcs[f->func_index].sym, hb, nacc, narr, ntests);
-      return true;
+    }
+    if (bottom) {
+      /* start passes the test as the next values do -- signed: of an m
+         and a start not negative the same, and what the ranges take
+         (a guard decides which copy runs, the same either way) */
+      uint32_t g = ir_new_block(f);
+      Ref ca[2] = { start, m };
+      IrOp srel = down ? rel : rel == I_LTS || rel == I_LTU ? I_LTS : I_LES;
+      Ref t = ir_emit(f, g, srel, VT_I32, ca, 2, 0, 0);
+      BV_TEST(g, t, 0);
+      tests[ntests++] = g;
+    }
+    if (rel == I_LTU || rel == I_LEU) {
+      uint32_t g = ir_new_block(f);
+      Ref z = ir_emit(f, g, I_CONST, pt, NULL, 0, 0, 0);
+      Ref ca[2] = { m, z };
+      Ref ge = ir_emit(f, g, I_GES, VT_I32, ca, 2, 0, 0);
+      BV_TEST(g, ge, 0);
+      tests[ntests++] = g;
     }
   }
-  BV_REJ("no counter tested against a bound with accesses behind the test");
+#undef BV_TEST
+  /* the edges: on (succs[0]) and the original (succs[1]) of each; the
+     chain's ways on were added in order, so each block has its way on
+     to the next first, the last's to the copy */
+  for (uint32_t t = 0; t < ntests; t++) {
+    uint32_t g = tests[t];
+    if (t + 1 == ntests) ir_add_edge(f, g, copyh, eargs, np);
+    ir_add_edge(f, g, hb, eargs, np);
+  }
+  pe->target = first;
+  pe->nargs = 0;
+  xfree(eargs);
+
+  /* the copy's symbolic accesses, which the tests put in bounds */
+  uint32_t narrs = 0, nsyms = 0;
+  for (uint32_t jj = 0; jj < njobs; jj++) {
+    narrs += jobs[jj].narr;
+    nsyms += jobs[jj].nsym;
+    for (uint32_t s = 0; s < jobs[jj].nsacc; s++) {
+      f->insts[map[jobs[jj].sacc[s]]].imm2 |= GCF_NOBOUND;
+      g_stats.bce_version_sym++;
+    }
+  }
+  ir_recompute_preds(f);
+  ir_order(f);
+  repair_copies(f, ni0, esc, eslot, euse, bcopy, map);
+  for (uint32_t i = 0; i < nesc; i++) xfree(euse[i].v);
+  xfree(esc); xfree(eslot); xfree(euse); xfree(map); xfree(bcopy);
+  prune_params(f);
+  ir_order(f);
+  g_stats.bce_versioned++;
+  if (warmc_getenv("WARMC_BV_DEBUG"))
+    fprintf(stderr, "bce_version %s b%u: copied, %u counters, %u accesses of %u arrays and %u symbolic groups, %u tests\n",
+            f->m->funcs[f->func_index].sym, hb, njobs, nacc, narrs, nsyms, ntests);
+  return true;
 }
 
-#define BV_LOOPS 8
+#define BV_LOOPS 16
 static bool pass_bce_version(IrFunc *f) {
   if (warmc_getenv("WARMC_NO_BCE_VERSION") || f->npads) return false;
   bool changed = false;
@@ -27460,6 +27794,145 @@ static void bce_shape(IrFunc *f, Ref x, int d, char *buf, size_t n) {
   if (k < n) snprintf(buf + k, n - k, ")");
 }
 
+/* ---- Bounds checks' lengths ----
+   A bounds check the proofs left loads its array's length where it is
+   made: ldr, cmp, b.hs.  Where the length is known otherwise the check
+   takes it as its access's last operand (GCF_LENARG) and compares with
+   that: a constant, for an array of a length known from its allocation
+   (array_exact_len), as the compare's immediate; an array.len a block
+   over the access makes already; or, of an array not null that is the
+   same every time round the loop, one array.len in the block over the
+   access in the fewest loops (bl_place) -- a register through the loop,
+   where the check loaded it every time round (Java's enumvm: an
+   interpreter's op[pc], a[pc], b[pc], c[pc] and r[a[pc]] of an r of 8).
+   Last, after every proof, so that no pass meets the operand
+   (WARMC_NO_BOUND_LENS). */
+static void bl_push_arg(IrFunc *f, Ref v, Ref x) {
+  Inst *in = &f->insts[v];
+  uint32_t n = in->nargs;
+  uint32_t oc_ = f->cap_argpool;
+  while (f->nargpool + n + 1 > f->cap_argpool)
+    f->cap_argpool = f->cap_argpool ? f->cap_argpool * 2 : 32;
+  if (f->cap_argpool != oc_)
+    f->argpool = ir_grow(f, f->argpool, (size_t)oc_ * sizeof(Ref),
+                         (size_t)f->cap_argpool * sizeof(Ref));
+  in = &f->insts[v];
+  uint32_t off = f->nargpool;
+  for (uint32_t k = 0; k < n; k++) f->argpool[f->nargpool++] = f->argpool[in->args_off + k];
+  f->argpool[f->nargpool++] = x;
+  in->args_off = off;
+  in->nargs = n + 1;
+}
+
+/* Where an array.len of an array made in block ab serves an access in bi:
+   the block over bi, of the fewest loops around it, nearest bi -- one
+   ab is over too, so the array is made there -- or REF_NONE where every
+   block over bi that ab is over is in as many loops as bi.  Up the
+   dominator tree, not out through each loop's preheader: past jump
+   threading a loop's one way in from before it can be inside the loop
+   itself, below nothing of it (luawasm's nbody: the length made there was
+   read where it had not been made).  At the end of the block, past a call
+   that can raise there, which leaves the block before it. */
+static uint32_t bl_place(IrFunc *f, uint32_t bi, uint32_t ab) {
+  uint32_t best = REF_NONE, depth = f->blocks[bi].loop_depth;
+  uint32_t d = f->blocks[bi].idom;
+  for (int hop = 0; hop < 256 && d != REF_NONE && d < f->nblocks; hop++) {
+    if (!dominates(f, ab, d)) break;
+    if (f->blocks[d].loop_depth < depth) {
+      best = d;
+      depth = f->blocks[d].loop_depth;
+      if (!depth) break;
+    }
+    if (d == f->entry || f->blocks[d].idom == d) break;
+    d = f->blocks[d].idom;
+  }
+  return best;
+}
+
+static bool pass_bound_lens(IrFunc *f) {
+  static _Atomic int on = -1;
+  if (on < 0) on = warmc_getenv("WARMC_NO_BOUND_LENS") == NULL;
+  if (!on) return false;
+  bool any = false;
+  for (uint32_t oi = 0; oi < f->norder && !any; oi++) {
+    const Block *b = &f->blocks[f->order[oi]];
+    for (uint32_t i = 0; i < b->ninsts && !any; i++) {
+      const Inst *in = &f->insts[b->insts[i]];
+      any = (in->op == I_ARRAY_GET || in->op == I_ARRAY_SET) &&
+            !(in->imm2 & (GCF_NOBOUND | GCF_LENARG));
+    }
+  }
+  if (!any) return false;
+  /* the array.lens of no null check, by array: made before, or made here */
+  uint32_t cap = f->ninsts + 64;
+  Ref *head = xmalloc(cap * sizeof(Ref)), *next = xmalloc(cap * sizeof(Ref));
+  for (uint32_t k = 0; k < cap; k++) head[k] = next[k] = REF_NONE;
+#define BL_ADD(arr, l) do { if ((arr) < cap && (l) < cap) { next[l] = head[arr]; head[arr] = (l); } } while (0)
+  for (uint32_t oi = 0; oi < f->norder; oi++) {
+    const Block *b = &f->blocks[f->order[oi]];
+    for (uint32_t i = 0; i < b->ninsts; i++) {
+      Ref v = b->insts[i];
+      const Inst *in = &f->insts[v];
+      if (in->op == I_ARRAY_LEN && in->nargs == 1 && !(in->imm2 & GCF_NULLCHK))
+        BL_ADD(ir_resolve(f, ir_args(f, v)[0]), v);
+    }
+  }
+  bool changed = false;
+  for (uint32_t oi = 0; oi < f->norder; oi++) {
+    uint32_t bi = f->order[oi];
+    for (uint32_t i = 0; i < f->blocks[bi].ninsts; i++) {
+      Ref v = f->blocks[bi].insts[i];
+      const Inst *in = &f->insts[v];
+      if ((in->op != I_ARRAY_GET && in->op != I_ARRAY_SET) || in->nargs < 2 ||
+          (in->imm2 & (GCF_NOBOUND | GCF_LENARG)))
+        continue;
+      Ref arr = ir_resolve(f, ir_args(f, v)[0]);
+      Ref L = REF_NONE;
+      uint64_t k = array_exact_len(f, arr, 4);
+      if (k && k <= 0xfff) {
+        L = emit_before(f, bi, &i, I_CONST, VT_I32, NULL, 0, k);
+      } else if (!k) {
+        /* an array.len made before, in this block or one over it */
+        for (Ref l = arr < cap ? head[arr] : REF_NONE; l != REF_NONE && L == REF_NONE; l = next[l]) {
+          uint32_t lb = f->insts[l].block;
+          if (lb != bi) {
+            if (dominates(f, lb, bi)) L = l;
+            continue;
+          }
+          for (uint32_t j = 0; j < i; j++)
+            if (f->blocks[bi].insts[j] == l) { L = l; break; }
+        }
+        /* one made in the block over the access of the fewest loops that
+           is over the array's (bl_place) */
+        ValType at = (ValType)f->insts[arr].type;
+        uint32_t ab = f->insts[arr].block;
+        uint32_t place = L == REF_NONE && f->blocks[bi].loop_depth && vt_is_ref(at) &&
+                         !vt_nullable(at) && ab < f->nblocks ? bl_place(f, bi, ab) : REF_NONE;
+        if (place != REF_NONE) {
+          L = ir_emit(f, place, I_ARRAY_LEN, VT_I32, &arr, 1, 0, 0);
+          if (L >= cap) {
+            uint32_t nc = L + 64;
+            head = xrealloc(head, nc * sizeof(Ref));
+            next = xrealloc(next, nc * sizeof(Ref));
+            for (uint32_t q = cap; q < nc; q++) head[q] = next[q] = REF_NONE;
+            cap = nc;
+          }
+          BL_ADD(arr, L);
+          g_stats.bound_lens_hoisted++;
+        }
+      }
+      if (L == REF_NONE) continue;
+      bl_push_arg(f, v, L);
+      f->insts[v].imm2 |= GCF_LENARG;
+      g_stats.bound_lens++;
+      changed = true;
+    }
+  }
+#undef BL_ADD
+  xfree(head); xfree(next);
+  return changed;
+}
+
 static void bce_report(IrFunc *f) {
   const Func *fn = &f->m->funcs[f->func_index];
   for (uint32_t oi = 0; oi < f->norder; oi++) {
@@ -27468,10 +27941,11 @@ static void bce_report(IrFunc *f) {
       Ref v = b->insts[i];
       const Inst *in = &f->insts[v];
       if ((in->op != I_ARRAY_GET && in->op != I_ARRAY_SET) || (in->imm2 & GCF_NOBOUND) || in->nargs < 2) continue;
-      char shape[256];
+      char shape[256], arr[256];
       bce_shape(f, ir_args(f, v)[1], 3, shape, sizeof shape);
-      fprintf(stderr, "bce: %s: %s %s\n", fn->name ? fn->name : fn->sym ? fn->sym : "?",
-              in->op == I_ARRAY_GET ? "get" : "set", shape);
+      bce_shape(f, ir_args(f, v)[0], 2, arr, sizeof arr);
+      fprintf(stderr, "bce: %s: d%u b%u v%u %s %s of %s\n", fn->name ? fn->name : fn->sym ? fn->sym : "?",
+              b->loop_depth, f->order[oi], v, in->op == I_ARRAY_GET ? "get" : "set", shape, arr);
     }
   }
 }
@@ -27769,6 +28243,7 @@ void ir_optimize(IrFunc *f, const OptOpts *o) {
   }
   if (o->fma && TP("fma", pass_fma(f)) && o->dce) pass_dce(f);
   if (o->wrap_params) TP("wrap_params", pass_wrap_params(f));
+  if (o->bce) TP("bound_lens", pass_bound_lens(f));
   if (o->print_ir) ir_print(f, "optimised");
   if (warmc_getenv("WARMC_BCE_REPORT")) bce_report(f);
   ir_verify(f, "post-opt");

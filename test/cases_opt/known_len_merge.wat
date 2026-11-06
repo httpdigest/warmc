@@ -2,8 +2,8 @@
 ;; array_exact_len): through a block parameter, the least of the lengths
 ;; its ways in give is a lower bound -- what a proof that an index is in
 ;; bounds may take -- and not the length: array.len stays a read of it
-;; (lenmerge: x of 4 or of 8 elements), and a read at k traps past x's own
-;; length, not past the least (getmerge).
+;; (lenmerge), and a check no proof removes compares with it, not with the
+;; least (getmerge: x of 4 or of 8 elements, read at k).
 ;; run: lenmerge 1 => i32:4
 ;; run: lenmerge 0 => i32:8
 ;; run: getmerge 1 3 => i32:3

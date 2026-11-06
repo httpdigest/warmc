@@ -559,8 +559,8 @@ BYTES = [0x41, 0xc3, 0x7f, 0x80, 0x00, 0xff, 0x20, 0xe2]
 
 # what warmc's --stats says at -O2: the bits tested and the folds made
 BIT_TESTS = 1380
-WAY_FOLDS = 3124
+WAY_FOLDS = 3128
 # and the blocks merge_blocks makes one with the block that jumps to them
-BLOCKS_MERGED = 29377
+BLOCKS_MERGED = 29484
 
 main()

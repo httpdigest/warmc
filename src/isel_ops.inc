@@ -2601,8 +2601,18 @@ static void emit_inst(Isel *s, Ref v) {
       int idx = rd(s, a[1], S1);
 
       if (!(in->imm2 & GCF_NOBOUND)) {
-        a64_ldr_imm(B, 2, TMP0, x, 4);
-        a64_cmp_reg(B, SF32, idx, TMP0);
+        if (in->imm2 & GCF_LENARG) {
+          /* the length an operand: a constant, or a register a block
+             before made it in */
+          Ref L = a[in->nargs - 1];
+          if (is_imm_at(s, v, in->nargs - 1, L))
+            a64_cmp_imm(B, SF32, idx, (uint32_t)(imm_of(s, L) & 0xfff));
+          else
+            a64_cmp_reg(B, SF32, idx, rd(s, L, TMP0));
+        } else {
+          a64_ldr_imm(B, 2, TMP0, x, 4);
+          a64_cmp_reg(B, SF32, idx, TMP0);
+        }
         trap_if_cc(s, CC_HS, TRAP_ARRAY_OOB);
       }
       /* A store's value is read before the element's address goes into

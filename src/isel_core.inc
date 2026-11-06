@@ -589,7 +589,11 @@ static bool load_needs_barrier(const IrFunc *f, const Inst *in) {
 static Ref load_barrier_mask(const IrFunc *f, Ref v) {
   const Inst *in = &f->insts[v];
   if (!(in->imm2 & GCF_MASKARG)) return REF_NONE;
-  return ir_args((IrFunc *)f, v)[in->nargs - 1];
+  /* before the length, where a bounds check takes one (GCF_LENARG) */
+  Ref m = ir_args((IrFunc *)f, v)[in->nargs - 1 - ((in->imm2 & GCF_LENARG) != 0)];
+  if (f->insts[m].op != I_GC_BADMASK)
+    warmc_fatal("internal: v%u's barrier mask v%u is no gc.badmask", v, m);
+  return m;
 }
 
 static void emit_move_to(Isel *s, Buf *out, int dst, int src, int fp, int wide,

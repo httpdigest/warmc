@@ -457,6 +457,12 @@ typedef struct {
      its types is decided by the object's type slot alone, with no runtime
      to ask about another module's objects. */
   bool gc_sealed;
+  /* In a sealed module, by field (compile.c module_field_writes), whether
+     some struct.set writes it -- one flag for a field a type shares with
+     its supertypes and subtypes, and its canonical equals: fld_base[t] + k
+     at the topmost type t that has field k -- NULL where not known */
+  uint8_t *fld_written;
+  uint32_t *fld_base, *fld_canon;
   /* No ref.i31 in the code reach found live or in an initialiser it runs,
      so that in a sealed module every non-null reference of the any
      hierarchy is an object (false when reach has not run) */
@@ -567,6 +573,9 @@ const ContSiteInfo *module_cont_sites(Module *m);
 uint32_t module_add_distinct_func_type(Module *m, const ValType *params, uint32_t nparams,
                                        const ValType *results, uint32_t nresults);
 uint32_t *module_type_canon(const Module *m);
+/* whether no struct.set in the sealed module writes field k of type ti:
+   past struct.new it keeps its value (compile.c module_field_writes) */
+bool module_field_unwritten(const Module *m, uint32_t ti, uint32_t k);
 void wasm_validate_funcs(Module *m, const uint32_t *fns, uint32_t n);
 uint32_t module_untrampoline(Module *m);
 uint32_t module_go_sp_args(Module *m);

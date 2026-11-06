@@ -1340,7 +1340,7 @@ and `ldcomb` need `guard-pages`; `small-loop-align` needs `align`; and
 |---|---|
 | `fold` | constant folding and algebraic simplification, including a constant reinterpreted between integer and float and two xor-shifts that cancel, an `eq` or `ne` against a constant with a bit the value cannot have, a test of an `Ordering` -- Rust's `(a > b) - (a < b)`, alone or masked to its byte -- as the compare of `a` and `b` it stands for, a branch on the high half of a call's i64 result, Go's unwind flag once `go-sp` packs it, as a `tst` of the result, and an i64 put back together from its halves, `x & 0xffffffff00000000` or'd with `x`'s low half extended, as `x`; `x*c + y*c` as `(x + y)*c`, and `x*c - y*c` as `(x - y)*c`, an integer's or lane by lane, where each product is read there alone; the sign extension of an i64 that already is the sign extension of its low 32 bits -- a signed load, an extension, a constant in range, an and, or, xor or select of such, a block parameter every edge hands one, a loop's too -- as that i64, as Go's int32 kept in an i64 and extended again at each use is; the value a loop hands its parameter `x` on a back edge, `x op c1 op c2 ...` with each `c` a constant and `op` an add, multiply, and, or or xor, as `x op c`, the constants folded into one, also where the links are read elsewhere, which keep them, so that the next iteration waits on one instruction, not on each link -- a loop unrolled four times, each copy its counter plus one -- though not where nothing else reads `x`, which would then be live to the chain's end; a reinterpret undone, a store of reinterpreted bits, and an integer load read only as float bits, as the C ABI copies a struct's doubles, move the bits in the float registers. Also from `fold`: a test of one bit, `(1 << n) & v` read only as a truth value (a branch, a select's condition, an `eqz`, an `eq` or `ne` of 0), is `(v >> n) & 1`, an `lsr` and a `tbnz` of the constant set Rust's `char::is_whitespace` tests against (`WARMC_NO_BIT_TESTS=1` turns it off); and an integer instruction whose operand the ways into its block bound is that operand or a constant -- an and that clears no bit the operand can have set, or all of them, an or that sets none it can have clear, a compare or `eqz` the values decide, a sign extension of a value already its own, a shift past every bit, and with one value left (a `br_table`'s case, an `x == k`) whatever the instruction is worked out -- where the operand can be what its shape leaves it (a signed byte's two ranges, `ir_value_max`) and what every branch on every way in says, jump threading's facts through merges, also of a value made again the same way: a signed byte found not negative is the byte without its mask (`WARMC_NO_WAY_FOLDS=1`, `WARMC_NO_WAY_ONE=1` for the one-value case) |
 | `dce` | dead-code elimination |
-| `cse` | common-subexpression elimination over dominators |
+| `cse` | common-subexpression elimination over dominators; an instruction's operands are taken to the twins found before it, so a chain of twins -- the copies of a computation LICM puts in one preheader from a loop's arms -- goes in one walk |
 | `licm` | loop-invariant code motion, including hoisting invariant stores and trap guards; a value is taken out of the innermost loop that reads it and no further, a native address stays by the access it serves, which folds it, and nothing comes out of a cold block, which would run what only a slow path reads on every way into the loop (`WARMC_LICM_COLD=1` takes it out too) |
 | `unswitch` | after LICM, an innermost loop of up to 600 instructions with a branch on a value made before it is copied, the original taking the branch's first way every time round and the copy its second, a test ahead of them choosing: an inline cache's guard and its slow way, a table's kind tested at every access. A branch with a cold way (a branch hint's) first; one with none only in a loop of up to 200; at most 3000 instructions copied a function; then LICM again. luawasm's awfy_sieve 22% and spectralnorm 9% fewer cycles. `WARMC_NO_UNSWITCH` turns it off. A copied block keeps its cold flag and its edges' hints (a copy without them took its slow paths for hot ones and spilled round their calls), and no copy merges an address made of `mem_ptr`'s base, which only an access may read |
 | `branch` | branch folding: a `br_if` or `br_table` on a constant, a `br_if` whose two edges go to one place, and edges through empty blocks that only jump on; and a block that jumps to one whose only way in it is becomes one block with it, the other's parameters the values the jump handed them -- a dispatch reached through a block that only hands its label on, LLVM's way round an irreducible loop (`cbench/lexer`), is then a switch on a parameter of its own, which `thread` takes each edge's constant label through, and the rest of the passes see one block where there were two (`ktbench/sum` takes 0.47 the time, `gobench/utf8scan` 0.63, `stdgo/mix` 0.75; `rsbench/wide128` 1.09, `asbench/mapint` 1.06, code placement and allocation; `WARMC_NO_BLOCK_MERGE=1` turns it off) |
@@ -1380,7 +1380,7 @@ and `ldcomb` need `guard-pages`; `small-loop-align` needs `align`; and
 | `ictab` | a `call_indirect` through table 0, when nothing writes it, it holds no imported function and it is not table64, loads its target from a code table per type, whose slots that fail the call's checks hold trap stubs, so the call needs no signature, null or instance check |
 | `reinline` | after the cleanup passes, inline again what devirtualisation made direct and the calls an allocation leaves by |
 | `throw-jump` | a `throw` caught in its own function, without the exnref, becomes a jump to the catch |
-| `gcpure` | treat immutable GC fields and `array.len` as pure; drop redundant null and bounds checks, and casts and type tests that a dominating `ref.test` or cast already decides |
+| `gcpure` | treat immutable GC fields -- and, in a sealed module, a field no `struct.set` of the module writes, as TeaVM's arrays' data (`WARMC_NO_FIELD_WRITES=1`) -- and `array.len` as pure; drop redundant null and bounds checks, and casts and type tests that a dominating `ref.test` or cast already decides |
 | `sealed` | in a module no reference crosses the boundary of, either way, every object the code meets is the module's own, so a cast or type test of one of its types whose passing types are one run of its numbering -- a type and the subtypes numbered after it -- compares the object's type slot inline and never asks the runtime; a cast that lets null through, whose object an access then checks for null, traps on null itself, so the object is checked once. Another module's objects carry type ids outside the module's range, so a module wrongly taken for sealed could only fail a cast that should pass, never pass one that should fail (on at every level) |
 | `once` | TeaVM initializes a class lazily: a global holds the class's initializer until it runs, which first stores an empty function there, and every static access calls whatever the global holds. A call through such a global goes where the global holds the empty function on every way there -- after another call through it, a call of the initializer or a store of the empty function -- and wherever the initializer only disarms globals of the pattern nothing reads but to call them; a loop that makes such a call is copied, and the copy, without the call, entered once the global holds the empty function, also from the end of a round of the original; the call's effects are the initializer's; and the inliner takes a callee in a loop whose only call is one of these |
 | `labcache`, `barelide` | keep the GC allocation buffer open in a one-block loop of small allocations and calls that cannot let anything escape; hoist the load-barrier mask out of a safepoint-free loop, and drop a repeated barrier on the same slot between safepoints |
@@ -1852,6 +1852,9 @@ working memory when it ends.
     checks: of the accesses that kept one, a quarter in `ktbench` (5549 to
     4107) and a fifth in `javabench` (13021 to 10117) no longer do
     (`WARMC_NO_BCE_RANGE=1` turns it off; `--stats` counts `bce_ranges`).
+    An unsigned compare with a constant is a lower bound where the value is
+    not negative, so reads of items 0 to 3 past `n >u 3` need no check
+    either (luawasm's `n > 3` ahead of its reads of items 0 to 2).
     A fact on `i + c` is one on `i`, unsigned ones too, so `i + 4 <=u n`
     and `i + 3 <u n` put `a[i]` .. `a[i + 3]` in bounds
     (`WARMC_NO_BCE_UBASE=1`); and of two multiples of `2^s` the lesser is
@@ -1868,8 +1871,18 @@ working memory when it ends.
     (`opt.c` `gc_smear`, `WARMC_NO_BCE_SMEAR=1`; `--stats` counts
     `bce_smeared`).  A store between reads ends a run, as the store must
     be made before a later read traps.  `WARMC_BCE_REPORT=1` lists, on
-    stderr, every array access whose check is left, by function and the
-    shape of its index.
+    stderr, every array access whose check is left, by function, loop depth
+    and the shape of its index and array.
+  - A check no proof removes compares with its array's length where that is
+    known without a load at the check (`opt.c` `pass_bound_lens`,
+    `WARMC_NO_BOUND_LENS=1`; `--stats` counts `bound_lens` and
+    `bound_lens_hoisted`): a constant, as the compare's immediate, for an
+    array of the length its allocation or an immutable global's initialiser
+    says (Kotlin's pool of string literals); an `array.len` made over the
+    access; or, of an array not null that the loops around the access do
+    not change, one `array.len` in the block over it in the fewest loops, a
+    register through them -- javabench/enumvm's interpreter, `op[pc]`,
+    `a[pc]` and `r[a[pc]]` of an `r` of 8, 5% fewer cycles.
   - A loop whose counter, stepping up from `start`, is tested `i + c0 < m`
     (or `<=`, signed or unsigned, at its top or its end) against an `m`
     the loop does not change, and that reads or writes arrays the loop
@@ -1886,11 +1899,30 @@ working memory when it ends.
     `count` is a field no length is known to bound, and luawasm's i64 counters indexing at
     their wrap: a signed compare of a widening that keeps its value -- a
     sign extension, a zero extension of what is not negative -- says the
-    same of what it widens (`rp_unext`, `WARMC_NO_BCE_UNEXT=1`).  Of loops
-    of at most 400 instructions with no landing pad, at `-O2`
+    same of what it widens (`rp_unext`, `WARMC_NO_BCE_UNEXT=1`).  A counter
+    that each way round steps up by a constant or not at all, through the
+    loop's arms, is one too where it is tested at the loop's top
+    (`bv_mono`, `WARMC_NO_BV_MONO=1`), and a loop of several counters is
+    copied once, behind every counter's tests -- Java's merge,
+    `while (i < mid && j < hi)`.  An array the loop reads anew each time
+    round that is an immutable field of an object the loop does not change
+    -- a Java array's data, read past the loop's tests, which its object's
+    null check keeps LICM from taking out -- is read once ahead of the
+    tests, past a test of the object's null.  An access at the counter plus
+    a value the loop does not change, or at a second counter that steps
+    with it -- `StringBuilder.insert`'s `value[i + n] = value[i]`, a copy's
+    `dst[k++] = src[i++]` -- loses its check in the copy by the counter's
+    range, which tests ahead put in bounds in 64 bits: the least index not
+    negative, the greatest below the length, the counter's last step not
+    past 2^31 - 1 (an i32 counter stepping up, tested `i < m` or `i <= m`;
+    `WARMC_NO_BV_SYM=1`; `--stats` counts `bce_version_sym`).  A loop inside
+    a copy is versioned in turn, but not one inside the cold original --
+    the columns' loop in the rows' copy of a matrix multiply
+    (javabench/matrix, 0.79 the cycles).  Of loops of at most 400
+    instructions with no landing pad, at most 16 a function, at `-O2`
     (`WARMC_NO_BCE_VERSION=1` copies none; `WARMC_BV_DEBUG=1` says why a
     loop is left; `--stats` counts `bce_versioned`): javabench's accesses
-    with a check go from 9987 to 6311, 853 loops copied.
+    with a check go from 9860 to 5848, 1051 loops copied.
   - Objects, and arrays of a constant length, are bumped inline from the
     program's allocation buffer, zeroed when their page was opened; on
     AArch64 so are arrays of a computed length.

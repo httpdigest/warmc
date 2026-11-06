@@ -4833,6 +4833,10 @@ static bool imm_ok_a64(IrFunc *f, Ref user, uint32_t idx, uint64_t cval, ValType
   int sf = vt_is_64(ct) ? SF64 : SF32;
   uint64_t masked = sf ? cval : (cval & 0xffffffffu);
   switch (in->op) {
+    /* a bounds check's constant length: cmp's 12 bits (unshifted: fused
+       with the b.hs after it) */
+    case I_ARRAY_GET: case I_ARRAY_SET:
+      return (in->imm2 & GCF_LENARG) && idx == in->nargs - 1u && masked <= 0xfff;
     /* 12 bits of the constant or its negation, or for an add or sub 12
        shifted by 12 (0x400000 in cbench/bitfield's kill count): a compare
        of a shifted immediate is not fused with the b.cond after it on

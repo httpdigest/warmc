@@ -190,6 +190,11 @@ typedef enum {
 
 #define GCF_MASKARG  128u
 
+/* an array.get or array.set whose bounds check takes its array's length
+   from its last operand, an i32 (opt.c pass_bound_lens): where the check
+   would load it.  The barrier's mask, where there is one, comes before. */
+#define GCF_LENARG   1024u
+
 #define GCA_CACHED   (1u << 31)
 
 #define ARRO_FILL      0u
@@ -783,6 +788,12 @@ typedef struct {
   uint64_t exit_defers;
   /* blocks merged into the one block that jumps to them (opt.c merge_blocks) */
   uint64_t blocks_merged;
+  /* bounds checks given their array's length as an operand, and the
+     array.lens made for them in a loop's preheader (opt.c pass_bound_lens) */
+  uint64_t bound_lens, bound_lens_hoisted;
+  /* accesses at a counter plus an invariant, or at a second counter, that
+     a versioned loop's copy proves in bounds itself (opt.c bv_sym_index) */
+  uint64_t bce_version_sym;
   /* two-way branches whose taken edge's moves went to a stub out of line,
      the other way falling into the next block (arm64) */
   uint64_t stubs_out;
