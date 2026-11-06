@@ -1701,6 +1701,27 @@ static uint32_t fit_pad(uint32_t at, uint32_t span, uint32_t align) {
   return p;
 }
 
+/* fit_pad for a loop whose hot way round alone fits (loop_hot_span), where
+   that is nops only, no more than 16 bytes; just the alignment where it
+   would take a branch over the padding: asbench/strswitch's halfword loop,
+   a few trips each of the many times it is entered, took a branch over 20
+   bytes on each and ran 7% slower in its block of its own */
+static uint32_t hot_pad(uint32_t at, uint32_t span, uint32_t align, bool dead) {
+  uint32_t p = fit_pad(at, span, align);
+  return p <= 16 || dead ? p : (align - (at & (align - 1))) & (align - 1);
+}
+
+/* Whether the code so far ends with a b, which nothing runs on from, so
+   that padding put after it never runs: any amount of it is free, and no
+   branch over it is wanted (gobench/utf8scan's byte loop, entered by a
+   jump into it, 24 bytes from fitting) */
+static bool ends_dead(const Buf *b) {
+  if (b->len < 4) return false;
+  uint32_t w;
+  memcpy(&w, b->data + b->len - 4, 4);
+  return (w & 0xfc000000u) == 0x14000000u;
+}
+
 /* Where in a 64-byte block the function starts, a multiple of the loop
    alignment so that every other loop's stays: the one whose small loops of
    the deepest nest, at the offsets the first emission measured, fit with
@@ -1718,7 +1739,7 @@ static uint32_t fit_pad(uint32_t at, uint32_t span, uint32_t align) {
    padding of a loop entered once a call.  rec holds (header, order index,
    offset, padding) per small loop, in order, and spans each one's bytes;
    header marks every loop header. */
-static uint32_t loop_phase(IrFunc *f, const uint32_t *rec, uint32_t nrec,
+static uint32_t loop_phase(IrFunc *f, const uint32_t *rec, const uint8_t *rhot, uint32_t nrec,
                            const uint16_t *spans, uint32_t align,
                            const uint8_t *header) {
   uint32_t deep = 0;
@@ -1729,7 +1750,7 @@ static uint32_t loop_phase(IrFunc *f, const uint32_t *rec, uint32_t nrec,
     if (!header[b] || f->blocks[b].loop_depth != deep) continue;
     uint32_t i = 0;
     while (i < nrec && rec[4 * i] != b) i++;
-    if (i == nrec || !spans[b]) return 0;
+    if (i == nrec || (rhot[i] & 1) || !spans[b]) return 0;
   }
   uint32_t best = 0;
   uint64_t best_cost = UINT64_MAX;
@@ -1739,13 +1760,63 @@ static uint32_t loop_phase(IrFunc *f, const uint32_t *rec, uint32_t nrec,
     for (uint32_t i = 0; i < nrec; i++) {
       uint32_t h = rec[4 * i], at = rec[4 * i + 2], pad = rec[4 * i + 3];
       uint32_t span = spans[h];
-      uint32_t np = span ? fit_pad((uint32_t)((int64_t)at + shift + k), span, align) : pad;
+      uint32_t a = (uint32_t)((int64_t)at + shift + k);
+      uint32_t np = !span ? pad : (rhot[i] & 1) ? hot_pad(a, span, align, rhot[i] & 2) : fit_pad(a, span, align);
       if (f->blocks[h].loop_depth == deep) cost += np > 16 ? 8 : np / 4;
       shift += (int64_t)np - (int64_t)pad;
     }
     if (cost < best_cost) { best_cost = cost; best = k; }
   }
   return best;
+}
+
+/* Whether a block of the natural loop headed by h calls (block_calls): its
+   blocks found back from the latches, the header's own ways in from ahead
+   of it left out */
+static bool loop_calls(IrFunc *f, uint32_t h) {
+  uint32_t nb = f->nblocks, sp = 0;
+  uint8_t *in = xcalloc(nb ? nb : 1, 1);
+  uint32_t *stk = xmalloc((nb ? nb : 1) * sizeof(uint32_t));
+  uint32_t hrpo = f->blocks[h].rpo;
+  in[h] = 1;
+  stk[sp++] = h;
+  bool calls = false;
+  while (sp && !calls) {
+    uint32_t x = stk[--sp];
+    calls = block_calls(f, &f->blocks[x]);
+    for (uint32_t p = 0; p < f->blocks[x].npreds; p++) {
+      uint32_t q = f->blocks[x].preds[p];
+      if (in[q] || (x == h && f->blocks[q].rpo < hrpo)) continue;
+      in[q] = 1;
+      stk[sp++] = q;
+    }
+  }
+  xfree(in); xfree(stk);
+  return calls;
+}
+
+/* The bytes of the hot way round the loop headed by h, its first block at
+   order index oi: from there to the end of the first block in a row of the
+   loop's own blocks (none of a loop inside it) that goes back to that
+   first block -- its header, or the latch a rotated loop starts at
+   (rotate_loops), which goes on to the header below it; 0 where there is
+   no such row.  The layout puts a loop's likelier ways first, so that is
+   what runs on most trips: gobench/utf8scan's byte loop, 40 bytes ahead of
+   the arms for the longer characters, counted as one loop of 14
+   instructions, sat across a fetch block or not by where the code ahead
+   of it ended (1.55x). */
+static uint32_t loop_hot_span(Isel *s, uint32_t h, const uint32_t *eo, uint32_t neo,
+                              uint32_t oi, const uint32_t *blk_end) {
+  IrFunc *f = s->f;
+  uint32_t d = f->blocks[h].loop_depth, top = eo[oi];
+  for (uint32_t k = oi; k < neo; k++) {
+    uint32_t b = eo[k];
+    const Block *bb = &f->blocks[b];
+    if (bb->loop_depth != d) return 0;
+    for (uint32_t si = 0; si < bb->nsuccs; si++)
+      if (bb->succs[si].target == top) return blk_end[b] - s->block_off[top];
+  }
+  return 0;
 }
 
 /* The bytes the loop headed by h took, its first block at order index oi:
@@ -4275,6 +4346,12 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
                         SplitCtl *sc, bool split_collect) {
   int split_ret = 0;
   bool refit = false;
+  /* A run that is made again whole -- to place the loops measured, or with
+     far branches -- counts nothing: the next counts it all, the allocation
+     it takes back with the counters that made (ra_keep_take); kept, those
+     were counted twice (bfi_carry's bfi_apart, once its loop was placed
+     again) */
+  OptStats stats_in = g_stats;
   Buf pro;
   memset(&pro, 0, sizeof pro);
   Isel st;
@@ -4588,9 +4665,14 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
   uint32_t phase = span_of ? f->loop_phase : 0;
   uint32_t *blk_end = fit && !span_of ? xmalloc(f->nblocks * sizeof(uint32_t)) : NULL;
   uint32_t *rec = NULL, nrec = 0;
+  /* and a loop whose hot way round alone fits (loop_hot_span) is placed so
+     that way stays inside a block, the same way */
+  bool hot_fit = fit && !warmc_getenv("WARMC_NO_HOT_FIT");
+  uint8_t *rhot = NULL;
 
   uint32_t neo, nsmall = 0;
   const uint32_t *eo = ir_emit_order(f, dead_ret, &neo);
+  bool keep_next = warmc_getenv("WARMC_KEEP_NEXT_JUMP") != NULL;
   s->prev_bi = UINT32_MAX;
   for (uint32_t oi = 0; oi < neo; oi++) {
     uint32_t bi = eo[oi];
@@ -4599,18 +4681,31 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
       bool header = lh != UINT32_MAX;
       bool small = header && small_align && small_loop(s, f, lh);
       if (small) nsmall++;
+      /* (not one that calls, as small_loop: rsbench/recurse's fib loop,
+         entered on every call, ran 20% slower behind a branch over its
+         padding) */
+      bool hot = header && !small && hot_fit && !loop_calls(f, lh);
       uint32_t want = small ? 64 : lalign;
       if (header) {
         uint32_t at = phase + (uint32_t)(pro.len + B->len);
         uint32_t pad = (want - (at & (want - 1))) & (want - 1);
+        bool dead = ends_dead(B) && !warmc_getenv("WARMC_NO_DEAD_PAD");
         if (small && span_of && span_of[bi]) pad = fit_pad(at, span_of[bi], lalign);
-        if (small && blk_end) {
+        if (hot && span_of && span_of[bi]) {
+          uint32_t hp = hot_pad(at, span_of[bi], lalign, dead);
+          if (hp != pad) g_stats.hot_fits++;
+          pad = hp;
+        }
+        if ((small || hot) && blk_end) {
           rec = xrealloc(rec, (nrec + 1) * 4 * sizeof(uint32_t));
+          rhot = xrealloc(rhot, nrec + 1);
           rec[4 * nrec] = bi; rec[4 * nrec + 1] = oi;
           rec[4 * nrec + 2] = at; rec[4 * nrec + 3] = pad;
+          rhot[nrec] = (uint8_t)(hot | (dead << 1));
           nrec++;
         }
-        if (pad > 16) {
+        if (pad > 16 && dead) g_stats.dead_pads++;
+        if (pad > 16 && !dead) {
           size_t site = B->len;
           a64_b(B, 0);
           while (phase + pro.len + B->len < at + pad) a64_nop(B);
@@ -4619,6 +4714,34 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
           while (phase + pro.len + B->len < at + pad) a64_nop(B);
         }
       }
+    }
+    /* A jump the code before ended with to this block, which starts right
+       after it -- past blocks between that made no code -- goes to the next
+       instruction: left out, those blocks moved back with it.  8421 in the
+       bench kernels: an arm of a branch made of an extendu or a copy the
+       allocation made nothing of (rsbench/recurse's fib, after every
+       call), the last edge's moves after a br_table's. */
+    /* (among the fixes the block before made: a br_table's table words
+       come after its last stub's jump) */
+    BrFix **jp = NULL;
+    uint32_t lo_k = oi;
+    while (lo_k > 0 && s->block_off[eo[lo_k - 1]] == B->len) lo_k--;
+    if (!keep_next && lo_k > 0 && B->len >= 4)
+      for (BrFix **pp = &s->fixups; *pp && (*pp)->site >= s->block_off[eo[lo_k - 1]]; pp = &(*pp)->next)
+        if ((*pp)->site + 4 == B->len) {
+          if ((*pp)->is19 == 0 && (*pp)->target == bi) jp = pp;
+          break;
+        }
+    if (jp) {
+      BrFix *fx = *jp;
+      *jp = fx->next;
+      xfree(fx);
+      size_t old = B->len;
+      B->len -= 4;
+      for (uint32_t k = oi; k-- > 0 && s->block_off[eo[k]] == old;) s->block_off[eo[k]] = (uint32_t)B->len;
+      if (blk_end)
+        for (uint32_t k = oi; k-- > 0 && blk_end[eo[k]] == old;) blk_end[eo[k]] = (uint32_t)B->len;
+      g_stats.next_jumps++;
     }
     s->block_off[bi] = (uint32_t)B->len;
     s->st_end = (size_t)-1;
@@ -4655,8 +4778,9 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
     uint16_t *spans = ir_alloc(f, f->nblocks * sizeof(uint16_t));
     memset(spans, 0, f->nblocks * sizeof(uint16_t));
     for (uint32_t k = 0; k < nrec; k++) {
-      uint32_t span = loop_span(s, ir_loop_header_at(f, rec[4 * k]), eo, neo, rec[4 * k + 1],
-                                blk_end);
+      uint32_t lh = ir_loop_header_at(f, rec[4 * k]);
+      uint32_t span = (rhot[k] & 1) ? loop_hot_span(s, lh, eo, neo, rec[4 * k + 1], blk_end)
+                              : loop_span(s, lh, eo, neo, rec[4 * k + 1], blk_end);
       if (span && span <= 0xffff) spans[rec[4 * k]] = (uint16_t)span;
     }
     uint32_t ph = 0;
@@ -4669,21 +4793,22 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
           if (f->blocks[lb->preds[p]].rpo >= lb->rpo)
             hdr[f->loop_top[b] != UINT32_MAX ? f->loop_top[b] : b] = 1;
       }
-      ph = loop_phase(f, rec, nrec, spans, lalign, hdr);
+      ph = loop_phase(f, rec, rhot, nrec, spans, lalign, hdr);
       xfree(hdr);
     }
     int64_t shift = 0;
     for (uint32_t k = 0; k < nrec; k++) {
       uint32_t h = rec[4 * k], at = rec[4 * k + 2], pad = rec[4 * k + 3];
       if (!spans[h]) continue;
-      uint32_t np = fit_pad((uint32_t)((int64_t)at + shift + ph), spans[h], lalign);
+      uint32_t a = (uint32_t)((int64_t)at + shift + ph);
+      uint32_t np = (rhot[k] & 1) ? hot_pad(a, spans[h], lalign, rhot[k] & 2) : fit_pad(a, spans[h], lalign);
       if (np != pad) refit = true;
       shift += (int64_t)np - (int64_t)pad;
     }
     if (ph) refit = true;
     if (refit) { f->loop_bytes = spans; f->loop_phase = (uint8_t)ph; }
   }
-  xfree(blk_end); xfree(rec);
+  xfree(blk_end); xfree(rec); xfree(rhot);
 
   if (early) early_ret_stub(s, &er, &pro, er_site);
   emit_alloc_slow_arms(s);
@@ -4762,11 +4887,12 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
     warmc_fatal("internal: %u caller-save entries built but %u emitted in %s",
                 s->ncsa_vals, s->csa_consumed, f->m->funcs[f->func_index].sym);
 
-  if (s->far_br_needed) goto give_up;
+  if (s->far_br_needed) { g_stats = stats_in; goto give_up; }
   if (refit || s->tbz_far) {
     if (s->tbz_far) f->no_tbz = true;
     if (!s->naive) ra_keep_save(s, &ra_added);
     split_ret = 4;
+    g_stats = stats_in;
     goto give_up;
   }
 

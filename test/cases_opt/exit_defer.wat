@@ -18,8 +18,8 @@
 ;; late: find \smadd\s=1
 ;; late: near \smadd\s=0
 ;; shape: near \sb\s=4
-;; stats -O2 a64: stubs_out=2
-;; stats -O2: exit_defers=3
+;; stats -O2 a64: stubs_out=1
+;; stats -O2: exit_defers=2
 ;;
 ;; run: find -1 => i32:-1
 ;; run: find 0 => i32:-1

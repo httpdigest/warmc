@@ -8,7 +8,9 @@
 ;; branch's other edge, or one that goes on through a block another way
 ;; reaches.  And a loop that calls, in its header too, is not aligned to 64
 ;; bytes as small (isel.c small_loop), one that does not is: small's, which
-;; is two once vectorised, its vector loop and the scalar one after it.
+;; is two once vectorised, its vector loop and the scalar one after it; nor
+;; placed by its way round past the call (loop_hot_span): push's, which
+;; would be, is not, and one of the others is.
 ;; Answers worked out in Python.
 ;;
 ;; shape: push \sb\s=1
@@ -18,7 +20,7 @@
 ;; late: armnotother \sbl\s=1
 ;; late: twoarm \sbl\s=1
 ;; late: armchain \sbl\s=1
-;; stats -O2 a64: small_loops=2
+;; stats -O2 a64: small_loops=2 hot_fits=1
 ;;
 ;; run: push 0 => i32:100
 ;; run: callloop 0 => i32:0

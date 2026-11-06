@@ -856,6 +856,11 @@ typedef struct {
   /* functions placed past the start of their 64-byte block for their small
      loops to fit (isel.c loop_phase) */
   uint64_t loop_phases;
+  /* jumps to the next instruction left out (isel.c produce_body); loops
+     placed by their hot way round alone (loop_hot_span), and ones whose
+     padding no branch goes over, put where nothing runs into it
+     (ends_dead) */
+  uint64_t next_jumps, hot_fits, dead_pads;
   /* -fexact-trap: stores checked that guard pages would have left to the
      page, and constant-length bulk ops given their tests */
   uint64_t exact_store_checks, exact_memop_checks;
