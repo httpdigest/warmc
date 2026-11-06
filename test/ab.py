@@ -7,7 +7,8 @@ The other warmc is REV's (HEAD by default), checked out as a worktree under
 build/ab and built there once.  Kernels are the corpora's modules as
 test/gobench.py left them in build/CORPUS, all of make's BENCH_CORPORA by
 default, each compiled at -O2 by both, the programs cached under build/ab by
-the compiler's, runtimes' and module's contents, the least recently used
+the compiler's, runtimes' and module's contents and the WARMC_ settings the
+compiles run under, the least recently used
 going past AB_CACHE_MB (2000).
 
 A kernel whose two programs are the same bytes is not timed, nor one whose
@@ -72,10 +73,12 @@ def digest(paths):
 
 
 def compiler(build):
-    """warmc and the runtimes it links, and their digest"""
+    """warmc and the runtimes it links, and their digest -- with the WARMC_
+    settings it is run under, which can change what it makes"""
     files = [os.path.join(build, "warmc")] + sorted(
         os.path.join(build, f) for f in os.listdir(build) if f.endswith("-macos.a"))
-    return gen_gosp.target_flags(build), digest(files)
+    env = "".join("%s=%s;" % kv for kv in sorted(ENV.items()) if kv[0].startswith("WARMC_"))
+    return gen_gosp.target_flags(build), digest(files) + hashlib.sha256(env.encode()).hexdigest()[:8]
 
 
 def base_build(rev):
