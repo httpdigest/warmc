@@ -3,16 +3,16 @@ op something else, carried as a loop with an accumulator.  Killed by
 test/cases_opt/acc_tail.wat (made by test/gen_acctail.py) -- its answers at
 every level and how many functions -O3 takes -- test/run_levels.sh and the
 traps at -O3 (not the cases, whose float rows fma changes there)."""
-O, MAIN = 'src/opt.c', 'src/main.c'
+O, MAIN = 'src/opt.c', 'src/compile.c'
 def m(old, new, path=O): return (path, [(old, new)])
 M = {
  # when
  'level': m('  o->fma = o->dead_frames = o->acc_tail = o->float_reassoc = o->addr_nowrap = level >= 3;',
             '  o->fma = o->dead_frames = o->float_reassoc = o->addr_nowrap = level >= 3;\n  o->acc_tail = level >= 2;', MAIN),
- 'exact': m('  if (opt.exact_trap) opt.trampoline = opt.go_sp = opt.dead_frames = opt.acc_tail = false;',
-            '  if (opt.exact_trap) opt.trampoline = opt.go_sp = opt.dead_frames = false;', MAIN),
- 'flag': m('      else if (!strcmp(name, "acc-tail")) opt.acc_tail = on;',
-           '      else if (!strcmp(name, "acc-tail")) opt.acc_tail = false;', MAIN),
+ 'exact': m('  if (o->exact_trap) o->trampoline = o->go_sp = o->dead_frames = o->acc_tail = false;',
+            '  if (o->exact_trap) o->trampoline = o->go_sp = o->dead_frames = false;', MAIN),
+ 'flag': m('  else if (!strcmp(name, "acc-tail")) o->acc_tail = on;',
+           '  else if (!strcmp(name, "acc-tail")) o->acc_tail = false;', MAIN),
  # which functions
  'pads': m('  if (f->npads || f->sig->nresults != 1) return false;\n  uint32_t size',
            '  if (f->sig->nresults != 1) return false;\n  uint32_t size'),

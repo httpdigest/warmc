@@ -3,14 +3,14 @@ lanes (opt.c vectorize_one), and float chains rebalanced (pass_reassoc,
 pass_reassoc_carried).  Killed by test/cases_opt/float_reassoc.wat (made
 by test/gen_floatreassoc.py) -- its answers at every level and its counts
 at -O2 and -O3 -- and test/run_levels.sh."""
-O, MAIN = 'src/opt.c', 'src/main.c'
+O, MAIN = 'src/opt.c', 'src/compile.c'
 def m(old, new, path=O): return (path, [(old, new)])
 M = {
  # when
  'level': m('  o->fma = o->dead_frames = o->acc_tail = o->float_reassoc = o->addr_nowrap = level >= 3;',
             '  o->fma = o->dead_frames = o->acc_tail = o->addr_nowrap = level >= 3;\n  o->float_reassoc = level >= 2;', MAIN),
- 'flag': m('      else if (!strcmp(name, "float-reassoc")) opt.float_reassoc = on;',
-           '      else if (!strcmp(name, "float-reassoc")) opt.float_reassoc = true;', MAIN),
+ 'flag': m('  else if (!strcmp(name, "float-reassoc")) o->float_reassoc = on;',
+           '  else if (!strcmp(name, "float-reassoc")) o->float_reassoc = true;', MAIN),
  'vec_off': m('TP("vectorize", pass_vectorize(f, o->exact_trap, o->float_reassoc))',
               'TP("vectorize", pass_vectorize(f, o->exact_trap, false))'),
  'chain_off': m('TP("reassoc", pass_reassoc(f, o->float_reassoc))', 'TP("reassoc", pass_reassoc(f, false))'),

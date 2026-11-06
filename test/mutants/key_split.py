@@ -3,13 +3,13 @@ tests it again copied with the value a constant.  Killed by
 test/cases_opt/key_split.wat (made by test/gen_keysplit.py) -- its answers
 at every level and how many copies -O1 and -O2 make -- and
 test/run_levels.sh."""
-O, MAIN = 'src/opt.c', 'src/main.c'
+O, MAIN = 'src/opt.c', 'src/compile.c'
 def m(old, new, path=O): return (path, [(old, new)])
 M = {
  # when
  'off': m('    if (o->keysplit && RUN(14, "keysplit", pass_key_split(f))) changed = true;\n', ''),
- 'flag': m('      else if (!strcmp(name, "key-split")) opt.keysplit = on;',
-           '      else if (!strcmp(name, "key-split")) opt.keysplit = true;', MAIN),
+ 'flag': m('  else if (!strcmp(name, "key-split")) o->keysplit = on;',
+           '  else if (!strcmp(name, "key-split")) o->keysplit = true;', MAIN),
  # the key
  'key_eqz': m('    if (ci->op == I_EQZ && ci->nargs == 1) y = ir_args(f, b->term_arg)[0];\n    else if (ci->op >= I_EQ && ci->op <= I_GEU && ci->nargs == 2 &&\n             is_const(f, ir_args(f, b->term_arg)[1], &k))\n      y = ir_args(f, b->term_arg)[0];\n    else return REF_NONE;\n  } else if (b->term == T_BRTABLE) {',
               '    if (ci->op >= I_EQ && ci->op <= I_GEU && ci->nargs == 2 &&\n             is_const(f, ir_args(f, b->term_arg)[1], &k))\n      y = ir_args(f, b->term_arg)[0];\n    else return REF_NONE;\n  } else if (b->term == T_BRTABLE) {'),

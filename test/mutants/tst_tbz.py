@@ -17,12 +17,12 @@ M = {
                            (vt_is_64((ValType)f->insts[ir_args(f, c)[0]].type) ? ~0ull : 0xffffffffu)) == 0)) {''',
              '''  if (ci->op == I_EQZ || ((ci->op == I_EQ || ci->op == I_NE) && ci->nargs == 2 &&
                           f->insts[ir_args(f, c)[1]].op == I_CONST)) {'''),
- 'unfused': m('    if (!s->fused[c]) return;\n    and = ir_args(f, c)[0];', '    and = ir_args(f, c)[0];'),
- 'and_unfused': m('  } else if (ci->op != I_AND || !s->fused[c]) {', '  } else if (ci->op != I_AND) {'),
+ 'unfused': m('    if (!s->fused[c]) return;\n    v = ir_args(f, c)[0];', '    v = ir_args(f, c)[0];'),
+ 'and_unfused': m('    if (v == c ? !s->fused[c] && !bf\n', '    if (v == c ? 0\n'),
  'polarity': m('    set = ci->op == I_NE;', '    set = ci->op != I_NE;'),
  'multibit': m('  return k && !(k & (k - 1)) ? __builtin_ctzll(k) : -1;', '  return k ? __builtin_ctzll(k) : -1;'),
- 'and_uses': m('    if (!s->folded[and] && (uses[and] != 1 || !fa_own(s, and))) return;',
-               '    if (!s->folded[and] && !fa_own(s, and)) return;'),
+ 'and_uses': m('               : !s->folded[v] && (uses[v] != 1 || !(fa_own(s, v) || bf)))',
+               '               : !s->folded[v] && !(fa_own(s, v) || bf))'),
  'set_bit': m('        kind = (s->tbit[c] & TBIT_SET) ? 4 : 3;', '        kind = (s->tbit[c] & TBIT_SET) ? 3 : 4;', O),
  'bit_index': m('        cc = (s->tbit[c] & ~TBIT_SET) - 1;', '        cc = (s->tbit[c] & ~TBIT_SET);', O),
  # out of reach

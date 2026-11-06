@@ -5,17 +5,17 @@ Killed by test/cases_opt/addr_nowrap.wat -- its answers at every level,
 -O3's traps and loads where wasm's addresses wrap, and how many accesses it
 folds at -O2 and -O3 -- and test/run_levels.sh, which counts them with
 -faddr-nowrap alone."""
-O, MAIN = 'src/opt.c', 'src/main.c'
+O, MAIN = 'src/opt.c', 'src/compile.c'
 def m(old, new, path=O): return (path, [(old, new)])
 M = {
  # when
  'level': m('  o->fma = o->dead_frames = o->acc_tail = o->float_reassoc = o->addr_nowrap = level >= 3;',
             '  o->fma = o->dead_frames = o->acc_tail = o->float_reassoc = level >= 3;\n  o->addr_nowrap = level >= 2;', MAIN),
- 'flag': m('      else if (!strcmp(name, "addr-nowrap")) opt.addr_nowrap = on;',
-           '      else if (!strcmp(name, "addr-nowrap")) opt.addr_nowrap = true;', MAIN),
+ 'flag': m('  else if (!strcmp(name, "addr-nowrap")) o->addr_nowrap = on;',
+           '  else if (!strcmp(name, "addr-nowrap")) o->addr_nowrap = true;', MAIN),
  'fold_off': m('    TP("addr_nowrap", pass_addr_nowrap(f));', '    (void)pass_addr_nowrap;'),
- 'fold_no_sp': m('  if (o->addr_nowrap && df_sp != UINT32_MAX && fx_mod == f->m)',
-                 '  if (o->addr_nowrap && fx_mod == f->m)'),
+ 'fold_no_sp': m('  if (o->addr_nowrap && df_sp != UINT32_MAX && fx_is(f->m))',
+                 '  if (o->addr_nowrap && fx_is(f->m))'),
  'scan': m('  df_func = o->dead_frames || o->addr_nowrap\n', '  df_func = o->dead_frames\n'),
  # which addresses
  'root_any': m('      if (r == REF_NONE || f->insts[r].op != I_GLOBAL_GET || f->insts[r].imm != df_sp) continue;',
