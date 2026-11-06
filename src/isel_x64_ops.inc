@@ -2946,10 +2946,14 @@ static void emit_block(Isel *s, uint32_t bi, uint32_t next_bi) {
       Ref c = b->term_arg;
 
       int kind = 0, cc = XCC_NE, zreg = 0, zw = 0;
-      if (s->fused && s->fused[c] && is_condition(s, c)) {
+      if (s->fused && s->fused[c] && f->insts[c].op == I_REF_IS_NULL) {
+        kind = 1; zw = 1; zreg = rd(s, ir_args(f, c)[0], S0);
+      } else if (s->fused && s->fused[c] && is_condition(s, c)) {
         Inst *ci = &f->insts[c];
         Ref *ca = ir_args(f, c);
-        if (ci->op == I_EQZ) {
+        if (ci->op == I_EQZ && s->folded[ca[0]] && f->insts[ca[0]].op == I_REF_IS_NULL) {
+          kind = 2; zw = 1; zreg = rd(s, ir_args(f, ca[0])[0], S0);
+        } else if (ci->op == I_EQZ) {
           kind = 1; zw = is64(f, ca[0]); zreg = rd(s, ca[0], S0);
         } else if ((ci->op == I_EQ || ci->op == I_NE) &&
                    is_imm_at(s, c, 1, ca[1]) && imm_of(s, ca[1]) == 0) {

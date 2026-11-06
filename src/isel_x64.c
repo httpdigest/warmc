@@ -1401,6 +1401,18 @@ static void analyse_immediates(Isel *s) {
     uint16_t op = f->insts[c].op;
     bool cmpish = (op >= I_EQ && op <= I_EQZ) || (op >= I_FEQ && op <= I_FGE);
     if (cmpish && !warmc_getenv("WARMC_NO_FUSE")) s->fused[c] = 1;
+    /* a null test the branch alone reads: a test of the reference and a jz,
+       and of the eqz of one a jnz, where a setcc made a 0 or 1 to test
+       again */
+    if (null_br()) {
+      if (op == I_REF_IS_NULL && f->insts[c].nargs == 1) s->fused[c] = 1;
+      if (op == I_EQZ && s->fused[c]) {
+        Ref r = ir_args(f, c)[0];
+        if (f->insts[r].op == I_REF_IS_NULL && f->insts[r].nargs == 1 && uses[r] == 1 &&
+            !blocked[r] && f->insts[r].block == bi && !s->folded[r])
+          s->folded[r] = 1;
+      }
+    }
   }
 
   /* A cast's slot test, which only its trap reads, jumps to the trap itself

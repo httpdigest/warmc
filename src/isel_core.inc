@@ -581,6 +581,14 @@ static void trap_defer(Isel *s, size_t site, bool is19, int code) {
   s->trap_used[code] = 1;
 }
 
+/* Whether a branch on a null test tests the reference itself
+   (WARMC_NO_NULLBR: makes the 0 or 1 and tests that) */
+static bool null_br(void) {
+  static _Atomic int on = -1;
+  if (on < 0) on = warmc_getenv("WARMC_NO_NULLBR") == NULL;
+  return on;
+}
+
 static bool load_needs_barrier(const IrFunc *f, const Inst *in) {
   if (in->imm2 & GCF_NOBAR) return false;
   return warmc_load_barrier && vt_ref_collectable(f->m, (ValType)in->type);

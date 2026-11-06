@@ -3426,11 +3426,15 @@ static void emit_block(Isel *s, uint32_t bi, uint32_t next_bi) {
         kind = (s->tbit[c] & TBIT_SET) ? 4 : 3;
         cc = (s->tbit[c] & ~TBIT_SET) - 1;
         zreg = rd(s, s->tsrc[c], S0);
+      } else if (s->fused && s->fused[c] && f->insts[c].op == I_REF_IS_NULL) {
+        kind = 1; zsf = SF64; zreg = rd(s, ir_args(f, c)[0], S0);
       } else if (s->fused && s->fused[c] && is_condition(s, c)) {
         Inst *ci = &f->insts[c];
         Ref *ca = ir_args(f, c);
         bool tst = s->folded[ca[0]] && f->insts[ca[0]].op == I_AND;
-        if (ci->op == I_EQZ && !tst) {
+        if (ci->op == I_EQZ && s->folded[ca[0]] && f->insts[ca[0]].op == I_REF_IS_NULL) {
+          kind = 2; zsf = SF64; zreg = rd(s, ir_args(f, ca[0])[0], S0);
+        } else if (ci->op == I_EQZ && !tst) {
           kind = 1; zsf = is64(f, ca[0]); zreg = rd(s, ca[0], S0);
         } else if ((ci->op == I_EQ || ci->op == I_NE) && !tst &&
                    is_imm_at(s, c, 1, ca[1]) && imm_of(s, ca[1]) == 0) {

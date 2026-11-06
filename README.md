@@ -1623,7 +1623,11 @@ it would each take a cycle: musl's `strtod` carries its first limb round a
 loop by `k == a && !x[k]` (`cbench/strtod` takes 0.85 the time). A
 `ref.is_null` is such a compare too, of the pointer with zero: luawasm's
 test for nil, a null reference and a zero payload, is a `cmp` and a `ccmp`
-where it was six instructions (`WARMC_NO_NULLCCMP=1` turns it off). The
+where it was six instructions (`WARMC_NO_NULLCCMP=1` turns it off). A
+branch on a null test alone is a `cbz` of the reference, and on the `eqz`
+of one -- `br_on_non_null`, luawasm's `if x` -- a `cbnz`, where a `cmp` and
+a `cset` made a 0 or 1 for a `cbz` to test again (on x86-64 a `test` and a
+`jz` or `jnz`; `WARMC_NO_NULLBR=1` turns it off). The
 selects on a compare read its flags, not a `cset` of them, when only
 instructions that leave the flags as they are come between. An add of a
 compare's 0 or 1 -- for an i64, of its zero extension -- is the compare and
