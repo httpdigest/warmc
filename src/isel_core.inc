@@ -128,6 +128,9 @@ typedef struct {
   GcSite *gcsites; uint32_t ngcsites, cap_gcsites;
   uint32_t *gcroots; uint32_t ngcroots, cap_gcroots;
   uint32_t cur_block;
+  /* the block emitted after it, the one whose only way in may be its end
+     (emit_block) */
+  uint32_t cur_next;
   uint32_t cur_pos;   /* the instruction's index in cur_block */
 
   Ref cur_inst;
@@ -453,6 +456,17 @@ static bool is_imm_at(Isel *s, Ref user, uint32_t idx, Ref v) {
 
 #define RC_CONST 0x80000000u
 
+/* Whether block b, entered only from block p emitted just before it, starts
+   with the reload cache p ends with.  What comes between keeps the cache as
+   it goes: the loop pieces' loads and saves, and the edges' moves, which
+   only drop what they overwrite (emit_move_to, emit_remat_move) -- the
+   other edge's too, made ahead of the way into b.  A landing pad's way in
+   is a call, after which the cache is empty (emit_inst). */
+static bool rc_carries(Isel *s, uint32_t b, uint32_t p) {
+  const Block *bb = &s->f->blocks[b];
+  return bb->npreds == 1 && bb->preds[0] == p && !warmc_getenv("WARMC_NO_RC_CARRY");
+}
+
 static void rc_clear(Isel *s) {
   s->rc_slot[0] = 0; s->rc_slot[1] = 0;
   s->frc_slot[0] = 0; s->frc_slot[1] = 0;
@@ -488,8 +502,22 @@ static bool used_soon(Isel *s, Ref v) {
     for (uint32_t j = 0; j < in->nargs; j++) if (a[j] == v) return true;
     if (inst_clobbers_caller_saved(f, u)) return false;
   }
-  return end == b->ninsts && b->term_arg == v &&
-         (b->term == T_BRIF || b->term == T_BRTABLE);
+  if (end < b->ninsts) return false;
+  if (b->term_arg == v && (b->term == T_BRIF || b->term == T_BRTABLE)) return true;
+  /* on into the block emitted next where this one is its only way in: the
+     cache goes on into it (rc_carries) -- a hash made ahead of a bounds
+     check and read past it, asbench/mapint's probe */
+  uint32_t nb = s->cur_next, left = s->cur_pos + 13 - end;
+  if (nb >= f->nblocks || !rc_carries(s, nb, s->cur_block)) return false;
+  Block *n = &f->blocks[nb];
+  for (uint32_t i = 0; i < n->ninsts && i < left; i++) {
+    Ref u = n->insts[i];
+    Inst *in = &f->insts[u];
+    Ref *a = ir_args(f, u);
+    for (uint32_t j = 0; j < in->nargs; j++) if (a[j] == v) return true;
+    if (inst_clobbers_caller_saved(f, u)) return false;
+  }
+  return false;
 }
 
 static void rc_put(Isel *s, uint32_t slot, int reg) {

@@ -3337,8 +3337,11 @@ static void emit_block(Isel *s, uint32_t bi, uint32_t next_bi) {
   IrFunc *f = s->f;
   Block *b = &f->blocks[bi];
 
+  /* the cache the block emitted before ends with, where that is the only
+     way in */
+  if (!rc_carries(s, bi, s->prev_bi)) rc_clear(s);
   s->cur_block = bi;
-  rc_clear(s);
+  s->cur_next = next_bi;
   s->t1_ok = false;
 
   bool eh = ir_block_has_eh(f, bi);

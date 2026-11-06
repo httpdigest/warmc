@@ -1731,7 +1731,11 @@ them cross any call). A value live across a call in a loop
 takes the callee-saved registers from the other end than the rest do, so
 that a callee's save and restore of the few it uses rarely puts a loop's
 counter through memory on every call; a constant does not, as the callee's
-restore of one is off any chain the loop waits on. A
+restore of one is off any chain the loop waits on. On arm64, in a function
+that calls, a value read from its slot or just stored to it stays in one of
+two registers kept for that, x29 and x30, for the reads that follow -- on
+into a block whose only way in is the end of the block laid out before it,
+past a bounds check, say (`WARMC_NO_RC_CARRY=1` stops it at each block). A
 vector select is made in whichever operand's register the allocator gave
 its result: the mask's (`bsl`), the false value's (`bit`) or the true
 value's (`bif`), so one carried round a loop moves nothing.
