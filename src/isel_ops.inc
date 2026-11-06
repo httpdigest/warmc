@@ -767,9 +767,12 @@ static void emit_inst(Isel *s, Ref v) {
         /* d starts as the value the field goes into; x is read after, so
            it must not be d unless the value is there already */
         int t = (d == x && d != o) ? S2 : d;
-        if (t != o) a64_mov_reg(B, sf, t, o);
+        /* a 32-bit bfm reads the low half of its destination and writes the
+           whole register, so the moves can be the 64-bit ones the core
+           makes in renaming rather than as an instruction of a chain */
+        if (t != o) a64_mov_reg(B, SF64, t, o);
         a64_bfm(B, sf, t, x, bf->immr, bf->imms);
-        if (t != d) a64_mov_reg(B, sf, d, t);
+        if (t != d) a64_mov_reg(B, SF64, d, t);
         commit(s, v, d);
         break;
       }
@@ -3541,6 +3544,46 @@ static void emit_block(Isel *s, uint32_t bi, uint32_t next_bi) {
         parallel_copy(s, hm, hoist);
       }
       xfree(hm);
+      /* A latch whose way round moves values and whose way out moves none
+         makes the moves ahead of the branch, where no register they write
+         is one the way out keeps a value in -- live into its target, or
+         its target's params' -- so that the branch goes round on its own,
+         not out to a block and back with a branch of its own: an integer
+         printing loop's quotient (asbench/virtual) and a recursive fib's
+         counter (gobench/recurse) went out and round on every trip.  Only
+         the likelier way's moves, which run nearly every time. */
+      if ((tn != 0) != (en != 0) && s->lv_in && !warmc_getenv("WARMC_NO_LATCH_HOIST")) {
+        bool mt = tn != 0;
+        Edge *me = mt ? t : e, *oe = mt ? e : t;
+        Move *mm = mt ? tm : em;
+        int mn = mt ? tn : en;
+        uint32_t mi = (uint32_t)(me - b->succs), oi = (uint32_t)(oe - b->succs);
+        bool ok = ir_succ_score(f, b, mi) >= ir_succ_score(f, b, oi) &&
+                  f->blocks[me->target].rpo <= b->rpo;
+        for (int i = 0; i < mn && ok; i++) {
+          if (mm[i].remat || IS_SLOT(mm[i].dst) || mm[i].dst < 0) ok = false;
+          else if (kind != 0 && !mm[i].fp && mm[i].dst == zreg) ok = false;
+        }
+        uint32_t ot = oe->target;
+        for (uint32_t k = s->lv_in_off[ot]; k < s->lv_in_off[ot + 1] && ok; k++) {
+          Ref x = s->lv_in[k];
+          int l = s->loc[x];
+          if (l == LOC_NONE || IS_SLOT(l)) continue;
+          for (int i = 0; i < mn && ok; i++)
+            if (mm[i].dst == l && (bool)mm[i].fp == (bool)is_fp_value(f, x)) ok = false;
+        }
+        const Block *otb = &f->blocks[ot];
+        for (uint32_t k = 0; k < otb->nparams && ok; k++) {
+          int l = s->loc[otb->params[k]];
+          if (l == LOC_NONE || IS_SLOT(l)) continue;
+          for (int i = 0; i < mn && ok; i++)
+            if (mm[i].dst == l && (bool)mm[i].fp == (bool)is_fp_value(f, otb->params[k])) ok = false;
+        }
+        if (ok) {
+          parallel_copy(s, mm, mn);
+          if (mt) tn = 0; else en = 0;
+        }
+      }
       bool tmoves = tn != 0, emoves = en != 0;
 
       bool invert = false;

@@ -79,6 +79,11 @@ typedef struct {
      marks and stack */
   int (*maxp)[2];
   uint32_t *lstamp, *lstack, lgen;
+  uint32_t *vuse, *vlv, vgen;
+  /* each value's copies in slots: where one dominates, a reload reads it
+     (mhead per value, through mnext) */
+  uint32_t *mhead, *mnext, *mblk, nmc, capmc;
+  Ref *mcp;
   uint8_t *inblk;
   /* folded instructions not moved to their one reader (ra2_fold_order): an
      address several accesses fold, each its own -- made again at each
@@ -137,17 +142,65 @@ static void ra2_insert(IrFunc *f, uint32_t b, uint32_t at, Ref v) {
   bb->ninsts++;
 }
 
-/* The value's copy in a slot, made right after its definition the first
-   time it is asked for; REF_NONE for one made again instead. */
-static Ref ra2_mem(Ra2 *R, Ref x) {
-  if (R->mem[x] != REF_NONE || R->rem[x]) return R->mem[x];
+/* whether block a dominates block b */
+static bool ra2_dom(IrFunc *f, uint32_t a, uint32_t b) {
+  for (uint32_t d = b, k = 0; d != REF_NONE && d < f->nblocks && k < f->nblocks; k++) {
+    if (d == a) return true;
+    if (d == f->entry || f->blocks[d].idom == d) break;
+    d = f->blocks[d].idom;
+  }
+  return false;
+}
+
+static void ra2_mem_note(Ra2 *R, Ref x, Ref c, uint32_t blk) {
+  if (!R->mhead) {
+    R->mhead = xmalloc((R->n0 ? R->n0 : 1) * sizeof(uint32_t));
+    for (uint32_t v = 0; v < R->n0; v++) R->mhead[v] = UINT32_MAX;
+  }
+  if (R->nmc == R->capmc) {
+    R->capmc = R->capmc ? R->capmc * 2 : 64;
+    R->mnext = xrealloc(R->mnext, R->capmc * sizeof(uint32_t));
+    R->mblk = xrealloc(R->mblk, R->capmc * sizeof(uint32_t));
+    R->mcp = xrealloc(R->mcp, R->capmc * sizeof(Ref));
+  }
+  R->mcp[R->nmc] = c;
+  R->mblk[R->nmc] = blk;
+  R->mnext[R->nmc] = R->mhead[x];
+  R->mhead[x] = R->nmc++;
+}
+
+/* a copy of x in a slot that block b's code may read: one made in b
+   already, or in a block that dominates b */
+static Ref ra2_mem_find(Ra2 *R, Ref x, uint32_t b) {
+  if (!R->mhead) return REF_NONE;
+  for (uint32_t k = R->mhead[x]; k != UINT32_MAX; k = R->mnext[k])
+    if (R->mblk[k] == b || ra2_dom(R->f, R->mblk[k], b)) return R->mcp[k];
+  return REF_NONE;
+}
+
+/* The value's copy in a slot for block b to read: one there or above it,
+   else one made right after its definition, which dominates every read;
+   REF_NONE for one made again instead. */
+static Ref ra2_mem_for(Ra2 *R, Ref x, uint32_t blk) {
+  if (R->rem[x]) return REF_NONE;
+  if (R->mem[x] == x) return x;
+  Ref have = ra2_mem_find(R, x, blk);
+  if (have != REF_NONE) return have;
+  if (R->mem[x] != REF_NONE) return R->mem[x];
   IrFunc *f = R->f;
   uint32_t db = f->insts[x].block;
   bool param = f->insts[x].op == I_PARAM;
   ValType t = (ValType)f->insts[x].type;
+  {
+    const char *de = warmc_getenv("WARMC_RA2_DEBUG_EV");
+    if (de && (uint32_t)atoi(de) == f->func_index)
+      fprintf(stderr, "ev v%u %s def b%u d%u at b%u d%u\n", x, ir_op_name(f->insts[x].op), db,
+              f->blocks[db].loop_depth, R->cur_b, f->blocks[R->cur_b].loop_depth);
+  }
   Ref c = ra2_new(R, db, I_COPY, t, &x, 1, 0, 0);
   R->slotv[c] = 1;
   R->mem[x] = c;
+  ra2_mem_note(R, x, c, db);
   R->nspill++;
   /* after x -- past the results that follow a call, which nothing may
      come between -- or first for a param */
@@ -171,6 +224,8 @@ static Ref ra2_mem(Ra2 *R, Ref x) {
   }
   return c;
 }
+
+static Ref ra2_mem(Ra2 *R, Ref x) { return ra2_mem_for(R, x, R->cur_b); }
 
 /* x's distance at block b's entry, RA2_INF where it is not live there */
 static int32_t ra2_din(Ra2 *R, uint32_t b, Ref x) {
@@ -342,14 +397,16 @@ static void ra2_block_pressure(Ra2 *R) {
    that reach a way back to h without passing h */
 static void ra2_loop_pressure(Ra2 *R, uint32_t h, int out[2]) {
   IrFunc *f = R->f;
+  Isel *s = R->s;
   uint32_t nb = f->nblocks;
   if (!R->lstamp) R->lstamp = xcalloc(nb ? nb : 1, sizeof(uint32_t));
   if (!R->lstack) R->lstack = xmalloc((nb ? nb : 1) * sizeof(uint32_t));
   uint32_t st = ++R->lgen;
-  out[0] = R->maxp[h][0];
-  out[1] = R->maxp[h][1];
   R->lstamp[h] = st;
-  uint32_t sp = 0;
+  uint32_t sp = 0, nl = 0;
+  /* the loop's blocks, in lstack[0..nl) once gathered */
+  uint32_t *lb = xmalloc((nb ? nb : 1) * sizeof(uint32_t));
+  lb[nl++] = h;
   Block *hb = &f->blocks[h];
   for (uint32_t p = 0; p < hb->npreds; p++) {
     uint32_t q = hb->preds[p];
@@ -359,7 +416,7 @@ static void ra2_loop_pressure(Ra2 *R, uint32_t h, int out[2]) {
   }
   while (sp) {
     uint32_t x = R->lstack[--sp];
-    for (int c = 0; c < 2; c++) if (R->maxp[x][c] > out[c]) out[c] = R->maxp[x][c];
+    lb[nl++] = x;
     Block *xb = &f->blocks[x];
     for (uint32_t p = 0; p < xb->npreds; p++) {
       uint32_t q = xb->preds[p];
@@ -368,6 +425,66 @@ static void ra2_loop_pressure(Ra2 *R, uint32_t h, int out[2]) {
       R->lstack[sp++] = q;
     }
   }
+  if (warmc_getenv("WARMC_RA2_OLD_LP")) {
+    out[0] = out[1] = 0;
+    for (uint32_t k = 0; k < nl; k++)
+      for (int c = 0; c < 2; c++) if (R->maxp[lb[k]][c] > out[c]) out[c] = R->maxp[lb[k]][c];
+    xfree(lb);
+    return;
+  }
+  /* The most values the loop reads live at once in it: a value live
+     through it and not read there is the carried value the header decides
+     on, in its register or in its slot -- counted, the values a big
+     function keeps in slots across a small loop left it no room for any
+     (gobench/strswitch's strings across its byte compare, stored on every
+     way round). */
+  if (!R->vuse) { R->vuse = xcalloc(R->n0 ? R->n0 : 1, sizeof(uint32_t)); R->vlv = xcalloc(R->n0 ? R->n0 : 1, sizeof(uint32_t)); }
+  uint32_t us = ++R->vgen;
+  Ref *rb = NULL;
+  uint32_t caprb = 0;
+#define RA2_LU(x) do { Ref x_ = (x); if (x_ < R->n0 && (R->need[x_] || R->res[x_])) R->vuse[x_] = us; } while (0)
+  for (uint32_t k = 0; k < nl; k++) {
+    Block *bb = &f->blocks[lb[k]];
+    for (uint32_t i = 0; i < bb->ninsts; i++) {
+      uint32_t na = ra2_reads(R, bb->insts[i], &rb, &caprb);
+      for (uint32_t j = 0; j < na; j++) RA2_LU(rb[j]);
+    }
+    if (bb->term == T_BRIF || bb->term == T_BRTABLE) RA2_LU(bb->term_arg);
+    for (uint32_t i = 0; i < bb->nret; i++) RA2_LU(bb->ret_args[i]);
+    for (uint32_t e = 0; e < bb->nsuccs; e++)
+      for (uint32_t j = 0; j < bb->succs[e].nargs; j++) RA2_LU(bb->succs[e].args[j]);
+  }
+#undef RA2_LU
+  out[0] = out[1] = 0;
+  for (uint32_t k = 0; k < nl; k++) {
+    uint32_t b = lb[k];
+    Block *bb = &f->blocks[b];
+    uint32_t ls = ++R->vgen;
+    int cnt[2] = { 0, 0 };
+#define RA2_LV(x) do { Ref x_ = (x); if (x_ < R->n0 && R->vuse[x_] == us && R->vlv[x_] != ls) { \
+      R->vlv[x_] = ls; cnt[ra2_cls(R, x_)]++; } } while (0)
+    for (uint32_t q = s->lv_out_off[b]; q < s->lv_out_off[b + 1]; q++) RA2_LV(s->lv_out[q]);
+    if (bb->term == T_BRIF || bb->term == T_BRTABLE) RA2_LV(bb->term_arg);
+    for (uint32_t i = 0; i < bb->nret; i++) RA2_LV(bb->ret_args[i]);
+    for (uint32_t e = 0; e < bb->nsuccs; e++)
+      for (uint32_t j = 0; j < bb->succs[e].nargs; j++) RA2_LV(bb->succs[e].args[j]);
+    for (int c = 0; c < 2; c++) if (cnt[c] > out[c]) out[c] = cnt[c];
+    for (uint32_t i = bb->ninsts; i-- > 0;) {
+      Ref u = bb->insts[i];
+      if (u < R->n0 && R->vlv[u] == ls) { R->vlv[u] = 0; cnt[ra2_cls(R, u)]--; }
+      uint32_t na = ra2_reads(R, u, &rb, &caprb);
+      for (uint32_t j = 0; j < na; j++) RA2_LV(rb[j]);
+      /* a result made while its operands are held */
+      if (u < R->n0 && (R->need[u] || R->res[u])) {
+        int c = ra2_cls(R, u);
+        if (cnt[c] + 1 > out[c]) out[c] = cnt[c] + 1;
+      }
+      for (int c = 0; c < 2; c++) if (cnt[c] > out[c]) out[c] = cnt[c];
+    }
+#undef RA2_LV
+  }
+  xfree(rb);
+  xfree(lb);
 }
 
 static Ra2W *ra2_exit_find(Ra2 *R, uint32_t b, Ref x) {
@@ -395,7 +512,7 @@ static Ref ra2_edge_arg(Ra2 *R, uint32_t p, Ref x) {
     R->slotv[r] = 2;
     return r;
   }
-  return ra2_mem(R, x);
+  return ra2_mem_for(R, x, p);
 }
 
 static void ra2_push_arg(IrFunc *f, Edge *e, Ref a) {
@@ -420,15 +537,66 @@ static void ra2_drop(Ra2Set *W, int c, int k) { W->w[c][k] = W->w[c][--W->n[c]];
 /* x out of the registers: its copy in a slot made where it is to be read
    again -- or, for a resident, which no copy may stand in for, a slot for
    all of its life, every read reading it there */
-static void ra2_evict(Ra2 *R, Ref x, int32_t nu) {
+/* Whether the block being rewritten runs less often than x's own, by the
+   loops: outside the loop x is made in, or within it on a way not every
+   trip takes -- one that does not dominate each way back to its header.
+   Elsewhere one store where x is made serves every way that wants it,
+   where a store wherever it goes would be one per way, or one per trip. */
+static bool ra2_rarer(Ra2 *R, Ref x) {
+  IrFunc *f = R->f;
+  uint32_t db = f->insts[x].block, b = R->cur_b;
+  uint32_t dd = f->blocks[db].loop_depth, bd = f->blocks[b].loop_depth;
+  if (bd < dd) return true;
+  if (bd > dd || b == db || dd == 0) return false;
+  /* the header of x's loop: the nearest block above x's of its depth that a
+     way back enters */
+  uint32_t h = REF_NONE;
+  for (uint32_t d = db, k = 0; d != REF_NONE && d < f->nblocks && k < f->nblocks; k++) {
+    const Block *hb = &f->blocks[d];
+    if (hb->loop_depth < dd) break;
+    for (uint32_t p = 0; p < hb->npreds && h == REF_NONE; p++)
+      if (f->blocks[hb->preds[p]].rpo >= hb->rpo) h = d;
+    if (h != REF_NONE || d == f->entry || hb->idom == d) break;
+    d = hb->idom;
+  }
+  if (h == REF_NONE || !ra2_dom(f, h, b)) return false;
+  const Block *hb = &f->blocks[h];
+  for (uint32_t p = 0; p < hb->npreds; p++) {
+    uint32_t q = hb->preds[p];
+    if (f->blocks[q].rpo >= hb->rpo && !ra2_dom(f, b, q)) return true;
+  }
+  return false;
+}
+
+/* Its copy for the slot is made where it goes, of the version the
+   registers hold -- before_last: ahead of the call just put out -- so that
+   a value only a rare way pushes out is stored on that way, not wherever
+   it is made (asbench/instof's sum, stored on every way round for a call
+   on its growth path); a copy above here does already. */
+static void ra2_evict_at(Ra2 *R, Ref x, Ref ver, int32_t nu, bool before_last) {
   if (R->res[x]) {
     R->res[x] = 0;
     R->slotv[x] = 1;
     R->nwhole++;
     return;
   }
-  if (nu < RA2_INF && !R->rem[x]) ra2_mem(R, x);
+  if (nu >= RA2_INF || R->rem[x]) return;
+  if (ra2_mem_find(R, x, R->cur_b) != REF_NONE || R->mem[x] == x) return;
+  if (ver == REF_NONE || warmc_getenv("WARMC_RA2_NO_LOCALSPILL") || !ra2_rarer(R, x)) { ra2_mem(R, x); return; }
+  IrFunc *f = R->f;
+  Ref c = ra2_new(R, R->cur_b, I_COPY, (ValType)f->insts[x].type, &ver, 1, 0, 0);
+  R->slotv[c] = 1;
+  ra2_mem_note(R, x, c, R->cur_b);
+  R->nspill++;
+  ra2_out(R, c);
+  if (before_last && R->nout >= 2) {
+    Ref last = R->out[R->nout - 2];
+    R->out[R->nout - 2] = c;
+    R->out[R->nout - 1] = last;
+    if (last < R->n0) R->outpos[last] = (int32_t)R->nout - 1;
+  }
 }
+
 
 /* How much further ahead than it is a value made again where it is out of
    the registers counts, for which goes: the constant costs its making at
@@ -460,7 +628,7 @@ static void ra2_room(Ra2 *R, Ra2Set *W, int c, int need, const Ref *keep, uint32
     }
     if (vic < 0) return;
     Ref x = W->w[c][vic].v;
-    ra2_evict(R, x, W->w[c][vic].nu);
+    ra2_evict_at(R, x, W->w[c][vic].ver, W->w[c][vic].nu, false);
     ra2_drop(W, c, vic);
   }
 }
@@ -739,14 +907,27 @@ static void ra2_block(Ra2 *R, uint32_t b, Ra2Uses *uses, Ref *touched, uint32_t 
        point: kept and then pushed out inside, it would be loaded back on
        every way round. */
     int lt_room[2] = { 64, 64 };
+    bool lfull[2] = { false, false };
     if (nproc < bb->npreds) {
       int lp[2], nlt[2] = { 0, 0 };
       ra2_loop_pressure(R, b, lp);
+      /* a loop that reads more than the registers hold: its constants are
+         made where they are read, not carried round in params -- pushed out
+         inside, they would be made again on every way back for the header
+         (cbench/switch: three per trip for cases that seldom read them) */
+      for (int c = 0; c < 2; c++) lfull[c] = lp[c] > R->K[c] && warmc_getenv("WARMC_RA2_HDR_NOCONSTS");
       for (uint32_t i = 0; i < m; i++)
         if (ck[i] / 4 >= RA2_LOOPX) nlt[ra2_cls(R, cv[i])]++;
       for (int c = 0; c < 2; c++) {
-        lt_room[c] = R->K[c] - (lp[c] - nlt[c]);
+        /* the loop's pressure counts what it reads only, the carried
+           values none (ra2_loop_pressure) */
+        lt_room[c] = warmc_getenv("WARMC_RA2_OLD_LP") ? R->K[c] - (lp[c] - nlt[c]) : R->K[c] - lp[c];
         if (lt_room[c] < 0) lt_room[c] = 0;
+        {
+          const char *de = warmc_getenv("WARMC_RA2_DEBUG_EV");
+          if (de && (uint32_t)atoi(de) == f->func_index)
+            fprintf(stderr, "hdr b%u c%d K=%d lp=%d nlt=%d room=%d m=%u\n", b, c, R->K[c], lp[c], nlt[c], lt_room[c], m);
+        }
       }
     }
     for (uint32_t i = 0; i < m; i++) {
@@ -759,6 +940,7 @@ static void ra2_block(Ra2 *R, uint32_t b, Ra2Uses *uses, Ref *touched, uint32_t 
         ra2_mem(R, x);
         continue;
       }
+      if (lfull[c] && R->rem[x] && !param) continue;
       if (carried) lt_room[c]--;
       if (W.n[c] >= R->K[c] || W.n[c] >= 64) {
         if (param) {
@@ -894,12 +1076,20 @@ static void ra2_block(Ra2 *R, uint32_t b, Ra2Uses *uses, Ref *touched, uint32_t 
             ra2_drop(&W, c, k);
           } else k++;
         }
+        /* what a call keeps across it in the callee-saved registers: no
+           constant ahead of a value, the constant being made again after
+           it for what one load and store would cost the value (asbench/
+           mathf's libm, its float constants round each call) */
+        bool cfirst = !warmc_getenv("WARMC_RA2_CALL_KEEPCONST");
         while (W.n[c] > keep) {
           int vic = -1;
-          for (int k = 0; k < W.n[c]; k++)
-            if (vic < 0 || W.w[c][k].nu > W.w[c][vic].nu) vic = k;
+          for (int k = 0; k < W.n[c]; k++) {
+            if (vic < 0) { vic = k; continue; }
+            bool rk = cfirst && R->rem[W.w[c][k].v], rv = cfirst && R->rem[W.w[c][vic].v];
+            if (rk != rv ? rk : W.w[c][k].nu > W.w[c][vic].nu) vic = k;
+          }
           if (vic < 0) break;
-          ra2_evict(R, W.w[c][vic].v, W.w[c][vic].nu);
+          ra2_evict_at(R, W.w[c][vic].v, W.w[c][vic].ver, W.w[c][vic].nu, true);
           ra2_drop(&W, c, vic);
         }
       }
@@ -1289,7 +1479,12 @@ static void ra2_spill(Isel *s, const int *gpool, int ngpool) {
        it is out of them: a loop's constant made on every way round costs
        that on every way round (rsbench/vecgrow's hash multiplier,
        rsbench/enummatch's element size, zigbench/simdsum's vector mask). */
-    if (remat_ok(s, v) && !(in->op == I_CONST && !warmc_getenv("WARMC_RA2_NO_CONST1")))
+    /* (a scalar float constant one fmov or a load from the pool makes is
+       left to be made where it is read: held, those of asbench/mathf's
+       libm took the callee-saved vector registers round its calls) */
+    if (remat_ok(s, v) &&
+        !(in->op == I_CONST && !warmc_getenv("WARMC_RA2_NO_CONST1") &&
+          (!vt_is_float((ValType)in->type) || !warmc_getenv("WARMC_RA2_NO_FPCONST"))))
       continue;
     /* left as they are: the barrier's mask, which a load takes as itself
        (load_barrier_mask); the memory base and an address made of it,
@@ -1412,7 +1607,8 @@ static void ra2_spill(Isel *s, const int *gpool, int ngpool) {
   xfree(R.done); xfree(R.din); xfree(R.pend); xfree(R.slotv); xfree(R.out); xfree(R.outpos);
   xfree(R.added);
   xfree(R.shared);
-  xfree(R.maxp); xfree(R.lstamp); xfree(R.lstack);
+  xfree(R.maxp); xfree(R.lstamp); xfree(R.lstack); xfree(R.vuse); xfree(R.vlv);
+  xfree(R.mhead); xfree(R.mnext); xfree(R.mblk); xfree(R.mcp);
   /* the liveness made for the pass is of the function before it */
   xfree(s->lv_in); xfree(s->lv_out); xfree(s->lv_in_off); xfree(s->lv_out_off);
   s->lv_in = s->lv_out = NULL;
