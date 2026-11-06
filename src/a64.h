@@ -249,6 +249,8 @@ void a64_vcmeq(Buf *b, int size, int rd, int rn, int rm);
 void a64_vcmhi(Buf *b, int size, int rd, int rn, int rm);
 void a64_vcmhs(Buf *b, int size, int rd, int rn, int rm);
 void a64_vbsl(Buf *b, int rd, int rn, int rm);
+void a64_vbit(Buf *b, int rd, int rn, int rm);
+void a64_vbif(Buf *b, int rd, int rn, int rm);
 void a64_vshl_imm(Buf *b, int size, int rd, int rn, int shift);
 void a64_vushr_imm(Buf *b, int size, int rd, int rn, int shift);
 void a64_vsli_imm(Buf *b, int size, int rd, int rn, int shift);

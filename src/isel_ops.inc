@@ -1968,9 +1968,20 @@ static void emit_inst(Isel *s, Ref v) {
       int m = rd(s, a[0], F0), x = rd(s, a[1], F1), y = rd(s, a[2], F2);
 
       int d = wr(s, v, FTMP);
-      if (d != m && (d == x || d == y)) d = FTMP;
-      if (d != m) a64_vmov(B, d, m);
-      a64_vbsl(B, d, x, y);
+      /* made in whichever operand's register the result is in: the mask's
+         (bsl), the false value's (bit: the true value's bits where the
+         mask's are set) or the true value's (bif) -- a select carried
+         round a loop in the register of the value it keeps, vecbench's
+         argmin, moves nothing */
+      if (d != m && d == y && !warmc_getenv("WARMC_NO_VBIT")) {
+        a64_vbit(B, d, x, m);
+      } else if (d != m && d == x && !warmc_getenv("WARMC_NO_VBIT")) {
+        a64_vbif(B, d, y, m);
+      } else {
+        if (d != m && (d == x || d == y)) d = FTMP;
+        if (d != m) a64_vmov(B, d, m);
+        a64_vbsl(B, d, x, y);
+      }
       commit(s, v, d);
       break;
     }

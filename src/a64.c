@@ -696,6 +696,10 @@ void a64_vcmeq(Buf *b, int size, int rd, int rn, int rm) { V3(0x6E208C00u | VSZ(
 void a64_vcmhi(Buf *b, int size, int rd, int rn, int rm) { V3(0x6E203400u | VSZ(size), rd, rn, rm); }
 void a64_vcmhs(Buf *b, int size, int rd, int rn, int rm) { V3(0x6E203C00u | VSZ(size), rd, rn, rm); }
 void a64_vbsl(Buf *b, int rd, int rn, int rm)            { V3(0x6E601C00u, rd, rn, rm); }
+/* rd's bits where rm's are clear, rn's where they are set (BIT), and the
+   other way round (BIF) */
+void a64_vbit(Buf *b, int rd, int rn, int rm)            { V3(0x6EA01C00u, rd, rn, rm); }
+void a64_vbif(Buf *b, int rd, int rn, int rm)            { V3(0x6EE01C00u, rd, rn, rm); }
 
 void a64_vshl_imm(Buf *b, int size, int rd, int rn, int shift) {
   uint32_t imm = (uint32_t)(8 << size) + (uint32_t)shift;
