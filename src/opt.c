@@ -13889,7 +13889,15 @@ typedef struct { Ref addr; uint64_t covered; uint32_t mem; } ChkEnt;
 
 static Edge *iv_edge(IrFunc *f, uint32_t from, uint32_t to);
 
-static uint64_t array_known_len(IrFunc *f, Ref r, int depth) {
+/* The length r's array is known to have at least (0: none known) -- or,
+   exact, the length it has: where ways meet with arrays of lengths that
+   differ, the least is a bound a proof may take, not the length, and
+   array.len folded to it was wrong for the longer (array_exact_len) */
+static uint64_t array_len_of(IrFunc *f, Ref r, int depth, bool exact);
+static uint64_t array_known_len(IrFunc *f, Ref r, int depth) { return array_len_of(f, r, depth, false); }
+static uint64_t array_exact_len(IrFunc *f, Ref r, int depth) { return array_len_of(f, r, depth, true); }
+
+static uint64_t array_len_of(IrFunc *f, Ref r, int depth, bool exact) {
   if (depth <= 0) return 0;
   Inst *in = &f->insts[r];
   Ref *a = ir_args(f, r);
@@ -13902,7 +13910,7 @@ static uint64_t array_known_len(IrFunc *f, Ref r, int depth) {
       return f->insts[a[1]].imm & 0xffffffffu;
 
     case I_REF_CONVERT:
-      return array_known_len(f, a[0], depth - 1);
+      return array_len_of(f, a[0], depth - 1, exact);
     case I_PARAM: {
       /* an array flowing through a merge is at least as long as the
          shortest any pred supplies -- min, where ir_value_max meets with
@@ -13917,8 +13925,8 @@ static uint64_t array_known_len(IrFunc *f, Ref r, int depth) {
       for (uint32_t p = 0; p < b->npreds; p++) {
         Edge *e = iv_edge(f, b->preds[p], in->block);
         if (!e || pi >= e->nargs) return 0;
-        uint64_t l = array_known_len(f, e->args[pi], depth - 1);
-        if (!l) return 0;
+        uint64_t l = array_len_of(f, e->args[pi], depth - 1, exact);
+        if (!l || (exact && best && l != best)) return 0;
         if (!best || l < best) best = l;
       }
       return best;
@@ -13941,7 +13949,7 @@ static bool pass_array_bounds(IrFunc *f) {
         /* the length is fixed at allocation, so a visible allocation
            makes it a constant; with a null check pending the trap must
            stay, so leave those alone */
-        uint64_t n = array_known_len(f, ir_args(f, v)[0], 4);
+        uint64_t n = array_exact_len(f, ir_args(f, v)[0], 4);
         if (n) {
           replace_with_const(f, v, n);
           changed = true;
