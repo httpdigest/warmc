@@ -197,15 +197,24 @@ static Ref ra2a_bfi_field(Isel *s, Ref v) {
    (emit_gc_load_barrier) -- which in the loaded reference's register made
    the test of it against itself, so the slow path on every non-null load
    (javabench/treemap) */
-static Ref ra2a_late_read(Isel *s, Ref v) {
+static Ref ra2a_late_arg(Isel *s, Ref v) {
   Ref fx = ra2a_bfi_field(s, v);
   if (fx != REF_NONE) return fx;
   IrFunc *f = s->f;
   const Inst *in = &f->insts[v];
   if ((in->op == I_FIELD_GET || in->op == I_ARRAY_GET || in->op == I_EXN_PAYLOAD) &&
       !vt_is_float((ValType)in->type) && (ValType)in->type != VT_V128 && load_needs_barrier(f, in))
-    return load_barrier_mask(f, v);
+    return load_mask_arg(f, v);
   return REF_NONE;
+}
+
+/* -- once the spiller has mapped its versions (ra2_versions): a mask that
+   is none fails here, where the spiller's own (ra2a_late_arg, the
+   operand as it stands) is of a version not mapped yet */
+static Ref ra2a_late_read(Isel *s, Ref v) {
+  Ref x = ra2a_late_arg(s, v);
+  if (x != REF_NONE && ra2a_bfi_field(s, v) == REF_NONE) load_barrier_mask(s->f, v);
+  return x;
 }
 
 /* Coalescing.  The affinities -- a param and the argument an edge passes
@@ -221,6 +230,24 @@ static Ref ra2a_late_read(Isel *s, Ref v) {
 /* (split: an edge's move that needs a block of its own, the edge leaving a
    branch for a merge -- the move and a branch) */
 typedef struct { Ref a, b; double w; uint32_t span; bool split; } Ra2Aff;
+
+/* How often a block runs, by the spiller's estimate (ra_spill.inc
+   ra2_freqs): a loop's arms each a share of its header's runs, where loop
+   depths alone (regalloc.inc blk_freq) weigh every arm as often as the
+   header -- of cbench/varargs' vpack loop, the arm that moves its pointer
+   on as heavy as the way round, taken in first by its shorter life, kept
+   the way round's param apart and put a move on every trip
+   (WARMC_RA2_NO_AFREQ). */
+static const double *ra2a_fq(const IrFunc *f) {
+  return f->ra2_freq && f->ra2_nfreq == f->nblocks && !warmc_getenv("WARMC_RA2_NO_AFREQ") ? f->ra2_freq : NULL;
+}
+/* -- for the plan, the recolouring and the fixed registers' hints too, which
+   weigh against the coalescer's (WARMC_RA2_AFREQ_CO: the coalescer's
+   alone) */
+static const double *ra2a_fq_all(const IrFunc *f) {
+  return warmc_getenv("WARMC_RA2_AFREQ_CO") ? NULL : ra2a_fq(f);
+}
+#define RA2A_FREQ(fq, f, b) ((fq) ? (fq)[b] : blk_freq(&(f)->blocks[b]))
 
 /* by weight, then the shorter lives first: of the arguments a merge's param
    is passed, one live everywhere -- the function's own param -- taken in
@@ -335,20 +362,29 @@ static void ra2a_coalesce(Isel *s, const bool *wants, uint32_t *grp, Ref *eu, ui
       if (f->insts[u].op == I_COPY && f->insts[u].nargs == 1) I.val[u] = I.val[ir_args(f, u)[0]];
     }
   }
+  const double *fq = ra2a_fq(f);
+  bool splitw = !warmc_getenv("WARMC_RA2_NO_SPLITW");
   for (uint32_t oi = 0; oi < f->norder; oi++) {
     uint32_t bi = f->order[oi];
     Block *bb = &f->blocks[bi];
-    double w = blk_freq(bb);
+    double w = RA2A_FREQ(fq, f, bi);
     for (uint32_t si = 0; si < bb->nsuccs; si++) {
       Edge *e = &bb->succs[si];
       if (e->eh) continue;
       Block *tb = &f->blocks[e->target];
       /* an edge's moves run as often as the less often run of its ends */
-      double we = blk_freq(tb) < w ? blk_freq(tb) : w;
+      double wt = RA2A_FREQ(fq, f, e->target);
+      double we = wt < w ? wt : w;
       bool split = bb->nsuccs > 1 && tb->npreds > 1;
       for (uint32_t j = 0; j < e->nargs && j < tb->nparams; j++) {
         Ref x = e->args[j], y = tb->params[j];
-        if (wants[x] && wants[y] && (bool)s->cls[x] == (bool)s->cls[y]) RA2A_AFF(x, y, we, split);
+        /* a move such an edge needs takes a branch with it: weighed
+           twice (gobench/tokenize's whitespace, its position moved in a
+           stub and a jump back on every blank, where the merge after it
+           could have moved it for all its ways in line;
+           WARMC_RA2_NO_SPLITW) */
+        double ws = split && splitw ? 2 * we : we;
+        if (wants[x] && wants[y] && (bool)s->cls[x] == (bool)s->cls[y]) RA2A_AFF(x, y, ws, split);
       }
     }
     for (uint32_t i = 0; i < bb->ninsts; i++) {
@@ -401,7 +437,7 @@ static void ra2a_coalesce(Isel *s, const bool *wants, uint32_t *grp, Ref *eu, ui
       int rb = ra2a_hint_best(fhint, fhw, xhot, mnext, gb, NULL, &bb);
       if (ra >= 0 && rb >= 0 && ra != rb) {
         ra2a_hint_best(fhint, fhw, xhot, mnext, ga, &gb, &bm);
-        double save = aff[k].w * (aff[k].split && !warmc_getenv("WARMC_RA2_HINTCO_NOSPLIT") ? 2 : 1);
+        double save = aff[k].w * (aff[k].split && !splitw && !warmc_getenv("WARMC_RA2_HINTCO_NOSPLIT") ? 2 : 1);
         if (ba + bb - save >= bm) continue;
       }
     }
@@ -537,9 +573,10 @@ static void ra2a_plan(Isel *s, const bool *wants, uint32_t *grp, const uint32_t 
      each by how often it runs */
   uint32_t *order = xmalloc((n ? n : 1) * sizeof(uint32_t));
   double *pw = xcalloc(n ? n : 1, sizeof(double));
+  const double *fq = ra2a_fq_all(f);
   for (uint32_t oi = 0; oi < f->norder; oi++) {
     Block *bb = &f->blocks[f->order[oi]];
-    double w = blk_freq(bb);
+    double w = RA2A_FREQ(fq, f, f->order[oi]);
     for (uint32_t i = 0; i < bb->ninsts; i++) {
       uint32_t ne = eff_uses(s, f, bb->insts[i], eu, eucap);
       for (uint32_t j = 0; j < ne; j++) if (wants[eu[j]]) pw[RA2P_G(eu[j])] += w;
@@ -782,13 +819,14 @@ static void ra2a_cycles(Isel *s, const bool *wants, uint32_t *grp, int *reg, Ra2
   }
   Ra2Ed *ed = NULL;
   uint32_t ned = 0, caped = 0;
+  const double *fq = ra2a_fq_all(f);
   for (uint32_t oi = 0; oi < f->norder; oi++) {
     uint32_t bi = f->order[oi];
     Block *bb = &f->blocks[bi];
-    double w = blk_freq(bb);
+    double w = RA2A_FREQ(fq, f, bi);
     for (uint32_t si = 0; si < bb->nsuccs; si++) {
       if (bb->succs[si].eh || !bb->succs[si].nargs) continue;
-      double we = blk_freq(&f->blocks[bb->succs[si].target]);
+      double we = RA2A_FREQ(fq, f, bb->succs[si].target);
       if (we > w) we = w;
       if (ned == caped) { caped = caped ? caped * 2 : 64; ed = xrealloc(ed, caped * sizeof(Ra2Ed)); }
       ed[ned++] = (Ra2Ed){ we, bi, si };
@@ -1098,6 +1136,7 @@ static void ra2a_recolor(Isel *s, const bool *wants, uint32_t *grp, const double
     uint32_t capmem = 0;
     const char *dbgs = warmc_getenv("WARMC_RA2_DEBUG_RC");
     bool dbg = dbgs && (uint32_t)atoi(dbgs) == f->func_index;
+    const double *fqr = ra2a_fq_all(f);
     for (uint32_t k = 0; k < ng && C.steps <= C.cap; k++) {
       uint32_t g = order[k];
       int c = s->cls[gfirst[g]] ? 1 : 0;
@@ -1114,14 +1153,14 @@ static void ra2a_recolor(Isel *s, const bool *wants, uint32_t *grp, const double
       for (uint32_t v = gfirst[g]; v != UINT32_MAX; v = gnext[v]) {
         if (nm == capmem) { capmem = capmem ? capmem * 2 : 32; mem = xrealloc(mem, capmem * sizeof(Ref)); }
         mem[nm++] = v;
-        wr[reg[v]] += 1 + blk_freq(&f->blocks[f->insts[v].block]);
+        wr[reg[v]] += 1 + RA2A_FREQ(fqr, f, f->insts[v].block);
         if (fhint[v] >= 0 && fhint[v] < 64) wr[fhint[v]] += fhw[v];
       }
       for (uint32_t i = 1; i < nm; i++) {
         Ref x = mem[i];
-        double wx = blk_freq(&f->blocks[f->insts[x].block]);
+        double wx = RA2A_FREQ(fqr, f, f->insts[x].block);
         uint32_t j = i;
-        while (j > 0 && blk_freq(&f->blocks[f->insts[mem[j - 1]].block]) < wx) { mem[j] = mem[j - 1]; j--; }
+        while (j > 0 && RA2A_FREQ(fqr, f, f->insts[mem[j - 1]].block) < wx) { mem[j] = mem[j - 1]; j--; }
         mem[j] = x;
       }
       /* the registers to try: the group's own, the heaviest first, the
@@ -1302,9 +1341,10 @@ static void ra2_assign(Isel *s) {
       if (vt_is_vec_reg(t)) { if (next_flt < 8) { fhint[e->params[i]] = next_flt; fhw[e->params[i]] = 1; } next_flt++; }
       else { if (next_int <= 7) { fhint[e->params[i]] = next_int; fhw[e->params[i]] = 1; } next_int++; }
     }
+    const double *fq = ra2a_fq_all(f);
     for (uint32_t oi = 0; oi < f->norder; oi++) {
       Block *b = &f->blocks[f->order[oi]];
-      double w = blk_freq(b);
+      double w = RA2A_FREQ(fq, f, f->order[oi]);
       if (b->term == T_RETURN && f->sig->nresults == 1 && b->nret == 1 && fhint[b->ret_args[0]] < 0) {
         fhint[b->ret_args[0]] = 0;
         fhw[b->ret_args[0]] = w;
@@ -1500,6 +1540,25 @@ static void ra2_assign(Isel *s) {
         }
         int pick = ra2a_pick(s, u, c, own, pool, np, hint, xhot, xalloc, c ? fclaim : gclaim,
                              ghot[RA2A_FIND(u)], RA2A_AVOID(u));
+        /* none free: the operands read here for the last time leave first,
+           as the spiller counted them (ra_spill.inc ra2_block), but the one
+           read after the result is written (ra2a_late_read) -- held for the
+           result, rsbench/constmat's float sums each went to a slot */
+        if (pick < 0 && !warmc_getenv("WARMC_RA2_NO_DIEFIRST")) {
+          Ref lr = ra2a_late_read(s, u);
+          int freed = -1;
+          for (uint32_t k = dp[i]; k < dp[i + 1]; k++) {
+            Ref x = dying[k];
+            int l = reg[x];
+            if (x == lr || l == LOC_NONE || IS_SLOT(l) || l < 0 || l >= 64 || (bool)s->cls[x] != (bool)c) continue;
+            if (own[l] != x) continue;
+            own[l] = REF_NONE;
+            if (freed < 0) freed = l;
+          }
+          if (freed >= 0)
+            pick = ra2a_pick(s, u, c, own, pool, np, freed, xhot, xalloc, c ? fclaim : gclaim,
+                             ghot[RA2A_FIND(u)], RA2A_AVOID(u));
+        }
         if (warmc_getenv("WARMC_RA2_DEBUG_CS") && want_cs && pick >= 0 &&
             !(c ? fpr_is_callee_saved(pick) : gpr_is_callee_saved(pick))) {
           fprintf(stderr, "ra2 cs-miss f%u b%u v%u %s:", f->func_index, b, u, ir_op_name(f->insts[u].op));

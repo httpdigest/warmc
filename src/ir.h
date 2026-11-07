@@ -439,6 +439,10 @@ typedef struct {
      rest (ra2_of, ra2_nof long; isel_core.inc ra2_source) */
   Ref *ra2_of;
   uint32_t ra2_nof;
+  /* per block, how often the spiller's estimate has it run (ra_spill.inc
+     ra2_freqs; ra2_nfreq long), which its assignment weighs by */
+  double *ra2_freq;
+  uint32_t ra2_nfreq;
   uint8_t *ra2_dbg;
 } IrFunc;
 

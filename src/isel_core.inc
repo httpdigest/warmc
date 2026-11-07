@@ -658,11 +658,17 @@ static Ref ra2_source(const IrFunc *f, Ref x, IrOp op) {
   return REF_NONE;
 }
 
-static Ref load_barrier_mask(const IrFunc *f, Ref v) {
+/* a barriered load's mask operand as it stands: before the length, where a
+   bounds check takes one (GCF_LENARG) */
+static Ref load_mask_arg(const IrFunc *f, Ref v) {
   const Inst *in = &f->insts[v];
   if (!(in->imm2 & GCF_MASKARG)) return REF_NONE;
-  /* before the length, where a bounds check takes one (GCF_LENARG) */
-  Ref m = ir_args((IrFunc *)f, v)[in->nargs - 1 - ((in->imm2 & GCF_LENARG) != 0)];
+  return ir_args((IrFunc *)f, v)[in->nargs - 1 - ((in->imm2 & GCF_LENARG) != 0)];
+}
+
+static Ref load_barrier_mask(const IrFunc *f, Ref v) {
+  Ref m = load_mask_arg(f, v);
+  if (m == REF_NONE) return REF_NONE;
   /* or a version of one, read in its register (ra2_source) */
   if (ra2_source(f, m, I_GC_BADMASK) == REF_NONE)
     warmc_fatal("internal: v%u's barrier mask v%u is no gc.badmask", v, m);
