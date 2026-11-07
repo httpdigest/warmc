@@ -1772,6 +1772,13 @@ static void ra2_trivial_params(Ra2 *R) {
          (gobench/typeswitch's array base, on every trip) */
       bool pslot = p < R->nslotv && R->slotv[p] == 1, oslot = one < R->nslotv && R->slotv[one] == 1;
       if (oslot && !pslot && !warmc_getenv("WARMC_RA2_TRIV_SLOT")) continue;
+      /* a param in a register for a copy made for the edges alone: the
+         copy takes the param's reads, in its register -- made at each, the
+         memory base made ahead of gobench/matrix's loops was made twice a
+         trip; not for a param in its slot, whose reads take no register
+         (WARMC_RA2_NO_EDGEREAD) */
+      if (!pslot && one < R->nslotv && R->slotv[one] == 2 && !warmc_getenv("WARMC_RA2_NO_EDGEREAD"))
+        R->slotv[one] = 3;
       repl[p] = one;
       gone[p] = 1;
       changed = true;
