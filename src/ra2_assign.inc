@@ -423,6 +423,19 @@ static void ra2a_coalesce(Isel *s, const bool *wants, uint32_t *grp, Ref *eu, ui
   uint32_t *mtail = xmalloc((n ? n : 1) * sizeof(uint32_t));
   uint32_t *msize = xmalloc((n ? n : 1) * sizeof(uint32_t));
   for (uint32_t v = 0; v < n; v++) { mnext[v] = UINT32_MAX; mtail[v] = v; msize[v] = 1; }
+  /* each value's affinities, by their place in the order (CSR) */
+  bool look = !warmc_getenv("WARMC_RA2_NO_LOOKAHEAD");
+  uint32_t *afo = NULL, *afl = NULL;
+  if (look) {
+    afo = xcalloc((size_t)n + 1, sizeof(uint32_t));
+    afl = xmalloc((naff ? 2 * (size_t)naff : 1) * sizeof(uint32_t));
+    for (uint32_t k = 0; k < naff; k++) { afo[aff[k].a + 1]++; afo[aff[k].b + 1]++; }
+    for (uint32_t v = 0; v < n; v++) afo[v + 1] += afo[v];
+    uint32_t *at = xmalloc(((size_t)n + 1) * sizeof(uint32_t));
+    memcpy(at, afo, ((size_t)n + 1) * sizeof(uint32_t));
+    for (uint32_t k = 0; k < naff; k++) { afl[at[aff[k].a]++] = k; afl[at[aff[k].b]++] = k; }
+    xfree(at);
+  }
   for (uint32_t k = 0; k < naff; k++) {
     uint32_t ga = aff[k].a, gb = aff[k].b;
     while (grp[ga] != ga) ga = grp[ga];
@@ -440,6 +453,37 @@ static void ra2a_coalesce(Isel *s, const bool *wants, uint32_t *grp, Ref *eu, ui
         fprintf(stderr, "co reject v%u-v%u w=%g: v%u(b%u) vs v%u(b%u)\n", aff[k].a, aff[k].b, aff[k].w,
                 cx, I.blk[cx], cy, I.blk[cy]);
       continue;
+    }
+    /* Not where the merge alone would keep later affinities apart that
+       weigh more than it does -- a member's, whose other end meets the
+       other group but not its own: of gobench/recurse's fib loop, the way
+       round's n-2 into n taken in first kept both of the merge after the
+       call apart, a move on each of its two ways in for the one it saved
+       (small groups only; WARMC_RA2_NO_LOOKAHEAD) */
+    if (look && msize[ga] + msize[gb] <= 16) {
+      double blocked = 0;
+      for (int side = 0; side < 2 && blocked <= aff[k].w; side++) {
+        uint32_t gs = side ? gb : ga, go = side ? ga : gb;
+        for (uint32_t m = gs; m != UINT32_MAX && blocked <= aff[k].w; m = mnext[m])
+          for (uint32_t t = afo[m]; t < afo[m + 1] && blocked <= aff[k].w; t++) {
+            uint32_t j = afl[t];
+            if (j <= k) continue;
+            uint32_t o = aff[j].a == m ? aff[j].b : aff[j].a;
+            uint32_t g3 = o;
+            while (grp[g3] != g3) g3 = grp[g3];
+            if (g3 == ga || g3 == gb || msize[g3] > 16) continue;
+            bool with_other = false, with_own = false;
+            for (uint32_t x = g3; x != UINT32_MAX && !with_other; x = mnext[x])
+              for (uint32_t y = go; y != UINT32_MAX && !with_other; y = mnext[y])
+                with_other = ra2a_interfere(&I, x, y);
+            if (!with_other) continue;
+            for (uint32_t x = g3; x != UINT32_MAX && !with_own; x = mnext[x])
+              for (uint32_t y = gs; y != UINT32_MAX && !with_own; y = mnext[y])
+                with_own = ra2a_interfere(&I, x, y);
+            if (!with_own) blocked += aff[j].w;
+          }
+      }
+      if (blocked > aff[k].w) continue;
     }
     /* Nor where the two are wanted in fixed registers apart, for at least
        as much as the move saves: one register for both meets one of them
@@ -466,7 +510,7 @@ static void ra2a_coalesce(Isel *s, const bool *wants, uint32_t *grp, Ref *eu, ui
     msize[ga] += msize[gb];
     gw[ga] += gw[gb] + aff[k].w;
   }
-  xfree(mnext); xfree(mtail); xfree(msize);
+  xfree(mnext); xfree(mtail); xfree(msize); xfree(afo); xfree(afl);
   *affout = aff;
   *naffout = naff;
   xfree(I.num); xfree(I.blk);
