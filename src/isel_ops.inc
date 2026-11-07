@@ -3578,8 +3578,14 @@ static void emit_block(Isel *s, uint32_t bi, uint32_t next_bi) {
         uint32_t mi = (uint32_t)(me - b->succs), oi = (uint32_t)(oe - b->succs);
         bool ok = ir_succ_score(f, b, mi) >= ir_succ_score(f, b, oi) &&
                   f->blocks[me->target].rpo <= b->rpo;
+        /* (a value the way round makes again -- a constant, the memory
+           base, an immutable global, the mask -- sets no flags here and
+           reads only the pinned registers: gobench/methodval's dispatch
+           loop under RA2, its memory base made again after each call, went
+           out to a jump back on every trip; WARMC_NO_LATCH_REMAT) */
+        bool remat_ok_here = !warmc_getenv("WARMC_NO_LATCH_REMAT");
         for (int i = 0; i < mn && ok; i++) {
-          if (mm[i].remat || IS_SLOT(mm[i].dst)) ok = false;
+          if ((mm[i].remat && !remat_ok_here) || IS_SLOT(mm[i].dst)) ok = false;
           else if (kind != 0 && !mm[i].fp && mm[i].dst == zreg) ok = false;
         }
         for (int j = 0; j < on && ok; j++) {

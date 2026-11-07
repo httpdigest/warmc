@@ -1,7 +1,10 @@
 ;; A latch whose way round moves values makes those moves ahead of its
 ;; branch, so that the branch goes round on its own and not out to a block
 ;; of moves and a jump back (isel_ops.inc T_BRIF; latch_hoists): $one's
-;; p + 1 goes to p's register ahead of the test.  Not where a register the
+;; p + 1 goes to p's register ahead of the test, and $zero's r, made 0
+;; again on every way round, a constant that sets no flags and reads no
+;; register (gobench/methodval's memory base under RA2, made again after
+;; each call of its dispatch loop).  Not where a register the
 ;; moves write is one the way out keeps a value in: $kept's way out passes
 ;; p as it was on the way in, in the register of its result, which the way
 ;; round's p + 1 would have overwritten.  A way out with moves of its own
@@ -15,15 +18,15 @@
 ;; way out's moves read: $clash's way out moves p as it was to the merge's
 ;; register, from the one the way round puts p + 1 in (cbench/varargs' sum
 ;; loop under RA2, a value loaded back on the way out, went out to a move
-;; and a branch back on every trip).  Only a way back into a
-;; loop, not a branch forward ($fwd's to the merge its arm meets); only the
-;; likelier way ($cont's inner latch, whose way back into the outer loop is
-;; less likely than its way round the inner one); no constant made again
-;; ($zero's r, made 0 on every way round); no store to a slot ($many's
-;; i + 1, more values round the loop than the registers hold).  The calls through the
-;; table keep $g and $gf out of line, their arguments in their registers.
+;; and a branch back on every trip).  Only a way back into a loop, not a
+;; branch forward ($fwd's to the merge its arm meets); only the likelier
+;; way ($cont's inner latch, whose way back into the outer loop is less
+;; likely than its way round the inner one); no store to a slot ($many's
+;; i + 1, more values round the loop than the registers hold).  The calls
+;; through the table keep $g and $gf out of line, their arguments in their
+;; registers.
 ;;
-;; stats -O2 a64: latch_hoists=1 latch_both=4
+;; stats -O2 a64: latch_hoists=2 latch_both=4
 ;; shape: one \sb\s=0
 ;; shape: kept \sb\s=1
 ;; shape: both \sb\s=0
