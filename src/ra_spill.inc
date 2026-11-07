@@ -1150,16 +1150,56 @@ static void ra2_block(Ra2 *R, uint32_t b, Ra2Uses *uses, Ref *touched, uint32_t 
     int64_t *ck = xmalloc((nc ? nc : 1) * sizeof(int64_t));
     uint32_t m = 0;
     bool entry = b == f->entry;
+    uint32_t nproc = 0;
+    for (uint32_t p = 0; p < bb->npreds; p++) nproc += R->done[bb->preds[p]];
+    /* On a loop's header, which of the values live in the loop reads: one
+       read after a loop within it is as far by the distances as one read
+       after the loop itself (a way out of a loop adds RA2_LOOPX), and would
+       be taken for one the loop only carries -- stdgo/variadic's two
+       constants and an address, read after its inner loop, made again and
+       loaded back on every trip with five registers free
+       (WARMC_RA2_NO_INLOOP) */
+    /* the loop's pressure (ra2_loop_pressure), for the room below too --
+       -- and where it is more than the registers hold, a value read only
+       past a loop within is carried still: taken in, it would be pushed
+       out inside and loaded back on every way round (cbench/varargs) */
+    int hlp[2] = { 0, 0 };
+    int *pm = NULL;
+    uint32_t *plb = NULL, pnl = 0;
+    if (nproc < bb->npreds)
+      ra2_loop_pressure(R, b, hlp, R->freq && !warmc_getenv("WARMC_RA2_NO_ROOMCOST") ? &pm : NULL, &plb, &pnl);
+    /* -- nor in a loop that makes a call, across which no more than the
+       callee-saved registers keep theirs (hsbench/lazy, typeclass) */
+    bool hfits[2] = { false, false };
+    if (plb) {
+      bool lcall = false;
+      for (uint32_t k = 0; k < pnl && !lcall; k++) {
+        Block *lbk = &f->blocks[plb[k]];
+        for (uint32_t i = 0; i < lbk->ninsts && !lcall; i++) lcall = ra2_hot_call(R, plb[k], lbk->insts[i]);
+      }
+      for (int c = 0; c < 2; c++) hfits[c] = hlp[c] <= R->K[c] && !lcall;
+    }
+    double *lrd = NULL;
+    if (nproc < bb->npreds && R->freq && !warmc_getenv("WARMC_RA2_NO_INLOOP")) {
+      Ref *all = xmalloc((nc ? nc : 1) * sizeof(Ref));
+      for (uint32_t k = 0; k < nc; k++) all[k] = k < nl ? s->lv_in[s->lv_in_off[b] + k] : bb->params[k - nl];
+      lrd = ra2_loop_uses(R, b, all, nc);
+      xfree(all);
+    }
+    bool *cr = xmalloc((nc ? nc : 1) * sizeof(bool));
     /* the residents live in, ahead of everything */
     for (uint32_t k = 0; k < nl + bb->nparams; k++) {
       Ref x = k < nl ? s->lv_in[s->lv_in_off[b] + k] : bb->params[k - nl];
       if (x >= R->n0 || !R->res[x]) continue;
       int32_t nu = ra2_next(R, b, uses[x].n ? &uses[x] : NULL, x, 0, blen);
       int c = ra2_cls(R, x);
+      /* one the loop does not read is carried: past RA2_LOOPX */
+      if (lrd && nu < RA2_INF) {
+        if (lrd[k] == 0) { if (nu < RA2_LOOPX) nu = RA2_LOOPX; }
+        else if (nu >= RA2_LOOPX && hfits[c]) nu = RA2_LOOPX - 1;
+      }
       if (nu < RA2_INF && W.n[c] < 64) W.w[c][W.n[c]++] = (Ra2W){ x, x, nu };
     }
-    uint32_t nproc = 0;
-    for (uint32_t p = 0; p < bb->npreds; p++) nproc += R->done[bb->preds[p]];
     for (uint32_t k = 0; k < nl + bb->nparams; k++) {
       Ref x = k < nl ? s->lv_in[s->lv_in_off[b] + k] : bb->params[k - nl];
       if (x >= R->n0 || !R->need[x]) continue;
@@ -1176,14 +1216,17 @@ static void ra2_block(Ra2 *R, uint32_t b, Ra2Uses *uses, Ref *touched, uint32_t 
          rather than on every way round */
       bool own = f->insts[x].op == I_PARAM && f->insts[x].block == b;
       bool header = nproc < bb->npreds;
-      if (!own && nproc && !held && !(header && nu < RA2_LOOPX) &&
+      bool carried = lrd ? lrd[k] == 0 || (nu >= RA2_LOOPX && !hfits[ra2_cls(R, x)]) : nu >= RA2_LOOPX;
+      if (!own && nproc && !held && !(header && !carried) &&
           !warmc_getenv("WARMC_RA2_ENTRY_ALL"))
         continue;
       int64_t key = (int64_t)(nu < RA2_LOOPX ? nu * ra2_remw(R, x) : nu) * 4 +
                     (held == nproc && nproc ? 0 : held ? 1 : 2);
+      cr[m] = carried;
       cv[m] = x;
       ck[m++] = key;
     }
+    xfree(lrd);
     /* by key, a few dozen at most: an insertion sort -- on a loop's header,
        the values the loop reads by how often it reads them (ra2_freqs)
        first, the nearest read only among equals: a value one arm of the
@@ -1194,7 +1237,7 @@ static void ra2_block(Ra2 *R, uint32_t b, Ra2Uses *uses, Ref *touched, uint32_t 
     if (byfreq) {
       double *uw = ra2_loop_uses(R, b, cv, m);
       for (uint32_t i = 0; i < m; i++)
-        sk[i] = ck[i] / 4 >= RA2_LOOPX ? 1e30 + (double)ck[i] : -uw[i] * 1e6 + (double)ck[i];
+        sk[i] = cr[i] ? 1e30 + (double)ck[i] : -uw[i] * 1e6 + (double)ck[i];
       xfree(uw);
     } else {
       for (uint32_t i = 0; i < m; i++) sk[i] = (double)ck[i];
@@ -1203,11 +1246,13 @@ static void ra2_block(Ra2 *R, uint32_t b, Ra2Uses *uses, Ref *touched, uint32_t 
       Ref x = cv[i];
       int64_t kx = ck[i];
       double sx = sk[i];
+      bool cx = cr[i];
       uint32_t j = i;
-      while (j > 0 && sk[j - 1] > sx) { cv[j] = cv[j - 1]; ck[j] = ck[j - 1]; sk[j] = sk[j - 1]; j--; }
+      while (j > 0 && sk[j - 1] > sx) { cv[j] = cv[j - 1]; ck[j] = ck[j - 1]; sk[j] = sk[j - 1]; cr[j] = cr[j - 1]; j--; }
       cv[j] = x;
       ck[j] = kx;
       sk[j] = sx;
+      cr[j] = cx;
     }
     xfree(sk);
     /* On a loop's header, a value the loop only carries keeps a register
@@ -1217,18 +1262,14 @@ static void ra2_block(Ra2 *R, uint32_t b, Ra2Uses *uses, Ref *touched, uint32_t 
     int lt_room[2] = { 64, 64 };
     bool lfull[2] = { false, false };
     if (nproc < bb->npreds) {
-      int lp[2], nlt[2] = { 0, 0 };
-      int *pm = NULL;
-      uint32_t *plb = NULL, pnl = 0;
-      bool rcost = R->freq && !warmc_getenv("WARMC_RA2_NO_ROOMCOST");
-      ra2_loop_pressure(R, b, lp, rcost ? &pm : NULL, &plb, &pnl);
+      int lp[2] = { hlp[0], hlp[1] }, nlt[2] = { 0, 0 };
       /* a loop that reads more than the registers hold: its constants are
          made where they are read, not carried round in params -- pushed out
          inside, they would be made again on every way back for the header
          (cbench/switch: three per trip for cases that seldom read them) */
       for (int c = 0; c < 2; c++) lfull[c] = lp[c] > R->K[c] && warmc_getenv("WARMC_RA2_HDR_NOCONSTS");
       for (uint32_t i = 0; i < m; i++)
-        if (ck[i] / 4 >= RA2_LOOPX) nlt[ra2_cls(R, cv[i])]++;
+        if (cr[i]) nlt[ra2_cls(R, cv[i])]++;
       for (int c = 0; c < 2; c++) {
         /* the loop's pressure counts what it reads only, the carried
            values none (ra2_loop_pressure) */
@@ -1258,7 +1299,7 @@ static void ra2_block(Ra2 *R, uint32_t b, Ra2Uses *uses, Ref *touched, uint32_t 
       int c = ra2_cls(R, x);
       bool param = f->insts[x].op == I_PARAM && f->insts[x].block == b;
       int32_t nu = (int32_t)(ck[i] / 4);
-      bool carried = nu >= RA2_LOOPX;
+      bool carried = cr[i];
       if (carried && lt_room[c] <= 0 && !param) {
         ra2_mem(R, x);
         continue;
@@ -1329,6 +1370,7 @@ static void ra2_block(Ra2 *R, uint32_t b, Ra2Uses *uses, Ref *touched, uint32_t 
     }
     xfree(cv);
     xfree(ck);
+    xfree(cr);
   }
 
   /* the instructions */

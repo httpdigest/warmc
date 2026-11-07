@@ -249,6 +249,25 @@ static const double *ra2a_fq_all(const IrFunc *f) {
 }
 #define RA2A_FREQ(fq, f, b) ((fq) ? (fq)[b] : blk_freq(&(f)->blocks[b]))
 
+/* How often edge si of block b runs: by the estimate, b's runs times the
+   edge's share of its ways out (ra_spill.inc ra2_edge_w) -- the less often
+   run of its two ends overweighs a way that runs on one trip in two into
+   a block every trip reaches (cbench/heap's sift-down, its last child
+   taken for the larger one, coalesced ahead of the way round and two
+   values swapped on every trip; WARMC_RA2_NO_EDGEW) -- else the less often
+   run of its ends. */
+static double ra2a_edge_freq(const IrFunc *f, const double *fq, uint32_t b, uint32_t si) {
+  const Block *bb = &f->blocks[b];
+  const Edge *e = &bb->succs[si];
+  if (fq && !warmc_getenv("WARMC_RA2_NO_EDGEW")) {
+    double tot = 0;
+    for (uint32_t k = 0; k < bb->nsuccs; k++) tot += ra2_edge_w(f, bb, &bb->succs[k]);
+    return tot > 0 ? fq[b] * ra2_edge_w(f, bb, e) / tot : 0;
+  }
+  double w = RA2A_FREQ(fq, f, b), wt = RA2A_FREQ(fq, f, e->target);
+  return wt < w ? wt : w;
+}
+
 /* by weight, then the shorter lives first: of the arguments a merge's param
    is passed, one live everywhere -- the function's own param -- taken in
    first keeps out each of those made on the ways in, which it meets
@@ -373,8 +392,7 @@ static void ra2a_coalesce(Isel *s, const bool *wants, uint32_t *grp, Ref *eu, ui
       if (e->eh) continue;
       Block *tb = &f->blocks[e->target];
       /* an edge's moves run as often as the less often run of its ends */
-      double wt = RA2A_FREQ(fq, f, e->target);
-      double we = wt < w ? wt : w;
+      double we = ra2a_edge_freq(f, fq, bi, si);
       bool split = bb->nsuccs > 1 && tb->npreds > 1;
       for (uint32_t j = 0; j < e->nargs && j < tb->nparams; j++) {
         Ref x = e->args[j], y = tb->params[j];
@@ -823,11 +841,9 @@ static void ra2a_cycles(Isel *s, const bool *wants, uint32_t *grp, int *reg, Ra2
   for (uint32_t oi = 0; oi < f->norder; oi++) {
     uint32_t bi = f->order[oi];
     Block *bb = &f->blocks[bi];
-    double w = RA2A_FREQ(fq, f, bi);
     for (uint32_t si = 0; si < bb->nsuccs; si++) {
       if (bb->succs[si].eh || !bb->succs[si].nargs) continue;
-      double we = RA2A_FREQ(fq, f, bb->succs[si].target);
-      if (we > w) we = w;
+      double we = ra2a_edge_freq(f, fq, bi, si);
       if (ned == caped) { caped = caped ? caped * 2 : 64; ed = xrealloc(ed, caped * sizeof(Ra2Ed)); }
       ed[ned++] = (Ra2Ed){ we, bi, si };
     }
