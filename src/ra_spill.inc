@@ -774,6 +774,39 @@ static Ra2W *ra2_exit_find(Ra2 *R, uint32_t b, Ref x) {
   return NULL;
 }
 
+/* A value the loop headed by h only carries, with no room: stored on the
+   one way into the loop, from the register it holds there, where that
+   runs less often than the value is made -- at its definition, the store
+   would run on every way round of the loop it is made in: gobench/
+   unicode's swapCase stored two on every rune for its search loop, which
+   only the runes past Latin-1 enter.  The reads below find the copy
+   (ra2_mem_find); false where it is not made (WARMC_RA2_NO_ENTRYSPILL). */
+static bool ra2_spill_entry(Ra2 *R, uint32_t h, Ref x) {
+  IrFunc *f = R->f;
+  if (!R->freq || R->rem[x] || R->res[x] || R->mem[x] != REF_NONE || warmc_getenv("WARMC_RA2_NO_ENTRYSPILL"))
+    return false;
+  Block *hb = &f->blocks[h];
+  uint32_t q = UINT32_MAX;
+  for (uint32_t p = 0; p < hb->npreds; p++) {
+    uint32_t pb = hb->preds[p];
+    if (!R->done[pb]) continue;
+    if (q != UINT32_MAX && q != pb) return false;
+    q = pb;
+  }
+  if (q == UINT32_MAX) return false;
+  uint32_t db = f->insts[x].block;
+  if (!(R->freq[q] < R->freq[db])) return false;
+  if (ra2_mem_find(R, x, q) != REF_NONE) return true;
+  Ra2W *w = ra2_exit_find(R, q, x);
+  if (!w) return false;
+  Ref c = ra2_new(R, q, I_COPY, (ValType)f->insts[x].type, &w->ver, 1, 0, 0);
+  R->slotv[c] = 1;
+  ra2_mem_note(R, x, c, q);
+  ra2_insert(f, q, f->blocks[q].ninsts, c);
+  R->nspill++;
+  return true;
+}
+
 /* the argument an edge of block p passes for x, by p's registers at its end */
 static Ref ra2_edge_arg(Ra2 *R, uint32_t p, Ref x) {
   Ra2W *w = ra2_exit_find(R, p, x);
@@ -900,6 +933,18 @@ static int64_t ra2_remw(Ra2 *R, Ref x) {
    loaded its state's address fifty times over (WARMC_RA2_RES_EVICT) */
 static bool ra2_res_last(Ra2 *R, Ref x) {
   return R->res[x] && !warmc_getenv("WARMC_RA2_RES_EVICT");
+}
+
+/* Whether x pushed out here needs no store here: it is in a slot already,
+   or its copy for one is made where x is made, which runs less often than
+   here -- one load to have it back, where a value made on the way round
+   costs a store and a load on every trip (gobench/unicode's swapCase:
+   the invariants its call takes held, the values each rune moves stored
+   and loaded round the call) */
+static bool ra2_clean(Ra2 *R, Ref x) {
+  IrFunc *f = R->f;
+  if (R->mem[x] != REF_NONE || ra2_mem_find(R, x, R->cur_b) != REF_NONE) return true;
+  return R->freq && R->freq[f->insts[x].block] < R->freq[R->cur_b];
 }
 
 static void ra2_room(Ra2 *R, Ra2Set *W, int c, int need, const Ref *keep, uint32_t nkeep) {
@@ -1301,7 +1346,7 @@ static void ra2_block(Ra2 *R, uint32_t b, Ra2Uses *uses, Ref *touched, uint32_t 
       int32_t nu = (int32_t)(ck[i] / 4);
       bool carried = cr[i];
       if (carried && lt_room[c] <= 0 && !param) {
-        ra2_mem(R, x);
+        if (!ra2_spill_entry(R, b, x)) ra2_mem(R, x);
         continue;
       }
       if (lfull[c] && R->rem[x] && !param) continue;
@@ -1448,12 +1493,15 @@ static void ra2_block(Ra2 *R, uint32_t b, Ra2Uses *uses, Ref *touched, uint32_t 
         bool cfirst = !warmc_getenv("WARMC_RA2_CALL_KEEPCONST");
         while (W.n[c] > keep) {
           int vic = -1;
+          bool clfirst = !warmc_getenv("WARMC_RA2_NO_CLEANFIRST");
           for (int k = 0; k < W.n[c]; k++) {
             if (vic < 0) { vic = k; continue; }
             bool sk = ra2_res_last(R, W.w[c][k].v), sv = ra2_res_last(R, W.w[c][vic].v);
             if (sk != sv) { if (sv) vic = k; continue; }
             bool rk = cfirst && R->rem[W.w[c][k].v], rv = cfirst && R->rem[W.w[c][vic].v];
-            if (rk != rv ? rk : W.w[c][k].nu > W.w[c][vic].nu) vic = k;
+            if (rk != rv) { if (rk) vic = k; continue; }
+            bool ck = clfirst && ra2_clean(R, W.w[c][k].v), cv2 = clfirst && ra2_clean(R, W.w[c][vic].v);
+            if (ck != cv2 ? ck : W.w[c][k].nu > W.w[c][vic].nu) vic = k;
           }
           if (vic < 0) break;
           ra2_evict_at(R, W.w[c][vic].v, W.w[c][vic].ver, W.w[c][vic].nu, true);
