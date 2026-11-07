@@ -63,7 +63,9 @@ static void ra2a_scan_block(Isel *s, uint32_t b, uint8_t *live, Ref *lst, uint32
     if (clob) {
       uint64_t ft;
       int64_t fl;
-      bool cold = bb->cold || gc_fastnew_shape(f, u, &ft, &fl);
+      /* (a call on a way hints mark rare as one off them, as the spiller
+         takes it: ra_spill.inc ra2_hot_call) */
+      bool cold = (bb->cold && warmc_getenv("WARMC_RA2_COLD_CSA")) || gc_fastnew_shape(f, u, &ft, &fl);
       uint16_t op = f->insts[u].op;
       bool alloc = op == I_STRUCT_NEW || op == I_ARRAY_NEW || op == I_ARRAY_NEW_SEG;
       for (uint32_t k = 0; k < *nl; k++) {

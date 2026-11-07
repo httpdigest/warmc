@@ -27,9 +27,9 @@
    only carries (a way out of a loop adds RA2_LOOPX to the distance).  At an
    instruction, its operands come in first and, if the registers are full,
    the value used furthest ahead goes; at a call that clobbers the
-   caller-saved registers -- one not on a way branch hints mark rare, nor an
-   allocation's slow path, which the scan saves around (csa) -- no more of
-   them stay than the callee-saved registers hold.  The scan then colours
+   caller-saved registers -- not an allocation's slow path, which the scan
+   saves around (csa) -- no more of them stay than the callee-saved
+   registers hold.  The scan then colours
    what is left, the pressure at most its registers. */
 
 #define RA2_INF (1 << 28)
@@ -975,7 +975,11 @@ static void ra2_room(Ra2 *R, Ra2Set *W, int c, int need, const Ref *keep, uint32
 static bool ra2_hot_call(Ra2 *R, uint32_t b, Ref u) {
   IrFunc *f = R->f;
   if (!inst_clobbers_caller_saved(f, u)) return false;
-  if (f->blocks[b].cold) return false;
+  /* (a call on a way branch hints mark rare too: left to be saved round
+     where it is made (csa), the slow paths luawasm's big functions call
+     into at every table access -- taken more often than the hints say --
+     saved and loaded several values round each; WARMC_RA2_COLD_CSA) */
+  if (f->blocks[b].cold && warmc_getenv("WARMC_RA2_COLD_CSA")) return false;
   uint64_t ft;
   int64_t fl;
   if (gc_fastnew_shape(f, u, &ft, &fl)) return false;
