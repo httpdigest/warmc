@@ -3553,18 +3553,29 @@ static void emit_block(Isel *s, uint32_t bi, uint32_t next_bi) {
          not out to a block and back with a branch of its own: an integer
          printing loop's quotient (asbench/virtual) and a recursive fib's
          counter (gobench/recurse) went out and round on every trip.  Only
-         the likelier way's moves, which run nearly every time. */
-      if ((tn != 0) != (en != 0) && s->lv_in && !warmc_getenv("WARMC_NO_LATCH_HOIST")) {
-        bool mt = tn != 0;
+         the likelier way's moves, which run nearly every time.  A way out
+         with moves of its own keeps them on its edge, where the way round's
+         write no register they read and they make nothing again from
+         registers: sum's loop in cbench/varargs under RA2, a value loaded
+         back on the way out, went out to a move and a branch back on every
+         trip (WARMC_NO_LATCH_BOTH). */
+      bool both = tn && en && !warmc_getenv("WARMC_NO_LATCH_BOTH");
+      if (((tn != 0) != (en != 0) || both) && s->lv_in && !warmc_getenv("WARMC_NO_LATCH_HOIST")) {
+        bool mt = both ? f->blocks[t->target].rpo <= b->rpo : tn != 0;
         Edge *me = mt ? t : e, *oe = mt ? e : t;
-        Move *mm = mt ? tm : em;
-        int mn = mt ? tn : en;
+        Move *mm = mt ? tm : em, *om = mt ? em : tm;
+        int mn = mt ? tn : en, on = mt ? en : tn;
         uint32_t mi = (uint32_t)(me - b->succs), oi = (uint32_t)(oe - b->succs);
         bool ok = ir_succ_score(f, b, mi) >= ir_succ_score(f, b, oi) &&
                   f->blocks[me->target].rpo <= b->rpo;
         for (int i = 0; i < mn && ok; i++) {
-          if (mm[i].remat || IS_SLOT(mm[i].dst) || mm[i].dst < 0) ok = false;
+          if (mm[i].remat || IS_SLOT(mm[i].dst)) ok = false;
           else if (kind != 0 && !mm[i].fp && mm[i].dst == zreg) ok = false;
+        }
+        for (int j = 0; j < on && ok; j++) {
+          if (om[j].remat) ok = false;
+          for (int i = 0; i < mn && ok; i++)
+            if (om[j].src == mm[i].dst && (bool)om[j].fp == (bool)mm[i].fp) ok = false;
         }
         uint32_t ot = oe->target;
         for (uint32_t k = s->lv_in_off[ot]; k < s->lv_in_off[ot + 1] && ok; k++) {
@@ -3584,6 +3595,8 @@ static void emit_block(Isel *s, uint32_t bi, uint32_t next_bi) {
         if (ok) {
           parallel_copy(s, mm, mn);
           if (mt) tn = 0; else en = 0;
+          if (both) g_stats.latch_both++;
+          else g_stats.latch_hoists++;
         }
       }
       bool tmoves = tn != 0, emoves = en != 0;

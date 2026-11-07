@@ -369,7 +369,7 @@ static void print_stats(void) {
           " unr_rej_body=%llu unr_rej_exit=%llu unr_rej_trip=%llu"
           " unr_rej_escape=%llu unr_addr_folded=%llu gc_nullchk=%llu bce_ranges=%llu bce_smeared=%llu bce_versioned=%llu gc_loads_pre=%llu fields_promoted=%llu\n"
           "             slot_tests=%llu slot_nullchks=%llu slot_brs=%llu once_dead=%llu once_dominated=%llu once_looped=%llu\n"
-          "             bit_tests=%llu way_folds=%llu bit_brs=%llu exit_defers=%llu stubs_out=%llu blocks_merged=%llu\n"
+          "             bit_tests=%llu way_folds=%llu bit_brs=%llu exit_defers=%llu stubs_out=%llu latch_hoists=%llu latch_both=%llu blocks_merged=%llu\n"
           "             bound_lens=%llu bound_lens_hoisted=%llu bce_version_sym=%llu gc_nonnull_params=%llu slot_nonnull=%llu gc_nulltraps=%llu\n"
           "             ra2_reloads=%llu ra2_spills=%llu ra2_remats=%llu ra2_params=%llu ra2_fallback=%llu ra2_csa_hot=%llu ra2_callsplits=%llu ra2_whole=%llu ra2_tried=%llu ra2_picked=%llu ra2_recolored=%llu\n",
           (unsigned long long)g_stats.folded, (unsigned long long)g_stats.dce_removed,
@@ -491,6 +491,7 @@ static void print_stats(void) {
           (unsigned long long)g_stats.bit_brs,
           (unsigned long long)g_stats.exit_defers,
           (unsigned long long)g_stats.stubs_out,
+          (unsigned long long)g_stats.latch_hoists, (unsigned long long)g_stats.latch_both,
           (unsigned long long)g_stats.blocks_merged,
           (unsigned long long)g_stats.bound_lens, (unsigned long long)g_stats.bound_lens_hoisted,
           (unsigned long long)g_stats.bce_version_sym,

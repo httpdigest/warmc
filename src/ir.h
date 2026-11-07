@@ -842,6 +842,10 @@ typedef struct {
   /* two-way branches whose taken edge's moves went to a stub out of line,
      the other way falling into the next block (arm64) */
   uint64_t stubs_out;
+  /* latches whose way round's moves went ahead of the branch: of those
+     whose way out moves none, and of those whose way out moves values of
+     its own (arm64 isel_ops.inc T_BRIF) */
+  uint64_t latch_hoists, latch_both;
   /* calls through a class initializer's global pass_once dropped: through a
      dead one, and where the empty function was certain to be there */
   uint64_t once_dead, once_dominated;
