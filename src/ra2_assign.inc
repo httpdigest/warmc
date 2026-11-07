@@ -1554,8 +1554,34 @@ static void ra2_assign(Isel *s) {
           int gp = gpref[RA2A_FIND(u)];
           if (gp >= 0 && own[gp] == REF_NONE) hint = gp;
         }
+        /* Not the register of the param an edge of this block passes
+           another argument to, where that argument is in the register of
+           u's own param on the edge: the edge's moves would make a cycle,
+           three moves through a scratch where a chain is two -- hsbench/
+           fib's frame pointer, moved down a slot on every trip into the
+           register the old one had left (WARMC_RA2_NO_CYCAVOID) */
+        uint64_t cav = 0;
+        if (!warmc_getenv("WARMC_RA2_NO_CYCAVOID"))
+          for (uint32_t si = 0; si < bb->nsuccs; si++) {
+            Edge *ce = &bb->succs[si];
+            if (ce->eh) continue;
+            Block *ctb = &f->blocks[ce->target];
+            for (uint32_t j = 0; j < ce->nargs && j < ctb->nparams; j++) {
+              if (ce->args[j] != u) continue;
+              Ref P = ctb->params[j];
+              int rp = reg[P] >= 0 && reg[P] < 64 ? reg[P] : gpref[RA2A_FIND(P)];
+              if (rp < 0 || rp >= 64) continue;
+              for (uint32_t k = 0; k < ce->nargs && k < ctb->nparams; k++) {
+                Ref w = ce->args[k], Q = ctb->params[k];
+                if (k == j || w >= n || reg[w] != rp || (bool)s->cls[w] != (bool)c) continue;
+                int rq = reg[Q] >= 0 && reg[Q] < 64 ? reg[Q] : gpref[RA2A_FIND(Q)];
+                if (rq >= 0 && rq < 64 && rq != rp) cav |= 1ull << rq;
+              }
+            }
+          }
+        if (hint >= 0 && hint < 64 && ((cav >> hint) & 1)) hint = -1;
         int pick = ra2a_pick(s, u, c, own, pool, np, hint, xhot, xalloc, c ? fclaim : gclaim,
-                             ghot[RA2A_FIND(u)], RA2A_AVOID(u));
+                             ghot[RA2A_FIND(u)], RA2A_AVOID(u) | cav);
         /* none free: the operands read here for the last time leave first,
            as the spiller counted them (ra_spill.inc ra2_block), but the one
            read after the result is written (ra2a_late_read) -- held for the
@@ -1573,7 +1599,7 @@ static void ra2_assign(Isel *s) {
           }
           if (freed >= 0)
             pick = ra2a_pick(s, u, c, own, pool, np, freed, xhot, xalloc, c ? fclaim : gclaim,
-                             ghot[RA2A_FIND(u)], RA2A_AVOID(u));
+                             ghot[RA2A_FIND(u)], RA2A_AVOID(u) | cav);
         }
         if (warmc_getenv("WARMC_RA2_DEBUG_CS") && want_cs && pick >= 0 &&
             !(c ? fpr_is_callee_saved(pick) : gpr_is_callee_saved(pick))) {
