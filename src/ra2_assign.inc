@@ -1532,7 +1532,13 @@ static void ra2_assign(Isel *s) {
       }
       Ref *own = c ? fown : gown;
       int gp = gpref[RA2A_FIND(x)];
-      if (gp >= 0 && own[gp] == REF_NONE) hint = gp;
+      /* (an entry param alone in its group stays in the register it comes
+         in, where that is free: in the plan's, every call moved it --
+         hsbench/rws's block functions, entered all the time, moved their
+         three; WARMC_RA2_NO_ENTRYHINT) */
+      bool keep_abi = b == f->entry && hint >= 0 && hint < 64 && own[hint] == REF_NONE &&
+                      gsize[RA2A_FIND(x)] <= 1 && !warmc_getenv("WARMC_RA2_NO_ENTRYHINT");
+      if (gp >= 0 && own[gp] == REF_NONE && !keep_abi) hint = gp;
       int pick = ra2a_pick(s, x, c, own, c ? FPR_ALLOC : gpool, c ? nfpool : ngall, hint, xhot, xalloc,
                            c ? fclaim : gclaim, ghot[RA2A_FIND(x)], RA2A_AVOID(x));
       if (pick < 0) { reg[x] = SLOT(take_slot(s, x, &slot)); g_stats.ra2_fallback++; continue; }
