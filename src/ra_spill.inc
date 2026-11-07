@@ -958,6 +958,10 @@ static void ra2_room(Ra2 *R, Ra2Set *W, int c, int need, const Ref *keep, uint32
       for (uint32_t j = 0; j < nkeep && !kept; j++) kept = keep[j] == x;
       if (kept) continue;
       int64_t key = (int64_t)W->w[c][k].nu * 2 * ra2_remw(R, x) + (R->rem[x] ? 1 : 0);
+      /* one that needs no store to go (ra2_clean) as if read twice as far
+         on: a load to have it back, where another costs a store and a load
+         (gobench/strbuild, 20% faster; WARMC_RA2_NO_CLEANROOM) */
+      if (!R->rem[x] && ra2_clean(R, x) && !warmc_getenv("WARMC_RA2_NO_CLEANROOM")) key *= 2;
       bool res = ra2_res_last(R, x);
       if (vic < 0 || (bres && !res) || (res == bres && key > best)) { best = key; vic = k; bres = res; }
     }
