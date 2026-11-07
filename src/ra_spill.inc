@@ -1781,6 +1781,17 @@ static void ra2_const_params(Ra2 *R) {
   xfree(isc); xfree(cimm); xfree(cimm2); xfree(rem); xfree(idx); xfree(gnd);
 }
 
+/* A value made again where it is read that its every reader now takes a
+   copy of instead: nothing reads it, and it reads nothing -- kept, it was
+   made where it was first defined into a register no one read, six
+   memory bases a block in stdgo/wordfreq's bufio.Scanner.Scan
+   (WARMC_RA2_KEEP_DEADREM) */
+static bool ra2_dead_rem(Ra2 *R, Ref u) {
+  const Inst *in = &R->f->insts[u];
+  return R->rem[u] && in->nargs == 0 && !warmc_getenv("WARMC_RA2_KEEP_DEADREM") &&
+         (in->op == I_CONST || in->op == I_MEM_BASE || in->op == I_GC_BADMASK || in->op == I_GLOBAL_GET);
+}
+
 static void ra2_trivial_params(Ra2 *R) {
   IrFunc *f = R->f;
   bool changed = true;
@@ -2266,14 +2277,14 @@ static void ra2_spill(Isel *s, const int *gpool, int ngpool) {
       uint32_t m = 0;
       for (uint32_t i = bb->ninsts; i-- > 0;) {
         Ref u = bb->insts[i];
-        bool gone = u < n0 && R.shared[u] && !cnt[u];
+        bool gone = u < n0 && (R.shared[u] || ra2_dead_rem(&R, u)) && !cnt[u];
         if (gone)
           for (uint32_t j = 0; j < f->insts[u].nargs; j++) cnt[ir_args(f, u)[j]]--;
         (void)m;
       }
       for (uint32_t i = 0; i < bb->ninsts; i++) {
         Ref u = bb->insts[i];
-        if (u < n0 && R.shared[u] && !cnt[u]) continue;
+        if (u < n0 && (R.shared[u] || ra2_dead_rem(&R, u)) && !cnt[u]) continue;
         bb->insts[m++] = u;
       }
       bb->ninsts = m;
