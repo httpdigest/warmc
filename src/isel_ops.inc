@@ -164,6 +164,13 @@ static bool flags_only(Isel *s, Ref v) {
 
 static void emit_cmp_chain(Isel *s, Ref v);
 
+/* Whether a move's register and another one are the same: the same number
+   in the same file (a move's fp says which; the integer and vector
+   registers share their numbers) */
+static bool same_reg(int a, bool afp, int b, bool bfp) {
+  return a == b && afp == bfp;
+}
+
 static void emit_compare(Isel *s, Ref v) {
   int kind, sf;
   Ref ra, rb;
@@ -3555,10 +3562,13 @@ static void emit_block(Isel *s, uint32_t bi, uint32_t next_bi) {
          counter (gobench/recurse) went out and round on every trip.  Only
          the likelier way's moves, which run nearly every time.  A way out
          with moves of its own keeps them on its edge, where the way round's
-         write no register they read and they make nothing again from
-         registers: sum's loop in cbench/varargs under RA2, a value loaded
-         back on the way out, went out to a move and a branch back on every
-         trip (WARMC_NO_LATCH_BOTH). */
+         write no register they read: sum's loop in cbench/varargs under
+         RA2, a value loaded back on the way out, went out to a move and a
+         branch back on every trip (WARMC_NO_LATCH_BOTH).  A value the way
+         out makes again -- a constant, the memory base plus an offset, an
+         immutable global, the barrier's mask -- reads no register but the
+         pinned ones, which no move writes (rsbench/strparse's digit loop
+         under RA2, a constant made on its way out). */
       bool both = tn && en && !warmc_getenv("WARMC_NO_LATCH_BOTH");
       if (((tn != 0) != (en != 0) || both) && s->lv_in && !warmc_getenv("WARMC_NO_LATCH_HOIST")) {
         bool mt = both ? f->blocks[t->target].rpo <= b->rpo : tn != 0;
@@ -3573,9 +3583,8 @@ static void emit_block(Isel *s, uint32_t bi, uint32_t next_bi) {
           else if (kind != 0 && !mm[i].fp && mm[i].dst == zreg) ok = false;
         }
         for (int j = 0; j < on && ok; j++) {
-          if (om[j].remat) ok = false;
           for (int i = 0; i < mn && ok; i++)
-            if (om[j].src == mm[i].dst && (bool)om[j].fp == (bool)mm[i].fp) ok = false;
+            if (same_reg(om[j].src, om[j].fp, mm[i].dst, mm[i].fp)) ok = false;
         }
         uint32_t ot = oe->target;
         for (uint32_t k = s->lv_in_off[ot]; k < s->lv_in_off[ot + 1] && ok; k++) {
@@ -3583,14 +3592,22 @@ static void emit_block(Isel *s, uint32_t bi, uint32_t next_bi) {
           int l = s->loc[x];
           if (l == LOC_NONE || IS_SLOT(l)) continue;
           for (int i = 0; i < mn && ok; i++)
-            if (mm[i].dst == l && (bool)mm[i].fp == (bool)is_fp_value(f, x)) ok = false;
+            if (same_reg(mm[i].dst, mm[i].fp, l, is_fp_value(f, x))) ok = false;
         }
+        /* -- a param's, but where the way out's own moves write it after
+           (rsbench/strparse's digit loop under RA2, its way out loading back
+           the register the way round moves into; WARMC_NO_LATCH_OUTDST) */
         const Block *otb = &f->blocks[ot];
+        bool outdst = !warmc_getenv("WARMC_NO_LATCH_OUTDST");
         for (uint32_t k = 0; k < otb->nparams && ok; k++) {
           int l = s->loc[otb->params[k]];
           if (l == LOC_NONE || IS_SLOT(l)) continue;
+          bool fp = is_fp_value(f, otb->params[k]);
+          bool rewritten = false;
+          for (int j = 0; j < on && outdst && !rewritten; j++) rewritten = same_reg(om[j].dst, om[j].fp, l, fp);
+          if (rewritten) continue;
           for (int i = 0; i < mn && ok; i++)
-            if (mm[i].dst == l && (bool)mm[i].fp == (bool)is_fp_value(f, otb->params[k])) ok = false;
+            if (same_reg(mm[i].dst, mm[i].fp, l, fp)) ok = false;
         }
         if (ok) {
           parallel_copy(s, mm, mn);

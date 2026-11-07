@@ -8,12 +8,14 @@
 ;; keeps them on its edge (latch_both): $both's way out moves m into the
 ;; register of the merge it shares with the test ahead of the loop, its way
 ;; round p + 1 into p's -- and $fout's a double, from the register d0 where
-;; the way round writes x0: a register of the other file.  Not where the way
-;; round writes a register the way out's moves read: $clash's way out moves
-;; p as it was to the merge's register, from the one the way round puts
-;; p + 1 in (cbench/varargs' sum loop under RA2, a value loaded back on the
-;; way out, went out to a move and a branch back on every trip); nor where
-;; the way out makes a constant again ($zout's 0).  Only a way back into a
+;; the way round writes x0: a register of the other file; $zout's way out
+;; makes the constant 0 again, which reads no register; $redo's way round
+;; writes the register of a param of the merge, which the way out's own
+;; moves write after it.  Not where the way round writes a register the
+;; way out's moves read: $clash's way out moves p as it was to the merge's
+;; register, from the one the way round puts p + 1 in (cbench/varargs' sum
+;; loop under RA2, a value loaded back on the way out, went out to a move
+;; and a branch back on every trip).  Only a way back into a
 ;; loop, not a branch forward ($fwd's to the merge its arm meets); only the
 ;; likelier way ($cont's inner latch, whose way back into the outer loop is
 ;; less likely than its way round the inner one); no constant made again
@@ -21,7 +23,7 @@
 ;; i + 1, more values round the loop than the registers hold).  The calls through the
 ;; table keep $g and $gf out of line, their arguments in their registers.
 ;;
-;; stats -O2 a64: latch_hoists=1 latch_both=2
+;; stats -O2 a64: latch_hoists=1 latch_both=4
 ;; shape: one \sb\s=0
 ;; shape: kept \sb\s=1
 ;; shape: both \sb\s=0
@@ -54,6 +56,9 @@
 ;; run: fout 0 5 => i32:-7
 ;; run: fout 10 5 => i32:-11
 ;; run: fout 30 2 => i32:-11
+;; run: redo 0 => i32:99000
+;; run: redo 10 => i32:13986
+;; run: redo 30 => i32:54945
 ;; run: cont 1 => i32:0
 ;; run: cont 4 => i32:45
 ;; run: cont 9 => i32:1360
@@ -154,6 +159,21 @@
           (br $l))
         (unreachable))
       (i32.load (i32.const 4))))
+  ;; g(n ? s : 99, s, 0), s the first sum of squares past n (0 for n = 0)
+  (func $redo (export "redo") (param $n i32) (result i32)
+    (local $p i32) (local $q i32) (local $s i32)
+    (call_indirect (type $t)
+      (block $out (result i32)
+        (drop (br_if $out (i32.const 99) (i32.eqz (local.get $n))))
+        (loop $l
+          (local.set $q (i32.add (local.get $p) (i32.const 1)))
+          (local.set $s (i32.add (local.get $s) (i32.mul (local.get $p) (local.get $p))))
+          (local.set $p (local.get $q))
+          (drop (br_if $out (local.get $s) (i32.gt_u (local.get $s) (local.get $n))))
+          (br $l))
+        (unreachable))
+      (local.get $s) (i32.const 0)
+      (i32.load (i32.const 0))))
   ;; a + ab: the arm stores b and subtracts what is at 12, nothing
   (func $fwd (export "fwd") (param $a i32) (param $b i32) (result i32)
     (i32.add (local.get $a)

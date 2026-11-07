@@ -23,16 +23,17 @@ M = {
  'branch_reg': (IO, [('          else if (kind != 0 && !mm[i].fp && mm[i].dst == zreg) ok = false;\n        }\n        for (int j = 0; j < on && ok; j++) {',
                       '        }\n        for (int j = 0; j < on && ok; j++) {')]),
  # what the way out moves
- 'out_remat': (IO, [('          if (om[j].remat) ok = false;', '')]),
- 'out_reads': (IO, [('            if (om[j].src == mm[i].dst && (bool)om[j].fp == (bool)mm[i].fp) ok = false;',
+ 'out_reads': (IO, [('            if (same_reg(om[j].src, om[j].fp, mm[i].dst, mm[i].fp)) ok = false;',
                      '            if (0) ok = false;')]),
- 'out_class': (IO, [('            if (om[j].src == mm[i].dst && (bool)om[j].fp == (bool)mm[i].fp) ok = false;',
-                     '            if (om[j].src == mm[i].dst) ok = false;')]),
+ # one register file for the other
+ 'reg_class': (IO, [('  return a == b && afp == bfp;', '  return a == b;')]),
  # what the way out keeps
- 'out_live': (IO, [('            if (mm[i].dst == l && (bool)mm[i].fp == (bool)is_fp_value(f, x)) ok = false;',
+ 'out_live': (IO, [('            if (same_reg(mm[i].dst, mm[i].fp, l, is_fp_value(f, x))) ok = false;',
                     '            if (0) ok = false;')]),
- 'out_params': (IO, [('            if (mm[i].dst == l && (bool)mm[i].fp == (bool)is_fp_value(f, otb->params[k])) ok = false;',
+ 'out_params': (IO, [('            if (same_reg(mm[i].dst, mm[i].fp, l, fp)) ok = false;',
                       '            if (0) ok = false;')]),
+ 'out_rewritten': (IO, [('          for (int j = 0; j < on && outdst && !rewritten; j++) rewritten = same_reg(om[j].dst, om[j].fp, l, fp);',
+                         '')]),
 }
 EQUIVALENT = {}
 SUITES = (('optcases', ['python3', 'test/run_optcases.py'], {}),
