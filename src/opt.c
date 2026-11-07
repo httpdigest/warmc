@@ -14792,6 +14792,9 @@ static bool rp_num_le_tgt(RP *p, const RCtx *c, int64_t v, const RTgt *t, int64_
   }
 }
 
+/* (the facts rp_len_ge looks through for a bound that covers a length) */
+#define RP_COVSCAN 256
+
 /* Is the length of t's array at least m? */
 static bool rp_len_ge(RP *p, const RCtx *c, const RTgt *t, int64_t m, int d) {
   if (m <= 0) return true;
@@ -14809,6 +14812,36 @@ static bool rp_len_ge(RP *p, const RCtx *c, const RTgt *t, int64_t m, int d) {
       const RFact *q = fv[j];
       if (q->rel == RF_LENOF && rp_ge(p, c, q->b, m, d - 1)) return true;
       if (q->rel == RF_ACCO && rp_ge(p, c, q->b, m - 1, d - 1)) return true;
+    }
+  }
+  /* a bound at most the array's length (gc_len_covers: luawasm's min of a
+     table's border and its array's), which a dominating test says is at
+     least m: so is the length -- a constant index, nbody_arr's bj[3],
+     whose test is of the bound, not of the index (WARMC_NO_BCE_COVLO) */
+  static _Atomic int covlo = -1;
+  int cl = atomic_load_explicit(&covlo, memory_order_relaxed);
+  if (cl < 0) {
+    cl = warmc_getenv("WARMC_NO_BCE_COVLO") == NULL;
+    atomic_store_explicit(&covlo, cl, memory_order_relaxed);
+  }
+  if (cl) {
+    uint32_t lo = p->nfs > RP_COVSCAN ? p->nfs - RP_COVSCAN : 0;
+    for (uint32_t i = p->nfs; i-- > lo;) {
+      const RFact *q = &p->fs[i];
+      if (q->b != REF_NONE || q->off != 0) continue;
+      /* (a bound not 0 -- an index of 0's test, k = 1 -- is at least 1,
+         where it is no negative) */
+      bool nz = q->rel == RF_NE && q->k == 0 && m <= 1;
+      if (!nz && (q->k < m || (q->rel != RF_UGE && q->rel != RF_GE))) continue;
+      if (!rp_valid(p, &p->fs[i], c)) continue;
+      Ref L = ir_resolve(f, q->a);
+      if (f->insts[L].op == I_EXTENDU && f->insts[L].nargs == 1) L = ir_resolve(f, ir_args(f, L)[0]);
+      if (nz && !rp_ge(p, c, L, 0, d - 1)) continue;
+      for (int s = 0; s < 2; s++) {
+        Ref o = s ? t->pr : t->obj;
+        if (s && o == t->obj) break;
+        if (gc_len_covers(f, L, o, gc_array_len_value(f, o), 2)) return true;
+      }
     }
   }
   return false;
@@ -27903,6 +27936,43 @@ static bool pass_fma(IrFunc *f) {
    at the calls an allocation leaves by. */
 #define OPT_INLINE_ROUNDS 4
 
+/* A float kept in an array of i64s, the bits of which a reinterpret gives:
+   loaded into a float register and stored from one, where luawasm's payload
+   array (I64s) holds a float -- an i64 load and an fmov were two
+   instructions at every float element read, an fmov and a store at every
+   write (WARMC_NO_FPELEM).  (GCF_SIZE is the element size's log2.) */
+static bool pass_fp_elems(IrFunc *f) {
+  uint32_t *uses = count_uses(f);
+  bool changed = false;
+  for (uint32_t oi = 0; oi < f->norder; oi++) {
+    Block *b = &f->blocks[f->order[oi]];
+    for (uint32_t i = 0; i < b->ninsts; i++) {
+      Ref v = b->insts[i];
+      Inst *in = &f->insts[v];
+      if (in->op == I_REINTERPRET && in->type == VT_F64 && (ValType)in->imm == VT_I64 && in->nargs == 1) {
+        Ref g = ir_resolve(f, ir_args(f, v)[0]);
+        Inst *gi = &f->insts[g];
+        if (gi->op != I_ARRAY_GET || gi->type != VT_I64 || GCF_SIZE(gi->imm2) != 3 || (gi->imm2 & GCF_SIGNED) ||
+            uses[g] != 1)
+          continue;
+        gi->type = VT_F64;
+        in->op = I_COPY;
+        in->imm = 0;
+        changed = true;
+      } else if (in->op == I_ARRAY_SET && in->nargs >= 3 && GCF_SIZE(in->imm2) == 3) {
+        Ref *a = ir_args(f, v);
+        Ref y = ir_resolve(f, a[2]);
+        const Inst *yi = &f->insts[y];
+        if (yi->op != I_REINTERPRET || yi->type != VT_I64 || (ValType)yi->imm != VT_F64 || yi->nargs != 1) continue;
+        a[2] = ir_args(f, y)[0];
+        changed = true;
+      }
+    }
+  }
+  xfree(uses);
+  return changed;
+}
+
 /* pass_devirt, then pass_once */
 static bool devirt_round(IrFunc *f, const OptOpts *o) {
   bool changed = o->devirt && TP("devirt", pass_devirt(f, o));
@@ -28381,6 +28451,7 @@ void ir_optimize(IrFunc *f, const OptOpts *o) {
     ir_order(f);
   }
   if (o->fma && TP("fma", pass_fma(f)) && o->dce) pass_dce(f);
+  if (!warmc_getenv("WARMC_NO_FPELEM") && TP("fp_elems", pass_fp_elems(f)) && o->dce) pass_dce(f);
   if (o->wrap_params) TP("wrap_params", pass_wrap_params(f));
   if (o->bce) TP("bound_lens", pass_bound_lens(f));
   if (o->print_ir) ir_print(f, "optimised");
