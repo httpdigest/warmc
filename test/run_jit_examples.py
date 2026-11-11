@@ -32,6 +32,11 @@ EX = os.path.join(ROOT, "example", "jit")
 WORK = os.path.join(BUILD, "jit-examples")
 GUEST = os.path.join(EX, "guest.wat")
 TIMEOUT = float(os.environ.get("WARMC_RUN_TIMEOUT", "300"))
+# A host's build has four times a run's time: it is its language's whole
+# toolchain, started cold beside every other row of the check -- on a
+# three-core runner `zig build` of the Zig host, which compiles Zig's own
+# library first, went past the 600 s a run has, night after night.
+BUILD_TIMEOUT = 4 * TIMEOUT
 WINDOWS = os.name == "nt" or platform.system().startswith(("MINGW", "MSYS", "CYGWIN"))
 
 
@@ -185,12 +190,21 @@ def main():
         cwd = os.path.join(EX, HOSTS[lang][1]) if HOSTS[lang][1] else ROOT
         bad = None
         for cmd in build:
-            r = sh(cmd, cwd=cwd)
+            try:
+                r = sh(cmd, cwd=cwd, timeout=BUILD_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                # (said as a failure of this host: the others are still run)
+                bad = "does not build in %g s: %s" % (BUILD_TIMEOUT, " ".join(cmd)[:200])
+                break
             if r.returncode:
                 bad = "does not build: %s" % (r.stdout + r.stderr).strip()[-600:]
                 break
         for veneers in ([False, True] if not bad else []):
-            r = sh(run, cwd=ROOT, env={"WARMC_JIT_VENEERS": "1"} if veneers else {})
+            try:
+                r = sh(run, cwd=ROOT, env={"WARMC_JIT_VENEERS": "1"} if veneers else {})
+            except subprocess.TimeoutExpired:
+                bad = "%sdoes not end in %g s" % ("with veneers, " if veneers else "", TIMEOUT)
+                break
             got = r.stdout.replace("\r\n", "\n")
             if r.returncode or got != want:
                 bad = "%sexits %d, prints:\n%s%s" % ("with veneers, " if veneers else "", r.returncode,
