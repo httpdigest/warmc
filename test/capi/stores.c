@@ -296,6 +296,8 @@ typedef struct {
    slept ran out after ten thousand of them shared among the waiters, 70 ms
    with 141 waiting, on a runner that had not started the rest by then. */
 static atomic_llong rendezvous_t0;
+/* the threads whose stores are made, about to call into wasm (one_round) */
+static atomic_int at_door;
 static long long mono_ms(void) {
   struct timespec t;
   clock_gettime(CLOCK_MONOTONIC, &t);
@@ -410,6 +412,15 @@ static void one_round(int tid, int round) {
   ctx.own_inc = export_func(&ex, mw, "inc");
 
   if (round == 0) {
+    /* Every thread at the door before any goes in: the rendezvous's ten
+       seconds are for being in wasm together, not for making two stores
+       and their instances first -- on a Windows runner 88 of the 200 had
+       theirs made ten seconds after the first, night after night.  Two
+       minutes for that, so that a thread whose stores never come does not
+       hold the rest for ever. */
+    atomic_fetch_add(&at_door, 1);
+    for (long long t0 = mono_ms(); atomic_load(&at_door) < nthreads && mono_ms() - t0 < 120000;)
+      nap_ms(1);
     wasm_val_t a = WASM_I32_VAL(tid);
     if (call(export_func(&ex, mw, "rendezvous"), &a, 1, &r, msg, sizeof msg) || r.of.i32 != 1)
       fail(tid, "not every thread was in wasm at once%s (%lld were)", "",
