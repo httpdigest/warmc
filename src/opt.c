@@ -7164,6 +7164,7 @@ static void kt_way_d(IrFunc *f, uint32_t p, uint32_t s, Ref x, uint64_t mask, ui
    together. */
 
 #define BF_WALKS 4096
+#define BF_SEL_WAYS 8
 #define BF_BLOOM 4096
 
 /* the bits some value of r has set, and those all of them have */
@@ -7364,6 +7365,16 @@ static bool pass_bit_facts(IrFunc *f) {
     typedef struct { Ref v, to; uint64_t k; } BfFold;
     BfFold *fl = NULL;
     uint32_t nfl = 0, cfl = 0, walks = 0;
+    /* a select each way in decides: which operand each edge hands on */
+    typedef struct {
+      Ref v;
+      uint32_t bi, ne, q[BF_SEL_WAYS], s[BF_SEL_WAYS];
+      uint8_t take[BF_SEL_WAYS];
+      bool param;
+    } BfSel;
+    BfSel *sl = NULL;
+    uint32_t nsl = 0, csl = 0;
+    bool sels = !warmc_getenv("WARMC_NO_WAY_SELECTS");
     KWay *kw = any ? xmalloc(sizeof *kw) : NULL;
     Ref lx = REF_NONE;
     uint32_t lb = UINT32_MAX;
@@ -7375,6 +7386,54 @@ static bool pass_bit_facts(IrFunc *f) {
         Ref v = f->blocks[bi].insts[i];
         const Inst *in = &f->insts[v];
         uint16_t op = in->op;
+        if (op == I_SELECT && in->nargs == 3 && sels) {
+          const Ref *sa = ir_args(f, v);
+          Ref x = sa[2];
+          if ((ValType)f->insts[x].type != VT_I32 || f->insts[x].op == I_CONST || x >= n1) continue;
+          if (!tested[x] && (f->insts[x].op == I_PARAM || !bloom[bf_key(f, x)])) continue;
+          BfSel d;
+          d.v = v; d.bi = bi; d.ne = 0;
+          bool ok = true, differ = false;
+          const Block *yb = &f->blocks[bi];
+          for (uint32_t pk = 0; pk < yb->npreds && ok; pk++) {
+            uint32_t q = yb->preds[pk];
+            bool seen = false;
+            for (uint32_t pj = 0; pj < pk; pj++) seen |= yb->preds[pj] == q;
+            if (seen) continue;
+            if (q >= f->nblocks || !f->blocks[q].reachable) { ok = false; break; }
+            for (uint32_t s = 0; s < f->blocks[q].nsuccs && ok; s++) {
+              if (f->blocks[q].succs[s].target != bi) continue;
+              if (d.ne == BF_SEL_WAYS || walks >= BF_WALKS) { ok = false; break; }
+              walks++;
+              KSet e;
+              kw->f = f;
+              kw->x = x;
+              kw->mask = 0xffffffffu;
+              kw->def = f->insts[x].block;
+              kw->left = KW_BUDGET;
+              kw->nsets = 0;
+              memset(kw->key, 0, sizeof kw->key);
+              kw_edge(kw, q, s, &e);
+              /* no value: a way no run takes, which hands on either */
+              bool zero = e.n && !e.lo[0], only = e.n == 1 && !e.hi[0];
+              if (zero && !only) { ok = false; break; }
+              d.q[d.ne] = q; d.s[d.ne] = s; d.take[d.ne] = zero ? 1 : 0;
+              differ |= d.take[d.ne] != d.take[0];
+              d.ne++;
+            }
+          }
+          if (!ok || !d.ne) continue;
+          /* The ways agree: the operand they pick.  Each its own: a
+             parameter, where what the select picks is made above the block
+             or is a constant, and so is there on every edge in. */
+          d.param = differ;
+          for (int k = 0; k < 2 && differ; k++)
+            ok &= f->insts[sa[k]].block != bi || f->insts[sa[k]].op == I_CONST;
+          if (!ok) continue;
+          if (nsl == csl) { csl = csl ? csl * 2 : 8; sl = xrealloc(sl, csl * sizeof *sl); }
+          sl[nsl++] = d;
+          continue;
+        }
         if (!bf_int_op(op, in->nargs)) continue;
         const Ref *a = ir_args(f, v);
         Ref x = a[0];
@@ -7497,10 +7556,39 @@ static bool pass_bit_facts(IrFunc *f) {
       g_stats.way_folds++;
       changed = true;
     }
+    /* A select whose condition the ways into its block decide is what they
+       picked: the one operand where they agree, and where each picks its
+       own a parameter of the block, handed the one or the other on each
+       edge.  musl's strstr leaves its loop two ways, at the string's end
+       and at a match, into `*h ? h - 1 : 0`: the byte each way has tested
+       is read no more, and the loop builds its next key in the byte's own
+       register (WARMC_NO_WAY_SELECTS). */
+    for (uint32_t j = 0; j < nsl; j++) {
+      const BfSel *d = &sl[j];
+      Inst *in = &f->insts[d->v];
+      if (in->op != I_SELECT) continue;
+      Ref arm[2] = { ir_args(f, d->v)[0], ir_args(f, d->v)[1] };
+      Ref to = arm[d->take[0]];
+      if (d->param) {
+        to = ir_add_param(f, d->bi, (ValType)in->type);
+        for (uint32_t e = 0; e < d->ne; e++) {
+          Ref g = arm[d->take[e]];
+          /* a constant of the block's own is one of each way's */
+          if (f->insts[g].block == d->bi)
+            g = ir_emit(f, d->q[e], I_CONST, (ValType)f->insts[g].type, NULL, 0, f->insts[g].imm, 0);
+          edge_push_arg_at(f, d->q[e], d->s[e], g);
+        }
+      }
+      ir_replace(f, d->v, to);
+      ir_make_nop(&f->insts[d->v]);
+      g_stats.way_selects++;
+      changed = true;
+    }
+    xfree(sl);
     xfree(fl);
     xfree(tested);
     xfree(bloom);
-    if (nfl) ir_apply_subst(f);
+    if (nfl || nsl) ir_apply_subst(f);
   }
   return changed;
 }
