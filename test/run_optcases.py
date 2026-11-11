@@ -56,6 +56,11 @@ level is wrong, -O0 included; the module is compiled at -O0, -O1, -O2 and
 -O3 and each call's output must be it.  A pass the module was written for
 is named in its header.  wasm-tools assembles the modules, since several
 use garbage collection, which wabt does not read.
+
+  python3 test/run_optcases.py [MODULE ...]
+
+runs them all, or the modules named (test/cases_opt/MODULE.wat) alone:
+what a spec of mutants gives for its transform's own cases.
 """
 import concurrent.futures
 import glob
@@ -144,10 +149,12 @@ def shapes(path):
     return out
 
 
-def shape_fails(name, dump, want):
+def shape_fails(name, dump, want, alone=False):
     """Each (function, pattern, count, late) of want against the disassembly,
-    where the case's functions are named CASE.FUNCTION"""
+    where the case's functions are named CASE.FUNCTION -- or FUNCTION, in a
+    program of the one module (alone)"""
     fails = []
+    pre = "" if alone else name + "."
 
     def code(sym):
         body = re.search(r"<_?%s>:\n(.*?)(?:\n\n|\Z)" % re.escape(sym), dump, re.S)
@@ -161,14 +168,14 @@ def shape_fails(name, dump, want):
         return lines
 
     for fn, pat, n, late in want:
-        lines = code("%s.%s" % (name, fn))
+        lines = code(pre + fn)
         if lines is None:
             fails.append("%s -O2: no function %s in the code" % (name, fn))
             continue
         # a shrink-wrapped function (src/codegen.c sw_start) is a start, which
         # runs again in its full body, and the full body: the function as it
         # is compiled whole, which the shapes are of
-        full = code("%s.%s$full" % (name, fn))
+        full = code(pre + fn + "$full")
         if full is not None:
             lines = full
         if late == "late":
@@ -279,7 +286,7 @@ def check_all(cases, build, warmc, target, run, tmp):
             if exe is None:
                 continue
             for name, c in names:
-                runs += [(exe, level, name, e, a, x, False) for e, a, x in calls(c, level)]
+                runs += [(exe, level, name, e, a, x, len(names) == 1) for e, a, x in calls(c, level)]
         # a module's own flag sets, each a program of the module alone
         for (name, c), wasm in zip(names, wasms):
             for n, flags in enumerate(flag_sets(c)):
@@ -301,7 +308,7 @@ def check_all(cases, build, warmc, target, run, tmp):
         for name, c in names:
             want = shapes(c)
             if want:
-                fails += shape_fails(name, dump, want)
+                fails += shape_fails(name, dump, want, len(names) == 1)
     return fails
 
 
@@ -313,6 +320,15 @@ def main():
     target = gen_gosp.target_flags(build)
     run = os.environ.get("WARMC_RUN", "").split()
     cases = sorted(glob.glob(os.path.join("test", "cases_opt", "*.wat")))
+    # the modules named alone, for a mutant's run, which what the others say
+    # is not to kill
+    names = sys.argv[1:]
+    if names:
+        have = {os.path.splitext(os.path.basename(c))[0] for c in cases}
+        if set(names) - have:
+            print("FAIL[optcases]: no test/cases_opt/%s.wat" % sorted(set(names) - have)[0])
+            return 1
+        cases = [c for c in cases if os.path.splitext(os.path.basename(c))[0] in names]
     fails = []
     with tempfile.TemporaryDirectory() as tmp:
         fails = check_all(cases, build, warmc, target, run, tmp)

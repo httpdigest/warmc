@@ -2579,14 +2579,16 @@ Most of the suite is **differential**. warmc's output is compared with:
   alone, every call checked again (`;; flags:`);
   `test/cases_opt/trunc_exact.wat` is made by `test/gen_fexact.py`,
   `addchain.wat` by `test/gen_addchain.py`, `slp.wat` by `test/gen_slp.py`,
-  `vec_iv.wat` by `test/gen_veciv.py`
+  `vec_iv.wat` by `test/gen_veciv.py`, `arr_bias.wat` by
+  `test/gen_arr_bias.py`
 - mutants of a transform -- a test it makes dropped or loosened, a bound
   moved, an operand swapped -- each of which some test must tell from the
   transform, or the spec names it equivalent and why (`make
   check-mutants`: `test/mutate.py`, one spec per transform in
   `test/mutants`); each mutant builds only warmc, in a worker's own copy of
   `src/` under `build/mut`, and runs the suites its spec names until one
-  fails
+  fails -- of a transform with cases of its own, those modules
+  alone (`test/run_optcases.py MODULE ...`)
 - exact arithmetic, for every division's magic numbers (`test/magic.py`)
 - the module itself, for the custom sections each linked image carries, read
   back from Mach-O, ELF and PE (`test/check_macho.py`, `check_elf.py`,
