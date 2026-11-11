@@ -52,6 +52,15 @@ c2619cb73ff1d296edd0644d92ae8ed94039bc1bdd43282398835b7f88134fb6  https://github
 f7e243dff54d60bcc576e94d6166b69f410f2500ae4a9ceef34315be10e77971  https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-34/wasi-sdk-34.0-arm64-linux.tar.gz
 b761e3a0721dbae9c09a0059e5fdb2bf917d1b4a8a7b430fb3b5aafb0984b2c4  https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-34/wasi-sdk-34.0-x86_64-linux.tar.gz
 
+# make engines: WasmEdge, Wasmer, and WAMR -- its source, its compiler as
+# released for x86-64 macOS, and the zstd that compiler loads (checked
+# against the .sha256 its release carries)
+32165a058abee03718f8fa3b7ffd64e5133443486f54a5b79221910fb1ae0628  https://github.com/WasmEdge/WasmEdge/releases/download/0.18.1/WasmEdge-0.18.1-darwin_arm64.tar.gz
+fd6526fdce3f8c68a8c3139e9b0e438991d04bafda3d0f091bf98c1600ea0401  https://github.com/wasmerio/wasmer/releases/download/v7.5.0/wasmer-darwin-arm64.tar.gz
+1ab09d51099f276ca4a1d6629f6b589aab2bd0caa01445e05031a4bed22c199b  https://github.com/bytecodealliance/wasm-micro-runtime/archive/refs/tags/WAMR-2.4.5.tar.gz
+419d41b8b9b29bb8bb0e86e0409725abab81aa693daa479e502fadd0c206db69  https://github.com/bytecodealliance/wasm-micro-runtime/releases/download/WAMR-2.4.5/wamrc-2.4.5-x86_64-macos-15-intel.tar.gz
+eb33e51f49a15e023950cd7825ca74a4a2b43db8354825ac24fc1b7ee09e6fa3  https://github.com/facebook/zstd/releases/download/v1.5.7/zstd-1.5.7.tar.gz
+
 # make simde
 ed2a3268658f2f2a9b5367628a85ccd4cf9516460ed8604eed369653d49b25fb  https://github.com/simd-everywhere/simde/archive/refs/tags/v0.8.2.tar.gz
 

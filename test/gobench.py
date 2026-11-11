@@ -885,6 +885,110 @@ def run_once(cmd):
     p.returncode = os.waitstatus_to_exitcode(status)
     return dt, ru.ru_maxrss * RSS_UNIT
 
+# ---- the other engines -------------------------------------------------------
+#
+# WasmEdge, Wasmer and WAMR beside wasmtime (--engines; `make engines` fetches
+# them), each in its ahead-of-time mode and at its own defaults, as wasmtime
+# is run at its: the engine's compiler makes the module's code once, and what
+# is timed is the engine loading and running that.  Three things each of
+# which cost a wrong figure before it was known:
+#
+#   * WasmEdge runs its interpreter unless told --run-mode aot, the compiled
+#     code beside the module or not: a hundred times the time.
+#   * WAMR's compiler has to be told that x18 is the platform's
+#     (+reserve-x18): macOS overwrites it, and code that kept a value there
+#     hung or summed wrong.  wamrc is the x86-64 release, which compiles for
+#     any target, so the target and its CPU are named too.
+#   * An engine's stack for compiled code is smaller than a thread's (512 KiB
+#     in WasmEdge, 64 KiB in WAMR); the kernels that recurse get 8 MiB, as a
+#     thread has.
+#
+# An engine times the kernels it can: WAMR's compiler loads no module with an
+# exception tag, Wasmer none with a GC type.
+ENGINES_DIR = os.path.join(ROOT, BUILD, "tools", "engines")
+
+def _eng(*path):
+    return os.path.join(ENGINES_DIR, *path)
+
+ENGINES = {
+    # name: (what says its version, what compiles w to o, what runs o, o's suffix)
+    "wamr": (lambda: [_eng("wamrc", "wamrc"), "--version"],
+             lambda w, o: [_eng("wamrc", "wamrc"), "--target=aarch64v8", "--cpu=apple-m3",
+                           "--cpu-features=+reserve-x18", "--enable-tail-call", "-o", o, w],
+             lambda o: [_eng("iwasm", "iwasm"), "--stack-size=8388608", o], ".aot"),
+    "wasmedge": (lambda: [_eng("wasmedge", "bin", "wasmedge"), "--version"],
+                 lambda w, o: [_eng("wasmedge", "bin", "wasmedge"), "compile", w, o],
+                 lambda o: [_eng("wasmedge", "bin", "wasmedge"), "--run-mode", "aot",
+                            "--stack-size-limit", "8388608", o], ".wasm"),
+    "wasmer": (lambda: [_eng("wasmer", "bin", "wasmer"), "--version"],
+               lambda w, o: [_eng("wasmer", "bin", "wasmer"), "compile", "--llvm", w, "-o", o],
+               lambda o: [_eng("wasmer", "bin", "wasmer"), "run", o], ".wasmu"),
+}
+
+def engines_installed():
+    return [e for e in ENGINES if os.path.exists(ENGINES[e][0]()[0])]
+
+def engine_versions(engines):
+    """What each engine says its version is, without the path it was run by"""
+    return {e: re.sub(r"\S*/", "", first_line(ENGINES[e][0]()) or "") or None for e in engines}
+
+def engine_prepare(engines, names, wasm, exes, base):
+    """What runs each kernel under each engine: {engine: {kernel: command}}.
+
+    The engine compiles a module once -- its code is kept beside the corpus's
+    modules, under the engine's version, until the module is newer -- and runs
+    it once here: a kernel is the engine's to time where that compiles, exits
+    as warmc's program does and prints what it prints.  The ones it cannot
+    are named, with what the first of them said; an engine that cannot run
+    the empty program has no floor and times nothing.
+    """
+    versions = engine_versions(engines)
+    ref = {}
+    for k in ["empty"] + names:
+        r = subprocess.run([exes[(k, base)]], capture_output=True, env=RUNENV)
+        ref[k] = (r.returncode, r.stdout)
+
+    def one(job):
+        e, k = job
+        _, comp, run, ext = ENGINES[e]
+        tag = "".join(c if c.isalnum() or c in ".-" else "_" for c in versions[e] or "unknown")
+        d = os.path.join(ROOT, BUILD, CORPUS, "engines", "%s-%s" % (e, tag))
+        os.makedirs(d, exist_ok=True)
+        o = os.path.join(d, k + ext)
+        try:
+            if not os.path.exists(o) or os.path.getmtime(o) < os.path.getmtime(wasm[k]):
+                r = subprocess.run(comp(wasm[k], o), capture_output=True, text=True,
+                                   errors="replace", timeout=1800)
+                if r.returncode != 0 or not os.path.exists(o):
+                    said = (r.stderr.strip() or r.stdout.strip()).splitlines()
+                    return e, k, None, "does not compile: " + (said[-1] if said else "exit %d" % r.returncode)
+            r = subprocess.run(run(o), capture_output=True, env=RUNENV, timeout=300)
+        except subprocess.TimeoutExpired:
+            return e, k, None, "does not end"
+        # (wasmer run prints a line of its own after a module that has no start)
+        if r.returncode != ref[k][0] or (r.stdout != ref[k][1] and (r.stdout.strip() or ref[k][1].strip())):
+            return e, k, None, "exits %d%s" % (r.returncode, "" if r.stdout == ref[k][1] else " and prints otherwise")
+        return e, k, run(o), None
+
+    cmds = {e: {} for e in engines}
+    cannot = {e: [] for e in engines}
+    with concurrent.futures.ThreadPoolExecutor(6) as ex:
+        for e, k, cmd, why in ex.map(one, [(e, k) for e in engines for k in ["empty"] + names]):
+            if cmd:
+                cmds[e][k] = cmd
+            else:
+                cannot[e].append((k, why))
+    for e in engines:
+        if "empty" not in cmds[e]:
+            print("%s: %s cannot run the empty program (%s): not timed"
+                  % (CORPUS, e, dict(cannot[e]).get("empty")), file=sys.stderr)
+            del cmds[e]
+        elif cannot[e]:
+            print("%s: %s cannot run %d of %d kernel(s): %s (%s: %s)"
+                  % (CORPUS, e, len(cannot[e]), len(names), " ".join(k for k, _ in cannot[e]),
+                     cannot[e][0][0], cannot[e][0][1][:120]), file=sys.stderr)
+    return cmds, versions
+
 def check(names, wasm, exes, variants):
     """Every kernel's output against wasmtime's, at every variant.
 
@@ -1003,7 +1107,7 @@ def baseline_load():
         return json.load(f)
 
 def baseline_rows(names, variants, best, second, have_wasmtime, rss=None,
-                  differs=()):
+                  differs=(), engines=()):
     """The figures worth keeping from a timing run.
 
     The *ratio* to wasmtime is the number recorded and compared, not the times.
@@ -1032,7 +1136,7 @@ def baseline_rows(names, variants, best, second, have_wasmtime, rss=None,
         if k in best.get("native", {}):
             n = best["native"][k] - best["native"]["empty"]
             row["native"] = round(max(n, 0.0), 5)
-            if n >= 0.005:
+            if n >= MIN_REF_TIME:
                 row["native_ratio"] = round(w / n, 4)
             if k in differs:
                 row["native_differs"] = True
@@ -1042,8 +1146,43 @@ def baseline_rows(names, variants, best, second, have_wasmtime, rss=None,
                 row["rss_kb_wasmtime"] = int(rss["wasmtime"][k] / 1024)
             if k in best.get("native", {}):
                 row["rss_kb_native"] = int(rss["native"][k] / 1024)
+        # another engine's time, with warmc's over it, where it runs the kernel:
+        # kept under 5 ms too, and no ratio taken from it there, as of a
+        # native time -- LLVM takes ktbench/sum's sum of its loop's counter
+        # by formula, and WasmEdge's run of it is the empty program's
+        for e in engines:
+            if k in best.get(e, {}):
+                t = best[e][k] - best[e]["empty"]
+                row[e] = round(max(t, 0.0), 5)
+                if t >= MIN_REF_TIME:
+                    row["ratio_" + e] = round(w / t, 4)
+                if rss is not None:
+                    row["rss_kb_" + e] = int(rss[e][k] / 1024)
         out[k] = row
     return out
+
+# a reference's time under this is lost in the spread of a process's start:
+# kept, and no ratio taken from it
+MIN_REF_TIME = 0.005
+
+def engine_keys(row):
+    """The names of the engines a baseline row has a time for"""
+    return [e for e in ENGINES if e in row]
+
+def baseline_keep_engines(rows, old):
+    """Each row's times under the other engines as last recorded, where this
+    run timed none, and warmc's ratios over them"""
+    for k, row in rows.items():
+        was = old.get(k, {})
+        for e in engine_keys(was):
+            if e in row:
+                continue
+            row[e] = was[e]
+            if "rss_kb_" + e in was:
+                row["rss_kb_" + e] = was["rss_kb_" + e]
+            if was[e] >= MIN_REF_TIME:
+                row["ratio_" + e] = round(row["warmc"] / was[e], 4)
+    return rows
 
 def first_line(cmd):
     """A tool's version line, or None when it will not say."""
@@ -1066,6 +1205,7 @@ def baseline_reuse(corpus, rows):
                     "native_differs"):
             if key in was:
                 row[key] = was[key]
+        baseline_keep_engines({k: row}, old)
         w = row["warmc"]
         if "wasmtime" in was:
             row["ratio"] = round(w / max(was["wasmtime"], 1e-9), 4)
@@ -1074,7 +1214,7 @@ def baseline_reuse(corpus, rows):
     return rows
 
 def baseline_record(corpus, rows, host, variant, lang, with_native=False,
-                    reuse=False):
+                    reuse=False, engines=None):
     """Write this run's figures in as the corpus's baseline.
 
     The ratios are against one wasmtime and one producer, so both versions go
@@ -1098,6 +1238,12 @@ def baseline_record(corpus, rows, host, variant, lang, with_native=False,
                 data[corpus][key] = was[key]
             else:
                 data[corpus].pop(key, None)
+    # the other engines' columns: this run's, or the ones recorded
+    if engines:
+        data[corpus]["engines"] = engines
+    elif "engines" in was:
+        baseline_keep_engines(rows, was.get("kernels", {}))
+        data[corpus]["engines"] = was["engines"]
     if with_native:
         data[corpus]["native"] = "%s %s" % (first_line(NATIVE_VERSION[lang]),
                                             " ".join(NATIVE_FLAGS[lang]))
@@ -1109,6 +1255,50 @@ def baseline_record(corpus, rows, host, variant, lang, with_native=False,
         f.write("\n")
     print("%s: recorded %d kernel(s) into %s"
           % (corpus, len(rows), os.path.relpath(BASELINE, ROOT)))
+    return 0
+
+def baseline_record_engines(corpus, names, base, engines, best, rss):
+    """--record-engines: the other engines' figures beside the recorded ones.
+
+    warmc and the engines are timed interleaved, nothing else; what is kept of
+    an engine is its time as this run's ratio says of the recorded warmc time
+    -- the recorded time over warmc's time here, times the engine's -- so
+    that the engine's column differs from warmc's by what the engines do and
+    not by the afternoon either was timed on.  Each kernel an engine runs
+    gets the engine's name, ratio_NAME (of a time of 5 ms or more) and
+    rss_kb_NAME, the corpus `engines`,
+    the versions; nothing else in the baseline moves, and a kernel an engine
+    no longer runs loses its figures.
+    """
+    data = baseline_load()
+    if corpus not in data:
+        print("%s: no baseline to record the engines beside" % corpus, file=sys.stderr)
+        return 1
+    old = data[corpus].get("kernels", {})
+    n = 0
+    for k in names:
+        row = old.get(k)
+        if not row or "warmc" not in row:
+            continue
+        w = best[base][k] - best[base]["empty"]
+        for e in ENGINES:
+            for key in (e, "ratio_" + e, "rss_kb_" + e):
+                row.pop(key, None)
+        for e in engines:
+            if k not in best.get(e, {}) or w <= 0:
+                continue
+            t = max(best[e][k] - best[e]["empty"], 0.0)
+            row[e] = round(row["warmc"] * t / w, 5)
+            if row[e] >= MIN_REF_TIME:
+                row["ratio_" + e] = round(w / t, 4)
+            row["rss_kb_" + e] = int(rss[e][k] / 1024)
+            n += 1
+    data[corpus]["engines"] = engines
+    with open(BASELINE, "w") as f:
+        json.dump(data, f, indent=2, sort_keys=True)
+        f.write("\n")
+    print("%s: recorded %d figure(s) of %s into %s"
+          % (corpus, n, ", ".join(engines) or "no engine", os.path.relpath(BASELINE, ROOT)))
     return 0
 
 def baseline_record_variant(corpus, names, variants, best, name):
@@ -1279,6 +1469,17 @@ usage: python3 test/gobench.py [options]
                      when warmc does, and re-running them is most of a record.
                      With --record, the ratios are the new warmc time over the
                      recorded ones.
+  --engines          also time each kernel under the other engines `make engines`
+                     fetched -- WAMR, WasmEdge, Wasmer -- each compiling the
+                     module ahead of time with its own compiler, interleaved
+                     with the rest.  An engine times the kernels it compiles
+                     and that print under it what warmc's program prints; the
+                     others are named.  With --record their times go into the
+                     baseline too.
+  --record-engines   time warmc and those engines interleaved, nothing else,
+                     and record the engines' figures beside what is recorded:
+                     each engine's time as this run's ratio to warmc says of
+                     the recorded warmc time, as ratio_NAME does.
   --record-variant NAME
                      with two --variants, the control first, and
                      --reuse-baseline: time the two interleaved, warmc alone,
@@ -1336,6 +1537,13 @@ def main():
     if reuse:
         args.remove("--reuse-baseline")
         want_native = False
+    record_engines = "--record-engines" in args
+    if record_engines:
+        args.remove("--record-engines")
+        want_native = False
+    want_engines = "--engines" in args or record_engines
+    if "--engines" in args:
+        args.remove("--engines")
     want_rss = want_rss or record or compare
     threshold = BASE_THRESHOLD
     if "--threshold" in args:
@@ -1376,8 +1584,15 @@ def main():
     if not os.path.exists(WARMC):
         print("%s: %s not built" % (CORPUS, WARMC), file=sys.stderr)
         return 1
-    have_wasmtime = have(["wasmtime", "--version"]) and not reuse
+    have_wasmtime = have(["wasmtime", "--version"]) and not reuse and not record_engines
     target_flags = host_flags()
+    engines = engines_installed() if want_engines else []
+    if want_engines and not engines:
+        print("%s: no other engine under %s (make engines)%s"
+              % (CORPUS, os.path.relpath(ENGINES_DIR, ROOT),
+                 "" if record_engines else ", none timed"), file=sys.stderr)
+        if record_engines:
+            return 1
 
     names, lang = kernels()
     if only:
@@ -1492,8 +1707,13 @@ def main():
             return 0
         return 1 if check(names, wasm, exes, variants) else 0
 
+    engine_cmds, engine_said = {}, {}
+    if engines:
+        engine_cmds, engine_said = engine_prepare(engines, names, wasm, exes, variants[0])
+        engine_said = {e: engine_said[e] for e in engine_cmds}
+
     cols = list(variants) + (["wasmtime"] if have_wasmtime else []) + \
-        (["native"] if native else [])
+        (["native"] if native else []) + list(engine_cmds)
     print("host: %s   rounds: %d   floor subtracted per engine" % (
         subprocess.run(". test/hostenv.sh; echo $WARMC_HOST", shell=True,
                        capture_output=True, text=True, cwd=ROOT,
@@ -1506,8 +1726,11 @@ def main():
             for c in cols:
                 if c == "native" and k not in native:
                     continue
+                if c in engine_cmds and k not in engine_cmds[c]:
+                    continue
                 cmd = ([exes[(k, c)]] if c in variants
                        else [native[k]] if c == "native"
+                       else engine_cmds[c][k] if c in engine_cmds
                        else ["wasmtime", wasm[k]])
                 t, m = run_once(cmd)
                 samples[c][k].append(t)
@@ -1552,18 +1775,22 @@ def main():
     if record_variant:
         return baseline_record_variant(CORPUS, names, variants, best, record_variant)
 
+    if record_engines:
+        print()
+        return baseline_record_engines(CORPUS, names, base, engine_said, best, rss)
+
     if record or compare:
         host = subprocess.run(". test/hostenv.sh; echo $WARMC_HOST", shell=True,
                               capture_output=True, text=True, cwd=ROOT,
                               executable="/bin/bash").stdout.strip() or "?"
         rows = baseline_rows(names, variants, best, second, have_wasmtime, rss,
-                             differs)
+                             differs, list(engine_cmds))
         if reuse:
             rows = baseline_reuse(CORPUS, rows)
         print()
         if record:
             return baseline_record(CORPUS, rows, host, base, lang,
-                                   bool(native), reuse)
+                                   bool(native), reuse, engine_said)
         return baseline_compare(CORPUS, rows, host, base, threshold)
     return 0
 

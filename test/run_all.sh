@@ -403,6 +403,8 @@ start pagefit-rule ./build/pagefit_test
 start pagefit python3 test/run_pagefit.py
 # WARMC_LISTING's offsets against the code's
 start listing python3 test/run_listing.py
+# the other engines' figures in the baseline, on figures made up for it
+start benchrec python3 test/run_benchrec.py
 
 start cases-farbr env WARMC_FAR_BRANCH=1 WARMC_FLAGS=-O2 ./test/run_tests.sh
 start traps-farbr env WARMC_FAR_BRANCH=1 ./test/run_traps.sh

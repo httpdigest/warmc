@@ -588,6 +588,71 @@ $(TEMURIN_STAMP):
 
 temurin: $(TEMURIN_STAMP)
 
+# The other engines test/gobench.py times warmc against, each in its
+# ahead-of-time mode (--engines): WasmEdge and Wasmer as released, and WAMR.
+# On arm64 macOS alone, where the baseline is recorded.  WAMR publishes no
+# arm64 macOS binaries: its runtime, iwasm, is built here from the release's
+# source, and its compiler, wamrc, is the x86-64 release run under Rosetta --
+# it compiles for whatever target it is told -- beside a zstd built for
+# x86-64, which it loads from a path of Homebrew's.
+WASMEDGE_VERSION := 0.18.1
+WASMER_VERSION   := 7.5.0
+WAMR_VERSION     := 2.4.5
+ZSTD_VERSION     := 1.5.7
+ENGINES_DIR      := $(BUILD)/tools/engines
+ENGINES_STAMP    := $(ENGINES_DIR)/.wasmedge-$(WASMEDGE_VERSION)-wasmer-$(WASMER_VERSION)-wamr-$(WAMR_VERSION)
+
+$(ENGINES_STAMP):
+	@test "$(UNAME_S)-$(UNAME_M)" = Darwin-arm64 || { \
+	  echo "make engines: the engines are fetched for arm64 macOS alone so far"; exit 1; }
+	@command -v cmake >/dev/null 2>&1 || { echo "make engines: cmake not found (WAMR's runtime is built with it)"; exit 1; }
+	@arch -x86_64 /usr/bin/true 2>/dev/null || { \
+	  echo "make engines: WAMR's compiler is an x86-64 program: install Rosetta (softwareupdate --install-rosetta)"; exit 1; }
+	@rm -rf $(ENGINES_DIR)
+	@mkdir -p $(ENGINES_DIR)/wasmedge $(ENGINES_DIR)/wasmer $(ENGINES_DIR)/wamr $(ENGINES_DIR)/wamrc $(ENGINES_DIR)/zstd
+	test/fetch.sh \
+	  "https://github.com/WasmEdge/WasmEdge/releases/download/$(WASMEDGE_VERSION)/WasmEdge-$(WASMEDGE_VERSION)-darwin_arm64.tar.gz" \
+	  $(ENGINES_DIR)/wasmedge.tar.gz
+	test/fetch.sh \
+	  "https://github.com/wasmerio/wasmer/releases/download/v$(WASMER_VERSION)/wasmer-darwin-arm64.tar.gz" \
+	  $(ENGINES_DIR)/wasmer.tar.gz
+	test/fetch.sh \
+	  "https://github.com/bytecodealliance/wasm-micro-runtime/archive/refs/tags/WAMR-$(WAMR_VERSION).tar.gz" \
+	  $(ENGINES_DIR)/wamr.tar.gz
+	test/fetch.sh \
+	  "https://github.com/bytecodealliance/wasm-micro-runtime/releases/download/WAMR-$(WAMR_VERSION)/wamrc-$(WAMR_VERSION)-x86_64-macos-15-intel.tar.gz" \
+	  $(ENGINES_DIR)/wamrc.tar.gz
+	test/fetch.sh \
+	  "https://github.com/facebook/zstd/releases/download/v$(ZSTD_VERSION)/zstd-$(ZSTD_VERSION).tar.gz" \
+	  $(ENGINES_DIR)/zstd.tar.gz
+	@tar xzf $(ENGINES_DIR)/wasmedge.tar.gz -C $(ENGINES_DIR)/wasmedge
+	@tar xzf $(ENGINES_DIR)/wasmer.tar.gz -C $(ENGINES_DIR)/wasmer
+	@tar xzf $(ENGINES_DIR)/wamr.tar.gz -C $(ENGINES_DIR)/wamr --strip-components=1
+	@tar xzf $(ENGINES_DIR)/wamrc.tar.gz -C $(ENGINES_DIR)/wamrc
+	@tar xzf $(ENGINES_DIR)/zstd.tar.gz -C $(ENGINES_DIR)/zstd --strip-components=1
+	@rm -f $(ENGINES_DIR)/*.tar.gz
+	@xattr -dr com.apple.quarantine $(ENGINES_DIR) 2>/dev/null || true
+	@# the library wamrc asks for, for the machine it was built for, and its
+	@# path in wamrc's own
+	$(MAKE) -C $(ENGINES_DIR)/zstd/lib libzstd CC="clang -arch x86_64" >$(ENGINES_DIR)/zstd.log 2>&1 || { \
+	  tail -20 $(ENGINES_DIR)/zstd.log; exit 1; }
+	@install_name_tool -change /usr/local/opt/zstd/lib/libzstd.1.dylib \
+	  $(abspath $(ENGINES_DIR))/zstd/lib/libzstd.1.dylib $(ENGINES_DIR)/wamrc/wamrc
+	@# iwasm: the runtime that loads what wamrc makes
+	@mkdir -p $(ENGINES_DIR)/iwasm
+	cd $(ENGINES_DIR)/iwasm && cmake ../wamr/product-mini/platforms/darwin -DCMAKE_BUILD_TYPE=Release \
+	  -DWAMR_BUILD_TARGET=AARCH64 -DWAMR_BUILD_AOT=1 -DWAMR_BUILD_INTERP=1 -DWAMR_BUILD_FAST_INTERP=1 \
+	  -DWAMR_BUILD_JIT=0 -DWAMR_BUILD_LIBC_WASI=1 -DWAMR_BUILD_LIBC_BUILTIN=1 -DWAMR_BUILD_SIMD=1 \
+	  -DWAMR_BUILD_REF_TYPES=1 -DWAMR_BUILD_BULK_MEMORY=1 -DWAMR_BUILD_TAIL_CALL=1 >cmake.log 2>&1 && \
+	  $(MAKE) >make.log 2>&1 || { tail -20 $(abspath $(ENGINES_DIR))/iwasm/make.log; exit 1; }
+	@$(ENGINES_DIR)/wasmedge/bin/wasmedge --version | head -1
+	@$(ENGINES_DIR)/wasmer/bin/wasmer --version
+	@$(ENGINES_DIR)/wamrc/wamrc --version
+	@$(ENGINES_DIR)/iwasm/iwasm --version | head -1
+	@touch $@
+
+engines: $(ENGINES_STAMP)
+
 # GLFW, for lwjgl/: the release's macOS binaries, its static library and
 # headers, which lwjgl/build.py links a program against.
 GLFW_VERSION := 3.5.1
@@ -757,6 +822,14 @@ bench-record-o3: all
 	    --variant -O2 --variant -O3 --record-variant O3 | tail -1; \
 	done
 
+# the other engines' columns (make engines), timed with warmc and recorded
+# beside what is there: each engine's time as its ratio to warmc's in this
+# run says of the recorded warmc time
+bench-record-engines: all engines
+	@for c in $(BENCH_CORPORA); do \
+	  python3 test/gobench.py --corpus $$c --rounds 5 --record-engines | tail -1; \
+	done
+
 # warmc's column only, against the wasmtime and native times already recorded
 bench-record-warmc: all
 	@for c in $(BENCH_CORPORA); do \
@@ -813,6 +886,6 @@ clean:
 	rm -rf $(BUILD)
 
 .PHONY: all jit libwarmc asan tsan check smoke check-tools check-linux check-encoder check-spec conformance testsuite wasm-tools \
-        kotlin-stdlib teavm temurin glfw lwjgl wasi-sdk fuzz check-combos clean bench-compare bench-record bench-record-o3 bench-record-warmc bench-ab bench-llvm simde check-mutants gc-jitter gc-jitter-full
+        kotlin-stdlib teavm temurin glfw lwjgl wasi-sdk fuzz check-combos clean engines bench-compare bench-record bench-record-o3 bench-record-warmc bench-record-engines bench-ab bench-llvm simde check-mutants gc-jitter gc-jitter-full
 
 -include $(WARMC_DEPS) $(wildcard $(BUILD)/obj-pic/*.d)
