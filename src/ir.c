@@ -1832,6 +1832,99 @@ uint64_t ir_known_bits(IrFunc *f, Ref v, int depth) {
   return kb_rec(f, v, depth);
 }
 
+/* ir_sign_ge's walk.  Each block parameter asked takes a level of depth,
+   so there are never more than SG_DEPTH of them. */
+#define SG_DEPTH 8
+typedef struct { Ref x; uint32_t n; } SgAsked;
+
+static bool sign_ge(IrFunc *f, Ref x, uint32_t n, int depth, SgAsked *asked, uint32_t nasked) {
+  const Inst *in = &f->insts[x];
+  if (in->type != VT_I32 && in->type != VT_I64) return false;
+  uint32_t w = in->type == VT_I64 ? 64 : 32;
+  if (n <= 1) return true;
+  if (n > w) return false;
+  if (in->op == I_CONST) {
+    uint64_t c = w == 64 ? in->imm : (uint64_t)(int64_t)(int32_t)(uint32_t)in->imm;
+    if ((int64_t)c < 0) c = ~c;
+    return (c >> (w - n)) == 0;
+  }
+  /* zeros from bit w - n up are a zero sign and its copies */
+  if ((ir_known_bits(f, x, KB_MAXD) >> (w - n)) == 0) return true;
+  const Ref *a = ir_args(f, x);
+  uint32_t from = 0;
+  switch (in->op) {
+    case I_EXTENDS: if (n <= 33) return true; break;
+    case I_EXT8S: from = 8; break;
+    case I_EXT16S: from = 16; break;
+    case I_EXT32S: from = 32; break;
+    case I_LOAD: {
+      uint32_t bits = 8u << MEMF_SIZE(in->imm2);
+      return (in->imm2 & MEMF_SIGNED) && n <= w - bits + 1;
+    }
+    default: break;
+  }
+  if (from && n <= w - from + 1) return true;
+  if (depth <= 0) return false;
+#define SG(v, need) sign_ge(f, (v), (need), depth - 1, asked, nasked)
+  switch (in->op) {
+    /* the i32's own copies beyond the 33 */
+    case I_EXTENDS: return in->nargs == 1 && SG(a[0], n - 32);
+    case I_WRAP: return in->nargs == 1 && SG(a[0], n + 32);
+    case I_SHRS: {
+      if (in->nargs != 2 || f->insts[a[1]].op != I_CONST) return false;
+      uint32_t k = (uint32_t)(f->insts[a[1]].imm % w);
+      return n <= k || SG(a[0], n - k);
+    }
+    case I_SHL: {
+      if (in->nargs != 2 || f->insts[a[1]].op != I_CONST) return false;
+      return SG(a[0], n + (uint32_t)(f->insts[a[1]].imm % w));
+    }
+    case I_AND: case I_OR: case I_XOR:
+      return in->nargs == 2 && SG(a[0], n) && SG(a[1], n);
+    case I_SELECT:
+      return in->nargs == 3 && SG(a[0], n) && SG(a[1], n);
+    /* a sum of two is one bit wider than the wider of them */
+    case I_ADD: case I_SUB:
+      return in->nargs == 2 && SG(a[0], n + 1) && SG(a[1], n + 1);
+    /* a product's bits are its operands' together: of values with s and t
+       copies it has s + t - w - 1 */
+    case I_MUL: {
+      if (in->nargs != 2) return false;
+      uint32_t each = (n + w + 2) / 2;
+      return SG(a[0], each) && SG(a[1], each);
+    }
+    case I_PARAM: {
+      for (uint32_t i = 0; i < nasked; i++)
+        if (asked[i].x == x && asked[i].n >= n) return true;
+      asked[nasked].x = x;
+      asked[nasked].n = n;
+      const Block *b = &f->blocks[in->block];
+      uint32_t q = 0;
+      while (q < b->nparams && b->params[q] != x) q++;
+      if (q == b->nparams || !b->npreds) return false;
+      for (uint32_t pk = 0; pk < b->npreds; pk++) {
+        const Block *pb = &f->blocks[b->preds[pk]];
+        for (uint32_t si = 0; si < pb->nsuccs; si++) {
+          const Edge *e = &pb->succs[si];
+          if (e->target != in->block) continue;
+          if (e->nargs != b->nparams ||
+              !sign_ge(f, e->args[q], n, depth - 1, asked, nasked + 1))
+            return false;
+        }
+      }
+      return true;
+    }
+    default:
+      return false;
+  }
+#undef SG
+}
+
+bool ir_sign_ge(IrFunc *f, Ref x, uint32_t n) {
+  SgAsked asked[SG_DEPTH];
+  return sign_ge(f, x, n, SG_DEPTH, asked, 0);
+}
+
 bool ir_imm_ok(IrFunc *f, Ref user, uint32_t idx, uint64_t cval, ValType ct) {
   return g_target->imm_ok(f, user, idx, cval, ct);
 }

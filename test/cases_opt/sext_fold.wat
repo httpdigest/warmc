@@ -1,5 +1,5 @@
 ;; An i64 that is already the sign extension of its low 32 bits needs no
-;; extending again (opt.c ir_sext32): a signed 32-bit load, a narrower
+;; extending again (ir.c ir_sign_ge, of 33): a signed 32-bit load, a narrower
 ;; load, an extension, a constant in range, an and, or or xor of two such,
 ;; a select of two, and a block parameter every edge hands one, a loop's
 ;; too, which Go's int32 kept in an i64 and extended at each use is: in

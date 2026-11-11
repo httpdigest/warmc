@@ -3185,66 +3185,6 @@ static bool carried_chain(IrFunc *f, Ref v, const uint32_t *uses, Ref *base, uin
   return false;
 }
 
-/* Whether i64 x is the sign extension of its low 32 bits: its top 33 bits
-   copies of bit 31.  A signed load, an extension, a constant in range, an
-   and, or or xor of two such, a select of two, and a block parameter every
-   edge hands one -- assumed of a parameter while its own edges are asked,
-   so that a loop's value is one where all it starts from and is made of
-   are: Go keeps an int32 in an i64 and sign-extends it again at each use
-   (stdgo/multiret's min and max, two sxtw on the chain each element). */
-#define SX_DEPTH 8
-static bool sext32_rec(IrFunc *f, Ref x, int depth, Ref *asked, uint32_t nasked) {
-  const Inst *in = &f->insts[x];
-  if (in->type != VT_I64) return false;
-  uint64_t c;
-  if (is_const(f, x, &c)) return (uint64_t)(int64_t)(int32_t)(uint32_t)c == c;
-  if ((ir_known_bits(f, x, KB_DEPTH) >> 31) == 0) return true;
-  switch (in->op) {
-    case I_EXT8S: case I_EXT16S: case I_EXT32S: case I_EXTENDS: return true;
-    case I_LOAD:
-      return MEMF_SIZE(in->imm2) < 2 || (MEMF_SIZE(in->imm2) == 2 && (in->imm2 & MEMF_SIGNED));
-    default: break;
-  }
-  if (depth <= 0) return false;
-  const Ref *a = ir_args(f, x);
-  switch (in->op) {
-    case I_AND: case I_OR: case I_XOR:
-      return in->nargs == 2 && sext32_rec(f, a[0], depth - 1, asked, nasked) &&
-             sext32_rec(f, a[1], depth - 1, asked, nasked);
-    case I_SELECT:
-      return in->nargs == 3 && sext32_rec(f, a[0], depth - 1, asked, nasked) &&
-             sext32_rec(f, a[1], depth - 1, asked, nasked);
-    case I_PARAM: {
-      for (uint32_t i = 0; i < nasked; i++)
-        if (asked[i] == x) return true;
-      /* each parameter asked takes a level of depth: nasked < SX_DEPTH */
-      asked[nasked] = x;
-      const Block *b = &f->blocks[in->block];
-      uint32_t q = 0;
-      while (q < b->nparams && b->params[q] != x) q++;
-      if (q == b->nparams || !b->npreds) return false;
-      for (uint32_t pk = 0; pk < b->npreds; pk++) {
-        const Block *pb = &f->blocks[b->preds[pk]];
-        for (uint32_t si = 0; si < pb->nsuccs; si++) {
-          const Edge *e = &pb->succs[si];
-          if (e->target != in->block) continue;
-          if (e->nargs != b->nparams ||
-              !sext32_rec(f, e->args[q], depth - 1, asked, nasked + 1))
-            return false;
-        }
-      }
-      return true;
-    }
-    default:
-      return false;
-  }
-}
-
-static bool ir_sext32(IrFunc *f, Ref x) {
-  Ref asked[SX_DEPTH];
-  return sext32_rec(f, x, SX_DEPTH, asked, 0);
-}
-
 /* x * c + y * c is (x + y) * c, and x * c - y * c is (x - y) * c: the
    distributive law, exact in wrapping arithmetic, an integer's or lane by
    lane, where each product is read here alone -- one multiply where there
@@ -3849,8 +3789,9 @@ static bool fold_block(IrFunc *f, uint32_t bi, const OptOpts *o, const uint32_t 
         }
         break;
       case I_EXT8S: case I_EXT16S: case I_EXT32S: {
-        /* a value already the sign extension of its low 32 bits */
-        if (in->op == I_EXT32S && in->type == VT_I64 && ir_sext32(f, a[0])) {
+        /* a value already the sign extension of the bits it extends from */
+        uint32_t from = in->op == I_EXT8S ? 8u : in->op == I_EXT16S ? 16u : 32u;
+        if (ir_sign_ge(f, a[0], (in->type == VT_I64 ? 64u : 32u) - from + 1)) {
           ir_replace(f, v, a[0]);
           ir_make_nop(in);
           changed = true;
@@ -3895,7 +3836,7 @@ static bool fold_block(IrFunc *f, uint32_t bi, const OptOpts *o, const uint32_t 
            was the sign extension of its low half already */
         if (in->op == I_EXTENDS) {
           if (f->insts[a[0]].op == I_WRAP && f->insts[a[0]].nargs == 1 &&
-              ir_sext32(f, ir_args(f, a[0])[0])) {
+              ir_sign_ge(f, ir_args(f, a[0])[0], 33)) {
             ir_replace(f, v, ir_args(f, a[0])[0]);
             ir_make_nop(in);
             changed = true;

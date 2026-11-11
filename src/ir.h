@@ -573,6 +573,20 @@ bool ir_not_int_min(IrFunc *f, Ref v);
 bool ir_nonzero_with(IrFunc *f, Ref c, Ref d);
 
 uint64_t ir_known_bits(IrFunc *f, Ref v, int depth);
+/* Whether the top n bits of integer x are all copies of its sign: 33 for an
+   i64 that is the sign extension of its low 32 bits, 49 for one that is an
+   int16's, 17 for an i32 that is.  A constant in range; zeros known from
+   there up; an extension, from where it extends, and an i32's own copies
+   beyond a widening; a signed load; a wrap of a value with 32 more; a right
+   shift's amount more than its operand had and a left shift's fewer; an
+   and, or, xor or select of two such; a sum or difference of two with one
+   more each; a product of two with half of n and the width together each;
+   and a block parameter every edge hands one -- assumed of a parameter
+   while its own edges are asked, so that a loop's value is one where all it
+   starts from and is made of are: Go keeps an int32 in an i64 and
+   sign-extends it again at each use (stdgo/multiret's min and max, two sxtw
+   on the chain each element). */
+bool ir_sign_ge(IrFunc *f, Ref x, uint32_t n);
 bool ir_has_result(const Inst *in);
 
 typedef struct {
