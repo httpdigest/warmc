@@ -123,6 +123,9 @@ static bool isel_fp_remat_ok(Isel *s, const Inst *in) {
 /* the memory base plus an offset is one lea up to a 31-bit displacement */
 #define RA_MEMBASE_ONE(off) ((off) <= 0x7fffffffull)
 #define RA_EXTENDU_TIED 0
+/* a result in the register of an operand that dies where it is made
+   (regalloc.inc): an x64 instruction of two operands writes one of them first */
+#define RA_DIE_TIE 0
 #define RA_CS_TOP 0
 #define RA_CS_LATE_A (-1)
 #define RA_CS_LATE_B (-1)

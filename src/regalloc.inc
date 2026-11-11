@@ -284,6 +284,8 @@ static bool w_written(const IrFunc *f, Ref v) {
   }
 }
 
+static Ref ra2a_late_arg(Isel *s, Ref v);
+
 static Ref tied_operand_of(IrFunc *f, Ref def) {
   Inst *in = &f->insts[def];
   /* A C function's result comes back in the register its first argument of
@@ -321,6 +323,25 @@ typedef struct {
   uint8_t caller_saved_ok;
   int32_t reg;
 } Interval;
+
+/* Whether the scan may have given `later` the register `earlier` held to
+   the position `later` starts at -- what its check of an assignment lets
+   pass: the operand the first of later's values is tied to, the one a bfi
+   writes into, and, where a result takes a dying value's register
+   (RA_DIE_TIE), any but the one its instruction reads after it has
+   written. */
+static bool ra_tie_ok(Isel *s, IrFunc *f, const Interval *later, const Interval *earlier,
+                      const uint32_t *web, const uint32_t *mem_head, bool no_die_tie) {
+  Ref d0 = mem_head[later->value] != UINT32_MAX ? mem_head[later->value] : later->value;
+  Ref ta = tied_operand_of(f, d0);
+  if (ta == REF_NONE && RA_BFI && s->bfi && s->bfi[d0])
+    ta = ir_args(f, d0)[(s->bfi[d0] - 1) ^ 1];
+  if (ta != REF_NONE && web[ta] == earlier->value) return true;
+  if (!RA_DIE_TIE || no_die_tie) return false;
+  Ref late = ra2a_late_arg(s, d0);
+  return late == REF_NONE || web[late] != earlier->value;
+}
+
 
 /* How many positions an interval holds a register for: its ranges, holes
    left out. */
@@ -2985,6 +3006,7 @@ static void regalloc_linear(Isel *s) {
       web_hint[web[v]] = hint[v];
 
   bool no_tie = warmc_getenv("WARMC_NO_TIE") != NULL;
+  bool no_die_tie = warmc_getenv("WARMC_NO_DIE_TIE") != NULL;
   bool cs_top = RA_CS_TOP && warmc_getenv("WARMC_NO_CS_TOP") == NULL;
   bool no_hint = warmc_getenv("WARMC_NO_HINT") != NULL;
   bool no_evict = warmc_getenv("WARMC_NO_EVICT") != NULL;
@@ -3054,7 +3076,7 @@ static void regalloc_linear(Isel *s) {
   uint32_t slot0 = slot;
   uint32_t used_gcs0 = s->used_gpr_cs, used_fcs0 = s->used_fpr_cs;
   uint64_t st_cs0 = g_stats.caller_saves, st_sp0 = g_stats.spills,
-           st_spv0 = g_stats.spills_v128_xcall;
+           st_spv0 = g_stats.spills_v128_xcall, st_dt0 = g_stats.die_ties;
   double best_cost = 1e300, base_cost = 1e300;
   int best_rule = 0;
   /* whether this pass ranked an integer value's victims by its rule */
@@ -3089,6 +3111,7 @@ static void regalloc_linear(Isel *s) {
       s->used_gpr_cs = used_gcs0; s->used_fpr_cs = used_fcs0;
       g_stats.caller_saves = st_cs0; g_stats.spills = st_sp0;
       g_stats.spills_v128_xcall = st_spv0;
+      g_stats.die_ties = st_dt0;
       csa_done = 0; csa_work = 0;
     }
     for (uint32_t i = 0; i < ns; i++) {
@@ -3125,8 +3148,15 @@ static void regalloc_linear(Isel *s) {
                        !inelig[cur->value] && f->insts[cur->value].op != I_CONST &&
                        !csa_crosses_hot(cur, R, num[cur->value], call_pos, call_cold, ncalls);
       int chosen = -1;
+      /* the first of the web's values: the one made where its interval
+         starts, if any is */
+      Ref d0 = mem_head[cur->value] != UINT32_MAX ? mem_head[cur->value] : cur->value;
       if (!no_tie) {
-        Ref ta = tied_operand_of(f, cur->value);
+        Ref ta = tied_operand_of(f, d0);
+        /* a bfi writes its field into its other operand: in place, where
+           that dies here */
+        if (ta == REF_NONE && RA_BFI && s->bfi && s->bfi[d0])
+          ta = ir_args(f, d0)[(s->bfi[d0] - 1) ^ 1];
         int tl = ta == REF_NONE ? LOC_NONE : s->loc[ta];
         /* The operand's own interval has to end here; the register's end can
            be later, when the operand sat in a hole of a value that lives on
@@ -3134,20 +3164,46 @@ static void regalloc_linear(Isel *s) {
            in that hole too.  A popcount that a running sum lent its register
            to is that: the wrap of the count found the sum's end there. */
         if (ta != REF_NONE && tl != LOC_NONE && !IS_SLOT(tl) && tl >= 0 &&
-            owner[tl] >= 0 && sorted[owner[tl]].value == ta &&
+            owner[tl] >= 0 && sorted[owner[tl]].value == web[ta] &&
             sorted[owner[tl]].end == cur->start) {
           bool cs = !v128 &&
                     (cur->cls ? fpr_is_callee_saved(tl) : gpr_is_callee_saved(tl));
           bool in_pool = false;
           for (int k = 0; k < npool; k++) if (pool[k] == tl) { in_pool = true; break; }
           int nc = occ_conflicts(&heaps[tl], cur, R, gone, &ostack, &vic);
-          bool only_tied = nc == 0 || (nc == 1 && sorted[vic].value == ta);
+          bool only_tied = nc == 0 || (nc == 1 && sorted[vic].value == web[ta]);
           if (in_pool && only_tied &&
               (!cur->crosses_call || cs || (rare_only && tl != RA_ALLOC_RES_REG)))
             chosen = tl;
         }
       }
       int want = no_hint ? -1 : hint[cur->value];
+      /* A result takes the register it is hinted to from a value that dies
+         where it is made, which is an operand of its instruction: that
+         reads its operands before it writes its result -- all but the one
+         ra2a_late_arg names -- so the two never hold the register at once.
+         A sum made for a call's
+         argument out of the parameter that came in that register is made
+         there, not beside it and moved (`add x0, x1, #3; mov x1, x0`), a
+         call's result comes back into x0 though an argument was made
+         there, and the value a function returns is made in x0 out of what
+         was there (WARMC_NO_DIE_TIE=1; --stats counts die_ties). */
+      if (RA_DIE_TIE && !no_die_tie && chosen < 0 && want >= 0 && owner[want] >= 0 &&
+          sorted[owner[want]].end == cur->start) {
+        /* the web in the register, and the operand d0 reads last */
+        Ref dx = sorted[owner[want]].value, late = ra2a_late_arg(s, d0);
+        if (late == REF_NONE || web[late] != dx) {
+          bool cs = !v128 && (cur->cls ? fpr_is_callee_saved(want) : gpr_is_callee_saved(want));
+          bool in_pool = false;
+          for (int k = 0; k < npool; k++) if (pool[k] == want) { in_pool = true; break; }
+          int nc = occ_conflicts(&heaps[want], cur, R, gone, &ostack, &vic);
+          if (in_pool && !((barred >> want) & 1) && nc == 1 && vic == owner[want] &&
+              (!cur->crosses_call || cs || (rare_only && want != RA_ALLOC_RES_REG))) {
+            chosen = want;
+            g_stats.die_ties++;
+          }
+        }
+      }
       /* A value live across a call made in a loop takes the callee-saved
          registers from the other end of the pool (RA_CS_TOP): callees take
          theirs from x22 up, and one that saves and restores the register a
@@ -4283,9 +4339,10 @@ static void regalloc_linear(Isel *s) {
         if (la == LOC_NONE || lb == LOC_NONE) continue;
         if (IS_SLOT(la) || IS_SLOT(lb) || la != lb) continue;
 
-        if (tied_operand_of(f, A->value) == Bv->value && Bv->end == A->start)
+        /* one may end where the other starts, by the scan's ties */
+        if (Bv->end == A->start && ra_tie_ok(s, f, A, Bv, web, mem_head, no_die_tie))
           continue;
-        if (tied_operand_of(f, Bv->value) == A->value && A->end == Bv->start)
+        if (A->end == Bv->start && ra_tie_ok(s, f, Bv, A, web, mem_head, no_die_tie))
           continue;
         if (iv_overlaps(A, Bv, R))
           warmc_fatal("regalloc: v%u [%d,%d] and v%u [%d,%d] both got r%d in %s",

@@ -23,8 +23,8 @@
 ;; flags: -O2 -fno-rotate -fno-unroll
 ;; shape: count \sb\.lt\s=1
 ;; shape: sw \smov\sx\d+, x\d+=4
-;; shape: early \smov\sx\d+, x\d+=2
-;; shape: early2 \smov\sx\d+, x\d+=2
+;; shape: early \smov\sx\d+, x\d+=1
+;; shape: early2 \smov\sx\d+, x\d+=1
 ;;
 ;; run: count 1 0 100 => i32:0
 ;; run: count 2 0 100 => i32:2

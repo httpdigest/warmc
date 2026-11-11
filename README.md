@@ -1822,7 +1822,20 @@ into a block whose only way in is the end of the block laid out before it,
 past a bounds check, say (`WARMC_NO_RC_CARRY=1` stops it at each block). A
 vector select is made in whichever operand's register the allocator gave
 its result: the mask's (`bsl`), the false value's (`bit`) or the true
-value's (`bif`), so one carried round a loop moves nothing.
+value's (`bif`), so one carried round a loop moves nothing. On arm64 a
+result takes the register it is hinted to -- an argument's, the returned
+value's -- from an operand that dies where it is made, an instruction
+reading its operands before it writes: a call's argument is made in its
+register out of the parameter that came in it (`add x1, x1, #3`, where
+`add x0, x1, #3` and a `mov` were), a call's result stays in `x0` though
+an argument was made there, and what a function returns is made in `x0`
+out of what was there -- a third of a program's returns had a `mov` to
+`x0` before them. Not from the one operand read after the result is
+written, a `bfi`'s field or a barriered load's mask; and a `bfi` writes
+into its other operand in place where that dies there. Over the 375
+kernels this is 0.998 the instructions, `javabench/lambda` 0.93,
+`cppbench/function` 0.94 (`WARMC_NO_DIE_TIE=1` turns it off; `--stats`
+counts `die_ties`).
 Functions compile in parallel and are laid out deterministically.
 
 **Linker** (`src/link.c`, `pe.c`, `elf.c`, `macho.c`, `coff.c`):
@@ -2592,7 +2605,7 @@ Most of the suite is **differential**. warmc's output is compared with:
   `vec_iv.wat` by `test/gen_veciv.py`, `arr_bias.wat` by
   `test/gen_arr_bias.py`, `tail_pairs.wat` by `test/gen_tail_pairs.py`,
   `wide_mul.wat` by `test/gen_wide_mul.py`, `sign_bits.wat` by
-  `test/gen_sign_bits.py`
+  `test/gen_sign_bits.py`, `die_tie.wat` by `test/gen_die_tie.py`
 - mutants of a transform -- a test it makes dropped or loosened, a bound
   moved, an operand swapped -- each of which some test must tell from the
   transform, or the spec names it equivalent and why (`make

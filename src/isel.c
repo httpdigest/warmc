@@ -251,6 +251,9 @@ static IrOp recomp_shape(IrFunc *f, Ref v, Ref *x, Ref *y, uint64_t *c);
 #define RA_MEMBASE_ONE(off) ((off) <= 0xfff || (((off) & 0xfff) == 0 && ((off) >> 12) <= 0xfff))
 /* an extend of an i32 a w-register write made is no instruction in place */
 #define RA_EXTENDU_TIED 1
+/* a result in the register of an operand that dies where it is made
+   (regalloc.inc): an a64 instruction reads its operands before it writes */
+#define RA_DIE_TIE 1
 /* memory.copy and memory.fill of memory 0 save nothing round them
    (regalloc.inc memop_preserves) */
 #define RA_MEMOP_PRESERVES 1
