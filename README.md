@@ -2205,22 +2205,22 @@ native one.
 
 | Corpus | Kernels | warmc / WAMR | Kernels it runs | Range | warmc / WasmEdge | Kernels it runs | Range | warmc / Wasmer | Kernels it runs | Range |
 |---|---:|---:|---:|---|---:|---:|---|---:|---:|---|
-| `gobench` | 39 | 0.56 | 39 | 0.05 – 1.11 | 0.58 | 39 | 0.05 – 1.16 | 0.58 | 39 | 0.03 – 1.08 |
-| `stdgo` | 49 | 0.48 | 49 | 0.07 – 1.03 | 0.52 | 49 | 0.11 – 0.97 | 0.50 | 49 | 0.04 – 0.97 |
-| `vecbench` | 43 | 0.18 | 43 | 0.009 – 1.01 | 0.20 | 43 | 0.008 – 1.04 | 0.17 | 43 | 0.02 – 1.03 |
-| `asbench` | 37 | 0.42 | 37 | 0.06 – 1.15 | 0.46 | 37 | 0.05 – 0.98 | 0.71 | 37 | 0.13 – 1.06 |
-| `rsbench` | 39 | 0.73 | 39 | 0.29 – 1.11 | 0.70 | 39 | 0.16 – 1.04 | 0.70 | 39 | 0.16 – 1.10 |
-| `zigbench` | 22 | 0.90 | 22 | 0.23 – 2.93 | 0.81 | 22 | 0.18 – 1.42 | 0.75 | 22 | 0.15 – 1.37 |
-| `ktbench` | 25 | – | 0 | – | 0.06 | 25 | 0.001 – 1.02 | – | 0 | – |
-| `cbench` | 27 | 0.83 | 26 | 0.31 – 1.21 | 0.86 | 27 | 0.48 – 1.18 | 0.67 | 27 | 0.003 – 1.03 |
-| `cppbench` | 26 | 0.98 | 1 | 0.98 – 0.98 | 0.86 | 26 | 0.43 – 1.05 | 0.72 | 26 | 0.002 – 1.16 |
-| `hsbench` | 28 | 0.53 | 28 | 0.31 – 1.12 | 0.46 | 28 | 0.24 – 1.09 | 0.59 | 28 | 0.35 – 1.11 |
-| `javabench` | 29 | – | 0 | – | 0.13 | 29 | 0.03 – 1.08 | – | 0 | – |
+| `gobench` | 39 | 0.53 | 39 | 0.05 – 1.09 | 0.55 | 39 | 0.05 – 1.06 | 0.56 | 39 | 0.03 – 1.08 |
+| `stdgo` | 49 | 0.47 | 49 | 0.07 – 1.07 | 0.51 | 49 | 0.12 – 0.98 | 0.49 | 49 | 0.04 – 0.98 |
+| `vecbench` | 43 | 0.18 | 43 | 0.008 – 1.01 | 0.19 | 43 | 0.007 – 1.04 | 0.17 | 43 | 0.02 – 1.03 |
+| `asbench` | 37 | 0.42 | 37 | 0.06 – 1.15 | 0.46 | 37 | 0.05 – 0.97 | 0.70 | 37 | 0.13 – 1.06 |
+| `rsbench` | 39 | 0.72 | 39 | 0.29 – 1.07 | 0.69 | 39 | 0.16 – 1.03 | 0.69 | 39 | 0.16 – 1.08 |
+| `zigbench` | 22 | 0.78 | 22 | 0.21 – 1.14 | 0.70 | 22 | 0.09 – 1.08 | 0.65 | 22 | 0.07 – 1.00 |
+| `ktbench` | 25 | – | 0 | – | 0.05 | 24 | 0.001 – 0.96 | – | 0 | – |
+| `cbench` | 27 | 0.82 | 26 | 0.31 – 1.19 | 0.85 | 27 | 0.48 – 1.17 | 0.66 | 27 | 0.003 – 1.03 |
+| `cppbench` | 26 | 0.98 | 1 | 0.98 – 0.98 | 0.86 | 26 | 0.40 – 1.21 | 0.72 | 26 | 0.002 – 1.20 |
+| `hsbench` | 28 | 0.52 | 28 | 0.31 – 1.07 | 0.45 | 28 | 0.25 – 1.03 | 0.59 | 28 | 0.35 – 1.05 |
+| `javabench` | 29 | – | 0 | – | 0.13 | 29 | 0.03 – 1.07 | – | 0 | – |
 
-Over the kernels each one runs, warmc's code takes **0.49×** WAMR's time
-(284 kernels), **0.41×** WasmEdge's (363 of its 364, one being under 5 ms)
-and **0.53×** Wasmer's (310); over the 284 that all three run, 0.49×, 0.50×
-and 0.52×, and 0.46× wasmtime's.
+Over the kernels each one runs, warmc's code takes **0.48×** WAMR's time
+(284 kernels), **0.39×** WasmEdge's (363 of its 364, one being under 5 ms)
+and **0.51×** Wasmer's (310); over the 284 that all three run, 0.48×, 0.49×
+and 0.51×, and 0.44× wasmtime's.
 Its median peak resident set is 2.2 MiB, where wasmtime's is 9.2, WAMR's
 18.3, WasmEdge's 23.9 and Wasmer's 36.5. wasmtime's own ahead-of-time mode
 (`wasmtime compile`, then `wasmtime run --allow-precompiled`) runs the code
@@ -2228,26 +2228,21 @@ its default run makes and keeps in its cache: timed side by side in one
 interleaved run over the 364 kernels, warmc took 0.391× the time of the one
 and 0.394× of the other.
 
-warmc is slower than WAMR on 33 kernels, 9 of them by more than 10%; slower
-than WasmEdge on 36, 5 by more than 10%; slower than Wasmer on 22, 4 by more
-than 10%. Those, none of which is looked into yet beyond the first:
+warmc is slower than WAMR on 25 kernels, 3 of them by more than 10%; slower
+than WasmEdge on 27, 4 by more than 10%; slower than Wasmer on 18, 2 by more
+than 10%. Those slower than one of the three by 9% or more:
 
 | Kernel | warmc / WAMR | warmc / WasmEdge | warmc / Wasmer | |
 |---|---:|---:|---:|---|
-| `ktbench/sum` | – | – | – | a sum of the loop's counter, 200 million times: WasmEdge's run takes the empty program's time and half a millisecond, warmc's vector loop 45 ms. Under 5 ms, so it is in no ratio above |
-| `zigbench/saturate` | 2.93 | 1.27 | 1.04 | saturating arithmetic on 16- and 8-bit samples, which the wasm has as compares and `select`s |
-| `zigbench/tailrec` | 1.44 | 1.42 | 1.37 | two functions that tail-call each other by `return_call` |
-| `cbench/strings` | 1.21 | 1.13 | 0.92 | |
-| `cbench/setjmp` | – | 1.18 | 0.003 | `longjmp` as a throw of the exception-handling proposal |
-| `gobench/mathfn` | 0.63 | 1.16 | 0.86 | |
-| `cppbench/bitset` | – | 1.02 | 1.16 | |
+| `ktbench/sum` | – | – | – | a sum of the loop's counter, 200 million times: WasmEdge's run takes the empty program's time and half a millisecond, warmc's vector loop 21 ms. Under 5 ms, so it is in no ratio above |
+| `cppbench/coroutine` | – | 1.21 | 1.20 | one program, two times: a run takes 139M cycles or 167M, and the recorded time is nearer the second |
+| `cbench/strings` | 1.19 | 1.11 | 0.90 | |
+| `cbench/setjmp` | – | 1.17 | 0.003 | `longjmp` as a throw of the exception-handling proposal |
 | `asbench/switchtab` | 1.15 | 0.89 | 0.85 | |
 | `zigbench/dfa` | 1.14 | 0.94 | 0.94 | |
-| `hsbench/spectral` | 1.12 | 1.09 | 1.11 | |
-| `rsbench/tokenize` | 1.11 | 1.00 | 0.94 | |
-| `gobench/recurse` | 1.11 | 0.75 | 0.90 | |
-| `zigbench/wordfreq` | 1.11 | 1.07 | 1.03 | |
-| `rsbench/itadapt` | 1.09 | 1.04 | 1.10 | |
+| `cppbench/bitset` | – | 1.00 | 1.13 | |
+| `cbench/lexer` | 0.99 | 1.12 | 0.90 | |
+| `gobench/recurse` | 1.09 | 0.73 | 0.89 | |
 
 Three things about running these engines, each of which gave a wrong figure
 before it was known (`test/gobench.py` has them): WasmEdge runs its
