@@ -1,7 +1,8 @@
 """How many of a value's top bits are copies of its sign (ir.c ir_sign_ge),
 and the fold that drops a sign extension of a value that is one already
 (opt.c's I_EXT8S, I_EXT16S and I_EXT32S).  Killed by
-test/cases_opt/sign_bits.wat's answers and shapes, with sext_fold.wat's."""
+test/cases_opt/sign_bits.wat's answers and shapes, with sext_fold.wat's and
+wide_mul.wat's."""
 I, O = 'src/ir.c', 'src/opt.c'
 def m(old, new, path=I): return (path, [(old, new)])
 CONST = '    return (c >> (w - n)) == 0;\n  }\n  /* zeros'
@@ -87,4 +88,4 @@ M = {
  'depth_less': m('#define SG_DEPTH 8', '#define SG_DEPTH 7'),
  'depth_more': m('#define SG_DEPTH 8', '#define SG_DEPTH 9'),
 }
-SUITES = (('optcases', ['python3', 'test/run_optcases.py'] + ['sign_bits', 'sext_fold'], {}),)
+SUITES = (('optcases', ['python3', 'test/run_optcases.py'] + ['sign_bits', 'sext_fold', 'wide_mul'], {}),)

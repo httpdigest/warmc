@@ -180,6 +180,11 @@ void a64_umulh(Buf *b, int rd, int rn, int rm) { dp3(b, 1, 6, rd, rn, rm, 0, RZR
 void a64_smulh(Buf *b, int rd, int rn, int rm) { dp3(b, 1, 2, rd, rn, rm, 0, RZR); }
 void a64_umull(Buf *b, int rd, int rn, int rm) { dp3(b, 1, 5, rd, rn, rm, 0, RZR); }
 void a64_smull(Buf *b, int rd, int rn, int rm) { dp3(b, 1, 1, rd, rn, rm, 0, RZR); }
+/* ra + or - the 64-bit product of two w registers, unsigned or signed:
+   umaddl, umsubl, smaddl, smsubl */
+void a64_maddl(Buf *b, bool sign, bool sub, int rd, int rn, int rm, int ra) {
+  dp3(b, 1, sign ? 1 : 5, rd, rn, rm, sub ? 1 : 0, ra);
+}
 
 static void dp2(Buf *b, int sf, int opcode, int rd, int rn, int rm) {
   W(((uint32_t)sf << 31) | (0xD6u << 21) | (M5(rm) << 16) |

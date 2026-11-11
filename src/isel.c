@@ -494,6 +494,13 @@ static int rd_peek(Isel *s, Ref v) {
   return -1;
 }
 
+/* What a umull or smull reads for operand x of its multiply (s->wmul): the
+   32-bit value whose extension is folded into it, or the operand itself,
+   which is its own low half extended. */
+static Ref wmul_src(Isel *s, Ref x) {
+  return s->folded[x] ? ir_args(s->f, x)[0] : x;
+}
+
 /* The zero register for an integer constant 0 with no register of its
    own, where the reader takes one as its value -- a store's, a result's --
    and what rd() makes of anything else.  The allocator keeps such zeros
@@ -3061,6 +3068,58 @@ static void analyse_immediates(Isel *s) {
     }
   }
 
+  /* A 64-bit multiply of two 32-bit values extended alike is umull or
+     smull, which read w registers and extend them themselves: an extension
+     only the multiply reads, in its block or made before it, is no
+     instruction.  The other
+     operand may be another such -- or the same one, a square -- or any
+     value that is its own low half extended that way already: one whose top
+     half is known zero (ir_known_bits), or whose top 33 bits are its sign's
+     (ir_sign_ge), as an extension read elsewhere too or made before the
+     loop, a narrow load, a masked or shifted value and a constant in range
+     are.  A hash's (u64)x * K and a big number's limb times limb are these,
+     and a sum with one is umaddl: zigbench/tailrec's step, a mov, a madd
+     and an add less a mov.  Before the folds into adds, which take the
+     multiply as it then is (WARMC_NO_WIDE_MUL=1; --stats counts
+     mull_folds). */
+  s->wmul = xcalloc(n ? n : 1, 1);
+  if (!warmc_getenv("WARMC_NO_WIDE_MUL"))
+  for (uint32_t oi = 0; oi < f->norder; oi++) {
+    uint32_t bi = f->order[oi];
+    Block *b = &f->blocks[bi];
+    for (uint32_t i = 0; i < b->ninsts; i++) {
+      Ref u = b->insts[i];
+      Inst *in = &f->insts[u];
+      if (in->op != I_MUL || s->folded[u]) continue;
+      Ref *a = ir_args(f, u);
+      /* The extensions to drop.  An extension is to 64 bits, so the
+         multiply of one is of 64; one the multiply alone reads is no
+         branch's or edge's operand. */
+      bool drop[2];
+      for (int slot = 0; slot < 2; slot++) {
+        const Inst *xi = &f->insts[a[slot]];
+        drop[slot] = (xi->op == I_EXTENDU || xi->op == I_EXTENDS || xi->op == I_EXT32S) &&
+                     uses[a[slot]] == (a[0] == a[1] ? 2u : 1u);
+      }
+      if (!drop[0] && !drop[1]) continue;
+      /* which way both operands are their low halves extended: 1 unsigned,
+         2 signed */
+      unsigned kind = 3;
+      for (int slot = 0; slot < 2; slot++) {
+        Ref x = a[slot];
+        /* another fold's is in no register */
+        if (s->folded[x]) kind = 0;
+        if (ir_known_bits(f, x, 4) > 0xffffffffull) kind &= ~1u;
+        if (!ir_sign_ge(f, x, 33)) kind &= ~2u;
+      }
+      if (!kind) continue;
+      for (int slot = 0; slot < 2; slot++)
+        if (drop[slot]) s->folded[a[slot]] = 1;
+      s->wmul[u] = kind & 1 ? 1 : 2;
+      g_stats.mull_folds++;
+    }
+  }
+
   if (!warmc_getenv("WARMC_NO_OPFUSE"))
   for (uint32_t oi = 0; oi < f->norder; oi++) {
     uint32_t bi = f->order[oi];
@@ -5178,6 +5237,7 @@ give_up:
   xfree(s->bfi);
   xfree(s->vrot); xfree(s->vadal); xfree(s->vmla); xfree(s->vbyel);
   xfree(s->extr);
+  xfree(s->wmul); s->wmul = NULL;
   xfree(s->pc); xfree(s->pc_bfirst); xfree(s->pc_bn); xfree(s->pc_head);
   xfree(s->recomp);
   xfree(s->pc_next);

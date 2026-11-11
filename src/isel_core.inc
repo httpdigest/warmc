@@ -161,6 +161,9 @@ typedef struct {
   uint8_t *cinc;
   /* an or or xor of x << k and y >> (width - k), both folded: one extr */
   uint8_t *extr;
+  /* a 64-bit multiply of two 32-bit values extended alike, an extension
+     folded: 1 a umull, 2 an smull (isel.c, ahead of the folds into adds) */
+  uint8_t *wmul;
   /* an or of a bitfield of x (a bfx, folded) and a value with zeros where
      the field goes: 1 + the bitfield's slot, and the or is x inserted into
      the value, bfi or bfxil -- one step on a chain through x where ubfiz

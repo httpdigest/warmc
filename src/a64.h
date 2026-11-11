@@ -80,6 +80,7 @@ void a64_umulh(Buf *b, int rd, int rn, int rm);
 void a64_smulh(Buf *b, int rd, int rn, int rm);
 void a64_umull(Buf *b, int rd, int rn, int rm);
 void a64_smull(Buf *b, int rd, int rn, int rm);
+void a64_maddl(Buf *b, bool sign, bool sub, int rd, int rn, int rm, int ra);
 void a64_sdiv(Buf *b, int sf, int rd, int rn, int rm);
 void a64_udiv(Buf *b, int sf, int rd, int rn, int rm);
 

@@ -1625,8 +1625,18 @@ not made. A limb of a multi-word add as GMP's generic C writes it, `s = u +
 v`, `r = s + cin`, carry out `(s < u) | (r < s)`, is one `adcs` on arm64,
 and a subtract's one `sbcs`; the next limb finds its carry in the flag
 still, so a chain of limbs is a chain of `adcs`, a cycle each, with a
-`cset` beside each for the carry's register (hsbench/integer). On arm64 an
-and or or of compares that a select or branch tests, up to four compares, is
+`cset` beside each for the carry's register (hsbench/integer). On arm64 a
+64-bit multiply of two 32-bit values extended alike is a `umull` or an
+`smull`, which read `w` registers and extend them themselves: an extension
+only the multiply reads is no instruction. The other operand
+is another such, the same one -- a square -- or any value that is its low
+half extended that way already: zeros known above bit 31, or its top 33 bits
+its sign's, as a narrow load, a masked or shifted value, an extension read
+elsewhere too or made before the loop, and a constant in range are. A sum
+with the product, or a difference from it, is a `umaddl`, `smaddl`, `umsubl`
+or `smsubl`: a hash's `(u64)x * K`, a big number's limb times limb
+(`WARMC_NO_WIDE_MUL=1` turns it off; `--stats` counts `mull_folds`). On
+arm64 an and or or of compares that a select or branch tests, up to four compares, is
 a `cmp` and a `ccmp` (or `ccmn`) for each compare after the first, its
 flags read by the `csel` or `b.cond` where `cset`s, an `and` and a test of
 it would each take a cycle: musl's `strtod` carries its first limb round a
@@ -2581,7 +2591,8 @@ Most of the suite is **differential**. warmc's output is compared with:
   `addchain.wat` by `test/gen_addchain.py`, `slp.wat` by `test/gen_slp.py`,
   `vec_iv.wat` by `test/gen_veciv.py`, `arr_bias.wat` by
   `test/gen_arr_bias.py`, `tail_pairs.wat` by `test/gen_tail_pairs.py`,
-  `sign_bits.wat` by `test/gen_sign_bits.py`
+  `wide_mul.wat` by `test/gen_wide_mul.py`, `sign_bits.wat` by
+  `test/gen_sign_bits.py`
 - mutants of a transform -- a test it makes dropped or loosened, a bound
   moved, an operand swapped -- each of which some test must tell from the
   transform, or the spec names it equivalent and why (`make

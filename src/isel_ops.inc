@@ -755,6 +755,10 @@ static void emit_inst(Isel *s, Ref v) {
         } else if (ci->op == I_EXTENDU || ci->op == I_EXTENDS || ci->op == I_EXT32S) {
           int y = rd(s, ca[0], S1);
           a64_addsub_extw(B, in->op == I_SUB, d, x, y, ci->op != I_EXTENDU, 0);
+        } else if (s->wmul && s->wmul[a[1]]) {
+          /* the product of two w registers, extended as they are read */
+          int y = rd(s, wmul_src(s, ca[0]), S1), z = rd(s, wmul_src(s, ca[1]), S3);
+          a64_maddl(B, s->wmul[a[1]] == 2, in->op == I_SUB, d, y, z, x);
         } else {
           int y = rd(s, ca[0], S1), z = rd(s, ca[1], S3);
           if (in->op == I_ADD) a64_madd(B, sf, d, y, z, x);
@@ -879,6 +883,13 @@ static void emit_inst(Isel *s, Ref v) {
       break;
     }
     case I_MUL: {
+      if (s->wmul && s->wmul[v]) {
+        int x = rd(s, wmul_src(s, a[0]), S0), y = rd(s, wmul_src(s, a[1]), S1);
+        int d = wr(s, v, S2);
+        if (s->wmul[v] == 2) a64_smull(B, d, x, y); else a64_umull(B, d, x, y);
+        commit(s, v, d);
+        break;
+      }
       int x = rd(s, a[0], S0), y = rd(s, a[1], S1);
       int d = wr(s, v, S2);
       a64_mul(B, sf, d, x, y);
