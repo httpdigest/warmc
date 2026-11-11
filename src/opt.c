@@ -29248,6 +29248,7 @@ void ir_optimize(IrFunc *f, const OptOpts *o) {
   if (devirt_round(f, o))
     ir_verify(f, "post-devirt");
 
+  if (o->selftail && o->inl && inline_tail_pairs(f, o)) ir_verify(f, "post-tail-pairs");
   if (o->selftail) pass_self_tail(f);
   if (o->acc_tail && pass_acc_tail(f)) ir_verify(f, "post-acc-tail");
 

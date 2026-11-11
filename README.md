@@ -1367,7 +1367,7 @@ and `ldcomb` need `guard-pages`; `small-loop-align` needs `align`; and
 | `slp` | straight-line vectors: a block's stores to adjacent addresses, as many as fill a vector, whose values are alike lane by lane -- one integer or float operation of operands themselves alike, loads of adjacent addresses, one value in every lane or constants -- as one vector computation and one vector store, where that is fewer instructions and no load or store moves past what it may touch: C++'s `w *= k; h *= k` as one `fmul.2d`, four words copied as one `ldr q` and `str q`, a matrix product's row two entries at a time; addresses adjacent through offsets and through 32-bit adds alike (an add that wraps between two lanes leaves the first within 12 bytes of 2^32, past any memory); lanes loaded in a block before the stores' are loaded as a vector there, before the loop where the scalars were; a block's groups share their splats; not lanes loaded just after a call that was handed their address, which wrote them a lane at a time, stores a vector load cannot take forwarded; with guard pages, not under `-fexact-trap` |
 | `addroff`, `memptr` | fold address arithmetic into displacements; compute a native pointer once per base, and for constant addresses too large for a displacement one per block, to the 4 KiB page below them where that reaches them (one add to the memory base), also for an access alone in its block |
 | `ldcomb` | merge byte-assembling loads into one wide load |
-| `selftail` | turn self `return_call` into a loop |
+| `selftail` | turn self `return_call` into a loop. With `inline`, a function whose `return_call` is of a function that tail-calls it back takes that function's body in at the call, its tail calls kept, where it is of at most 96 instructions and neither has a handler: the call back is then a tail call of itself, and the pair one loop in each of the two (`zigbench/tailrec`'s `even` and `odd`, a dozen instructions and a jump each, are seven instructions a pair and take 0.67 the cycles; `WARMC_NO_TAIL_PAIRS=1` turns it off, `--stats` counts `tail_pairs`) |
 | `gloop`, `gssa` | keep globals in registers across loops; promote a global to SSA where that does fewer memory operations on it, such as a shadow stack pointer moved in a loop, or Go's where `go-sp` does not pass it (`-fgssa-all` promotes every one, which costs more than it saves) |
 | `loopclose` | loop-closed SSA for values used after a loop |
 | `escape` | remove GC objects that never escape and forward their fields |
@@ -2580,7 +2580,7 @@ Most of the suite is **differential**. warmc's output is compared with:
   `test/cases_opt/trunc_exact.wat` is made by `test/gen_fexact.py`,
   `addchain.wat` by `test/gen_addchain.py`, `slp.wat` by `test/gen_slp.py`,
   `vec_iv.wat` by `test/gen_veciv.py`, `arr_bias.wat` by
-  `test/gen_arr_bias.py`
+  `test/gen_arr_bias.py`, `tail_pairs.wat` by `test/gen_tail_pairs.py`
 - mutants of a transform -- a test it makes dropped or loosened, a bound
   moved, an operand swapped -- each of which some test must tell from the
   transform, or the spec names it equivalent and why (`make

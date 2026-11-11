@@ -286,6 +286,8 @@ static void splice(IrFunc *f, IrFunc *g, uint32_t bi, uint32_t cont,
         break;
       }
       default:
+        /* (and a block that ends in a tail call, where a callee's are kept --
+           inline_tail_pairs: nothing runs on from one) */
         f->blocks[nb].term = T_TRAP;
         f->blocks[nb].term_imm = TRAP_UNREACHABLE;
         break;
@@ -2057,6 +2059,81 @@ static bool inl_run(IrFunc *f, const OptOpts *o, uint32_t budget0, bool more) {
   xfree(sites.v);
   xfree(ev);
   memo_end_run(memo);
+  return any;
+}
+
+/* ---- two functions that tail-call each other --------------------------------
+
+   A function whose tail call is of one that tail-calls it back takes that
+   one's body in at the call, its tail calls kept: its tail call back is then
+   this function's of itself, which pass_self_tail makes a loop of -- the
+   two functions' steps one after the other, no jump between them and no
+   arguments moved into place for one.  LLVM gets there by inlining the one
+   into the other and eliminating the tail call that is left; three engines
+   that compile with it ran zigbench/tailrec's even and odd, a dozen
+   instructions and a jump each here, as six instructions a pair, in 0.7
+   the time.  The other function takes this one in the same way when it is
+   compiled.  A callee of at most TAIL_PAIR_MAX instructions, with no
+   handler of its own, at a call no handler covers
+   (WARMC_NO_TAIL_PAIRS=1; --stats counts tail_pairs). */
+#define TAIL_PAIR_MAX 96u
+
+bool inline_tail_pairs(IrFunc *f, const OptOpts *o) {
+  if (f->npads || warmc_getenv("WARMC_NO_TAIL_PAIRS")) return false;
+  Module *m = f->m;
+  bool any = false;
+  uint32_t nb = f->nblocks;
+  for (uint32_t bi = 0; bi < nb; bi++) {
+    Block *b = &f->blocks[bi];
+    if (!b->reachable || !b->ninsts) continue;
+    Ref call = b->insts[b->ninsts - 1];
+    if (f->insts[call].op != I_RETURN_CALL) continue;
+    uint32_t gi = (uint32_t)f->insts[call].imm;
+    if (gi == f->func_index || m->funcs[gi].imported) continue;
+    IrFunc *g = ir_build(m, gi, o);
+    uint32_t n = 0;
+    bool back = false;
+    for (uint32_t gb = 0; gb < g->nblocks; gb++) {
+      const Block *x = &g->blocks[gb];
+      if (!x->reachable) continue;
+      n += x->ninsts;
+      for (uint32_t i = 0; i < x->ninsts; i++) {
+        const Inst *in = &g->insts[x->insts[i]];
+        if (in->op == I_RETURN_CALL && (uint32_t)in->imm == f->func_index) back = true;
+      }
+    }
+    if (!back || g->npads || n > TAIL_PAIR_MAX) {
+      ir_free(g);
+      continue;
+    }
+    /* the call gone from its block, which the splice ends in a jump to the
+       callee's entry; where the callee returns, a block that returns what it
+       returns */
+    CompType *sig = &m->types[m->funcs[gi].type_index];
+    uint32_t nargs = f->insts[call].nargs;
+    Ref *callargs = xmalloc((nargs ? nargs : 1) * sizeof(Ref));
+    if (nargs) memcpy(callargs, ir_args(f, call), nargs * sizeof(Ref));
+    uint32_t cont = ir_new_block(f);
+    Ref *ret = ir_alloc(f, (sig->nresults ? sig->nresults : 1) * sizeof(Ref));
+    for (uint32_t i = 0; i < sig->nresults; i++) ret[i] = ir_add_param(f, cont, sig->results[i]);
+    Block *cb = &f->blocks[cont];
+    cb->term = T_RETURN;
+    cb->nret = cb->cap_ret = sig->nresults;
+    cb->ret_args = ret;
+    cb->sealed = cb->filled = cb->reachable = true;
+    f->blocks[bi].ninsts--;
+    ir_make_nop(&f->insts[call]);
+    splice(f, g, bi, cont, callargs, nargs, NULL, 0);
+    xfree(callargs);
+    ir_free(g);
+    g_stats.tail_pairs++;
+    any = true;
+  }
+  if (any) {
+    ir_mark_reachable(f);
+    ir_recompute_preds(f);
+    ir_order(f);
+  }
   return any;
 }
 

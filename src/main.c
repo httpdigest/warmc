@@ -348,7 +348,7 @@ static void print_stats(void) {
           "warmc stats: folded=%llu dce=%llu cse=%llu licm=%llu branch=%llu\n"
           "             loads_fwd=%llu dead_stores=%llu checks_removed=%llu params=%llu\n"
           "             strength=%llu inlined=%llu rotated=%llu vectorised=%llu\n"
-          "             self_tail=%llu acc_tail=%llu addr_nowrap=%llu ldcomb=%llu spills=%llu insts=%llu\n"
+          "             self_tail=%llu tail_pairs=%llu acc_tail=%llu addr_nowrap=%llu ldcomb=%llu spills=%llu insts=%llu\n"
           "             ldpairs=%llu stpairs=%llu cold_frames=%llu early_rets=%llu shrink_wrapped=%llu entry_checks=%llu loop_phases=%llu page_fits=%llu page_fit_bytes=%llu next_jumps=%llu hot_fits=%llu dead_pads=%llu"
           " exact_store_checks=%llu exact_memop_checks=%llu\n"
           "             reloads=%llu caller_saves=%llu csa_restores=%llu"
@@ -384,7 +384,7 @@ static void print_stats(void) {
           (unsigned long long)g_stats.inlined,
           (unsigned long long)g_stats.rotated,
           (unsigned long long)g_stats.vectorized,
-          (unsigned long long)g_stats.self_tail,
+          (unsigned long long)g_stats.self_tail, (unsigned long long)g_stats.tail_pairs,
           (unsigned long long)g_stats.acc_tail,
           (unsigned long long)g_stats.addr_nowrap,
           (unsigned long long)g_stats.loads_combined,

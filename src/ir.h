@@ -783,6 +783,8 @@ bool compile_parse_flag(OptOpts *o, const char *a);
 void compile_finish_opts(OptOpts *o);
 void compile_release(void);
 bool pass_inline(IrFunc *f, const OptOpts *o);
+/* inline.c: the body of a tail call's callee that tail-calls back, taken in */
+bool inline_tail_pairs(IrFunc *f, const OptOpts *o);
 /* Frees the calling thread's inliner memo (inline.c). */
 void inl_memos_release(void);
 bool pass_inline_round2(IrFunc *f, const OptOpts *o);
@@ -798,6 +800,9 @@ typedef struct {
   uint64_t loads_forwarded, stores_removed, checks_removed, inlined;
   uint64_t params_removed, strength_reduced, moves_coalesced, sunk, rotated;
   uint64_t insts_emitted, spills, reloads, vectorized, self_tail, acc_tail, addr_nowrap;
+  /* tail calls of a function that tail-calls back, its body taken in
+     (inline.c inline_tail_pairs) */
+  uint64_t tail_pairs;
   uint64_t escape_removed, escape_forwarded, escape_made;
   uint64_t loads_combined;
   uint64_t globals_promoted, loops_closed, globals_ssa;
