@@ -5053,6 +5053,8 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
     fout->fit = xmalloc(2 * (size_t)npfr * sizeof(uint32_t));
     for (uint32_t i = 0; i < 2 * npfr; i++) fout->fit[i] = pfr[i] + (uint32_t)(pro.len + lead.len);
   }
+  /* (the listing below wants it after the lead is freed) */
+  uint32_t code_at = (uint32_t)(lead.len + pro.len);
   buf_free(&lead);
   const char *sym = f->m->funcs[f->func_index].sym;
   fout->sym = sym;
@@ -5063,10 +5065,10 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
        instruction's offset in the code with the value it made and where
        that and its operands live (a register number, or sN for a slot) */
     fprintf(stderr, "LISTING %s func=%u len=%u body=%u slots=%u nslots=%u\n", sym, f->func_index,
-            fout->code_len, (uint32_t)(lead.len + pro.len), s->slots_off, s->nslots);
+            fout->code_len, code_at, s->slots_off, s->nslots);
     ir_print(f, "listing");
     for (uint32_t k = 0; k + 1 < s->nlst; k += 2) {
-      uint32_t off = s->lst[k] + (uint32_t)(lead.len + pro.len), v = s->lst[k + 1];
+      uint32_t off = s->lst[k] + code_at, v = s->lst[k + 1];
       if (v & 0x80000000u) {
         fprintf(stderr, "@%x %c%u\n", off, (v & 0x40000000u) ? 'T' : 'B', v & 0x3fffffffu);
         continue;

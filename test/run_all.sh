@@ -401,6 +401,8 @@ start same python3 test/run_same.py
 # the rule by itself, and what the compiler and the linker make of it
 start pagefit-rule ./build/pagefit_test
 start pagefit python3 test/run_pagefit.py
+# WARMC_LISTING's offsets against the code's
+start listing python3 test/run_listing.py
 
 start cases-farbr env WARMC_FAR_BRANCH=1 WARMC_FLAGS=-O2 ./test/run_tests.sh
 start traps-farbr env WARMC_FAR_BRANCH=1 ./test/run_traps.sh

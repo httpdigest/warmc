@@ -2542,6 +2542,9 @@ The other rows check what has no second engine to compare with:
   (`test/run_pagefit.py`); the rule by itself on stretches and code made to
   measure, a loop behind each kind of branch at and over a page's edge
   (`test/pagefit_test.c`)
+- `WARMC_LISTING`'s offsets: each multiplication it lists, of an exported
+  function and of one placed as a start and a full body, is one in the
+  object's disassembly at that offset (`test/run_listing.py`)
 - a Go `net/http` server (`test/gohttp`, `test/run_gohttp.py`), built by
   Go's own compiler and run at `-O0`, `-O1` and `-O2` with a listener and a
   directory preopened: many requests on one connection and many connections
