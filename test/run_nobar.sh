@@ -17,6 +17,19 @@ if [ ${#mods[@]} -eq 0 ]; then
   exit 0
 fi
 
+# The corpora's rows build their modules again while this one runs (make
+# check runs the rows side by side), and a module replaced between its two
+# compiles -- gobench/bintree, on a run that rebuilt the corpora -- differed
+# from itself, not by the barrier.  So both compile one copy, taken first
+# (test/run_jobs.sh's reason, and its way).
+snap="$WORK/mods"
+rm -rf "$snap"
+mkdir -p "$snap"
+for w in "${mods[@]}"; do
+  cp "$w" "$snap/$(basename "$(dirname "$w")")-$(basename "$w")"
+done
+mods=("$snap"/*.wasm)
+
 for w in "${mods[@]}"; do
 
   if ! "$BUILD/warmc" -O2 -c "$w" -o "$WORK/a.o" 2>"$WORK/err"; then
