@@ -1,4 +1,5 @@
 #include "linkobj.h"
+#include "pagefit.h"
 
 #include <stdio.h>
 #include <sys/stat.h>
@@ -1080,7 +1081,16 @@ static uint64_t align_up(uint64_t v, uint64_t a) {
   return a <= 1 ? v : (v + a - 1) & ~(a - 1);
 }
 
+/* Each section of a kind at its address, in the objects' order.  A text
+   atom of another's making -- the runtime's functions, not the module's
+   text, one atom its maker placed its functions in -- lies inside its 4 KB
+   page by pagefit.c's rule, its loops read off its code; not a PE's, which
+   is x86-64's.  WARMC_NO_PAGE_FIT=1 turns that off, and
+   WARMC_PAGE_FIT_DEBUG=1 prints each atom looked at: where it would have
+   started, where it starts, its size and its alignment. */
 uint64_t place(Linker *L, SecKind k, uint64_t at) {
+  bool fit = k == K_TEXT && L->fmt != TGT_PE && !warmc_getenv("WARMC_NO_PAGE_FIT");
+  bool say = fit && warmc_getenv("WARMC_PAGE_FIT_DEBUG");
   for (uint32_t i = 0; i < L->nobjs; i++) {
     InObj *o = &L->objs[i];
     for (uint32_t s = 0; s < o->nsecs; s++) {
@@ -1088,6 +1098,13 @@ uint64_t place(Linker *L, SecKind k, uint64_t at) {
       if (is->kind != k || (!is->size && k != K_BSS)) continue;
       if (!is->size) continue;
       at = align_up(at, is->align);
+      if (fit) {
+        uint64_t to = pagefit_code(is->data, is->size, is->align, at);
+        if (say && is->align < PAGEFIT_PAGE)
+          fprintf(stderr, "linkfit at=%llu to=%llu size=%llu align=%llu\n", (unsigned long long)at,
+                  (unsigned long long)to, (unsigned long long)is->size, (unsigned long long)is->align);
+        at = to;
+      }
       is->addr = at;
       at += is->size;
     }

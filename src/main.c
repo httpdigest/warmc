@@ -349,7 +349,7 @@ static void print_stats(void) {
           "             loads_fwd=%llu dead_stores=%llu checks_removed=%llu params=%llu\n"
           "             strength=%llu inlined=%llu rotated=%llu vectorised=%llu\n"
           "             self_tail=%llu acc_tail=%llu addr_nowrap=%llu ldcomb=%llu spills=%llu insts=%llu\n"
-          "             ldpairs=%llu stpairs=%llu cold_frames=%llu early_rets=%llu shrink_wrapped=%llu entry_checks=%llu loop_phases=%llu next_jumps=%llu hot_fits=%llu dead_pads=%llu"
+          "             ldpairs=%llu stpairs=%llu cold_frames=%llu early_rets=%llu shrink_wrapped=%llu entry_checks=%llu loop_phases=%llu page_fits=%llu page_fit_bytes=%llu next_jumps=%llu hot_fits=%llu dead_pads=%llu"
           " exact_store_checks=%llu exact_memop_checks=%llu\n"
           "             reloads=%llu caller_saves=%llu csa_restores=%llu"
           " v128_spills=%llu rb_trips=%llu split_cuts=%llu split_invs=%llu pieces=%llu"
@@ -396,7 +396,8 @@ static void print_stats(void) {
           (unsigned long long)g_stats.early_rets,
           (unsigned long long)g_stats.shrink_wrapped,
           (unsigned long long)g_stats.entry_checks,
-          (unsigned long long)g_stats.loop_phases, (unsigned long long)g_stats.next_jumps,
+          (unsigned long long)g_stats.loop_phases, (unsigned long long)g_stats.page_fits,
+          (unsigned long long)g_stats.page_fit_bytes, (unsigned long long)g_stats.next_jumps,
           (unsigned long long)g_stats.hot_fits, (unsigned long long)g_stats.dead_pads,
           (unsigned long long)g_stats.exact_store_checks,
           (unsigned long long)g_stats.exact_memop_checks,

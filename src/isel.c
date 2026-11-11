@@ -1,6 +1,7 @@
 #include "ir.h"
 #include "a64.h"
 #include "target.h"
+#include "pagefit.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -1674,6 +1675,11 @@ static void emit_memop_r(Isel *s, Ref v, const Ref *a, bool fill) {
 }
 
 #define SMALL_LOOP_INSTS 12u
+/* a loop of at most PAGEFIT_MAX bytes lies inside one 4 KB page
+   (pagefit.c): one that may be so small has at most PAGE_LOOP_INSTS IR
+   instructions and terminators, calls among them -- half as many again as
+   the bytes are instructions, for those that make none */
+#define PAGE_LOOP_INSTS 96u
 
 static bool block_calls(IrFunc *f, const Block *b) {
   for (uint32_t i = 0; i < b->ninsts; i++) {
@@ -1708,7 +1714,7 @@ static uint32_t block_emits(Isel *s, IrFunc *f, const Block *b) {
    once lowered -- and no call.
    A loop that calls waits on the call, not on fetching itself: the branch
    over its padding was gobench/recurse's whole gap to clang. */
-static bool small_loop(Isel *s, IrFunc *f, uint32_t h) {
+static bool loop_within(Isel *s, IrFunc *f, uint32_t h, uint32_t limit, bool calls_too) {
   uint32_t nb = f->nblocks, n = 0, sp = 0;
   uint8_t *in = xcalloc(nb ? nb : 1, 1);
   uint32_t *stk = xmalloc((nb ? nb : 1) * sizeof(uint32_t));
@@ -1720,19 +1726,23 @@ static bool small_loop(Isel *s, IrFunc *f, uint32_t h) {
     uint32_t l = hb->preds[p];
     if (f->blocks[l].rpo >= hb->rpo && !in[l]) { in[l] = 1; stk[sp++] = l; }
   }
-  bool ok = !block_calls(f, hb);
+  bool ok = calls_too || !block_calls(f, hb);
   while (sp && ok) {
     uint32_t x = stk[--sp];
     Block *xb = &f->blocks[x];
     n += (exact ? block_emits(s, f, xb) : xb->ninsts) + 1;
-    if (n > SMALL_LOOP_INSTS || x == f->entry || block_calls(f, xb)) ok = false;
+    if (n > limit || x == f->entry || (!calls_too && block_calls(f, xb))) ok = false;
     for (uint32_t p = 0; p < xb->npreds && ok; p++) {
       uint32_t q = xb->preds[p];
       if (!in[q]) { in[q] = 1; stk[sp++] = q; }
     }
   }
   xfree(in); xfree(stk);
-  return ok && n <= SMALL_LOOP_INSTS;
+  return ok && n <= limit;
+}
+
+static bool small_loop(Isel *s, IrFunc *f, uint32_t h) {
+  return loop_within(s, f, h, SMALL_LOOP_INSTS, false);
 }
 
 /* The least padding after offset `at` that starts a loop of `span` bytes on
@@ -4737,14 +4747,34 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
 
   uint32_t neo, nsmall = 0;
   const uint32_t *eo = ir_emit_order(f, dead_ret, &neo);
+  /* each loop's that may be small, its header and order index, and every
+     block's end: the stretches the placing keeps inside a page
+     (FuncOut.fit) */
+  bool pfit = opt->align && !warmc_getenv("WARMC_NO_PAGE_FIT");
+  uint32_t *pfr = NULL, npfr = 0, *pend = NULL;
   bool keep_next = warmc_getenv("WARMC_KEEP_NEXT_JUMP") != NULL;
   s->prev_bi = UINT32_MAX;
   for (uint32_t oi = 0; oi < neo; oi++) {
     uint32_t bi = eo[oi];
+    bool tiny = false;
+    if (opt->align && f->blocks[bi].loop_depth && (small_align || pfit)) {
+      uint32_t lh = ir_loop_header_at(f, bi);
+      tiny = lh != UINT32_MAX && small_align && small_loop(s, f, lh);
+      /* (a loop that may come to PAGEFIT_MAX bytes: its emitted size tells) */
+      if (pfit && lh != UINT32_MAX && (tiny || loop_within(s, f, lh, PAGE_LOOP_INSTS, true))) {
+        if (!pfr) {
+          pfr = ir_alloc(f, 2 * (size_t)f->nblocks * sizeof(uint32_t));
+          pend = ir_alloc(f, (size_t)f->nblocks * sizeof(uint32_t));
+          memset(pend, 0, (size_t)f->nblocks * sizeof(uint32_t));
+        }
+        pfr[2 * npfr] = bi; pfr[2 * npfr + 1] = oi;
+        npfr++;
+      }
+    }
     if (lalign && opt->align && f->blocks[bi].loop_depth) {
       uint32_t lh = ir_loop_header_at(f, bi);
       bool header = lh != UINT32_MAX;
-      bool small = header && small_align && small_loop(s, f, lh);
+      bool small = tiny;
       if (small) nsmall++;
       /* (not one that calls, as small_loop: rsbench/recurse's fib loop,
          entered on every call, ran 20% slower behind a branch over its
@@ -4824,6 +4854,7 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
     s->ra_cost += a64_code_cost(B->data + s->block_off[bi], B->len - s->block_off[bi]) *
                   blk_freq(&f->blocks[bi]);
     if (blk_end) blk_end[bi] = (uint32_t)B->len;
+    if (pend) pend[bi] = (uint32_t)B->len;
     if (opt->profile) {
       uint32_t w = (uint32_t)((B->len - s->prof_start[bi]) / 4);
       w = (w > s->prof_skip) ? w - s->prof_skip : 0;
@@ -4874,6 +4905,20 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
     if (refit) { f->loop_bytes = spans; f->loop_phase = (uint8_t)ph; }
   }
   xfree(blk_end); xfree(rec); xfree(rhot);
+  /* (a block emitted before the first of these loops has no end in pend: a
+     loop's blocks all come after its top) */
+  {
+    uint32_t keep = 0;
+    for (uint32_t k = 0; k < npfr; k++) {
+      uint32_t top = s->block_off[pfr[2 * k]];
+      uint32_t span = loop_span(s, ir_loop_header_at(f, pfr[2 * k]), eo, neo, pfr[2 * k + 1], pend);
+      if (!span || span > PAGEFIT_MAX) continue;
+      pfr[2 * keep] = top;
+      pfr[2 * keep + 1] = top + span;
+      keep++;
+    }
+    npfr = keep;
+  }
 
   if (early) early_ret_stub(s, &er, &pro, er_site);
   emit_alloc_slow_arms(s);
@@ -5002,6 +5047,11 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
     fout->full_br = xmalloc(s->nfull_br * sizeof(uint32_t));
     for (uint32_t i = 0; i < s->nfull_br; i++)
       fout->full_br[i] = s->full_br[i] + (uint32_t)(pro.len + lead.len);
+  }
+  if (npfr) {
+    fout->nfit = npfr;
+    fout->fit = xmalloc(2 * (size_t)npfr * sizeof(uint32_t));
+    for (uint32_t i = 0; i < 2 * npfr; i++) fout->fit[i] = pfr[i] + (uint32_t)(pro.len + lead.len);
   }
   buf_free(&lead);
   const char *sym = f->m->funcs[f->func_index].sym;

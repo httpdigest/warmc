@@ -157,8 +157,10 @@ void write_macho64(ObjBuilder *o, const char *path) {
 
   struct { const char *sect, *seg; const Buf *data; uint64_t addr, off;
            uint32_t align, flags; const Buf *rel; uint64_t reloff; } S[4] = {
+    /* (2^12: an offset in the text is its address but for whole pages, which
+       its functions are placed by, pagefit.c) */
     { "__text",  "__TEXT", &o->text,   text_addr,  off_text,
-      6, S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS, &reloc[0], rel_off[0] },
+      12, S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS, &reloc[0], rel_off[0] },
     { "__const", "__TEXT", &o->rodata, const_addr, off_const, 4, 0, &reloc[1], rel_off[1] },
     { "__data",  "__DATA", &o->data,   data_addr,  off_data,  4, 0, &reloc[2], rel_off[2] },
     { "__wasm_custom", "__TEXT", &o->custom, custom_addr, off_custom, 3, 0, &reloc[3], rel_off[3] },

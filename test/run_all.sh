@@ -397,6 +397,10 @@ start bigtable python3 test/run_bigtable.py
 start pools python3 test/run_pools.py
 # the slower ways behind a switch that find what the quicker ones do
 start same python3 test/run_same.py
+# small loops and small functions inside one 4 KB page, the runtime's too:
+# the rule by itself, and what the compiler and the linker make of it
+start pagefit-rule ./build/pagefit_test
+start pagefit python3 test/run_pagefit.py
 
 start cases-farbr env WARMC_FAR_BRANCH=1 WARMC_FLAGS=-O2 ./test/run_tests.sh
 start traps-farbr env WARMC_FAR_BRANCH=1 ./test/run_traps.sh

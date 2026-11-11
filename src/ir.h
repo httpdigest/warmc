@@ -743,6 +743,11 @@ typedef struct FuncOut {
 
   uint32_t *refs; uint32_t nrefs;
 
+  /* stretches of the code, [start, end) byte offsets in pairs, each to lie
+     inside one 4 KB page (pagefit.c): its loops of at most PAGEFIT_MAX
+     bytes (isel.c) */
+  uint32_t *fit; uint32_t nfit;
+
   /* A shrink-wrapped function (codegen.c sw_start): this is its start, a
      leaf, and full the whole function, placed right after it as
      "<sym>$full"; full_br are the offsets of the start's branches to it,
@@ -927,6 +932,9 @@ typedef struct {
   /* functions placed past the start of their 64-byte block for their small
      loops to fit (isel.c loop_phase) */
   uint64_t loop_phases;
+  /* functions moved for a small loop of theirs, or their own code, to lie
+     inside one 4 KB page (pagefit.c), and the bytes left ahead of them */
+  uint64_t page_fits, page_fit_bytes;
   /* jumps to the next instruction left out (isel.c produce_body); loops
      placed by their hot way round alone (loop_hot_span), and ones whose
      padding no branch goes over, put where nothing runs into it

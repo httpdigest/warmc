@@ -1392,7 +1392,7 @@ and `ldcomb` need `guard-pages`; `small-loop-align` needs `align`; and
 | `labcache`, `barelide` | keep the GC allocation buffer open in a one-block loop of small allocations and calls that cannot let anything escape; hoist the load-barrier mask out of a safepoint-free loop, and drop a repeated barrier on the same slot between safepoints |
 | `reach`, `prune`, `merge` | module-wide reachability, whose unreachable bodies are not compiled; a body the optimised code no longer calls becomes a stub that traps; share byte-identical functions |
 | `split` | live-range splitting at loop boundaries in loops that make no call, so a value the loop carries keeps a register inside it although it is spilled outside |
-| `align`, `small-loop-align` | code alignment; a loop small enough for one 64-byte fetch block is placed inside one (arm64) |
+| `align`, `small-loop-align` | code alignment; a loop small enough for one 64-byte fetch block is placed inside one, and a loop or a function of at most 256 bytes inside one 4 KB page (arm64) |
 | `cpool`, `regalloc`, `guard-pages` | constant pools; the real register allocator (off: every value lives in a stack slot); guard-page bounds checking |
 | `compress-data` | write the active data segments of a memory the module defines, when every one has a constant offset in bounds, as one compressed image of what they make of it, which instantiation decodes into the memory (see [Runtime](#how-it-works)); off, each segment's bytes as they are. On at every level |
 
@@ -1696,7 +1696,21 @@ takes 0.79 the time, `ktbench/bintree` 0.82, luawasm's `awfy_permute` 0.94;
 `WARMC_NO_SHRINK_WRAP=1` turns it off); a function with a loop small enough for one 64-byte fetch
 block starts at the offset in its block that lets such loops fit with the
 least padding run on their entry, the rest of the block left ahead of it,
-where nothing runs; a loop's one latch, the jump or test back to its
+where nothing runs; code that runs over a 4 KB boundary takes a cycle more
+to fetch each time it does -- on an Apple M4 a loop of five instructions is
+one cycle a trip inside a page and two across a boundary, one of a dozen
+1.5 and two, a leaf called in a loop three cycles a call and four, a
+recursion of nine instructions half as long again, where the same code at
+any offset in a 64-byte line, or across a boundary of any size under 4 KB,
+runs as it did -- so a loop of at most 256 bytes and a function of at most
+256 bytes lie inside one page: where one would not, its function starts
+later, by bytes ahead of it that nothing runs, the text section aligned to
+4096 so that an offset in it is an address but for whole pages; the linker
+places the runtime's functions by the same rule, their loops read off
+their code, a backward branch and its target (arm64;
+`WARMC_NO_PAGE_FIT=1` turns both off, `--stats` counts `page_fits` and
+`page_fit_bytes`, and `WARMC_PAGE_FIT_DEBUG=1` prints each function and
+each of the runtime's as it is placed); a loop's one latch, the jump or test back to its
 header, is laid out above the header where no block falls into it or three
 or more reach it, so that a way round which branched to the latch falls
 from it into the header, one taken branch where it took two
@@ -2519,6 +2533,15 @@ The other rows check what has no second engine to compare with:
   threadings made whole, every tail of a root list looked up, every gate's
   skipped work done and compared -- giving the same object for every
   module of the cases (`test/run_same.py`)
+- code inside its 4 KB page: a module of 780 loops and 1,400 small functions,
+  some placed as a start and a full body, each placed where the rule,
+  worked out again from the compiler's list of them, says, none of them
+  over a boundary in the disassembly, where without the rule dozens are;
+  and the runtime's functions behind ten programs of as many sizes, each
+  where the rule puts it for the branches the disassembly has
+  (`test/run_pagefit.py`); the rule by itself on stretches and code made to
+  measure, a loop behind each kind of branch at and over a page's edge
+  (`test/pagefit_test.c`)
 - a Go `net/http` server (`test/gohttp`, `test/run_gohttp.py`), built by
   Go's own compiler and run at `-O0`, `-O1` and `-O2` with a listener and a
   directory preopened: many requests on one connection and many connections

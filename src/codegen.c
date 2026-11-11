@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdatomic.h>
+#include "pagefit.h"
 
 #define ALIGN_BYTES 64u
 static void split_edge_push_arg(IrFunc *f, uint32_t from, uint32_t si, Ref v) {
@@ -1065,7 +1066,7 @@ done:
 static void fout_free(FuncOut *fo) {
   xfree(fo->uw.sites); xfree(fo->uw.clauses);
   xfree(fo->uw.gcsites); xfree(fo->uw.gcroots);
-  xfree(fo->code); xfree(fo->relocs); xfree(fo->refs); xfree(fo->full_br);
+  xfree(fo->code); xfree(fo->relocs); xfree(fo->refs); xfree(fo->full_br); xfree(fo->fit);
   if (fo->sym_owned) xfree((char *)fo->sym);
   memset(fo, 0, sizeof *fo);
 }
@@ -1310,12 +1311,40 @@ void codegen_drop_function(ObjBuilder *obj, FuncOut *fo) {
   g_dead_bytes += fo->code_len;
   xfree(fo->uw.sites); xfree(fo->uw.clauses);
   xfree(fo->uw.gcsites); xfree(fo->uw.gcroots);
-  xfree(fo->code); xfree(fo->relocs); xfree(fo->refs);
+  xfree(fo->code); xfree(fo->relocs); xfree(fo->refs); xfree(fo->fit);
 }
 
 void codegen_dead_stats(uint32_t *bodies, uint64_t *bytes) {
   *bodies = g_dead_bodies;
   *bytes = g_dead_bytes;
+}
+
+/* A function's code inside its 4 KB page (pagefit.c): where it starts, by
+   the stretches isel.c measured (FuncOut.fit) and its own size.
+   WARMC_NO_PAGE_FIT=1 turns this off, and the linker's use of the rule
+   with it; --stats counts page_fits and page_fit_bytes, and
+   WARMC_PAGE_FIT_DEBUG=1 prints each function as it is placed: where the
+   text ended, where its code starts, its step, the bytes ahead of its
+   symbol, its length and its stretches.
+   0: off; 1: on; 2: on, and printing. */
+static int page_fit_mode(void) {
+  static _Atomic int v = -1;
+  int x = atomic_load_explicit(&v, memory_order_relaxed);
+  if (x < 0) {
+    x = !warmc_getenv("WARMC_NO_PAGE_FIT") && !g_target->is_x64;
+    if (x && warmc_getenv("WARMC_PAGE_FIT_DEBUG")) x = 2;
+    atomic_store_explicit(&v, x, memory_order_relaxed);
+  }
+  return x;
+}
+
+static uint64_t page_fit(uint64_t at, const FuncOut *fo, uint32_t step) {
+  if (!page_fit_mode()) return at;
+  return pagefit_stretches(at, step, fo->entry_off, fo->code_len, fo->fit, fo->nfit);
+}
+
+static uint32_t fit_step(const FuncOut *fo) {
+  return fo->want_align ? ALIGN_BYTES : fo->align8 ? 8u : 4u;
 }
 
 /* One function's code into the text, at its symbol; with merge, onto an
@@ -1339,7 +1368,7 @@ static void commit_one(ObjBuilder *obj, FuncOut *fo, bool merge, bool seed,
     g_stats.insts_emitted += fo->insts_emitted;
     xfree(fo->uw.sites); xfree(fo->uw.clauses);
     xfree(fo->uw.gcsites); xfree(fo->uw.gcroots);
-    xfree(fo->code); xfree(fo->relocs);
+    xfree(fo->code); xfree(fo->relocs); xfree(fo->fit);
     return;
   }
   if (!seed) goto placed_seed;
@@ -1365,6 +1394,22 @@ placed_seed:
   else if (fo->align8)
     while ((obj->text.len + fo->entry_off) & 7)
       g_target->pad_nop(&obj->text);
+  {
+    uint64_t want = page_fit(obj->text.len, fo, fit_step(fo));
+    if (page_fit_mode() == 2) {
+      fprintf(stderr, "pagefit %s at=%llu to=%llu step=%u entry=%u len=%u fit=", fo->sym,
+              (unsigned long long)obj->text.len, (unsigned long long)want, fit_step(fo),
+              fo->entry_off, fo->code_len);
+      for (uint32_t i = 0; i < fo->nfit; i++)
+        fprintf(stderr, "%s%u-%u", i ? "," : "", fo->fit[2 * i], fo->fit[2 * i + 1]);
+      fputc('\n', stderr);
+    }
+    if (want != obj->text.len) {
+      g_stats.page_fits++;
+      g_stats.page_fit_bytes += want - obj->text.len;
+      while (obj->text.len < want) g_target->pad_nop(&obj->text);
+    }
+  }
   uint64_t base = obj->text.len;
   *placed = base;
   buf_bytes(&obj->text, fo->code, fo->code_len);
@@ -1394,7 +1439,7 @@ placed_seed:
   if (merge) mb_add(base, fo, &g_aux, h);
   xfree(fo->uw.sites); xfree(fo->uw.clauses);
   xfree(fo->uw.gcsites); xfree(fo->uw.gcroots);
-  xfree(fo->code); xfree(fo->relocs); xfree(fo->refs);
+  xfree(fo->code); xfree(fo->relocs); xfree(fo->refs); xfree(fo->fit);
 }
 
 void codegen_commit_function(ObjBuilder *obj, FuncOut *fo) {
@@ -1411,10 +1456,11 @@ void codegen_commit_function(ObjBuilder *obj, FuncOut *fo) {
   fo->full = NULL;
   if (fo->want_align || fo->align8 || x->align8)
     warmc_fatal("internal: shrink-wrapped %s wants an alignment", fo->sym);
-  uint64_t start = obj->text.len;
+  uint64_t start = page_fit(obj->text.len, fo, fit_step(fo));
   uint64_t p = start + fo->code_len;
   if (x->want_align)
     while (((p + x->entry_off) & (ALIGN_BYTES - 1)) != x->phase) p += 4;
+  p = page_fit(p, x, fit_step(x));
   uint64_t body = p + x->entry_off;
   for (uint32_t i = 0; i < fo->nfull_br; i++) {
     uint32_t off = fo->full_br[i];
