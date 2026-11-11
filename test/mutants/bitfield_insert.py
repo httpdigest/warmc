@@ -16,7 +16,7 @@ M = {
  'bfi_const': (IS, [('        if (f->insts[o].op == I_CONST || s->folded[o]) continue;', '        if (s->folded[o]) continue;')]),
  'bfi_folded': (IS, [('        if (f->insts[o].op == I_CONST || s->folded[o]) continue;', '        if (f->insts[o].op == I_CONST) continue;')]),
  'bfi_tmp': (I, [('        int t = (d == x && d != o) ? S2 : d;', '        int t = d;')]),
- 'bfi_mov': (I, [('        if (t != o) a64_mov_reg(B, sf, t, o);\n', '')]),
+ 'bfi_mov': (I, [('        if (t != o) a64_mov_reg(B, SF64, t, o);\n', '')]),
 }
 SUITES = (('optcases', ['python3', 'test/run_optcases.py'], {}),
           ('cases', ['./test/run_tests.sh'], {'WARMC_FLAGS': '-O2'}),

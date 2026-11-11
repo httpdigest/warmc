@@ -392,6 +392,11 @@ start cases-table16-stubs env WARMC_NO_DIRECT_BRTABLE=1 WARMC_TABLE16_REACH=8 \
   WARMC_FLAGS=-O2 ./test/run_tests.sh
 # and tables of 70000 entries, which halfwords cannot reach past
 start bigtable python3 test/run_bigtable.py
+# an initialiser of 100000 constants in a compile's time, and root lists
+# that share their tails
+start pools python3 test/run_pools.py
+# the slower ways behind a switch that find what the quicker ones do
+start same python3 test/run_same.py
 
 start cases-farbr env WARMC_FAR_BRANCH=1 WARMC_FLAGS=-O2 ./test/run_tests.sh
 start traps-farbr env WARMC_FAR_BRANCH=1 ./test/run_traps.sh

@@ -6,7 +6,12 @@
 ;; (emit_gc_load_barrier_pre).  Collected at every allocation and every
 ;; object moved each time (test/run_gc.sh runs it so), each read after a
 ;; collection takes the slow path; a slot made wrong heals some other word,
-;; which the verifier or the sums see.  Every export checks its own answer
+;; which the verifier or the sums see.  far reads elements 520 and 599 of
+;; a row of 600, 4168 and 4800 bytes into it, past what an add takes as an
+;; immediate: the slow path makes the slot's address of the row kept
+;; beside the offset, not in the register that holds the row (isel.c
+;; emit_gc_load_stubs -- the address was twice the offset, and the stub
+;; healed that word or faulted on it).  Every export checks its own answer
 ;; and traps when it is wrong.  Assembled with wasm-tools.
 
 (module
@@ -15,6 +20,8 @@
   (type $outer (array (mut (ref null $refs))))
 
   (global $o (mut (ref null $outer)) (ref.null $outer))
+  ;; one row of 600, its elements 520 and 599 a 7 and a 9
+  (global $fo (mut (ref null $outer)) (ref.null $outer))
   ;; where each round's allocation goes, so that it is made and fills pages
   (global $junk (mut (ref null $refs)) (ref.null $refs))
 
@@ -27,7 +34,14 @@
                                  (struct.new $s (i32.const 30)))
         (array.new_fixed $refs 3 (struct.new $s (i32.const 100)) (struct.new $s (i32.const 200))
                                  (struct.new $s (i32.const 300))))))
-  (start $init)
+  (func $initfar
+    (local $row (ref null $refs))
+    (local.set $row (array.new_default $refs (i32.const 600)))
+    (array.set $refs (local.get $row) (i32.const 520) (struct.new $s (i32.const 7)))
+    (array.set $refs (local.get $row) (i32.const 599) (struct.new $s (i32.const 9)))
+    (global.set $fo (array.new_fixed $outer 1 (local.get $row))))
+  (func $start (call $init) (call $initfar))
+  (start $start)
 
   (func $check (param $got i32) (param $want i32)
     (if (i32.ne (local.get $got) (local.get $want)) (then unreachable)))
@@ -51,6 +65,21 @@
       (local.set $i (i32.add (local.get $i) (i32.const 1)))
       (br_if $l (i32.lt_u (local.get $i) (local.get $n))))
     (call $check (local.get $sum) (i32.mul (local.get $n) (i32.const 323))))
+
+  ;; n rounds, an allocation each, of reads at 520 and 599 of the long row,
+  ;; the row read for each: 7 + 9 a round
+  (func (export "far") (param $n i32)
+    (local $i i32) (local $sum i32)
+    (loop $l
+      (global.set $junk (array.new_default $refs (i32.const 256)))
+      (local.set $sum
+        (i32.add (local.get $sum)
+          (i32.add
+            (struct.get $s 0 (array.get $refs (array.get $outer (global.get $fo) (i32.const 0)) (i32.const 520)))
+            (struct.get $s 0 (array.get $refs (array.get $outer (global.get $fo) (i32.const 0)) (i32.const 599))))))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br_if $l (i32.lt_u (local.get $i) (local.get $n))))
+    (call $check (local.get $sum) (i32.mul (local.get $n) (i32.const 16))))
 
   ;; n rounds of a row's elements turned round at constant indices -- 0 and
   ;; 2 swapped, a new one at 1 -- each round allocating: the row's three

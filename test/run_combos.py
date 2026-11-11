@@ -48,7 +48,7 @@ rotate addroff memptr align guard-pages regalloc split vectorize edge-tests
 selftail ldcomb escape partial-escape gloop loopclose cpool ictab trampoline
 go-sp go-resume go-noret wrap-params gssa small-loop-align labcache barelide merge reach
 prune devirt reinline throw-jump unroll ifconv mulwide gcpure closed-world sealed once
-compress-data""".split()
+compress-data tails cmp-sink test-chain way-split arr-bias""".split()
 LEFT_OUT = {"fma", "dead-frames", "acc-tail", "float-reassoc", "addr-nowrap", "gssa-all",
             "exact-trap"}
 

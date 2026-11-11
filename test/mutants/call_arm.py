@@ -9,7 +9,12 @@ M = {
  'arm_calls': (IR, [('    if (t == other) return calls;', '    if (t == other) return true;')]),
  'arm_chain': (IR, [('  for (int steps = 0; steps < 8; steps++) {\n    for (uint32_t i = 0; i < b->ninsts && !calls; i++) {', '  for (int steps = 0; steps < 1; steps++) {\n    for (uint32_t i = 0; i < b->ninsts && !calls; i++) {')]),
  'arm_chain_npreds': (IR, [('    b = &f->blocks[t];\n    if (b->npreds != 1) return false;', '    b = &f->blocks[t];')]),
- 'arm_hook': (IR, [('    bool out = b->outline || call_arm(f, bi);', '    bool out = b->outline;')]),
+ 'arm_hook': (IR, [('    uint32_t flagged = b->outline || (cold_late && b->cold) || call_arm(f, bi);', '    uint32_t flagged = b->outline || (cold_late && b->cold);')]),
+}
+EQUIVALENT = {
+ 'arm_chain': "a block that only jumps to one nothing else reaches is one block with it by then "
+              "(opt.c merge_blocks, in every pass_branch), so an arm is one block and the walk's "
+              "second step runs only with block merging off, which no case's code is checked under",
 }
 SUITES = (('optcases', ['python3', 'test/run_optcases.py'], {}),
           ('cases', ['./test/run_tests.sh'], {'WARMC_FLAGS': '-O2'}),

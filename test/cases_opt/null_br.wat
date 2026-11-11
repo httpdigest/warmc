@@ -15,7 +15,8 @@
 ;;   twice2    the eqz's operand read by the return too: the eqz is a cbz of
 ;;             the 0 or 1 made
 ;;   twice3    the eqz's operand read by a sum before the branch too: made,
-;;             and not folded into the branch
+;;             and not folded into the branch (its sum is not twice's, which
+;;             it would otherwise be, code and all, and one symbol for both)
 ;;   apart     the test made in one block and the branch in another: no fold
 ;;   pair      two null tests and'ed: the ccmp chain, untouched
 ;;
@@ -46,7 +47,7 @@
 ;; run: twice 1 => i32:8
 ;; run: twice2 0 => i32:1
 ;; run: twice2 2 => i32:18
-;; run: twice3 0 => i32:100
+;; run: twice3 0 => i32:200
 ;; run: twice3 1 => i32:8
 ;; run: apart 0 => i32:5
 ;; run: apart 1 => i32:6
@@ -102,7 +103,7 @@
     (local $x (ref null $s)) (local $t i32) (local $u i32)
     (local.set $x (array.get $refs (global.get $tab) (local.get $i)))
     (local.set $t (ref.is_null (local.get $x)))
-    (local.set $u (i32.add (i32.mul (local.get $t) (i32.const 100)) (local.get $i)))
+    (local.set $u (i32.add (i32.mul (local.get $t) (i32.const 200)) (local.get $i)))
     (if (i32.eqz (local.get $t))
       (then (return (i32.add (struct.get $s 0 (local.get $x)) (local.get $u)))))
     (local.get $u))

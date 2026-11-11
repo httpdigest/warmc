@@ -48,9 +48,11 @@
 ;; past its null arm, held's, asnn's, kindsn's, heldtest's -- 11; the
 ;; params, merge's, merge2's, heldmerge's two (the first brought the object
 ;; on the null branch's other way) and heldtest's, each counted in each of
-;; the two rounds the pass runs in -- 10.  Answers worked out by hand.
+;; the two rounds the pass runs in -- 10: counted without the copies
+;; pass_hot_tails makes of the blocks after the null branches, which the
+;; pass counts again.  Answers worked out by hand.
 ;;
-;; stats -O2: gc_nonnull_params=10 slot_nonnull=11
+;; stats -O2 -fno-tails: gc_nonnull_params=10 slot_nonnull=11
 ;; shape: heldmerge cb(n)?z\s+x\d+,=1
 ;; shape: kinds cb(n)?z\s+x\d+,=1
 ;; shape: access cb(n)?z\s+x\d+,=1

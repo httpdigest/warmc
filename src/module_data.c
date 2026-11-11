@@ -405,7 +405,16 @@ static int ict_by_sites(const void *a, const void *b) {
   return x->ti < y->ti ? -1 : x->ti > y->ti;
 }
 
+#define BBC_N (8 * 65536)
 void codegen_plan_icall_tables(Module *m, ObjBuilder *o, bool on) {
+  /* WARMC_BBC=<function>: a counter per block of that function, 8 bytes
+     each at warmc_bbc + 8 * (65536 * k + block) for the k-th function of
+     the list (up to 8), read back with a debugger (a debugging
+     aid, arm64 only) */
+  if (warmc_getenv("WARMC_BBC")) {
+    m->bbc = true;
+    m->bbc_sym = obj_intern_sym(o, "warmc_bbc", SYM_LOCAL_DATA, -1, 0);
+  }
   if (!on || !g_target->emit_trap_stub) return;
   const Table0Facts *t0 = module_table0_facts(m);
   if (!t0->frozen || !t0->entry || !t0->n || m->tables[0].index64) return;
@@ -525,6 +534,11 @@ static uint32_t ict_stub(ObjBuilder *o, uint32_t *have, int code) {
 /* After the functions are placed: the stubs go at the end of the text, the
    tables at the end of the data. */
 static void emit_icall_tables(Module *m, ObjBuilder *o) {
+  if (m->bbc) {
+    buf_align(&o->data, 16);
+    obj_intern_sym(o, "warmc_bbc", SYM_LOCAL_DATA, 2, o->data.len);
+    for (uint32_t i = 0; i < BBC_N; i++) buf_u64(&o->data, 0);
+  }
   if (!m->nict) return;
   const Table0Facts *t0 = m->t0;
   uint32_t s_oob = UINT32_MAX, s_null = UINT32_MAX, s_type = UINT32_MAX;
@@ -581,6 +595,20 @@ static uint64_t ro_hash(const void *p, size_t n) {
   uint64_t h = 1469598103934665603ull;
   for (size_t i = 0; i < n; i++) { h ^= b[i]; h *= 1099511628211ull; }
   return h;
+}
+
+/* The hash of each tail of p[0..n) that starts at one of at[0..k), which
+   rise: h[i] that of p[at[i]..n).  The bytes are taken from the end, so
+   one pass over them gives all k; each tail hashed from its own start is
+   the square of the length. */
+static void ro_hash_tails(const uint8_t *p, size_t n, const uint32_t *at,
+                          uint32_t k, uint64_t *h) {
+  uint64_t x = 1469598103934665603ull;
+  size_t j = n;
+  for (uint32_t i = k; i-- > 0;) {
+    while (j > at[i]) { x ^= p[--j]; x *= 1099511628211ull; }
+    h[i] = x;
+  }
 }
 
 static void ro_ix_put(uint32_t i) {
@@ -707,7 +735,8 @@ static void rr_ix_grow(void) {
   for (uint32_t i = 0; i < g_nrr; i++) rr_ix_put(i);
 }
 
-static void rr_record(const RoTmp *pool, uint32_t first, uint32_t n,
+/* false when the run was recorded already */
+static bool rr_record(const RoTmp *pool, uint32_t first, uint32_t n,
                       uint32_t nbytes, uint64_t hash) {
   if (g_rr_ix_cap) {
     uint32_t mask = g_rr_ix_cap - 1;
@@ -716,7 +745,7 @@ static void rr_record(const RoTmp *pool, uint32_t first, uint32_t n,
       const RootRun *r = &g_rr[g_rr_ix[k] - 1];
       if (r->hash == hash && r->n == n && r->nbytes == nbytes &&
           !memcmp(pool->p + r->first, pool->p + first, nbytes))
-        return;
+        return false;
       k = (k + 1) & mask;
     }
   }
@@ -731,6 +760,7 @@ static void rr_record(const RoTmp *pool, uint32_t first, uint32_t n,
   uint32_t idx = g_nrr++;
   if ((uint64_t)g_nrr * 3 >= (uint64_t)g_rr_ix_cap * 2) rr_ix_grow();
   else rr_ix_put(idx);
+  return true;
 }
 
 static void sort_u32(uint32_t *a, uint32_t n) {
@@ -752,6 +782,7 @@ static uint32_t uleb_put(uint8_t *p, uint32_t v) {
 }
 
 static bool g_check_roots;
+static int g_pool_tails;   /* -1 none recorded, 1 as they are, 2 each looked up */
 
 static void root_run_check(const RoTmp *pool, uint32_t first,
                            const uint32_t *v, uint32_t n) {
@@ -773,21 +804,33 @@ static void root_run_check(const RoTmp *pool, uint32_t first,
   }
 }
 
+/* A safepoint's roots, n of them rising, as a run in the pool: the one
+   that is there, or a new one, every tail of which is recorded with it -- a
+   list is as often the end of a longer one, the roots that are left when
+   the first have died.  (WARMC_NO_POOL_TAILS=1 records the whole run
+   alone; WARMC_POOL_ALL_TAILS=1 looks every tail up, where the first one
+   found ends it: that one was recorded with its own tails, which are the
+   rest of these.)  n is not 0. */
 static uint32_t root_run_intern(RoTmp *pool, const uint32_t *v, uint32_t n) {
 
   uint8_t bytes[5 * 64];
   uint32_t offs[64];
+  uint64_t hashes[64];
   uint8_t *heap = NULL;
   uint32_t *offheap = NULL;
+  uint64_t *hashheap = NULL;
   uint8_t *p = bytes;
   uint32_t *off = offs;
+  uint64_t *th = hashes;
   if (n > 64) {
     heap = xmalloc(n * 5u); p = heap;
     offheap = xmalloc(n * sizeof(uint32_t)); off = offheap;
+    hashheap = xmalloc(n * sizeof(uint64_t)); th = hashheap;
   }
   uint32_t len = 0;
   for (uint32_t i = 0; i < n; i++) { off[i] = len; len += uleb_put(p + len, v[i]); }
-  uint64_t h = ro_hash(p, len);
+  ro_hash_tails(p, len, off, n, th);
+  uint64_t h = th[0];
   if (g_rr_ix_cap) {
     uint32_t mask = g_rr_ix_cap - 1;
     uint32_t k = (uint32_t)h & mask;
@@ -796,7 +839,7 @@ static uint32_t root_run_intern(RoTmp *pool, const uint32_t *v, uint32_t n) {
       if (r->hash == h && r->n == n && r->nbytes == len &&
           !memcmp(pool->p + r->first, p, len)) {
         g_rr_shared += n;
-        xfree(heap); xfree(offheap);
+        xfree(heap); xfree(offheap); xfree(hashheap);
         if (g_check_roots) root_run_check(pool, r->first, v, n);
         return r->first;
       }
@@ -806,10 +849,10 @@ static uint32_t root_run_intern(RoTmp *pool, const uint32_t *v, uint32_t n) {
   uint32_t first = (uint32_t)pool->len;
   for (uint32_t i = 0; i < len; i++) rotmp_u8(pool, p[i]);
 
-  for (uint32_t s = 0; s < n; s++)
-    rr_record(pool, first + off[s], n - s, len - off[s],
-              s ? ro_hash(p + off[s], len - off[s]) : h);
-  xfree(heap); xfree(offheap);
+  uint32_t upto = g_pool_tails < 0 ? 1 : n;
+  for (uint32_t s = 0; s < upto; s++)
+    if (!rr_record(pool, first + off[s], n - s, len - off[s], th[s]) && g_pool_tails < 2) break;
+  xfree(heap); xfree(offheap); xfree(hashheap);
   if (g_check_roots) root_run_check(pool, first, v, n);
   return first;
 }
@@ -847,21 +890,8 @@ static void cp_ix_grow(void) {
   for (uint32_t i = 0; i < g_ncp; i++) cp_ix_put(i);
 }
 
-static void cp_record(ObjBuilder *o, uint64_t base, uint32_t first,
-                      uint32_t nbytes, uint64_t hash) {
-  if (g_cp_ix_cap) {
-    uint32_t mask = g_cp_ix_cap - 1;
-    uint32_t k = (uint32_t)hash & mask;
-    const uint8_t *mine = o->data.data + base + (uint64_t)first * CONST_UNIT;
-    while (g_cp_ix[k]) {
-      const ConstProg *c = &g_cp[g_cp_ix[k] - 1];
-      if (c->hash == hash && c->nbytes == nbytes &&
-          !memcmp(o->data.data + base + (uint64_t)c->first * CONST_UNIT,
-                  mine, nbytes))
-        return;
-      k = (k + 1) & mask;
-    }
-  }
+/* a program that is not there (emit_const_expr has looked) */
+static void cp_record(uint32_t first, uint32_t nbytes, uint64_t hash) {
   if (g_ncp == g_cap_cp) {
     g_cap_cp = g_cap_cp ? g_cap_cp * 2 : 64;
     g_cp = xrealloc(g_cp, g_cap_cp * sizeof(ConstProg));
@@ -899,13 +929,19 @@ static void cp_insn(RoTmp *t, uint32_t op, uint64_t lo, uint64_t hi) {
   }
 }
 
+/* A constant expression as the program the runtime's evaluator runs, in
+   the pool at base: the one that is there, or a new one.  The whole
+   expression is what is recorded, and no tail of it: what is ahead of a
+   tail left values for it to take, so a tail is no expression, and none
+   that comes can be equal to one.  (Every tail was recorded once, each
+   hashed from its own start: the square of an initialiser's length, and
+   2.7 s of a 3.2 s compile for the 25,820 bytes of a string constant that
+   luawasm makes an array.new_fixed of.) */
 static uint32_t emit_const_expr(ObjBuilder *o, const Module *m, uint64_t base,
                                 const InitExpr *e, uint32_t *count) {
 
-  uint32_t *at = xmalloc(((size_t)e->n + 1) * sizeof(uint32_t));
   g_cp_tmp.len = 0;
   for (uint32_t i = 0; i < e->n; i++) {
-    at[i] = (uint32_t)g_cp_tmp.len;
     uint64_t lo = e->ins[i].lo;
 
     switch (e->ins[i].op) {
@@ -917,7 +953,6 @@ static uint32_t emit_const_expr(ObjBuilder *o, const Module *m, uint64_t base,
     }
     cp_insn(&g_cp_tmp, e->ins[i].op, lo, e->ins[i].hi);
   }
-  at[e->n] = (uint32_t)g_cp_tmp.len;
   cp_insn(&g_cp_tmp, IOP_END, 0, 0);
 
   const uint8_t *p = g_cp_tmp.p;
@@ -932,7 +967,6 @@ static uint32_t emit_const_expr(ObjBuilder *o, const Module *m, uint64_t base,
           !memcmp(o->data.data + base + (uint64_t)c->first * CONST_UNIT,
                   p, n)) {
         g_cp_shared += (uint32_t)(n / CONST_UNIT);
-        xfree(at);
         return c->first;
       }
       k = (k + 1) & mask;
@@ -942,10 +976,7 @@ static uint32_t emit_const_expr(ObjBuilder *o, const Module *m, uint64_t base,
   buf_bytes(&o->data, p, n);
   *count += (uint32_t)(n / CONST_UNIT);
 
-  for (uint32_t i = 0; i <= e->n; i++)
-    cp_record(o, base, first + at[i] / CONST_UNIT, (uint32_t)(n - at[i]),
-              at[i] ? ro_hash(p + at[i], n - at[i]) : h);
-  xfree(at);
+  cp_record(first, (uint32_t)n, h);
   return first;
 }
 
@@ -1424,6 +1455,7 @@ void codegen_emit_module_data(Module *m, ObjBuilder *o) {
   uint32_t *run = NULL, run_cap = 0;
   root_pool_reset();
   g_check_roots = warmc_getenv("WARMC_CHECK_ROOTS") != NULL;
+  g_pool_tails = warmc_getenv("WARMC_NO_POOL_TAILS") ? -1 : warmc_getenv("WARMC_POOL_ALL_TAILS") ? 2 : 1;
   for (uint32_t i = 0; i < g_nunwind; i++) {
     const FuncUnwind *u = &g_unwind[i];
     if (!(u->saved & UW_HAS_LR) || !u->ngcsites) continue;

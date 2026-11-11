@@ -20,6 +20,25 @@
 #define S3 R15
 #define TMP0 R16
 #define TMP1 R17
+
+/* the place of a function in a debugging list (WARMC_LISTING, WARMC_BBC:
+   indexes, symbols or names, separated by commas), or -1 */
+static int dbg_func_listed(const char *l, uint32_t fi, const char *sy, const char *nm) {
+  if (!l) return -1;
+  int k = 0;
+  while (*l) {
+    const char *e = strchr(l, ',');
+    size_t n = e ? (size_t)(e - l) : strlen(l);
+    if ((*l >= '0' && *l <= '9' && (uint32_t)atoi(l) == fi) ||
+        (sy && strlen(sy) == n && !strncmp(l, sy, n)) ||
+        (nm && strlen(nm) == n && !strncmp(l, nm, n)))
+      return k;
+    k++;
+    if (!e) break;
+    l = e + 1;
+  }
+  return -1;
+}
 #define F0 26
 #define F1 27
 #define F2 28
@@ -453,6 +472,27 @@ static int rd(Isel *s, Ref v, int scratch) {
   return scratch;
 }
 
+/* The register v can be read from with no instruction, or -1: its own, a
+   piece's, or the reload cache's, which is then kept for the instruction
+   being made as rd() keeps it.  For a read the selection can do without
+   (an element access's GCF_BIASARG). */
+static int rd_peek(Isel *s, Ref v) {
+  while (s->walias && s->walias[v]) v = ir_args(s->f, v)[0];
+  if (is_fp_value(s->f, v) || is_vec_value(s->f, v)) return -1;
+  int pr = piece_reg(s, v);
+  if (pr >= 0) return pr;
+  int l = s->loc[v];
+  if (l == LOC_NONE) return -1;
+  if (!IS_SLOT(l)) return l;
+  if (s->rc_reg[0])
+    for (int i = 0; i < 2; i++)
+      if (s->rc_reg[i] && s->rc_slot[i] == SLOT_OF(l) + 1) {
+        s->rc_used[i] = 1;
+        return s->rc_reg[i];
+      }
+  return -1;
+}
+
 /* The zero register for an integer constant 0 with no register of its
    own, where the reader takes one as its value -- a store's, a result's --
    and what rd() makes of anything else.  The allocator keeps such zeros
@@ -751,9 +791,13 @@ static void emit_gc_load_stubs(Isel *s) {
     if (bf->off_reg >= 0) {
       a64_add_reg(B, SF64, S3, bf->base, bf->off_reg);
     } else if (bf->off > 0xfff) {
-
-      a64_load_imm(B, SF64, S3, bf->off);
-      a64_add_reg(B, SF64, S3, bf->base, S3);
+      /* (the offset not in S3 where the base is S3 itself, the copy
+         emit_gc_load_barrier_pre keeps of a base its load overwrote:
+         p = p.field, the field past 4095 bytes -- the slot's address was
+         twice the offset, and the stub healed, or faulted on, that) */
+      int t = bf->base == S3 ? TMP0 : S3;
+      a64_load_imm(B, SF64, t, bf->off);
+      a64_add_reg(B, SF64, S3, bf->base, t);
     } else if (bf->off) {
       a64_add_imm(B, SF64, S3, bf->base, bf->off, 0);
     } else if (bf->base != S3) {
@@ -2685,6 +2729,14 @@ bits:
   for (uint32_t oi = 0; oi < f->norder; oi++) find_tbits(s, uses, f->order[oi]);
 }
 
+/* an integer or reference constant one move makes */
+static bool remat_one_move(IrFunc *f, Ref x) {
+  const Inst *c = &f->insts[x];
+  ValType t = (ValType)c->type;
+  return c->op == I_CONST && !vt_is_float(t) && t != VT_V128 &&
+         ir_const_cost(c->imm, vt_is_64(t)) <= 1;
+}
+
 static void analyse_immediates(Isel *s) {
   IrFunc *f = s->f;
   uint32_t n = f->ninsts;
@@ -2757,7 +2809,11 @@ static void analyse_immediates(Isel *s) {
                         in->op == I_EXTERN_OF_ANY);
       for (uint32_t j = 0; j < in->nargs; j++) {
         uses[a[j]]++;
-        if (via_moves) s->no_remat[a[j]] = 1;
+        /* (an array.new's operands, made in place by emit_call_args_core
+           -- in the allocation's stub out of line too, where a one-move
+           constant needs nothing the reload cache held) */
+        if (via_moves && !(in->op == I_ARRAY_NEW && remat_one_move(f, a[j])))
+          s->no_remat[a[j]] = 1;
         if (!s->imm_fold[a[j]] || in_place) continue;
         if (!ir_imm_ok(f, u, j, f->insts[a[j]].imm, (ValType)f->insts[a[j]].type))
           s->imm_fold[a[j]] = 0;
@@ -4376,6 +4432,15 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
   s->no_small_memop = warmc_getenv("WARMC_NO_SMALL_MEMOP") != NULL;
   s->no_rc_def = warmc_getenv("WARMC_NO_RC_DEF") != NULL;
   s->pin = codegen_pinned();
+  {
+    /* WARMC_LISTING / WARMC_BBC: a comma-separated list of function
+       indexes, symbols or names */
+    const char *sy = f->m->funcs[f->func_index].sym, *nm = f->m->funcs[f->func_index].name;
+    s->lst_on = dbg_func_listed(warmc_getenv("WARMC_LISTING"), f->func_index, sy, nm) >= 0;
+    int k = f->m->bbc ? dbg_func_listed(warmc_getenv("WARMC_BBC"), f->func_index, sy, nm) : -1;
+    s->bbc_on = k >= 0 && k < 8;
+    s->bbc_base = s->bbc_on ? (uint32_t)k * 65536u : 0;
+  }
   analyse_function(s);
 
   s->lab_reg = 0;
@@ -4943,6 +5008,35 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
   fout->sym = sym;
   fout->insts_emitted = fout->code_len / 4;
   collect_refs(f, fout);
+  if (s->lst_on) {
+    /* WARMC_LISTING=<index or symbol>: the final IR, then each emitted
+       instruction's offset in the code with the value it made and where
+       that and its operands live (a register number, or sN for a slot) */
+    fprintf(stderr, "LISTING %s func=%u len=%u body=%u slots=%u nslots=%u\n", sym, f->func_index,
+            fout->code_len, (uint32_t)(lead.len + pro.len), s->slots_off, s->nslots);
+    ir_print(f, "listing");
+    for (uint32_t k = 0; k + 1 < s->nlst; k += 2) {
+      uint32_t off = s->lst[k] + (uint32_t)(lead.len + pro.len), v = s->lst[k + 1];
+      if (v & 0x80000000u) {
+        fprintf(stderr, "@%x %c%u\n", off, (v & 0x40000000u) ? 'T' : 'B', v & 0x3fffffffu);
+        continue;
+      }
+      Inst *in = &f->insts[v];
+      int l = s->loc[v];
+      fprintf(stderr, "@%x v%u %s", off, v, ir_op_name(in->op));
+      if (l == LOC_NONE) fprintf(stderr, "=-");
+      else if (IS_SLOT(l)) fprintf(stderr, "=s%u", SLOT_OF(l));
+      else fprintf(stderr, "=r%d", l);
+      Ref *a = ir_args(f, v);
+      for (uint32_t j = 0; j < in->nargs; j++) {
+        int al = s->loc[a[j]];
+        if (al == LOC_NONE) fprintf(stderr, " v%u", a[j]);
+        else if (IS_SLOT(al)) fprintf(stderr, " v%u:s%u", a[j], SLOT_OF(al));
+        else fprintf(stderr, " v%u:r%d", a[j], al);
+      }
+      fprintf(stderr, "\n");
+    }
+  }
 
   {
     FuncUnwind u;
@@ -5042,6 +5136,7 @@ give_up:
   xfree(s->csa_slot); xfree(s->csa_on); xfree(s->vac_slot);
   xfree(s->csa_first); xfree(s->csa_n); xfree(s->csa_vals);
   xfree(s->lv_in); xfree(s->lv_out); xfree(s->lv_in_off); xfree(s->lv_out_off);
+  xfree(s->lst);
   if (split_ret) return split_ret;
   return s->far_br_needed ? 0 : 1;
 }
@@ -5069,6 +5164,14 @@ static bool imm_ok_a64(IrFunc *f, Ref user, uint32_t idx, uint64_t cval, ValType
     case I_EQ: case I_NE: case I_LTS: case I_LTU: case I_GTS: case I_GTU:
     case I_LES: case I_LEU: case I_GES: case I_GEU: {
       if (idx != 1) return false;
+      /* the least integer, to eq or ne: cmp x, #1 and the overflow flag
+         (is_min_cmp) */
+      if ((in->op == I_EQ || in->op == I_NE) &&
+          masked == (sf ? 0x8000000000000000ull : 0x80000000u)) {
+        static _Atomic int off = -1;
+        if (off < 0) off = warmc_getenv("WARMC_NO_MIN_CMP") != NULL;
+        if (!off) return true;
+      }
       uint32_t i12;
       int lsl;
       bool neg;

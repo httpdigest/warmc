@@ -202,6 +202,14 @@ typedef enum {
    would load it.  The barrier's mask, where there is one, comes before. */
 #define GCF_LENARG   1024u
 
+/* an array.get or array.set with one operand more right after its own (the
+   third of a get, the fourth of a set): the value its index is k less
+   than, k the number of elements its array's header is long (opt.c
+   pass_array_bias) -- the element is at the array's address plus that
+   value times the element's size */
+#define GCF_BIASARG  2048u
+#define GCF_BIAS_AT(op) ((op) == I_ARRAY_SET ? 3u : 2u)
+
 #define GCA_CACHED   (1u << 31)
 
 #define ARRO_FILL      0u
@@ -311,6 +319,10 @@ typedef struct {
   bool outline;
 
   bool is_pad;
+  /* its branch tests one side of an and or an or, the other side another
+     block's (opt.c pass_test_chain): a null test here is no bare one
+     (ir_test_bare_null), but part of the test the two make */
+  bool chained;
   /* a loop versioned for its bounds checks (opt.c pass_bce_version), the
      original or the copy: versioned no more */
   bool bver;
@@ -482,6 +494,7 @@ typedef struct { uint32_t *off, *src, *si; } IrEdgeIdx;
 IrEdgeIdx ir_edge_index(IrFunc *f);
 void ir_edge_index_free(IrEdgeIdx *x);
 void ir_order(IrFunc *f);
+void ir_order_light(IrFunc *f);
 /* ir_order's reachability, loop depths and divergence alone; its
    reachability alone (ir.c) */
 void ir_order_depths(IrFunc *f);
@@ -491,6 +504,15 @@ void ir_mark_reachable(IrFunc *f);
    saves a branch (f->loop_top): the order the back ends emit the blocks in.
    Sets *n to its length. */
 const uint32_t *ir_emit_order(IrFunc *f, uint32_t skip, uint32_t *n);
+/* the way out of test b that the static rules say is rare (a reference
+   test's or equality's failure, a null or nil test's success, an index
+   past a GC length), or UINT32_MAX */
+uint32_t ir_unlikely_way(const IrFunc *f, const Block *b);
+uint32_t ir_unlikely_way_sure(const IrFunc *f, const Block *b);
+bool ir_test_bare_null(const IrFunc *f, const Block *b);
+/* opt.c: the blocks no likely way reaches, or NULL (the caller frees) */
+uint8_t *ir_rare_blocks(IrFunc *f);
+
 /* The header of the loop block t is the first of in that order: t, or the
    header whose latch it laid out above it; UINT32_MAX where t starts no
    loop. */
@@ -534,6 +556,7 @@ uint32_t ir_vec_copies(void);
 /* Is a wrap that only low-half readers read no instruction (Target)? */
 bool ir_wrap_alias(void);
 bool ir_has_bitrev(void);
+bool ir_addr_index_disp(void);
 bool ir_vec_mul_one(uint32_t lane);
 
 bool ir_imm_ok(IrFunc *f, Ref user, uint32_t idx, uint64_t cval, ValType ct);
@@ -594,6 +617,19 @@ typedef struct {
   /* an i32 block parameter edges pass the wraps of i64s takes the i64s
      (opt.c pass_wrap_params) */
   bool wrap_params;
+  /* the hot way's blocks copied for the rare ways back into them (opt.c
+     pass_hot_tails) */
+  bool tails;
+  /* a branch's compare from another block copied to the branch (opt.c
+     pass_cmp_sink) */
+  bool cmpsink;
+  /* the hot way's blocks copied for the ways in that fix a value they test
+     (opt.c pass_way_split) */
+  bool waysplit;
+  /* a branch on an and or an or of type tests made a branch a test (opt.c
+     pass_test_chain) */
+  bool tchain;
+  bool arrbias;
   bool gssa;
 
   bool labcache;
@@ -683,6 +719,8 @@ IrFunc *ir_build(Module *m, uint32_t func_index, const OptOpts *o);
    a reader that only walks each block's instructions. */
 IrFunc *ir_build_unordered(Module *m, uint32_t func_index, const OptOpts *o);
 void ir_optimize(IrFunc *f, const OptOpts *o);
+/* opt.c: a callee's body made ready for a look at its start (inline.c) */
+void ir_pinl_prep(IrFunc *g, const OptOpts *o);
 
 typedef struct FuncOut {
   uint8_t *code; uint32_t code_len;
@@ -772,6 +810,7 @@ typedef struct {
   uint64_t unswitched; /* loops copied for a branch on a value made before them */
   uint64_t param_compares; /* parameters found to be a compare, made again */
   uint64_t key_splits;   /* regions copied below an edge that fixes a value */
+  uint64_t way_splits;   /* the same on the hot way, by pass_way_split's limits */
   uint64_t bfi_apart;    /* bfi results kept from the parameter of their field */
   uint64_t ccmp_chains;  /* ands and ors of compares made as cmp and ccmp */
   uint64_t loop_tops;    /* loops laid out with their latch above the header */
@@ -788,6 +827,8 @@ typedef struct {
   uint64_t const_reads, throw_jumps, inl_more;
   uint64_t inl_flat, inl_spliced, inl_once_forced, inl_retcall_sites;
   uint64_t inl_transitive, inl_escape, inl_partial;
+  uint64_t inl_hot_starts;   /* of those, starts the likely ways made, past PINLINE_MAX */
+  uint64_t inl_blocks;       /* blocks the splices made in their callers */
   uint64_t inl_rej_size, inl_rej_budget, inl_rej_tailcall, inl_rej_retcalls;
   uint64_t inl_rej_pads, inl_rej_score, inl_rej_depth, inl_rej_recursion;
   uint64_t unrolled, unr_guarded, unr_rej_shape, unr_rej_body, unr_rej_exit;
@@ -801,6 +842,13 @@ typedef struct {
   /* field reads made on a merge's cold ways in for one after it to go
      (opt.c rle_pre) */
   uint64_t gc_loads_pre;
+  uint64_t branch_decided;   /* branches on a test a branch above decided, their blocks doing more than test */
+  uint64_t test_chains;   /* branches on an and or an or with a type test made two branches */
+  uint64_t arr_bias_args; /* element accesses given the value their index is less than (pass_array_bias) */
+  uint64_t arr_biased;    /* of those, emitted at base + value * size: a register had the value */
+  uint64_t rare_csa;   /* values across rare calls alone given a caller-saved register and a slot */
+  uint64_t ra_cnone;   /* constants no read of which a register would save anything: given none */
+  uint64_t gc_elems_reused;   /* array elements read again taken from the read or write before */
   /* loops copied behind a test of their bounds, the copy's checks then
      taken off (opt.c pass_bce_version) */
   uint64_t bce_versioned;
@@ -811,6 +859,16 @@ typedef struct {
   uint64_t slot_tests, slot_nullchks;
   /* slot tests a branch makes itself, no 0 or 1 made (arm64 isel, T_BRIF) */
   uint64_t slot_brs;
+  /* branches on a compare made for other readers too that read its flags,
+     not its 0 or 1 (arm64 isel, T_BRIF); integer constants whose register
+     the scan priced by what each read saves (regalloc.inc ra_cuse_cost) */
+  uint64_t br_flags, ra_cpriced;
+  /* times the scan kept a value it can make again out of a callee-saved
+     register the function saved for nothing else (regalloc.inc ra_cs_worth) */
+  uint64_t ra_cs_spared;
+  /* eq and ne of a value with its width's least integer made cmp x, #1
+     and the overflow flag (arm64 isel is_min_cmp) */
+  uint64_t min_cmps;
   /* tests of a bit 1 << n made shifts of the value tested (opt.c
      pass_bit_facts), instructions the ways into their blocks decided made
      their operand or a constant, and branches on a sign, or on a bit
@@ -821,6 +879,11 @@ typedef struct {
   uint64_t exit_defers;
   /* blocks merged into the one block that jumps to them (opt.c merge_blocks) */
   uint64_t blocks_merged;
+  /* blocks copied for the rare ways into them (opt.c pass_hot_tails) */
+  uint64_t hot_tails, hot_tail_pres;
+  /* compares copied to the branches on them, and branch tests passed along
+     their own edges made constants (opt.c pass_cmp_sink) */
+  uint64_t cmps_sunk, cmp_edge_consts;
   /* bounds checks given their array's length as an operand, and the
      array.lens made for them in a loop's preheader (opt.c pass_bound_lens) */
   uint64_t bound_lens, bound_lens_hoisted;

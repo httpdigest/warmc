@@ -425,13 +425,16 @@ WARMC_GC_VERIFY=1 WARMC_GC_STRESS=1 expect deep          "OK" 1000 333833500
 build_one kidx
 expect chains "OK" 300
 expect swaps  "OK" 300
+expect far    "OK" 300
 WARMC_GC_VERIFY=1 WARMC_GC_STRESS=1 WARMC_GC_RELOCATE_ALL=1 expect chains "OK" 300
 WARMC_GC_VERIFY=1 WARMC_GC_STRESS=1 WARMC_GC_RELOCATE_ALL=1 expect swaps  "OK" 300
+WARMC_GC_VERIFY=1 WARMC_GC_STRESS=1 WARMC_GC_RELOCATE_ALL=1 expect far    "OK" 300
 # every value in a stack slot, the array and the element it reads are one
 # scratch register: the slot made before the load overwrites the array
 WARMC_FLAGS="${WARMC_FLAGS:-} -fno-regalloc" build_one kidx_nr
 WARMC_GC_VERIFY=1 WARMC_GC_STRESS=1 WARMC_GC_RELOCATE_ALL=1 expect chains "OK" 300
 WARMC_GC_VERIFY=1 WARMC_GC_STRESS=1 WARMC_GC_RELOCATE_ALL=1 expect swaps  "OK" 300
+WARMC_GC_VERIFY=1 WARMC_GC_STRESS=1 WARMC_GC_RELOCATE_ALL=1 expect far    "OK" 300
 
 build_one arraynew
 for t in 8 16 32 64 f32 f64 v128 ref; do expect lengths_$t "OK"; done

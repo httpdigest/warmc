@@ -10,7 +10,8 @@
 ;;   loaded   a mutable global's array, which a call may replace with one of
 ;;            k: its length read and compared with 3
 ;;   far      5000 i64s, element 4500 (proven in bounds): 8 + 36000 bytes,
-;;            past a scaled immediate's reach, in a register
+;;            past a scaled immediate's reach, in a register (the store's:
+;;            the read after it is the value stored, opt.c pass_gc_rle)
 ;;   bytes    5000 i8s, element 4000 (4008 fits) and 4090 (4098 does not)
 ;;   bigk     an index of 4096 with a bounds check: past cmp's 12 bits
 ;;   sizes    an i16, an i32, an f64 and a v128 element, set and read again
@@ -29,7 +30,7 @@
 ;; shape: checked uxtw=0
 ;; shape: loaded ldr\s+w\d+, \[x\d+, #0x4\]=1
 ;; shape: loaded b\.ls=2
-;; shape: far uxtw=2
+;; shape: far uxtw=1
 ;; shape: far mov\s+w\d+, #0x1194=1
 ;; shape: lenarg cmp\s+w\d+, #0x3=1
 ;; shape: lenarg ldr\s+w\d+, \[x\d+, #0x4\]=1

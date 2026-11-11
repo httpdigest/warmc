@@ -64,6 +64,22 @@ static uint32_t global_off(uint32_t i) {
 }
 
 static bool is_int_cmp(uint16_t op) { return op >= I_EQ && op <= I_GEU; }
+
+/* An eq or ne of a value with its width's least integer -- luawasm's mark
+   for a field that holds no number, 0x8000000000000000, tested at every
+   read and write of one: cmp x, #1 overflows there and nowhere else, VS
+   for eq and VC for ne, where the constant took a register (a mov before
+   every test).  imm_ok_a64 takes the constant as an immediate for it.
+   WARMC_NO_MIN_CMP=1 makes the constant as before. */
+static bool is_min_cmp(Isel *s, Ref v) {
+  IrFunc *f = s->f;
+  const Inst *in = &f->insts[v];
+  if ((in->op != I_EQ && in->op != I_NE) || in->nargs != 2) return false;
+  Ref *a = ir_args(f, v);
+  if (!is_imm_at(s, v, 1, a[1])) return false;
+  uint64_t c = imm_of(s, a[1]);
+  return is64(f, a[0]) ? c == 0x8000000000000000ull : (c & 0xffffffffu) == 0x80000000u;
+}
 static bool is_flt_cmp(uint16_t op) { return op >= I_FEQ && op <= I_FGE; }
 
 static bool cmp_operand_stable(Isel *s, Ref r) {
@@ -226,6 +242,11 @@ static void emit_compare_raw(Isel *s, Ref v) {
     return;
   }
   int sf = is64(f, a[0]) ? SF64 : SF32;
+  if (is_min_cmp(s, v)) {
+    g_stats.min_cmps++;
+    a64_subs_imm(B, sf, RZR, rd(s, a[0], S0), 1, 0);
+    return;
+  }
   if (is_imm_at(s, v, 1, a[1])) {
     /* an immediate compare's register 31 is sp: a zero is made */
     int x = rd(s, a[0], S0);
@@ -314,6 +335,7 @@ static int cond_of(Isel *s, Ref v) {
   if (s->cchain && s->cchain[v]) return cond_of(s, ir_args(s->f, v)[s->cchain[v] - 1]);
   if (in->op == I_EQZ || in->op == I_REF_IS_NULL) return CC_EQ;
   if (in->op == I_AND) return CC_NE;
+  if (is_min_cmp(s, v)) return in->op == I_EQ ? CC_VS : CC_VC;
   return cc_for(in->op);
 }
 
@@ -360,6 +382,7 @@ static void emit_cmp_chain(Isel *s, Ref v) {
   /* an immediate form's register 31 is the zero register, as in the other */
   int x = rd_zr(s, ca[0], S0);
   if (f->insts[c].op == I_EQZ || f->insts[c].op == I_REF_IS_NULL) { a64_ccmp_imm(B, sf, x, 0, nzcv, open); return; }
+  if (is_min_cmp(s, c)) { a64_ccmp_imm(B, sf, x, 1, nzcv, open); return; }
   if (f->insts[ca[1]].op == I_CONST) {
     uint64_t m = sf ? ~0ull : 0xffffffffu;
     uint64_t k = f->insts[ca[1]].imm & m;
@@ -2555,8 +2578,9 @@ static void emit_inst(Isel *s, Ref v) {
       uint32_t off = (uint32_t)in->imm;
       ValType t = (ValType)f->insts[a[1]].type;
       /* The value is read before a far field's address goes into TMP0, as
-         in array.set. */
-      int y = rd(s, a[1], t == VT_V128 || vt_is_float(t) ? F0 : S1);
+         in array.set: a zero no register holds -- a null among them -- as
+         the zero register (rd_zr). */
+      int y = t == VT_V128 || vt_is_float(t) ? rd(s, a[1], F0) : rd_zr(s, a[1], S1);
       bool scaled = (off >> size) <= 0xfff;
       int base = x;
       if (!scaled) {
@@ -2616,6 +2640,12 @@ static void emit_inst(Isel *s, Ref v) {
       break;
 
     case I_ARRAY_GET: case I_ARRAY_SET: {
+      /* the value the index is the header's elements less than, where a
+         register has it (GCF_BIASARG, opt.c pass_array_bias): the element
+         is at the array's address and that value, scaled */
+      int by = -1;
+      if ((in->imm2 & GCF_BIASARG) && !is_imm_at(s, v, 1, a[1]))
+        by = rd_peek(s, a[GCF_BIAS_AT(in->op)]);
       int x = rd(s, a[0], S0);
       if (in->imm2 & GCF_NULLCHK) trap_if_zero(s, SF64, x, TRAP_NULL_REF);
       int size = (int)GCF_SIZE(in->imm2);
@@ -2623,7 +2653,8 @@ static void emit_inst(Isel *s, Ref v) {
       uint32_t koff = 0;
       bool kidx = is_imm_at(s, v, 1, a[1]) &&
                   arr_imm_index(f, in, imm_of(s, a[1]) & 0xffffffffu, &koff, true);
-      int idx = kidx ? -1 : rd(s, a[1], S1);
+      /* (the index for the check of its bound, or for its address) */
+      int idx = kidx || (by >= 0 && (in->imm2 & GCF_NOBOUND)) ? -1 : rd(s, a[1], S1);
 
       if (!(in->imm2 & GCF_NOBOUND) && kidx) {
         /* out of bounds where the length is at most the index */
@@ -2655,10 +2686,27 @@ static void emit_inst(Isel *s, Ref v) {
       ValType yt = VT_I32;
       if (in->op == I_ARRAY_SET) {
         yt = (ValType)f->insts[a[2]].type;
-        y = rd(s, a[2], yt == VT_V128 || vt_is_float(yt) ? F0 : S2);
+        y = yt == VT_V128 || vt_is_float(yt) ? rd(s, a[2], F0) : rd_zr(s, a[2], S2);
       }
       uint32_t off = f->m->types[in->imm].hdr_size;
       int ea = TMP0;
+      if (by >= 0) {
+        /* (an integer's: pass_array_bias gives no other the operand) */
+        int sc = size ? 1 : 0;
+        ValType bt = in->op == I_ARRAY_GET ? (ValType)in->type : yt;
+        if (bt != VT_I32 && bt != VT_I64)
+          warmc_fatal("internal: an element that is no integer read by its index's value");
+        g_stats.arr_biased++;
+        if (in->op == I_ARRAY_GET) {
+          int d = wr(s, v, S0);
+          if (in->imm2 & GCF_SIGNED) a64_ldrs_reg(B, size, wide, d, x, by, 2, sc);
+          else a64_ldr_reg(B, size, d, x, by, 2, sc);
+          commit(s, v, d);
+        } else {
+          a64_str_reg(B, size, y, x, by, 2, sc);
+        }
+        break;
+      }
       if (kidx) { ea = x; off = koff; }
       else a64_add_uxtw(B, TMP0, x, idx, size);
       if (in->op == I_ARRAY_GET) {
@@ -2962,7 +3010,7 @@ static bool pair_reg(Isel *s, Ref r) {
 static bool pair_zr(Isel *s, Ref r) {
   const Inst *in = &s->f->insts[r];
   return in->op == I_CONST && s->loc[r] == LOC_NONE &&
-         ((ValType)in->type == VT_I64 ? in->imm
+         ((ValType)in->type == VT_I64 || vt_is_ref((ValType)in->type) ? in->imm
           : (ValType)in->type == VT_I32 ? (in->imm & 0xffffffffu) : 1) == 0;
 }
 
@@ -3359,9 +3407,31 @@ static bool maybe_pair(Isel *s, Block *b, uint32_t idx) {
   return false;
 }
 
+static void lst_add(Isel *s, uint32_t off, uint32_t v) {
+  if (s->nlst + 2 > s->lst_cap) {
+    s->lst_cap = s->lst_cap ? 2 * s->lst_cap : 1024;
+    s->lst = xrealloc(s->lst, s->lst_cap * sizeof(uint32_t));
+  }
+  s->lst[s->nlst++] = off;
+  s->lst[s->nlst++] = v;
+}
+
 static void emit_block(Isel *s, uint32_t bi, uint32_t next_bi) {
   IrFunc *f = s->f;
   Block *b = &f->blocks[bi];
+  if (s->lst_on) lst_add(s, (uint32_t)B->len, 0x80000000u | bi);
+  if (s->bbc_on && bi < 65536) {
+    /* x16/x17 hold nothing from one block to the next; no flags written */
+    uint32_t at = (s->bbc_base + bi) * 8;
+    isel_reloc(s, REL_ADR_PAGE21, B->len, f->m->bbc_sym, 0);
+    a64_adrp(B, TMP0, 0);
+    isel_reloc(s, REL_ADD_LO12, B->len, f->m->bbc_sym, 0);
+    a64_add_imm(B, SF64, TMP0, TMP0, 0, 0);
+    if (at >= 4096) a64_add_imm(B, SF64, TMP0, TMP0, at >> 12, 1);
+    a64_ldr_imm(B, 3, TMP1, TMP0, at & 0xfff);
+    a64_add_imm(B, SF64, TMP1, TMP1, 1, 0);
+    a64_str_imm(B, 3, TMP1, TMP0, at & 0xfff);
+  }
 
   /* the cache the block emitted before ends with, where that is the only
      way in */
@@ -3393,6 +3463,7 @@ static void emit_block(Isel *s, uint32_t bi, uint32_t next_bi) {
     if (s->paired[b->insts[i]]) continue;
     if (!eh && !s->no_ldpair && maybe_pair(s, b, i)) continue;
     s->cur_pos = i;
+    if (s->lst_on) lst_add(s, (uint32_t)B->len, b->insts[i]);
     emit_inst(s, b->insts[i]);
 
     /* A cache entry made while emitting this instruction -- an operand rd()
@@ -3409,6 +3480,7 @@ static void emit_block(Isel *s, uint32_t bi, uint32_t next_bi) {
   s->pc_live = false;
   s->pc_term = s->pc_head != NULL;
   s->at_eh_site = false;
+  if (s->lst_on) lst_add(s, (uint32_t)B->len, 0xc0000000u | bi);
 
   if (s->tail_done) { s->tail_done = false; s->pc_term = false; return; }
 
@@ -3502,6 +3574,14 @@ static void emit_block(Isel *s, uint32_t bi, uint32_t next_bi) {
           emit_compare(s, c);
           cc = cond_of(s, c);
         }
+      } else if (s->cmp_ref == c && s->cmp_epoch == B->flags_epoch &&
+                 !warmc_getenv("WARMC_NO_BR_FLAGS")) {
+        /* A compare whose 0 or 1 is made for readers in other blocks too
+           -- luawasm's guards, tested again where jump threading copied the
+           branch -- still has its flags here: b.cond reads them, where
+           cbnz waited on the cset (WARMC_NO_BR_FLAGS) */
+        cc = s->cmp_cc;
+        g_stats.br_flags++;
       } else {
 
         kind = 2; zsf = SF32; zreg = rd(s, c, S0);
@@ -3614,6 +3694,27 @@ static void emit_block(Isel *s, uint32_t bi, uint32_t next_bi) {
           if (rewritten) continue;
           for (int i = 0; i < mn && ok; i++)
             if (same_reg(mm[i].dst, mm[i].fp, l, fp)) ok = false;
+        }
+        /* -- nor one lent to a value the other way's loop holds in it
+           through that loop (a loop piece: regalloc.inc place_loop_pieces),
+           or that this block fills for the loop that way enters: the
+           register is free of values there, which is why it was lent, and
+           the way out's moves may write it on their edge -- ahead of the
+           branch they wrote it on the way round the inner loop too.
+           tinygo's FNV loop in a loop (gowasi/binenc) multiplied by the
+           outer loop's counter after its first byte, the multiplier's
+           register written before the inner latch's branch
+           (WARMC_NO_LATCH_PIECES=1 leaves the pieces out). */
+        if (ok && s->pc_bn && !warmc_getenv("WARMC_NO_LATCH_PIECES")) {
+          const uint32_t pb[2] = { ot, s->cur_block };
+          for (int w = 0; w < 2 && ok; w++)
+            for (uint32_t q = s->pc_bfirst[pb[w]], qe = q + s->pc_bn[pb[w]]; q < qe && ok; q++) {
+              const struct Piece *p = &s->pc[q];
+              if (p->kind != (w ? PC_FILL : PC_LOOP)) continue;
+              bool fp = is_fp_value(f, p->v);
+              for (int i = 0; i < mn && ok; i++)
+                if (same_reg(mm[i].dst, mm[i].fp, p->reg, fp)) ok = false;
+            }
         }
         if (ok) {
           parallel_copy(s, mm, mn);

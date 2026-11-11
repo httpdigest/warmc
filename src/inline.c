@@ -17,6 +17,13 @@
 /* the most instructions a partial inline takes in: the start of a callee
    up to where it would call or loop (pinl_build) */
 #define PINLINE_MAX 32
+/* and where the rules name its rare ways (ir_unlikely_way): all the likely
+   ways reach that goes on, by likely ways, to a return without a call */
+#define PINLINE_HOT_MAX 160
+/* such starts' own share of a caller's growth, beside INLINE_MAX_GROWTH */
+#define PINLINE_HOT_GROWTH 4000
+/* the most instructions of a callee that is made ready for the look */
+#define PINLINE_PREP_MAX 4000
 
 /* Site scoring: the value of removing one call, before dividing by what the
    splice costs. A constant argument is worth more than the instructions it
@@ -53,7 +60,7 @@ static pthread_once_t g_inl_once = PTHREAD_ONCE_INIT;
 static struct {
   uint32_t max_callee, growth, tiny;
   uint32_t retcalls, retcall_cost, retcall_total, depth, round2_growth;
-  uint32_t partial_max;
+  uint32_t partial_max, partial_hot, partial_growth, partial_prep;
   long only, upto, max;
   bool dbg, noscore, leafonly, notrans, notail, round2, nopartial;
 } g_inl;
@@ -93,6 +100,9 @@ static void inl_init(void) {
   g_inl.notail = warmc_getenv("WARMC_INLINE_NO_TAIL") != NULL;
   g_inl.round2 = warmc_getenv("WARMC_INLINE_ROUND2") != NULL;
   g_inl.nopartial = warmc_getenv("WARMC_NO_PARTIAL_INLINE") != NULL;
+  g_inl.partial_hot = (e = warmc_getenv("WARMC_PARTIAL_INLINE_HOT")) ? (uint32_t)atol(e) : PINLINE_HOT_MAX;
+  g_inl.partial_growth = (e = warmc_getenv("WARMC_PARTIAL_INLINE_GROWTH")) ? (uint32_t)atol(e) : PINLINE_HOT_GROWTH;
+  g_inl.partial_prep = (e = warmc_getenv("WARMC_PARTIAL_INLINE_PREP")) ? (uint32_t)atol(e) : PINLINE_PREP_MAX;
   g_inl.partial_max = (e = warmc_getenv("WARMC_PARTIAL_INLINE_MAX"))
                           ? (uint32_t)atol(e)
                           : PINLINE_MAX;
@@ -154,20 +164,54 @@ static void split_at_raising_sites(IrFunc *g) {
   ir_order(g);
 }
 
+/* Only the blocks the callee's entry reaches are copied.  A partial callee
+   is a start of some dozens of blocks in a copy of the callee whose other
+   blocks, thousands in a large one, were emptied; and a block of the
+   caller's for each of those, with its parameters, at every site was a
+   caller mostly of blocks nothing reaches -- luawasm awfy_permute's f6_s,
+   2,200 blocks before its inlining and 36,400 after, 2,700 of them in
+   reach -- which every later pass and every ordering then went over: a
+   thousand orderings in that function's jump threading, three quarters of
+   its compile (WARMC_SPLICE_ALL=1 copies them all).  The search is the
+   splice's own: a callee's order need not be the one of the graph as it
+   is. */
 static void splice(IrFunc *f, IrFunc *g, uint32_t bi, uint32_t cont,
                    const Ref *callargs, uint32_t nargs,
                    const Edge *ehe, uint32_t nehe) {
-  uint32_t *bmap = xmalloc(g->nblocks * sizeof(uint32_t));
+  uint32_t *bmap = xmalloc((g->nblocks ? g->nblocks : 1) * sizeof(uint32_t));
   Ref *vmap = xmalloc((g->ninsts ? g->ninsts : 1) * sizeof(Ref));
   for (uint32_t i = 0; i < g->ninsts; i++) vmap[i] = REF_NONE;
 
-  for (uint32_t i = 0; i < g->nblocks; i++) bmap[i] = ir_new_block(f);
+  uint8_t *reach = xcalloc(g->nblocks ? g->nblocks : 1, 1);
+  if (warmc_getenv("WARMC_SPLICE_ALL")) memset(reach, 1, g->nblocks);
+  else {
+    uint32_t *stk = xmalloc((g->nblocks ? g->nblocks : 1) * sizeof(uint32_t)), sp = 0;
+    reach[g->entry] = 1;
+    stk[sp++] = g->entry;
+    while (sp) {
+      const Block *b = &g->blocks[stk[--sp]];
+      for (uint32_t s = 0; s < b->nsuccs; s++) {
+        uint32_t t = b->succs[s].target;
+        if (!reach[t]) { reach[t] = 1; stk[sp++] = t; }
+      }
+    }
+    xfree(stk);
+  }
 
-  for (uint32_t i = 0; i < g->nblocks; i++)
+  for (uint32_t i = 0; i < g->nblocks; i++) {
+    bmap[i] = UINT32_MAX;
+    if (!reach[i]) continue;
+    bmap[i] = ir_new_block(f);
+    g_stats.inl_blocks++;
+  }
+
+  for (uint32_t i = 0; i < g->nblocks; i++) {
+    if (!reach[i]) continue;
     for (uint32_t p = 0; p < g->blocks[i].nparams; p++) {
       Ref src = g->blocks[i].params[p];
       vmap[src] = ir_add_param(f, bmap[i], (ValType)g->insts[src].type);
     }
+  }
 
   Ref *tmp = xmalloc(64 * sizeof(Ref));
   uint32_t tmpcap = 64;
@@ -176,11 +220,12 @@ static void splice(IrFunc *f, IrFunc *g, uint32_t bi, uint32_t cont,
   uint8_t *ordered = xcalloc(g->nblocks ? g->nblocks : 1, 1);
   uint32_t ncorder = 0;
   for (uint32_t oi = 0; oi < g->norder; oi++) {
+    if (!reach[g->order[oi]]) continue;
     corder[ncorder++] = g->order[oi];
     ordered[g->order[oi]] = 1;
   }
   for (uint32_t i = 0; i < g->nblocks; i++)
-    if (!ordered[i]) corder[ncorder++] = i;
+    if (!ordered[i] && reach[i]) corder[ncorder++] = i;
   xfree(ordered);
   for (uint32_t ci = 0; ci < ncorder; ci++) {
     uint32_t i = corder[ci];
@@ -207,6 +252,7 @@ static void splice(IrFunc *f, IrFunc *g, uint32_t bi, uint32_t cont,
 
   xfree(corder);
   for (uint32_t i = 0; i < g->nblocks; i++) {
+    if (!reach[i]) continue;
     Block *gb = &g->blocks[i];
     uint32_t nb = bmap[i];
     switch (gb->term) {
@@ -261,7 +307,7 @@ static void splice(IrFunc *f, IrFunc *g, uint32_t bi, uint32_t cont,
   f->blocks[bi].term = T_JUMP;
   ir_add_edge(f, bi, bmap[g->entry], callargs, nargs);
 
-  xfree(bmap); xfree(vmap); xfree(tmp);
+  xfree(bmap); xfree(vmap); xfree(tmp); xfree(reach);
 }
 
 static bool has_tail_call(IrFunc *g) {
@@ -699,6 +745,8 @@ typedef struct {
   uint8_t pverdict;
   IrFunc *pplain, *psplit;
   uint32_t pninsts;
+  /* its start is one the likely ways made, over PINLINE_MAX */
+  bool phot;
   /* the callee as built, untailed and ordered, when the whole callee was
      refused: the partial inline's to cut, so that it is not built twice */
   IrFunc *refused;
@@ -1007,6 +1055,29 @@ static bool pinl_rerun_ok(IrFunc *g, Ref v) {
   }
 }
 
+/* A field's write the start may make on its way to a cut, though the call
+   there makes it again: one of a field no read in the start comes before
+   -- at its offset, of any object -- so that run again it writes what it
+   wrote, of values nothing it wrote has changed.  luawasm's push links the
+   disk to the pile's top, disk.next = top, ahead of the store to the pile
+   whose slow ways are cuts; self.count = self.count + 1 reads what it
+   writes, and is no such write. */
+static bool pinl_idem_write(IrFunc *g, const uint8_t *ret, uint32_t bi, uint32_t at) {
+  const Inst *w = &g->insts[g->blocks[bi].insts[at]];
+  if (w->op != I_FIELD_SET || warmc_getenv("WARMC_NO_PINL_IDEM")) return false;
+  for (uint32_t oi = 0; oi < g->norder; oi++) {
+    uint32_t x = g->order[oi];
+    const Block *B = &g->blocks[x];
+    if (!ret[x] || B->rpo > g->blocks[bi].rpo) continue;
+    uint32_t end = x == bi ? at : B->ninsts;
+    for (uint32_t i = 0; i < end; i++) {
+      const Inst *in = &g->insts[B->insts[i]];
+      if (in->op == I_FIELD_GET && in->imm == w->imm) return false;
+    }
+  }
+  return true;
+}
+
 /* What may stand between a write pinl_sink_to moves and where it goes: no
    effect and no read of memory, which would see the write not yet made. */
 static bool pinl_sink_past(const Inst *in) {
@@ -1081,7 +1152,7 @@ static uint32_t pinl_sink_to(IrFunc *g, const uint8_t *ret, const uint8_t *cut, 
    loops, no return is reached without, nothing is cut, or the start is over
    g_inl.partial_max instructions); *size is the start's instruction count. */
 static IrFunc *pinl_build(IrFunc *f, const OptOpts *o, uint32_t fidx,
-                          bool split, uint32_t *size, IrFunc *built) {
+                          bool split, uint32_t *size, IrFunc *built, bool *hot) {
   Module *m = f->m;
   IrFunc *g = built;
   if (!g) {
@@ -1090,6 +1161,16 @@ static IrFunc *pinl_build(IrFunc *f, const OptOpts *o, uint32_t fidx,
   }
   if (split) split_at_raising_sites(g);
   ir_order(g);
+  if (hot) *hot = false;
+  /* where the callee has a test with a rare way by a rule, the look is at
+     its body cleaned up as the callee's own compile cleans it: a test its
+     tests decide is no way out of the start then (WARMC_NO_PINL_HOT=1) */
+  bool prep = false;
+  if (g_inl.partial_hot && !split && !warmc_getenv("WARMC_NO_PINL_HOT") && g->ninsts <= g_inl.partial_prep) {
+    for (uint32_t bi = 0; bi < g->nblocks && !prep; bi++)
+      prep = g->blocks[bi].reachable && ir_unlikely_way_sure(g, &g->blocks[bi]) != UINT32_MAX;
+    if (prep) ir_pinl_prep(g, o);
+  }
   uint32_t nb = g->nblocks;
   uint8_t *bad = xcalloc(nb ? nb : 1, 1), *in_g = xcalloc(nb ? nb : 1, 1);
   uint8_t *ret = xcalloc(nb ? nb : 1, 1), *cut = xcalloc(nb ? nb : 1, 1);
@@ -1116,6 +1197,15 @@ static IrFunc *pinl_build(IrFunc *f, const OptOpts *o, uint32_t fidx,
         bad[bi] = 1;
     }
   }
+  /* each block's rare way out by the rules, or UINT32_MAX */
+  uint32_t *rway = xmalloc((nb ? nb : 1) * sizeof(uint32_t));
+  uint8_t *hotw = xcalloc(nb ? nb : 1, 1), *hotret = xcalloc(nb ? nb : 1, 1);
+  bool hot_on = false;
+  for (uint32_t bi = 0; bi < nb; bi++) {
+    rway[bi] = g->blocks[bi].reachable ? ir_unlikely_way_sure(g, &g->blocks[bi]) : UINT32_MAX;
+    hot_on |= rway[bi] != UINT32_MAX;
+  }
+  if (!prep) hot_on = false;
   IrFunc *out = NULL;
   uint32_t n = 0, ncut = 0;
   bool any_ret = false;
@@ -1189,8 +1279,31 @@ static IrFunc *pinl_build(IrFunc *f, const OptOpts *o, uint32_t fidx,
           if (ret[t] && pdin[bi] + psz[bi] < pdin[t]) pdin[t] = pdin[bi] + psz[bi];
         }
       }
+      /* the likely ways: from the entry, and on to a return */
+      memset(hotw, 0, nb);
+      memset(hotret, 0, nb);
+      if (hot_on) {
+        hotw[g->entry] = 1;
+        for (uint32_t oi = 0; oi < g->norder; oi++) {
+          uint32_t bi = g->order[oi];
+          if (!hotw[bi] || !ret[bi]) { hotw[bi] = 0; continue; }
+          const Block *b = &g->blocks[bi];
+          for (uint32_t s = 0; s < b->nsuccs; s++) {
+            uint32_t t = b->succs[s].target;
+            if (s != rway[bi] && !b->succs[s].cold && !g->blocks[t].cold && ret[t]) hotw[t] = 1;
+          }
+        }
+        for (uint32_t oi = g->norder; oi-- > 0;) {
+          uint32_t bi = g->order[oi];
+          if (!hotw[bi]) continue;
+          const Block *b = &g->blocks[bi];
+          if (b->term == T_RETURN) hotret[bi] = 1;
+          for (uint32_t s = 0; s < b->nsuccs && !hotret[bi]; s++)
+            if (s != rway[bi] && hotw[b->succs[s].target] && hotret[b->succs[s].target]) hotret[bi] = 1;
+        }
+      }
       for (uint32_t bi = 0; bi < nb; bi++)
-        if (ret[bi] && pdin[bi] + pdout[bi] > g_inl.partial_max) ret[bi] = 0;
+        if (ret[bi] && pdin[bi] + pdout[bi] > g_inl.partial_max && !(hotw[bi] && hotret[bi])) ret[bi] = 0;
       if (!ret[g->entry]) {
         if (g_inl.dbg) fprintf(stderr, "pinl %s: no start: no short way out (round %u)\n", inl_name(&m->funcs[fidx]), round);
         goto done;
@@ -1221,7 +1334,7 @@ static IrFunc *pinl_build(IrFunc *f, const OptOpts *o, uint32_t fidx,
         Ref v = b->insts[i];
         uint16_t op = g->insts[v].op;
         if (op != I_CONST && op != I_PARAM && op != I_NOP) n++;
-        if (cut[bi] && !pinl_rerun_ok(g, v)) {
+        if (cut[bi] && !pinl_rerun_ok(g, v) && !pinl_idem_write(g, ret, bi, i)) {
           uint32_t to = pinl_sink_to(g, ret, cut, mcut, bi, i);
           if (to != REF_NONE) { sink[v] = to; nsink++; continue; }
           if (g_inl.dbg)
@@ -1233,7 +1346,7 @@ static IrFunc *pinl_build(IrFunc *f, const OptOpts *o, uint32_t fidx,
     }
     if (!again) break;
   }
-  if (!ncut || !any_ret || n > g_inl.partial_max) {
+  if (!ncut || !any_ret || n > (hot_on ? g_inl.partial_hot : g_inl.partial_max)) {
     if (g_inl.dbg)
       fprintf(stderr, "pinl %s: no start: %s (%u instructions, %u cuts)\n", inl_name(&m->funcs[fidx]),
               !ncut ? "nothing cut" : !any_ret ? "no return" : "too big", n, ncut);
@@ -1322,10 +1435,12 @@ static IrFunc *pinl_build(IrFunc *f, const OptOpts *o, uint32_t fidx,
     ir_order(g);
     out = g;
     *size = n + 1;
+    if (hot) *hot = hot_on && n > g_inl.partial_max;
   }
 done:
   xfree(bad); xfree(in_g); xfree(ret); xfree(cut); xfree(mcut); xfree(sink);
   xfree(psz); xfree(pdin); xfree(pdout);
+  xfree(rway); xfree(hotw); xfree(hotret);
   if (!out) ir_free(g);
   return out;
 }
@@ -1341,15 +1456,16 @@ static IrFunc *inl_partial_callee(IrFunc *f, const OptOpts *o, InlMemos *memo,
     uint32_t size = 0;
     IrFunc *built = e->refused;
     e->refused = NULL;
-    e->pplain = pinl_build(f, o, fidx, false, &size, built);
-    if (e->pplain) { e->pverdict = 1; e->pninsts = size; }
+    bool hot = false;
+    e->pplain = pinl_build(f, o, fidx, false, &size, built, &hot);
+    if (e->pplain) { e->pverdict = 1; e->pninsts = size; e->phot = hot; }
     if (known) __atomic_store_n(known, e->pplain ? 1 : 2, __ATOMIC_RELAXED);
   }
   if (e->pverdict != 1) return NULL;
   if (!want_split) return e->pplain;
   if (!e->psplit) {
     uint32_t size = 0;
-    e->psplit = pinl_build(f, o, fidx, true, &size, NULL);
+    e->psplit = pinl_build(f, o, fidx, true, &size, NULL, NULL);
   }
   return e->psplit;
 }
@@ -1656,16 +1772,18 @@ static bool inl_score_partial(IrFunc *f, const OptOpts *o, InlMemos *memo,
   if (g_inl.dbg && fidx == f->func_index)
     fprintf(stderr, "pinl %s: own call at b%u%s%s%s\n", inl_name(&m->funcs[fidx]), bi, b->diverges ? " diverges" : "",
             b->cold ? " cold" : "", parent ? " in an inline" : "");
-  if (b->diverges || b->cold) return false;
+  if (b->diverges || b->cold) { inl_dbg(f, fidx, bi, "partial: cold or diverging"); return false; }
   uint16_t idepth = 0;
   if (parent) {
-    if ((uint32_t)parent->idepth + 1 > g_inl.depth || fidx == parent->fidx)
+    if ((uint32_t)parent->idepth + 1 > g_inl.depth || fidx == parent->fidx) {
+      inl_dbg(f, fidx, bi, "partial: depth or own chain");
       return false;
+    }
     for (uint16_t j = 0; j < parent->idepth; j++)
       if (parent->anc[j] == fidx) return false;
     idepth = parent->idepth + 1;
   }
-  if (!inl_partial_callee(f, o, memo, fidx, false)) return false;
+  if (!inl_partial_callee(f, o, memo, fidx, false)) { inl_dbg(f, fidx, bi, "partial: no start"); return false; }
   uint32_t charged = memo_at(memo, fidx)->pninsts;
   if (charged < 4) charged = 4;
   uint32_t d = b->loop_depth > 3 ? 3 : b->loop_depth;
@@ -1720,8 +1838,9 @@ static void inl_collect(IrFunc *f, const OptOpts *o, InlMemos *memo,
    blocks, and redoing the order after each such splice, and before each
    scoring, most of a Rust main that inlines three hundred panics. */
 static bool inl_apply(IrFunc *f, const OptOpts *o, InlMemos *memo,
-                      const InlSite *site, uint32_t *budget,
+                      const InlSite *site, uint32_t *budget0, uint32_t *pbudget,
                       uint32_t *retsum, bool *stale) {
+  uint32_t *budget = budget0;
   Module *m = f->m;
   Ref call = site->call;
   Inst *cin = &f->insts[call];
@@ -1772,8 +1891,14 @@ static bool inl_apply(IrFunc *f, const OptOpts *o, InlMemos *memo,
       rc = 0;
     }
   }
+  /* (a start the likely ways made is charged to its own share) */
+  if (partial && !nehe && memo_at(memo, fidx)->phot) budget = pbudget;
   if (charged > *budget) {
     g_stats.inl_rej_budget++;
+    if (g_inl.dbg)
+      fprintf(stderr, "inline %s: callee %s: %u instructions, over the %u left%s\n",
+              inl_name(&m->funcs[f->func_index]), inl_name(&m->funcs[fidx]), charged, *budget,
+              partial ? " (its start)" : "");
     return false;
   }
   if (rc && *retsum + rc > rcap) {
@@ -1872,6 +1997,7 @@ static bool inl_apply(IrFunc *f, const OptOpts *o, InlMemos *memo,
       if (f->insts[v].op == I_CALL && (uint32_t)f->insts[v].imm == fidx)
         f->insts[v].flags |= IRF_PARTIAL_SLOW;
     g_stats.inl_partial++;
+    if (budget == pbudget) g_stats.inl_hot_starts++;
     inl_dbg(f, fidx, bi, "inlined partially");
   } else {
     g_stats.inlined++;
@@ -1893,17 +2019,17 @@ static bool inl_run(IrFunc *f, const OptOpts *o, uint32_t budget0, bool more) {
   inl_collect(f, o, memo, ev, &sites, more);
   if (sites.n > 1) qsort(sites.v, sites.n, sizeof(InlSite), inl_site_cmp);
 
-  uint32_t budget = budget0;
+  uint32_t budget = budget0, pbudget = more ? 0 : g_inl.partial_growth;
   uint32_t retsum = 0;
   long events = 0;
   /* stale: the substitutions and the order are left to the end; depths:
      the blocks' loop depths and divergence are the graph's as it is now */
   bool any = false, stale = false, depths = true;
-  for (uint32_t i = 0; i < sites.n && budget > 0; i++) {
+  for (uint32_t i = 0; i < sites.n && (budget > 0 || pbudget > 0); i++) {
     if (g_inl.max >= 0 && events >= g_inl.max) break;
     InlSite site = sites.v[i];
     uint32_t before = f->ninsts, nb_before = f->nblocks;
-    if (!inl_apply(f, o, memo, &site, &budget, &retsum, &stale)) continue;
+    if (!inl_apply(f, o, memo, &site, &budget, &pbudget, &retsum, &stale)) continue;
     any = true;
     /* a flat inline leaves the graph as it was */
     if (f->nblocks != nb_before) depths = false;

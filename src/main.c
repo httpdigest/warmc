@@ -74,9 +74,9 @@ static const char *usage_text =
   "                cpool, ictab, reach, prune, merge, devirt, reinline,\n"
   "                throw-jump, closed-world, sealed, once, gcpure, split,\n"
   "                labcache, ifconv, mulwide, barelide, small-loop-align,\n"
-  "                trampoline, go-sp, go-resume, go-noret, wrap-params, fma,\n"
-  "                dead-frames, acc-tail, float-reassoc, addr-nowrap,\n"
-  "                exact-trap\n"
+  "                trampoline, go-sp, go-resume, go-noret, wrap-params, tails,\n"
+  "                cmp-sink, test-chain, way-split, arr-bias, fma, dead-frames, acc-tail,\n"
+  "                float-reassoc, addr-nowrap, exact-trap\n"
   "                fma is off below -O3: it fuses a float multiply\n"
   "                into the add that reads it, rounded once, which is not\n"
   "                wasm's arithmetic and can change a result's last bit\n"
@@ -356,20 +356,21 @@ static void print_stats(void) {
           " loop_pieces=%llu vacates=%llu gc_loads_reused=%llu recomputes=%llu dead_frame_stores=%llu tramp_funcs=%llu gosp_funcs=%llu"
           " go_resume_pruned=%llu go_resume_split=%llu go_noret_calls=%llu wrap_params=%llu\n"
           "             escape_removed=%llu escape_forwarded=%llu escape_made=%llu gloop=%llu\n"
-          "             loop_closed=%llu reassoc=%llu cmp_reused=%llu csel_fused=%llu cincs=%llu mul_wide=%llu fma=%llu gssa=%llu bitrevs=%llu common_factors=%llu threaded_known=%llu threaded_eval=%llu threaded_path=%llu unswitched=%llu param_compares=%llu key_splits=%llu bfi_apart=%llu ccmp_chains=%llu loop_tops=%llu loop_consts=%llu small_loops=%llu slp_groups=%llu\n"
+          "             loop_closed=%llu reassoc=%llu cmp_reused=%llu csel_fused=%llu cincs=%llu mul_wide=%llu fma=%llu gssa=%llu bitrevs=%llu common_factors=%llu threaded_known=%llu threaded_eval=%llu threaded_path=%llu unswitched=%llu param_compares=%llu key_splits=%llu way_splits=%llu bfi_apart=%llu ccmp_chains=%llu loop_tops=%llu loop_consts=%llu small_loops=%llu slp_groups=%llu\n"
           "             bar_masks=%llu bar_elided=%llu\n"
           "             devirt_ref=%llu devirt_indirect=%llu"
           " devirt_null_kept=%llu const_reads=%llu throw_jumps=%llu"
           " inl_more=%llu\n"
           "             inl_flat=%llu inl_spliced=%llu inl_once=%llu"
-          " inl_retcall_sites=%llu inl_trans=%llu inl_escape=%llu inl_partial=%llu rej_size=%llu"
+          " inl_retcall_sites=%llu inl_trans=%llu inl_escape=%llu inl_partial=%llu inl_hot_starts=%llu inl_blocks=%llu rej_size=%llu"
           " rej_budget=%llu rej_tail=%llu rej_retcalls=%llu rej_pads=%llu"
           " rej_score=%llu rej_depth=%llu rej_rec=%llu max_frame=%llu\n"
           "             unrolled=%llu unr_guarded=%llu unr_rej_shape=%llu"
           " unr_rej_body=%llu unr_rej_exit=%llu unr_rej_trip=%llu"
-          " unr_rej_escape=%llu unr_addr_folded=%llu gc_nullchk=%llu bce_ranges=%llu bce_smeared=%llu bce_versioned=%llu gc_loads_pre=%llu fields_promoted=%llu\n"
-          "             slot_tests=%llu slot_nullchks=%llu slot_brs=%llu once_dead=%llu once_dominated=%llu once_looped=%llu\n"
+          " unr_rej_escape=%llu unr_addr_folded=%llu gc_nullchk=%llu bce_ranges=%llu bce_smeared=%llu bce_versioned=%llu gc_loads_pre=%llu gc_elems_reused=%llu fields_promoted=%llu\n"
+          "             slot_tests=%llu slot_nullchks=%llu slot_brs=%llu br_flags=%llu ra_cpriced=%llu ra_cnone=%llu rare_csa=%llu test_chains=%llu arr_bias_args=%llu arr_biased=%llu branch_decided=%llu ra_cs_spared=%llu min_cmps=%llu once_dead=%llu once_dominated=%llu once_looped=%llu\n"
           "             bit_tests=%llu way_folds=%llu bit_brs=%llu exit_defers=%llu stubs_out=%llu latch_hoists=%llu latch_both=%llu blocks_merged=%llu\n"
+          "             hot_tails=%llu hot_tail_pres=%llu cmps_sunk=%llu cmp_edge_consts=%llu\n"
           "             bound_lens=%llu bound_lens_hoisted=%llu bce_version_sym=%llu gc_nonnull_params=%llu slot_nonnull=%llu gc_nulltraps=%llu\n"
           "             ra2_reloads=%llu ra2_spills=%llu ra2_remats=%llu ra2_params=%llu ra2_fallback=%llu ra2_csa_hot=%llu ra2_callsplits=%llu ra2_whole=%llu ra2_tried=%llu ra2_picked=%llu ra2_recolored=%llu\n",
           (unsigned long long)g_stats.folded, (unsigned long long)g_stats.dce_removed,
@@ -437,7 +438,7 @@ static void print_stats(void) {
           (unsigned long long)g_stats.threaded_path,
           (unsigned long long)g_stats.unswitched,
           (unsigned long long)g_stats.param_compares,
-          (unsigned long long)g_stats.key_splits,
+          (unsigned long long)g_stats.key_splits, (unsigned long long)g_stats.way_splits,
           (unsigned long long)g_stats.bfi_apart,
           (unsigned long long)g_stats.ccmp_chains,
           (unsigned long long)g_stats.loop_tops,
@@ -459,6 +460,8 @@ static void print_stats(void) {
           (unsigned long long)g_stats.inl_transitive,
           (unsigned long long)g_stats.inl_escape,
           (unsigned long long)g_stats.inl_partial,
+          (unsigned long long)g_stats.inl_hot_starts,
+          (unsigned long long)g_stats.inl_blocks,
           (unsigned long long)g_stats.inl_rej_size,
           (unsigned long long)g_stats.inl_rej_budget,
           (unsigned long long)g_stats.inl_rej_tailcall,
@@ -479,10 +482,17 @@ static void print_stats(void) {
           (unsigned long long)g_stats.gc_nullchk_removed,
           (unsigned long long)g_stats.bce_ranges, (unsigned long long)g_stats.bce_smeared,
           (unsigned long long)g_stats.bce_versioned, (unsigned long long)g_stats.gc_loads_pre,
+          (unsigned long long)g_stats.gc_elems_reused,
           (unsigned long long)g_stats.fields_promoted,
           (unsigned long long)g_stats.slot_tests,
           (unsigned long long)g_stats.slot_nullchks,
           (unsigned long long)g_stats.slot_brs,
+          (unsigned long long)g_stats.br_flags,
+          (unsigned long long)g_stats.ra_cpriced, (unsigned long long)g_stats.ra_cnone, (unsigned long long)g_stats.rare_csa,
+          (unsigned long long)g_stats.test_chains, (unsigned long long)g_stats.arr_bias_args,
+          (unsigned long long)g_stats.arr_biased, (unsigned long long)g_stats.branch_decided,
+          (unsigned long long)g_stats.ra_cs_spared,
+          (unsigned long long)g_stats.min_cmps,
           (unsigned long long)g_stats.once_dead,
           (unsigned long long)g_stats.once_dominated,
           (unsigned long long)g_stats.once_looped,
@@ -493,6 +503,8 @@ static void print_stats(void) {
           (unsigned long long)g_stats.stubs_out,
           (unsigned long long)g_stats.latch_hoists, (unsigned long long)g_stats.latch_both,
           (unsigned long long)g_stats.blocks_merged,
+          (unsigned long long)g_stats.hot_tails, (unsigned long long)g_stats.hot_tail_pres,
+          (unsigned long long)g_stats.cmps_sunk, (unsigned long long)g_stats.cmp_edge_consts,
           (unsigned long long)g_stats.bound_lens, (unsigned long long)g_stats.bound_lens_hoisted,
           (unsigned long long)g_stats.bce_version_sym,
           (unsigned long long)g_stats.gc_nonnull_params,

@@ -513,6 +513,9 @@ typedef struct {
   IcTable *ict; uint32_t nict;
   uint32_t *ict_of;
 
+  /* WARMC_BBC: the block counters' data symbol, when bbc */
+  bool bbc; uint32_t bbc_sym;
+
   /* per function, whether a partial inline has a start of it to take in
      (inline.c pinl_build): 0 not known yet, 1 yes, 2 no -- written by
      whichever compile thread finds out first (__atomic, relaxed); NULL

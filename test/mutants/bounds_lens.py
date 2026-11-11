@@ -91,8 +91,8 @@ M = {
  'bl_isel': m('          Ref L = a[in->nargs - 1];', '          Ref L = a[1];', path='src/isel_ops.inc'),
  'bl_isel_imm': m('            a64_cmp_imm(B, SF32, idx, (uint32_t)(imm_of(s, L) & 0xfff));',
                   '            a64_cmp_imm(B, SF32, idx, (uint32_t)(imm_of(s, L) & 0xfff) + 1);', path='src/isel_ops.inc'),
- 'bl_mask': m('  Ref m = ir_args((IrFunc *)f, v)[in->nargs - 1 - ((in->imm2 & GCF_LENARG) != 0)];',
-              '  Ref m = ir_args((IrFunc *)f, v)[in->nargs - 1];', path='src/isel_core.inc'),
+ 'bl_mask': m('  return ir_args((IrFunc *)f, v)[in->nargs - 1 - ((in->imm2 & GCF_LENARG) != 0)];',
+              '  return ir_args((IrFunc *)f, v)[in->nargs - 1];', path='src/isel_core.inc'),
 
  'glob_mutable': m('      if (g->mutable_ || g->imported || !g->init.n) return 0;', '      if (g->imported || !g->init.n) return 0;'),
  'glob_fixed': m('      if (e[n - 1].op == IOP_ARRAY_NEW_FIXED) return (uint32_t)e[n - 1].hi;',

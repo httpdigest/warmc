@@ -312,9 +312,35 @@ static int32_t ra2_dout(Ra2 *R, uint32_t b, Ref x) {
    location (analyse_immediates), where a version the pass made of the
    constant -- a block's param -- would take a register and the immediate's
    form with it (a compare with zero, a test of the sign bit). */
+/* And so is a one-move constant a call reads as an argument, or an
+   array.new as an operand: either makes it in the argument's register
+   (emit_call_args_core), which costs
+   the move a register holding it would cost there -- as the scan prices it
+   (regalloc.inc ra_cuse_cost); counted as a read, the constant kept a
+   register up to each call that passes it (WARMC_RA2_NO_INPLACE) */
+static bool ra2_inplace_use(Ra2 *R, Ref u, uint32_t j, Ref x) {
+  IrFunc *f = R->f;
+  const Inst *c = &f->insts[x];
+  ValType t = (ValType)c->type;
+  if (c->op != I_CONST || vt_is_float(t) || t == VT_V128 || ir_const_cost(c->imm, vt_is_64(t)) > 1)
+    return false;
+  const Inst *in = &f->insts[u];
+  switch (in->op) {
+    case I_CALL: case I_RETURN_CALL: case I_ARRAY_NEW: break;
+    case I_CALL_INDIRECT: case I_CALL_REF:
+    case I_RETURN_CALL_INDIRECT: case I_RETURN_CALL_REF:
+      if (j + 1 >= in->nargs) return false;
+      break;
+    default:
+      return false;
+  }
+  return !R->s->no_remat[x] && !warmc_getenv("WARMC_RA2_NO_INPLACE");
+}
+
 static bool ra2_imm_use(Ra2 *R, Ref u, uint32_t j, Ref x) {
-  return x < R->n0 && R->rem[x] && R->f->insts[x].op == I_CONST && is_imm_at(R->s, u, j, x) &&
-         !warmc_getenv("WARMC_RA2_NO_IMMUSE");
+  if (!(x < R->n0 && R->rem[x] && R->f->insts[x].op == I_CONST)) return false;
+  if (ra2_inplace_use(R, u, j, x)) return true;
+  return is_imm_at(R->s, u, j, x) && !warmc_getenv("WARMC_RA2_NO_IMMUSE");
 }
 
 /* How often each block runs, by the estimate that needs no profile: the

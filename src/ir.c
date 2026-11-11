@@ -367,8 +367,12 @@ bool ir_dom_walk(const IrFunc *f, uint32_t a, uint32_t b) {
 /* Read before the first ordering computes a range, which every compile
    thread does before it asks a dominance question. */
 static bool g_dom_check;
+static int g_order_light;   /* 0 as ir_order, 1 the light ordering, 2 checked against ir_order */
 static pthread_once_t g_dom_check_once = PTHREAD_ONCE_INIT;
-static void dom_check_init(void) { g_dom_check = warmc_getenv("WARMC_CHECK_DOM") != NULL; }
+static void dom_check_init(void) {
+  g_dom_check = warmc_getenv("WARMC_CHECK_DOM") != NULL;
+  g_order_light = warmc_getenv("WARMC_NO_ORDER_LIGHT") ? 0 : warmc_getenv("WARMC_VERIFY_GATES") ? 2 : 1;
+}
 
 bool ir_dominates_checked(const IrFunc *f, uint32_t a, uint32_t b) {
   bool r = ir_dom_range(f, a, b);
@@ -382,17 +386,91 @@ static bool block_dominates(IrFunc *f, uint32_t a, uint32_t b) {
   return ir_dominates_checked(f, a, b);
 }
 
-static int branch_bias(const IrFunc *f, const Block *b) {
-  if (b->term != T_BRIF || b->nsuccs != 2) return 0;
-  Ref c = b->term_arg;
+static bool is_cond_op(uint16_t op) {
+  return (op >= I_EQ && op <= I_GEU) || op == I_EQZ || op == I_REF_IS_NULL ||
+         op == I_REF_TEST || op == I_REF_SLOT;
+}
+
+/* A length read from a GC object: an array's, or a struct's field, as it
+   is, widened, or the lesser of two (a Lua table's array part: its size,
+   or its array's length when that is less) */
+static bool gc_length(const IrFunc *f, Ref v) {
+  for (int d = 0; d < 4 && v < f->ninsts; d++) {
+    const Inst *in = &f->insts[v];
+    if (in->op == I_ARRAY_LEN || in->op == I_FIELD_GET) return true;
+    if (in->op == I_SELECT && in->nargs == 3) {
+      const Ref *a = &f->argpool[in->args_off];
+      return (a[0] < f->ninsts && (f->insts[a[0]].op == I_ARRAY_LEN || f->insts[a[0]].op == I_FIELD_GET)) ||
+             (a[1] < f->ninsts && (f->insts[a[1]].op == I_ARRAY_LEN || f->insts[a[1]].op == I_FIELD_GET));
+    }
+    if (in->op != I_EXTENDU && in->op != I_WRAP) return false;
+    v = f->argpool[in->args_off];
+  }
+  return false;
+}
+
+static bool bias_gc_on(void) {
+  static _Atomic int on = -1;
+  if (on < 0) on = warmc_getenv("WARMC_NO_GC_BIAS") == NULL;
+  return on;
+}
+
+/* How likely condition c is to hold without a profile: 1 likely, -1
+   unlikely, 0 either way.  An integer's equality with a constant is the
+   rare way, its order with 0 says which side, a null test fails.  And,
+   counted in luawasm's kernels (2026-11-09, every block of the hot
+   functions of awfy permute, towers, sieve, list, queens and methodcall,
+   as WARMC_BBC counted them): a type test holds and an equality of two
+   references holds -- a value's tag against a tag constant, a method
+   against the closure a call was inlined for, in the global that names it
+   -- at every branch on one; Lua's nil test, an and of a null test and a
+   payload of 0, never did; the test that an index is past the array part,
+   an unsigned >= of the index and the size, never did; a test that a
+   value is not null holds.  So an eqz of a condition is the opposite of
+   it, an and is as unlikely as either side is and as likely as one is
+   when neither is unlikely, an or the other way round, and an unsigned
+   compare says the index is inside.  WARMC_NO_GC_BIAS=1 keeps to the
+   integer rules and an eqz of anything unlikely. */
+static int cond_bias(const IrFunc *f, Ref c, int depth, bool emit, int strong) {
   if (c >= f->ninsts) return 0;
   const Inst *in = &f->insts[c];
-  if (in->op == I_EQZ || in->op == I_REF_IS_NULL) return -1;
+  bool gc = emit && bias_gc_on();
+  if (in->op == I_REF_IS_NULL) return -1;
+  if (in->op == I_EQZ) {
+    Ref x = f->argpool[in->args_off];
+    if (gc && depth < 4 && x < f->ninsts && is_cond_op(f->insts[x].op))
+      return -cond_bias(f, x, depth + 1, emit, strong);
+    return strong ? 0 : -1;
+  }
+  if (!gc && in->nargs != 2) return 0;
+  if (gc) {
+    if (in->op == I_REF_TEST || in->op == I_REF_SLOT) return 1;
+    if ((in->op == I_AND || in->op == I_OR) && in->nargs == 2 && depth < 4) {
+      const Ref *a = &f->argpool[in->args_off];
+      if (a[0] >= f->ninsts || a[1] >= f->ninsts ||
+          !is_cond_op(f->insts[a[0]].op) || !is_cond_op(f->insts[a[1]].op))
+        return 0;
+      int x = cond_bias(f, a[0], depth + 1, emit, strong), y = cond_bias(f, a[1], depth + 1, emit, strong);
+      if (in->op == I_AND) return x < 0 || y < 0 ? -1 : x > 0 || y > 0 ? 1 : 0;
+      return x > 0 || y > 0 ? 1 : x < 0 && y < 0 ? -1 : 0;
+    }
+  }
   if (in->nargs != 2) return 0;
   const Ref *a = &f->argpool[in->args_off];
+  const Inst *lhs = a[0] < f->ninsts ? &f->insts[a[0]] : NULL;
   const Inst *rhs = a[1] < f->ninsts ? &f->insts[a[1]] : NULL;
   bool rhs_const = rhs && rhs->op == I_CONST;
   bool rhs_zero = rhs_const && rhs->imm == 0;
+  if (gc && (in->op == I_EQ || in->op == I_NE) && lhs && rhs &&
+      vt_is_ref((ValType)lhs->type) && vt_is_ref((ValType)rhs->type) &&
+      !(rhs_const && rhs->imm == 0) && !(lhs->op == I_CONST && lhs->imm == 0)) {
+    /* against a constant, a tag: which of a number's tags a value has is
+       a guess, taken where a wrong one costs little (strong 1, not 2) */
+    if (strong >= 2 && (rhs_const || lhs->op == I_CONST)) return 0;
+    return in->op == I_EQ ? 1 : -1;
+  }
+  if (strong && !(gc && (in->op == I_GEU || in->op == I_GTU || in->op == I_LTU || in->op == I_LEU)))
+    return 0;
   switch (in->op) {
 
     case I_LTS: case I_LES: return rhs_zero ? -1 : 0;
@@ -400,8 +478,103 @@ static int branch_bias(const IrFunc *f, const Block *b) {
 
     case I_EQ: return rhs_const ? -1 : 0;
     case I_NE: return rhs_const ? 1 : 0;
+
+    case I_GEU: case I_GTU: return gc && gc_length(f, a[1]) ? -1 : 0;
+    case I_LTU: case I_LEU: return gc && gc_length(f, a[1]) ? 1 : 0;
     default: return 0;
   }
+}
+
+/* The way out of block b, a test, that the rules above make the unlikely
+   one by themselves, the integer rules aside (strong): a reference test or
+   equality, a null or nil test, a compare of an index with a GC length, and
+   the eqz, and and or, of those -- never the other way in the blocks
+   counted -- or UINT32_MAX. */
+static Ref strip_width(const IrFunc *f, Ref v) {
+  while (v < f->ninsts && (f->insts[v].op == I_EXTENDU || f->insts[v].op == I_WRAP))
+    v = f->argpool[f->insts[v].args_off];
+  return v;
+}
+
+/* What block s and the blocks after it first do with the element at idx:
+   1 a store, -1 a read, 0 neither within the search.  A test's two ways
+   are both searched, its likely way alone where the rules name one, and
+   a read down any way decides. */
+static int first_access(const IrFunc *f, const Block *s, Ref idx, int strong, int hops, uint32_t *budget) {
+  for (;;) {
+    for (uint32_t i = 0; i < s->ninsts; i++) {
+      const Inst *x = &f->insts[s->insts[i]];
+      if ((x->op != I_ARRAY_SET && x->op != I_ARRAY_GET) || x->nargs < 2) continue;
+      if (strip_width(f, f->argpool[x->args_off + 1]) != idx) continue;
+      return x->op == I_ARRAY_SET ? 1 : -1;
+    }
+    if (!hops-- || !*budget) return 0;
+    --*budget;
+    if (s->term == T_JUMP && s->nsuccs == 1) {
+      s = &f->blocks[s->succs[0].target];
+    } else if (s->term == T_BRIF && s->nsuccs == 2) {
+      int bias = cond_bias(f, s->term_arg, 0, true, strong);
+      if (bias) { s = &f->blocks[s->succs[bias > 0 ? 0 : 1].target]; continue; }
+      int x = first_access(f, &f->blocks[s->succs[0].target], idx, strong, hops, budget);
+      int y = first_access(f, &f->blocks[s->succs[1].target], idx, strong, hops, budget);
+      return x < 0 || y < 0 ? -1 : x > 0 || y > 0 ? 1 : 0;
+    } else {
+      return 0;
+    }
+  }
+}
+
+/* Whether the test c of block b, an index against a GC length, is ahead of
+   a write of that element: down the ways from the side the index is inside
+   on, the first access at the index is an array.set.  A store past the end
+   is how a Lua table grows -- t[i] = x in a loop from 1, or t[#t + 1] = x
+   -- so that test goes either way (awfy_sieve's loop that fills its table
+   of flags took the far side every time); a read past the end is rare. */
+static bool guards_store(const IrFunc *f, const Block *b, Ref c, int strong) {
+  static _Atomic int off = -1;
+  if (off < 0) off = warmc_getenv("WARMC_NO_STORE_GUARD") != NULL;
+  if (off) return false;
+  bool neg = false;
+  while (c < f->ninsts && f->insts[c].op == I_EQZ) { c = f->argpool[f->insts[c].args_off]; neg = !neg; }
+  if (c >= f->ninsts) return false;
+  const Inst *in = &f->insts[c];
+  if (in->nargs != 2 || (in->op != I_GEU && in->op != I_GTU && in->op != I_LTU && in->op != I_LEU))
+    return false;
+  const Ref *a = &f->argpool[in->args_off];
+  if (!gc_length(f, a[1])) return false;
+  Ref idx = strip_width(f, a[0]);
+  bool inside_true = (in->op == I_LTU || in->op == I_LEU) != neg;
+  uint32_t budget = 12;
+  return first_access(f, &f->blocks[b->succs[inside_true ? 0 : 1].target], idx, strong, 4, &budget) > 0;
+}
+
+static uint32_t unlikely_way(const IrFunc *f, const Block *b, int strong) {
+  if (b->term != T_BRIF || b->nsuccs != 2 || b->succs[0].target == b->succs[1].target ||
+      b->succs[0].eh || b->succs[1].eh)
+    return UINT32_MAX;
+  int bias = cond_bias(f, b->term_arg, 0, true, strong);
+  if (bias && guards_store(f, b, b->term_arg, strong)) return UINT32_MAX;
+  return bias > 0 ? 1 : bias < 0 ? 0 : UINT32_MAX;
+}
+
+uint32_t ir_unlikely_way(const IrFunc *f, const Block *b) { return unlikely_way(f, b, 1); }
+
+/* Whether block b's test is a null test and nothing else, through eqz: the
+   rare way of one is the null's by the rule, and as often the way a walk
+   of a tree or a list takes at every leaf. */
+bool ir_test_bare_null(const IrFunc *f, const Block *b) {
+  if (b->term != T_BRIF || b->chained) return false;
+  Ref c = b->term_arg;
+  while (c < f->ninsts && f->insts[c].op == I_EQZ) c = f->argpool[f->insts[c].args_off];
+  return c < f->ninsts && f->insts[c].op == I_REF_IS_NULL;
+}
+
+/* the same without the guesses: no test of a tag */
+uint32_t ir_unlikely_way_sure(const IrFunc *f, const Block *b) { return unlikely_way(f, b, 2); }
+
+static int branch_bias(const IrFunc *f, const Block *b, bool emit) {
+  if (b->term != T_BRIF || b->nsuccs != 2) return 0;
+  return cond_bias(f, b->term_arg, 0, emit, false);
 }
 
 bool ir_reads_low32(const IrFunc *f, Ref u, uint32_t j) {
@@ -417,6 +590,17 @@ bool ir_reads_low32(const IrFunc *f, Ref u, uint32_t j) {
       return true;
     case I_STORE: return j == 1 && MEMF_SIZE(in->imm2) <= 2;
     case I_MEM_ADDR: case I_MEM_PTR: return j == 0;
+    /* an array's index, an i32, compared and scaled as a w register (arm64
+       isel; where a wrap is an instruction, x86-64, nothing asks): the wrap
+       of a 64-bit index -- Lua's 1-based i less 1 -- was a mov wN, wN
+       before each access, 6% of luawasm awfy_permute's samples */
+    case I_ARRAY_GET: case I_ARRAY_SET: {
+      static int off = -1;
+      if (off < 0) off = warmc_getenv("WARMC_NO_ARR_LOW32") != NULL;
+      /* (and the value the index is less than, GCF_BIASARG, scaled as a w
+         register too) */
+      return (j == 1 || ((in->imm2 & GCF_BIASARG) && j == GCF_BIAS_AT(in->op))) && !off;
+    }
     /* a 32-bit table's index, compared and scaled as a w register: Go's
        closure calls take it from the function value's high bits */
     case I_CALL_INDIRECT: case I_RETURN_CALL_INDIRECT: return j + 1 == in->nargs;
@@ -424,20 +608,24 @@ bool ir_reads_low32(const IrFunc *f, Ref u, uint32_t j) {
   }
 }
 
-static int layout_score_of(const IrFunc *f, const Block *b, uint32_t si);
+static int layout_score_of(const IrFunc *f, const Block *b, uint32_t si, bool emit);
 
 int ir_succ_score(const IrFunc *f, const Block *b, uint32_t si) {
-  return layout_score_of(f, b, si);
+  return layout_score_of(f, b, si, true);
 }
 
-static int layout_score_of(const IrFunc *f, const Block *b, uint32_t si) {
+/* emit: for the layout's own order and the way a branch is emitted, with the
+   rules the allocator's order (f->order) leaves out: in that order they
+   changed what the scan spilled (luawasm awfy_permute, 18.7M loads from the
+   stack a run where 29.6M) */
+static int layout_score_of(const IrFunc *f, const Block *b, uint32_t si, bool emit) {
   const Edge *e = &b->succs[si];
   const Block *t = &f->blocks[e->target];
   if (e->eh || t->is_pad) return -1000;
 
   if (t->diverges || t->cold) return -100;
   int score = 4 * (int)(t->loop_depth < 8 ? t->loop_depth : 8);
-  int bias = branch_bias(f, b);
+  int bias = branch_bias(f, b, emit);
   if (bias) score += (si == 0) ? bias : -bias;
   return score;
 }
@@ -484,7 +672,7 @@ static bool dfs_defer_exit(IrFunc *f, const uint8_t *seen, uint32_t b, uint32_t 
 
 /* stk0 holds cap entries; a search that needs more moves to the heap */
 static void dfs_post(IrFunc *f, uint32_t entry, uint8_t *seen, uint32_t *post,
-                     uint32_t *n, bool by_score, bool defer, uint32_t *stk0, uint32_t cap) {
+                     uint32_t *n, bool by_score, bool defer, bool emit, uint32_t *stk0, uint32_t cap) {
   uint32_t sp = 0;
   uint32_t *stk = stk0;
 
@@ -518,7 +706,7 @@ static void dfs_post(IrFunc *f, uint32_t entry, uint8_t *seen, uint32_t *post,
     uint32_t idx[64];
     int sc[64];
     uint32_t ns = b->nsuccs < 64 ? b->nsuccs : 64;
-    for (uint32_t i = 0; i < ns; i++) { idx[i] = i; sc[i] = layout_score_of(f, b, i); }
+    for (uint32_t i = 0; i < ns; i++) { idx[i] = i; sc[i] = layout_score_of(f, b, i, emit); }
     for (uint32_t i = 0; i < ns; i++)
       for (uint32_t j = i + 1; j < ns; j++)
         if (sc[idx[j]] < sc[idx[i]]) {
@@ -542,7 +730,7 @@ static void dfs_post(IrFunc *f, uint32_t entry, uint8_t *seen, uint32_t *post,
    are the graph's own and not the search order's, and a second ordering
    given keep = true takes them as they are and renumbers only what follows
    the order -- rpo, and the dominator tree's interval numbering. */
-static bool order_once(IrFunc *f, bool by_score, bool keep) {
+static bool order_once(IrFunc *f, bool by_score, bool keep, bool noloops) {
   bool reducible = true;
   /* Every array below is the function's blocks long, or one more, and the
      search's stack twice that: carved from one buffer the function keeps.
@@ -572,7 +760,7 @@ static bool order_once(IrFunc *f, bool by_score, bool keep) {
   uint8_t *fwd = (uint8_t *)w;
   memset(seen, 0, nb);
   uint32_t n = 0;
-  dfs_post(f, f->entry, seen, post, &n, by_score, false, dstk, nb + 8);
+  dfs_post(f, f->entry, seen, post, &n, by_score, false, false, dstk, nb + 8);
 
   if (n > f->cap_order) {
     f->order = ir_grow(f, f->order, (size_t)f->cap_order * sizeof(uint32_t),
@@ -673,6 +861,21 @@ static bool order_once(IrFunc *f, bool by_score, bool keep) {
      every block per back edge made this blocks times loops, which in a
      function of 78,000 blocks and 300 loops was most of the compile. */
   if (keep) return true;
+  if (noloops) {
+    /* the caller reads no depth: only whether every edge back is natural,
+       and with one that is not, the loops after all -- its second search
+       takes its successors by them */
+    bool all = true;
+    for (uint32_t i = 0; i < n && all; i++) {
+      uint32_t bi = f->order[i];
+      const Block *b = &f->blocks[bi];
+      for (uint32_t s = 0; s < b->nsuccs && all; s++) {
+        uint32_t t = b->succs[s].target;
+        if (f->blocks[t].rpo <= b->rpo && !block_dominates(f, t, bi)) all = false;
+      }
+    }
+    if (all) return true;
+  }
   memset(inloop, 0, nb);
   memset(fwd, 0, nb);
   if (f->cap_loop_head < nb) {
@@ -782,7 +985,7 @@ static void order_sig_fill(const IrFunc *f, uint32_t *o) {
     o[k++] = b->is_pad;
     o[k++] = b->term;
     o[k++] = b->nsuccs;
-    o[k++] = (uint32_t)(branch_bias(f, b) + 2);
+    o[k++] = (uint32_t)(branch_bias(f, b, false) + 2);
     for (uint32_t s = 0; s < b->nsuccs; s++) {
       o[k++] = b->succs[s].target;
       o[k++] = b->succs[s].eh;
@@ -955,13 +1158,14 @@ const uint32_t *ir_emit_order(IrFunc *f, uint32_t skip, uint32_t *n) {
   if (defer_on < 0) defer_on = warmc_getenv("WARMC_NO_EXIT_DEFER") == NULL;
   const uint32_t *order = f->order;
   f->ord_defers = 0;
-  if (defer_on && f->reducible && f->cap_loop_head >= f->nblocks && f->norder) {
+  bool emit_bias = bias_gc_on();
+  if ((defer_on || emit_bias) && f->reducible && f->cap_loop_head >= f->nblocks && f->norder) {
     uint32_t nb = f->nblocks, m = 0;
     uint8_t *seen = xcalloc(nb, 1);
     uint32_t *post = xmalloc(nb * sizeof(uint32_t));
     uint32_t *stk = xmalloc(2 * ((size_t)nb + 8) * sizeof(uint32_t));
-    dfs_post(f, f->entry, seen, post, &m, true, true, stk, nb + 8);
-    if (f->ord_defers && m == f->norder) {
+    dfs_post(f, f->entry, seen, post, &m, true, defer_on, emit_bias, stk, nb + 8);
+    if ((f->ord_defers || emit_bias) && m == f->norder) {
       uint32_t *deferred = ir_alloc(f, m * sizeof(uint32_t));
       for (uint32_t i = 0; i < m; i++) deferred[i] = post[m - 1 - i];
       order = deferred;
@@ -977,18 +1181,57 @@ const uint32_t *ir_emit_order(IrFunc *f, uint32_t skip, uint32_t *n) {
      where it is */
   uint8_t *late = ir_alloc(f, f->nblocks ? f->nblocks : 1);
   memset(late, 0, f->nblocks);
+  static _Atomic int cold_late = -1;
+  if (cold_late < 0) cold_late = warmc_getenv("WARMC_NO_COLD_LATE") == NULL;
+  static _Atomic int unlike_late = -1;
+  if (unlike_late < 0) unlike_late = warmc_getenv("WARMC_NO_UNLIKELY_LATE") == NULL;
+  static _Atomic int null_late = -1;
+  if (null_late < 0) null_late = warmc_getenv("WARMC_NULL_LATE") != NULL;
+  /* How late: a block's count of rare ways on the way to it with the
+     fewest, up to LATE_MAX, and the blocks are emitted by that count.  The
+     copies pass_hot_tails makes are reached by one, and the rare arms off
+     them by two: in one run with them, in the order's own turn, each arm
+     sat between a copy and the copy after it, which the copy then jumped
+     over -- luawasm's awfy_storage, whose method lookup misses the
+     object's own slots every time and so runs in the copies, took eight
+     jumps more a call (1.08 the time; WARMC_NO_LATE_TIERS=1 emits them in
+     one run). */
+#define LATE_MAX 3
+  static _Atomic int tiers = -1;
+  if (tiers < 0) tiers = warmc_getenv("WARMC_NO_LATE_TIERS") == NULL;
   for (uint32_t oi = 0; oi < f->norder; oi++) {
     uint32_t bi = f->order[oi];
     const Block *b = &f->blocks[bi];
-    bool out = b->outline || call_arm(f, bi);
-    if (!out && bi != f->entry && b->npreds) {
-      out = true;
-      for (uint32_t p = 0; p < b->npreds && out; p++) out = late[b->preds[p]];
+    uint32_t flagged = b->outline || (cold_late && b->cold) || call_arm(f, bi);
+    uint32_t least = bi != f->entry && b->npreds ? LATE_MAX : 0, rare = 0;
+    for (uint32_t p = 0; p < b->npreds && least; p++) {
+      uint32_t pb = b->preds[p];
+      const Block *P = &f->blocks[pb];
+      /* a block the unlikely way of a test reaches (ir_unlikely_way), where
+         the test is not the block's own loop's way round, which keeps the
+         block where it is */
+      uint32_t w = unlike_late && P->rpo < b->rpo ? ir_unlikely_way(f, P) : UINT32_MAX;
+      /* (not a null test's and nothing else's: null is as often the way
+         things are -- a table with no hash part, which luawasm's store
+         past the end tests for -- and awfy_sieve's loop that fills its
+         table left the line for the store and came back on every trip,
+         1.10 the time; WARMC_NULL_LATE=1 moves those too) */
+      if (w != UINT32_MAX && !null_late && ir_test_bare_null(f, P)) w = UINT32_MAX;
+      if (w != UINT32_MAX && P->succs[w].target == bi && P->succs[w ^ 1].target != bi) {
+        /* (a rare way in: after the latest block that has one, so that
+           none of them jumps over the arm to what follows it) */
+        if (late[pb] + 1u > rare) rare = late[pb] + 1u;
+      } else if (late[pb] < least) {
+        least = late[pb];
+      }
     }
-    late[bi] = out;
+    if (rare && rare < least) least = rare;
+    if (least < flagged) least = flagged;
+    if (least > LATE_MAX) least = LATE_MAX;
+    late[bi] = (uint8_t)(tiers || !least ? least : 1);
   }
   uint32_t k = 0;
-  for (uint8_t pass = 0; pass < 2; pass++)
+  for (uint8_t pass = 0; pass <= LATE_MAX; pass++)
     for (uint32_t oi = 0; oi < f->norder; oi++) {
       uint32_t bi = order[oi];
       if (bi != skip && late[bi] == pass) eo[k++] = bi;
@@ -1009,9 +1252,9 @@ const uint32_t *ir_emit_order(IrFunc *f, uint32_t skip, uint32_t *n) {
    the next ir_order makes them again whatever the graph. */
 void ir_order_depths(IrFunc *f) {
   pthread_once(&g_dom_check_once, dom_check_init);
-  bool reducible = order_once(f, false, false);
+  bool reducible = order_once(f, false, false, false);
   mark_diverging(f);
-  if (!reducible) order_once(f, true, false);
+  if (!reducible) order_once(f, true, false, false);
   f->order_sig_valid = false;
 }
 
@@ -1063,15 +1306,83 @@ bool ir_order_current(IrFunc *f) {
   return f->order_sig_valid && order_sig_same(f);
 }
 
+/* What a light ordering finds: each block's reachability, dominator and
+   predecessors, and which of its edges go back. */
+static uint64_t order_facts(const IrFunc *f, uint32_t i) {
+  const Block *b = &f->blocks[i];
+  uint64_t h = 1469598103934665603ull;
+#define OF_MIX(v) do { h ^= (uint64_t)(v); h *= 1099511628211ull; } while (0)
+  OF_MIX(b->reachable);
+  if (!b->reachable) return h;
+  OF_MIX(b->idom);
+  OF_MIX(b->npreds);
+  for (uint32_t p = 0; p < b->npreds; p++) OF_MIX(b->preds[p]);
+  for (uint32_t s = 0; s < b->nsuccs; s++) OF_MIX(f->blocks[b->succs[s].target].rpo <= b->rpo);
+#undef OF_MIX
+  return h;
+}
+
+/* ir_order for a pass that orders between its own changes to the graph --
+   jump threading, once for each edge it threads -- and reads nothing of a
+   block's place in the order, its depth or its divergence: the first of
+   ir_order's two searches, which takes a block's successors as they are
+   listed, and of what follows it the part that is the graph's own and
+   cheap -- reachability, predecessors, dominators and their intervals
+   (ir_dom_range), and, the graph being reducible, which edges go back: an
+   edge whose target dominates its source, whatever the search, so rpo may
+   be compared along an edge.  f->order and rpo are that search's, a
+   reverse postorder but not the one ir_order's second search makes, which
+   takes the likelier successor first for the allocator and the layout; the
+   dominator intervals are numbered by it; and loop depths, loop heads and
+   divergence are not found at all (every depth is 0).  An irreducible
+   graph, whose edges back are the search's, is ordered as ir_order orders
+   it.  The graph's signature is left invalid, so the next ir_order orders
+   it whole.
+
+   The second search, with a branch's bias worked out for every block, the
+   signature, made twice, and the walk of every loop's body were more than
+   half of an ordering, and the orderings between threadings half the
+   compile of a function with thousands of blocks: luawasm awfy_permute's
+   f6, 8,000 blocks in reach and 26 loops of 600 blocks each on average,
+   ordered after each of 617 threadings (WARMC_NO_ORDER_LIGHT=1 orders as
+   ir_order does; WARMC_VERIFY_GATES=1 orders that way too after each light
+   one and checks that every block's facts are the same; and
+   test/run_same.py, that the code is the same either way, which it is
+   while nothing between two threadings reads what a light ordering leaves
+   out). */
+void ir_order_light(IrFunc *f) {
+  pthread_once(&g_dom_check_once, dom_check_init);
+  if (!g_order_light) { ir_order(f); return; }
+  bool reducible = order_once(f, false, false, true);
+  f->reducible = reducible;
+  if (!reducible) {
+    mark_diverging(f);
+    order_once(f, true, false, false);
+  }
+  f->order_sig_valid = false;
+  if (g_order_light == 2) {
+    uint32_t nb = f->nblocks;
+    uint64_t *facts = xmalloc((nb ? nb : 1) * sizeof(uint64_t));
+    for (uint32_t i = 0; i < nb; i++) facts[i] = order_facts(f, i);
+    ir_order(f);
+    for (uint32_t i = 0; i < nb; i++)
+      if (facts[i] != order_facts(f, i))
+        warmc_fatal("WARMC_VERIFY_GATES: the light ordering and ir_order differ on block %u "
+                    "(reachable %d idom %u preds %u)", i,
+                    f->blocks[i].reachable, f->blocks[i].idom, f->blocks[i].npreds);
+    xfree(facts);
+  }
+}
+
 bool ir_order_changed(IrFunc *f) {
   pthread_once(&g_dom_check_once, dom_check_init);
   if (order_sig_same(f)) return false;
 
-  bool reducible = order_once(f, false, false);
+  bool reducible = order_once(f, false, false, false);
   f->reducible = reducible;
 
   mark_diverging(f);
-  order_once(f, true, reducible);
+  order_once(f, true, reducible, false);
 
   f->order_sig_len = order_sig_len_of(f);
   order_sig_fill(f, f->order_sig);
@@ -1188,6 +1499,11 @@ bool ir_wrap_alias(void) {
 
 bool ir_has_bitrev(void) {
   return !g_target->is_x64;
+}
+
+/* whether an address is a base, a scaled index and an offset at once */
+bool ir_addr_index_disp(void) {
+  return g_target->is_x64;
 }
 
 bool ir_vec_mul_one(uint32_t lane) {
@@ -1396,7 +1712,7 @@ uint64_t ir_value_max(IrFunc *f, Ref v, int depth) {
     case I_EQ: case I_NE: case I_LTS: case I_LTU: case I_GTS: case I_GTU:
     case I_LES: case I_LEU: case I_GES: case I_GEU: case I_EQZ:
     case I_FEQ: case I_FNE: case I_FLT: case I_FGT: case I_FLE: case I_FGE:
-    case I_REF_IS_NULL:
+    case I_REF_IS_NULL: case I_REF_TEST: case I_REF_SLOT:
       return 1;
     default: return all;
   }
@@ -1464,7 +1780,7 @@ static uint64_t kb_compute(IrFunc *f, Ref v, int depth) {
     case I_EQ: case I_NE: case I_LTS: case I_LTU: case I_GTS: case I_GTU:
     case I_LES: case I_LEU: case I_GES: case I_GEU: case I_EQZ:
     case I_FEQ: case I_FNE: case I_FLT: case I_FGT: case I_FLE: case I_FGE:
-    case I_REF_IS_NULL:
+    case I_REF_IS_NULL: case I_REF_TEST: case I_REF_SLOT:
       return 1;
 
     case I_CLZ: case I_CTZ: case I_POPCNT:

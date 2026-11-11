@@ -999,6 +999,11 @@ void compile_default_opts(OptOpts *o) {
   o->once = true;
   o->go_resume = o->go_noret = true;
   o->wrap_params = true;
+  o->tails = true;
+  o->cmpsink = true;
+  o->tchain = true;
+  o->arrbias = true;
+  o->waysplit = true;
 }
 
 /* -O<n> or -f[no-]<pass>, as the CLI takes them: true when a is one of them
@@ -1050,6 +1055,11 @@ bool compile_parse_flag(OptOpts *o, const char *a) {
   else if (!strcmp(name, "go-resume")) o->go_resume = on;
   else if (!strcmp(name, "go-noret")) o->go_noret = on;
   else if (!strcmp(name, "wrap-params")) o->wrap_params = on;
+  else if (!strcmp(name, "tails")) o->tails = on;
+  else if (!strcmp(name, "cmp-sink")) o->cmpsink = on;
+  else if (!strcmp(name, "test-chain")) o->tchain = on;
+  else if (!strcmp(name, "arr-bias")) o->arrbias = on;
+  else if (!strcmp(name, "way-split")) o->waysplit = on;
   else if (!strcmp(name, "gssa")) o->gssa = on;
   else if (!strcmp(name, "gssa-all")) { o->gssa_all = on; if (on) o->gssa = true; }
   else if (!strcmp(name, "small-loop-align")) o->small_loop_align = on;

@@ -297,6 +297,8 @@ typedef struct {
   int fl_sf;
   uint32_t fl_epoch;
   uint32_t prev_bi;   /* the block emitted last, for its flags */
+  /* WARMC_LISTING: (body offset, value or ~block) per emitted instruction */
+  uint32_t *lst; uint32_t nlst, lst_cap; bool lst_on, bbc_on; uint32_t bbc_base;
 
   /* The compare whose result the flags still hold, as cc, while the buffer's
      flags epoch is still cmp_epoch: a select on it reads the flags instead of

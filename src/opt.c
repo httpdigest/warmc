@@ -6697,7 +6697,7 @@ static bool thread_dispatch(IrFunc *f, uint32_t B, const uint32_t *nread,
    put back into SSA form. */
 static void thread_repair(IrFunc *f, uint32_t B, TdVec *mv) {
   TdVec made = *mv;
-  ir_order(f);
+  ir_order_light(f);
 
   uint32_t nb = f->nblocks, np = f->blocks[B].nparams;
   uint8_t *fresh = xcalloc(nb, 1);
@@ -6760,7 +6760,7 @@ typedef struct { uint32_t orig, nin; TdVec made, cps; } TeGroup;
    anywhere but in it and its copies, made by each of them, put back into
    SSA form as thread_repair does B's parameters */
 static void thread_repair_groups(IrFunc *f, TeGroup *g, uint32_t ng) {
-  ir_order(f);
+  ir_order_light(f);
   uint32_t nb = f->nblocks, nv = 0;
   for (uint32_t k = 0; k < ng; k++) nv += f->blocks[g[k].orig].nparams + g[k].nin;
   Ref *vals = xmalloc((nv ? nv : 1) * sizeof(Ref));
@@ -8602,11 +8602,46 @@ static bool param_compares(IrFunc *f) {
   return any;
 }
 
+static int et_known(IrFunc *f, uint32_t b, Ref v);
+
+/* A branch on a test that the branch into its block has decided -- or the
+   branch into a block above it that every way to it enters by that one
+   edge (et_known) -- goes the one way, whatever else its block does: the
+   threadings below take a block that only tests, by each way into it, and
+   left the second test of an object's type in a block that counts or
+   stores ahead of it, the two tests one value since CSE (luawasm: the
+   guard of a field's write after the guard of its read).  With the order
+   and the dominators just made; only edges that never run go, so what the
+   walk reads of the rest stays true while it changes them
+   (WARMC_NO_DECIDED_BR=1). */
+static bool thread_decided(IrFunc *f) {
+  if (warmc_getenv("WARMC_NO_DECIDED_BR")) return false;
+  bool any = false;
+  for (uint32_t oi = 0; oi < f->norder; oi++) {
+    uint32_t bi = f->order[oi];
+    Block *b = &f->blocks[bi];
+    if (b->term != T_BRIF || b->nsuccs != 2 || ir_block_has_eh(f, bi)) continue;
+    int r = et_known(f, bi, b->term_arg);
+    if (r < 0) continue;
+    b->succs[0] = b->succs[r ? 0 : 1];
+    b->nsuccs = 1;
+    b->term = T_JUMP;
+    g_stats.branch_decided++;
+    any = true;
+  }
+  if (any) {
+    ir_recompute_preds(f);
+    ir_order(f);
+  }
+  return any;
+}
+
 static bool pass_thread(IrFunc *f) {
   if (f->npads) return false;
   /* (the threadings move constants to a block's idom: up to date) */
   ir_order(f);
-  bool changed = !warmc_getenv("WARMC_NO_PCMP") && param_compares(f);
+  bool decided = thread_decided(f);
+  bool changed = (!warmc_getenv("WARMC_NO_PCMP") && param_compares(f)) || decided;
   if (changed) prune_params(f);
   uint32_t *nread = changed ? count_uses(f) : count_uses_shared(f, UC_THREAD);
   uint32_t nnread = f->ninsts;
@@ -8646,6 +8681,8 @@ static bool pass_thread(IrFunc *f) {
   xfree(nulls.next);
   xfree(nread);
   if (changed) {
+    /* (the threadings' orderings were light ones: the whole order now) */
+    ir_order(f);
     prune_params(f);
     ir_order(f);
   }
@@ -8997,6 +9034,452 @@ static bool pass_nodesplit_whole(IrFunc *f) {
   return true;
 }
 
+static bool is_call_op(uint16_t op);
+
+/* ---- the hot way's blocks copied for the rare ways back into it ----------
+
+   A compiler for a language with no types on its variables writes every
+   table access, method call and add as a fast way and the ways round it --
+   the element is in the array part, the method is the one the call was
+   inlined for, the two numbers are integers -- and each way round comes
+   back into the fast way at the block after its test.  At that block what
+   the fast way knew is gone: a field it read may have been written there,
+   a value is one of several, a test that passed on the one way did not on
+   another.  luawasm's awfy_permute swaps two elements of a table and reads
+   the table's array, size and kind four times doing it, and tests the
+   index against the size four times; five in six of its blocks never run.
+
+   So every block of the hot way that a rare way comes back into is copied,
+   with the hot blocks after it, and the rare ways go to the copies.  The
+   hot way is then a run of blocks nothing joins, and the passes that work
+   down the dominator tree -- CSE, load forwarding, the decided tests, the
+   bounds checks -- take what it knows from its start to its end; the copies
+   are the function as it was.  A copy ends at the next loop header, which
+   it enters beside the hot way: the copies make no cycle, so the graph
+   stays reducible, and a loop keeps its one header.  (Past the header each
+   trip of a loop starts knowing only what the loop's entry and its trips
+   agree on; a copy of the loop for the rare ways would keep that too, at
+   the loop's size again.)
+
+   The hot way is what the likely ways reach from the entry (hot_set_build):
+   every edge but a test's rare way by ir_unlikely_way's rules, an edge a
+   branch hint calls rare and the edges into cold blocks.  A value the
+   copied blocks define and something past them reads is defined twice
+   then, and merged where the two meet (repair_copies) -- or, a constant,
+   made again where it is read.
+
+   Counted in instructions, luawasm's awfy_permute takes 0.71 of what it
+   took, towers 0.83, bounce 0.86, queens 0.87, the 32 kernels 0.970
+   together; ktbench/sealed 0.95, javabench/list and matrix 0.92 the time.
+   -fno-tails and WARMC_NO_TAILS=1 turn it off; WARMC_TAILS_DEBUG=1 prints
+   what it took of each function. */
+#define HT_MAX_COPY 40000u
+/* (a function of more blocks than this is left: the cleanup after the
+   copies is as slow as the function is long) */
+#define HT_MAX_BLOCKS 4000u
+
+static bool ht_rare(const IrFunc *f, const uint32_t *way, const uint32_t *forced,
+                    uint32_t p, uint32_t s) {
+  const Edge *e = &f->blocks[p].succs[s];
+  const Block *t = &f->blocks[e->target];
+  if (s < 32 && (forced[p] >> s & 1)) return false;
+  return e->eh || e->cold || t->cold || t->is_pad || way[p] == s;
+}
+
+static bool ht_in_loop(const IrFunc *f, const uint32_t *outer, uint32_t t, uint32_t h) {
+  for (uint32_t c = f->loop_head[t]; c != UINT32_MAX; c = outer[c])
+    if (c == h) return true;
+  return false;
+}
+
+static void ht_flood(const IrFunc *f, const uint32_t *way, const uint32_t *forced,
+                     uint8_t *hot, uint32_t *wl, uint32_t nwl) {
+  while (nwl) {
+    uint32_t x = wl[--nwl];
+    const Block *xb = &f->blocks[x];
+    for (uint32_t s = 0; s < xb->nsuccs; s++) {
+      uint32_t t = xb->succs[s].target;
+      if (hot[t] || ht_rare(f, way, forced, x, s)) continue;
+      hot[t] = 1;
+      wl[nwl++] = t;
+    }
+  }
+}
+
+/* The blocks the likely ways reach from the entry, hot[], with what found
+   them: each test's rare way out (ir_unlikely_way) or UINT32_MAX, the rare
+   ways taken for likely all the same (forced, a bit a successor), and each
+   loop header's next loop out.  False when the function has no rare way,
+   or its graph is not reducible.  ir_order has to be current. */
+typedef struct {
+  uint32_t *way, *forced, *outer;
+  uint8_t *hot;
+  /* some test has a rare way by a rule (ir_unlikely_way) */
+  bool tests;
+} HotSet;
+
+static void hot_set_free(HotSet *hs) {
+  xfree(hs->way); xfree(hs->forced); xfree(hs->outer); xfree(hs->hot);
+  memset(hs, 0, sizeof *hs);
+}
+
+static bool hot_set_build(IrFunc *f, HotSet *hs, bool sure) {
+  memset(hs, 0, sizeof *hs);
+  uint32_t nb0 = f->nblocks;
+  if (f->npads || !f->reducible || f->cap_loop_head < nb0 || !nb0) return false;
+  uint32_t *way = xmalloc(nb0 * sizeof(uint32_t));
+  bool any = false;
+  for (uint32_t b = 0; b < nb0; b++) {
+    const Block *bb = &f->blocks[b];
+    way[b] = !bb->reachable ? UINT32_MAX : sure ? ir_unlikely_way_sure(f, bb) : ir_unlikely_way(f, bb);
+    if (!bb->reachable) continue;
+    if (way[b] != UINT32_MAX) any = hs->tests = true;
+    for (uint32_t s = 0; s < bb->nsuccs && !any; s++)
+      if (bb->succs[s].cold || f->blocks[bb->succs[s].target].cold) any = true;
+  }
+  if (!any) { xfree(way); return false; }
+  uint32_t *forced = xcalloc(nb0, sizeof(uint32_t));
+  uint32_t *outer = xmalloc(nb0 * sizeof(uint32_t));
+  uint32_t *wl = xmalloc(nb0 * sizeof(uint32_t)), nwl = 0;
+  uint32_t *mark = xcalloc(nb0, sizeof(uint32_t)), st = 0;
+  uint32_t *hasx = xcalloc(nb0, sizeof(uint32_t));
+  uint8_t *hot = xcalloc(nb0, 1);
+#define HT_HEAD(b) (f->loop_head[b] == (b))
+  /* each loop's header's next loop out */
+  for (uint32_t b = 0; b < nb0; b++) outer[b] = UINT32_MAX;
+  for (uint32_t oi = 0; oi < f->norder; oi++) {
+    uint32_t bi = f->order[oi];
+    const Block *b = &f->blocks[bi];
+    for (uint32_t s = 0; s < b->nsuccs; s++) {
+      uint32_t t = b->succs[s].target;
+      if (f->blocks[t].rpo > b->rpo) continue;
+      st++;
+      mark[t] = st;
+      nwl = 0;
+      if (mark[bi] != st) { mark[bi] = st; wl[nwl++] = bi; }
+      while (nwl) {
+        uint32_t cur = wl[--nwl];
+        if (HT_HEAD(cur) && cur != t &&
+            (outer[cur] == UINT32_MAX || f->blocks[t].rpo > f->blocks[outer[cur]].rpo))
+          outer[cur] = t;
+        const Block *c = &f->blocks[cur];
+        for (uint32_t p = 0; p < c->npreds; p++)
+          if (mark[c->preds[p]] != st) { mark[c->preds[p]] = st; wl[nwl++] = c->preds[p]; }
+      }
+    }
+  }
+  hot[f->entry] = 1;
+  wl[0] = f->entry;
+  ht_flood(f, way, forced, hot, wl, 1);
+  /* a loop no likely way leaves is left by its rare ones */
+  for (uint32_t it = 1;; it++) {
+    bool grew = false;
+    nwl = 0;
+    for (uint32_t p = 0; p < nb0; p++) {
+      const Block *pb = &f->blocks[p];
+      if (!pb->reachable || !hot[p]) continue;
+      for (uint32_t s = 0; s < pb->nsuccs; s++) {
+        uint32_t t = pb->succs[s].target;
+        if (ht_rare(f, way, forced, p, s)) continue;
+        for (uint32_t c = f->loop_head[p]; c != UINT32_MAX; c = outer[c]) {
+          if (ht_in_loop(f, outer, t, c)) break;
+          hasx[c] = it;
+        }
+      }
+    }
+    for (uint32_t p = 0; p < nb0; p++) {
+      const Block *pb = &f->blocks[p];
+      if (!pb->reachable || !hot[p]) continue;
+      for (uint32_t s = 0; s < pb->nsuccs && s < 32; s++) {
+        const Edge *e = &pb->succs[s];
+        uint32_t t = e->target;
+        const Block *tb = &f->blocks[t];
+        if (!ht_rare(f, way, forced, p, s) || e->eh || tb->cold || tb->is_pad || tb->diverges)
+          continue;
+        for (uint32_t c = f->loop_head[p]; c != UINT32_MAX; c = outer[c]) {
+          if (ht_in_loop(f, outer, t, c)) break;
+          if (hasx[c] == it || !hot[c]) continue;
+          forced[p] |= 1u << s;
+          if (!hot[t]) { hot[t] = 1; wl[nwl++] = t; }
+          grew = true;
+          break;
+        }
+      }
+    }
+    if (!grew) break;
+    ht_flood(f, way, forced, hot, wl, nwl);
+  }
+#undef HT_HEAD
+  xfree(wl); xfree(mark); xfree(hasx);
+  hs->way = way; hs->forced = forced; hs->outer = outer; hs->hot = hot;
+  return true;
+}
+
+/* The blocks no likely way reaches, 1 each, by the rules without their
+   guesses (hot_set_build's sure), the branch hints' rare ways and the cold
+   blocks: for the allocator, to which a call there is one made now and
+   then.  NULL where the function has no test with a rare way by a rule --
+   a function of hints alone has its cold blocks -- or its order is stale. */
+uint8_t *ir_rare_blocks(IrFunc *f) {
+  HotSet hs;
+  if (!ir_order_current(f) || !hot_set_build(f, &hs, true)) return NULL;
+  uint8_t *rare = NULL;
+  if (hs.tests) {
+    rare = xcalloc(f->nblocks ? f->nblocks : 1, 1);
+    for (uint32_t b = 0; b < f->nblocks; b++) rare[b] = f->blocks[b].reachable && !hs.hot[b];
+  }
+  hot_set_free(&hs);
+  return rare;
+}
+
+static bool pass_hot_tails(IrFunc *f) {
+  if (f->npads || warmc_getenv("WARMC_NO_TAILS")) return false;
+  {
+    /* (debugging: WARMC_TAILS_FUNCS=LO-HI, the functions by index it takes) */
+    const char *r = warmc_getenv("WARMC_TAILS_FUNCS");
+    unsigned lo = 0, hi = 0;
+    if (r && sscanf(r, "%u-%u", &lo, &hi) == 2 && (f->func_index < lo || f->func_index > hi))
+      return false;
+  }
+  ir_order(f);
+  uint32_t nb0 = f->nblocks, ni0 = f->ninsts;
+  HotSet hs;
+  if (!hot_set_build(f, &hs, false)) return false;
+  /* Only where a test's rule names a rare way, the tests of a language
+     with typed references: with none there are only cold blocks, a Go
+     function's ways to its panics and its resume, whose copies took the
+     same instructions and more time (stdgo/rangefunc 1.06). */
+  if (!hs.tests) { hot_set_free(&hs); return false; }
+  uint32_t *way = hs.way, *forced = hs.forced;
+  uint8_t *hot = hs.hot, *inR = xcalloc(nb0, 1);
+  uint32_t *wl = xmalloc(nb0 * sizeof(uint32_t)), nwl = 0;
+#define HT_HEAD(b) (f->loop_head[b] == (b))
+  /* The rare ways taken at their word, and the blocks behind them (slow):
+     all of them, where the rare blocks are the bulk of what is not the hot
+     way, as a slow way's are.  Where the copies would be more than twice
+     the rare blocks -- rare ways that are mostly a test's empty arm -- a
+     bare null test's is not one: its rare way is as often a way the
+     program takes half the time, a tree's missing child, a list's end,
+     unless the blocks behind it call or are cold, a slow way by what it
+     does.  javabench/treemap, whose balancing tests each child for null,
+     took 1.10 the time with 80 of a function's 97 blocks copied for its 15
+     rare ones, the null ways' code moved away for nothing (WARMC_TAILS_ANY=1
+     takes every rare way). */
+  uint8_t *slow = xcalloc(nb0, 1);
+  bool any_way = true, any_only = warmc_getenv("WARMC_TAILS_ANY") != NULL;
+  uint32_t nR = 0, ncopy = 0, nseed = 0, nrare = 0;
+  for (uint32_t c = 0; c < nb0; c++) nrare += f->blocks[c].reachable && !hot[c];
+#define HT_WORD(p, s) (ht_rare(f, way, forced, p, s) &&                       \
+                       (any_way || way[p] != (s) || !ir_test_bare_null(f, &f->blocks[p])))
+  for (;;) {
+    memset(slow, 0, nb0);
+    memset(inR, 0, nb0);
+    for (uint32_t oi = 0; oi < f->norder; oi++) {
+      uint32_t c = f->order[oi];
+      const Block *cb = &f->blocks[c];
+      if (c >= nb0) continue;
+      if (hot[c]) {
+        for (uint32_t s = 0; s < cb->nsuccs; s++) {
+          uint32_t t = cb->succs[s].target;
+          if (t < nb0 && !hot[t] && HT_WORD(c, s)) slow[t] = 1;
+        }
+        continue;
+      }
+      bool sl = cb->cold || slow[c];
+      for (uint32_t i = 0; i < cb->ninsts && !sl; i++) sl = is_call_op(f->insts[cb->insts[i]].op);
+      slow[c] = sl;
+      if (!sl) continue;
+      for (uint32_t s = 0; s < cb->nsuccs; s++) {
+        uint32_t t = cb->succs[s].target;
+        if (t < nb0 && !hot[t]) slow[t] = 1;
+      }
+    }
+    /* the blocks such a way comes back into, and what they lead to up to
+       the next loop header */
+    nwl = 0;
+    for (uint32_t p = 0; p < nb0; p++) {
+      const Block *pb = &f->blocks[p];
+      if (!pb->reachable) continue;
+      for (uint32_t s = 0; s < pb->nsuccs; s++) {
+        uint32_t t = pb->succs[s].target;
+        if (inR[t] || !hot[t] || HT_HEAD(t) || t == f->entry || f->blocks[t].diverges) continue;
+        if (hot[p] ? !HT_WORD(p, s) : !slow[p]) continue;
+        inR[t] = 1;
+        wl[nwl++] = t;
+      }
+    }
+    nR = 0; ncopy = 0; nseed = nwl;
+    while (nwl) {
+      uint32_t x = wl[--nwl];
+      const Block *xb = &f->blocks[x];
+      nR++;
+      ncopy += xb->ninsts + xb->nparams;
+      for (uint32_t s = 0; s < xb->nsuccs; s++) {
+        uint32_t t = xb->succs[s].target;
+        if (!hot[t] || HT_HEAD(t) || t == f->entry || f->blocks[t].diverges || inR[t]) continue;
+        inR[t] = 1;
+        wl[nwl++] = t;
+      }
+    }
+    if (!any_way || any_only || nR <= 2 * nrare) break;
+    any_way = false;
+  }
+  bool ok = nR && ncopy <= HT_MAX_COPY && f->norder <= HT_MAX_BLOCKS;
+  uint8_t *esc = NULL;
+  uint32_t *eslot = NULL, nesc = 0;
+  TdVec *euse = NULL;
+  if (ok) {
+    esc = xcalloc(ni0 ? ni0 : 1, 1);
+    eslot = xmalloc((ni0 ? ni0 : 1) * sizeof(uint32_t));
+    nesc = escaping_values(f, inR, nb0, ni0, true, esc, eslot, &euse);
+    for (uint32_t v = 0; v < ni0 && ok; v++)
+      if (esc[v] && !copy_mergeable(f, v, true)) ok = false;
+  }
+  if (warmc_getenv("WARMC_TAILS_DEBUG")) {
+    uint32_t nh = 0, nr = 0;
+    for (uint32_t b = 0; b < nb0; b++) { nr += f->blocks[b].reachable; nh += f->blocks[b].reachable && hot[b]; }
+    fprintf(stderr, "tails %s: blocks %u hot %u seeds %u copied %u (%u insts of %u) esc %u %s\n",
+            f->m->funcs[f->func_index].sym ? f->m->funcs[f->func_index].sym : "?", nr, nh,
+            nseed, nR, ncopy, ni0, nesc, ok ? "" : "-- not taken");
+  }
+  if (!ok) {
+    for (uint32_t i = 0; i < nesc; i++) xfree(euse[i].v);
+    hot_set_free(&hs);
+    xfree(wl); xfree(inR); xfree(slow); xfree(esc); xfree(eslot); xfree(euse);
+    return false;
+  }
+  Ref *map = xmalloc((ni0 ? ni0 : 1) * sizeof(Ref));
+  uint32_t *bcopy = xmalloc(nb0 * sizeof(uint32_t));
+  clone_blocks(f, inR, nb0, ni0, bcopy, map);
+  /* a copy's read of what another copied block defines is the original's
+     again, for the repair to say what reaches it */
+  uint32_t nnew = f->ninsts - ni0;
+  Ref *inv = xmalloc((nnew ? nnew : 1) * sizeof(Ref));
+  for (uint32_t i = 0; i < nnew; i++) inv[i] = REF_NONE;
+  for (uint32_t v = 0; v < ni0; v++) if (map[v] != REF_NONE) inv[map[v] - ni0] = v;
+#define HT_UNMAP(r) do {                                                      \
+    Ref r_ = (r);                                                             \
+    if (r_ != REF_NONE && r_ >= ni0 && r_ - ni0 < nnew) {                     \
+      Ref o_ = inv[r_ - ni0];                                                 \
+      if (o_ != REF_NONE && f->insts[o_].block != x) {                        \
+        (r) = o_;                                                             \
+        TdVec *u_ = &euse[eslot[o_]];                                         \
+        if (!u_->n || u_->v[u_->n - 1] != y) td_push(u_, y);                  \
+      }                                                                       \
+    }                                                                         \
+  } while (0)
+  for (uint32_t x = 0; x < nb0; x++) {
+    if (!inR[x]) continue;
+    uint32_t y = bcopy[x];
+    Block *yb = &f->blocks[y];
+    for (uint32_t i = 0; i < yb->ninsts; i++) {
+      Ref *a = ir_args(f, yb->insts[i]);
+      for (uint32_t q = 0; q < f->insts[yb->insts[i]].nargs; q++) HT_UNMAP(a[q]);
+    }
+    if (yb->term == T_BRIF || yb->term == T_BRTABLE) HT_UNMAP(yb->term_arg);
+    for (uint32_t q = 0; q < yb->nret; q++) HT_UNMAP(yb->ret_args[q]);
+    for (uint32_t s = 0; s < yb->nsuccs; s++)
+      for (uint32_t q = 0; q < yb->succs[s].nargs; q++) HT_UNMAP(yb->succs[s].args[q]);
+  }
+#undef HT_UNMAP
+  /* A constant the copied blocks make and another block reads is made
+     again in each such block: merged with its copy where the two meet it
+     was no constant any more -- luawasm's 1, in a callee-saved register
+     through permute's loops. */
+  for (uint32_t v = 0; v < ni0; v++) {
+    if (!esc[v] || f->insts[v].op != I_CONST) continue;
+    TdVec *uv = &euse[eslot[v]];
+    for (uint32_t k = 0; k < uv->n; k++) {
+      uint32_t u = uv->v[k];
+      bool seen = false;
+      for (uint32_t j = 0; j < k && !seen; j++) seen = uv->v[j] == u;
+      if (seen) continue;
+      Inst src = f->insts[v];
+      uint32_t at = 0;
+      Ref c = emit_before(f, u, &at, I_CONST, (ValType)src.type, NULL, 0, src.imm);
+      f->insts[c].imm2 = src.imm2;
+      f->insts[c].flags = src.flags;
+      Block *ub = &f->blocks[u];
+      for (uint32_t i = 1; i < ub->ninsts; i++) {
+        Ref *a = ir_args(f, ub->insts[i]);
+        for (uint32_t q = 0; q < f->insts[ub->insts[i]].nargs; q++) if (a[q] == v) a[q] = c;
+      }
+      if ((ub->term == T_BRIF || ub->term == T_BRTABLE) && ub->term_arg == v) ub->term_arg = c;
+      for (uint32_t q = 0; q < ub->nret; q++) if (ub->ret_args[q] == v) ub->ret_args[q] = c;
+      for (uint32_t sx = 0; sx < ub->nsuccs; sx++)
+        for (uint32_t q = 0; q < ub->succs[sx].nargs; q++)
+          if (ub->succs[sx].args[q] == v) ub->succs[sx].args[q] = c;
+    }
+    esc[v] = 0;
+  }
+  /* the slow ways in go to the copies, and the rare ways out of a block
+     that has a copy: its copy's too */
+  for (uint32_t p = 0; p < nb0; p++) {
+    Block *pb = &f->blocks[p];
+    if (!pb->reachable) continue;
+    for (uint32_t s = 0; s < pb->nsuccs; s++) {
+      uint32_t t = pb->succs[s].target;
+      if (t >= nb0 || !inR[t]) continue;
+      if (hot[p] ? HT_WORD(p, s) : slow[p]) pb->succs[s].target = bcopy[t];
+    }
+  }
+  /* A loop header the copies now enter beside its own way in gets one
+     block ahead of it that all of them enter: the loop passes take a loop
+     with one way in, and what the ways in merge is merged there, ahead of
+     the loop, not in its header.  A way in is an edge of a block the last
+     ordering had ahead of the header, or of that block's copy. */
+  uint32_t nbc = f->nblocks;
+  uint32_t *nfwd = xcalloc(nb0, sizeof(uint32_t)), *pre = xmalloc(nb0 * sizeof(uint32_t));
+  uint8_t *entered = xcalloc(nb0, 1);
+  uint32_t *borig = xmalloc((nbc - nb0 ? nbc - nb0 : 1) * sizeof(uint32_t));
+  for (uint32_t x = 0; x < nb0; x++) if (inR[x]) borig[bcopy[x] - nb0] = x;
+#define HT_WAY_IN(p, e)                                                       \
+  ((e)->target < nb0 && HT_HEAD((e)->target) && !(e)->eh &&                   \
+   f->blocks[(p) < nb0 ? (p) : borig[(p) - nb0]].reachable &&                 \
+   f->blocks[(p) < nb0 ? (p) : borig[(p) - nb0]].rpo < f->blocks[(e)->target].rpo)
+  for (uint32_t p = 0; p < nbc; p++)
+    for (uint32_t s = 0; s < f->blocks[p].nsuccs; s++) {
+      const Edge *e = &f->blocks[p].succs[s];
+      if (!HT_WAY_IN(p, e)) continue;
+      nfwd[e->target]++;
+      if (p >= nb0) entered[e->target] = 1;
+    }
+  for (uint32_t h = 0; h < nb0; h++) {
+    pre[h] = UINT32_MAX;
+    if (nfwd[h] < 2 || !entered[h]) continue;
+    uint32_t np = f->blocks[h].nparams;
+    uint32_t ph = ir_new_block(f);
+    Ref *pa = xmalloc((np ? np : 1) * sizeof(Ref));
+    for (uint32_t q = 0; q < np; q++)
+      pa[q] = ir_add_param(f, ph, (ValType)f->insts[f->blocks[h].params[q]].type);
+    f->blocks[ph].term = T_JUMP;
+    f->blocks[ph].reachable = true;
+    ir_add_edge(f, ph, h, pa, np);
+    xfree(pa);
+    pre[h] = ph;
+    g_stats.hot_tail_pres++;
+  }
+  for (uint32_t p = 0; p < nbc; p++)
+    for (uint32_t s = 0; s < f->blocks[p].nsuccs; s++) {
+      Edge *e = &f->blocks[p].succs[s];
+      if (HT_WAY_IN(p, e) && pre[e->target] != UINT32_MAX) e->target = pre[e->target];
+    }
+#undef HT_WAY_IN
+  xfree(nfwd); xfree(pre); xfree(entered); xfree(borig);
+#undef HT_HEAD
+#undef HT_WORD
+  ir_order(f);
+  repair_copies(f, ni0, esc, eslot, euse, bcopy, map);
+  for (uint32_t i = 0; i < nesc; i++) xfree(euse[i].v);
+  hot_set_free(&hs);
+  xfree(wl); xfree(inR); xfree(slow); xfree(esc); xfree(eslot); xfree(euse);
+  xfree(map); xfree(bcopy); xfree(inv);
+  g_stats.hot_tails += nR;
+  prune_params(f);
+  ir_order(f);
+  return true;
+}
+
 /* ---- a region split on a value the way in fixes ------------------------
 
    Below an edge along whose way the branches taken fix a value -- the
@@ -9025,12 +9508,18 @@ static bool pass_nodesplit_whole(IrFunc *f) {
 #define KS_CONSTS 16
 #define KS_SAME 2
 #define KS_GROW 2
+/* on the hot way (pass_way_split) */
+#define KS_HOT_TESTS 2
+#define KS_HOT_DECIDED 1
+#define KS_HOT_ROUNDS 1024
 
 static bool is_call_op(uint16_t op);
+/* what a run of the pass goes by */
+typedef struct { bool self, refs; uint32_t tests, decided, copy; const uint8_t *hot; } KsCfg;
 
 /* the value B's branch tests, less what is added to it, or REF_NONE: a
    compare with a constant, or a switch */
-static Ref ks_key_of(IrFunc *f, uint32_t B) {
+static Ref ks_key_of(IrFunc *f, uint32_t B, bool self) {
   const Block *b = &f->blocks[B];
   Ref y;
   uint64_t k;
@@ -9040,6 +9529,12 @@ static Ref ks_key_of(IrFunc *f, uint32_t B) {
     else if (ci->op >= I_EQ && ci->op <= I_GEU && ci->nargs == 2 &&
              is_const(f, ir_args(f, b->term_arg)[1], &k))
       y = ir_args(f, b->term_arg)[0];
+    /* (not whether a reference is null, which is no value to split on: the
+       missing child a tree's code tests for is as likely as not, and the
+       copies below each such test cost javabench/treemap 8%) */
+    else if (self && ci->type == VT_I32 && !(ci->op >= I_EQ && ci->op <= I_GEU) && ci->op != I_CONST &&
+             ci->op != I_REF_IS_NULL)
+      y = b->term_arg;
     else return REF_NONE;
   } else if (b->term == T_BRTABLE) {
     y = b->term_arg;
@@ -9121,7 +9616,8 @@ static bool ks_copyable(IrFunc *f, uint32_t y) {
    stack[] are the function's length, reach[] cleared. */
 static bool ks_region(IrFunc *f, uint32_t S, Ref x, uint64_t k, uint64_t mask,
                       uint8_t *reach, uint8_t *keep, uint32_t *way, uint32_t *stack,
-                      uint32_t *ninsts) {
+                      uint32_t *ninsts, const KsCfg *kc) {
+  const uint8_t *hot = kc->hot;
   uint32_t nb = f->nblocks, sp = 0, decided = 0;
   /* the walk: the blocks reached, at most KS_COPY * 4 instructions of them */
   uint32_t walked = 0;
@@ -9134,7 +9630,7 @@ static bool ks_region(IrFunc *f, uint32_t S, Ref x, uint64_t k, uint64_t mask,
     walked += yb->ninsts + 1;
     if (walked > KS_COPY * 4) { ok = false; break; }
     uint32_t only = UINT32_MAX;
-    if (ks_key_of(f, y) == x) {
+    if (ks_key_of(f, y, kc->self) == x) {
       only = ks_way(f, y, x, k, mask);
       if (only == UINT32_MAX) { ok = false; break; }
       decided++;
@@ -9144,7 +9640,7 @@ static bool ks_region(IrFunc *f, uint32_t S, Ref x, uint64_t k, uint64_t mask,
     for (uint32_t s = 0; s < yb->nsuccs; s++) {
       if (only != UINT32_MAX && s != only) continue;
       uint32_t t = yb->succs[s].target;
-      if (t >= nb || reach[t] || !ks_copyable(f, t)) continue;
+      if (t >= nb || reach[t] || !ks_copyable(f, t) || (hot && !hot[t])) continue;
       reach[t] = 2;
       stack[sp++] = t;
     }
@@ -9168,23 +9664,46 @@ static bool ks_region(IrFunc *f, uint32_t S, Ref x, uint64_t k, uint64_t mask,
   for (uint32_t y = 0; y < nb; y++)
     if (keep[y]) n += f->blocks[y].ninsts + f->blocks[y].nparams;
   *ninsts = n;
-  return ok && keep[S] && decided >= KS_DECIDED && n <= KS_COPY;
+  return ok && keep[S] && decided >= kc->decided && n <= kc->copy;
 }
 
-static bool pass_key_split(IrFunc *f) {
+static bool pass_key_split_m(IrFunc *f, bool hotmode) {
   if (f->npads) return false;
+  KsCfg kc = { hotmode, hotmode, hotmode ? KS_HOT_TESTS : KS_TESTS,
+               hotmode ? KS_HOT_DECIDED : KS_DECIDED, KS_COPY, NULL };
+  if (hotmode) {
+    /* (to try other limits: WARMC_KS_TESTS, WARMC_KS_DECIDED, WARMC_KS_COPY) */
+    const char *e;
+    if ((e = warmc_getenv("WARMC_KS_TESTS"))) kc.tests = (uint32_t)atoi(e);
+    if ((e = warmc_getenv("WARMC_KS_DECIDED"))) kc.decided = (uint32_t)atoi(e);
+    if ((e = warmc_getenv("WARMC_KS_COPY"))) kc.copy = (uint32_t)atoi(e);
+  }
   ir_order(f);
+  int max_rounds = hotmode ? KS_HOT_ROUNDS : 64;
   /* the function's size: what is folded away after a copy is not counted */
   uint32_t live = 0;
   for (uint32_t oi = 0; oi < f->norder; oi++) live += f->blocks[f->order[oi]].ninsts;
   if (!f->ks_base) f->ks_base = live;
+  uint32_t base = f->ks_base;
   bool any = false;
-  for (int round = 0; round < 64; round++) {
+  for (int round = 0; round < max_rounds; round++) {
     uint32_t nb0 = f->nblocks, ni0 = f->ninsts;
+    HotSet hs;
+    const uint8_t *hot = NULL;
+    bool hs_ok = hotmode && hot_set_build(f, &hs, false);
+    /* the hot way's: only where a test's rule names a rare way, as the
+       tails are -- with none every block is on it, and these limits are
+       for the few a rule leaves there */
+    if (hotmode && (!hs_ok || !hs.tests)) {
+      if (hs_ok) hot_set_free(&hs);
+      break;
+    }
+    if (hs_ok) hot = hs.hot;
+    kc.hot = hot;
     /* how many branches test each value */
     uint32_t *tests = xcalloc(ni0 ? ni0 : 1, sizeof(uint32_t));
     for (uint32_t oi = 0; oi < f->norder; oi++) {
-      Ref x = ks_key_of(f, f->order[oi]);
+      Ref x = ks_key_of(f, f->order[oi], kc.self);
       if (x != REF_NONE) tests[x]++;
     }
     uint8_t *reach = xcalloc(nb0 ? nb0 : 1, 1), *keep = xcalloc(nb0 ? nb0 : 1, 1);
@@ -9195,12 +9714,18 @@ static bool pass_key_split(IrFunc *f) {
     uint64_t kval = 0;
     for (uint32_t oi = 0; oi < f->norder && P == UINT32_MAX; oi++) {
       uint32_t pb = f->order[oi];
-      Ref x = ks_key_of(f, pb);
-      if (x == REF_NONE || tests[x] < KS_TESTS) continue;
+      Ref x = ks_key_of(f, pb, kc.self);
+      if (x == REF_NONE || tests[x] < kc.tests) continue;
+      /* (from the hot way: a rare way's own test, whose way comes back
+         into a hot block where the tails left it one, is not the hot
+         way's to split -- awfy_permute's largest function, past the
+         tails' limit) */
+      if (hot && !hot[pb]) continue;
       uint64_t mask = f->insts[x].type == VT_I64 ? ~0ull : 0xffffffffu;
       const Block *b = &f->blocks[pb];
       for (uint32_t s = 0; s < b->nsuccs; s++) {
         uint32_t S = b->succs[s].target;
+        if (hot && !hot[S]) continue;
         /* x made above S, a block that can be copied, and only one value
            of x on the way in */
         if (!ks_copyable(f, S) || f->insts[x].block == S ||
@@ -9218,14 +9743,15 @@ static bool pass_key_split(IrFunc *f) {
         memset(reach, 0, nb0);
         memset(keep, 0, nb0);
         uint32_t n;
-        if (!ks_region(f, S, x, kway.lo[0], mask, reach, keep, way, stack, &n) ||
-            live + n > KS_GROW * f->ks_base)
+        if (!ks_region(f, S, x, kway.lo[0], mask, reach, keep, way, stack, &n, &kc) ||
+            live + n > KS_GROW * base)
           continue;
         P = pb; ps = s; key = x; kval = kway.lo[0]; ncopy = n;
         break;
       }
     }
     xfree(tests); xfree(stack);
+    if (hs_ok) hot_set_free(&hs);
     if (P == UINT32_MAX) { xfree(keep); xfree(reach); xfree(way); break; }
 
     /* the values the copy defines again that something past it reads */
@@ -9235,7 +9761,7 @@ static bool pass_key_split(IrFunc *f) {
     uint32_t nesc = escaping_values(f, keep, nb0, ni0, true, esc, eslot, &euse);
     bool ok = true;
     for (uint32_t v = 0; v < ni0 && ok; v++)
-      if (esc[v] && !copy_mergeable(f, v, false)) ok = false;
+      if (esc[v] && !copy_mergeable(f, v, kc.refs)) ok = false;
     if (!ok) {
       for (uint32_t i = 0; i < nesc; i++) xfree(euse[i].v);
       xfree(esc); xfree(eslot); xfree(euse); xfree(keep); xfree(reach); xfree(way);
@@ -9297,17 +9823,43 @@ static bool pass_key_split(IrFunc *f) {
     for (uint32_t i = 0; i < nesc; i++) xfree(euse[i].v);
     xfree(esc); xfree(eslot); xfree(euse); xfree(map); xfree(bcopy);
     if (warmc_getenv("WARMC_KEYSPLIT_DEBUG"))
-      fprintf(stderr, "keysplit %s b%u->b%u: v%u == %llu, %u instructions\n",
+      fprintf(stderr, "%s %s b%u->b%u: v%u == %llu, %u instructions\n",
+              hotmode ? "waysplit" : "keysplit",
               f->m->funcs[f->func_index].sym ? f->m->funcs[f->func_index].sym : "?",
               P, S, key, (unsigned long long)kval, ncopy);
     xfree(keep); xfree(reach); xfree(way);
     live += ncopy;
-    g_stats.key_splits++;
+    if (hotmode) g_stats.way_splits++;
+    else g_stats.key_splits++;
     any = true;
     ir_order(f);
   }
   if (any) prune_params(f);
   return any;
+}
+
+static bool pass_key_split(IrFunc *f) { return pass_key_split_m(f, false); }
+
+/* ---- the hot way split where its ways in fix a value --------------------
+
+   pass_key_split's copies again, once the hot way's tails have their own
+   (pass_hot_tails), by other limits and on the hot way alone: the walk
+   keeps to the blocks the likely ways reach, a value two branches test is
+   one to split on, and one test decided is enough -- a branch on the value
+   itself is a test of it, and what a copy defines again may be a
+   reference; only in a function some test of which has a rare way by a
+   rule, as the tails are.  What the copy is for is not the test it decides but the way
+   it takes out of a merge: luawasm reads t[i] one of three ways, by the
+   kind of t's array part, the three meet, and the store to t[i] after
+   tests the kind again; with the two typed kinds' ways gone to copies of
+   their own up to that test, the way of the third is one way in, and what
+   it read of the table -- its arrays, their lengths, the element -- is
+   what the store reads again (pass_gc_rle, the bounds checks, the tests
+   decided above).  awfy_towers, a pile's top read and replaced, takes
+   0.96 the instructions for it, awfy_permute 0.90 (WARMC_NO_WAY_SPLIT=1). */
+static bool pass_way_split(IrFunc *f) {
+  if (warmc_getenv("WARMC_NO_WAY_SPLIT")) return false;
+  return pass_key_split_m(f, true);
 }
 
 typedef struct {
@@ -11421,6 +11973,90 @@ void module_go_resume_facts(Module *m) {
   m->go_pcf = pcf;
 }
 
+/* ---- an element at the array's address plus a multiple of its size ---------
+
+   An array's elements start a header after its address, so an element is
+   at address + header + index * size: on arm64 an add and the load or the
+   store, whose address is a base and a scaled index or a base and an
+   offset, never the three.  Where the index is a value less k and the
+   header is k elements long -- Lua's t[i] is the element at i - 1, and
+   luawasm's arrays have 8 bytes ahead of elements of 8 -- the element is at
+   address + value * size, one instruction.  In 32 bits, as the index is:
+   value - k wraps only where the value's low half is under k, an index
+   past any array's length, which the access's check of its bound turns
+   away or a check that was removed has ruled out.
+
+   The access is given the value as one operand more (GCF_BIASARG) and
+   keeps its index: the allocator then sees the value read there, keeps it
+   to there and prices its register by that read, and the selection takes
+   the value's register where one has it when the access is made, and the
+   index and the add where none has.  Put in the index's place before the
+   allocation, the value was read from its slot where the index had been in
+   a register -- a reload for each add saved.
+
+   Integer elements alone.  A reference's load is the collector's barrier's,
+   whose slow path takes the slot's address from a register, and its stores
+   made the other way ran luawasm awfy_towers 27% longer: a store that
+   makes its own address has it late for the load that reads the element
+   back -- a push and the pop after it, 2.16 ns a round where 1.69 with the
+   add ahead of the store -- which an array all of whose accesses are made
+   this way gets back in instructions (awfy_permute, whose swaps are four
+   of them, takes 0.93 the time, awfy_sieve 0.94) and one whose loads keep
+   the add does not.  A float's load ran spectralnorm's one row loop 18%
+   longer and its other not at all, for no reason found.  Not for x86-64,
+   whose addresses have a base, a scaled index and an offset
+   (WARMC_NO_ARR_BIAS=1; --stats counts arr_bias_args, and arr_biased the
+   accesses made so). */
+static void ab_insert_arg(IrFunc *f, Ref v, uint32_t at, Ref x) {
+  uint32_t n = f->insts[v].nargs, oc_ = f->cap_argpool;
+  while (f->nargpool + n + 1 > f->cap_argpool)
+    f->cap_argpool = f->cap_argpool ? f->cap_argpool * 2 : 32;
+  if (f->cap_argpool != oc_)
+    f->argpool = ir_grow(f, f->argpool, (size_t)oc_ * sizeof(Ref),
+                         (size_t)f->cap_argpool * sizeof(Ref));
+  Inst *in = &f->insts[v];
+  uint32_t off = f->nargpool;
+  for (uint32_t k = 0; k < at; k++) f->argpool[f->nargpool++] = f->argpool[in->args_off + k];
+  f->argpool[f->nargpool++] = x;
+  for (uint32_t k = at; k < n; k++) f->argpool[f->nargpool++] = f->argpool[in->args_off + k];
+  in->args_off = off;
+  in->nargs = n + 1;
+}
+
+static bool pass_array_bias(IrFunc *f) {
+  if (ir_addr_index_disp() || warmc_getenv("WARMC_NO_ARR_BIAS")) return false;
+  bool any = false;
+  for (uint32_t oi = 0; oi < f->norder; oi++) {
+    const Block *b = &f->blocks[f->order[oi]];
+    for (uint32_t i = 0; i < b->ninsts; i++) {
+      Ref v = b->insts[i];
+      const Inst *in = &f->insts[v];
+      if ((in->op != I_ARRAY_GET && in->op != I_ARRAY_SET) || (in->imm2 & GCF_BIASARG)) continue;
+      uint32_t size = (uint32_t)GCF_SIZE(in->imm2), hdr = f->m->types[in->imm].hdr_size;
+      uint32_t k = hdr >> size;
+      if (!k || k << size != hdr || in->nargs < GCF_BIAS_AT(in->op)) continue;
+      ValType et = in->op == I_ARRAY_SET ? (ValType)f->insts[ir_args(f, v)[2]].type : (ValType)in->type;
+      if (et != VT_I32 && et != VT_I64) continue;
+      Ref t = ir_args(f, v)[1];
+      if (f->insts[t].op == I_WRAP) t = ir_args(f, t)[0];
+      const Inst *ti = &f->insts[t];
+      uint64_t c;
+      if ((ti->op != I_SUB && ti->op != I_ADD) || ti->nargs != 2 || !is_const(f, ir_args(f, t)[1], &c))
+        continue;
+      if (ti->op == I_ADD) c = 0 - c;
+      if ((c & 0xffffffffu) != k) continue;
+      Ref y = ir_args(f, t)[0];
+      ValType yt = (ValType)f->insts[y].type;
+      if (yt != VT_I64 && yt != VT_I32) continue;
+      ab_insert_arg(f, v, GCF_BIAS_AT(f->insts[v].op), y);
+      f->insts[v].imm2 |= GCF_BIASARG;
+      g_stats.arr_bias_args++;
+      any = true;
+    }
+  }
+  return any;
+}
+
 /* ---- Go's resume dispatch --------------------------------------------------
 
    Go's wasm port starts every function with a br_table on its first
@@ -11526,12 +12162,16 @@ static bool pass_go_resume(IrFunc *f) {
     f->blocks[tb].term_imm = TRAP_UNREACHABLE;
   }
   uint32_t tab = h;
+  if (split) tab = ir_new_block(f);
+  /* (a new block may have moved them all: a function of exactly as many
+     blocks as it had room for kept its dispatch's edges, the pruned table's
+     put after them -- every case as it was, and the two past the default's
+     the entry's) */
+  hb = &f->blocks[h];
   if (split) {
-    tab = ir_new_block(f);
     Ref two = ir_emit(f, h, I_CONST, VT_I32, NULL, 0, 2, 0);
     Ref ca[2] = { idx, two };
     Ref c = ir_emit(f, h, I_LTU, VT_I32, ca, 2, 0, 0);
-    hb = &f->blocks[h];
     hb->nsuccs = 0;
     hb->term = T_BRIF;
     hb->term_arg = c;
@@ -15478,6 +16118,9 @@ static void gc_test_passed(IrFunc *f, Ref test, Ref *set, uint32_t *n,
   }
 }
 
+/* the tests one branch's condition is made of, at most (an and of ands) */
+#define GC_AND_MAX 8
+
 /* The facts pass_gc_nullchk holds at the end of each block it has done:
    objects not null, and the types of objects. */
 typedef struct {
@@ -16593,11 +17236,27 @@ static bool pass_gc_nullchk(IrFunc *f) {
       if (p->term == T_BRIF && p->nsuccs >= 2 &&
           p->succs[0].target != p->succs[1].target &&
           (p->succs[0].target == bi || p->succs[1].target == bi)) {
-        bool taken = p->succs[0].target == bi;
-        Ref cond = ir_resolve(f, p->term_arg);
+        /* the tests the branch's says have each passed or failed: its
+           own, and under an and that held, or an or that did not, each of
+           the two (luawasm's `if (ref.test f) & (ref.test x)` ahead of the
+           call that casts both: WARMC_NO_AND_FACTS) */
+        Ref cq[GC_AND_MAX];
+        bool tq[GC_AND_MAX];
+        uint32_t nq = 0;
+        cq[nq] = p->term_arg; tq[nq++] = p->succs[0].target == bi;
+        bool and_on = !warmc_getenv("WARMC_NO_AND_FACTS");
+        for (uint32_t qi = 0; qi < nq; qi++) {
+        bool taken = tq[qi];
+        Ref cond = ir_resolve(f, cq[qi]);
         while (f->insts[cond].op == I_EQZ && f->insts[cond].nargs == 1) {
           cond = ir_resolve(f, ir_args(f, cond)[0]);
           taken = !taken;
+        }
+        if (and_on && f->insts[cond].nargs == 2 && f->insts[cond].type == VT_I32 &&
+            (f->insts[cond].op == (taken ? I_AND : I_OR)) && nq + 2 <= GC_AND_MAX) {
+          cq[nq] = ir_args(f, cond)[0]; tq[nq++] = taken;
+          cq[nq] = ir_args(f, cond)[1]; tq[nq++] = taken;
+          continue;
         }
         if (f->insts[cond].op == I_REF_IS_NULL && f->insts[cond].nargs == 1 &&
             !taken)
@@ -16624,6 +17283,7 @@ static bool pass_gc_nullchk(IrFunc *f) {
           bsets[bi][bcounts[bi]].idx = bidx;
           bsets[bi][bcounts[bi]].len = blen;
           bcounts[bi]++;
+        }
         }
       }
     }
@@ -18684,6 +19344,8 @@ static bool licm_split_preheaders(IrFunc *f) {
 static bool pass_licm(IrFunc *f, const OptOpts *o) {
   bool changed = false;
   bool licm_nocold = !warmc_getenv("WARMC_LICM_COLD");
+  HotSet lhs;
+  bool lhs_ok = licm_nocold && ir_order_current(f) && hot_set_build(f, &lhs, true);
   uint8_t *inloop = xcalloc(f->nblocks, 1);
   uint8_t *reach = xmalloc(f->nblocks);
   uint32_t *stack = xmalloc(f->nblocks * sizeof(uint32_t));
@@ -18784,6 +19446,22 @@ static bool pass_licm(IrFunc *f, const OptOpts *o) {
     const_reg_uses(f, lblk, nlbl, const_reg_use, cru_touched, &cru_nt);
 
     Block *pre = &f->blocks[preheader];
+    /* A loop the unswitcher may take (pass_unswitch: innermost, of
+       US_LOOP_MAX instructions at most) gives up what its rare blocks read
+       as it did: the unswitcher splits a loop on a test of a value made
+       before it, and a test left reading a value its rare arm still makes
+       is none -- luawasm's loop that fills a table (awfy_sieve), a third
+       of its tests left in, took 1.03 the instructions. */
+    bool rare_stay = lhs_ok;
+    if (rare_stay) {
+      uint32_t lsize = 0;
+      bool inner = f->cap_loop_head >= f->nblocks;
+      for (uint32_t i = 0; i < nlbl && inner; i++) {
+        lsize += f->blocks[lblk[i]].ninsts;
+        if (f->loop_head[lblk[i]] != hb) inner = false;
+      }
+      if (inner && lsize <= US_LOOP_MAX) rare_stay = false;
+    }
     for (uint32_t bo = 0; bo < nlbl; bo++) {
       uint32_t bi = (uint32_t)lord[bo];
       Block *b = &f->blocks[bi];
@@ -18793,7 +19471,7 @@ static bool pass_licm(IrFunc *f, const OptOpts *o) {
          permute's loops of six trips and spilled; awfy_list, permute and
          deltablue 1.5% faster, nbody 2% slower on the same instructions,
          the corpora the same; WARMC_LICM_COLD=1 takes them out too) */
-      if (licm_nocold && b->cold && bi != hb) continue;
+      if (licm_nocold && (b->cold || (rare_stay && !lhs.hot[bi])) && bi != hb) continue;
 
       bool reach_mem = (bi == hb), reach_any = (bi == hb);
       uint32_t k = 0;
@@ -18853,6 +19531,7 @@ static bool pass_licm(IrFunc *f, const OptOpts *o) {
   xfree(inloop); xfree(reach); xfree(stack); xfree(rstack);
   xfree(lblk); xfree(lord); xfree(const_reg_use); xfree(cru_touched);
   xfree(udepth);
+  if (lhs_ok) hot_set_free(&lhs);
 #undef LICM_USE
   return changed;
 }
@@ -27349,6 +28028,32 @@ static bool pass_addr_nowrap(IrFunc *f) {
 typedef struct { Ref root, value; uint64_t off; uint32_t size; ValType ty; } RleEnt;
 typedef struct { RleEnt e[RLE_MAX]; uint32_t n; bool valid; } RleSet;
 
+/* An array's element, read again: off is its index, the value that
+   indexes it, with RLE_ELEM set -- no field's offset -- and what ends it
+   is a write of an element of its kind (rle_elem_kind: the element's size,
+   and whether it is a reference) to any array at any index, an array.copy
+   or fill, or a call.  A write gives the element it wrote; the read after
+   it, and the read after a read, are of the same array at the same index,
+   so their checks have been made.  luawasm stores to t[i] past a test of
+   what t[i] holds, which the access before it read (awfy_towers: a pile's
+   top read, then replaced); a sort compares a[j] and then moves it
+   (WARMC_NO_RLE_ELEM=1 leaves elements alone). */
+#define RLE_ELEM ((uint64_t)1 << 40)
+#define RLE_IS_ELEM(off) (((off) & RLE_ELEM) != 0)
+static uint32_t rle_elem_kind(uint32_t size, ValType ty) {
+  return (size & 7u) | (vt_is_ref(ty) ? 8u : 0u);
+}
+
+/* the elements of that kind forgotten: all of them with all set */
+static void rle_kill_elems(RleSet *st, uint32_t kind, bool all) {
+  uint32_t k = 0;
+  for (uint32_t j = 0; j < st->n; j++)
+    if (!RLE_IS_ELEM(st->e[j].off) ||
+        (!all && rle_elem_kind(st->e[j].size, st->e[j].ty) != kind))
+      st->e[k++] = st->e[j];
+  st->n = k;
+}
+
 static bool rle_kills_all(uint16_t op) {
   switch (op) {
     case I_CALL: case I_CALL_INDIRECT: case I_CALL_REF:
@@ -27527,13 +28232,16 @@ static Ref rle_pend_get(IrFunc *f, RlePend *pd, uint32_t idx, Ref v) {
 }
 
 static bool pass_gc_rle(IrFunc *f) {
-  static const uint16_t gets[] = { I_FIELD_GET };
-  if (round_lacks(f, 15, gets, 1)) return false;
+  static const uint16_t gets[] = { I_FIELD_GET, I_ARRAY_GET };
+  if (round_lacks(f, 15, gets, 2)) return false;
+  bool elems = !warmc_getenv("WARMC_NO_RLE_ELEM");
   uint32_t nb = f->nblocks;
   RleSet *out = xcalloc(nb ? nb : 1, sizeof(RleSet));
-  /* what each block writes: offsets as bits of a hash, or everything */
+  /* what each block writes: offsets as bits of a hash, or everything; and
+     the kinds of array element, a bit each */
   uint64_t *wmask = xcalloc(nb ? nb : 1, sizeof(uint64_t));
   uint8_t *wall = xcalloc(nb ? nb : 1, 1);
+  uint16_t *wel = xcalloc(nb ? nb : 1, sizeof(uint16_t));
   bool any_get = false;
   for (uint32_t oi = 0; oi < f->norder; oi++) {
     uint32_t bi = f->order[oi];
@@ -27543,6 +28251,11 @@ static bool pass_gc_rle(IrFunc *f) {
       if (in->op == I_FIELD_SET) wmask[bi] |= (uint64_t)1 << ((in->imm >> 2) & 63);
       else if (rle_kills_all(in->op)) wall[bi] = 1;
       else if (in->op == I_FIELD_GET) any_get = true;
+      else if (in->op == I_ARRAY_GET) any_get |= elems;
+      else if (in->op == I_ARRAY_SET && in->nargs >= 3)
+        wel[bi] |= (uint16_t)(1u << rle_elem_kind((uint32_t)in->imm2,
+                                                   (ValType)f->insts[ir_args(f, b->insts[i])[2]].type));
+      else if (in->op == I_ARRAY_OP) wel[bi] = 0xffff;
     }
   }
   bool changed = false;
@@ -27602,7 +28315,7 @@ static bool pass_gc_rle(IrFunc *f) {
         const RleSet *a = &out[hot];
         for (uint32_t j = 0; j < a->n && cur.n < RLE_MAX && npd < RLE_PMAX; j++) {
           RleEnt e = a->e[j];
-          if (RLE_IS_PEND(e.value)) continue;
+          if (RLE_IS_PEND(e.value) || RLE_IS_ELEM(e.off)) continue;
           bool have = false;
           for (uint32_t q = 0; q < cur.n && !have; q++)
             have = cur.e[q].root == e.root && cur.e[q].off == e.off;
@@ -27636,13 +28349,17 @@ static bool pass_gc_rle(IrFunc *f) {
       }
     } else if (fwd == 1 && loop_body(f, bi, inloop, stack) == first) {
       uint64_t m = 0;
+      uint16_t me = 0;
       bool killed = false;
       for (uint32_t x = 0; x < nb && !killed; x++)
-        if (inloop[x]) { m |= wmask[x]; killed = wall[x] != 0 || f->blocks[x].is_pad; }
+        if (inloop[x]) { m |= wmask[x]; me |= wel[x]; killed = wall[x] != 0 || f->blocks[x].is_pad; }
       if (!killed) {
         const RleSet *a = &out[first];
         for (uint32_t j = 0; j < a->n; j++)
-          if (!((m >> ((a->e[j].off >> 2) & 63)) & 1)) cur.e[cur.n++] = a->e[j];
+          if (RLE_IS_ELEM(a->e[j].off)
+                  ? !(me >> rle_elem_kind(a->e[j].size, a->e[j].ty) & 1)
+                  : !((m >> ((a->e[j].off >> 2) & 63)) & 1))
+            cur.e[cur.n++] = a->e[j];
       }
     }
     for (uint32_t i = 0; i < b->ninsts; i++) {
@@ -27704,6 +28421,44 @@ static bool pass_gc_rle(IrFunc *f) {
             if (!(cur.e[j].root == root && cur.e[j].off == in->imm)) cur.e[k++] = cur.e[j];
           cur.n = k;
         }
+      } else if (elems && in->op == I_ARRAY_GET && in->nargs >= 2) {
+        Ref root = gc_ref_root(f, ir_args(f, v)[0]);
+        uint64_t off = RLE_ELEM | ir_resolve(f, ir_args(f, v)[1]);
+        uint32_t size = (uint32_t)(in->imm2 & (7u | GCF_SIGNED));
+        Ref hit = REF_NONE;
+        for (uint32_t j = 0; j < cur.n && hit == REF_NONE; j++) {
+          const RleEnt *e = &cur.e[j];
+          if (e->root != root || e->off != off || e->size != size) continue;
+          if (e->ty == (ValType)in->type ||
+              (vt_is_ref(e->ty) && vt_is_ref((ValType)in->type)))
+            hit = e->value;
+        }
+        if (hit != REF_NONE) {
+          /* (WARMC_RLE_DEBUG: each element's read taken, by function) */
+          if (warmc_getenv("WARMC_RLE_DEBUG"))
+            fprintf(stderr, "rle %s: element read v%u is v%u\n",
+                    f->m->funcs[f->func_index].name ? f->m->funcs[f->func_index].name : "?", v, hit);
+          ir_replace(f, v, hit);
+          ir_make_nop(in);
+          g_stats.gc_elems_reused++;
+          changed = true;
+          continue;
+        }
+        rle_put(&cur, (RleEnt){ root, v, off, size, (ValType)in->type });
+      } else if (elems && in->op == I_ARRAY_SET && in->nargs >= 3) {
+        Ref root = gc_ref_root(f, ir_args(f, v)[0]);
+        uint64_t off = RLE_ELEM | ir_resolve(f, ir_args(f, v)[1]);
+        Ref val = ir_resolve(f, ir_args(f, v)[2]);
+        ValType vt = (ValType)f->insts[val].type;
+        uint32_t size = (uint32_t)(in->imm2 & 7u);
+        if (!(in->imm2 & GCF_INIT)) rle_kill_elems(&cur, rle_elem_kind(size, vt), false);
+        /* a packed element's read extends what is stored: nothing to give
+           (and nothing to take back: a store that is no array's first has
+           just ended what was known of the element) */
+        if (vt_width(vt) == (1u << size))
+          rle_put(&cur, (RleEnt){ root, val, off, size, vt });
+      } else if (in->op == I_ARRAY_OP) {
+        rle_kill_elems(&cur, 0, true);
       } else if (rle_kills_all(in->op)) {
         cur.n = 0;
       }
@@ -27714,7 +28469,7 @@ static bool pass_gc_rle(IrFunc *f) {
   for (uint32_t i = 0; i < npd; i++) if (pd[i].phi != REF_NONE) changed = true;
 done:
   xfree(pd);
-  xfree(out); xfree(wmask); xfree(wall);
+  xfree(out); xfree(wmask); xfree(wall); xfree(wel);
   if (changed) ir_apply_subst(f);
   return changed;
 }
@@ -28159,6 +28914,330 @@ static void bce_report(IrFunc *f) {
   }
 }
 
+/* ---- tests made where their branches are ---------------------------------
+
+   A compare and the branch on it are one cmp and one b.cond when they are
+   in one block and the branch is the compare's only reader (isel's fused
+   tests); a compare in another block is made a 0 or 1 there, a cset, kept
+   in a register or a stack slot to the branch, and tested again.  LICM
+   takes a loop's tests of values from before it out to the loop's
+   preheader, the unswitcher's material, and the copies pass_hot_tails
+   makes read the tests the hot way made: luawasm's permute made 90 such
+   flags on entry, 17 of them in stack slots, for loops of six trips.  So,
+   last of all, a branch on a compare from another block gets a copy of the
+   compare for itself (LLVM's CodeGenPrepare sinks them the same way); the
+   original, unread, goes.  An eqz, and or or of tests takes its operands
+   along.  A type test, a dozen instructions as a value and eight as a
+   branch, comes only to a branch no deeper in loops than it is.
+
+   And the test a block branches on, passed along its own edges, is 1 on
+   the taken one and 0 on the other. */
+static bool cs_is_cmp(uint16_t op) {
+  return (op >= I_EQ && op <= I_EQZ) || (op >= I_FEQ && op <= I_FGE) || op == I_REF_IS_NULL;
+}
+
+static bool cs_cheap(const IrFunc *f, Ref c, uint32_t u, int depth) {
+  if (c >= f->ninsts) return false;
+  const Inst *in = &f->insts[c];
+  if (cs_is_cmp(in->op)) return true;
+  if ((in->op == I_REF_SLOT || in->op == I_REF_TEST) && in->block < f->nblocks)
+    return f->blocks[in->block].loop_depth >= f->blocks[u].loop_depth;
+  if ((in->op == I_AND || in->op == I_OR) && in->nargs == 2 && depth < 2 &&
+      (ValType)in->type == VT_I32) {
+    const Ref *a = ir_args((IrFunc *)f, c);
+    for (int k = 0; k < 2; k++) {
+      if (a[k] >= f->ninsts) return false;
+      uint16_t op = f->insts[a[k]].op;
+      if (!cs_is_cmp(op) && op != I_AND && op != I_OR) return false;
+      if (!cs_cheap(f, a[k], u, depth + 1)) return false;
+    }
+    return true;
+  }
+  return false;
+}
+
+/* a copy of test c just ahead of position *at of block u, its operands
+   that are tests in other blocks copied ahead of it */
+static Ref cs_copy(IrFunc *f, uint32_t u, uint32_t *at, Ref c, int depth) {
+  Inst src = f->insts[c];
+  Ref args[3];
+  memcpy(args, ir_args(f, c), src.nargs * sizeof(Ref));
+  if ((src.op == I_EQZ || src.op == I_AND || src.op == I_OR) && depth < 2)
+    for (uint32_t k = 0; k < src.nargs; k++) {
+      Ref x = args[k];
+      if (x < f->ninsts && f->insts[x].block != u && (ValType)f->insts[x].type == VT_I32 &&
+          (cs_is_cmp(f->insts[x].op) || f->insts[x].op == I_AND || f->insts[x].op == I_OR ||
+           f->insts[x].op == I_REF_SLOT || f->insts[x].op == I_REF_TEST) &&
+          cs_cheap(f, x, u, depth + 1))
+        args[k] = cs_copy(f, u, at, x, depth + 1);
+    }
+  Ref r = emit_before(f, u, at, (IrOp)src.op, (ValType)src.type, args, src.nargs, src.imm);
+  f->insts[r].imm2 = src.imm2;
+  f->insts[r].flags = src.flags;
+  g_stats.cmps_sunk++;
+  return r;
+}
+
+/* the i32 constant 0 or 1 in the entry block, where the allocator makes a
+   constant again at each read: made in the block that hands it to a rare
+   way it took a register and a mov on the hot one */
+static Ref cs_bit(IrFunc *f, Ref *bits, bool one) {
+  if (bits[one] != REF_NONE) return bits[one];
+  Block *eb = &f->blocks[f->entry];
+  for (uint32_t i = 0; i < eb->ninsts; i++) {
+    const Inst *in = &f->insts[eb->insts[i]];
+    if (in->op == I_CONST && (ValType)in->type == VT_I32 && in->imm == (uint64_t)one)
+      return bits[one] = eb->insts[i];
+  }
+  uint32_t at = 0;
+  return bits[one] = emit_before(f, f->entry, &at, I_CONST, VT_I32, NULL, 0, one);
+}
+
+static bool cs_is_bit(const IrFunc *f, Ref c) {
+  uint16_t op = f->insts[c].op;
+  return cs_is_cmp(op) || op == I_REF_SLOT || op == I_REF_TEST;
+}
+
+static bool pass_cmp_sink(IrFunc *f) {
+  if (warmc_getenv("WARMC_NO_CMP_SINK")) return false;
+  /* (the ways in and the dominators the decided tests are read from) */
+  ir_order(f);
+  bool changed = false;
+  Ref bits[2] = { REF_NONE, REF_NONE };
+  /* A test passed along an edge where a branch above has decided it: the
+     block's own branch on it, or the branch into a block that dominates
+     this one and has that one way in (et_edge_fact).  1 only of a test
+     that makes 0 or 1. */
+  for (uint32_t u = 0, nb = f->nblocks; u < nb; u++) {
+    Block *b = &f->blocks[u];
+    if (!b->reachable) continue;
+    Ref fc[9];
+    bool ft[9];
+    uint32_t nf = 0;
+    uint32_t d = u;
+    for (int step = 0; step < 8; step++) {
+      bool truth;
+      Ref c = et_edge_fact(f, d, &truth);
+      if (c != REF_NONE && c < f->ninsts && (ValType)f->insts[c].type == VT_I32 &&
+          (!truth || cs_is_bit(f, c))) {
+        fc[nf] = c; ft[nf++] = truth;
+      }
+      uint32_t up = f->blocks[d].idom;
+      if (up == REF_NONE || up == d || d == f->entry) break;
+      d = up;
+    }
+    bool own = b->term == T_BRIF && b->nsuccs == 2 && b->term_arg < f->ninsts &&
+               b->succs[0].target != b->succs[1].target &&
+               (ValType)f->insts[b->term_arg].type == VT_I32;
+    for (uint32_t s = 0; s < b->nsuccs; s++) {
+      Edge *e = &f->blocks[u].succs[s];
+      if (e->eh) continue;
+      for (uint32_t q = 0; q < e->nargs; q++) {
+        Ref a = e->args[q];
+        int val = -1;
+        if (own && s < 2 && a == f->blocks[u].term_arg && (s == 1 || cs_is_bit(f, a)))
+          val = s == 0;
+        for (uint32_t k = 0; val < 0 && k < nf; k++)
+          if (fc[k] == a) val = ft[k];
+        if (val < 0) continue;
+        Ref kc = cs_bit(f, bits, val);
+        f->blocks[u].succs[s].args[q] = kc;
+        g_stats.cmp_edge_consts++;
+        changed = true;
+      }
+    }
+  }
+  for (uint32_t u = 0, nb = f->nblocks; u < nb; u++) {
+    if (!f->blocks[u].reachable || f->blocks[u].term != T_BRIF || f->blocks[u].nsuccs != 2)
+      continue;
+    Ref c = f->blocks[u].term_arg;
+    if (c >= f->ninsts) continue;
+    if (f->insts[c].block == u) {
+      /* an eqz, and or or here of tests from elsewhere */
+      Inst *ci = &f->insts[c];
+      if ((ci->op != I_EQZ && ci->op != I_AND && ci->op != I_OR) || (ValType)ci->type != VT_I32)
+        continue;
+      uint32_t at = UINT32_MAX;
+      for (uint32_t i = f->blocks[u].ninsts; i-- > 0;)
+        if (f->blocks[u].insts[i] == c) { at = i; break; }
+      if (at == UINT32_MAX) continue;
+      for (uint32_t k = 0; k < f->insts[c].nargs; k++) {
+        Ref x = ir_args(f, c)[k];
+        if (x >= f->ninsts || f->insts[x].block == u || (ValType)f->insts[x].type != VT_I32)
+          continue;
+        uint16_t op = f->insts[x].op;
+        if (!(cs_is_cmp(op) || op == I_AND || op == I_OR || op == I_REF_SLOT || op == I_REF_TEST) ||
+            !cs_cheap(f, x, u, 1))
+          continue;
+        Ref r = cs_copy(f, u, &at, x, 1);
+        ir_args(f, c)[k] = r;
+        changed = true;
+      }
+      continue;
+    }
+    if (!cs_cheap(f, c, u, 0)) continue;
+    uint32_t at = f->blocks[u].ninsts;
+    Ref r = cs_copy(f, u, &at, c, 0);
+    f->blocks[u].term_arg = r;
+    changed = true;
+  }
+  return changed;
+}
+
+/* ---- a branch on type tests, one branch a test ---------------------------
+
+   A type test is a branch where a branch reads it alone -- the null and
+   the i31 tested, the type's word loaded and compared, each going straight
+   to the way the test fails by -- and a dozen instructions as a value: the
+   same tests, then a 0 or a 1 made in a register on either way out.  A
+   branch on an and of two tests made both values, anded them and tested
+   that: luawasm's `if (ref.test f) & (ref.test x)` ahead of every call it
+   knows the callee of.  So, after the tests have come to their branches
+   (pass_cmp_sink), a branch on an and or an or that it alone reads, one
+   side of it a type test, is two branches: the first side's, and in a block
+   of its own the second's, made there, both going the one way out where
+   they fail (and) or pass (or).  An and only of two values that are 0 or
+   1, whose and is not 0 just where neither is; an or of any two.  Not of
+   two compares, which are one cmp, one ccmp and one branch as they are. */
+static bool tc_has_test(const IrFunc *f, Ref c, int depth) {
+  if (c >= f->ninsts) return false;
+  const Inst *in = &f->insts[c];
+  if (in->op == I_REF_TEST || in->op == I_REF_SLOT) return true;
+  if ((in->op == I_AND || in->op == I_OR || in->op == I_EQZ) && depth < 3 &&
+      (ValType)in->type == VT_I32) {
+    const Ref *a = ir_args((IrFunc *)f, c);
+    for (uint32_t k = 0; k < in->nargs; k++)
+      if (tc_has_test(f, a[k], depth + 1)) return true;
+  }
+  return false;
+}
+
+/* whether y is made in block u for one reader, with no effect: what a
+   block of its own can make instead */
+static bool tc_movable(const IrFunc *f, const uint32_t *uses, uint32_t nuses, Ref y, uint32_t u) {
+  if (y >= nuses || uses[y] != 1 || f->insts[y].block != u) return false;
+  const Inst *in = &f->insts[y];
+  return ir_has_no_effect(in) && in->op != I_PARAM && in->op != I_CONST && in->op != I_NOP &&
+         in->nargs <= 3;
+}
+
+/* y made again at the end of block n, and with it what y alone reads of
+   block u's -- the tests an and of tests is made of */
+static Ref tc_move(IrFunc *f, const uint32_t *uses, uint32_t nuses, Ref y, uint32_t u,
+                   uint32_t n, int depth) {
+  Inst src = f->insts[y];
+  Ref args[3];
+  memcpy(args, ir_args(f, y), src.nargs * sizeof(Ref));
+  for (uint32_t k = 0; k < src.nargs && depth < 3; k++)
+    if (tc_movable(f, uses, nuses, args[k], u))
+      args[k] = tc_move(f, uses, nuses, args[k], u, n, depth + 1);
+  Ref r = ir_emit(f, n, (IrOp)src.op, (ValType)src.type, args, src.nargs, src.imm, src.imm2);
+  f->insts[r].flags = src.flags;
+  return r;
+}
+
+/* whether c is an and or an or one side of which is a type test, or has one */
+static bool tc_of_tests(const IrFunc *f, Ref c) {
+  if (c >= f->ninsts) return false;
+  const Inst *ci = &f->insts[c];
+  if ((ci->op != I_AND && ci->op != I_OR) || ci->nargs != 2 || (ValType)ci->type != VT_I32)
+    return false;
+  const Ref *a = ir_args((IrFunc *)f, c);
+  return tc_has_test(f, a[0], 0) || tc_has_test(f, a[1], 0);
+}
+
+static bool pass_test_chain(IrFunc *f) {
+  if (warmc_getenv("WARMC_NO_TEST_CHAIN")) return false;
+  bool any = false;
+  for (uint32_t oi = 0; oi < f->norder && !any; oi++) {
+    const Block *b = &f->blocks[f->order[oi]];
+    any = b->term == T_BRIF && tc_of_tests(f, b->term_arg);
+  }
+  if (!any) return false;
+  bool changed = false;
+  /* (again for the blocks a round made: an and of an and) */
+  for (int round = 0; round < 4; round++) {
+    uint32_t *uses = count_uses(f);
+    uint32_t nuses = f->ninsts, nb = f->nblocks;
+    bool moved = false;
+    for (uint32_t u = 0; u < nb; u++) {
+      Block *b = &f->blocks[u];
+      if (!b->reachable || b->is_pad || b->term != T_BRIF || b->nsuccs != 2) continue;
+      if (b->succs[0].eh || b->succs[1].eh || b->succs[0].target == b->succs[1].target) continue;
+      Ref c = b->term_arg;
+      if (c >= nuses || uses[c] != 1 || !tc_of_tests(f, c)) continue;
+      const Inst *ci = &f->insts[c];
+      Ref x = ir_args(f, c)[0], y = ir_args(f, c)[1];
+      bool is_and = ci->op == I_AND;
+      if (is_and && ((ir_known_bits(f, x, KB_DEPTH) | ir_known_bits(f, y, KB_DEPTH)) & ~1ull))
+        continue;
+      /* the second side made in its own block: the one this block makes
+         for the and alone */
+      if (!tc_movable(f, uses, nuses, y, u)) {
+        if (!tc_movable(f, uses, nuses, x, u)) continue;
+        Ref t = x; x = y; y = t;
+      }
+      uint32_t T = b->succs[0].target, F = b->succs[1].target;
+      uint32_t nt = b->succs[0].nargs, nf = b->succs[1].nargs;
+      Ref *ta = xmalloc((nt ? nt : 1) * sizeof(Ref)), *fa = xmalloc((nf ? nf : 1) * sizeof(Ref));
+      memcpy(ta, b->succs[0].args, nt * sizeof(Ref));
+      memcpy(fa, b->succs[1].args, nf * sizeof(Ref));
+      bool tcold = b->succs[0].cold, fcold = b->succs[1].cold;
+      uint32_t n = ir_new_block(f);
+      f->blocks[n].reachable = true;
+      f->blocks[n].cold = f->blocks[u].cold;
+      Ref y2 = tc_move(f, uses, nuses, y, u, n, 0);
+      f->blocks[n].term = T_BRIF;
+      f->blocks[n].term_arg = y2;
+      ir_add_edge(f, n, T, ta, nt);
+      ir_add_edge(f, n, F, fa, nf);
+      f->blocks[n].succs[0].cold = tcold;
+      f->blocks[n].succs[1].cold = fcold;
+      f->blocks[n].chained = true;
+      xfree(ta); xfree(fa);
+      b = &f->blocks[u];
+      b->chained = true;
+      b->term_arg = x;
+      /* and: on to the second test where the first holds; or: where it fails */
+      Edge *go = &b->succs[is_and ? 0 : 1];
+      go->target = n;
+      go->nargs = 0;
+      go->cold = false;
+      /* (WARMC_TC_DEBUG: each branch taken apart, by function) */
+      if (warmc_getenv("WARMC_TC_DEBUG"))
+        fprintf(stderr, "test-chain %s: b%u's %s, the second side in b%u\n",
+                f->m->funcs[f->func_index].name ? f->m->funcs[f->func_index].name : "?", u,
+                is_and ? "and" : "or", n);
+      g_stats.test_chains++;
+      moved = true;
+    }
+    xfree(uses);
+    if (!moved) break;
+    changed = true;
+    /* (the new blocks in the order before what they left behind goes) */
+    ir_recompute_preds(f);
+    ir_order(f);
+    pass_dce(f);
+    ir_order(f);
+  }
+  return changed;
+}
+
+/* A callee's body made ready for a look at its start (inline.c pinl_build):
+   cleaned up as its own compile cleans it, and the hot way given its
+   tails, so that a test the body's own tests decide -- the type of what
+   an access before it tested, past where that access's slow way came back
+   -- is no way out of the start.  (Without the tails awfy_towers' push and
+   pop have no start past their first store; with the hot way's ways split
+   too, pass_way_split, the starts are larger for nothing.) */
+void ir_pinl_prep(IrFunc *g, const OptOpts *o) {
+  pthread_once(&g_pt_once, pt_init);
+  ir_order(g);
+  opt_cleanup(g, o);
+  if (o->tails && pass_hot_tails(g)) opt_cleanup(g, o);
+  ir_order(g);
+}
+
 void ir_optimize(IrFunc *f, const OptOpts *o) {
   pthread_once(&g_pt_once, pt_init);
   if (o->level == 0) return;
@@ -28213,6 +29292,15 @@ void ir_optimize(IrFunc *f, const OptOpts *o) {
     if (o->cse) pass_cse(f, o);
     if (o->dce) pass_dce(f);
     ir_order(f);
+  }
+
+  if (o->tails && TP("tails", pass_hot_tails(f))) {
+    ir_verify(f, "post-tails");
+    opt_cleanup(f, o);
+  }
+  if (o->waysplit && TP("way_split", pass_way_split(f))) {
+    ir_verify(f, "post-way-split");
+    opt_cleanup(f, o);
   }
 
   /* before the stack pointer's writes move: global_ssa leaves only the ones
@@ -28454,6 +29542,12 @@ void ir_optimize(IrFunc *f, const OptOpts *o) {
   if (!warmc_getenv("WARMC_NO_FPELEM") && TP("fp_elems", pass_fp_elems(f)) && o->dce) pass_dce(f);
   if (o->wrap_params) TP("wrap_params", pass_wrap_params(f));
   if (o->bce) TP("bound_lens", pass_bound_lens(f));
+  if (o->cmpsink && TP("cmp_sink", pass_cmp_sink(f)) && o->dce) {
+    pass_dce(f);
+    ir_order(f);
+  }
+  if (o->tchain && TP("test_chain", pass_test_chain(f))) ir_verify(f, "post-test-chain");
+  if (o->arrbias && TP("arr_bias", pass_array_bias(f))) ir_verify(f, "post-arr-bias");
   if (o->print_ir) ir_print(f, "optimised");
   if (warmc_getenv("WARMC_BCE_REPORT")) bce_report(f);
   ir_verify(f, "post-opt");

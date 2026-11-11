@@ -34,6 +34,18 @@ if [ ${#mods[@]} -eq 0 ]; then
   echo "jobs: no corpus built; run test/gobench.py first (skipped)"
   exit 0
 fi
+# The corpora's rows build their modules again while this one runs (make
+# check runs the rows side by side), and a module rewritten between two of
+# its compiles -- rsbench/dyntrait, its crate's hash in every symbol another
+# -- differed at every width from the one before.  So each width compiles
+# the same copy, taken once.
+snap="$WORK/mods"
+rm -rf "$snap"
+mkdir -p "$snap"
+for w in "${mods[@]}"; do
+  cp "$w" "$snap/$(basename "$(dirname "$w")")-$(basename "$w")"
+done
+mods=("$snap"/*.wasm)
 one="${mods[0]}"
 
 for form in -j1 -j4 -j16; do
@@ -68,8 +80,7 @@ for w in "${mods[@]}"; do
     if [ -z "$ref" ]; then
       ref="$WORK/j$j.o"
     elif ! cmp -s "$ref" "$WORK/j$j.o"; then
-      # both kept, to be told apart function by function: once, under make
-      # check's load, a module differed at every -j from 3 up and never again
+      # both kept, to be told apart function by function
       keep="$BUILD/checklogs/jobs"
       mkdir -p "$keep"
       cp "$ref" "$keep/$(basename "$w" .wasm)-j$first.o"

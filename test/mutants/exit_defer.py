@@ -12,7 +12,7 @@ O = 'src/isel_ops.inc'
 I = 'src/ir.c'
 def m(old, new, path=I): return (path, [(old, new)])
 M = {
- 'emit_only': m('  if (defer_on && f->reducible && f->cap_loop_head >= f->nblocks && f->norder) {', '  if (0) {'),
+ 'emit_only': m('  if ((defer_on || emit_bias) && f->reducible && f->cap_loop_head >= f->nblocks && f->norder) {', '  if (0) {'),
  'emit_order': m('      order = deferred;\n', ''),
  'stub_off': m('  s->no_stub_out = warmc_getenv("WARMC_NO_STUB_OUT") != NULL;', '  s->no_stub_out = true;', 'src/isel.c'),
  'stub_likelier': m('''                 (t->target == next_bi

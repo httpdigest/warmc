@@ -198,10 +198,13 @@ static double remat_discount(Isel *s, Ref v) {
    never allocated nor refilled -- on a64; x64 has no zero register. */
 static bool ra_zero_const(Isel *s, Ref v, int cls) {
   const Inst *in = &s->f->insts[v];
+  /* (a null too: the zero register where a store or a compare reads it,
+     as an integer's 0 -- luawasm's nil, a 0 and a null stored side by
+     side, took a register and a mov for the null) */
   if (!RA_ZERO_REG || cls || in->op != I_CONST ||
-      ((ValType)in->type != VT_I32 && (ValType)in->type != VT_I64))
+      ((ValType)in->type != VT_I32 && (ValType)in->type != VT_I64 && !vt_is_ref((ValType)in->type)))
     return false;
-  uint64_t m = (ValType)in->type == VT_I64 ? in->imm : (in->imm & 0xffffffffu);
+  uint64_t m = (ValType)in->type == VT_I32 ? (in->imm & 0xffffffffu) : in->imm;
   return m == 0 && remat_ok(s, v);
 }
 
@@ -685,6 +688,86 @@ static uint32_t eff_uses_at(Isel *s, IrFunc *f, Ref u, Ref *out, uint32_t k,
 
 static uint32_t eff_uses(Isel *s, IrFunc *f, Ref u, Ref *out, uint32_t cap) {
   return eff_uses_at(s, f, u, out, 0, cap);
+}
+
+/* A constant made again where it is read (remat_ok) costs, beside a
+   register holding it, nothing where the selection takes it as an
+   immediate, and nothing either where it is made in place of a move from
+   that register: a call's argument register (emit_call_args_core), an
+   edge's target (parallel_copy_to), a return's register -- `mov x4, #1`
+   for `mov x4, x26`.  Elsewhere it costs its sequence.  ra_cuse_cost is
+   that, for operand idx of user; ra_cuse_walk adds it, times w, over the
+   effective uses of u (eff_uses_at's walk through folded operands) into
+   cw for each value rc marks.  A constant's weight is what its register
+   saves: priced by its references alone, luawasm's 0, 1, 3 and 4, read
+   in every inlined call's arguments and as immediates, held five of the
+   seven callee-saved registers over awfy_queens' hot loop while its
+   counters went to slots.  WARMC_RA_CUSE_ALL prices every reference. */
+static double ra_cuse_cost(Isel *s, Ref user, uint32_t idx, Ref v) {
+  IrFunc *f = s->f;
+  const Inst *in = &f->insts[user], *c = &f->insts[v];
+  int cost = ir_const_cost(c->imm, vt_is_64((ValType)c->type));
+  bool inplace = false;
+  switch (in->op) {
+    /* (an array.new's operands too: the allocator's arguments, or its
+       constant length an immediate of the inline bump, moved to its
+       arguments in its stub) */
+    case I_CALL: case I_RETURN_CALL: case I_ARRAY_NEW:
+      inplace = true;
+      break;
+    case I_CALL_INDIRECT: case I_CALL_REF:
+    case I_RETURN_CALL_INDIRECT: case I_RETURN_CALL_REF:
+      inplace = idx + 1 < in->nargs;
+      break;
+    default:
+      break;
+  }
+  if (inplace) return cost - 1;
+  if (ir_imm_ok(f, user, idx, c->imm, (ValType)c->type)) return 0;
+  return cost;
+}
+
+/* whether a read of x as operand idx of user takes a register at all:
+   not a one-move constant's that the selection takes as an immediate or
+   makes in place (ra_cuse_cost) -- a piece filled for such reads alone
+   would be made and never read */
+static bool ra_read_free(Isel *s, Ref user, uint32_t idx, Ref x) {
+  const Inst *c = &s->f->insts[x];
+  if (c->op != I_CONST || vt_is_float((ValType)c->type) || (ValType)c->type == VT_V128 ||
+      s->cls[x] || !remat_ok(s, x))
+    return false;
+  return ra_cuse_cost(s, user, idx, x) <= 0;
+}
+
+/* eff_uses_at with each read's user and operand index */
+static uint32_t eff_uses_ui(Isel *s, IrFunc *f, Ref u, Ref *out, Ref *ouser, uint32_t *oidx,
+                            uint32_t k, uint32_t cap) {
+  Inst *in = &f->insts[u];
+  Ref *a = ir_args(f, u);
+  for (uint32_t j = 0; j < in->nargs; j++) {
+    Ref x = a[j];
+    if ((s->folded && s->folded[x]) || (s->walias && s->walias[x])) {
+      k = eff_uses_ui(s, f, x, out, ouser, oidx, k, cap);
+    } else {
+      if (k >= cap) warmc_fatal("internal: effective-use buffer overflow");
+      ouser[k] = u; oidx[k] = j;
+      out[k++] = x;
+    }
+  }
+  return k;
+}
+
+static void ra_cuse_walk(Isel *s, IrFunc *f, Ref u, const uint8_t *rc, const uint32_t *web,
+                         double w, double *cw) {
+  Inst *in = &f->insts[u];
+  Ref *a = ir_args(f, u);
+  for (uint32_t j = 0; j < in->nargs; j++) {
+    Ref x = a[j];
+    if ((s->folded && s->folded[x]) || (s->walias && s->walias[x]))
+      ra_cuse_walk(s, f, x, rc, web, w, cw);
+    else if (rc[web[x]])
+      cw[web[x]] += w * ra_cuse_cost(s, u, j, x);
+  }
 }
 
 static uint32_t eff_use_cap(IrFunc *f) {
@@ -2225,6 +2308,24 @@ static int ra_gpr_pool(Isel *s, int *gpool) {
   return ngpool;
 }
 
+/* A callee-saved register the function saves for nothing else costs a
+   save and a restore on every run of it, at the entry's weight, 1: a value
+   made again where it is read takes one only where its register saves more
+   than that at its reads -- its definition is no saving, made again it is
+   not made there.  luawasm's 1.0, read by the cold float paths of
+   awfy_permute's arithmetic but defined where LICM put it, held d8 over
+   its recursion, and every call saved and restored it (WARMC_RA_CS_ANY
+   lets any value take any). */
+static bool ra_cs_worth(Isel *s, const Interval *X, int reg, const double *wuse, bool cs_any) {
+  if (cs_any || !remat_ok(s, X->value)) return true;
+  if ((ValType)s->f->insts[X->value].type == VT_V128) return true;
+  bool fresh = X->cls ? fpr_is_callee_saved(reg) && !(s->used_fpr_cs & (1u << reg))
+                      : gpr_is_callee_saved(reg) && !(s->used_gpr_cs & (1u << reg));
+  if (!fresh || wuse[X->value] * remat_discount(s, X->value) >= 2.0) return true;
+  g_stats.ra_cs_spared++;
+  return false;
+}
+
 static void regalloc_linear(Isel *s) {
   IrFunc *f = s->f;
   uint32_t n = f->ninsts;
@@ -2251,6 +2352,16 @@ static void regalloc_linear(Isel *s) {
   float *call_share = xmalloc((n + 1) * sizeof(float));
   float *bshare = xmalloc((f->nblocks ? f->nblocks : 1) * sizeof(float));
   ir_path_share(f, bshare);
+  /* The blocks no likely way reaches (opt.c ir_rare_blocks): a call there
+     is one made now and then, as a cold block's is -- what lives across
+     such calls alone may have a caller-saved register and be saved round
+     them, no callee-saved register every call of the function saves and
+     restores (luawasm's accessors, whose slow ways call the runtime: a
+     pile's push and pop in awfy_towers saved eight registers each time for
+     ways they never took) -- and a constant handed on from there is made
+     there (WARMC_NO_RARE_BLOCKS=1). */
+  uint8_t *rareb = warmc_getenv("WARMC_NO_RARE_BLOCKS") ? NULL : ir_rare_blocks(f);
+  bool rare_csa = !warmc_getenv("WARMC_NO_RARE_CSA");
   uint32_t ncalls = 0;
   int32_t pos = 0;
   for (uint32_t oi = 0; oi < f->norder; oi++) {
@@ -2268,8 +2379,13 @@ static void regalloc_linear(Isel *s) {
         call_depth[ncalls] = (uint8_t)(b->loop_depth < 8 ? b->loop_depth : 8);
         /* the allocation's slow path, or a call on a way a branch hint
            says is rare */
-        call_cold[ncalls] = b->cold ? 2 : gc_fastnew_shape(f, r, &ft, &fl) ? 1 : 0;
-        call_share[ncalls] = bshare[bi];
+        call_cold[ncalls] = b->cold || (rareb && rareb[bi]) ? 2
+                            : gc_fastnew_shape(f, r, &ft, &fl) ? 1 : 0;
+        /* (where the rules say which ways are rare, a call on a likely
+           way is one every run makes: its share by even splits at each
+           branch took luawasm's fib for calling itself one time in four,
+           and saved n round each call) */
+        call_share[ncalls] = rareb ? 1.0f : bshare[bi];
         call_pos[ncalls++] = pos;
       }
       pos++;
@@ -2386,6 +2502,7 @@ static void regalloc_linear(Isel *s) {
   bool co_dbg = warmc_getenv("WARMC_COALESCE_DEBUG") != NULL;
   bool co_ok = !warmc_getenv("WARMC_NO_COALESCE");
   bool exact = !warmc_getenv("WARMC_NO_COALESCE_EXACT");
+  bool rare_const = !warmc_getenv("WARMC_NO_RARE_CONST_EDGE");
   LiveAfter la = { s, num, eu, eucap, 0 };
   if (co_ok && co_only) co_ok = (uint32_t)atoi(co_only) == f->func_index;
   if (co_ok && co_upto) co_ok = f->func_index <= (uint32_t)atoi(co_upto);
@@ -2419,6 +2536,16 @@ static void regalloc_linear(Isel *s) {
           if (s->cls[arg] != s->cls[param]) continue;
           uint32_t ra = FIND(arg), rp = FIND(param);
           if (ra == rp) continue;
+          /* A constant handed to a rare way is made on that way's edge:
+             one web with the parameter, it was made where it is defined,
+             on the way that runs, for the way that does not -- the 0 or 1
+             a test hands its own rare edge (opt.c pass_cmp_sink), a mov
+             ahead of each of luawasm's guards
+             (WARMC_NO_RARE_CONST_EDGE=1). */
+          if (rare_const && f->insts[arg].op == I_CONST && sb->rpo < b->rpo &&
+              (sb->succs[sidx].cold || ir_unlikely_way(f, sb) == sidx ||
+               (rareb && rareb[src])))
+            continue;
           if (s->pinned[arg] || s->pinned[ra] || s->pinned[rp]) continue;
 
           /* The exact test only on a loop's back edge, whose moves run
@@ -2632,6 +2759,27 @@ static void regalloc_linear(Isel *s) {
   double *wdef = xcalloc(n ? n : 1, sizeof(double));
   uint32_t *lstamp = xcalloc(n ? n : 1, sizeof(uint32_t));
   uint32_t lseg = 0;
+  /* the integer constants priced by what their register saves at each use
+     (ra_cuse_cost), and that price, cw */
+  uint8_t *rc = xcalloc(n ? n : 1, 1);
+  double *cw = NULL;
+  bool cs_any = warmc_getenv("WARMC_RA_CS_ANY") != NULL;
+  if (!warmc_getenv("WARMC_RA_CUSE_ALL")) {
+    uint32_t *webn = xcalloc(n ? n : 1, sizeof(uint32_t));
+    for (uint32_t i = 0; i < n; i++) webn[web[i]]++;
+    bool any = false;
+    for (uint32_t i = 0; i < n; i++) {
+      const Inst *ci = &f->insts[i];
+      if (web[i] != i || webn[i] != 1 || ci->op != I_CONST || vt_is_float((ValType)ci->type) ||
+          (ValType)ci->type == VT_V128 || s->cls[i] || !remat_ok(s, i))
+        continue;
+      rc[i] = 1;
+      any = true;
+      g_stats.ra_cpriced++;
+    }
+    xfree(webn);
+    if (any) cw = xcalloc(n ? n : 1, sizeof(double));
+  }
   /* cumf[p] sums the frequency of the positions before p, the weight a
      reference there would get, for the frequency-weighted spans of the
      density rules (iv_wspan). */
@@ -2680,6 +2828,7 @@ static void regalloc_linear(Isel *s) {
           wlat[rep] += w;
         }
       }
+      if (cw) ra_cuse_walk(s, f, r2, rc, web, w, cw);
     }
     if (b->term == T_BRIF || b->term == T_BRTABLE) {
       weight[web[b->term_arg]] += w;
@@ -2690,15 +2839,45 @@ static void regalloc_linear(Isel *s) {
       weight[web[b->ret_args[i]]] += w;
       wlat[web[b->ret_args[i]]] += w;
       wuse[web[b->ret_args[i]]] += w;
+      Ref x = b->ret_args[i];
+      if (cw && rc[web[x]])
+        cw[web[x]] += w * (ir_const_cost(f->insts[x].imm, vt_is_64((ValType)f->insts[x].type)) - 1);
     }
     for (uint32_t sidx = 0; sidx < b->nsuccs; sidx++)
       for (uint32_t j = 0; j < b->succs[sidx].nargs; j++) {
         weight[web[b->succs[sidx].args[j]]] += w;
         wlat[web[b->succs[sidx].args[j]]] += w;
         wuse[web[b->succs[sidx].args[j]]] += w;
+        Ref x = b->succs[sidx].args[j];
+        if (cw && rc[web[x]])
+          cw[web[x]] += w * (ir_const_cost(f->insts[x].imm, vt_is_64((ValType)f->insts[x].type)) -
+                             (b->succs[sidx].eh ? 0 : 1));
       }
   }
   xfree(lstamp);
+  /* a priced constant's weight is its def and what its register saves;
+     one whose register saves nothing -- every read of it an immediate or
+     made in place -- takes none (cnone): a register that was free cost
+     its move where the constant is defined, each time that ran, for a
+     read on an edge that rarely does (luawasm's tags, handed to the slow
+     ways' merges: WARMC_RA_CNONE_OFF=1) */
+  uint8_t *cnone = NULL;
+  if (cw) {
+    bool cn = !warmc_getenv("WARMC_RA_CNONE_OFF");
+    for (uint32_t i = 0; i < n; i++)
+      if (rc[i]) {
+        double d = wdef[i];
+        weight[i] = d + cw[i];
+        wuse[i] = cw[i];
+        if (wlat[i] > weight[i]) wlat[i] = weight[i];
+        if (cn && cw[i] <= 0) {
+          if (!cnone) cnone = xcalloc(n ? n : 1, 1);
+          cnone[i] = 1;
+          g_stats.ra_cnone++;
+        }
+      }
+    xfree(cw);
+  }
 
   /* A rematerialised global pays a load at every use; a spilled one pays one
      cached reload per use segment.  A global whose uses cluster
@@ -2724,8 +2903,13 @@ static void regalloc_linear(Isel *s) {
       weight[i] *= remat_discount(s, i);
       continue;
     }
+    /* (a priced constant of more than one move pays its whole sequence at
+       each read already: gobench/embed's type switch lost two of its seven
+       case constants' registers in its inner loop at half that price) */
+    if (rc[i] && ir_const_cost(ri->imm, vt_is_64((ValType)ri->type)) > 1) continue;
     weight[i] *= remat_discount(s, i);
   }
+  xfree(rc);
 
   int32_t gpr_end[32], fpr_end[32];
   int32_t gpr_owner[32], fpr_owner[32];
@@ -2924,7 +3108,7 @@ static void regalloc_linear(Isel *s) {
       if (hint[cur->value] < 0 && cur->value < n)
         hint[cur->value] = web_hint[cur->value];
 
-      if (ra_zero_const(s, cur->value, cur->cls)) {
+      if (ra_zero_const(s, cur->value, cur->cls) || (cnone && cnone[cur->value])) {
         s->loc[cur->value] = LOC_NONE;
         continue;
       }
@@ -2932,6 +3116,14 @@ static void regalloc_linear(Isel *s) {
                       !remat_ok(s, cur->value);
       uint32_t barred = spare_ok || cur->cls ? 0 : spare;
 
+      /* What lives across calls on rare ways alone (rareb) takes a
+         caller-saved register, saved round each of those calls where the
+         call is made, ahead of a callee-saved one, which every call of the
+         function saves and restores: the way that runs then saves nothing
+         for the ways that do not (WARMC_NO_RARE_CSA=1). */
+      bool rare_only = rareb && rare_csa && cur->crosses_call && !v128 && csa_ok &&
+                       !inelig[cur->value] && f->insts[cur->value].op != I_CONST &&
+                       !csa_crosses_hot(cur, R, num[cur->value], call_pos, call_cold, ncalls);
       int chosen = -1;
       if (!no_tie) {
         Ref ta = tied_operand_of(f, cur->value);
@@ -2950,7 +3142,9 @@ static void regalloc_linear(Isel *s) {
           for (int k = 0; k < npool; k++) if (pool[k] == tl) { in_pool = true; break; }
           int nc = occ_conflicts(&heaps[tl], cur, R, gone, &ostack, &vic);
           bool only_tied = nc == 0 || (nc == 1 && sorted[vic].value == ta);
-          if (in_pool && only_tied && (!cur->crosses_call || cs)) chosen = tl;
+          if (in_pool && only_tied &&
+              (!cur->crosses_call || cs || (rare_only && tl != RA_ALLOC_RES_REG)))
+            chosen = tl;
         }
       }
       int want = no_hint ? -1 : hint[cur->value];
@@ -2981,7 +3175,8 @@ static void regalloc_linear(Isel *s) {
                                      : gpr_is_callee_saved(want));
         bool in_pool = false;
         for (int k = 0; k < npool; k++) if (pool[k] == want) { in_pool = true; break; }
-        if (in_pool && !((barred >> want) & 1) && (!cur->crosses_call || cs))
+        if (in_pool && !((barred >> want) & 1) &&
+            (!cur->crosses_call || cs || (rare_only && want != RA_ALLOC_RES_REG)))
           chosen = want;
       }
       for (int pass = 0; pass < 2 && chosen < 0; pass++) {
@@ -2989,14 +3184,35 @@ static void regalloc_linear(Isel *s) {
           int k = from_top ? npool - 1 - kk : kk;
           int rr = pool[k];
           bool cs = cur->cls ? fpr_is_callee_saved(rr) : gpr_is_callee_saved(rr);
-          if (cur->crosses_call && (v128 || !cs)) continue;
+          if (cur->crosses_call && !rare_only && (v128 || !cs)) continue;
+          if (rare_only && !cs && !cur->cls && rr == RA_ALLOC_RES_REG) continue;
           if ((spare >> rr) & 1 && !cur->cls) continue;
-          bool want_cs = cur->crosses_call ? true : (pass == 1);
+          bool want_cs = cur->crosses_call && !rare_only ? true : (pass == 1);
           if (cs != want_cs) continue;
           if (occ_conflicts(&heaps[rr], cur, R, gone, &ostack, &vic) != 0) continue;
           chosen = rr;
           break;
         }
+      }
+      /* (in a caller-saved register: its slot for the calls it crosses) */
+      if (chosen >= 0 && rare_only &&
+          !(cur->cls ? fpr_is_callee_saved(chosen) : gpr_is_callee_saved(chosen))) {
+        if (!s->csa_on) {
+          s->csa_on = xcalloc(n ? n : 1, 1);
+          s->csa_slot = xmalloc((n ? n : 1) * sizeof(int32_t));
+          for (uint32_t z = 0; z < n; z++) s->csa_slot[z] = -1;
+        }
+        cur->caller_saved_ok = 1;
+        s->csa_on[cur->value] = 1;
+        s->csa_slot[cur->value] = (int32_t)take_slot(s, cur->value, &slot);
+        g_stats.caller_saves++;
+        g_stats.rare_csa++;
+        if (csa_dbg)
+          fprintf(stderr, "csa[%u] v%u r%d rare calls alone\n", f->func_index, cur->value, chosen);
+      }
+      if (chosen >= 0 && !ra_cs_worth(s, cur, chosen, wuse, cs_any)) {
+        s->loc[cur->value] = LOC_NONE;
+        continue;
       }
 
       if (chosen < 0) {
@@ -3190,12 +3406,13 @@ static void regalloc_linear(Isel *s) {
         const Range *xr = X->rcount ? &R[X->rfirst] : &whole;
         uint32_t nx = X->rcount ? X->rcount : 1;
         int got = -1;
-        if (ra_zero_const(s, X->value, X->cls)) continue;
+        if (ra_zero_const(s, X->value, X->cls) || (cnone && cnone[X->value])) continue;
         for (int pass = 0; pass < 2 && got < 0; pass++)
           for (int k = 0; k < npool && got < 0; k++) {
             int rr = pool[k];
             bool cs = X->cls ? fpr_is_callee_saved(rr) : gpr_is_callee_saved(rr);
             if (X->crosses_call && (v128 || !cs)) continue;
+            if (!ra_cs_worth(s, X, rr, wuse, cs_any)) continue;
             if (!X->cls && ((spare >> rr) & 1)) continue;
             bool want_cs = X->crosses_call ? true : (pass == 1);
             if (cs != want_cs) continue;
@@ -3443,6 +3660,9 @@ static void regalloc_linear(Isel *s) {
     PieceUse *pu = NULL; uint32_t npu = 0, cap_pu = 0;
     PieceCand *pcd = NULL; uint32_t npcd = 0, cap_pcd = 0;
     uint32_t *clob = NULL; uint32_t cap_clob = 0;
+    Ref *euu = xmalloc(eucap * sizeof(Ref));
+    uint32_t *eui = xmalloc(eucap * sizeof(uint32_t));
+    bool cfree = !warmc_getenv("WARMC_RA_CUSE_ALL");
     for (uint32_t oi = 0; oi < f->norder; oi++) {
       uint32_t bi = f->order[oi];
       Block *b = &f->blocks[bi];
@@ -3463,7 +3683,7 @@ static void regalloc_linear(Isel *s) {
                        rop == I_RETURN_CALL_INDIRECT || rop == I_RETURN_CALL_REF;
         clob[i + 1] = clob[i] + (barrier ? 1 : 0);
         if (barrier) continue;
-        uint32_t ne = eff_uses(s, f, r, eu, eucap);
+        uint32_t ne = eff_uses_ui(s, f, r, eu, euu, eui, 0, eucap);
         for (uint32_t j = 0; j < ne; j++) {
           Ref u = eu[j];
           if (u >= n || num[u] < 0 || iv[web[u]].end < 0) continue;
@@ -3472,8 +3692,10 @@ static void regalloc_linear(Isel *s) {
           int l = s->loc[web[u]];
           if (l != LOC_NONE && !IS_SLOT(l)) continue;
           /* a zero's readers read the zero register (rd_zr): a piece's
-             would be made and never read */
+             would be made and never read; and so would one for a constant
+             read as an immediate */
           if (ra_zero_const(s, u, s->cls[u])) continue;
+          if (cfree && l == LOC_NONE && ra_read_free(s, euu[j], eui[j], u)) continue;
           if (nlps) {
             uint64_t key = (uint64_t)u << 32 | bi;
             uint32_t a = 0, z = nlps;
@@ -3566,7 +3788,7 @@ static void regalloc_linear(Isel *s) {
     } else {
       xfree(pcs);
     }
-    xfree(pu); xfree(pcd); xfree(clob);
+    xfree(pu); xfree(pcd); xfree(clob); xfree(euu); xfree(eui);
   for (int c = 0; c < 2; c++)
       for (int r = 0; r < 32; r++) xfree(rl[c][r].v);
   }
@@ -3942,6 +4164,8 @@ static void regalloc_linear(Isel *s) {
   xfree(wlat);
   xfree(wuse);
   xfree(wdef);
+  xfree(cnone);
+  xfree(rareb);
   xfree(cumf);
   xfree(cumc[0]); xfree(cumc[1]);
 

@@ -24,6 +24,11 @@ warmc makes AArch64 code (everywhere but Windows, whose is x86-64):
 
     ;; stats -O2 a64: wrap_params=3
 
+or, with -f flags after the level, what it counts without a pass that would
+change the counts of the one the module is for:
+
+    ;; stats -O2 -fno-tails: gc_nonnull_params=10
+
 and how many instructions of a function's AArch64 code at -O2 match a
 pattern, checked on an AArch64 host -- for what changes the code and not
 what it computes:
@@ -34,6 +39,11 @@ or, with late, of the instructions after its first ret, which are the blocks
 emitted after the rest of the function (ir.c ir_emit_order's late ones):
 
     ;; late: FUNCTION REGEX=N
+
+or, with last, of the instructions after its last ret -- what is emitted
+after even the copies of its ends, the blocks two rare ways lead to:
+
+    ;; last: FUNCTION REGEX=N
 
 and with what flags besides the levels the module is compiled -- on its own,
 every call checked against that too -- for a pass a flag the levels never
@@ -70,8 +80,8 @@ import testcache
 LEVELS = ["-O0", "-O1", "-O2", "-O3"]
 RUN_TIMEOUT = float(os.environ.get("WARMC_RUN_TIMEOUT", "30"))
 RUN_LINE = re.compile(r"^;; run(?: (-O[0-3]))?: (\S+)((?: \S+)*) => (.*)$")
-STATS_LINE = re.compile(r"^;; stats(?: (-O[0-3]))?( a64)?: (.*)$")
-SHAPE_LINE = re.compile(r"^;; (shape|late): (\S+) (.*)=(\d+)$")
+STATS_LINE = re.compile(r"^;; stats(?: (-O[0-3]))?((?: -f[a-z0-9-]+)*)( a64)?: (.*)$")
+SHAPE_LINE = re.compile(r"^;; (shape|late|last): (\S+) (.*)=(\d+)$")
 FLAGS_LINE = re.compile(r"^;; flags: (.+)$")
 OBJDUMP = shutil.which("llvm-objdump") or shutil.which("objdump")
 # the shapes are in Apple's syntax for vectors, add.4s v0, v1, v2, which an
@@ -111,8 +121,8 @@ def stats(path):
     out = {}
     for line in open(path):
         m = STATS_LINE.match(line.rstrip("\n"))
-        if m and not (m.group(2) and hostbuild.WINDOWS):
-            out.setdefault(m.group(1) or "-O0", []).extend(m.group(3).split())
+        if m and not (m.group(3) and hostbuild.WINDOWS):
+            out.setdefault((m.group(1) or "-O0") + (m.group(2) or ""), []).extend(m.group(4).split())
     return out
 
 
@@ -130,7 +140,7 @@ def shapes(path):
     for line in open(path):
         m = SHAPE_LINE.match(line.rstrip("\n"))
         if m:
-            out.append((m.group(2), m.group(3), int(m.group(4)), m.group(1) == "late"))
+            out.append((m.group(2), m.group(3), int(m.group(4)), m.group(1)))
     return out
 
 
@@ -161,13 +171,17 @@ def shape_fails(name, dump, want):
         full = code("%s.%s$full" % (name, fn))
         if full is not None:
             lines = full
-        if late:
+        if late == "late":
             first = next((i for i, l in enumerate(lines) if re.search(r"\sret$", l)), len(lines))
             lines = lines[first + 1:]
+        elif late == "last":
+            rets = [i for i, l in enumerate(lines) if re.search(r"\sret$", l)]
+            lines = lines[(rets[-1] if rets else len(lines)) + 1:]
         got = len([l for l in lines if re.search(pat, l)])
         if got != n:
             fails.append("%s -O2: %s has %d instructions%s matching %s, not %d"
-                         % (name, fn, got, " after its ret" if late else "", pat, n))
+                         % (name, fn, got, {"late": " after its ret", "last": " after its last ret"}.get(late, ""),
+                            pat, n))
     return fails
 
 
@@ -212,8 +226,8 @@ def check_all(cases, build, warmc, target, run, tmp):
         (name, c), wasm, level, want = job
         # a program, as the cases' is (an object's module is not its program's
         # only instance, which some counts depend on), but never run
-        r = subprocess.run([warmc, level] + target + ["--stats", "-o",
-                            hostbuild.exe(os.path.join(tmp, "%s%s" % (name, level))), wasm],
+        r = subprocess.run([warmc] + level.split() + target + ["--stats", "-o",
+                            hostbuild.exe(os.path.join(tmp, "%s%s" % (name, level.replace(" ", "")))), wasm],
                            capture_output=True, text=True, timeout=120, env=VERIFY)
         got = r.stderr.split()
         out = []
