@@ -1390,7 +1390,7 @@ static IrFunc *pinl_build(IrFunc *f, const OptOpts *o, uint32_t fidx,
     S->sealed = S->filled = S->reachable = true;
     const Block *eb = &g->blocks[g->entry];
     Ref *args = xmalloc((eb->nparams ? eb->nparams : 1) * sizeof(Ref));
-    memcpy(args, eb->params, eb->nparams * sizeof(Ref));
+    if (eb->nparams) memcpy(args, eb->params, eb->nparams * sizeof(Ref));
     Ref call = ir_emit(g, sb, I_CALL, nres == 1 ? sig->results[0] : 0, args,
                        eb->nparams, fidx, 0);
     xfree(args);

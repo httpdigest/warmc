@@ -1038,7 +1038,7 @@ static IrFunc *sw_start(IrFunc *f, const OptOpts *opt, uint32_t *dup_out) {
     if (ok) {
       const Block *eb = &st->blocks[st->entry];
       Ref *args = xmalloc((eb->nparams ? eb->nparams : 1) * sizeof(Ref));
-      memcpy(args, eb->params, eb->nparams * sizeof(Ref));
+      if (eb->nparams) memcpy(args, eb->params, eb->nparams * sizeof(Ref));
       ir_emit(st, sb, I_RETURN_CALL, VT_BOT, args, eb->nparams, f->func_index, RCALL_FULL);
       xfree(args);
       st->blocks[sb].term = T_TRAP;

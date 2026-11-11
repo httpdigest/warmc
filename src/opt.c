@@ -20950,7 +20950,7 @@ static bool rotate_one(IrFunc *f, uint32_t hb) {
 
   uint32_t nparams = h->nparams, ninsts = h->ninsts, nsuccs = h->nsuccs;
   uint32_t *insts = xmalloc((ninsts ? ninsts : 1) * sizeof(uint32_t));
-  memcpy(insts, h->insts, ninsts * sizeof(uint32_t));
+  if (ninsts) memcpy(insts, h->insts, ninsts * sizeof(uint32_t));
   uint32_t *ptypes = xmalloc((nparams ? nparams : 1) * sizeof(uint32_t));
   Ref *pold = xmalloc((nparams ? nparams : 1) * sizeof(Ref));
   for (uint32_t p = 0; p < nparams; p++) {
