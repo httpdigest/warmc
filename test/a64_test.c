@@ -593,6 +593,9 @@ int main(int argc, char **argv) {
   CASE("ushl v3.8h, v4.8h, v5.8h", a64_vushl_reg(b, 1, 3, 4, 5));
   CASE("ushl v6.4s, v7.4s, v8.4s", a64_vushl_reg(b, 2, 6, 7, 8));
   CASE("ushl v9.2d, v10.2d, v11.2d", a64_vushl_reg(b, 3, 9, 10, 11));
+  CASE("uqshl v0.16b, v1.16b, v2.16b", a64_vuqshl_reg(b, 0, 0, 1, 2));
+  CASE("uqshl v3.8h, v4.8h, v5.8h", a64_vuqshl_reg(b, 1, 3, 4, 5));
+  CASE("uqshl v30.4s, v29.4s, v31.4s", a64_vuqshl_reg(b, 2, 30, 29, 31));
   CASE("sshl v12.16b, v13.16b, v14.16b", a64_vsshl_reg(b, 0, 12, 13, 14));
   CASE("sshl v15.8h, v16.8h, v17.8h", a64_vsshl_reg(b, 1, 15, 16, 17));
   CASE("sshl v18.4s, v19.4s, v20.4s", a64_vsshl_reg(b, 2, 18, 19, 20));

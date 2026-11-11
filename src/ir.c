@@ -1506,6 +1506,10 @@ bool ir_addr_index_disp(void) {
   return g_target->is_x64;
 }
 
+bool ir_vec_shl_sat(void) {
+  return g_target->vec_shl_sat;
+}
+
 bool ir_vec_mul_one(uint32_t lane) {
   return !VLANE_IS_FLOAT(lane) && ((g_target->vec_mul_lanes >> VLANE_SIZE(lane)) & 1);
 }
@@ -1973,6 +1977,7 @@ bool ir_has_no_effect(const Inst *in) {
     case I_VNOT: case I_VANDNOT:
     case I_VNEG: case I_VABS: case I_VPOPCNT: case I_VREV:
     case I_VADDSATS: case I_VADDSATU: case I_VSUBSATS: case I_VSUBSATU:
+    case I_VSHLSATU:
     case I_VAVGRU: case I_VQ15MULR: case I_VDOT:
     case I_VEXTADD: case I_VEXTMUL: case I_VEXTEND: case I_VNARROW:
     case I_VEXTMLA: case I_VADDHN:
@@ -2117,7 +2122,7 @@ const char *ir_op_name(uint16_t op) {
     N(I_VNEG, "vneg"), N(I_VABS, "vabs"), N(I_VPOPCNT, "vpopcnt"),
     N(I_VREV, "vrev"),
     N(I_VADDSATS, "vaddsats"), N(I_VADDSATU, "vaddsatu"),
-    N(I_VSUBSATS, "vsubsats"), N(I_VSUBSATU, "vsubsatu"),
+    N(I_VSUBSATS, "vsubsats"), N(I_VSUBSATU, "vsubsatu"), N(I_VSHLSATU, "vshlsatu"),
     N(I_VAVGRU, "vavgru"), N(I_VQ15MULR, "vq15mulr"), N(I_VDOT, "vdot"),
     N(I_VEXTADD, "vextadd"), N(I_VEXTMUL, "vextmul"),
     N(I_VEXTEND, "vextend"), N(I_VNARROW, "vnarrow"),
@@ -2241,6 +2246,7 @@ static uint32_t ir_vec_arity(uint16_t op) {
     case I_VFMIN: case I_VFMAX:
     case I_VANDNOT:
     case I_VADDSATS: case I_VADDSATU: case I_VSUBSATS: case I_VSUBSATU:
+    case I_VSHLSATU:
     case I_VAVGRU: case I_VQ15MULR: case I_VDOT:
     case I_VEXTMUL: case I_VNARROW:
     case I_VSHLV: case I_VSHRUV: case I_VSHRSV:

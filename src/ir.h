@@ -91,6 +91,9 @@ typedef enum {
      vectoriser makes -- wasm has no instruction for it */
   I_VREV,
   I_VADDSATS, I_VADDSATU, I_VSUBSATS, I_VSUBSATU,
+  /* a lane shifted left by the amount in the other vector's lane, stuck at
+     the lane's top where a bit would be lost (a64 uqshl; ir_vec_shl_sat) */
+  I_VSHLSATU,
   I_VAVGRU,
   I_VQ15MULR,
   I_VDOT,
@@ -558,6 +561,9 @@ bool ir_wrap_alias(void);
 bool ir_has_bitrev(void);
 bool ir_addr_index_disp(void);
 bool ir_vec_mul_one(uint32_t lane);
+/* whether the target has I_VSHLSATU: a left shift of lanes by lanes that
+   saturates (a64) */
+bool ir_vec_shl_sat(void);
 
 bool ir_imm_ok(IrFunc *f, Ref user, uint32_t idx, uint64_t cval, ValType ct);
 /* whether reference x is no null where instruction pos of block bi runs

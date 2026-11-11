@@ -5399,4 +5399,5 @@ const Target warmc_target_a64 = {
   .max_frame = 32000,
   .vec_copies = 4,
   .vec_mul_lanes = 0x7,    /* mul of 8, 16 and 32-bit lanes */
+  .vec_shl_sat = true,     /* uqshl */
 };

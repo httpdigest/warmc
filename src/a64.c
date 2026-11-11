@@ -725,6 +725,9 @@ void a64_vsshr_imm(Buf *b, int size, int rd, int rn, int shift) {
 
 void a64_vushl_reg(Buf *b, int size, int rd, int rn, int rm) { V3(0x6E204400u | VSZ(size), rd, rn, rm); }
 void a64_vsshl_reg(Buf *b, int size, int rd, int rn, int rm) { V3(0x4E204400u | VSZ(size), rd, rn, rm); }
+/* uqshl: each lane of rn shifted left by the low byte of rm's lane, the
+   lane's top where a bit would be lost */
+void a64_vuqshl_reg(Buf *b, int size, int rd, int rn, int rm) { V3(0x6E204C00u | VSZ(size), rd, rn, rm); }
 
 static uint32_t lane_imm5(int size, int index) {
   return (uint32_t)(((index) << (size + 1)) | (1 << size)) & 0x1fu;

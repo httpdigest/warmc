@@ -258,6 +258,7 @@ void a64_vsli_imm(Buf *b, int size, int rd, int rn, int shift);
 void a64_vsshr_imm(Buf *b, int size, int rd, int rn, int shift);
 
 void a64_vushl_reg(Buf *b, int size, int rd, int rn, int rm);
+void a64_vuqshl_reg(Buf *b, int size, int rd, int rn, int rm);
 void a64_vsshl_reg(Buf *b, int size, int rd, int rn, int rm);
 void a64_vdup_gpr(Buf *b, int size, int rd, int rn);
 void a64_vdup_lane(Buf *b, int size, int rd, int rn, int index);

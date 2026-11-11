@@ -102,6 +102,9 @@ typedef struct Target {
   // The integer lane sizes (bit n for VLANE_SIZE n) where a vector multiply
   // is one instruction, no dearer than the shift and add it can stand for.
   uint8_t vec_mul_lanes;
+  // Whether a vector shifts its lanes left by another's and saturates, in
+  // one instruction (I_VSHLSATU).
+  bool vec_shl_sat;
 } Target;
 
 extern const Target warmc_target_a64;

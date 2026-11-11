@@ -1526,6 +1526,7 @@ static void emit_inst(Isel *s, Ref v) {
     case I_VFADD: case I_VFSUB: case I_VFMUL: case I_VFDIV:
     case I_VFMIN: case I_VFMAX:
     case I_VADDSATS: case I_VADDSATU: case I_VSUBSATS: case I_VSUBSATU:
+    case I_VSHLSATU:
     case I_VAVGRU: case I_VQ15MULR: case I_VEXTMUL: case I_VSWIZZLE: {
 
       if (in->op == I_VMUL && in->imm2 == VLANE_I64) {
@@ -1648,6 +1649,7 @@ static void emit_inst(Isel *s, Ref v) {
         case I_VADDSATU: a64_vuqadd(B, sz, d, x, y); break;
         case I_VSUBSATS: a64_vsqsub(B, sz, d, x, y); break;
         case I_VSUBSATU: a64_vuqsub(B, sz, d, x, y); break;
+        case I_VSHLSATU: a64_vuqshl_reg(B, sz, d, x, y); break;
         case I_VAVGRU:   a64_vurhadd(B, sz, d, x, y); break;
         case I_VQ15MULR: a64_vsqrdmulh(B, sz, d, x, y); break;
 
@@ -1742,14 +1744,18 @@ static void emit_inst(Isel *s, Ref v) {
     case I_VNARROW: {
       int x = rd(s, a[0], F0), y = rd(s, a[1], F1);
       int sz = VLANE_SIZE(in->imm2);
+      /* the low half is written first: into the result's own register,
+         unless that is the one the high half is read from */
+      int d = wr(s, v, F2);
+      int t = d == y ? FTMP : d;
       if (in->imm & 1) {
-        a64_vsqxtn(B, 0, sz, FTMP, x);
-        a64_vsqxtn(B, 1, sz, FTMP, y);
+        a64_vsqxtn(B, 0, sz, t, x);
+        a64_vsqxtn(B, 1, sz, t, y);
       } else {
-        a64_vsqxtun(B, 0, sz, FTMP, x);
-        a64_vsqxtun(B, 1, sz, FTMP, y);
+        a64_vsqxtun(B, 0, sz, t, x);
+        a64_vsqxtun(B, 1, sz, t, y);
       }
-      commit(s, v, FTMP);
+      commit(s, v, t);
       break;
     }
 
