@@ -173,8 +173,13 @@ def compare(ref_path, binary, label, run=None, timeout=None, prefix=()):
             argv.append(n)
         p = subprocess.Popen(run + [binary] + list(prefix) + argv,
                              stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        # (the limit is of CPU, as a compile's is: a launch that only waits
+        # its turn beside every other row of the check is not one that hangs
+        # -- vector.wat's, whose code the JIT makes in the launch itself, went
+        # past thirty seconds of the clock in one run of the check in two
+        # and took four alone)
         try:
-            out, err = p.communicate(timeout=timeout)
+            out, err = hostbuild.communicate_limited(p, timeout)
         except subprocess.TimeoutExpired:
             where = hostbuild.stack_of(p.pid, binary + ".sample.txt")
             p.kill()
