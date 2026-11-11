@@ -406,7 +406,8 @@ def selftest_buildcache(d):
             got = f.read()
         if got != want:
             bad.append("go build . through the shim gave %r where the package is %r" % (got, want))
-        if not os.stat(out).st_mode & stat.S_IXUSR:
+        # (Windows keeps no such bit: a file is a program there by its name)
+        if os.name != "nt" and not os.stat(out).st_mode & stat.S_IXUSR:
             bad.append("go build . through the shim gave a program that does not run")
     return bad
 
