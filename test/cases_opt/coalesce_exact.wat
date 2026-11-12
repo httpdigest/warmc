@@ -4,11 +4,11 @@
 ;; exit, laid out after the loop, so its interval spans j + 1's definition,
 ;; where it is dead: the two share a register and the loop's back edge is
 ;; its b.lt, no block of a move and a b.  Only on a back edge: sw's switch
-;; cases each end in a move to the state the loop goes on with.  And only
-;; for a step short beside the parameter's span: early's j + 1, made at the
-;; top of the loop and read through the rest, keeps its move, as it does in
-;; early2, where the exit's tail before it reads j makes j's span a little
-;; over twice the step's.  Live at
+;; cases each end in a move to the state the loop goes on with.  However
+;; long the step lives beside the parameter: early's j + 1, made at the top
+;; of the loop and read through the rest, is in j's register too, as it is
+;; in early2, where the exit's tail before it reads j makes j's span a
+;; little over twice the step's.  Live at
 ;; once, so kept apart: in after, j read by the exit past j + 1's
 ;; definition; in from, a counter and its first value, read in the loop,
 ;; and in reset, a value read in the loop that the back edge hands the
@@ -23,8 +23,8 @@
 ;; flags: -O2 -fno-rotate -fno-unroll
 ;; shape: count \sb\.lt\s=1
 ;; shape: sw \smov\sx\d+, x\d+=4
-;; shape: early \smov\sx\d+, x\d+=1
-;; shape: early2 \smov\sx\d+, x\d+=1
+;; shape: early \smov\sx\d+, x\d+=0
+;; shape: early2 \smov\sx\d+, x\d+=0
 ;;
 ;; run: count 1 0 100 => i32:0
 ;; run: count 2 0 100 => i32:2

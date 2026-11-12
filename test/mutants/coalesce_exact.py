@@ -23,9 +23,6 @@ M = {
  'uses': m('      if (la->eu[j] == x) return true;\n  }', '      if (0) return true;\n  }'),
  'before': m('    if (la->num[r] <= p) continue;', '    if (la->num[r] < p) continue;'),
  'fwd': m('          if (by_exact && (!exact || sb->rpo < b->rpo ||', '          if (by_exact && (!exact ||'),
- 'length': m('  if (4 * (int64_t)(ea - sa) > (int64_t)(eb - sb)) return true;\n', ''),
- 'length4': m('  if (4 * (int64_t)(ea - sa) > (int64_t)(eb - sb)) return true;',
-              '  if (2 * (int64_t)(ea - sa) > (int64_t)(eb - sb)) return true;'),
  'pairs': m('#define LA_PAIRS 16', '#define LA_PAIRS 0'),
 }
 EQUIVALENT = {

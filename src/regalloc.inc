@@ -2261,27 +2261,21 @@ static bool live_after(LiveAfter *la, Ref x, uint32_t bi, int32_t p) {
    position to its last, so a loop counter read on a cold exit laid out
    after the loop spans its successor's definition, though it is dead
    there, and the back edge kept a move of its own.  Webs of more than a
-   few values, and functions past the budget, keep the interval's answer. */
+   few values, and functions past the budget, keep the interval's answer.
+   However long either web is beside the other: a scanner's place in its
+   input, one web through the loops that each step it and hand it on, is
+   one register in all of them (cbench/lexer), and two long webs that are
+   one are one to find a register for, not two (zigbench/arraylist kept
+   two of its loop's counts in the frame, 0.885 the instructions with them
+   in registers). */
 #define LA_PAIRS 16
 static bool web_interferes(LiveAfter *la, const Interval *iv, uint32_t a, uint32_t b,
                            const uint32_t *next) {
   IrFunc *f = la->s->f;
   uint32_t na = 0, nb = 0;
-  int32_t sa = INT32_MAX, ea = -1, sb = INT32_MAX, eb = -1;
-  for (uint32_t x = a; x != UINT32_MAX; x = next[x]) {
-    na++;
-    if (iv[x].start < sa) sa = iv[x].start;
-    if (iv[x].end > ea) ea = iv[x].end;
-  }
-  for (uint32_t y = b; y != UINT32_MAX; y = next[y]) {
-    nb++;
-    if (iv[y].start < sb) sb = iv[y].start;
-    if (iv[y].end > eb) eb = iv[y].end;
-  }
+  for (uint32_t x = a; x != UINT32_MAX; x = next[x]) na++;
+  for (uint32_t y = b; y != UINT32_MAX; y = next[y]) nb++;
   if (na * nb > LA_PAIRS || la->budget > 4 * (uint64_t)f->ninsts + 4096) return true;
-  /* only for an argument's web, a, short beside the parameter's, b: a
-     quarter of its span at most, as a counter's step is */
-  if (4 * (int64_t)(ea - sa) > (int64_t)(eb - sb)) return true;
 
   for (uint32_t x = a; x != UINT32_MAX; x = next[x])
     for (uint32_t y = b; y != UINT32_MAX; y = next[y])

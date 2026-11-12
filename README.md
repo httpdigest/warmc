@@ -110,9 +110,11 @@ Hello world!
   - a linear-scan register allocator that runs under several spill rules and
     keeps the cheapest, with rematerialisation, a second-chance pass and
     live-range splitting at loop boundaries; a loop parameter shares its
-    register with the step its back edge hands it wherever the two are never
+    register with the value its back edge hands it wherever the two are never
     live at once, though a value read on an exit laid out after the loop
-    makes their intervals overlap, so the back edge carries no move -- but
+    makes their intervals overlap, and however long either lives beside the
+    other, so the back edge carries no move and a scanner's place in its
+    input is one register through every loop that steps it -- but
     not a `bfi` that inserts the parameter's own field, `hw << 8 & 0xff00
     | c`, which in the parameter's register would be made through a
     scratch register and copies on the chain the loop carries
