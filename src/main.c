@@ -369,7 +369,7 @@ static void print_stats(void) {
           " unr_rej_body=%llu unr_rej_exit=%llu unr_rej_trip=%llu"
           " unr_rej_escape=%llu unr_addr_folded=%llu gc_nullchk=%llu bce_ranges=%llu bce_smeared=%llu bce_versioned=%llu gc_loads_pre=%llu gc_elems_reused=%llu fields_promoted=%llu\n"
           "             slot_tests=%llu slot_nullchks=%llu slot_brs=%llu br_flags=%llu ra_cpriced=%llu ra_cnone=%llu rare_csa=%llu test_chains=%llu arr_bias_args=%llu arr_biased=%llu branch_decided=%llu ra_cs_spared=%llu min_cmps=%llu once_dead=%llu once_dominated=%llu once_looped=%llu\n"
-          "             bit_tests=%llu way_folds=%llu way_selects=%llu bit_brs=%llu exit_defers=%llu stubs_out=%llu latch_hoists=%llu latch_both=%llu blocks_merged=%llu\n"
+          "             bit_tests=%llu way_folds=%llu way_selects=%llu way_select_made=%llu bit_brs=%llu exit_defers=%llu stubs_out=%llu latch_hoists=%llu latch_both=%llu blocks_merged=%llu\n"
           "             hot_tails=%llu hot_tail_pres=%llu cmps_sunk=%llu cmp_edge_consts=%llu\n"
           "             bound_lens=%llu bound_lens_hoisted=%llu bce_version_sym=%llu gc_nonnull_params=%llu slot_nonnull=%llu gc_nulltraps=%llu\n"
           "             ra2_reloads=%llu ra2_spills=%llu ra2_remats=%llu ra2_params=%llu ra2_fallback=%llu ra2_csa_hot=%llu ra2_callsplits=%llu ra2_whole=%llu ra2_tried=%llu ra2_picked=%llu ra2_recolored=%llu\n",
@@ -501,6 +501,7 @@ static void print_stats(void) {
           (unsigned long long)g_stats.once_looped,
           (unsigned long long)g_stats.bit_tests,
           (unsigned long long)g_stats.way_folds, (unsigned long long)g_stats.way_selects,
+          (unsigned long long)g_stats.way_select_made,
           (unsigned long long)g_stats.bit_brs,
           (unsigned long long)g_stats.exit_defers,
           (unsigned long long)g_stats.stubs_out,

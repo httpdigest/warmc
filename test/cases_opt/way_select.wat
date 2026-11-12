@@ -25,10 +25,20 @@
 ;;   agree     both ways find the byte not zero: the operand
 ;;   ways8     eight ways in, as many as are looked at
 ;;   ways9     nine: the select stays
+;;   made      what one way picks is made in the select's block for it
+;;             alone, of a value from above and a constant: made on that
+;;             way
+;;   madeboth  what each picks is
+;;   made2     read once more beside the select: it stays, and the select
+;;   madein    made of a byte the block loads: it stays
+;;   mademul   a multiplication: it stays
 ;;   ehconst   a way in ends in a call a handler stands behind: the
 ;;             constant it picks is made ahead of that call
+;;   ehmade    and what it picks, made in the select's block, is too
+;;   ehresult  what one way picks is made of a call's result: on the way
+;;             that begins after the call
 ;;
-;; stats -O2: way_selects=10
+;; stats -O2: way_selects=14 way_select_made=5
 ;; stats -O2 -fno-fold: way_selects=0
 ;; shape: find \scs(el|inv|inc|neg)\s=0
 ;; shape: three \scs(el|inv|inc|neg)\s=0
@@ -44,7 +54,14 @@
 ;; shape: agree \scs(el|inv|inc|neg)\s=0
 ;; shape: ways8 \scs(el|inv|inc|neg)\s=0
 ;; shape: ways9 \scs(el|inv|inc|neg)\s=1
+;; shape: made \scs(el|inv|inc|neg)\s=0
+;; shape: madeboth \scs(el|inv|inc|neg)\s=0
+;; shape: made2 \scs(el|inv|inc|neg)\s=1
+;; shape: madein \scs(el|inv|inc|neg)\s=1
+;; shape: mademul \scs(el|inv|inc|neg)\s=1
 ;; shape: ehconst \scs(el|inv|inc|neg)\s=0
+;; shape: ehmade \scs(el|inv|inc|neg)\s=0
+;; shape: ehresult \scs(el|inv|inc|neg)\s=0
 ;;
 ;; run: find 0 3 => i32:2
 ;; run: find 0 200 => i32:3
@@ -121,20 +138,58 @@
 ;; run: ways9 10 1 => i32:4106
 ;; run: ways9 11 3 => i32:4107
 ;; run: ways9 12 8 => i32:4104
+;; run: made 0 3 => i32:102
+;; run: made 0 77 => i32:77
+;; run: made 2 5 => i32:105
+;; run: made 7 99 => i32:99
+;; run: made 10 4 => i32:112
+;; run: madeboth 0 3 => i32:16
+;; run: madeboth 0 77 => i32:4729
+;; run: madeboth 2 5 => i32:40
+;; run: madeboth 7 99 => i32:4695
+;; run: madeboth 10 4 => i32:96
+;; run: made2 0 3 => i32:1
+;; run: made2 0 77 => i32:231
+;; run: made2 2 5 => i32:4
+;; run: made2 7 99 => i32:594
+;; run: made2 10 4 => i32:81
+;; run: madein 0 3 => i32:250
+;; run: madein 0 77 => i32:77
+;; run: madein 2 5 => i32:50
+;; run: madein 7 99 => i32:99
+;; run: madein 10 4 => i32:56
+;; run: mademul 0 3 => i32:2000006
+;; run: mademul 0 77 => i32:77
+;; run: mademul 2 5 => i32:5000015
+;; run: mademul 7 99 => i32:99
+;; run: mademul 10 4 => i32:12000036
 ;; run: ehconst 0 5 => i32:5
 ;; run: ehconst 1 5 => i32:77
 ;; run: ehconst 3 5 => i32:-7
 ;; run: ehconst 2 2147483649 => i32:77
+;; run: ehmade 0 5 => i32:5
+;; run: ehmade 1 5 => i32:14
+;; run: ehmade 3 5 => i32:-7
+;; run: ehmade 2 2147483649 => i32:-2147483638
+;; run: ehresult 0 5 => i32:34
+;; run: ehresult 1 5 => i32:5
+;; run: ehresult 0 3 => i32:-7
+;; run: ehresult 1 3 => i32:-7
+;; run: ehresult 0 2147483649 => i32:-2147483634
 
 (module
   (type $t1 (func (param i32)))
+  (type $t2 (func (param i32) (result i32)))
   (memory 1)
-  (table 1 funcref)
-  (elem (i32.const 0) $thrower)
+  (table 2 funcref)
+  (elem (i32.const 0) $thrower $five)
   (tag $e)
   (data (i32.const 0) "\07\09\03\c8\01\05\00\0b\0d\00\ff\02\04\06\08\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\07\07\07\00\07\07\09\07\00\00\00\00\00\00\00\00\07\00\00\01\09\00\00\00\01\00\01\02\00\00\00\00")
-  ;; throws at 3; called through the table at an index read from memory, which keeps it out of line
+  (data (i32.const 221) "\01")
+  ;; throw at 3; called through the table at an index read from memory, which keeps them out of line
   (func $thrower (type $t1) (if (i32.eq (local.get 0) (i32.const 3)) (then (throw $e))))
+  (func $five (type $t2) (if (i32.eq (local.get 0) (i32.const 3)) (then (throw $e)))
+    (i32.mul (local.get 0) (i32.const 5)))
   (func $find (export "find") (param $p i32) (param $k i32) (result i32)
     (local $c i32)
     (block $out
@@ -290,6 +345,57 @@
         (local.set $p (i32.add (local.get $p) (i32.const 1)))
         (br $l)))
     (i32.xor (select (local.get $p) (local.get $a) (local.get $c)) (i32.const 0x1000)))
+  (func $made (export "made") (param $p i32) (param $k i32) (result i32)
+    (local $c i32)
+    (block $out
+      (loop $l
+        (local.set $c (i32.load8_u (local.get $p)))
+        (br_if $out (i32.eqz (local.get $c)))
+        (br_if $out (i32.eq (local.get $c) (local.get $k)))
+        (local.set $p (i32.add (local.get $p) (i32.const 1)))
+        (br $l)))
+    (select (i32.add (local.get $p) (i32.const 100)) (local.get $k) (local.get $c)))
+  (func $madeboth (export "madeboth") (param $p i32) (param $k i32) (result i32)
+    (local $c i32)
+    (block $out
+      (loop $l
+        (local.set $c (i32.load8_u (local.get $p)))
+        (br_if $out (i32.eqz (local.get $c)))
+        (br_if $out (i32.eq (local.get $c) (local.get $k)))
+        (local.set $p (i32.add (local.get $p) (i32.const 1)))
+        (br $l)))
+    (select (i32.shl (local.get $p) (i32.const 3)) (i32.xor (local.get $k) (i32.const 0x1234)) (local.get $c)))
+  (func $made2 (export "made2") (param $p i32) (param $k i32) (result i32)
+    (local $c i32) (local $x i32)
+    (block $out
+      (loop $l
+        (local.set $c (i32.load8_u (local.get $p)))
+        (br_if $out (i32.eqz (local.get $c)))
+        (br_if $out (i32.eq (local.get $c) (local.get $k)))
+        (local.set $p (i32.add (local.get $p) (i32.const 1)))
+        (br $l)))
+    (local.set $x (i32.sub (local.get $p) (i32.const 3)))
+    (i32.mul (select (local.get $x) (local.get $k) (local.get $c)) (local.get $x)))
+  (func $madein (export "madein") (param $p i32) (param $k i32) (result i32)
+    (local $c i32)
+    (block $out
+      (loop $l
+        (local.set $c (i32.load8_u (local.get $p)))
+        (br_if $out (i32.eqz (local.get $c)))
+        (br_if $out (i32.eq (local.get $c) (local.get $k)))
+        (local.set $p (i32.add (local.get $p) (i32.const 1)))
+        (br $l)))
+    (select (i32.add (i32.load8_u offset=1 (local.get $p)) (i32.const 50)) (local.get $k) (local.get $c)))
+  (func $mademul (export "mademul") (param $p i32) (param $k i32) (result i32)
+    (local $c i32)
+    (block $out
+      (loop $l
+        (local.set $c (i32.load8_u (local.get $p)))
+        (br_if $out (i32.eqz (local.get $c)))
+        (br_if $out (i32.eq (local.get $c) (local.get $k)))
+        (local.set $p (i32.add (local.get $p) (i32.const 1)))
+        (br $l)))
+    (select (i32.mul (local.get $p) (i32.const 1000003)) (local.get $k) (local.get $c)))
   (func $ehconst (export "ehconst") (param $c i32) (param $a i32) (result i32)
     (block $h
       (try_table (catch_all $h)
@@ -297,5 +403,21 @@
           (then (call_indirect (type $t1) (local.get $c) (i32.load8_u (i32.const 220))))
           (else (i32.store8 (i32.const 230) (local.get $a))))
         (return (select (i32.const 77) (local.get $a) (local.get $c)))))
+    (i32.const -7))
+  (func $ehmade (export "ehmade") (param $c i32) (param $a i32) (result i32)
+    (block $h
+      (try_table (catch_all $h)
+        (if (local.get $c)
+          (then (call_indirect (type $t1) (local.get $c) (i32.load8_u (i32.const 220))))
+          (else (i32.store8 (i32.const 230) (local.get $a))))
+        (return (select (i32.add (local.get $a) (i32.const 9)) (local.get $a) (local.get $c)))))
+    (i32.const -7))
+  (func $ehresult (export "ehresult") (param $c i32) (param $a i32) (result i32)
+    (local $r i32)
+    (block $h
+      (try_table (catch_all $h)
+        (local.set $r (call_indirect (type $t2) (local.get $a) (i32.load8_u (i32.const 221))))
+        (if (local.get $c) (then (i32.store8 (i32.const 231) (local.get $a))))
+        (return (select (local.get $a) (i32.add (local.get $r) (i32.const 9)) (local.get $c)))))
     (i32.const -7))
 )

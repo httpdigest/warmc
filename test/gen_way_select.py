@@ -283,8 +283,86 @@ def ways(n):
     return name, wat, model
 
 
+SCAN = """  (func $%(n)s (export "%(n)s") (param $p i32) (param $k i32) (result i32)
+    (local $c i32)%(lo)s
+    (block $out
+      (loop $l
+        (local.set $c (i32.load8_u (local.get $p)))
+        (br_if $out (i32.eqz (local.get $c)))
+        (br_if $out (i32.eq (local.get $c) (local.get $k)))
+        (local.set $p (i32.add (local.get $p) (i32.const 1)))
+        (br $l)))
+    %(tail)s)
+"""
+
+
+def scan_end(p, k):
+    """where the scan ends, and whether at the byte looked for"""
+    while True:
+        c = MEM[p]
+        if c == 0 or c == k:
+            return p, c != 0
+        p += 1
+
+
+# What the select picks is made in its block for it alone, of a value from
+# above and a constant: made on the way that picks it (gobench/unicode's
+# search of a range table, `lo = mid + 1` picked by a test the branch before
+# has made).
+MADE = SCAN % dict(n="made", lo="", tail="(select (i32.add (local.get $p) (i32.const 100)) (local.get $k) (local.get $c))")
+
+
+def made(p, k):
+    q, hit = scan_end(p, k)
+    return q + 100 if hit else k
+
+
+# Both operands are.
+MADEBOTH = SCAN % dict(n="madeboth", lo="", tail="(select (i32.shl (local.get $p) (i32.const 3)) "
+                       "(i32.xor (local.get $k) (i32.const 0x1234)) (local.get $c))")
+
+
+def madeboth(p, k):
+    q, hit = scan_end(p, k)
+    return q << 3 if hit else k ^ 0x1234
+
+
+# Read once more beside the select: it stays in the block, and the select with it.
+MADE2 = SCAN % dict(n="made2", lo=" (local $x i32)",
+                    tail="(local.set $x (i32.sub (local.get $p) (i32.const 3)))\n    "
+                         "(i32.mul (select (local.get $x) (local.get $k) (local.get $c)) (local.get $x))")
+
+
+def made2(p, k):
+    q, hit = scan_end(p, k)
+    return ((q - 3 if hit else k) * (q - 3)) & M32
+
+
+# Made of a value the block itself loads: not there on the ways in.
+MADEIN = SCAN % dict(n="madein", lo="",
+                     tail="(select (i32.add (i32.load8_u offset=1 (local.get $p)) (i32.const 50)) "
+                          "(local.get $k) (local.get $c))")
+
+
+def madein(p, k):
+    q, hit = scan_end(p, k)
+    return MEM[q + 1] + 50 if hit else k
+
+
+# A multiplication is not made on a way that may not want it.
+MADEMUL = SCAN % dict(n="mademul", lo="",
+                      tail="(select (i32.mul (local.get $p) (i32.const 1000003)) (local.get $k) (local.get $c))")
+
+
+def mademul(p, k):
+    q, hit = scan_end(p, k)
+    return (q * 1000003) & M32 if hit else k
+
+
 # A way in ends in a call a handler stands behind: the constant that way
-# picks is made ahead of the call, which stays its block's last.
+# picks is made ahead of the call, which stays its block's last, and so is
+# an operand made in the select's block; one made of a call's result is made
+# on the way that begins after that call.
 EHWAY = """  (func $%(n)s (export "%(n)s") (param $c i32) (param $a i32) (result i32)
     (block $h
       (try_table (catch_all $h)
@@ -295,10 +373,30 @@ EHWAY = """  (func $%(n)s (export "%(n)s") (param $c i32) (param $a i32) (result
     (i32.const -7))
 """
 EHCONST = EHWAY % dict(n="ehconst", pick="(i32.const 77)")
+EHMADE = EHWAY % dict(n="ehmade", pick="(i32.add (local.get $a) (i32.const 9))")
+
+
+EHRESULT = """  (func $ehresult (export "ehresult") (param $c i32) (param $a i32) (result i32)
+    (local $r i32)
+    (block $h
+      (try_table (catch_all $h)
+        (local.set $r (call_indirect (type $t2) (local.get $a) (i32.load8_u (i32.const 221))))
+        (if (local.get $c) (then (i32.store8 (i32.const 231) (local.get $a))))
+        (return (select (local.get $a) (i32.add (local.get $r) (i32.const 9)) (local.get $c)))))
+    (i32.const -7))
+"""
+
+
+def ehresult(c, a):
+    return -7 if a == 3 else a if c else (a * 5 + 9) & M32
 
 
 def ehconst(c, a):
     return -7 if c == 3 else 77 if c else a
+
+
+def ehmade(c, a):
+    return -7 if c == 3 else a + 9 if c else a
 
 
 CSEL = r"\scs(el|inv|inc|neg)\s"
@@ -329,14 +427,26 @@ def main(path):
     add(n8, w8, m8, [(0, 77), (4, 5), (7, 9), (10, 1), (11, 3), (12, 8)], 0)
     n9, w9, m9 = ways(9)
     add(n9, w9, m9, [(0, 77), (4, 5), (7, 9), (10, 1), (11, 3), (12, 8)], 1)
+    scans = [(0, 3), (0, 77), (2, 5), (7, 99), (10, 4)]
+    add("made", MADE, made, scans, 0)
+    add("madeboth", MADEBOTH, madeboth, scans, 0)
+    add("made2", MADE2, made2, scans, 1)
+    add("madein", MADEIN, madein, scans, 1)
+    add("mademul", MADEMUL, mademul, scans, 1)
     add("ehconst", EHCONST, ehconst, [(0, 5), (1, 5), (3, 5), (2, 0x80000001)], 0)
+    add("ehmade", EHMADE, ehmade, [(0, 5), (1, 5), (3, 5), (2, 0x80000001)], 0)
+    add("ehresult", EHRESULT, ehresult, [(0, 5), (1, 5), (0, 3), (1, 3), (0, 0x80000001)], 0)
     data = "".join("\\%02x" % b for b in MEM)
     with open(path, "w") as f:
         f.write(HEAD + "\n".join(shapes) + "\n;;\n" + "\n".join(runs) +
-                "\n\n(module\n  (type $t1 (func (param i32)))\n  (memory 1)\n  (table 1 funcref)\n"
-                "  (elem (i32.const 0) $thrower)\n  (tag $e)\n  (data (i32.const 0) \"%s\")\n" % data +
-                "  ;; throws at 3; called through the table at an index read from memory, which keeps it out of line\n"
-                "  (func $thrower (type $t1) (if (i32.eq (local.get 0) (i32.const 3)) (then (throw $e))))\n" +
+                "\n\n(module\n  (type $t1 (func (param i32)))\n  (type $t2 (func (param i32) (result i32)))\n"
+                "  (memory 1)\n  (table 2 funcref)\n"
+                "  (elem (i32.const 0) $thrower $five)\n  (tag $e)\n  (data (i32.const 0) \"%s\")\n" % data +
+                "  (data (i32.const 221) \"\\01\")\n"
+                "  ;; throw at 3; called through the table at an index read from memory, which keeps them out of line\n"
+                "  (func $thrower (type $t1) (if (i32.eq (local.get 0) (i32.const 3)) (then (throw $e))))\n"
+                "  (func $five (type $t2) (if (i32.eq (local.get 0) (i32.const 3)) (then (throw $e)))\n"
+                "    (i32.mul (local.get 0) (i32.const 5)))\n" +
                 "".join(funcs) + ")\n")
     print("%s: %d functions, %d runs" % (path, len(funcs), len(runs)))
 
@@ -368,10 +478,20 @@ HEAD = """;; A select whose condition each way into its block decides is what th
 ;;   agree     both ways find the byte not zero: the operand
 ;;   ways8     eight ways in, as many as are looked at
 ;;   ways9     nine: the select stays
+;;   made      what one way picks is made in the select's block for it
+;;             alone, of a value from above and a constant: made on that
+;;             way
+;;   madeboth  what each picks is
+;;   made2     read once more beside the select: it stays, and the select
+;;   madein    made of a byte the block loads: it stays
+;;   mademul   a multiplication: it stays
 ;;   ehconst   a way in ends in a call a handler stands behind: the
 ;;             constant it picks is made ahead of that call
+;;   ehmade    and what it picks, made in the select's block, is too
+;;   ehresult  what one way picks is made of a call's result: on the way
+;;             that begins after the call
 ;;
-;; stats -O2: way_selects=10
+;; stats -O2: way_selects=14 way_select_made=5
 ;; stats -O2 -fno-fold: way_selects=0
 """
 

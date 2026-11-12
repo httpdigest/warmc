@@ -7374,6 +7374,27 @@ static uint32_t bf_def(IrFunc *f, Ref x, uint32_t bi, int d) {
 
 /* an integer instruction the ways into its block may decide: one
    fold_int_unop or fold_int_binop works out */
+/* Whether v, made in block bi, could as well be made at the end of a block
+   that leads into it: an integer operation that cannot trap, of values
+   made above bi and constants. */
+static bool bf_sel_made(IrFunc *f, Ref v, uint32_t bi) {
+  const Inst *in = &f->insts[v];
+  ValType t = (ValType)in->type;
+  if (in->nargs != 2 || (t != VT_I32 && t != VT_I64)) return false;
+  switch (in->op) {
+    case I_ADD: case I_SUB: case I_AND: case I_OR: case I_XOR:
+    case I_SHL: case I_SHRU: case I_SHRS:
+      break;
+    default:
+      return false;
+  }
+  for (uint32_t a = 0; a < 2; a++) {
+    const Inst *ai = &f->insts[ir_args(f, v)[a]];
+    if (ai->block == bi && ai->op != I_CONST) return false;
+  }
+  return true;
+}
+
 static bool bf_int_op(uint16_t op, uint32_t nargs) {
   if (nargs == 1)
     switch (op) {
@@ -7484,6 +7505,7 @@ static bool pass_bit_facts(IrFunc *f) {
     } BfSel;
     BfSel *sl = NULL;
     uint32_t nsl = 0, csl = 0;
+    uint32_t *wuses = NULL;
     bool sels = !warmc_getenv("WARMC_NO_WAY_SELECTS");
     KWay *kw = any ? xmalloc(sizeof *kw) : NULL;
     Ref lx = REF_NONE;
@@ -7537,8 +7559,21 @@ static bool pass_bit_facts(IrFunc *f) {
              parameter, where what the select picks is made above the block
              or is a constant, and so is there on every edge in. */
           d.param = differ;
-          for (int k = 0; k < 2 && differ; k++)
-            ok &= f->insts[sa[k]].block != bi || f->insts[sa[k]].op == I_CONST;
+          for (int k = 0; k < 2 && differ && ok; k++) {
+            if (f->insts[sa[k]].block != bi || f->insts[sa[k]].op == I_CONST) continue;
+            /* made in the block for the select alone, of values from above
+               it and constants: made on each way that picks it instead --
+               ahead of the call that ends the way, where a handler stands
+               behind that call, so of no result of it */
+            if (!wuses) wuses = count_uses(f);
+            ok = bf_sel_made(f, sa[k], bi) && wuses[sa[k]] == 1 && !warmc_getenv("WARMC_NO_WAY_SELECT_MADE");
+            for (uint32_t e = 0; e < d.ne && ok; e++) {
+              const Block *qb = &f->blocks[d.q[e]];
+              if (d.take[e] != k || !ir_block_has_eh(f, d.q[e]) || !qb->ninsts) continue;
+              Ref last = qb->insts[qb->ninsts - 1];
+              ok = ir_args(f, sa[k])[0] != last && ir_args(f, sa[k])[1] != last;
+            }
+          }
           if (!ok) continue;
           if (nsl == csl) { csl = csl ? csl * 2 : 8; sl = xrealloc(sl, csl * sizeof *sl); }
           sl[nsl++] = d;
@@ -7683,12 +7718,34 @@ static bool pass_bit_facts(IrFunc *f) {
         to = ir_add_param(f, d->bi, (ValType)in->type);
         for (uint32_t e = 0; e < d->ne; e++) {
           Ref g = arm[d->take[e]];
-          /* a constant of the block's own is one of each way's, made ahead
-             of the call that ends the way where a handler stands behind it */
-          if (f->insts[g].block == d->bi)
-            g = emit_at_end(f, d->q[e], I_CONST, (ValType)f->insts[g].type, NULL, 0, f->insts[g].imm);
+          /* a constant of the block's own is one of each way's, and so is
+             what the block made for the select */
+          if (f->insts[g].block == d->bi) {
+            const Inst *gi = &f->insts[g];
+            ValType gt = (ValType)gi->type;
+            if (gi->op == I_CONST) {
+              g = emit_at_end(f, d->q[e], I_CONST, gt, NULL, 0, gi->imm);
+            } else {
+              Ref ga[2];
+              uint32_t gn = gi->nargs;
+              uint16_t gop = gi->op;
+              uint64_t gimm = gi->imm, gimm2 = gi->imm2;
+              for (uint32_t a = 0; a < gn; a++) {
+                ga[a] = ir_args(f, g)[a];
+                if (f->insts[ga[a]].block == d->bi)
+                  ga[a] = emit_at_end(f, d->q[e], I_CONST, (ValType)f->insts[ga[a]].type, NULL, 0, f->insts[ga[a]].imm);
+              }
+              g = emit_at_end(f, d->q[e], (IrOp)gop, gt, ga, gn, gimm);
+              f->insts[g].imm2 = gimm2;
+            }
+          }
           edge_push_arg_at(f, d->q[e], d->s[e], g);
         }
+        for (int k = 0; k < 2; k++)
+          if (f->insts[arm[k]].block == d->bi && f->insts[arm[k]].op != I_CONST) {
+            ir_make_nop(&f->insts[arm[k]]);
+            g_stats.way_select_made++;
+          }
       }
       ir_replace(f, d->v, to);
       ir_make_nop(&f->insts[d->v]);
@@ -7696,6 +7753,7 @@ static bool pass_bit_facts(IrFunc *f) {
       changed = true;
     }
     xfree(sl);
+    xfree(wuses);
     xfree(fl);
     xfree(tested);
     xfree(bloom);

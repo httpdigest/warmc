@@ -909,7 +909,7 @@ typedef struct {
      pass_bit_facts), instructions the ways into their blocks decided made
      their operand or a constant, and branches on a sign, or on a bit
      through shifts and extensions, made tbz or tbnz (arm64 isel) */
-  uint64_t bit_tests, way_folds, bit_brs, way_selects;
+  uint64_t bit_tests, way_folds, bit_brs, way_selects, way_select_made;
   /* loop exits the final layout took from the loop's other way out (ir.c
      dfs_defer_exit) */
   uint64_t exit_defers;
