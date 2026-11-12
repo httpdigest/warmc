@@ -14,8 +14,8 @@ M = {
  'rule': m('    if (hotmode && (!hs_ok || !hs.tests)) {', '    if (hotmode && !hs_ok && 0) {'),
  'hot_from': m('      if (hot && !hot[pb]) continue;', '      if (0 && hot && !hot[pb]) continue;'),
  'hot_to': m('        if (hot && !hot[S]) continue;', '        if (0 && hot && !hot[S]) continue;'),
- 'hot_walk': m('      if (t >= nb || reach[t] || !ks_copyable(f, t) || (hot && !hot[t])) continue;',
-               '      if (t >= nb || reach[t] || !ks_copyable(f, t)) continue;'),
+ 'hot_walk': m('      if (can[t] != 1 || (hot && !hot[t])) continue;',
+              '      if (can[t] != 1) continue;'),
  # a branch on the value itself
  'self_key': m('    else if (self && ci->type == VT_I32 && !(ci->op >= I_EQ && ci->op <= I_GEU) && ci->op != I_CONST &&',
                '    else if (0 && self && ci->type == VT_I32 && !(ci->op >= I_EQ && ci->op <= I_GEU) && ci->op != I_CONST &&'),

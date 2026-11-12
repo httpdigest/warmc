@@ -10171,17 +10171,23 @@ static bool ks_copyable(IrFunc *f, uint32_t y) {
 
 /* The blocks the copy for x == k below S is made of, marked in keep[],
    and the way each test of x there goes, in way[]: false where it decides
-   too few tests or keeps too many instructions.  reach[], way[] and
-   stack[] are the function's length, reach[] cleared. */
+   too few tests or keeps too many instructions.  reach[], keep[], way[],
+   stack[] and seen[] are the function's length, reach[] and keep[] clear;
+   seen[] lists the *nseen blocks the walk marked in reach[], which are all
+   it looks at after and all the caller has to clear again -- a walk is of
+   a few blocks, and going through the function for each edge that tests a
+   value was most of the pass in a function of thousands of them. */
 static bool ks_region(IrFunc *f, uint32_t S, Ref x, uint64_t k, uint64_t mask,
                       uint8_t *reach, uint8_t *keep, uint32_t *way, uint32_t *stack,
+                      uint32_t *seen, uint32_t *nseen, const Ref *keyof, uint8_t *can,
                       uint32_t *ninsts, const KsCfg *kc) {
   const uint8_t *hot = kc->hot;
-  uint32_t nb = f->nblocks, sp = 0, decided = 0;
+  uint32_t nb = f->nblocks, sp = 0, decided = 0, ns = 0;
   /* the walk: the blocks reached, at most KS_COPY * 4 instructions of them */
   uint32_t walked = 0;
   reach[S] = 2;
   stack[sp++] = S;
+  seen[ns++] = S;
   bool ok = true;
   while (sp && ok) {
     uint32_t y = stack[--sp];
@@ -10189,7 +10195,7 @@ static bool ks_region(IrFunc *f, uint32_t S, Ref x, uint64_t k, uint64_t mask,
     walked += yb->ninsts + 1;
     if (walked > KS_COPY * 4) { ok = false; break; }
     uint32_t only = UINT32_MAX;
-    if (ks_key_of(f, y, kc->self) == x) {
+    if (keyof[y] == x) {
       only = ks_way(f, y, x, k, mask);
       if (only == UINT32_MAX) { ok = false; break; }
       decided++;
@@ -10199,19 +10205,24 @@ static bool ks_region(IrFunc *f, uint32_t S, Ref x, uint64_t k, uint64_t mask,
     for (uint32_t s = 0; s < yb->nsuccs; s++) {
       if (only != UINT32_MAX && s != only) continue;
       uint32_t t = yb->succs[s].target;
-      if (t >= nb || reach[t] || !ks_copyable(f, t) || (hot && !hot[t])) continue;
+      if (t >= nb || reach[t]) continue;
+      /* (whether a block can be copied, asked of it once a round) */
+      if (!can[t]) can[t] = ks_copyable(f, t) ? 1 : 2;
+      if (can[t] != 1 || (hot && !hot[t])) continue;
       reach[t] = 2;
       stack[sp++] = t;
+      seen[ns++] = t;
     }
   }
+  *nseen = ns;
   /* kept: the tests, and what the walk reached that goes on to one */
   bool changed = true;
-  for (uint32_t x2 = 0; x2 < nb; x2++) if (reach[x2] == 3) keep[x2] = 1;
+  for (uint32_t i = 0; i < ns; i++) if (reach[seen[i]] == 3) keep[seen[i]] = 1;
   while (changed) {
     changed = false;
-    for (uint32_t oi = f->norder; oi-- > 0;) {
-      uint32_t y = f->order[oi];
-      if (!reach[y] || keep[y]) continue;
+    for (uint32_t i = ns; i-- > 0;) {
+      uint32_t y = seen[i];
+      if (keep[y]) continue;
       const Block *yb = &f->blocks[y];
       for (uint32_t s = 0; s < yb->nsuccs; s++)
         if (keep[yb->succs[s].target] && reach[yb->succs[s].target]) {
@@ -10220,10 +10231,43 @@ static bool ks_region(IrFunc *f, uint32_t S, Ref x, uint64_t k, uint64_t mask,
     }
   }
   uint32_t n = 0;
-  for (uint32_t y = 0; y < nb; y++)
-    if (keep[y]) n += f->blocks[y].ninsts + f->blocks[y].nparams;
+  for (uint32_t i = 0; i < ns; i++)
+    if (keep[seen[i]]) n += f->blocks[seen[i]].ninsts + f->blocks[seen[i]].nparams;
   *ninsts = n;
   return ok && keep[S] && decided >= kc->decided && n <= kc->copy;
+}
+
+/* The walks of a round that came to nothing, by the block they start at
+   and the value and constant they are for: several edges enter one block
+   with one constant, the walk from it is the same walk whichever edge it
+   is for, and nothing changes between the walks of a round -- a quarter of
+   the 25,000 walks of javabench/recur's largest function. */
+typedef struct { uint32_t S; Ref x; uint64_t k; } KsWalk;
+typedef struct { KsWalk *v; uint32_t n, cap; } KsTried;   /* cap a power of two; an empty slot's x is REF_NONE */
+
+static uint32_t ks_tried_at(const KsTried *t, uint32_t S, Ref x, uint64_t k) {
+  uint32_t i = (S * 0x9e3779b1u ^ x * 0x85ebca6bu ^ (uint32_t)k * 0xc2b2ae35u ^ (uint32_t)(k >> 32)) & (t->cap - 1);
+  while (t->v[i].x != REF_NONE && !(t->v[i].S == S && t->v[i].x == x && t->v[i].k == k))
+    i = (i + 1) & (t->cap - 1);
+  return i;
+}
+
+static bool ks_tried_has(const KsTried *t, uint32_t S, Ref x, uint64_t k) {
+  return t->cap && t->v[ks_tried_at(t, S, x, k)].x != REF_NONE;
+}
+
+static void ks_tried_add(KsTried *t, uint32_t S, Ref x, uint64_t k) {
+  if (2 * (t->n + 1) > t->cap) {
+    KsTried g = { NULL, t->n, t->cap ? 2 * t->cap : 64 };
+    g.v = xmalloc(g.cap * sizeof(KsWalk));
+    for (uint32_t i = 0; i < g.cap; i++) g.v[i].x = REF_NONE;
+    for (uint32_t i = 0; i < t->cap; i++)
+      if (t->v[i].x != REF_NONE) g.v[ks_tried_at(&g, t->v[i].S, t->v[i].x, t->v[i].k)] = t->v[i];
+    xfree(t->v);
+    *t = g;
+  }
+  t->v[ks_tried_at(t, S, x, k)] = (KsWalk){ S, x, k };
+  t->n++;
 }
 
 static bool pass_key_split_m(IrFunc *f, bool hotmode) {
@@ -10259,21 +10303,27 @@ static bool pass_key_split_m(IrFunc *f, bool hotmode) {
     }
     if (hs_ok) hot = hs.hot;
     kc.hot = hot;
-    /* how many branches test each value */
+    /* how many branches test each value, and the value each block's does:
+       asked of a block once a round, where every walk below asked it again
+       of each block it came to, and whether the block can be copied */
     uint32_t *tests = xcalloc(ni0 ? ni0 : 1, sizeof(uint32_t));
+    Ref *keyof = xmalloc((nb0 ? nb0 : 1) * sizeof(Ref));
+    for (uint32_t x = 0; x < nb0; x++) keyof[x] = REF_NONE;
     for (uint32_t oi = 0; oi < f->norder; oi++) {
-      Ref x = ks_key_of(f, f->order[oi], kc.self);
+      Ref x = keyof[f->order[oi]] = ks_key_of(f, f->order[oi], kc.self);
       if (x != REF_NONE) tests[x]++;
     }
+    uint8_t *can = xcalloc(nb0 ? nb0 : 1, 1);
+    KsTried tried = {0};
     uint8_t *reach = xcalloc(nb0 ? nb0 : 1, 1), *keep = xcalloc(nb0 ? nb0 : 1, 1);
-    uint32_t *stack = xmalloc((nb0 ? nb0 : 1) * sizeof(uint32_t));
+    uint32_t *stack = xmalloc((nb0 ? nb0 : 1) * 2 * sizeof(uint32_t)), *seen = stack + (nb0 ? nb0 : 1);
     uint32_t *way = xmalloc((nb0 ? nb0 : 1) * sizeof(uint32_t));
     uint32_t P = UINT32_MAX, ps = 0, ncopy = 0;
     Ref key = REF_NONE;
     uint64_t kval = 0;
     for (uint32_t oi = 0; oi < f->norder && P == UINT32_MAX; oi++) {
       uint32_t pb = f->order[oi];
-      Ref x = ks_key_of(f, pb, kc.self);
+      Ref x = keyof[pb];
       if (x == REF_NONE || tests[x] < kc.tests) continue;
       /* (from the hot way: a rare way's own test, whose way comes back
          into a hot block where the tails left it one, is not the hot
@@ -10287,7 +10337,8 @@ static bool pass_key_split_m(IrFunc *f, bool hotmode) {
         if (hot && !hot[S]) continue;
         /* x made above S, a block that can be copied, and only one value
            of x on the way in */
-        if (!ks_copyable(f, S) || f->insts[x].block == S ||
+        if (!can[S]) can[S] = ks_copyable(f, S) ? 1 : 2;
+        if (can[S] != 1 || f->insts[x].block == S ||
             !dominates(f, f->insts[x].block, S))
           continue;
         /* nor where the switch sends many cases to S, each of which would
@@ -10299,17 +10350,19 @@ static bool pass_key_split_m(IrFunc *f, bool hotmode) {
         KSet kway;
         kt_way(f, pb, s, x, mask, &kway);
         if (kway.n != 1 || kway.lo[0] != kway.hi[0]) continue;
-        memset(reach, 0, nb0);
-        memset(keep, 0, nb0);
-        uint32_t n;
-        if (!ks_region(f, S, x, kway.lo[0], mask, reach, keep, way, stack, &n, &kc) ||
-            live + n > KS_GROW * base)
+        uint32_t n, nseen;
+        if (ks_tried_has(&tried, S, x, kway.lo[0])) continue;
+        if (!ks_region(f, S, x, kway.lo[0], mask, reach, keep, way, stack, seen, &nseen, keyof, can, &n, &kc) ||
+            live + n > KS_GROW * base) {
+          for (uint32_t i = 0; i < nseen; i++) reach[seen[i]] = keep[seen[i]] = 0;
+          ks_tried_add(&tried, S, x, kway.lo[0]);
           continue;
+        }
         P = pb; ps = s; key = x; kval = kway.lo[0]; ncopy = n;
         break;
       }
     }
-    xfree(tests); xfree(stack);
+    xfree(tests); xfree(stack); xfree(keyof); xfree(can); xfree(tried.v);
     if (hs_ok) hot_set_free(&hs);
     if (P == UINT32_MAX) { xfree(keep); xfree(reach); xfree(way); break; }
 
