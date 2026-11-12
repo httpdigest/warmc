@@ -708,6 +708,11 @@ static bool compile_parallel(Module *m, ObjBuilder *o, const OptOpts *opts,
   uint64_t largest = n ? cost[0] : 0;
   const char *be = warmc_getenv("WARMC_COMPILE_BUDGET");
   sched.budget = be ? (uint64_t)atoll(be) : 2 * largest;
+  /* and no less than 16 KB of bodies a worker: where the largest body is
+     small, twice its size bounds no memory worth the name, only how many
+     workers have work -- a Go module's largest function is 30 KB, and half
+     its workers waited (stdgo/json 435 ms to 290 for 20 MB more) */
+  if (!be && sched.budget < (uint64_t)nthreads * 16384) sched.budget = (uint64_t)nthreads * 16384;
   if (sched.budget < largest) sched.budget = largest;
   sched.small = sched.budget / 32;
   w.sched = &sched;
