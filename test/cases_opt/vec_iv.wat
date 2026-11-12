@@ -12,7 +12,7 @@
 ;; vector's and its copies'.  Made by test/gen_veciv.py.
 ;;
 ;; shape: rsum \sand\.16b\s=5
-;; shape: rsum \sadd\.4s\s=20
+;; shape: rsum \sadd\.4s\s=19
 ;; shape: rxor3 \smul\.4s\s=5
 ;; shape: rdown \sorr\.16b\s=5
 ;; shape: rsum64 \seor\.16b\s=5

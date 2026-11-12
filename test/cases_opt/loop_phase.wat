@@ -15,7 +15,9 @@
 ;; loop too big to be measured, which a phase could move anywhere -- and
 ;; none of the three is given one.  $rot's inner loop, fmodf's (see
 ;; loop_top.wat), starts at its latch, laid out above its header, and is
-;; the small loop its phase places.
+;; the small loop its phase places.  ($flat's c sums j: a second count of
+;; its trips, from 0 as j is, would be j itself -- lockstep.wat -- and the
+;; loop, an instruction shorter, would need no padding where it is.)
 ;;
 ;; stats -O2 a64: loop_phases=2
 ;;
@@ -32,7 +34,7 @@
 ;; run: scan 8 => i32:824
 ;; run: once 13 => i32:17
 ;; run: once 3 => i32:5
-;; run: flat 13 => i32:10
+;; run: flat 13 => i32:11
 ;; run: mixed 13 => i32:-892258946
 ;; run: mixed 3 => i32:-901180716
 ;; run: rot 1 => i32:2318
@@ -91,7 +93,7 @@
       (loop $skip
         (br_if $found (i32.load8_u (local.get $j)))
         (local.set $j (i32.add (local.get $j) (i32.const 1)))
-        (local.set $c (i32.add (local.get $c) (i32.const 1)))
+        (local.set $c (i32.add (local.get $c) (local.get $j)))
         (local.set $d (i32.xor (local.get $d) (local.get $j)))
         (br $skip)))
     (i32.add (i32.load8_u (local.get $j)) (i32.add (local.get $c) (local.get $d))))

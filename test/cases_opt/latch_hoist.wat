@@ -7,7 +7,10 @@
 ;; each call of its dispatch loop).  Not where a register the
 ;; moves write is one the way out keeps a value in: $kept's way out passes
 ;; p as it was on the way in, in the register of its result, which the way
-;; round's p + 1 would have overwritten.  A way out with moves of its own
+;; round's p + 1 would have overwritten (p + 1 is made first there, and p
+;; read after it: where the step is the last to read p, the way out reads
+;; the stepped value less the step, and p + 1 is made in p's register --
+;; lockstep.wat).  A way out with moves of its own
 ;; keeps them on its edge (latch_both): $both's way out moves m into the
 ;; register of the merge it shares with the test ahead of the loop, its way
 ;; round p + 1 into p's -- and $fout's a double, from the register d0 where
@@ -95,12 +98,13 @@
     (i32.add (i32.mul (local.get $s) (i32.const 100)) (local.get $p)))
   ;; the last p squared: the first whose sum passes n
   (func $kept (export "kept") (param $n i32) (result i32)
-    (local $p i32) (local $s i32) (local $o i32)
+    (local $p i32) (local $q i32) (local $s i32) (local $o i32)
     (block $out (result i32)
       (loop $l
         (local.set $o (local.get $p))
+        (local.set $q (i32.add (local.get $p) (i32.const 1)))
         (local.set $s (i32.add (local.get $s) (i32.mul (local.get $p) (local.get $p))))
-        (local.set $p (i32.add (local.get $p) (i32.const 1)))
+        (local.set $p (local.get $q))
         (drop (br_if $out (local.get $o) (i32.gt_u (local.get $s) (local.get $n))))
         (br $l))
       (unreachable)))
@@ -120,14 +124,15 @@
       (i32.load (i32.const 0))))
   ;; g(n ? kept(n) : 99, 7, m)
   (func $clash (export "clash") (param $n i32) (param $m i32) (result i32)
-    (local $p i32) (local $s i32) (local $o i32)
+    (local $p i32) (local $q i32) (local $s i32) (local $o i32)
     (call_indirect (type $t)
       (block $out (result i32)
         (drop (br_if $out (i32.const 99) (i32.eqz (local.get $n))))
         (loop $l
           (local.set $o (local.get $p))
+          (local.set $q (i32.add (local.get $p) (i32.const 1)))
           (local.set $s (i32.add (local.get $s) (i32.mul (local.get $p) (local.get $p))))
-          (local.set $p (i32.add (local.get $p) (i32.const 1)))
+          (local.set $p (local.get $q))
           (drop (br_if $out (local.get $o) (i32.gt_u (local.get $s) (local.get $n))))
           (br $l))
         (unreachable))

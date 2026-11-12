@@ -36,7 +36,8 @@ NS = [0, 1, 3, 4, 5, 15, 16, 17, 31, 63, 64, 65, 1000]
 
 # gobench/bigstruct's loop: (i & 3) + 14 summed, no memory, in four copies
 # and the loop of one after them; a second counter t counts along and is
-# read only after the loop, so its vector goes
+# read only after the loop, so its vector goes -- and t itself from the loop
+# of one, which both ways in hand i's value (opt.c pass_iv_lockstep)
 case('rsum', '(param $n i32) (result i32)', '(local $i i32) (local $s i32) (local $t i32)', '''
     (block $done
       (loop $l
@@ -47,7 +48,7 @@ case('rsum', '(param $n i32) (result i32)', '(local $i i32) (local $s i32) (loca
         (br $l)))
     (i32.add (local.get $s) (i32.mul (local.get $t) (i32.const 1000)))''',
      lambda n: sum((i & 3) + 14 for i in range(n)) + 1000 * n,
-     [(n,) for n in NS], [(r'\sand\.16b\s', 5), (r'\sadd\.4s\s', 20)])
+     [(n,) for n in NS], [(r'\sand\.16b\s', 5), (r'\sadd\.4s\s', 19)])
 
 # a counter stepping by 3 from 7, its product xor'd into the sum
 case('rxor3', '(param $n i32) (result i32)', '(local $i i32) (local $s i32)', '''

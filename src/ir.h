@@ -830,6 +830,10 @@ typedef struct {
   uint64_t cmp_reused;
   uint64_t csel_fused;
   uint64_t cincs;        /* adds of a compare made cinc on its flags */
+  /* counters that step together (opt.c pass_iv_lockstep): those taken out
+     of their loops, the ways out handed a stepped value, and the addresses
+     made of one */
+  uint64_t lockstep, lockstep_exits, lockstep_addrs;
   uint64_t die_ties;     /* results given the register of an operand that dies where they are made */
   uint64_t mull_folds;   /* 64-bit multiplies of extended 32-bit values made umull or smull */
   uint64_t mul_wide;     /* 64x64 multiplies in halves made mul, mulhu or mulhs */

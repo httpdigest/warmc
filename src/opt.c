@@ -21567,6 +21567,553 @@ static void use_index_free(UseIdx *x) {
   xfree(x->first); xfree(x->next); xfree(x->user); xfree(x->arg0); xfree(x->escapes);
 }
 
+/* ---- counters that step together ----------------------------------------
+
+   A loop's parameters that every way round hands their own value plus a
+   constant, the same constant for all of them, differ by what they differed
+   by when the loop was entered: one counts, and the others are it plus
+   that difference.  LLVM leaves wasm a scan with a pointer, an index and a
+   length each stepping by one; musl's and Rust's scanners are these, and
+   cbench/lexer's loop over an identifier carried three, an add and a move
+   back for each on every character.
+
+   One that the loop itself reads nothing of -- only its step reads it, and
+   what comes after the loop -- is taken out of the loop, and its readers
+   are handed the counter that stays plus the difference: an edge leaving
+   the loop in a block of the edge's own, a reader past the loop where it
+   reads.  That is for two that start a constant apart, or as one value, on
+   every way in: a difference that had to be worked out where the loop is
+   entered, and added on each way out, is two instructions a run of the
+   loop against one a time round, and the loops that carry such a pair go
+   round too few times for it (1500 of them over the benchmarks, taken out
+   so, left the instructions run where they were: 0.9999).
+
+   The counter that stays is read past its step as the stepped value less
+   the step, by the ways out below the step and the readers past the loop,
+   and an address made of the counter, another value and the step -- (x +
+   i) + 1 where i + 1 is the step -- reads the stepped value: with no
+   reader of the old value after its step, the step is made in the
+   counter's own register and no way round moves it.
+
+   One index of who reads what serves a run over all the loops; a loop
+   beside an edge a run has put a block on, or with a counter an address
+   was remade of, waits for the next run (WARMC_NO_LOCKSTEP=1; --stats
+   counts lockstep, the counters taken out, lockstep_exits, the readers
+   given a counter's stepped value for the counter, and lockstep_addrs, the
+   addresses). */
+#define LS_MAX 16
+#define LS_WAYS 8
+typedef struct {
+  Ref p, s;
+  uint32_t k;        /* which of the header's parameters */
+  uint64_t delta;    /* what a way round adds, in the type's bits */
+  ValType t;
+  uint32_t real;     /* reads in the loop besides the step's */
+  bool out;          /* read where it cannot be made again from another */
+  bool gone;
+} LsIv;
+
+/* By value, the blocks whose branch, return or edges read it. */
+typedef struct { uint32_t *first, *next, *blk; } LsEsc;
+
+static LsEsc ls_esc_index(IrFunc *f) {
+  LsEsc x;
+  uint32_t n = f->ninsts;
+  size_t tot = 0, k = 0;
+  for (uint32_t oi = 0; oi < f->norder; oi++) {
+    const Block *b = &f->blocks[f->order[oi]];
+    tot += 1 + b->nret;
+    for (uint32_t e = 0; e < b->nsuccs; e++) tot += b->succs[e].nargs;
+  }
+  x.first = xmalloc((n ? n : 1) * sizeof(uint32_t));
+  for (uint32_t v = 0; v < n; v++) x.first[v] = UINT32_MAX;
+  x.next = xmalloc((tot ? tot : 1) * sizeof(uint32_t));
+  x.blk = xmalloc((tot ? tot : 1) * sizeof(uint32_t));
+#define LS_READ(v) do { Ref v_ = (v);                                              \
+    if (v_ < n && (x.first[v_] == UINT32_MAX || x.blk[x.first[v_]] != bi)) {       \
+      x.blk[k] = bi; x.next[k] = x.first[v_]; x.first[v_] = (uint32_t)k; k++;      \
+    } } while (0)
+  for (uint32_t oi = 0; oi < f->norder; oi++) {
+    uint32_t bi = f->order[oi];
+    const Block *b = &f->blocks[bi];
+    if (b->term == T_BRIF || b->term == T_BRTABLE) LS_READ(b->term_arg);
+    for (uint32_t i = 0; i < b->nret; i++) LS_READ(b->ret_args[i]);
+    for (uint32_t e = 0; e < b->nsuccs; e++)
+      for (uint32_t j = 0; j < b->succs[e].nargs; j++) LS_READ(b->succs[e].args[j]);
+  }
+#undef LS_READ
+  return x;
+}
+
+static void ls_esc_free(LsEsc *x) { xfree(x->first); xfree(x->next); xfree(x->blk); }
+
+static uint64_t ls_mask(ValType t) { return t == VT_I64 ? ~0ull : 0xffffffffu; }
+
+/* base + k, made at the end of block b */
+static Ref ls_add(IrFunc *f, uint32_t b, ValType t, Ref base, uint64_t k) {
+  if (!k) return base;
+  Ref a[2] = { base, ir_emit(f, b, I_CONST, t, NULL, 0, k, 0) };
+  return ir_emit(f, b, I_ADD, t, a, 2, 0, 0);
+}
+
+/* base + k, made ahead of the instruction r */
+static Ref ls_add_before(IrFunc *f, Ref r, ValType t, Ref base, uint64_t k) {
+  if (!k) return base;
+  uint32_t b = f->insts[r].block, idx = 0;
+  while (f->blocks[b].insts[idx] != r) idx++;
+  Ref a[2] = { base, emit_before(f, b, &idx, I_CONST, t, NULL, 0, k) };
+  return emit_before(f, b, &idx, I_ADD, t, a, 2, 0);
+}
+
+/* Whether a is made before b runs: in a block above b's, or earlier in its own. */
+static bool ls_before(IrFunc *f, Ref a, Ref b) {
+  uint32_t ab = f->insts[a].block, bb = f->insts[b].block;
+  if (ab != bb) return dominates(f, ab, bb);
+  const Block *blk = &f->blocks[ab];
+  for (uint32_t i = 0; i < blk->ninsts; i++) {
+    if (blk->insts[i] == a) return true;
+    if (blk->insts[i] == b) return false;
+  }
+  return false;
+}
+
+/* a less b, in their type's bits, where that is one constant whichever
+   way the two were come by: one value, two constants, each of those plus
+   constants, or parameters of one block that every way in hands values
+   that far apart. */
+static bool ls_diff(IrFunc *f, Ref a, Ref b, int depth, uint64_t *k) {
+  uint64_t off = 0, c, ca, cb, mask = ls_mask((ValType)f->insts[a].type);
+  for (int side = 0; side < 2; side++) {
+    Ref *x = side ? &b : &a;
+    for (int i = 0; i < 4; i++) {
+      const Inst *in = &f->insts[*x];
+      if ((in->op != I_ADD && in->op != I_SUB) || !is_const(f, ir_args(f, *x)[1], &c)) break;
+      off += (in->op == I_ADD) != (side == 1) ? c : (uint64_t)0 - c;
+      *x = ir_args(f, *x)[0];
+    }
+  }
+  if (a == b) { *k = off & mask; return true; }
+  if (is_const(f, a, &ca) && is_const(f, b, &cb)) { *k = (off + ca - cb) & mask; return true; }
+  const Inst *ia = &f->insts[a], *ib = &f->insts[b];
+  if (!depth || ia->op != I_PARAM || ib->op != I_PARAM) return false;
+  const Block *m = &f->blocks[ia->block];
+  uint32_t pa = 0, pb = 0;
+  while (pa < m->nparams && m->params[pa] != a) pa++;
+  while (pb < m->nparams && m->params[pb] != b) pb++;
+  if (pa == m->nparams || pb == m->nparams || !m->npreds || m->npreds > LS_WAYS) return false;
+  uint64_t k0 = 0, kw;
+  for (uint32_t w = 0; w < m->npreds; w++) {
+    const Edge *e = iv_edge(f, m->preds[w], ia->block);
+    if (!e || e->nargs != m->nparams || !ls_diff(f, e->args[pa], e->args[pb], depth - 1, &kw)) return false;
+    if (w && kw != k0) return false;
+    k0 = kw;
+  }
+  *k = (off + k0) & mask;
+  return true;
+}
+
+/* What c starts as less what d starts as, the same constant on every way
+   into the loop. */
+static bool ls_apart(IrFunc *f, uint32_t hb, const uint32_t *ways, uint32_t nways,
+                     const LsIv *c, const LsIv *d, uint64_t *dk) {
+  for (uint32_t w = 0; w < nways; w++) {
+    const Edge *e = iv_edge(f, ways[w], hb);
+    uint64_t k;
+    if (!ls_diff(f, e->args[c->k], e->args[d->k], 2, &k)) return false;
+    if (w && k != *dk) return false;
+    *dk = k;
+  }
+  return true;
+}
+
+/* Whether block b, past the loop, is come to only by a way out that is
+   taken before the step is made: below a block whose one way in is from a
+   block of the loop that no run comes to from the step's (nor is it the
+   step's own, which is above all it leads to). */
+static bool ls_left_before(const IrFunc *f, const uint8_t *inloop, const uint8_t *after,
+                           uint32_t sb, uint32_t b) {
+  for (;;) {
+    uint32_t d = f->blocks[b].idom;
+    if (d == REF_NONE || d == b || b == f->entry) return false;
+    if (inloop[d]) {
+      const Block *t = &f->blocks[b];
+      return t->npreds == 1 && !after[d];
+    }
+    b = d;
+  }
+}
+
+/* A run over the loops; *again where one had to wait for the next. */
+static bool pass_iv_lockstep(IrFunc *f, bool *again) {
+  if (warmc_getenv("WARMC_NO_LOCKSTEP")) return false;
+  bool changed = false;
+  uint32_t nb0 = f->nblocks, ni0 = f->ninsts;
+  uint8_t *inloop = xcalloc(nb0 ? nb0 : 1, 1);
+  uint8_t *after = xcalloc(nb0 ? nb0 : 1, 1);
+  uint8_t *dirty = xcalloc(nb0 ? nb0 : 1, 1);
+  uint8_t *touched = NULL;
+  uint32_t *stack = xmalloc((nb0 ? nb0 : 1) * sizeof(uint32_t));
+  uint32_t *body = xmalloc((nb0 ? nb0 : 1) * sizeof(uint32_t));
+  uint32_t *seen = xmalloc((nb0 ? nb0 : 1) * sizeof(uint32_t));
+  uint32_t nbody = 0;
+  UseIdx ui;
+  LsEsc xi;
+  bool have = false;
+
+  for (uint32_t oi = 0; oi < f->norder; oi++) {
+    uint32_t hb = f->order[oi];
+    if (!f->blocks[hb].nparams || f->blocks[hb].is_pad) continue;
+    if (dirty[hb]) { *again = true; continue; }
+    uint32_t np = f->blocks[hb].nparams;
+
+    /* the ways in and the ways round */
+    uint32_t ways[LS_WAYS], nways = 0, nback = 0;
+    bool ok = true;
+    for (uint32_t p = 0; p < f->blocks[hb].npreds && ok; p++) {
+      uint32_t pb = f->blocks[hb].preds[p];
+      Edge *e = iv_edge(f, pb, hb);
+      if (!e || e->nargs != np || e->eh) ok = false;
+      else if (f->blocks[pb].rpo >= f->blocks[hb].rpo) nback++;
+      else if (nways == LS_WAYS) ok = false;
+      else ways[nways++] = pb;
+    }
+    if (!ok || !nways || !nback) continue;
+
+    for (uint32_t j = 0; j < nbody; j++) inloop[body[j]] = 0;
+    nbody = 0;
+    inloop[hb] = 1;
+    body[nbody++] = hb;
+    uint32_t sp = 0;
+    for (uint32_t p = 0; p < f->blocks[hb].npreds; p++) {
+      uint32_t pb = f->blocks[hb].preds[p];
+      if (f->blocks[pb].rpo < f->blocks[hb].rpo || inloop[pb]) continue;
+      inloop[pb] = 1; body[nbody++] = pb; stack[sp++] = pb;
+    }
+    while (sp) {
+      const Block *c = &f->blocks[stack[--sp]];
+      for (uint32_t p = 0; p < c->npreds; p++) {
+        uint32_t q = c->preds[p];
+        if (inloop[q]) continue;
+        inloop[q] = 1; body[nbody++] = q; stack[sp++] = q;
+      }
+    }
+    /* (a loop only its header leads into) */
+    for (uint32_t w = 0; w < nways; w++)
+      if (inloop[ways[w]]) ok = false;
+    if (!ok || inloop[f->entry]) continue;
+    bool wait = false;
+    for (uint32_t j = 0; j < nbody && !wait; j++) wait = dirty[body[j]];
+
+    /* the counters: one stepped value on every way round */
+    LsIv iv[LS_MAX];
+    uint32_t n = 0;
+    for (uint32_t k = 0; k < np && n < LS_MAX; k++) {
+      Ref p = f->blocks[hb].params[k], st = REF_NONE;
+      ValType t = (ValType)f->insts[p].type;
+      if (t != VT_I32 && t != VT_I64) continue;
+      bool one = true;
+      for (uint32_t q = 0; q < f->blocks[hb].npreds && one; q++) {
+        uint32_t pb = f->blocks[hb].preds[q];
+        if (f->blocks[pb].rpo < f->blocks[hb].rpo) continue;
+        Ref x = iv_edge(f, pb, hb)->args[k];
+        if (st == REF_NONE) st = x;
+        else one = x == st;
+      }
+      if (!one) continue;
+      const Inst *si = &f->insts[st];
+      uint64_t c;
+      if ((si->op != I_ADD && si->op != I_SUB) || ir_args(f, st)[0] != p ||
+          !is_const(f, ir_args(f, st)[1], &c))
+        continue;
+      if (touched && (touched[p] || touched[st])) wait = true;
+      iv[n++] = (LsIv){ .p = p, .s = st, .k = k, .t = t,
+                        .delta = (si->op == I_ADD ? c : (uint64_t)0 - c) & ls_mask(t) };
+    }
+    if (!n) continue;
+    if (wait) { *again = true; continue; }
+
+    if (!have) {
+      ui = use_index(f);
+      xi = ls_esc_index(f);
+      touched = xcalloc(ni0 ? ni0 : 1, 1);
+      have = true;
+    }
+    uint32_t hd = f->blocks[hb].loop_depth;
+
+    /* who reads each counter: the loop, its ways out, what comes after */
+    for (uint32_t c = 0; c < n; c++) {
+      LsIv *v = &iv[c];
+      for (int w = 0; w < 2; w++) {
+        Ref x = w ? v->s : v->p;
+        for (uint32_t u = ui.first[x]; u != UINT32_MAX; u = ui.next[u]) {
+          Ref r = ui.user[u];
+          if (f->insts[r].op == I_NOP || (!w && r == v->s)) continue;
+          uint32_t rb = f->insts[r].block;
+          if (inloop[rb]) v->real++;
+          /* (past the loop, and in no other: made again where it is read) */
+          else if (f->blocks[rb].loop_depth >= hd) v->out = true;
+        }
+        for (uint32_t u = xi.first[x]; u != UINT32_MAX; u = xi.next[u]) {
+          uint32_t bi = xi.blk[u];
+          const Block *b = &f->blocks[bi];
+          if (!inloop[bi]) {
+            /* (made again at the block's end: not in a loop of its own, nor
+               after a call a handler stands behind, which ends its block) */
+            if (b->loop_depth >= hd || ir_block_has_eh(f, bi)) v->out = true;
+            continue;
+          }
+          if ((b->term == T_BRIF || b->term == T_BRTABLE) && b->term_arg == x) v->real++;
+          for (uint32_t e = 0; e < b->nsuccs; e++) {
+            const Edge *ed = &b->succs[e];
+            for (uint32_t a = 0; a < ed->nargs; a++) {
+              if (ed->args[a] != x) continue;
+              if (ed->target == hb) { if (a != v->k) v->real++; }
+              else if (inloop[ed->target]) v->real++;
+              else if (ed->eh) v->out = true;
+            }
+          }
+        }
+      }
+    }
+
+    /* the ones taken out: of each set that steps alike, all that nothing in
+       the loop reads but one */
+    bool any = false;
+    uint32_t lead_of[LS_MAX];
+    uint64_t dk[LS_MAX];
+    for (uint32_t c = 0; c < n; c++) {
+      lead_of[c] = UINT32_MAX;
+      dk[c] = 0;
+      if (iv[c].real || iv[c].out) continue;
+      for (uint32_t d = 0; d < n && lead_of[c] == UINT32_MAX; d++)
+        if (!iv[d].gone && iv[d].t == iv[c].t && iv[d].delta == iv[c].delta &&
+            (iv[d].real || iv[d].out || d < c) && ls_apart(f, hb, ways, nways, &iv[c], &iv[d], &dk[c]))
+          lead_of[c] = d;
+      if (lead_of[c] == UINT32_MAX) continue;
+      iv[c].gone = true;
+      any = true;
+    }
+
+    /* an address of a counter that stays, a value and the step: of the
+       stepped value */
+    for (uint32_t c = 0; c < n; c++) {
+      LsIv *v = &iv[c];
+      if (v->gone) continue;
+      for (uint32_t u = ui.first[v->p]; u != UINT32_MAX; u = ui.next[u]) {
+        Ref r = ui.user[u];
+        if (r == v->s || f->insts[r].op != I_ADD) continue;
+        uint32_t u2 = ui.first[r];
+        if (u2 == UINT32_MAX || ui.next[u2] != UINT32_MAX || xi.first[r] != UINT32_MAX) continue;
+        Ref r2 = ui.user[u2];
+        Ref *a1 = ir_args(f, r);
+        uint64_t k2;
+        if (f->insts[r2].op != I_ADD || !is_const(f, ir_args(f, r2)[1], &k2) ||
+            (k2 & ls_mask(v->t)) != v->delta || !ls_before(f, v->s, r2))
+          continue;
+        /* (i + i: still a reader of i past its step) */
+        if ((a1[0] == v->p) == (a1[1] == v->p)) continue;
+        Ref x = a1[0] == v->p ? a1[1] : a1[0];
+        Ref *a2 = ir_args(f, r2);
+        a2[0] = x;
+        a2[1] = v->s;
+        ir_make_nop(&f->insts[r]);
+        /* (x has a reader the index knows nothing of) */
+        if (x < ni0) touched[x] = 1;
+        changed = true;
+        g_stats.lockstep_addrs++;
+      }
+    }
+
+    /* a counter that stays and that nothing reads past its step but ways
+       out below the step and what comes after the loop below it: those
+       read the stepped value */
+    bool late[LS_MAX];
+    for (uint32_t c = 0; c < n; c++) {
+      LsIv *v = &iv[c];
+      late[c] = false;
+      if (v->gone || v->out) continue;
+      uint32_t sb = f->insts[v->s].block;
+      /* someone to hand the stepped value: a reader past the loop, or a
+         way out, below the step */
+      bool some = false, all = true;
+      for (uint32_t u = ui.first[v->p]; u != UINT32_MAX && !some; u = ui.next[u]) {
+        Ref r = ui.user[u];
+        some = f->insts[r].op != I_NOP && !inloop[f->insts[r].block] && dominates(f, sb, f->insts[r].block);
+      }
+      for (uint32_t u = xi.first[v->p]; u != UINT32_MAX && !some; u = xi.next[u]) {
+        uint32_t bi = xi.blk[u];
+        if (!dominates(f, sb, bi)) continue;
+        const Block *b = &f->blocks[bi];
+        some = !inloop[bi];
+        for (uint32_t e = 0; e < b->nsuccs && !some; e++)
+          for (uint32_t a = 0; a < b->succs[e].nargs && !some; a++)
+            some = b->succs[e].args[a] == v->p && !inloop[b->succs[e].target];
+      }
+      if (!some) continue;
+      /* the blocks a run may come to from the step's before it goes round */
+      uint32_t nseen = 0;
+      sp = 0;
+      stack[sp++] = sb;
+      while (sp) {
+        const Block *b = &f->blocks[stack[--sp]];
+        for (uint32_t e = 0; e < b->nsuccs; e++) {
+          uint32_t t = b->succs[e].target;
+          if (t == hb || t >= nb0 || !inloop[t] || after[t]) continue;
+          after[t] = 1; seen[nseen++] = t; stack[sp++] = t;
+        }
+      }
+      for (uint32_t u = ui.first[v->p]; u != UINT32_MAX && all; u = ui.next[u]) {
+        Ref r = ui.user[u];
+        uint32_t rb = f->insts[r].block;
+        if (r == v->s || f->insts[r].op == I_NOP) continue;
+        if (!inloop[rb]) all = dominates(f, sb, rb) || ls_left_before(f, inloop, after, sb, rb);
+        else if (after[rb] || (rb == sb && !ls_before(f, r, v->s))) all = false;
+      }
+      for (uint32_t u = xi.first[v->p]; u != UINT32_MAX && all; u = xi.next[u]) {
+        uint32_t bi = xi.blk[u];
+        if (!inloop[bi]) {
+          all = dominates(f, sb, bi) || ls_left_before(f, inloop, after, sb, bi);
+          continue;
+        }
+        /* (a block's branch and edges read after all it makes) */
+        if (bi != sb && !after[bi]) continue;
+        const Block *b = &f->blocks[bi];
+        if ((b->term == T_BRIF || b->term == T_BRTABLE) && b->term_arg == v->p) all = false;
+        for (uint32_t e = 0; e < b->nsuccs && all; e++)
+          for (uint32_t a = 0; a < b->succs[e].nargs && all; a++)
+            if (b->succs[e].args[a] == v->p && (inloop[b->succs[e].target] || !dominates(f, sb, bi)))
+              all = false;
+      }
+      for (uint32_t j = 0; j < nseen; j++) after[seen[j]] = 0;
+      late[c] = all;
+      any |= all;
+    }
+    if (!any) continue;
+
+    /* what a reader of x in or below block q reads now, as base + *k:
+       REF_NONE where x is none of these */
+#define LS_FOR(x_, q_, base_, k_, isexit_)                                              \
+    do {                                                                                \
+      (base_) = REF_NONE; (k_) = 0; (isexit_) = false;                                  \
+      for (uint32_t c_ = 0; c_ < n && (base_) == REF_NONE; c_++) {                      \
+        const LsIv *v_ = &iv[c_];                                                       \
+        if (v_->gone && ((x_) == v_->p || (x_) == v_->s)) {                             \
+          const LsIv *l_ = &iv[lead_of[c_]];                                            \
+          /* the counter that stays, at its stepped value where that is made            \
+             above the reader */                                                        \
+          bool stepped_ = dominates(f, f->insts[l_->s].block, (q_));                    \
+          (base_) = stepped_ ? l_->s : l_->p;                                           \
+          (k_) = dk[c_] + ((x_) == v_->s ? v_->delta : 0) - (stepped_ ? l_->delta : 0); \
+        } else if (late[c_] && (x_) == v_->p && dominates(f, f->insts[v_->s].block, (q_))) { \
+          (base_) = v_->s;                                                              \
+          (k_) = (uint64_t)0 - v_->delta;                                               \
+          (isexit_) = true;                                                             \
+        }                                                                               \
+        (k_) &= ls_mask(v_->t);                                                         \
+      }                                                                                 \
+    } while (0)
+
+    /* the ways out: through a block of its own where one has an add to make */
+    for (uint32_t j = 0; j < nbody; j++) {
+      uint32_t q = body[j];
+      for (uint32_t e = 0; e < f->blocks[q].nsuccs; e++) {
+        uint32_t tg = f->blocks[q].succs[e].target;
+        if (tg < nb0 && inloop[tg]) continue;
+        uint32_t at = UINT32_MAX;
+        for (int make = 0; make < 2; make++) {
+          bool adds = false;
+          Edge *oe = at == UINT32_MAX ? &f->blocks[q].succs[e] : &f->blocks[at].succs[0];
+          for (uint32_t a = 0; a < oe->nargs; a++) {
+            Ref x = oe->args[a], base;
+            uint64_t k;
+            bool exit_s;
+            LS_FOR(x, q, base, k, exit_s);
+            if (base == REF_NONE) continue;
+            if (k) adds = true;
+            if (!make) continue;
+            Ref y = ls_add(f, at == UINT32_MAX ? q : at, (ValType)f->insts[base].type, base, k);
+            oe = at == UINT32_MAX ? &f->blocks[q].succs[e] : &f->blocks[at].succs[0];
+            oe->args[a] = y;
+            if (exit_s) g_stats.lockstep_exits++;
+          }
+          if (!make && adds) {
+            at = gl_split_edge(f, q, e);
+            dirty[q] = 1;
+            if (tg < nb0) dirty[tg] = 1;
+          }
+        }
+      }
+    }
+    /* what comes after the loop */
+    for (uint32_t c = 0; c < n; c++) {
+      if (!iv[c].gone && !late[c]) continue;
+      for (int w = 0; w < 2; w++) {
+        Ref x = w ? iv[c].s : iv[c].p;
+        for (uint32_t u = ui.first[x]; u != UINT32_MAX; u = ui.next[u]) {
+          Ref r = ui.user[u];
+          uint32_t rb = f->insts[r].block;
+          if (f->insts[r].op == I_NOP || inloop[rb]) continue;
+          Ref base;
+          uint64_t k;
+          bool exit_s;
+          LS_FOR(x, rb, base, k, exit_s);
+          if (base == REF_NONE) continue;
+          Ref y = ls_add_before(f, r, (ValType)f->insts[base].type, base, k);
+          Ref *ra = ir_args(f, r);
+          for (uint32_t a = 0; a < f->insts[r].nargs; a++)
+            if (ra[a] == x) ra[a] = y;
+          if (exit_s) g_stats.lockstep_exits++;
+        }
+        for (uint32_t u = xi.first[x]; u != UINT32_MAX; u = xi.next[u]) {
+          uint32_t bi = xi.blk[u];
+          if (inloop[bi]) continue;
+          Ref base;
+          uint64_t k;
+          bool exit_s;
+          LS_FOR(x, bi, base, k, exit_s);
+          if (base == REF_NONE) continue;
+          Ref y = ls_add(f, bi, (ValType)f->insts[base].type, base, k);
+          Block *b = &f->blocks[bi];
+          if ((b->term == T_BRIF || b->term == T_BRTABLE) && b->term_arg == x) b->term_arg = y;
+          for (uint32_t i = 0; i < b->nret; i++)
+            if (b->ret_args[i] == x) b->ret_args[i] = y;
+          for (uint32_t e = 0; e < b->nsuccs; e++)
+            for (uint32_t a = 0; a < b->succs[e].nargs; a++)
+              if (b->succs[e].args[a] == x) b->succs[e].args[a] = y;
+          if (exit_s) g_stats.lockstep_exits++;
+        }
+      }
+    }
+#undef LS_FOR
+    /* the counters taken out: the header's parameter, what each way in
+       hands it, and the step nothing reads */
+    for (uint32_t k = np; k-- > 0;) {
+      uint32_t c = 0;
+      while (c < n && !(iv[c].gone && iv[c].k == k)) c++;
+      if (c == n) continue;
+      Block *h = &f->blocks[hb];
+      for (uint32_t q = 0; q < h->npreds; q++) {
+        Edge *ed = iv_edge(f, h->preds[q], hb);
+        for (uint32_t a = k; a + 1 < ed->nargs; a++) ed->args[a] = ed->args[a + 1];
+        ed->nargs--;
+      }
+      for (uint32_t a = k; a + 1 < h->nparams; a++) h->params[a] = h->params[a + 1];
+      h->nparams--;
+      ir_make_nop(&f->insts[iv[c].s]);
+      g_stats.lockstep++;
+    }
+    changed = true;
+  }
+  if (have) { use_index_free(&ui); ls_esc_free(&xi); xfree(touched); }
+  xfree(inloop); xfree(after); xfree(dirty); xfree(stack); xfree(body); xfree(seen);
+  if (changed) {
+    ir_mark_reachable(f);
+    ir_recompute_preds(f);
+  }
+  return changed;
+}
+
+
 static bool addr_only_zero_disp_uses(IrFunc *f, const UseIdx *ui, Ref ea,
                                      uint32_t *mem) {
   bool any = false;
@@ -29993,6 +30540,19 @@ void ir_optimize(IrFunc *f, const OptOpts *o) {
   /* after the dead links of the old chain are gone, which read its terms */
   if (reassoced && o->fold && TP("common_factor", pass_common_factor(f)) && o->dce)
     pass_dce(f);
+  /* (after the reassociation: an unrolled loop's counter steps by a chain
+     of its steps until then.  A loop beside one that was changed waits for
+     another run.) */
+  if (o->strength) {
+    bool again = true;
+    for (int run = 0; run < 4 && again; run++) {
+      again = false;
+      if (!TP("iv_lockstep", pass_iv_lockstep(f, &again))) break;
+      ir_order(f);
+      if (o->dce) pass_dce(f);
+      ir_verify(f, "post-lockstep");
+    }
+  }
 
   if (o->barelide) TP("bar_elide", pass_bar_elide(f));
   bool brt_jumped = false;
