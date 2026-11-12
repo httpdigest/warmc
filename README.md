@@ -2411,21 +2411,23 @@ after.
 
 | Module | warmc | tiered: ready | tiered: optimised | wasmtime | warmc peak | wasmtime peak |
 |---|---:|---:|---:|---:|---:|---:|
-| Go's `net/http` server | 391 ms | 170 ms | 573 ms | 256 ms | 79 MiB | 266 MiB |
-| Go, `text/template` | 340 ms | 119 ms | 458 ms | 144 ms | 54 MiB | 183 MiB |
-| Zig, `divmod` | 296 ms | 154 ms | 460 ms | 99 ms | 61 MiB | 478 MiB |
-| Haskell, `containers` | 134 ms | 102 ms | 243 ms | 165 ms | 63 MiB | 271 MiB |
-| C++, `random` | 68 ms | 12.6 ms | 84 ms | 27 ms | 28 MiB | 61 MiB |
-| Kotlin, `extensions` | 61 ms | 17 ms | 80 ms | 259 ms | 27 MiB | 235 MiB |
-| Rust, `vecops` | 55 ms | 8.0 ms | 66 ms | 11 ms | 20 MiB | 34 MiB |
-| C, `mathlib` | 14 ms | 4.9 ms | 20 ms | 6.3 ms | 8.2 MiB | 16 MiB |
+| Go's `net/http` server | 488 ms | 195 ms | 684 ms | 256 ms | 103 MiB | 266 MiB |
+| Go, `text/template` | 285 ms | 117 ms | 403 ms | 144 ms | 91 MiB | 183 MiB |
+| Zig, `divmod` | 467 ms | 175 ms | 643 ms | 99 ms | 86 MiB | 478 MiB |
+| Haskell, `containers` | 174 ms | 115 ms | 289 ms | 165 ms | 70 MiB | 271 MiB |
+| C++, `random` | 92 ms | 14.7 ms | 106 ms | 27 ms | 37 MiB | 61 MiB |
+| Kotlin, `extensions` | 65 ms | 16.7 ms | 82 ms | 259 ms | 43 MiB | 235 MiB |
+| Rust, `vecops` | 52 ms | 9.3 ms | 61 ms | 11 ms | 22 MiB | 34 MiB |
+| C, `mathlib` | 41 ms | 5.6 ms | 47 ms | 6.3 ms | 11 MiB | 16 MiB |
 
 A compile at `-O2` takes more time than Cranelift's on most modules -- its
 optimiser runs inlining and cleanup rounds over each function until they
-stop finding work -- and less memory on every one, a third to a ninth of
+stop finding work, and its jump threading works every small test out for
+each way into it -- and less memory on every one, a fifth to a half of
 wasmtime's on the large ones: the functions in flight are bounded by their
-size (twice the largest), and each compile's working memory comes from a
-heap of its own that is given back when it ends. Tiered, warmc is ready to run before wasmtime on all but
+size (twice the largest, and no less than 16 KB of bodies a worker), and
+each compile's working memory comes from a heap of its own that is given
+back when it ends. Tiered, warmc is ready to run before wasmtime on all but
 `divmod`, a module of a few very large functions.
 
 ---
