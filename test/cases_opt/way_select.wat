@@ -25,8 +25,10 @@
 ;;   agree     both ways find the byte not zero: the operand
 ;;   ways8     eight ways in, as many as are looked at
 ;;   ways9     nine: the select stays
+;;   ehconst   a way in ends in a call a handler stands behind: the
+;;             constant it picks is made ahead of that call
 ;;
-;; stats -O2: way_selects=9
+;; stats -O2: way_selects=10
 ;; stats -O2 -fno-fold: way_selects=0
 ;; shape: find \scs(el|inv|inc|neg)\s=0
 ;; shape: three \scs(el|inv|inc|neg)\s=0
@@ -42,6 +44,7 @@
 ;; shape: agree \scs(el|inv|inc|neg)\s=0
 ;; shape: ways8 \scs(el|inv|inc|neg)\s=0
 ;; shape: ways9 \scs(el|inv|inc|neg)\s=1
+;; shape: ehconst \scs(el|inv|inc|neg)\s=0
 ;;
 ;; run: find 0 3 => i32:2
 ;; run: find 0 200 => i32:3
@@ -118,10 +121,20 @@
 ;; run: ways9 10 1 => i32:4106
 ;; run: ways9 11 3 => i32:4107
 ;; run: ways9 12 8 => i32:4104
+;; run: ehconst 0 5 => i32:5
+;; run: ehconst 1 5 => i32:77
+;; run: ehconst 3 5 => i32:-7
+;; run: ehconst 2 2147483649 => i32:77
 
 (module
+  (type $t1 (func (param i32)))
   (memory 1)
+  (table 1 funcref)
+  (elem (i32.const 0) $thrower)
+  (tag $e)
   (data (i32.const 0) "\07\09\03\c8\01\05\00\0b\0d\00\ff\02\04\06\08\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\07\07\07\00\07\07\09\07\00\00\00\00\00\00\00\00\07\00\00\01\09\00\00\00\01\00\01\02\00\00\00\00")
+  ;; throws at 3; called through the table at an index read from memory, which keeps it out of line
+  (func $thrower (type $t1) (if (i32.eq (local.get 0) (i32.const 3)) (then (throw $e))))
   (func $find (export "find") (param $p i32) (param $k i32) (result i32)
     (local $c i32)
     (block $out
@@ -277,4 +290,12 @@
         (local.set $p (i32.add (local.get $p) (i32.const 1)))
         (br $l)))
     (i32.xor (select (local.get $p) (local.get $a) (local.get $c)) (i32.const 0x1000)))
+  (func $ehconst (export "ehconst") (param $c i32) (param $a i32) (result i32)
+    (block $h
+      (try_table (catch_all $h)
+        (if (local.get $c)
+          (then (call_indirect (type $t1) (local.get $c) (i32.load8_u (i32.const 220))))
+          (else (i32.store8 (i32.const 230) (local.get $a))))
+        (return (select (i32.const 77) (local.get $a) (local.get $c)))))
+    (i32.const -7))
 )

@@ -283,6 +283,24 @@ def ways(n):
     return name, wat, model
 
 
+# A way in ends in a call a handler stands behind: the constant that way
+# picks is made ahead of the call, which stays its block's last.
+EHWAY = """  (func $%(n)s (export "%(n)s") (param $c i32) (param $a i32) (result i32)
+    (block $h
+      (try_table (catch_all $h)
+        (if (local.get $c)
+          (then (call_indirect (type $t1) (local.get $c) (i32.load8_u (i32.const 220))))
+          (else (i32.store8 (i32.const 230) (local.get $a))))
+        (return (select %(pick)s (local.get $a) (local.get $c)))))
+    (i32.const -7))
+"""
+EHCONST = EHWAY % dict(n="ehconst", pick="(i32.const 77)")
+
+
+def ehconst(c, a):
+    return -7 if c == 3 else 77 if c else a
+
+
 CSEL = r"\scs(el|inv|inc|neg)\s"
 
 
@@ -311,10 +329,15 @@ def main(path):
     add(n8, w8, m8, [(0, 77), (4, 5), (7, 9), (10, 1), (11, 3), (12, 8)], 0)
     n9, w9, m9 = ways(9)
     add(n9, w9, m9, [(0, 77), (4, 5), (7, 9), (10, 1), (11, 3), (12, 8)], 1)
+    add("ehconst", EHCONST, ehconst, [(0, 5), (1, 5), (3, 5), (2, 0x80000001)], 0)
     data = "".join("\\%02x" % b for b in MEM)
     with open(path, "w") as f:
         f.write(HEAD + "\n".join(shapes) + "\n;;\n" + "\n".join(runs) +
-                "\n\n(module\n  (memory 1)\n  (data (i32.const 0) \"%s\")\n" % data + "".join(funcs) + ")\n")
+                "\n\n(module\n  (type $t1 (func (param i32)))\n  (memory 1)\n  (table 1 funcref)\n"
+                "  (elem (i32.const 0) $thrower)\n  (tag $e)\n  (data (i32.const 0) \"%s\")\n" % data +
+                "  ;; throws at 3; called through the table at an index read from memory, which keeps it out of line\n"
+                "  (func $thrower (type $t1) (if (i32.eq (local.get 0) (i32.const 3)) (then (throw $e))))\n" +
+                "".join(funcs) + ")\n")
     print("%s: %d functions, %d runs" % (path, len(funcs), len(runs)))
 
 
@@ -345,8 +368,10 @@ HEAD = """;; A select whose condition each way into its block decides is what th
 ;;   agree     both ways find the byte not zero: the operand
 ;;   ways8     eight ways in, as many as are looked at
 ;;   ways9     nine: the select stays
+;;   ehconst   a way in ends in a call a handler stands behind: the
+;;             constant it picks is made ahead of that call
 ;;
-;; stats -O2: way_selects=9
+;; stats -O2: way_selects=10
 ;; stats -O2 -fno-fold: way_selects=0
 """
 

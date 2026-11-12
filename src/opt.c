@@ -941,6 +941,16 @@ static Ref emit_before(IrFunc *f, uint32_t bi, uint32_t *idx, IrOp op, ValType t
   return r;
 }
 
+/* An instruction at the end of block bi: ahead of the call that ends it,
+   where a handler stands behind that call, which stays the block's last
+   (ir_verify).  Its operands are no result of that call. */
+static Ref emit_at_end(IrFunc *f, uint32_t bi, IrOp op, ValType t, const Ref *args,
+                       uint32_t nargs, uint64_t imm) {
+  if (!ir_block_has_eh(f, bi) || !f->blocks[bi].ninsts) return ir_emit(f, bi, op, t, args, nargs, imm, 0);
+  uint32_t at = f->blocks[bi].ninsts - 1;
+  return emit_before(f, bi, &at, op, t, args, nargs, imm);
+}
+
 /* A value a loop carries round, made by a chain of one associative op --
    acc = ((acc + a) + b) + c -- waits on every link of the chain each
    iteration, so the loop runs no faster than one op per link.  The same sum
@@ -7673,9 +7683,10 @@ static bool pass_bit_facts(IrFunc *f) {
         to = ir_add_param(f, d->bi, (ValType)in->type);
         for (uint32_t e = 0; e < d->ne; e++) {
           Ref g = arm[d->take[e]];
-          /* a constant of the block's own is one of each way's */
+          /* a constant of the block's own is one of each way's, made ahead
+             of the call that ends the way where a handler stands behind it */
           if (f->insts[g].block == d->bi)
-            g = ir_emit(f, d->q[e], I_CONST, (ValType)f->insts[g].type, NULL, 0, f->insts[g].imm, 0);
+            g = emit_at_end(f, d->q[e], I_CONST, (ValType)f->insts[g].type, NULL, 0, f->insts[g].imm);
           edge_push_arg_at(f, d->q[e], d->s[e], g);
         }
       }

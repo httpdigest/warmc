@@ -13,7 +13,7 @@ UND = '              if (zero && !only) { ok = false; break; }'
 TAKE = '              d.q[d.ne] = q; d.s[d.ne] = s; d.take[d.ne] = zero ? 1 : 0;'
 LOOP = '          for (int k = 0; k < 2 && differ; k++)\n'
 CLONE = ('          if (f->insts[g].block == d->bi)\n'
-         '            g = ir_emit(f, d->q[e], I_CONST, (ValType)f->insts[g].type, NULL, 0, f->insts[g].imm, 0);')
+         '            g = emit_at_end(f, d->q[e], I_CONST, (ValType)f->insts[g].type, NULL, 0, f->insts[g].imm);')
 M = {
  'off': m(HEAD, '        if (0 && op == I_SELECT && in->nargs == 3 && sels) {'),
  # which selects
@@ -41,6 +41,8 @@ M = {
  # what is made of it
  'const_shared': m(CLONE, ''),
  'const_first_way': m(CLONE, CLONE.replace('d->q[e], I_CONST', 'd->q[0], I_CONST')),
+ 'const_after_call': m(CLONE, CLONE.replace('emit_at_end(f, d->q[e], I_CONST, (ValType)f->insts[g].type, NULL, 0, f->insts[g].imm)',
+                                            'ir_emit(f, d->q[e], I_CONST, (ValType)f->insts[g].type, NULL, 0, f->insts[g].imm, 0)')),
  'one_edge': m('        for (uint32_t e = 0; e < d->ne; e++) {\n          Ref g = arm[d->take[e]];', '        for (uint32_t e = 0; e < 1; e++) {\n          Ref g = arm[d->take[e]];'),
  'select_stays': m('      ir_replace(f, d->v, to);\n      ir_make_nop(&f->insts[d->v]);\n      g_stats.way_selects++;', '      g_stats.way_selects++;'),
  'count': m('      ir_make_nop(&f->insts[d->v]);\n      g_stats.way_selects++;', '      ir_make_nop(&f->insts[d->v]);'),
