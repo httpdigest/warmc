@@ -8757,6 +8757,19 @@ static uint32_t te_pick(KtEv *ev) {
   return UINT32_MAX;
 }
 
+/* Whether block b has more than max instructions a copy of it would take
+   -- all but its constants.  Asked first, of every block a threading looks
+   at: the look at what each of them is read by goes through the block once
+   for each, and a block too long to copy has hundreds. */
+static bool te_longer(const IrFunc *f, const Block *b, uint32_t max) {
+  uint32_t n = 0;
+  for (uint32_t i = 0; i < b->ninsts; i++) {
+    uint16_t op = f->insts[b->insts[i]].op;
+    if (op != I_NOP && op != I_CONST && ++n > max) return true;
+  }
+  return false;
+}
+
 static bool thread_eval(IrFunc *f, uint32_t B, const uint32_t *nread, uint32_t nnread,
                         const KtNulls *ni, uint32_t *budget) {
   Block *b = &f->blocks[B];
@@ -8765,6 +8778,7 @@ static bool thread_eval(IrFunc *f, uint32_t B, const uint32_t *nread, uint32_t n
   if (b->term_arg >= nnread) return false;
   for (uint32_t p = 0; p < b->npreds; p++)
     if (f->blocks[b->preds[p]].rpo >= b->rpo) return false;
+  if (te_longer(f, b, TE_COPY < *budget ? TE_COPY : *budget)) return false;
   uint32_t nc = 0;
   for (uint32_t i = 0; i < b->ninsts; i++) {
     Ref v = b->insts[i];
@@ -8867,8 +8881,10 @@ static bool thread_eval(IrFunc *f, uint32_t B, const uint32_t *nread, uint32_t n
 /* Whether block X can be copied for threading -- no landing pad, no
    exception's way, not the entry nor a loop's header, its terminator a
    jump or a branch, what it makes and is read beyond it of a parameter's
-   type -- and the instructions it would copy (*nc, its constants left). */
-static bool te_copyable(IrFunc *f, uint32_t X, const uint32_t *nread, uint32_t nnread, uint32_t *nc) {
+   type, at most max instructions to copy -- and the instructions it would
+   copy (*nc, its constants left). */
+static bool te_copyable(IrFunc *f, uint32_t X, const uint32_t *nread, uint32_t nnread, uint32_t *nc,
+                        uint32_t max) {
   const Block *b = &f->blocks[X];
   if (!b->reachable || b->is_pad || X == f->entry || ir_block_has_eh(f, X)) return false;
   if (b->term != T_BRIF && b->term != T_JUMP) return false;
@@ -8876,6 +8892,7 @@ static bool te_copyable(IrFunc *f, uint32_t X, const uint32_t *nread, uint32_t n
     if (f->blocks[b->preds[p]].rpo >= b->rpo) return false;
   for (uint32_t q = 0; q < b->nparams; q++)
     if (!td_param_ok((ValType)f->insts[b->params[q]].type)) return false;
+  if (te_longer(f, b, max)) return false;
   *nc = 0;
   for (uint32_t i = 0; i < b->ninsts; i++) {
     Ref v = b->insts[i];
@@ -8982,7 +8999,7 @@ static bool thread_path_copy(IrFunc *f, uint32_t Y, uint32_t sy, uint32_t B, uin
 static bool thread_path(IrFunc *f, uint32_t B, const uint32_t *nread, uint32_t nnread,
                         const KtNulls *ni, uint32_t *budget) {
   uint32_t nc;
-  if (f->blocks[B].term != T_BRIF || !te_copyable(f, B, nread, nnread, &nc) || nc > TE_COPY ||
+  if (f->blocks[B].term != T_BRIF || !te_copyable(f, B, nread, nnread, &nc, TE_COPY) ||
       f->blocks[B].term_arg >= nnread)
     return false;
   uint32_t np0 = f->blocks[B].npreds;
@@ -8999,7 +9016,7 @@ static bool thread_path(IrFunc *f, uint32_t B, const uint32_t *nread, uint32_t n
     for (uint32_t pj = 0; pj < pk; pj++) seen |= preds[pj] == Y;
     if (seen) continue;
     uint32_t ncy, sy = UINT32_MAX, nto = 0;
-    if (te_diamond(f, Y, B) || !te_copyable(f, Y, nread, nnread, &ncy) || nc + ncy > TP_COPY) continue;
+    if (te_diamond(f, Y, B) || !te_copyable(f, Y, nread, nnread, &ncy, TP_COPY - nc)) continue;
     for (uint32_t k = 0; k < f->blocks[Y].nsuccs; k++)
       if (f->blocks[Y].succs[k].target == B) { sy = k; nto++; }
     if (nto != 1 || f->blocks[Y].succs[sy].eh || f->blocks[Y].succs[sy].nargs != f->blocks[B].nparams) continue;
