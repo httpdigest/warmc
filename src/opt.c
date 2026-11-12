@@ -10427,9 +10427,14 @@ typedef struct {
   /* only the value's low 1 << size bytes are what memory holds: an i64
      stored as 4 bytes, whose high half nothing knows */
   bool low;
+  /* where it is, read off its address once (mem_key): the scans of the
+     entries for each access ask these first, and walk no address but the
+     access's own */
+  Ref kroot; uint32_t kt; int64_t koff;
 } MemEnt;
 typedef struct {
   Ref addr; uint64_t off; uint32_t size; uint32_t mem; Ref inst;
+  Ref kroot; uint32_t kt; int64_t koff;
 } PendStore;
 
 /* Accesses that ran, without a trap, on every path to a point: a scan's
@@ -10694,6 +10699,47 @@ static bool same_access_after(IrFunc *f, Ref addr_a, uint64_t imm_a, uint32_t si
   if (d <= is) return is - d == il;
   uint64_t e = (ca - cb) & 0xffffffffull;
   return ran && e < 0x10000 && il == is + e && addr_ran(f, ran, rb, cb);
+}
+
+/* An access's place, read off its address once: its root, the low 32
+   bits of all that is added to the root -- the constants in the address's
+   own arithmetic and the access's offsets -- and that sum as may_alias
+   takes it.  same_access and same_access_after say yes only of two accesses
+   with one root and the same low 32 bits: every way they have of taking
+   two for one -- one base and equal offsets, one root and constants that
+   agree in its width, a constant moved between the add and the offset
+   with a witness that no add wrapped -- leaves the address, which is the
+   root plus that sum in 32 bits or more, the same.  So a scan of the
+   entries for an access asks the two numbers first, and reads an entry's
+   address only where they match.  may_alias is theirs alone: two roots may
+   be anywhere, and one root's accesses are apart by their sums. */
+typedef struct { Ref root; uint32_t t; int64_t off; } MemKey;
+
+static MemKey mem_key(IrFunc *f, Ref addr, uint64_t imm) {
+  MemKey k;
+  Ref r;
+  uint64_t c, i;
+  bool w;
+  access_parts(f, addr, &r, &c, &i, &w);
+  access_root(f, addr, &k.root, &k.off);
+  k.off += (int64_t)imm;
+  k.t = (uint32_t)(c + i + imm);
+  return k;
+}
+
+/* may_alias of an access at root + off (1 << size bytes of memory mem) and
+   the one k is the key of */
+static bool key_may_alias(Ref root, int64_t off, uint32_t size, uint32_t mem,
+                          const MemKey *k, uint32_t size_b, uint32_t mem_b) {
+  if (mem != mem_b) return false;
+  if (root != k->root) return true;
+  int64_t d = off - k->off;
+  int64_t wa = (int64_t)1 << size, wb = (int64_t)1 << size_b;
+  if (d >= wb || -d >= wa) {
+    int64_t ad = d < 0 ? -d : d;
+    if ((int64_t)0x100000000ll - ad >= (wa > wb ? wa : wb)) return false;
+  }
+  return true;
 }
 
 #define FRAME_SPAN ((int64_t)1 << 30)
@@ -14600,7 +14646,8 @@ static Ref materialise_param(IrFunc *f, MemState *st, const MemEnt *e) {
       /* no -faddr-nowrap here: the join took the entry only where every
          predecessor holds it at the same address as same_access has it */
       MemRan ran = { st[x].ent, st[x].nent, st[x].pend, st[x].npend, false };
-      if (!same_access_after(f, pe->addr, pe->off, pe->size, pe->mem,
+      if (pe->kroot != e->kroot || pe->kt != e->kt ||
+          !same_access_after(f, pe->addr, pe->off, pe->size, pe->mem,
                              e->addr, e->off, e->size, e->mem, &ran))
         continue;
       if (f->insts[pe->value].type == e->vtype && pe->sgn == e->sgn &&
@@ -14801,7 +14848,8 @@ static bool pass_memopt(IrFunc *f, const OptOpts *o) {
             bool found = false;
             for (uint32_t j = 0; j < ps->nent; j++) {
               if (!ps->ent[j].valid || ps->ent[j].pending) continue;
-              if (!same_access(f, ps->ent[j].addr, ps->ent[j].off, ps->ent[j].size,
+              if (ps->ent[j].kroot != cand.kroot || ps->ent[j].kt != cand.kt ||
+                  !same_access(f, ps->ent[j].addr, ps->ent[j].off, ps->ent[j].size,
                                ps->ent[j].mem,
                                cand.addr, cand.off, cand.size, cand.mem)) continue;
               found = f->insts[ps->ent[j].value].type == f->insts[cand.value].type &&
@@ -14863,15 +14911,15 @@ static bool pass_memopt(IrFunc *f, const OptOpts *o) {
         uint32_t mem = MEMF_MEM(in->imm2);
         bool sgn = (in->imm2 & MEMF_SIGNED) != 0;
         bool have = false;
+        MemKey key = mem_key(f, a[0], in->imm);
 
         for (uint32_t k = 0; k < npend;) {
-          if (may_alias(f, pend[k].addr, pend[k].off, pend[k].size, pend[k].mem,
-                        a[0], in->imm, size, mem))
+          if (key_may_alias(pend[k].kroot, pend[k].koff, pend[k].size, pend[k].mem, &key, size, mem))
             pend[k] = pend[--npend];
           else k++;
         }
         for (uint32_t k = 0; k < nent; k++) {
-          if (!ent[k].valid ||
+          if (!ent[k].valid || ent[k].kroot != key.root || ent[k].kt != key.t ||
               !same_access_after(f, ent[k].addr, ent[k].off, ent[k].size, ent[k].mem,
                            a[0], in->imm, size, mem, &ran))
             continue;
@@ -14900,7 +14948,8 @@ static bool pass_memopt(IrFunc *f, const OptOpts *o) {
         }
         if (!have && nent == MEMOPT_ENTS) nent = memopt_compact(ent, nent);
         if (!have && nent < MEMOPT_ENTS) {
-          ent[nent++] = (MemEnt){ a[0], in->imm, size, mem, v, sgn, true, false, 0, 0, false };
+          ent[nent++] = (MemEnt){ a[0], in->imm, size, mem, v, sgn, true, false, 0, 0, false,
+                                  key.root, key.t, key.off };
         }
       } else if (in->op == I_STORE) {
         uint32_t size = (uint32_t)MEMF_SIZE(in->imm2);
@@ -14910,8 +14959,10 @@ static bool pass_memopt(IrFunc *f, const OptOpts *o) {
            GHC's code does when it puts back a register it loaded; an access
            of the same size there came first, so it traps where that did. */
         bool holds = false;
+        MemKey key = mem_key(f, a[0], in->imm);
         for (uint32_t k = 0; k < nent && !holds; k++)
           holds = ent[k].valid && !ent[k].pending && ent[k].value == a[1] &&
+                  ent[k].kroot == key.root && ent[k].kt == key.t &&
                   same_access_after(f, ent[k].addr, ent[k].off, ent[k].size, ent[k].mem,
                               a[0], in->imm, size, mem, &ran);
         if (holds) {
@@ -14924,7 +14975,8 @@ static bool pass_memopt(IrFunc *f, const OptOpts *o) {
         }
 
         for (uint32_t k = 0; k < npend; k++) {
-          if (!same_access_after(f, pend[k].addr, pend[k].off, pend[k].size, pend[k].mem,
+          if (pend[k].kroot != key.root || pend[k].kt != key.t ||
+              !same_access_after(f, pend[k].addr, pend[k].off, pend[k].size, pend[k].mem,
                            a[0], in->imm, size, mem, &ran))
             continue;
           if (apply) {
@@ -14939,10 +14991,10 @@ static bool pass_memopt(IrFunc *f, const OptOpts *o) {
            own place, gone above, ran the same check first, so this one
            cannot trap after it */
         if (o->exact_trap && lh_can_trap(f, v)) npend = 0;
-        if (npend < MEMOPT_ENTS) pend[npend++] = (PendStore){ a[0], in->imm, size, mem, v };
+        if (npend < MEMOPT_ENTS)
+          pend[npend++] = (PendStore){ a[0], in->imm, size, mem, v, key.root, key.t, key.off };
         for (uint32_t k = 0; k < nent; k++)
-          if (may_alias(f, ent[k].addr, ent[k].off, ent[k].size, ent[k].mem,
-                        a[0], in->imm, size, mem))
+          if (key_may_alias(ent[k].kroot, ent[k].koff, ent[k].size, ent[k].mem, &key, size, mem))
             ent[k].valid = false;
 
         uint32_t vw = vt_width((ValType)f->insts[a[1]].type);
@@ -14955,7 +15007,8 @@ static bool pass_memopt(IrFunc *f, const OptOpts *o) {
         if (whole || low) {
           bool found = false;
           for (uint32_t k = 0; k < nent; k++)
-            if (same_access_after(f, ent[k].addr, ent[k].off, ent[k].size, ent[k].mem,
+            if (ent[k].kroot == key.root && ent[k].kt == key.t &&
+                same_access_after(f, ent[k].addr, ent[k].off, ent[k].size, ent[k].mem,
                             a[0], in->imm, size, mem, &ran)) {
               ent[k].value = a[1]; ent[k].valid = true; ent[k].pending = false;
               ent[k].sgn = false; ent[k].low = low;
@@ -14963,7 +15016,8 @@ static bool pass_memopt(IrFunc *f, const OptOpts *o) {
             }
           if (!found && nent == MEMOPT_ENTS) nent = memopt_compact(ent, nent);
           if (!found && nent < MEMOPT_ENTS)
-            ent[nent++] = (MemEnt){ a[0], in->imm, size, mem, a[1], false, true, false, 0, 0, low };
+            ent[nent++] = (MemEnt){ a[0], in->imm, size, mem, a[1], false, true, false, 0, 0, low,
+                                    key.root, key.t, key.off };
         }
       } else if (o->gcpure && in->op == I_FIELD_GET &&
                  vt_width((ValType)in->type) == (1u << GCF_SIZE(in->imm2))) {
@@ -14976,8 +15030,9 @@ static bool pass_memopt(IrFunc *f, const OptOpts *o) {
         Ref root = gc_ref_root(f, a[0]);
         uint32_t size = (uint32_t)GCF_SIZE(in->imm2);
         bool have = false;
+        MemKey key = mem_key(f, root, in->imm);
         for (uint32_t k = 0; k < nent; k++) {
-          if (!ent[k].valid ||
+          if (!ent[k].valid || ent[k].kroot != key.root || ent[k].kt != key.t ||
               !same_access(f, ent[k].addr, ent[k].off, ent[k].size, ent[k].mem,
                            root, in->imm, size, GC_FIELD_MEM))
             continue;
@@ -15007,7 +15062,7 @@ static bool pass_memopt(IrFunc *f, const OptOpts *o) {
         }
         if (!have && nent < MEMOPT_ENTS)
           ent[nent++] = (MemEnt){ root, in->imm, size, GC_FIELD_MEM, v,
-                                  false, true, false, 0, 0, false };
+                                  false, true, false, 0, 0, false, key.root, key.t, key.off };
       } else if (o->gcpure && in->op == I_FIELD_SET) {
         /* No dead-store elimination here: dropping an earlier set past a
            potentially trapping op would change post-trap state, which
@@ -15019,22 +15074,23 @@ static bool pass_memopt(IrFunc *f, const OptOpts *o) {
            them -- without this every allocation clobbers its offset */
         bool fresh = (in->imm2 & GCF_INIT) &&
                      f->insts[root].op == I_STRUCT_NEW;
+        MemKey key = mem_key(f, root, in->imm);
         if (!fresh)
           for (uint32_t k = 0; k < nent; k++)
-            if (may_alias(f, ent[k].addr, ent[k].off, ent[k].size, ent[k].mem,
-                          root, in->imm, size, GC_FIELD_MEM))
+            if (key_may_alias(ent[k].kroot, ent[k].koff, ent[k].size, ent[k].mem, &key, size, GC_FIELD_MEM))
               ent[k].valid = false;
         if (vt_width((ValType)f->insts[a[1]].type) == (1u << size)) {
           bool found = false;
           for (uint32_t k = 0; k < nent; k++)
-            if (same_access(f, ent[k].addr, ent[k].off, ent[k].size,
+            if (ent[k].kroot == key.root && ent[k].kt == key.t &&
+                same_access(f, ent[k].addr, ent[k].off, ent[k].size,
                             ent[k].mem, root, in->imm, size, GC_FIELD_MEM)) {
               ent[k].value = a[1]; ent[k].valid = true; ent[k].pending = false;
               found = true;
             }
           if (!found && nent < MEMOPT_ENTS)
             ent[nent++] = (MemEnt){ root, in->imm, size, GC_FIELD_MEM, a[1],
-                                    false, true, false, 0, 0, false };
+                                    false, true, false, 0, 0, false, key.root, key.t, key.off };
         }
       } else if (in->op == I_GLOBAL_GET) {
         uint32_t g = (uint32_t)in->imm;
