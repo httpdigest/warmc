@@ -1752,7 +1752,16 @@ runs on without jumping over them (`WARMC_NO_LATE_TIERS=1` emits them in
 one run), and the same rules choose which way of a test falls through, in
 the layout alone (the allocator's order without them spilled more): luawasm's `awfy_permute` takes 0.61 the time, `queens` 0.79,
 `towers` 0.87, the other corpora the same (`WARMC_NO_COLD_LATE=1`,
-`WARMC_NO_UNLIKELY_LATE=1`, `WARMC_NO_GC_BIAS=1`); a constant handed to a
+`WARMC_NO_UNLIKELY_LATE=1`, `WARMC_NO_GC_BIAS=1`); in a loop, an arm that
+only a conditional branch reaches and that calls on its way to where the
+branch's other way goes comes after the rest too -- a vector's growth out
+of the way of the pushes round it -- but not where the call is as likely
+as not: an arm taken where the branch's value, no comparison, is not zero,
+a pointer there to walk or to free, a bit that is set, or one that calls
+the function itself, a recursion's own call, stays in line, a branch over
+it where it is not taken and none where it is (`gobench/recurse` takes
+0.68 the time, `gobench/bintree` 0.92, `gobench/alloc` 0.96;
+`WARMC_CALL_ARM_ALL=1` moves every such arm); a constant handed to a
 rare way is made on that way's edge, no web with the parameter it is
 handed to, which made it where it is defined, on the way that runs
 (`WARMC_NO_RARE_CONST_EDGE=1`); a latch's moves made ahead of its branch

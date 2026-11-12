@@ -1060,8 +1060,16 @@ void ir_order(IrFunc *f) { (void)ir_order_changed(f); }
    calling on the way: rsbench/vecgrow's push growing its vector.  In line,
    the way round the loop past it takes two branches, the one over it and
    the back edge; emitted after the rest, one.  Where the call is frequent
-   after all, it costs more than the branch to it and the one back.  The
-   blocks after it follow it there, as only it leads to them. */
+   after all, it costs more than the branch to it and the one back, so not
+   an arm taken where the branch's value, no comparison, is not zero -- a
+   pointer there to walk or to free, a bit that is set: Go's allocator
+   marks a root for each bit set in a block's state (gobench/bintree takes
+   0.92 the time with those calls in line, gobench/alloc 0.96) -- nor one
+   that calls the function itself, a recursion's own call: the loop TinyGo
+   makes of fib's second call took the branch out and the one back at every
+   call (gobench/recurse, 0.68 the time in line).  The blocks after it
+   follow it there, as only it leads to them (WARMC_CALL_ARM_ALL=1: every
+   such arm). */
 static bool call_arm(const IrFunc *f, uint32_t bi) {
   const Block *b = &f->blocks[bi];
   if (!b->loop_depth || bi == f->entry || b->npreds != 1) return false;
@@ -1069,10 +1077,23 @@ static bool call_arm(const IrFunc *f, uint32_t bi) {
   if (p->term != T_BRIF || p->nsuccs != 2) return false;
   uint32_t other = p->succs[0].target == bi ? p->succs[1].target : p->succs[0].target;
   if (other == bi) return false;
+  static _Atomic int all = -1;
+  if (all < 0) all = warmc_getenv("WARMC_CALL_ARM_ALL") != NULL;
+  if (!all) {
+    Ref c = p->term_arg;
+    bool zero = p->succs[0].target != bi;
+    while (c < f->ninsts && f->insts[c].op == I_EQZ) { c = f->argpool[f->insts[c].args_off]; zero = !zero; }
+    if (c < f->ninsts && !zero) {
+      uint16_t op = f->insts[c].op;
+      if (op != I_EQ && op != I_NE && !(op >= I_LTS && op <= I_GEU)) return false;
+    }
+  }
   bool calls = false;
   for (int steps = 0; steps < 8; steps++) {
     for (uint32_t i = 0; i < b->ninsts && !calls; i++) {
-      uint16_t op = f->insts[b->insts[i]].op;
+      const Inst *in = &f->insts[b->insts[i]];
+      uint16_t op = in->op;
+      if (op == I_CALL && in->imm == f->func_index && !all) return false;
       calls = op == I_CALL || op == I_CALL_INDIRECT || op == I_CALL_REF ||
               op == I_CONT_OP;
     }
