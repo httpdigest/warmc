@@ -1,5 +1,6 @@
-"""opt.c lx_match, fold_lex_select, lx_branch: two pairs compared by their
-first members and then by their second, as one compare of two keys.  Killed
+"""opt.c lx_match, fold_lex_select, lx_branch and ir.c ir_lex_pair, which
+they read the test with: two pairs compared by their first members and then
+by their second, as one compare of two keys.  Killed
 by test/cases_opt/lex_cmp.wat's answers, its counts and its shapes, where a
 mutant makes a key of the wrong values, of a value no block before it
 makes, or of another width.
@@ -13,16 +14,19 @@ bits, which only keeps the arithmetic after it in range; and the tests that
 the two blocks end in branches, which are what say their two ways out may
 be read at all."""
 O = 'src/opt.c'
+I = 'src/ir.c'
 def m(old, new): return (O, [(old, new)])
+def mi(old, new): return (I, [(old, new)])
 
 ROT = '  if (!fm.sh && fn.sh == fm.w && fn.sh + fn.w == W) {\n    s->kind = LX_ROT;\n    s->c = W - fm.w;'
 SAME = '  } else if (!fn.sh && fm.sh == fn.w && fm.sh + fm.w == W) {\n    s->kind = LX_SAME;\n    s->c = fn.w;'
 FIRSTS = '  if (!(ma[0] == ea[0] && ma[1] == ea[1]) && !(ma[0] == ea[1] && ma[1] == ea[0])) return false;\n'
-MKNOWN = ('  if (mg && !((ir_known_bits(f, ma[0], KB_DEPTH) | ir_known_bits(f, ma[1], KB_DEPTH)) >> (wm - 1)))\n'
+MKNOWN = ('  if (mg && !((ir_known_bits(f, ma[0], KB_MAXD) | ir_known_bits(f, ma[1], KB_MAXD)) >> (wm - 1)))\n'
           '    mg = false;\n')
-NKNOWN = ('  if (ng && ((ir_known_bits(f, na[0], KB_DEPTH) | ir_known_bits(f, na[1], KB_DEPTH)) >> (wn - 1)))\n'
+NKNOWN = ('  if (ng && ((ir_known_bits(f, na[0], KB_MAXD) | ir_known_bits(f, na[1], KB_MAXD)) >> (wn - 1)))\n'
           '    return false;\n')
-OP = '  x->op = mg ? (ns ? I_LTS : I_LES) : (ns ? I_LTU : I_LEU);'
+OP = '  x->op = p.sgn ? (p.strict ? I_LTS : I_LES) : (p.strict ? I_LTU : I_LEU);'
+INV = '  if (negn) { nl = !nl; ns = !ns; }'
 LAYOUT = '    if (s->kind >= LX_ROT && s->c != x->c) s->kind = LX_GEN;'
 USES = ('  if (c >= f->fold_n || cn >= f->fold_n || cm >= f->fold_n ||\n'
         '      uses[c] != 1 || uses[cn] != 1 || uses[cm] != 1)\n    return false;')
@@ -63,18 +67,18 @@ M = {
  'same_width': m(SAME, SAME.replace('s->c = fn.w;', 's->c = W - fn.w;')),
  'same_is_rot': m(SAME, SAME.replace('LX_SAME', 'LX_ROT')),
  # the compares
- 'ltu_greater': m('case I_LTU: *less = true;  *strict = true; ', 'case I_LTU: *less = false; *strict = true; '),
- 'leu_strict': m('case I_LEU: *less = true;  *strict = false;', 'case I_LEU: *less = true;  *strict = true; '),
- 'gtu_less': m('case I_GTU: *less = false; *strict = true; ', 'case I_GTU: *less = true;  *strict = true; '),
- 'gtu_loose': m('case I_GTU: *less = false; *strict = true; ', 'case I_GTU: *less = false; *strict = false;'),
- 'geu_strict': m('case I_GEU: *less = false; *strict = false;', 'case I_GEU: *less = false; *strict = true; '),
- 'lts_unsigned': m('case I_LTS: *less = true;  *strict = true;  *sgn = true; ', 'case I_LTS: *less = true;  *strict = true;  *sgn = false;'),
- 'les_unsigned': m('case I_LES: *less = true;  *strict = false; *sgn = true; ', 'case I_LES: *less = true;  *strict = false; *sgn = false;'),
- 'les_greater': m('case I_LES: *less = true;  *strict = false;', 'case I_LES: *less = false; *strict = false;'),
- 'gts_less': m('case I_GTS: *less = false; *strict = true; ', 'case I_GTS: *less = true;  *strict = true; '),
- 'gts_unsigned': m('case I_GTS: *less = false; *strict = true;  *sgn = true; ', 'case I_GTS: *less = false; *strict = true;  *sgn = false;'),
- 'ges_less': m('case I_GES: *less = false; *strict = false;', 'case I_GES: *less = true;  *strict = false;'),
- 'ges_unsigned': m('case I_GES: *less = false; *strict = false; *sgn = true; ', 'case I_GES: *less = false; *strict = false; *sgn = false;'),
+ 'ltu_greater': mi('case I_LTU: *less = true;  *strict = true; ', 'case I_LTU: *less = false; *strict = true; '),
+ 'leu_strict': mi('case I_LEU: *less = true;  *strict = false;', 'case I_LEU: *less = true;  *strict = true; '),
+ 'gtu_less': mi('case I_GTU: *less = false; *strict = true; ', 'case I_GTU: *less = true;  *strict = true; '),
+ 'gtu_loose': mi('case I_GTU: *less = false; *strict = true; ', 'case I_GTU: *less = false; *strict = false;'),
+ 'geu_strict': mi('case I_GEU: *less = false; *strict = false;', 'case I_GEU: *less = false; *strict = true; '),
+ 'lts_unsigned': mi('case I_LTS: *less = true;  *strict = true;  *sgn = true; ', 'case I_LTS: *less = true;  *strict = true;  *sgn = false;'),
+ 'les_unsigned': mi('case I_LES: *less = true;  *strict = false; *sgn = true; ', 'case I_LES: *less = true;  *strict = false; *sgn = false;'),
+ 'les_greater': mi('case I_LES: *less = true;  *strict = false;', 'case I_LES: *less = false; *strict = false;'),
+ 'gts_less': mi('case I_GTS: *less = false; *strict = true; ', 'case I_GTS: *less = true;  *strict = true; '),
+ 'gts_unsigned': mi('case I_GTS: *less = false; *strict = true;  *sgn = true; ', 'case I_GTS: *less = false; *strict = true;  *sgn = false;'),
+ 'ges_less': mi('case I_GES: *less = false; *strict = false;', 'case I_GES: *less = true;  *strict = false;'),
+ 'ges_unsigned': mi('case I_GES: *less = false; *strict = false; *sgn = true; ', 'case I_GES: *less = false; *strict = false; *sgn = false;'),
  # the keys' layout
  'signed_anywhere': m('  if (sgn && wm != x->W - x->c) return false;\n', ''),
  'other_layout': m(LAYOUT, '    (void)0;'),
@@ -85,21 +89,23 @@ M = {
  'any_layout': m('    if ((k ? s1 : s0).kind < LX_ROT) continue;\n', ''),
  'sides_kept': m('    x->s[0] = s0;\n    x->s[1] = s1;\n', ''),
  # the test
- 'firsts_other': m(FIRSTS, ''),
- 'firsts_same_way': m(FIRSTS, '  if (!(ma[0] == ea[0] && ma[1] == ea[1])) return false;\n'),
- 'firsts_other_way': m(FIRSTS, '  if (!(ma[0] == ea[1] && ma[1] == ea[0])) return false;\n'),
- 'no_inverse': m('!lx_rel(negn ? cmp_inverse(ni->op) : ni->op, &nl, &ns, &ng))', '!lx_rel(ni->op, &nl, &ns, &ng))'),
- 'firsts_signed_always': m(MKNOWN, ''),
- 'firsts_one_known': m(MKNOWN, MKNOWN.replace('(ir_known_bits(f, ma[0], KB_DEPTH) | ir_known_bits(f, ma[1], KB_DEPTH))', 'ir_known_bits(f, ma[0], KB_DEPTH)')),
- 'firsts_other_known': m(MKNOWN, MKNOWN.replace('(ir_known_bits(f, ma[0], KB_DEPTH) | ir_known_bits(f, ma[1], KB_DEPTH))', 'ir_known_bits(f, ma[1], KB_DEPTH)')),
- 'seconds_signed': m(NKNOWN, ''),
- 'seconds_one_known': m(NKNOWN, NKNOWN.replace('(ir_known_bits(f, na[0], KB_DEPTH) | ir_known_bits(f, na[1], KB_DEPTH))', 'ir_known_bits(f, na[0], KB_DEPTH)')),
- 'seconds_other_known': m(NKNOWN, NKNOWN.replace('(ir_known_bits(f, na[0], KB_DEPTH) | ir_known_bits(f, na[1], KB_DEPTH))', 'ir_known_bits(f, na[1], KB_DEPTH)')),
- 'firsts_order': m('  x->s[0].m = ma[ml ? 0 : 1]; x->s[1].m = ma[ml ? 1 : 0];', '  x->s[0].m = ma[0]; x->s[1].m = ma[1];'),
- 'seconds_order': m('  x->s[0].n = na[nl ? 0 : 1]; x->s[1].n = na[nl ? 1 : 0];', '  x->s[0].n = na[0]; x->s[1].n = na[1];'),
- 'strict_as_firsts': m(OP, '  x->op = mg ? (ms ? I_LTS : I_LES) : (ms ? I_LTU : I_LEU);'),
- 'always_unsigned': m(OP, '  x->op = ns ? I_LTU : I_LEU;'),
- 'always_signed': m(OP, '  x->op = ns ? I_LTS : I_LES;'),
+ 'firsts_other': mi(FIRSTS, ''),
+ 'firsts_same_way': mi(FIRSTS, '  if (!(ma[0] == ea[0] && ma[1] == ea[1])) return false;\n'),
+ 'firsts_other_way': mi(FIRSTS, '  if (!(ma[0] == ea[1] && ma[1] == ea[0])) return false;\n'),
+ 'no_inverse': mi(INV, '  (void)negn;'),
+ 'inverse_as_strict': mi(INV, '  if (negn) { nl = !nl; }'),
+ 'inverse_same_way': mi(INV, '  if (negn) { ns = !ns; }'),
+ 'firsts_signed_always': mi(MKNOWN, ''),
+ 'firsts_one_known': mi(MKNOWN, MKNOWN.replace('(ir_known_bits(f, ma[0], KB_MAXD) | ir_known_bits(f, ma[1], KB_MAXD))', 'ir_known_bits(f, ma[0], KB_MAXD)')),
+ 'firsts_other_known': mi(MKNOWN, MKNOWN.replace('(ir_known_bits(f, ma[0], KB_MAXD) | ir_known_bits(f, ma[1], KB_MAXD))', 'ir_known_bits(f, ma[1], KB_MAXD)')),
+ 'seconds_signed': mi(NKNOWN, ''),
+ 'seconds_one_known': mi(NKNOWN, NKNOWN.replace('(ir_known_bits(f, na[0], KB_MAXD) | ir_known_bits(f, na[1], KB_MAXD))', 'ir_known_bits(f, na[0], KB_MAXD)')),
+ 'seconds_other_known': mi(NKNOWN, NKNOWN.replace('(ir_known_bits(f, na[0], KB_MAXD) | ir_known_bits(f, na[1], KB_MAXD))', 'ir_known_bits(f, na[1], KB_MAXD)')),
+ 'firsts_order': mi('  x->m[0] = ma[ml ? 0 : 1]; x->m[1] = ma[ml ? 1 : 0];', '  x->m[0] = ma[0]; x->m[1] = ma[1];'),
+ 'seconds_order': mi('  x->n[0] = na[nl ? 0 : 1]; x->n[1] = na[nl ? 1 : 0];', '  x->n[0] = na[0]; x->n[1] = na[1];'),
+ 'strict_as_firsts': mi('  x->strict = ns;', '  x->strict = ms;'),
+ 'always_unsigned': m(OP, '  x->op = p.strict ? I_LTU : I_LEU;'),
+ 'always_signed': m(OP, '  x->op = p.strict ? I_LTS : I_LES;'),
  # the keys
  'gen_cheap': m('  return s->kind == LX_GEN ? 2 : s->kind == LX_ROT ? 1 : 0;', '  return s->kind == LX_GEN ? 1 : s->kind == LX_ROT ? 1 : 0;'),
  'rot_free': m('  return s->kind == LX_GEN ? 2 : s->kind == LX_ROT ? 1 : 0;', '  return s->kind == LX_GEN ? 2 : 0;'),
@@ -112,9 +118,9 @@ M = {
  'gen_order': m('      sa[0] = lx_member(f, bi, idx, s->m, t);\n      oa[1] = lx_member(f, bi, idx, s->n, t);',
                 '      sa[0] = lx_member(f, bi, idx, s->n, t);\n      oa[1] = lx_member(f, bi, idx, s->m, t);'),
  # the select
- 'select_off': m('  if (in->nargs != 3 || !uses) return false;\n  Ref *a = ir_args(f, v);\n  Ref c = a[2];', '  return false;\n  Ref *a = ir_args(f, v);\n  Ref c = a[2];'),
- 'eq_only': m('  if (cop != I_EQ && cop != I_NE) return false;\n  Ref cn', '  if (cop != I_EQ) return false;\n  Ref cn'),
- 'arms_swapped': m('  Ref cn = a[cop == I_EQ ? 0 : 1], cm = a[cop == I_EQ ? 1 : 0];', '  Ref cn = a[cop == I_EQ ? 1 : 0], cm = a[cop == I_EQ ? 0 : 1];'),
+ 'select_off': m('  if (!uses || !ir_lex_select(f, v, &c, &cm, &cn)) return false;', '  if (!uses || !ir_lex_select(f, v, &c, &cm, &cn) || 1) return false;'),
+ 'eq_only': mi('  if (cop != I_EQ && cop != I_NE) return false;\n  *eq = a[2];', '  if (cop != I_EQ) return false;\n  *eq = a[2];'),
+ 'arms_swapped': mi('  *cn = a[cop == I_EQ ? 0 : 1];\n  *cm = a[cop == I_EQ ? 1 : 0];', '  *cn = a[cop == I_EQ ? 1 : 0];\n  *cm = a[cop == I_EQ ? 0 : 1];'),
  'cond_read_twice': m(USES, USES.replace('uses[c] != 1 || ', '')),
  'second_read_twice': m(USES, USES.replace('uses[cn] != 1 || ', '')),
  'first_read_twice': m(USES, USES.replace(' || uses[cm] != 1', '')),

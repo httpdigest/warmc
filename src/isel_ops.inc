@@ -330,8 +330,21 @@ static bool sel_fuses(Isel *s, Ref v, uint64_t *imm) {
   return true;
 }
 
+/* The two pairs select v compares (find_cmp_chains' CCH_LEX) */
+static IrLex lex_of(Isel *s, Ref v) {
+  Ref eq, cm, cn;
+  IrLex x;
+  if (!ir_lex_select(s->f, v, &eq, &cm, &cn) || !ir_lex_pair(s->f, eq, cm, cn, false, &x))
+    warmc_fatal("internal: v%u is no compare of two pairs", v);
+  return x;
+}
+
 static int cond_of(Isel *s, Ref v) {
   Inst *in = &s->f->insts[v];
+  if (s->cchain && s->cchain[v] == CCH_LEX) {
+    IrLex x = lex_of(s, v);
+    return x.strict ? (x.sgn ? CC_LT : CC_LO) : (x.sgn ? CC_GE : CC_HS);
+  }
   if (s->cchain && s->cchain[v]) return cond_of(s, ir_args(s->f, v)[s->cchain[v] - 1]);
   if (in->op == I_EQZ || in->op == I_REF_IS_NULL) return CC_EQ;
   if (in->op == I_AND) return CC_NE;
@@ -365,8 +378,38 @@ static bool cc_holds(int cc, int nzcv) {
    where v is 1: its first side's, then its compare as a ccmp where that
    side leaves v open -- holds for an and, fails for an or -- and elsewhere
    the flags on which the compare's condition says what the side did. */
+/* The flags of two pairs in order: (m0, n0) < (m1, n1) is the borrow of
+   n0 - n1 taken on into m0 - m1, cmp and sbcs, LO where the firsts are
+   unsigned and LT where signed; (m0, n0) <= (m1, n1) is not (m1, n1) <
+   (m0, n0), the same of the pairs the other way round and HS or GE
+   (cond_of).  Each compare in its own width. */
+static void emit_lex(Isel *s, Ref v) {
+  IrFunc *f = s->f;
+  IrLex x = lex_of(s, v);
+  int lo = x.strict ? 0 : 1;
+  Ref n0 = x.n[lo], n1 = x.n[1 - lo], m0 = x.m[lo], m1 = x.m[1 - lo];
+  int sfn = is64(f, n0) ? SF64 : SF32, sfm = is64(f, m0) ? SF64 : SF32;
+  const Inst *k = &f->insts[n1];
+  uint32_t i12;
+  int lsl;
+  bool neg;
+  /* (an immediate compare's register 31 is sp: no zero register there;
+     and a cmn of -k carries just where the cmp of k does not borrow) */
+  if (k->op == I_CONST && recomp_addsub_imm(sfn ? k->imm : (k->imm & 0xffffffffu), sfn, &i12, &lsl, &neg)) {
+    int p = rd(s, n0, S0);
+    if (neg) a64_adds_imm(B, sfn, RZR, p, i12, lsl);
+    else a64_subs_imm(B, sfn, RZR, p, i12, lsl);
+  } else {
+    int p = rd_zr(s, n0, S0), q = rd_zr(s, n1, S1);
+    a64_cmp_reg(B, sfn, p, q);
+  }
+  int p = rd_zr(s, m0, S0), q = rd_zr(s, m1, S1);
+  a64_sbcs(B, sfm, RZR, p, q);
+}
+
 static void emit_cmp_chain(Isel *s, Ref v) {
   IrFunc *f = s->f;
+  if (s->cchain[v] == CCH_LEX) { emit_lex(s, v); return; }
   Ref *a = ir_args(f, v);
   int r = s->cchain[v] - 1;
   Ref l = a[1 - r], c = a[r];

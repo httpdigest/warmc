@@ -1857,6 +1857,59 @@ uint64_t ir_known_bits(IrFunc *f, Ref v, int depth) {
   return kb_rec(f, v, depth);
 }
 
+/* a less or a greater, strict or not, signed or not */
+static bool lex_rel(uint16_t op, bool *less, bool *strict, bool *sgn) {
+  switch (op) {
+    case I_LTU: *less = true;  *strict = true;  *sgn = false; return true;
+    case I_LEU: *less = true;  *strict = false; *sgn = false; return true;
+    case I_GTU: *less = false; *strict = true;  *sgn = false; return true;
+    case I_GEU: *less = false; *strict = false; *sgn = false; return true;
+    case I_LTS: *less = true;  *strict = true;  *sgn = true;  return true;
+    case I_LES: *less = true;  *strict = false; *sgn = true;  return true;
+    case I_GTS: *less = false; *strict = true;  *sgn = true;  return true;
+    case I_GES: *less = false; *strict = false; *sgn = true;  return true;
+    default: return false;
+  }
+}
+
+bool ir_lex_pair(IrFunc *f, Ref eq, Ref cm, Ref cn, bool negn, IrLex *x) {
+  const Inst *ei = &f->insts[eq], *mi = &f->insts[cm], *ni = &f->insts[cn];
+  if (ei->nargs != 2 || mi->nargs != 2 || ni->nargs != 2) return false;
+  const Ref *ea = ir_args(f, eq), *ma = ir_args(f, cm), *na = ir_args(f, cn);
+  if (!(ma[0] == ea[0] && ma[1] == ea[1]) && !(ma[0] == ea[1] && ma[1] == ea[0])) return false;
+  bool ml, ms, mg, nl, ns, ng;
+  if (!lex_rel(mi->op, &ml, &ms, &mg) || !lex_rel(ni->op, &nl, &ns, &ng)) return false;
+  /* not less is greater or equal */
+  if (negn) { nl = !nl; ns = !ns; }
+  uint32_t wm = vt_is_64((ValType)f->insts[ma[0]].type) ? 64 : 32;
+  uint32_t wn = vt_is_64((ValType)f->insts[na[0]].type) ? 64 : 32;
+  /* a signed compare of two values that are not negative is the unsigned
+     one: the firsts' may be either, the seconds' has to be that */
+  if (mg && !((ir_known_bits(f, ma[0], KB_MAXD) | ir_known_bits(f, ma[1], KB_MAXD)) >> (wm - 1)))
+    mg = false;
+  if (ng && ((ir_known_bits(f, na[0], KB_MAXD) | ir_known_bits(f, na[1], KB_MAXD)) >> (wn - 1)))
+    return false;
+  /* the lesser side first: a > b is b < a */
+  x->m[0] = ma[ml ? 0 : 1]; x->m[1] = ma[ml ? 1 : 0];
+  x->n[0] = na[nl ? 0 : 1]; x->n[1] = na[nl ? 1 : 0];
+  x->strict = ns;
+  x->sgn = mg;
+  x->wm = wm;
+  return true;
+}
+
+bool ir_lex_select(IrFunc *f, Ref v, Ref *eq, Ref *cm, Ref *cn) {
+  const Inst *in = &f->insts[v];
+  if (in->nargs != 3) return false;
+  const Ref *a = ir_args(f, v);
+  uint16_t cop = f->insts[a[2]].op;
+  if (cop != I_EQ && cop != I_NE) return false;
+  *eq = a[2];
+  *cn = a[cop == I_EQ ? 0 : 1];
+  *cm = a[cop == I_EQ ? 1 : 0];
+  return true;
+}
+
 /* ir_sign_ge's walk.  Each block parameter asked takes a level of depth,
    so there are never more than SG_DEPTH of them. */
 #define SG_DEPTH 8

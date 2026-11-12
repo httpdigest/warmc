@@ -582,6 +582,23 @@ bool ir_not_int_min(IrFunc *f, Ref v);
 bool ir_nonzero_with(IrFunc *f, Ref c, Ref d);
 
 uint64_t ir_known_bits(IrFunc *f, Ref v, int depth);
+/* Two pairs in order: `eq's operands equal ? cn : cm`, eq a test of two
+   firsts for equality, cm a less or a greater of the same two and cn one of
+   two seconds (its inverse where negn), as (m[0], n[0]) < (m[1], n[1]) --
+   or <= where not strict -- by the firsts and, where they are equal, by
+   the seconds.  The seconds compare unsigned: signed ones only where
+   neither can be negative.  The firsts compare signed where sgn, and are
+   wm bits wide.  Whether the firsts' own compare is strict does not matter:
+   it is read where they differ. */
+typedef struct {
+  Ref m[2], n[2];
+  bool strict, sgn;
+  uint32_t wm;
+} IrLex;
+bool ir_lex_pair(IrFunc *f, Ref eq, Ref cm, Ref cn, bool negn, IrLex *x);
+/* Whether select v is select(cn, cm, eq) or select(cm, cn, ne), and its
+   three parts. */
+bool ir_lex_select(IrFunc *f, Ref v, Ref *eq, Ref *cm, Ref *cn);
 /* Whether the top n bits of integer x are all copies of its sign: 33 for an
    i64 that is the sign extension of its low 32 bits, 49 for one that is an
    int16's, 17 for an i32 that is.  A constant in range; zeros known from
@@ -916,6 +933,9 @@ typedef struct {
   /* compares of two pairs made one compare of two keys (opt.c lx_match):
      selects, and branches */
   uint64_t lex_cmps, lex_brs;
+  /* those left as they were that arm64 makes a compare and a subtract with
+     carry of (isel.c find_cmp_chains) */
+  uint64_t lex_sbcs;
   /* loop exits the final layout took from the loop's other way out (ir.c
      dfs_defer_exit) */
   uint64_t exit_defers;

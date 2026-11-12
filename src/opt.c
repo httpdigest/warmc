@@ -3449,21 +3449,6 @@ static void lx_side(IrFunc *f, LxSide *s) {
   s->W = W;
 }
 
-/* a less or a greater, strict or not, signed or not */
-static bool lx_rel(uint16_t op, bool *less, bool *strict, bool *sgn) {
-  switch (op) {
-    case I_LTU: *less = true;  *strict = true;  *sgn = false; return true;
-    case I_LEU: *less = true;  *strict = false; *sgn = false; return true;
-    case I_GTU: *less = false; *strict = true;  *sgn = false; return true;
-    case I_GEU: *less = false; *strict = false; *sgn = false; return true;
-    case I_LTS: *less = true;  *strict = true;  *sgn = true;  return true;
-    case I_LES: *less = true;  *strict = false; *sgn = true;  return true;
-    case I_GTS: *less = false; *strict = true;  *sgn = true;  return true;
-    case I_GES: *less = false; *strict = false; *sgn = true;  return true;
-    default: return false;
-  }
-}
-
 /* Whether both pairs have keys of x's layout: a side that is one value's
    bits by another layout, a constant side and any other are put together,
    each member within its bits of the key. */
@@ -3486,31 +3471,17 @@ static bool lx_fits(IrFunc *f, LxCmp *x, bool sgn, uint32_t wm) {
   return true;
 }
 
-/* Whether `eq's operands equal ? cn : cm` -- cm a compare of those operands,
-   cn one of two others, or its inverse where negn -- is one compare of two
-   keys, and in *x which. */
+/* Whether `eq's operands equal ? cn : cm` (ir_lex_pair) is one compare of
+   two keys, and in *x which. */
 static bool lx_match(IrFunc *f, Ref eq, Ref cm, Ref cn, bool negn, LxCmp *x) {
-  const Inst *ei = &f->insts[eq], *mi = &f->insts[cm], *ni = &f->insts[cn];
-  if (ei->nargs != 2 || mi->nargs != 2 || ni->nargs != 2) return false;
-  const Ref *ea = ir_args(f, eq), *ma = ir_args(f, cm), *na = ir_args(f, cn);
-  if (!(ma[0] == ea[0] && ma[1] == ea[1]) && !(ma[0] == ea[1] && ma[1] == ea[0])) return false;
-  bool ml, ms, mg, nl, ns, ng;
-  if (!lx_rel(mi->op, &ml, &ms, &mg) || !lx_rel(negn ? cmp_inverse(ni->op) : ni->op, &nl, &ns, &ng))
-    return false;
-  uint32_t wm = vt_is_64((ValType)f->insts[ma[0]].type) ? 64 : 32;
-  uint32_t wn = vt_is_64((ValType)f->insts[na[0]].type) ? 64 : 32;
-  /* a signed compare of two values that are not negative is the unsigned
-     one: the firsts' may be either, the seconds' has to be that */
-  if (mg && !((ir_known_bits(f, ma[0], KB_DEPTH) | ir_known_bits(f, ma[1], KB_DEPTH)) >> (wm - 1)))
-    mg = false;
-  if (ng && ((ir_known_bits(f, na[0], KB_DEPTH) | ir_known_bits(f, na[1], KB_DEPTH)) >> (wn - 1)))
-    return false;
-  /* the lesser side first: a > b is b < a */
-  x->s[0].m = ma[ml ? 0 : 1]; x->s[1].m = ma[ml ? 1 : 0];
-  x->s[0].n = na[nl ? 0 : 1]; x->s[1].n = na[nl ? 1 : 0];
-  x->op = mg ? (ns ? I_LTS : I_LES) : (ns ? I_LTU : I_LEU);
-  lx_side(f, &x->s[0]);
-  lx_side(f, &x->s[1]);
+  IrLex p;
+  if (!ir_lex_pair(f, eq, cm, cn, negn, &p)) return false;
+  for (int j = 0; j < 2; j++) {
+    x->s[j].m = p.m[j];
+    x->s[j].n = p.n[j];
+    lx_side(f, &x->s[j]);
+  }
+  x->op = p.sgn ? (p.strict ? I_LTS : I_LES) : (p.strict ? I_LTU : I_LEU);
   /* the keys are laid out as a side that is one value's bits has them: the
      first such side the other fits beside */
   LxSide s0 = x->s[0], s1 = x->s[1];
@@ -3520,7 +3491,7 @@ static bool lx_match(IrFunc *f, Ref eq, Ref cm, Ref cn, bool negn, LxCmp *x) {
     x->s[1] = s1;
     x->W = x->s[k].W;
     x->c = x->s[k].c;
-    if (lx_fits(f, x, mg, wm)) return true;
+    if (lx_fits(f, x, p.sgn, p.wm)) return true;
   }
   return false;
 }
@@ -3563,12 +3534,8 @@ static Ref lx_key(IrFunc *f, uint32_t bi, uint32_t *idx, const LxCmp *x, const L
    alone: the keys' compare. */
 static bool fold_lex_select(IrFunc *f, uint32_t bi, uint32_t *idx, Ref v, const uint32_t *uses) {
   Inst *in = &f->insts[v];
-  if (in->nargs != 3 || !uses) return false;
-  Ref *a = ir_args(f, v);
-  Ref c = a[2];
-  uint16_t cop = f->insts[c].op;
-  if (cop != I_EQ && cop != I_NE) return false;
-  Ref cn = a[cop == I_EQ ? 0 : 1], cm = a[cop == I_EQ ? 1 : 0];
+  Ref c, cm, cn;
+  if (!uses || !ir_lex_select(f, v, &c, &cm, &cn)) return false;
   if (c >= f->fold_n || cn >= f->fold_n || cm >= f->fold_n ||
       uses[c] != 1 || uses[cn] != 1 || uses[cm] != 1)
     return false;
@@ -3577,7 +3544,7 @@ static bool fold_lex_select(IrFunc *f, uint32_t bi, uint32_t *idx, Ref v, const 
   Ref k0 = lx_key(f, bi, idx, &x, &x.s[0]);
   Ref k1 = lx_key(f, bi, idx, &x, &x.s[1]);
   in = &f->insts[v];
-  a = ir_args(f, v);
+  Ref *a = ir_args(f, v);
   in->op = x.op;
   in->nargs = 2;
   a[0] = k0;

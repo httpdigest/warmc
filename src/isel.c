@@ -2481,6 +2481,29 @@ static int cch_cost(IrFunc *f, Ref c) {
    Selects and branches on a chain read its flags; anything else, the 0 or 1
    a cset makes of them. */
 #define CCH_MAX 4
+
+/* Two pairs in order (ir.h ir_lex_pair), left a select of two compares on
+   a third because neither pair is one value's bits (opt.c lx_match) -- a
+   sort's comparator on a key and a tie-break, two 128-bit numbers in
+   halves: a compare of the seconds and a subtract with carry of the firsts,
+   cmp and sbcs, whose flags are the whole difference's, its borrow for an
+   unsigned less and its sign against its overflow for a signed one, where
+   three compares, two csets and a csel made a 0 or 1 to test again.  Less
+   or equal is not greater: the pairs the other way round, and no borrow
+   (emit_lex).  A chain like an and of compares: taken in by the selects and
+   the branch that test it, the first side of an and or an or.  Each of its
+   three compares is read by the select alone, in its block. */
+#define CCH_LEX 3
+static bool cch_lex(Isel *s, const uint32_t *uses, Ref v, uint32_t bi) {
+  IrFunc *f = s->f;
+  Ref part[3];
+  IrLex x;
+  if (!ir_lex_select(f, v, &part[0], &part[1], &part[2])) return false;
+  for (int k = 0; k < 3; k++)
+    if (uses[part[k]] != 1 || f->insts[part[k]].block != bi) return false;
+  return ir_lex_pair(f, part[0], part[1], part[2], false, &x) && !warmc_getenv("WARMC_NO_LEX_SBC");
+}
+
 static void find_cmp_chains(Isel *s, const uint32_t *uses, const uint8_t *blocked) {
   IrFunc *f = s->f;
   uint32_t n = f->ninsts;
@@ -2493,6 +2516,13 @@ static void find_cmp_chains(Isel *s, const uint32_t *uses, const uint8_t *blocke
     for (uint32_t i = 0; i < b->ninsts; i++) {
       Ref v = b->insts[i];
       Inst *in = &f->insts[v];
+      if (in->op == I_SELECT && cch_lex(s, uses, v, bi)) {
+        Ref *a = ir_args(f, v);
+        len[v] = 2;
+        s->cchain[v] = CCH_LEX;
+        s->folded[a[0]] = s->folded[a[1]] = s->folded[a[2]] = 1;
+        continue;
+      }
       if ((in->op != I_AND && in->op != I_OR) || in->nargs != 2 || in->type != VT_I32) continue;
       if (!fa_own(s, v)) continue;
       Ref *a = ir_args(f, v);
@@ -5072,7 +5102,10 @@ static int produce_body(IrFunc *f, ObjBuilder *obj, const OptOpts *opt,
   if (early) g_stats.early_rets++;
   g_stats.small_loops += nsmall;
   for (uint32_t i = 0; i < f->nblocks; i++) g_stats.loop_tops += f->loop_top[i] != UINT32_MAX;
-  for (uint32_t i = 0; i < f->ninsts; i++) g_stats.ccmp_chains += s->cchain[i] != 0;
+  for (uint32_t i = 0; i < f->ninsts; i++) {
+    g_stats.ccmp_chains += s->cchain[i] && s->cchain[i] != CCH_LEX;
+    g_stats.lex_sbcs += s->cchain[i] == CCH_LEX;
+  }
   Buf lead;
   memset(&lead, 0, sizeof lead);
   Reloc lead_rel;

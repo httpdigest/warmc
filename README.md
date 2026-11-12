@@ -1645,7 +1645,22 @@ it would each take a cycle: musl's `strtod` carries its first limb round a
 loop by `k == a && !x[k]` (`cbench/strtod` takes 0.85 the time). A
 `ref.is_null` is such a compare too, of the pointer with zero: luawasm's
 test for nil, a null reference and a zero payload, is a `cmp` and a `ccmp`
-where it was six instructions (`WARMC_NO_NULLCCMP=1` turns it off). A
+where it was six instructions (`WARMC_NO_NULLCCMP=1` turns it off). Two
+pairs in order that `fold` left a select of two compares on a third --
+`a.m == b.m ? a.n < b.n : a.m < b.m` of four separate values, which no one
+compare of two keys is: a sort's comparator on a key and a tie-break, two
+128-bit numbers in halves -- are on arm64 a `cmp` of the seconds and an
+`sbcs` of the firsts, whose flags are the whole difference's: its borrow,
+`lo`, for an unsigned less and `lt` for a signed one, and for a less or
+equal the pairs the other way round and `hs` or `ge`; each compare in its
+own width, a constant second member the `cmp`'s or `cmn`'s immediate. It is
+a chain like the and of compares -- read as flags by the selects and the
+branch that test it, the first side of an and or an or with another compare
+-- where three compares, two `cset`s and a `csel` made a 0 or 1 to test
+again; each of the three compares is read by the select alone, in its
+block (`cppbench/dijkstra` runs 0.89 the instructions, `cppbench/sort`
+0.92, `rsbench/sortkey` and `rsbench/dijkstra` 0.94, `cbench/int128` 0.95;
+`WARMC_NO_LEX_SBC=1` turns it off, `--stats` counts `lex_sbcs`). A
 branch on a null test alone is a `cbz` of the reference, and on the `eqz`
 of one -- `br_on_non_null`, luawasm's `if x` -- a `cbnz`, where a `cmp` and
 a `cset` made a 0 or 1 for a `cbz` to test again (on x86-64 a `test` and a
@@ -2617,9 +2632,9 @@ Most of the suite is **differential**. warmc's output is compared with:
   `vec_sat_nofold.wat` and `vec_narrow.wat` by `test/gen_vec_sat.py`,
   `lockstep.wat` and `lockstep_nodce.wat` by `test/gen_lockstep.py`,
   `carried_dep.wat` by `test/gen_carried_dep.py`, `sink_use.wat` by
-  `test/gen_sink.py` and `lex_cmp.wat` by `test/gen_lex_cmp.py`, which also
-  say what `--stats` counts for each of their functions compiled alone
-  (`--each`)
+  `test/gen_sink.py`, `lex_cmp.wat` by `test/gen_lex_cmp.py` and
+  `lex_sbc.wat` by `test/gen_lex_sbc.py`, which also say what `--stats`
+  counts for each of their functions compiled alone (`--each`)
 - mutants of a transform -- a test it makes dropped or loosened, a bound
   moved, an operand swapped -- each of which some test must tell from the
   transform, or the spec names it equivalent and why (`make
