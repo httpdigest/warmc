@@ -51,7 +51,7 @@ Hello world!
   (x86-64), with `include/warm.h` for what the standard has no word for. It
   compiles a whole module at once to the code `-c` makes, in less memory
   than wasmtime takes, or tiered: ready to run at `-O0` in a fraction of a
-  full compile's time (Go's `net/http` server in 170 ms, where wasmtime
+  full compile's time (Go's `net/http` server in 195 ms, where wasmtime
   takes 256), the optimised code sent in once a thread of the library's has
   made it. Each store is apart from the others, its GC heap and collector
   its own, and threads run in different stores at once: a server calls into
