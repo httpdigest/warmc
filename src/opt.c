@@ -21743,6 +21743,17 @@ static bool ls_left_before(const IrFunc *f, const uint8_t *inloop, const uint8_t
   }
 }
 
+/* Whether an edge of block b to a handler hands x on. */
+static bool ls_eh_reads(const IrFunc *f, uint32_t bi, Ref x) {
+  const Block *b = &f->blocks[bi];
+  for (uint32_t e = 0; e < b->nsuccs; e++) {
+    if (!b->succs[e].eh) continue;
+    for (uint32_t j = 0; j < b->succs[e].nargs; j++)
+      if (b->succs[e].args[j] == x) return true;
+  }
+  return false;
+}
+
 /* A run over the loops; *again where one had to wait for the next. */
 static bool pass_iv_lockstep(IrFunc *f, bool *again) {
   if (warmc_getenv("WARMC_NO_LOCKSTEP")) return false;
@@ -22113,6 +22124,118 @@ static bool pass_iv_lockstep(IrFunc *f, bool *again) {
   return changed;
 }
 
+
+/* ---- a value made where it is read --------------------------------------
+
+   A cheap value of one other and a constant is made in the block that is
+   above all its readers and below every other such, ahead of its first
+   reader there, when that is not the block it was made in and its operand
+   is read there too: the operand lives that far anyway, and the value no
+   longer lives from the one block to the other -- across a call in
+   between, in a register every run of the function saves (gobench/recurse's
+   fib made n - 2 at the top of its loop, read where the loop goes round, n
+   read there as well: a third callee-saved register, saved and restored on
+   every call), or round a loop that only what comes after it reads it from.
+   The operand may be the block's own parameter, where its one way in hands
+   the operand on as that: a loop's way out, closed.  Not into a loop
+   deeper than where it was made (WARMC_NO_SINK=1; --stats counts sunk). */
+static uint32_t sink_above(const IrFunc *f, uint32_t a, uint32_t b) {
+  while (a != b) {
+    uint32_t *lower = f->blocks[a].rpo > f->blocks[b].rpo ? &a : &b;
+    uint32_t d = f->blocks[*lower].idom;
+    if (d == REF_NONE || d == *lower) return f->entry;
+    *lower = d;
+  }
+  return a;
+}
+
+static bool pass_sink(IrFunc *f) {
+  if (warmc_getenv("WARMC_NO_SINK")) return false;
+  bool changed = false;
+  uint32_t n0 = f->ninsts;
+  UseIdx ui = use_index(f);
+  LsEsc xi = ls_esc_index(f);
+  for (uint32_t oi = 0; oi < f->norder; oi++) {
+    uint32_t bi = f->order[oi];
+    for (uint32_t i = 0; i < f->blocks[bi].ninsts; i++) {
+      Ref v = f->blocks[bi].insts[i];
+      if (v >= n0) continue;
+      const Inst *in = &f->insts[v];
+      ValType t = (ValType)in->type;
+      uint64_t c;
+      if (t != VT_I32 && t != VT_I64) continue;
+      switch (in->op) {
+        case I_ADD: case I_SUB: case I_AND: case I_OR: case I_XOR:
+        case I_SHL: case I_SHRU: case I_SHRS:
+          break;
+        default:
+          continue;
+      }
+      /* (an operand this pass made is in the block its reader is) */
+      Ref x = ir_args(f, v)[0];
+      if (x >= n0 || !is_const(f, ir_args(f, v)[1], &c) || is_const(f, x, &c)) continue;
+      /* the block above all that read it */
+      uint32_t ub = UINT32_MAX;
+      bool eh = false;
+      for (uint32_t u = ui.first[v]; u != UINT32_MAX; u = ui.next[u]) {
+        uint32_t rb = f->insts[ui.user[u]].block;
+        ub = ub == UINT32_MAX ? rb : sink_above(f, ub, rb);
+      }
+      for (uint32_t u = xi.first[v]; u != UINT32_MAX; u = xi.next[u]) {
+        ub = ub == UINT32_MAX ? xi.blk[u] : sink_above(f, ub, xi.blk[u]);
+        eh |= ls_eh_reads(f, xi.blk[u], v);
+      }
+      if (ub == UINT32_MAX || ub == bi || eh) continue;
+      if (f->blocks[ub].loop_depth > f->blocks[bi].loop_depth) continue;
+      Block *U = &f->blocks[ub];
+      if (U->npreds == 1) {
+        const Edge *pe = iv_edge(f, U->preds[0], ub);
+        for (uint32_t a = 0; pe && a < pe->nargs && a < U->nparams; a++)
+          if (pe->args[a] == x) { x = U->params[a]; break; }
+      }
+      /* the first that reads it there, and whether another reads its operand */
+      uint32_t at = U->ninsts;
+      bool there = false;
+      for (uint32_t k = U->ninsts; k-- > 0;) {
+        Ref r = U->insts[k];
+        for (uint32_t a = 0; a < f->insts[r].nargs; a++) {
+          if (ir_args(f, r)[a] == v) at = k;
+          else if (ir_args(f, r)[a] == x) there = true;
+        }
+      }
+      for (uint32_t u = x < n0 ? xi.first[x] : UINT32_MAX; u != UINT32_MAX && !there; u = xi.next[u])
+        there = xi.blk[u] == ub;
+      if (!there) continue;
+      /* (read by the block's end alone, and the block ends in a call a
+         handler stands behind: nothing is made after that) */
+      if (at == U->ninsts && ir_block_has_eh(f, ub)) continue;
+      Ref args[2] = { x, ir_args(f, v)[1] };
+      Ref w = emit_before(f, ub, &at, (IrOp)in->op, t, args, 2, 0);
+      for (uint32_t u = ui.first[v]; u != UINT32_MAX; u = ui.next[u]) {
+        Ref r = ui.user[u];
+        for (uint32_t a = 0; a < f->insts[r].nargs; a++)
+          if (ir_args(f, r)[a] == v) ir_args(f, r)[a] = w;
+      }
+      for (uint32_t u = xi.first[v]; u != UINT32_MAX; u = xi.next[u]) {
+        Block *b = &f->blocks[xi.blk[u]];
+        if ((b->term == T_BRIF || b->term == T_BRTABLE) && b->term_arg == v) b->term_arg = w;
+        for (uint32_t k = 0; k < b->nret; k++)
+          if (b->ret_args[k] == v) b->ret_args[k] = w;
+        for (uint32_t e = 0; e < b->nsuccs; e++)
+          for (uint32_t a = 0; a < b->succs[e].nargs; a++)
+            if (b->succs[e].args[a] == v) b->succs[e].args[a] = w;
+      }
+      /* (where it was made nothing reads it now: a reader left behind
+         would be the verifier's to find) */
+      ir_make_nop(&f->insts[v]);
+      g_stats.sunk++;
+      changed = true;
+    }
+  }
+  use_index_free(&ui);
+  ls_esc_free(&xi);
+  return changed;
+}
 
 static bool addr_only_zero_disp_uses(IrFunc *f, const UseIdx *ui, Ref ea,
                                      uint32_t *mem) {
@@ -30583,6 +30706,10 @@ void ir_optimize(IrFunc *f, const OptOpts *o) {
   }
   if (o->tchain && TP("test_chain", pass_test_chain(f))) ir_verify(f, "post-test-chain");
   if (o->arrbias && TP("arr_bias", pass_array_bias(f))) ir_verify(f, "post-arr-bias");
+  if (o->strength && TP("sink", pass_sink(f))) {
+    if (o->dce) pass_dce(f);
+    ir_verify(f, "post-sink");
+  }
   if (o->print_ir) ir_print(f, "optimised");
   if (warmc_getenv("WARMC_BCE_REPORT")) bce_report(f);
   ir_verify(f, "post-opt");
