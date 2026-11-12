@@ -37,8 +37,9 @@ M = {
         bf_mark(f, tested, bloom, ir_args(f, c)[0]);''', '''is_const(f, ir_args(f, c)[1], &k))
         {}'''),
  'mark_offset': m('      y = ir_args(f, y)[0];\n    else break;', '      break;\n    else break;'),
- 'bloom_off': m('if (!tested[x] && (f->insts[x].op == I_PARAM || !bloom[bf_key(f, x)])) continue;',
-                'if (!tested[x]) continue;'),
+ # (the test of a select's condition, three lines above this one's twin, is way_select.py's)
+ 'bloom_off': m('x >= n1) continue;\n        if (!tested[x] && (f->insts[x].op == I_PARAM || !bloom[bf_key(f, x)])) continue;',
+                'x >= n1) continue;\n        if (!tested[x]) continue;'),
  'def_off': m('if (def == bi && (def = bf_def(f, x, bi, 3)) == UINT32_MAX) continue;',
               'if (def == bi) continue;'),
  'cache_block': m('if (x == lx && bi == lb) sx = ls;', 'if (x == lx) sx = ls;'),

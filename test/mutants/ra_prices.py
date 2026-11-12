@@ -38,7 +38,7 @@ M = {
  'brf_epoch': m(O, '      } else if (s->cmp_ref == c && s->cmp_epoch == B->flags_epoch &&',
                 '      } else if (s->cmp_ref == c &&'),
  # the array index's low half
- 'arr_low32': m(C, '      return j == 1 && !off;', '      return false && !off;'),
+ 'arr_low32': m(C, '      return (j == 1 || ((in->imm2 & GCF_BIASARG)', '      return (false || ((in->imm2 & GCF_BIASARG)'),
  # a constant no read of which a register would save anything takes none
  'cnone_off': m(R, '    bool cn = !warmc_getenv("WARMC_RA_CNONE_OFF");', '    bool cn = false;'),
  'cnone_any': m(R, '        if (cn && cw[i] <= 0) {', '        if (cn) {'),

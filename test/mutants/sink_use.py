@@ -33,7 +33,7 @@ M = {
  'insts_only': m('        ub = ub == UINT32_MAX ? xi.blk[u] : sink_above(f, ub, xi.blk[u]);\n', ''),
  'edges_only': m('        ub = ub == UINT32_MAX ? rb : sink_above(f, ub, rb);\n', '        (void)rb;\n'),
  # the operand
- 'operand_anywhere': m('      if (!there) continue;\n      Ref args[2]', '      Ref args[2]'),
+ 'operand_anywhere': m('      if (!there) continue;\n      /* (read by the block', '      /* (read by the block'),
  'operand_by_inst': m('        there = xi.blk[u] == ub;\n', '        there = false;\n'),
  'operand_by_edge': m(SCAN, '          if (ir_args(f, r)[a] == v) at = k;'),
  'no_parameter': m('          if (pe->args[a] == x) { x = U->params[a]; break; }', '          if (0) { x = U->params[a]; break; }'),
