@@ -973,7 +973,101 @@ static uint32_t rc_path(IrFunc *f, Ref v, Ref p, uint16_t op, uint8_t ty,
   return 0;
 }
 
+/* The chain's terms that read the carried value themselves -- h << 5 in
+   h * 33 + c -- wait on it as the chain does, and are added after it: the
+   others among themselves, then the carried value, then each of those.
+   Added among the others such a term gained nothing, and a shift an add
+   would have taken in with h took an instruction of its own beside an
+   extension, or beside another shift of h.  The terms are the chain's and
+   those of a term that is itself such a sum, made in the loop for the
+   chain alone.  RC_NONE: no term reads p, and the chain is the caller's;
+   RC_ALL: every one does, and the chain stays as it is; RC_DONE: remade
+   (WARMC_NO_CARRIED_DEP=1 leaves them all to the caller). */
+enum { RC_NONE, RC_ALL, RC_DONE };
+
+static bool rc_leaves(IrFunc *f, Ref v, const Inst *ri, const uint32_t *uses, uint32_t nuses,
+                      uint32_t lo, Ref *leaf, uint32_t *nl) {
+  const Inst *in = &f->insts[v];
+  if (v < nuses && uses[v] == 1 && in->op == ri->op && in->type == ri->type && in->imm2 == ri->imm2 &&
+      in->nargs == 2 && f->blocks[in->block].rpo >= lo)
+    return rc_leaves(f, ir_args(f, v)[0], ri, uses, nuses, lo, leaf, nl) &&
+           rc_leaves(f, ir_args(f, v)[1], ri, uses, nuses, lo, leaf, nl);
+  if (*nl == RC_LINKS) return false;
+  leaf[(*nl)++] = v;
+  return true;
+}
+
+static int rc_dependents(IrFunc *f, Ref r, Ref p, const Ref *term, uint32_t n,
+                         const uint32_t *uses, uint32_t nuses, uint32_t lo, bool nk) {
+  const Inst *ri = &f->insts[r];
+  uint16_t op = ri->op;
+  ValType ty = (ValType)ri->type;
+  uint64_t lane = ri->imm2;
+  Ref leaf[RC_LINKS];
+  bool dep[RC_LINKS];
+  uint32_t nl = 0, ndep = 0;
+  for (uint32_t k = n; k-- > 0;)
+    if (!rc_leaves(f, term[k], ri, uses, nuses, lo, leaf, &nl)) return RC_NONE;
+  for (uint32_t k = 0; k < nl; k++) {
+    const Inst *li = &f->insts[leaf[k]];
+    if (leaf[k] == p) return RC_ALL;
+    dep[k] = false;
+    for (uint32_t a = 0; a < li->nargs && !dep[k]; a++) dep[k] = ir_args(f, leaf[k])[a] == p;
+    ndep += dep[k];
+  }
+  if (!ndep) return RC_NONE;
+  if (ndep == nl) return RC_ALL;
+
+  uint32_t rb = ri->block, at = 0;
+  const Block *b = &f->blocks[rb];
+  while (at < b->ninsts && b->insts[at] != r) at++;
+  if (at == b->ninsts) return RC_ALL;
+  /* the others, their constants one constant */
+  uint64_t kv = 0, c;
+  bool have_k = false;
+  Ref acc = REF_NONE;
+  for (uint32_t k = 0; k < nl; k++) {
+    if (dep[k]) continue;
+    if (!nk && is_const(f, leaf[k], &c)) {
+      if (!have_k) kv = c;
+      else fold_int_binop(op, ty, kv, c, &kv);
+      have_k = true;
+      continue;
+    }
+    Ref pr[2] = { acc, leaf[k] };
+    acc = acc == REF_NONE ? leaf[k] : emit_before(f, rb, &at, (IrOp)op, ty, pr, 2, 0);
+    f->insts[acc].imm2 = acc == leaf[k] ? f->insts[acc].imm2 : lane;
+  }
+  /* the carried value, the constant beside it */
+  Ref t = p;
+  if (acc != REF_NONE) {
+    Ref pr[2] = { acc, p };
+    t = emit_before(f, rb, &at, (IrOp)op, ty, pr, 2, 0);
+    f->insts[t].imm2 = lane;
+  }
+  if (have_k) {
+    Ref pr[2] = { t, emit_before(f, rb, &at, I_CONST, ty, NULL, 0, trunc_to(ty, kv)) };
+    t = emit_before(f, rb, &at, (IrOp)op, ty, pr, 2, 0);
+  }
+  /* each that waits on it, the last where the chain ended */
+  for (uint32_t k = 0, left = ndep; k < nl; k++) {
+    if (!dep[k]) continue;
+    Ref pr[2] = { t, leaf[k] };
+    if (--left) {
+      t = emit_before(f, rb, &at, (IrOp)op, ty, pr, 2, 0);
+      f->insts[t].imm2 = lane;
+    } else {
+      Ref *ra = ir_args(f, r);
+      ra[0] = t;
+      ra[1] = leaf[k];
+    }
+  }
+  /* (the links the chain had, and the sums taken apart, nothing reads now) */
+  return RC_DONE;
+}
+
 static bool pass_reassoc_carried(IrFunc *f, bool fre) {
+  uint32_t nuses = f->ninsts;
   uint32_t *uses = count_uses(f);
   bool changed = false;
   for (uint32_t oi = 0; oi < f->norder; oi++) {
@@ -1001,7 +1095,7 @@ static bool pass_reassoc_carried(IrFunc *f, bool fre) {
         /* link[0] is r, link[n - 1] the one that reads p */
         Ref link[RC_LINKS], term[RC_LINKS];
         uint32_t n = rc_path(f, r, p, op, ty, lane, uses, f->blocks[h].rpo, link, 0);
-        if (n < 2) continue;
+        if (!n) continue;
         bool twice = false;
         for (uint32_t k = 0; k < n; k++) {
           Ref *a = ir_args(f, link[k]);
@@ -1010,6 +1104,12 @@ static bool pass_reassoc_carried(IrFunc *f, bool fre) {
           if (term[k] == p) twice = true;
         }
         if (twice) continue;
+        if (!warmc_getenv("WARMC_NO_CARRIED_DEP")) {
+          int d = rc_dependents(f, r, p, term, n, uses, nuses, f->blocks[h].rpo, nk);
+          if (d == RC_DONE) { changed = true; g_stats.reassoc++; }
+          if (d != RC_NONE) continue;
+        }
+        if (n < 2) continue;
 
         /* the constants among the terms are one constant: an unrolled
            counter's steps are */
