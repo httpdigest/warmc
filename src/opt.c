@@ -3350,6 +3350,242 @@ static bool pass_common_factor(IrFunc *f) {
   return any;
 }
 
+/* ---- two pairs in order, one compare --------------------------------------
+
+   A pair ordered by its first member and, where two firsts are equal, by
+   its second -- a distance and a node in a priority queue, a key and the
+   number it came in with -- is compared as `a.m == b.m ? a.n < b.n :
+   a.m < b.m`: a select of two compares on a third, or three branches.  It
+   is one compare of two keys, each the first member above the second:
+   where a pair is the bits of one value, the first its low bits and the
+   second all the rest, the key is the value with the two changed over, a
+   rotation; where the first is the high bits it is the value itself; two
+   constants are one constant; and any other pair is put together with a
+   shift and an or, which only pays where the other key is one of those.
+   Zig's std.PriorityQueue of `struct { dist: u32, node: u32 }`, which LLVM
+   keeps in an i64, compared two of them with ten instructions where it
+   picks the lesser child and with two compares and two branches where it
+   sifts: ror, ror, cmp.
+
+   The second members compare unsigned (or signed where neither can be
+   negative, which is the same); the first members either way, a signed
+   first being the key's top bits with its sign.  Whether the firsts'
+   compare is strict does not matter, as it is read only where they differ:
+   the key's compare is as strict as the seconds'. */
+
+/* v as bits of another value: (src >> sh) & (2^w - 1), nothing above them */
+typedef struct { Ref src; uint32_t sh, w; } LxField;
+
+static LxField lx_field(IrFunc *f, Ref v, int depth) {
+  const Inst *in = &f->insts[v];
+  uint32_t W = vt_is_64((ValType)in->type) ? 64 : 32;
+  LxField r = { v, 0, W }, s;
+  uint64_t c;
+  if (depth == 4 || !in->nargs) return r;
+  const Ref *a = ir_args(f, v);
+  switch (in->op) {
+    case I_WRAP:
+      s = lx_field(f, a[0], depth + 1);
+      if (s.w > 32) s.w = 32;
+      return s;
+    case I_AND:
+      if (in->nargs != 2 || !is_const(f, a[1], &c) || !c || (c & (c + 1))) return r;
+      s = lx_field(f, a[0], depth + 1);
+      if (s.w > 64u - (uint32_t)__builtin_clzll(c)) s.w = 64u - (uint32_t)__builtin_clzll(c);
+      return s;
+    case I_SHRU:
+      if (in->nargs != 2 || !is_const(f, a[1], &c)) return r;
+      c &= W - 1;
+      s = lx_field(f, a[0], depth + 1);
+      if (s.w <= c) return r;
+      s.sh += (uint32_t)c;
+      s.w -= (uint32_t)c;
+      return s;
+    default:
+      return r;
+  }
+}
+
+/* How a pair's key is made: put together of its members, a constant, the
+   value the two are the bits of rotated by the first's width, or that
+   value as it is. */
+enum { LX_GEN, LX_CONST, LX_ROT, LX_SAME };
+typedef struct {
+  Ref m, n;          /* the first member and the second, as they are compared */
+  int kind;
+  Ref src;           /* LX_ROT, LX_SAME: the value both are bits of */
+  uint32_t W, c;     /* those: the key's width, and the second member's */
+  uint64_t cm, cn;   /* LX_CONST */
+} LxSide;
+
+typedef struct {
+  uint16_t op;       /* the keys' compare: I_LTU, I_LEU, I_LTS or I_LES */
+  uint32_t W, c;     /* a key's bits, the low c of them the second member */
+  LxSide s[2];
+} LxCmp;
+
+static void lx_side(IrFunc *f, LxSide *s) {
+  s->kind = LX_GEN;
+  s->src = REF_NONE;
+  s->W = s->c = 0;
+  s->cm = s->cn = 0;
+  if (is_const(f, s->m, &s->cm) && is_const(f, s->n, &s->cn)) {
+    s->kind = LX_CONST;
+    return;
+  }
+  LxField fm = lx_field(f, s->m, 0), fn = lx_field(f, s->n, 0);
+  if (fm.src != fn.src) return;
+  uint32_t W = vt_is_64((ValType)f->insts[fm.src].type) ? 64 : 32;
+  if (!fm.sh && fn.sh == fm.w && fn.sh + fn.w == W) {
+    s->kind = LX_ROT;
+    s->c = W - fm.w;
+  } else if (!fn.sh && fm.sh == fn.w && fm.sh + fm.w == W) {
+    s->kind = LX_SAME;
+    s->c = fn.w;
+  } else {
+    return;
+  }
+  s->src = fm.src;
+  s->W = W;
+}
+
+/* a less or a greater, strict or not, signed or not */
+static bool lx_rel(uint16_t op, bool *less, bool *strict, bool *sgn) {
+  switch (op) {
+    case I_LTU: *less = true;  *strict = true;  *sgn = false; return true;
+    case I_LEU: *less = true;  *strict = false; *sgn = false; return true;
+    case I_GTU: *less = false; *strict = true;  *sgn = false; return true;
+    case I_GEU: *less = false; *strict = false; *sgn = false; return true;
+    case I_LTS: *less = true;  *strict = true;  *sgn = true;  return true;
+    case I_LES: *less = true;  *strict = false; *sgn = true;  return true;
+    case I_GTS: *less = false; *strict = true;  *sgn = true;  return true;
+    case I_GES: *less = false; *strict = false; *sgn = true;  return true;
+    default: return false;
+  }
+}
+
+/* Whether both pairs have keys of x's layout: a side that is one value's
+   bits by another layout, a constant side and any other are put together,
+   each member within its bits of the key. */
+static bool lx_fits(IrFunc *f, LxCmp *x, bool sgn, uint32_t wm) {
+  /* a signed first member is the key's top bits, sign and all (what the
+     tests below come to as well, where known bits say of a value all that
+     the bits it is made of do: one that may be negative fits no narrower
+     place) */
+  if (sgn && wm != x->W - x->c) return false;
+  for (int j = 0; j < 2; j++) {
+    LxSide *s = &x->s[j];
+    /* (a layout is its second member's width: an i32's bits have theirs in
+       fewer than 32, an i64's that are compared with them in 32 or more) */
+    if (s->kind >= LX_ROT && s->c != x->c) s->kind = LX_GEN;
+    if (s->kind >= LX_ROT) continue;
+    if (ir_known_bits(f, s->n, KB_DEPTH) >> x->c) return false;
+    /* (a signed first member is as wide as its place: the test above) */
+    if (ir_known_bits(f, s->m, KB_DEPTH) >> (x->W - x->c)) return false;
+  }
+  return true;
+}
+
+/* Whether `eq's operands equal ? cn : cm` -- cm a compare of those operands,
+   cn one of two others, or its inverse where negn -- is one compare of two
+   keys, and in *x which. */
+static bool lx_match(IrFunc *f, Ref eq, Ref cm, Ref cn, bool negn, LxCmp *x) {
+  const Inst *ei = &f->insts[eq], *mi = &f->insts[cm], *ni = &f->insts[cn];
+  if (ei->nargs != 2 || mi->nargs != 2 || ni->nargs != 2) return false;
+  const Ref *ea = ir_args(f, eq), *ma = ir_args(f, cm), *na = ir_args(f, cn);
+  if (!(ma[0] == ea[0] && ma[1] == ea[1]) && !(ma[0] == ea[1] && ma[1] == ea[0])) return false;
+  bool ml, ms, mg, nl, ns, ng;
+  if (!lx_rel(mi->op, &ml, &ms, &mg) || !lx_rel(negn ? cmp_inverse(ni->op) : ni->op, &nl, &ns, &ng))
+    return false;
+  uint32_t wm = vt_is_64((ValType)f->insts[ma[0]].type) ? 64 : 32;
+  uint32_t wn = vt_is_64((ValType)f->insts[na[0]].type) ? 64 : 32;
+  /* a signed compare of two values that are not negative is the unsigned
+     one: the firsts' may be either, the seconds' has to be that */
+  if (mg && !((ir_known_bits(f, ma[0], KB_DEPTH) | ir_known_bits(f, ma[1], KB_DEPTH)) >> (wm - 1)))
+    mg = false;
+  if (ng && ((ir_known_bits(f, na[0], KB_DEPTH) | ir_known_bits(f, na[1], KB_DEPTH)) >> (wn - 1)))
+    return false;
+  /* the lesser side first: a > b is b < a */
+  x->s[0].m = ma[ml ? 0 : 1]; x->s[1].m = ma[ml ? 1 : 0];
+  x->s[0].n = na[nl ? 0 : 1]; x->s[1].n = na[nl ? 1 : 0];
+  x->op = mg ? (ns ? I_LTS : I_LES) : (ns ? I_LTU : I_LEU);
+  lx_side(f, &x->s[0]);
+  lx_side(f, &x->s[1]);
+  /* the keys are laid out as a side that is one value's bits has them: the
+     first such side the other fits beside */
+  LxSide s0 = x->s[0], s1 = x->s[1];
+  for (int k = 0; k < 2; k++) {
+    if ((k ? s1 : s0).kind < LX_ROT) continue;
+    x->s[0] = s0;
+    x->s[1] = s1;
+    x->W = x->s[k].W;
+    x->c = x->s[k].c;
+    if (lx_fits(f, x, mg, wm)) return true;
+  }
+  return false;
+}
+
+/* what a key costs to make */
+static int lx_cost(const LxSide *s) {
+  return s->kind == LX_GEN ? 2 : s->kind == LX_ROT ? 1 : 0;
+}
+
+/* a member where a key is put together, as wide as the key */
+static Ref lx_member(IrFunc *f, uint32_t bi, uint32_t *idx, Ref v, ValType t) {
+  if (t == VT_I64 && (ValType)f->insts[v].type == VT_I32)
+    return emit_before(f, bi, idx, I_EXTENDU, VT_I64, &v, 1, 0);
+  return v;
+}
+
+static Ref lx_key(IrFunc *f, uint32_t bi, uint32_t *idx, const LxCmp *x, const LxSide *s) {
+  ValType t = x->W == 64 ? VT_I64 : VT_I32;
+  switch (s->kind) {
+    case LX_SAME:
+      return s->src;
+    case LX_ROT: {
+      Ref ra[2] = { s->src, emit_before(f, bi, idx, I_CONST, t, NULL, 0, x->W - x->c) };
+      return emit_before(f, bi, idx, I_ROTR, t, ra, 2, 0);
+    }
+    case LX_CONST:
+      return emit_before(f, bi, idx, I_CONST, t, NULL, 0, (s->cm << x->c) | s->cn);
+    default: {
+      Ref sa[2], oa[2];
+      sa[0] = lx_member(f, bi, idx, s->m, t);
+      oa[1] = lx_member(f, bi, idx, s->n, t);
+      sa[1] = emit_before(f, bi, idx, I_CONST, t, NULL, 0, x->c);
+      oa[0] = emit_before(f, bi, idx, I_SHL, t, sa, 2, 0);
+      return emit_before(f, bi, idx, I_OR, t, oa, 2, 0);
+    }
+  }
+}
+
+/* select(cn, cm, eq) and select(cm, cn, ne), each of the three read there
+   alone: the keys' compare. */
+static bool fold_lex_select(IrFunc *f, uint32_t bi, uint32_t *idx, Ref v, const uint32_t *uses) {
+  Inst *in = &f->insts[v];
+  if (in->nargs != 3 || !uses) return false;
+  Ref *a = ir_args(f, v);
+  Ref c = a[2];
+  uint16_t cop = f->insts[c].op;
+  if (cop != I_EQ && cop != I_NE) return false;
+  Ref cn = a[cop == I_EQ ? 0 : 1], cm = a[cop == I_EQ ? 1 : 0];
+  if (c >= f->fold_n || cn >= f->fold_n || cm >= f->fold_n ||
+      uses[c] != 1 || uses[cn] != 1 || uses[cm] != 1)
+    return false;
+  LxCmp x;
+  if (!lx_match(f, c, cm, cn, false, &x) || warmc_getenv("WARMC_NO_LEX_CMP")) return false;
+  Ref k0 = lx_key(f, bi, idx, &x, &x.s[0]);
+  Ref k1 = lx_key(f, bi, idx, &x, &x.s[1]);
+  in = &f->insts[v];
+  a = ir_args(f, v);
+  in->op = x.op;
+  in->nargs = 2;
+  a[0] = k0;
+  a[1] = k1;
+  g_stats.lex_cmps++;
+  return true;
+}
+
 static bool fold_block(IrFunc *f, uint32_t bi, const OptOpts *o, const uint32_t *uses) {
   Block *b = &f->blocks[bi];
   bool changed = false;
@@ -4119,6 +4355,10 @@ static bool fold_block(IrFunc *f, uint32_t bi, const OptOpts *o, const uint32_t 
           ir_make_nop(in);
           changed = true;
           g_stats.folded++;
+        } else if (fold_lex_select(f, bi, &i, v, uses)) {
+          in = &f->insts[v]; a = ir_args(f, v);
+          changed = true;
+          g_stats.folded++;
         } else {
           Ref t = select_trunc_sat(f, v);
           if (t != REF_NONE) {
@@ -4384,6 +4624,7 @@ static bool fold_flag_branches(IrFunc *f, const uint32_t *uses) {
 static bool pass_fold(IrFunc *f, const OptOpts *o) {
   bool changed = false;
   uint32_t *uses = count_uses_shared(f, UC_FOLD);
+  f->fold_n = f->ninsts;
   for (uint32_t oi = 0; oi < f->norder; oi++)
     if (fold_block(f, f->order[oi], o, uses)) changed = true;
   if (fold_flag_branches(f, uses)) changed = true;
@@ -6092,8 +6333,144 @@ static bool merge_blocks(IrFunc *f) {
   return merged;
 }
 
+/* The same test as three branches: block bi branches on whether two firsts
+   are equal, to two blocks that do nothing but compare -- the seconds where
+   they are, the firsts where they are not -- and branch on to the same two
+   places with the same values.  bi branches there itself, on the keys'
+   compare; the two blocks stay for what else enters them, and what such a
+   way in hands them, their parameters, bi's own branch reads as bi handed
+   it.  Not where that is more work each time than the first compare and
+   its branch were: a key put together of two members in the loop the test
+   is in, beside one that takes an instruction too. */
+static bool lx_plain(const IrFunc *f, const Block *b) {
+  for (uint32_t i = 0; i < b->ninsts; i++)
+    switch (f->insts[b->insts[i]].op) {
+      case I_CONST: case I_WRAP: case I_EXTENDU: case I_SHRU: case I_AND:
+      case I_EQ: case I_NE: case I_LTS: case I_LTU: case I_GTS: case I_GTU:
+      case I_LES: case I_LEU: case I_GES: case I_GEU:
+        break;
+      default:
+        return false;
+    }
+  return true;
+}
+
+/* v as block bi has it where it branches to one of the two blocks: what
+   bi hands the block where v is that block's parameter -- one a second way
+   in gives it -- and v itself otherwise */
+static Ref lx_handed(IrFunc *f, uint32_t bi, Ref v, uint32_t b0, uint32_t b1) {
+  const Inst *in = &f->insts[v];
+  if (in->op != I_PARAM || (in->block != b0 && in->block != b1)) return v;
+  const Block *t = &f->blocks[in->block], *b = &f->blocks[bi];
+  const Edge *e = &b->succs[b->succs[0].target == in->block ? 0 : 1];
+  for (uint32_t k = 0; k < t->nparams; k++)
+    if (t->params[k] == v) return e->args[k];
+  return v;
+}
+
+/* whether two edges of the two blocks go to one place with the same values,
+   a constant being the same as an equal one */
+static bool lx_same_edge(IrFunc *f, uint32_t bi, const Edge *p, const Edge *q, uint32_t b0, uint32_t b1) {
+  if (p->target != q->target) return false;
+  for (uint32_t j = 0; j < p->nargs; j++) {
+    uint64_t x, y;
+    Ref pa = lx_handed(f, bi, p->args[j], b0, b1), qa = lx_handed(f, bi, q->args[j], b0, b1);
+    if (pa == qa) continue;
+    if (!is_const(f, pa, &x) || !is_const(f, qa, &y) || x != y) return false;
+  }
+  return true;
+}
+
+/* v where block bi ends: itself, what bi hands on as it, or made again
+   there where it is one of the two blocks' own -- plain blocks, whose
+   values are constants and the shifts, masks and compares of others */
+static Ref lx_bring(IrFunc *f, uint32_t bi, uint32_t *at, Ref v, uint32_t b0, uint32_t b1) {
+  v = lx_handed(f, bi, v, b0, b1);
+  Inst in = f->insts[v];
+  if (in.block != b0 && in.block != b1) return v;
+  Ref args[2];
+  for (uint32_t k = 0; k < in.nargs; k++) args[k] = lx_bring(f, bi, at, ir_args(f, v)[k], b0, b1);
+  return emit_before(f, bi, at, (IrOp)in.op, (ValType)in.type, args, in.nargs, in.imm);
+}
+
+/* whether v is made outside the loop block bi is in, or is made in one of
+   the two blocks of nothing but such values */
+static bool lx_outside(IrFunc *f, Ref v, uint32_t bi, uint32_t b0, uint32_t b1) {
+  v = lx_handed(f, bi, v, b0, b1);
+  const Inst *in = &f->insts[v];
+  if (in->op == I_CONST) return true;
+  if (in->block != b0 && in->block != b1)
+    return f->blocks[in->block].loop_depth < f->blocks[bi].loop_depth;
+  for (uint32_t k = 0; k < in->nargs; k++)
+    if (!lx_outside(f, ir_args(f, v)[k], bi, b0, b1)) return false;
+  return true;
+}
+
+static bool lx_branch(IrFunc *f, uint32_t bi) {
+  Block *b = &f->blocks[bi];
+  if (b->term != T_BRIF) return false;
+  Ref c = b->term_arg;
+  uint16_t cop = f->insts[c].op;
+  if (cop != I_EQ && cop != I_NE) return false;
+  uint32_t se = b->succs[cop == I_EQ ? 0 : 1].target, sn = b->succs[cop == I_EQ ? 1 : 0].target;
+  Block *E = &f->blocks[se], *N = &f->blocks[sn];
+  if (E->term != T_BRIF || N->term != T_BRIF || !lx_plain(f, E) || !lx_plain(f, N)) return false;
+  bool same = lx_same_edge(f, bi, &N->succs[0], &E->succs[0], se, sn) &&
+              lx_same_edge(f, bi, &N->succs[1], &E->succs[1], se, sn);
+  if (!same && !(lx_same_edge(f, bi, &N->succs[0], &E->succs[1], se, sn) &&
+                 lx_same_edge(f, bi, &N->succs[1], &E->succs[0], se, sn)))
+    return false;
+  LxCmp x;
+  if (!lx_match(f, c, N->term_arg, E->term_arg, !same, &x)) return false;
+  int cost = 0;
+  for (int j = 0; j < 2; j++) {
+    const LxSide *s = &x.s[j];
+    if (s->kind >= LX_ROT ? !lx_outside(f, s->src, bi, se, sn)
+        : s->kind == LX_GEN && (!lx_outside(f, s->m, bi, se, sn) || !lx_outside(f, s->n, bi, se, sn)))
+      cost += lx_cost(s);
+  }
+  if (cost > 2 || warmc_getenv("WARMC_NO_LEX_CMP")) return false;
+  uint32_t at = f->blocks[bi].ninsts;
+  /* the members a key is put together of, where the two blocks made them
+     (a value both members are bits of is made above: the test of whether
+     the firsts are equal reads it) */
+  for (int j = 0; j < 2; j++) {
+    LxSide *s = &x.s[j];
+    if (s->kind != LX_GEN) continue;
+    s->m = lx_bring(f, bi, &at, s->m, se, sn);
+    s->n = lx_bring(f, bi, &at, s->n, se, sn);
+  }
+  Ref ka[2];
+  ka[0] = lx_key(f, bi, &at, &x, &x.s[0]);
+  ka[1] = lx_key(f, bi, &at, &x, &x.s[1]);
+  Ref k = emit_before(f, bi, &at, (IrOp)x.op, VT_I32, ka, 2, 0);
+  /* the ways on are the ones the firsts' compare had */
+  for (uint32_t e = 0; e < 2; e++) {
+    Edge old = f->blocks[sn].succs[e];
+    Ref *na = old.nargs ? ir_alloc(f, old.nargs * sizeof(Ref)) : NULL;
+    for (uint32_t j = 0; j < old.nargs; j++) {
+      /* (a constant of the block that goes: one of this block's) */
+      na[j] = lx_bring(f, bi, &at, old.args[j], se, sn);
+    }
+    Edge *ne = &f->blocks[bi].succs[e];
+    ne->target = old.target;
+    ne->args = na;
+    ne->nargs = ne->cap = old.nargs;
+    ne->cold = old.cold;
+  }
+  f->blocks[bi].term_arg = k;
+  g_stats.lex_brs++;
+  return true;
+}
+
 static bool pass_branch(IrFunc *f) {
   bool changed = false;
+  /* (the two blocks a branch leaves behind are no block's way in any more
+     once the ways in are counted again, below; and a block that branches
+     two ways ends in no call with a handler behind it, which is followed
+     by a jump to a block of its own) */
+  for (uint32_t oi = 0; oi < f->norder; oi++)
+    if (lx_branch(f, f->order[oi])) changed = true;
   for (uint32_t oi = 0; oi < f->norder; oi++) {
     uint32_t bi = f->order[oi];
     Block *b = &f->blocks[bi];

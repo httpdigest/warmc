@@ -425,6 +425,9 @@ typedef struct {
   uint64_t ir_gen, uc_gen;
   uint32_t *uc;
   uint32_t uc_n, uc_cap;
+  /* the instructions the fold pass's use counts cover: those there were
+     when it started (opt.c pass_fold) */
+  uint32_t fold_n;
   int uc_pass;
   /* which opcodes the function's instructions have, made at ops_gen; the
      cleanup pass the round is running (run_pass), -1 outside */
@@ -910,6 +913,9 @@ typedef struct {
      their operand or a constant, and branches on a sign, or on a bit
      through shifts and extensions, made tbz or tbnz (arm64 isel) */
   uint64_t bit_tests, way_folds, bit_brs, way_selects, way_select_made;
+  /* compares of two pairs made one compare of two keys (opt.c lx_match):
+     selects, and branches */
+  uint64_t lex_cmps, lex_brs;
   /* loop exits the final layout took from the loop's other way out (ir.c
      dfs_defer_exit) */
   uint64_t exit_defers;
