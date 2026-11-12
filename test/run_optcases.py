@@ -45,6 +45,11 @@ after even the copies of its ends, the blocks two rare ways lead to:
 
     ;; last: FUNCTION REGEX=N
 
+or, with loop, of the instructions in its loops -- from where a branch back
+goes to the branch:
+
+    ;; loop: FUNCTION REGEX=N
+
 and with what flags besides the levels the module is compiled -- on its own,
 every call checked against that too -- for a pass a flag the levels never
 give would expose:
@@ -86,7 +91,7 @@ LEVELS = ["-O0", "-O1", "-O2", "-O3"]
 RUN_TIMEOUT = float(os.environ.get("WARMC_RUN_TIMEOUT", "30"))
 RUN_LINE = re.compile(r"^;; run(?: (-O[0-3]))?: (\S+)((?: \S+)*) => (.*)$")
 STATS_LINE = re.compile(r"^;; stats(?: (-O[0-3]))?((?: -f[a-z0-9-]+)*)( a64)?: (.*)$")
-SHAPE_LINE = re.compile(r"^;; (shape|late|last): (\S+) (.*)=(\d+)$")
+SHAPE_LINE = re.compile(r"^;; (shape|late|last|loop): (\S+) (.*)=(\d+)$")
 FLAGS_LINE = re.compile(r"^;; flags: (.+)$")
 OBJDUMP = shutil.which("llvm-objdump") or shutil.which("objdump")
 # the shapes are in Apple's syntax for vectors, add.4s v0, v1, v2, which an
@@ -184,10 +189,22 @@ def shape_fails(name, dump, want, alone=False):
         elif late == "last":
             rets = [i for i, l in enumerate(lines) if re.search(r"\sret$", l)]
             lines = lines[(rets[-1] if rets else len(lines)) + 1:]
+        elif late == "loop":
+            # from each branch back, the instructions from where it goes to itself
+            at = [int(m.group(1), 16) if m else None for m in (re.match(r"\s*([0-9a-f]+):", l) for l in lines)]
+            inside = [False] * len(lines)
+            for i, l in enumerate(lines):
+                m = re.search(r"\s(?:b(?:\.\w+)?|cbn?z|tbn?z)\s.*?0x([0-9a-f]+)", l)
+                if m and at[i] is not None and int(m.group(1), 16) <= at[i]:
+                    for j in range(i + 1):
+                        if at[j] is not None and at[j] >= int(m.group(1), 16):
+                            inside[j] = True
+            lines = [l for l, k in zip(lines, inside) if k]
         got = len([l for l in lines if re.search(pat, l)])
         if got != n:
             fails.append("%s -O2: %s has %d instructions%s matching %s, not %d"
-                         % (name, fn, got, {"late": " after its ret", "last": " after its last ret"}.get(late, ""),
+                         % (name, fn, got, {"late": " after its ret", "last": " after its last ret",
+                                            "loop": " in its loops"}.get(late, ""),
                             pat, n))
     return fails
 

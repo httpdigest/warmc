@@ -2591,8 +2591,9 @@ Most of the suite is **differential**. warmc's output is compared with:
   modules each of which some pass once compiled wrong or is to transform
   (`test/run_optcases.py`, `test/cases_opt`); a module also says what
   `--stats` counts for it at each level, and how many of a function's AArch64
-  instructions at `-O2` match a pattern, in the whole function or after its
-  `ret`, where the blocks emitted after the rest go, for what changes the code
+  instructions at `-O2` match a pattern, in the whole function, after its
+  `ret`, where the blocks emitted after the rest go, or in its loops, from
+  where a branch back goes to the branch, for what changes the code
   and not what it computes, and what other flags it is compiled with besides,
   alone, every call checked again (`;; flags:`);
   `test/cases_opt/trunc_exact.wat` is made by `test/gen_fexact.py`,
