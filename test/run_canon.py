@@ -51,8 +51,8 @@ WARMC = os.path.join(ROOT, BUILD, "warmc") + (".exe" if os.name == "nt" else "")
 WASM_TOOLS = os.path.join(ROOT, BUILD, "tools", "bin",
                           "wasm-tools.exe" if os.name == "nt" else "wasm-tools")
 WORK = os.path.join(ROOT, BUILD, "canon")
-SPEC_COMMIT = "fed10b0b823b82553dd8363f16a640816f5eac65"
-SPEC_SHA256 = "27271503ddcb9c490fd518bd142088df19482d670e19c5e1ea9cff046dece576"
+SPEC_COMMIT = "585526aa1f2c7f76f07557d16e265dede38b3acb"
+SPEC_SHA256 = "d529bf7ad87ff8ccf8fac710d36e674f8097e7e7f24ed25c736ec7a127a89e09"
 SPEC_DIR = os.path.join(ROOT, BUILD, "canon-ref", SPEC_COMMIT)
 SPEC = os.path.join(SPEC_DIR, "definitions.py")
 SPEC_URL = ("https://raw.githubusercontent.com/WebAssembly/component-model/"

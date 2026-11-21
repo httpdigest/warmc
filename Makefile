@@ -434,7 +434,7 @@ check-encoder: $(BUILD)/a64_test$(EXE) $(BUILD)/x64_test$(EXE)
 # fetches again instead of testing against whatever an older pin left behind.
 # Every file downloaded here goes through test/fetch.sh, which checks it
 # against the SHA-256 test/fetch.sha256 records for its URL.
-TESTSUITE_COMMIT := 63908677d00585fdab4c4eccbf01f781d3a454d5
+TESTSUITE_COMMIT := 92a3d806c7d70f5b63f125e6155b8d76304509f1
 TESTSUITE_STAMP  := $(BUILD)/testsuite/.commit-$(TESTSUITE_COMMIT)
 
 $(TESTSUITE_STAMP):
@@ -448,7 +448,7 @@ $(TESTSUITE_STAMP):
 
 # The stack-switching proposal's tests, which its own repository keeps
 # (test/core/stack-switching), pinned likewise
-STACK_SWITCHING_COMMIT := d9fbe345495d15af623b981440d6aaacd5ad015c
+STACK_SWITCHING_COMMIT := f0b43efd4952e6520592e4d601f2c271ea6cd659
 STACK_SWITCHING_STAMP  := $(BUILD)/stack-switching/.commit-$(STACK_SWITCHING_COMMIT)
 
 $(STACK_SWITCHING_STAMP):
