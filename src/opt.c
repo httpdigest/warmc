@@ -6695,12 +6695,12 @@ static void td_push(TdVec *x, uint32_t b) {
   x->v[x->n++] = b;
 }
 
-/* Dominance frontiers, and the dominator tree as child lists, of the CFG
-   ir_order last saw; the blocks it does not reach that branch somewhere;
-   and td_repair's working arrays, each entry of which counts only when its
-   stamp is the call's. */
+/* Dominance frontiers of the CFG ir_order last saw -- block x's are
+   df[df_at[x]] up to df[df_at[x + 1]], rising; the blocks it does not
+   reach that branch somewhere; and td_repair's working arrays, each entry
+   of which counts only when its stamp is the call's. */
 typedef struct {
-  TdVec *df; uint32_t *kids_at, *kids, nb;
+  uint32_t *df_at, *df, nb;
   uint32_t *unreached, nunreached;
   uint32_t stamp, *st_live, *st_inwl, *st_phi, *st_def, *st_cur, *st_done;
   Ref *phi, *def, *cur;
@@ -6709,32 +6709,43 @@ typedef struct {
 
 static void td_dom_build(IrFunc *f, TdDom *d) {
   uint32_t nb = d->nb = f->nblocks;
-  d->df = xcalloc(nb, sizeof(TdVec));
-  uint32_t *last = xmalloc(nb * sizeof(uint32_t));
+  /* Each block with two ways in is in the frontier of every block from a
+     predecessor up to its own dominator.  A walk up that meets a block an
+     earlier one from the same block passed stops: that one went on to the
+     dominator.  The pairs made, block by block, are then laid out by the
+     block whose frontier they are in, in the order made -- a list for each
+     block, grown as it filled, was two fifths of the repairs of a function
+     threaded two thousand times (javabench/recur). */
+  uint32_t *last = xmalloc((nb ? nb : 1) * sizeof(uint32_t));
   for (uint32_t i = 0; i < nb; i++) last[i] = UINT32_MAX;
+  d->df_at = xcalloc((size_t)nb + 2, sizeof(uint32_t));
+  uint32_t cap = 2 * nb + 16, np = 0;
+  uint32_t *pr = xmalloc(2 * (size_t)cap * sizeof(uint32_t));
   for (uint32_t y = 0; y < nb; y++) {
     Block *yb = &f->blocks[y];
     if (!yb->reachable || yb->npreds < 2) continue;
     for (uint32_t pp = 0; pp < yb->npreds; pp++) {
       uint32_t r = yb->preds[pp];
-      while (f->blocks[r].reachable && r != yb->idom) {
-        if (last[r] != y) { last[r] = y; td_push(&d->df[r], y); }
+      while (f->blocks[r].reachable && r != yb->idom && last[r] != y) {
+        last[r] = y;
+        if (np == cap) {
+          cap *= 2;
+          pr = xrealloc(pr, 2 * (size_t)cap * sizeof(uint32_t));
+        }
+        pr[2 * np] = r; pr[2 * np + 1] = y; np++;
+        d->df_at[r + 2]++;
         if (r == f->entry) break;
         r = f->blocks[r].idom;
       }
     }
   }
   xfree(last);
-  d->kids_at = xcalloc(nb + 1, sizeof(uint32_t));
-  d->kids = xmalloc((nb ? nb : 1) * sizeof(uint32_t));
-  for (uint32_t x = 0; x < nb; x++)
-    if (f->blocks[x].reachable && x != f->entry) d->kids_at[f->blocks[x].idom + 1]++;
-  for (uint32_t x = 0; x < nb; x++) d->kids_at[x + 1] += d->kids_at[x];
-  uint32_t *fill = xmalloc((nb ? nb : 1) * sizeof(uint32_t));
-  memcpy(fill, d->kids_at, nb * sizeof(uint32_t));
-  for (uint32_t x = 0; x < nb; x++)
-    if (f->blocks[x].reachable && x != f->entry) d->kids[fill[f->blocks[x].idom]++] = x;
-  xfree(fill);
+  /* (df_at[x + 1] is where x's list is being filled, and where it ends
+     once all are) */
+  for (uint32_t x = 0; x < nb; x++) d->df_at[x + 2] += d->df_at[x + 1];
+  d->df = xmalloc((np ? np : 1) * sizeof(uint32_t));
+  for (uint32_t k = 0; k < np; k++) d->df[d->df_at[pr[2 * k] + 1]++] = pr[2 * k + 1];
+  xfree(pr);
   d->unreached = xmalloc((nb ? nb : 1) * sizeof(uint32_t));
   d->nunreached = 0;
   for (uint32_t x = 0; x < nb; x++)
@@ -6752,8 +6763,7 @@ static void td_dom_build(IrFunc *f, TdDom *d) {
 }
 
 static void td_dom_free(TdDom *d) {
-  for (uint32_t i = 0; i < d->nb; i++) xfree(d->df[i].v);
-  xfree(d->df); xfree(d->kids_at); xfree(d->kids); xfree(d->unreached);
+  xfree(d->df); xfree(d->df_at); xfree(d->unreached);
   xfree(d->st_live); xfree(d->st_inwl); xfree(d->st_phi);
   xfree(d->st_def); xfree(d->st_cur); xfree(d->st_done);
   xfree(d->phi); xfree(d->def); xfree(d->cur); xfree(d->wl); xfree(d->path);
@@ -6828,8 +6838,8 @@ static void td_repair(IrFunc *f, Ref p, const uint32_t *defb, const Ref *def,
   }
   while (nwl) {
     uint32_t x = wl[--nwl];
-    for (uint32_t k = 0; k < d->df[x].n; k++) {
-      uint32_t y = d->df[x].v[k];
+    for (uint32_t k = d->df_at[x]; k < d->df_at[x + 1]; k++) {
+      uint32_t y = d->df[k];
       if (d->st_live[y] != st || TD_ISDEF(y) || d->st_phi[y] == st) continue;
       d->st_phi[y] = st;
       d->phi[y] = ir_add_param(f, y, t);
