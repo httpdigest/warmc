@@ -21,8 +21,8 @@
 ;; if-conversion, its merge's test not threaded (addr64's bound, whose
 ;; select the range prover reads).  Answers worked out by hand.
 ;;
-;; stats -O1: threaded_eval=11 threaded_path=1
-;; stats -O2: threaded_eval=11 threaded_path=1
+;; stats -O1: threaded_eval=11 threaded_path=1 thread_orders=8 thread_orders_whole=0
+;; stats -O2: threaded_eval=11 threaded_path=1 thread_orders=8 thread_orders_whole=0
 ;;
 ;; run: view 0 5 => i32:5
 ;; run: view 1 5 => i32:-1

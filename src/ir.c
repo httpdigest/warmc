@@ -140,6 +140,8 @@ void ir_free(IrFunc *f) {
   xfree(f->kb_epoch);
   xfree(f->kb_bits);
   xfree(f->ord_tmp);
+  xfree(f->thr_edges);
+  xfree(f->thr_copies);
   xfree(f->loop_head);
   xfree(f->ra2_mem);
   xfree(f->ra2_of);
@@ -368,14 +370,19 @@ bool ir_dom_walk(const IrFunc *f, uint32_t a, uint32_t b) {
    thread does before it asks a dominance question. */
 static bool g_dom_check;
 static int g_order_light;   /* 0 as ir_order, 1 the light ordering, 2 checked against ir_order */
+static bool g_order_inc;    /* a light ordering after threading made from the last one */
 static pthread_once_t g_dom_check_once = PTHREAD_ONCE_INIT;
 static void dom_check_init(void) {
   g_dom_check = warmc_getenv("WARMC_CHECK_DOM") != NULL;
   g_order_light = warmc_getenv("WARMC_NO_ORDER_LIGHT") ? 0 : warmc_getenv("WARMC_VERIFY_GATES") ? 2 : 1;
+  g_order_inc = !warmc_getenv("WARMC_NO_ORDER_INC");
 }
 
 bool ir_dominates_checked(const IrFunc *f, uint32_t a, uint32_t b) {
   bool r = ir_dom_range(f, a, b);
+  if (g_dom_check && f->dom_stale)
+    warmc_fatal("internal: block %u dom %u asked of dominator intervals that an "
+                "ordering after threading has not renumbered", a, b);
   if (g_dom_check && r != ir_dom_walk(f, a, b))
     warmc_fatal("internal: dominator range test says %s for %u dom %u and the "
                 "idom walk says %s", r ? "yes" : "no", a, b, r ? "no" : "yes");
@@ -735,6 +742,16 @@ static uint64_t dom_facts(const IrFunc *f, uint32_t i) {
   return h;
 }
 
+static uint32_t *ord_tmp(IrFunc *f) {
+  size_t words = 14 * (size_t)f->nblocks + 64;
+  if (words > f->ord_tmp_cap) {
+    xfree(f->ord_tmp);
+    f->ord_tmp_cap = words + words / 2;
+    f->ord_tmp = xmalloc(f->ord_tmp_cap * sizeof(uint32_t));
+  }
+  return f->ord_tmp;
+}
+
 /* Returns whether every retreating edge was natural, which makes the graph
    reducible: then the dominators, the predecessor lists and the loop depths
    are the graph's own and not the search order's, and a second ordering
@@ -754,13 +771,11 @@ static bool order_once(IrFunc *f, bool by_score, int keep, bool noloops) {
      runs twice for each -- 118,000 times in compiling stdgotests/webtext --
      where allocating its dozen arrays each time was half a percent. */
   uint32_t nb = f->nblocks;
-  size_t words = 14 * (size_t)nb + 64;
-  if (words > f->ord_tmp_cap) {
-    xfree(f->ord_tmp);
-    f->ord_tmp_cap = words + words / 2;
-    f->ord_tmp = xmalloc(f->ord_tmp_cap * sizeof(uint32_t));
-  }
-  uint32_t *w = f->ord_tmp;
+  uint32_t *w = ord_tmp(f);
+  /* (what threading noted is of the graph before this ordering) */
+  f->nthr_edges = f->nthr_copies = 0;
+  f->ord_nblocks = nb;
+  f->dom_stale = false;
   uint32_t *post = w;      w += nb;
   uint32_t *dstk = w;      w += 2 * ((size_t)nb + 8);
   uint32_t *stamp = w;     w += nb + 1;
@@ -1425,6 +1440,293 @@ void ir_order_light(IrFunc *f) {
                     "(reachable %d idom %u preds %u)", i,
                     f->blocks[i].reachable, f->blocks[i].idom, f->blocks[i].npreds);
     xfree(facts);
+  }
+}
+
+void ir_thread_copy(IrFunc *f, uint32_t z, uint32_t model) {
+  if (f->nthr_copies + 2 > f->cap_thr_copies) {
+    f->cap_thr_copies = f->cap_thr_copies ? 2 * f->cap_thr_copies : 16;
+    f->thr_copies = xrealloc(f->thr_copies, f->cap_thr_copies * sizeof(uint32_t));
+  }
+  f->thr_copies[f->nthr_copies++] = z;
+  f->thr_copies[f->nthr_copies++] = model;
+}
+
+void ir_thread_edge(IrFunc *f, uint32_t src, uint32_t old, uint32_t z) {
+  if (f->nthr_edges + 3 > f->cap_thr_edges) {
+    f->cap_thr_edges = f->cap_thr_edges ? 2 * f->cap_thr_edges : 24;
+    f->thr_edges = xrealloc(f->thr_edges, f->cap_thr_edges * sizeof(uint32_t));
+  }
+  f->thr_edges[f->nthr_edges++] = src;
+  f->thr_edges[f->nthr_edges++] = old;
+  f->thr_edges[f->nthr_edges++] = z;
+}
+
+/* one listing of p out of block t's predecessors, the others' order kept */
+static bool pred_drop(Block *t, uint32_t p) {
+  for (uint32_t i = 0; i < t->npreds; i++)
+    if (t->preds[i] == p) {
+      memmove(t->preds + i, t->preds + i + 1, (t->npreds - i - 1) * sizeof(uint32_t));
+      t->npreds--;
+      return true;
+    }
+  return false;
+}
+
+/* What ir_order_light finds, made from what the last ordering found and
+   what threading says it did since (f->thr_copies, f->thr_edges) -- or
+   false, where that does not say enough, with nothing changed that a whole
+   ordering does not make anew.
+
+   The graph before, G, was reducible, and its order O one in which every
+   edge goes forward or to a block that dominates its source -- any
+   search's reverse postorder of a reducible graph.  Threading made fresh
+   blocks, each a copy of an old one, its model, with ways out the model
+   has (to a block copied too, to the copy), and sent edges to them: an
+   edge that went to the copy's model, or to a block that only jumps to the
+   model.  So a path of the graph now, G', read with every copy as its
+   model (and the jumping block put back before it), is a path of G.  No
+   model, and no block an edge was taken from, has a retreating edge into
+   it in G -- none heads a loop -- which is asked here.  Then:
+
+   - A block that dominated another in G, and is neither a model nor a
+     block that lost an edge, dominates it in G' (a path around it would
+     be one in G), and it dominates a copy if it dominated the model.  A
+     loop's header is such a block: every edge that went back still goes
+     to a block that dominates its source, and so does a copy's edge to a
+     header its model went back to.
+   - With each copy put into O right after its model, every other edge
+     goes forward: an old one as before; an edge sent to a copy, since its
+     source came before the block it went to, which is the model or comes
+     before it; a copy's edge where its model's went forward, to a block
+     after the model, or to a copy, after that copy's model.
+
+   So G' is reducible and the new order is one of its kind, which is all
+   the threadings read of an order -- whether an edge goes back, by rpo
+   along it.  In such an order a block is reachable if a block before it
+   that is reachable has an edge to it, and its dominator is the nearest
+   common one of those blocks, all final by then: one walk from the first
+   block that lost an edge, since before it nothing changed -- no fresh
+   block is before it, and no edge to a block before it went but those
+   that go back, which decide nothing.  A block the walk finds out of
+   reach leaves its successors' predecessor lists, as ir_recompute_preds
+   lists only edges from blocks in reach; the lists are otherwise the old
+   ones, in order, less the edges sent away, and the fresh blocks last in
+   the order made (ir_add_edge), which is rising by number.
+
+   Not made: the dominator intervals (f->dom_stale; WARMC_CHECK_DOM stops
+   on a question asked of them); the order is not the one a search would
+   make; and the loop depths are the last ordering's, a light one's zeros
+   or not.  Jump threading reads none of them between two threadings.
+
+   What the callers make sure of is asked too, and a whole ordering made
+   where it does not hold: every fresh block noted, in the order made, a
+   copy of an old block in reach with ways out that block has, and one way
+   in -- an edge sent to it from an old block in reach, or another copy's. */
+static bool order_threaded(IrFunc *f) {
+  uint32_t nb0 = f->ord_nblocks, nb = f->nblocks, n = f->norder;
+  uint32_t ne = f->nthr_edges / 3, nc = f->nthr_copies / 2;
+  const uint32_t *E = f->thr_edges, *C = f->thr_copies;
+  if (!f->reducible || nb - nb0 != nc) return false;
+  uint32_t *w = ord_tmp(f);
+  uint32_t *stamp = w;         w += nb + 1;
+  uint32_t *key = w;           w += nc + 1;      /* a copy's model's place in O */
+  uint32_t *srt = w;           w += nc + 1;      /* the copies by key, then by number */
+  uint8_t *mark = (uint8_t *)w;                  /* 1 asked, 2 out of reach, 4 an edge sent to it */
+  memset(mark, 0, nb);
+#define OT_HEADS(x) ({                                                         \
+    const Block *xb_ = &f->blocks[x];                                          \
+    bool h_ = false;                                                           \
+    if (!(mark[x] & 1)) {                                                      \
+      mark[x] |= 1;                                                            \
+      for (uint32_t p_ = 0; p_ < xb_->npreds && !h_; p_++)                     \
+        h_ = xb_->preds[p_] < nb0 && f->blocks[xb_->preds[p_]].rpo >= xb_->rpo; \
+    }                                                                          \
+    h_; })
+  /* the copies: made in order, each of an old block in reach that heads no
+     loop, with ways out its model has */
+  for (uint32_t k = 0; k < nc; k++) {
+    uint32_t z = C[2 * k], m = C[2 * k + 1];
+    if (z != nb0 + k || m >= nb0 || !f->blocks[m].reachable || m == f->entry) return false;
+    if (OT_HEADS(m)) return false;
+  }
+  for (uint32_t k = 0; k < nc; k++) {
+    const Block *zb = &f->blocks[nb0 + k], *mb = &f->blocks[C[2 * k + 1]];
+    for (uint32_t s = 0; s < zb->nsuccs; s++) {
+      uint32_t t = zb->succs[s].target;
+      if (t >= nb0) t = C[2 * (t - nb0) + 1];
+      bool has = false;
+      for (uint32_t q = 0; q < mb->nsuccs && !has; q++) has = mb->succs[q].target == t;
+      if (!has) return false;
+    }
+  }
+  /* the edges: from an old block in reach, one to a copy, and what it left
+     the copy's model or a block that only jumps to it, heading no loop */
+  uint32_t start = UINT32_MAX;
+  for (uint32_t k = 0; k < ne; k++) {
+    uint32_t src = E[3 * k], old = E[3 * k + 1], z = E[3 * k + 2];
+    if (src >= nb0 || old >= nb0 || z < nb0 || z >= nb || (mark[z] & 4)) return false;
+    mark[z] |= 4;
+    uint32_t m = C[2 * (z - nb0) + 1];
+    const Block *ob = &f->blocks[old];
+    if (!f->blocks[src].reachable || !ob->reachable) return false;
+    if (old != m && (ob->nsuccs != 1 || ob->succs[0].target != m)) return false;
+    if (OT_HEADS(old)) return false;
+    if (ob->rpo < start) start = ob->rpo;
+  }
+#undef OT_HEADS
+  for (uint32_t k = 0; k < nc; k++)
+    if (!(mark[nb0 + k] & 4) == !f->blocks[nb0 + k].npreds) return false;
+
+  /* (from here on a false is still safe: a whole ordering lists the
+     predecessors anew) */
+  for (uint32_t k = 0; k < ne; k++) {
+    uint32_t src = E[3 * k], old = E[3 * k + 1], z = E[3 * k + 2];
+    if (!pred_drop(&f->blocks[old], src)) return false;
+    Block *zb = &f->blocks[z];
+    GROW(f, zb->preds, zb->npreds, zb->cap_preds, uint32_t);
+    zb->preds[zb->npreds++] = src;
+  }
+
+  /* the order: each copy right after its model, the copies of one in the
+     order made */
+  for (uint32_t k = 0; k < nc; k++) {
+    uint32_t kk = f->blocks[C[2 * k + 1]].rpo, j = k;
+    while (j && key[srt[j - 1]] > kk) { srt[j] = srt[j - 1]; j--; }
+    srt[j] = k;
+    key[k] = kk;
+  }
+  if (n + nc > f->cap_order) {
+    uint32_t cap = n + nc + (n + nc) / 4 + 8;
+    f->order = ir_grow(f, f->order, (size_t)f->cap_order * sizeof(uint32_t),
+                       (size_t)cap * sizeof(uint32_t));
+    f->cap_order = cap;
+  }
+  uint32_t j = n + nc, left = nc;
+  for (uint32_t i = n; left;) {
+    i--;
+    uint32_t b = f->order[i];
+    while (left && key[srt[left - 1]] == i) {
+      uint32_t z = nb0 + srt[--left];
+      f->order[--j] = z;
+      f->blocks[z].rpo = j;
+    }
+    f->order[--j] = b;
+    f->blocks[b].rpo = j;
+  }
+  n += nc;
+  f->norder = n;
+
+  /* reach and dominators, from the first block that lost an edge on
+     (with nothing noted, none: nothing changed) */
+  memset(stamp, 0, (size_t)nb * sizeof(uint32_t));
+  uint32_t cur = 0, dead0 = UINT32_MAX;
+  for (uint32_t i = start; i < n; i++) {
+    uint32_t bi = f->order[i];
+    Block *b = &f->blocks[bi];
+    uint32_t newidom = REF_NONE;
+    cur++;
+    for (uint32_t p = 0; p < b->npreds; p++) {
+      uint32_t pi = b->preds[p];
+      if (f->blocks[pi].rpo >= i) continue;       /* an edge back */
+      if (newidom == REF_NONE) { newidom = pi; stamp[pi] = cur; continue; }
+      uint32_t x = pi, y = newidom;
+      while (x != y) {
+        while (f->blocks[x].rpo > f->blocks[y].rpo) {
+          if (stamp[x] == cur) { x = y; break; }
+          stamp[x] = cur;
+          x = f->blocks[x].idom;
+        }
+        while (f->blocks[y].rpo > f->blocks[x].rpo) {
+          stamp[y] = cur;
+          y = f->blocks[y].idom;
+        }
+      }
+      newidom = x;
+      stamp[x] = cur;
+    }
+    if (newidom != REF_NONE) { b->idom = newidom; continue; }
+    /* no way in from before it: out of reach, and its edges with it */
+    mark[bi] |= 2;
+    if (dead0 == UINT32_MAX) dead0 = i;
+    for (uint32_t s = 0; s < b->nsuccs; s++) pred_drop(&f->blocks[b->succs[s].target], bi);
+  }
+  if (dead0 != UINT32_MAX) {
+    uint32_t k = dead0;
+    for (uint32_t i = dead0; i < n; i++) {
+      uint32_t bi = f->order[i];
+      Block *b = &f->blocks[bi];
+      if (mark[bi] & 2) {
+        b->reachable = false;
+        b->rpo = 0xffffffffu;
+        b->idom = REF_NONE;
+        continue;
+      }
+      f->order[k] = bi;
+      b->rpo = k++;
+    }
+    f->norder = k;
+  }
+  f->nthr_edges = f->nthr_copies = 0;
+  f->ord_nblocks = nb;
+  f->dom_stale = true;
+  f->order_sig_valid = false;
+  return true;
+}
+
+/* ir_order_light for the repair after a threading (opt.c thread_repair),
+   made from the last ordering where order_threaded can; WARMC_NO_ORDER_INC=1
+   orders anew every time, and WARMC_VERIFY_GATES=1 does that too after each
+   and checks that every block's facts are the same. */
+void ir_order_threaded(IrFunc *f) {
+  pthread_once(&g_dom_check_once, dom_check_init);
+  if (!g_order_light || !g_order_inc || !order_threaded(f)) {
+    g_stats.thread_orders_whole++;
+    ir_order_light(f);
+    return;
+  }
+  g_stats.thread_orders++;
+  if (g_order_light == 2) {
+    /* checked against a whole ordering, and then on from what this one
+       left, as without the check: its order, its numbers, and what it
+       noted for the next */
+    uint32_t nb = f->nblocks, no = f->norder;
+    uint32_t ne = f->nthr_edges, nc = f->nthr_copies, nb0 = f->ord_nblocks;
+    uint64_t *facts = xmalloc((nb ? nb : 1) * sizeof(uint64_t));
+    uint32_t *was = xmalloc(((size_t)no + 4 * (size_t)nb + 1) * sizeof(uint32_t));
+    for (uint32_t i = 0; i < no; i++)
+      if (f->blocks[f->order[i]].rpo != i)
+        warmc_fatal("WARMC_VERIFY_GATES: block %u is the order's %u-th after threading "
+                    "and numbered %u", f->order[i], i, f->blocks[f->order[i]].rpo);
+    memcpy(was, f->order, no * sizeof(uint32_t));
+    for (uint32_t i = 0; i < nb; i++) {
+      const Block *b = &f->blocks[i];
+      uint32_t *k = was + no + 4 * (size_t)i;
+      k[0] = b->rpo; k[1] = b->loop_depth; k[2] = b->dom_in; k[3] = b->dom_out;
+      facts[i] = order_facts(f, i);
+      if (!b->reachable && b->npreds)
+        warmc_fatal("WARMC_VERIFY_GATES: block %u is out of reach after threading and "
+                    "has predecessors listed", i);
+    }
+    ir_order_light(f);
+    if (!f->reducible || f->norder != no)
+      warmc_fatal("WARMC_VERIFY_GATES: the ordering after threading has %u blocks, reducible, "
+                  "and ir_order_light %u, %sreducible", no, f->norder, f->reducible ? "" : "not ");
+    for (uint32_t i = 0; i < nb; i++)
+      if (facts[i] != order_facts(f, i))
+        warmc_fatal("WARMC_VERIFY_GATES: the ordering after threading and ir_order_light "
+                    "differ on block %u (reachable %d idom %u preds %u)", i,
+                    f->blocks[i].reachable, f->blocks[i].idom, f->blocks[i].npreds);
+    memcpy(f->order, was, no * sizeof(uint32_t));
+    for (uint32_t i = 0; i < nb; i++) {
+      Block *b = &f->blocks[i];
+      const uint32_t *k = was + no + 4 * (size_t)i;
+      b->rpo = k[0]; b->loop_depth = k[1]; b->dom_in = k[2]; b->dom_out = k[3];
+    }
+    f->nthr_edges = ne; f->nthr_copies = nc; f->ord_nblocks = nb0;
+    f->dom_stale = true;
+    f->order_sig_valid = false;
+    xfree(facts); xfree(was);
   }
 }
 

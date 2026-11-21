@@ -371,6 +371,16 @@ typedef struct {
      header: no retreating edge goes to a block that does not dominate the
      block it leaves */
   bool reducible;
+  /* What jump threading has done to the graph since the last ordering, for
+     ir_order_threaded: each edge it sent to a fresh block (three numbers:
+     the edge's source, the block it went to, the fresh one), and each fresh
+     block with the one whose ways out it has (two).  The blocks the last
+     ordering saw, and whether the dominator intervals are older than the
+     dominators. */
+  uint32_t *thr_edges; uint32_t nthr_edges, cap_thr_edges;
+  uint32_t *thr_copies; uint32_t nthr_copies, cap_thr_copies;
+  uint32_t ord_nblocks;
+  bool dom_stale;
 
   uint32_t nlocals;
   ValType *local_types;
@@ -501,6 +511,14 @@ IrEdgeIdx ir_edge_index(IrFunc *f);
 void ir_edge_index_free(IrEdgeIdx *x);
 void ir_order(IrFunc *f);
 void ir_order_light(IrFunc *f);
+/* ir_order_light after jump threading, which says what it did since the
+   last ordering: block z made with model's ways out (all of them or some,
+   one to a block copied too going to its copy), and src's edge that went
+   to old now going to z, old being z's model or a block that only jumps
+   to it. */
+void ir_thread_copy(IrFunc *f, uint32_t z, uint32_t model);
+void ir_thread_edge(IrFunc *f, uint32_t src, uint32_t old, uint32_t z);
+void ir_order_threaded(IrFunc *f);
 /* ir_order's reachability, loop depths and divergence alone; its
    reachability alone (ir.c) */
 void ir_order_depths(IrFunc *f);
@@ -863,6 +881,8 @@ typedef struct {
   uint64_t threaded_known; /* edges past a test their way in decided */
   uint64_t threaded_eval; /* edges past a test worked out from their values, the block copied */
   uint64_t threaded_path; /* ways of two blocks past a test, both copied */
+  uint64_t thread_orders; /* orderings after a threading made from the one before (ir_order_threaded) */
+  uint64_t thread_orders_whole; /* and those made anew: a loop's header threaded, a graph not reducible */
   uint64_t unswitched; /* loops copied for a branch on a value made before them */
   uint64_t param_compares; /* parameters found to be a compare, made again */
   uint64_t key_splits;   /* regions copied below an edge that fixes a value */

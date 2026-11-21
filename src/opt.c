@@ -7014,8 +7014,10 @@ static bool thread_test(IrFunc *f, uint32_t B, const uint32_t *uses,
 
 /* The edge pi's s-th, into B, sent to a fresh block that takes B's
    parameters and jumps where B's pick-th edge goes, or false where that is
-   B itself, a landing pad or an exception's way. */
-static bool thread_edge(IrFunc *f, uint32_t B, uint32_t pi, uint32_t s, uint32_t pick,
+   B itself, a landing pad or an exception's way.  was is where the edge
+   went at the last ordering: B, or a block that only jumps to it, which
+   the caller has taken out of the way (ir_order_threaded). */
+static bool thread_edge(IrFunc *f, uint32_t B, uint32_t was, uint32_t pi, uint32_t s, uint32_t pick,
                         TdVec *made) {
   Block *bb = &f->blocks[B];
   uint32_t t = bb->succs[pick].target;
@@ -7038,6 +7040,8 @@ static bool thread_edge(IrFunc *f, uint32_t B, uint32_t pi, uint32_t s, uint32_t
   xfree(na);
   f->blocks[x].reachable = true;
   f->blocks[pi].succs[s].target = x;
+  ir_thread_copy(f, x, B);
+  ir_thread_edge(f, pi, was, x);
   td_push(made, x);
   g_stats.branch_simplified++;
   return true;
@@ -7086,7 +7090,7 @@ static bool thread_dispatch(IrFunc *f, uint32_t B, const uint32_t *nread,
       uint32_t pick;
       if (bb->term == T_BRIF) pick = c ? 0 : 1;
       else pick = c < bb->nsuccs - 1 ? (uint32_t)c : bb->nsuccs - 1;
-      thread_edge(f, B, pi, s, pick, &made);
+      thread_edge(f, B, B, pi, s, pick, &made);
     }
   }
   if (!made.n) return false;
@@ -7102,7 +7106,7 @@ static bool thread_dispatch(IrFunc *f, uint32_t B, const uint32_t *nread,
    put back into SSA form. */
 static void thread_repair(IrFunc *f, uint32_t B, TdVec *mv) {
   TdVec made = *mv;
-  ir_order_light(f);
+  ir_order_threaded(f);
 
   uint32_t nb = f->nblocks, np = f->blocks[B].nparams;
   uint8_t *fresh = xcalloc(nb, 1);
@@ -7165,7 +7169,7 @@ typedef struct { uint32_t orig, nin; TdVec made, cps; } TeGroup;
    anywhere but in it and its copies, made by each of them, put back into
    SSA form as thread_repair does B's parameters */
 static void thread_repair_groups(IrFunc *f, TeGroup *g, uint32_t ng) {
-  ir_order_light(f);
+  ir_order_threaded(f);
   uint32_t nb = f->nblocks, nv = 0;
   for (uint32_t k = 0; k < ng; k++) nv += f->blocks[g[k].orig].nparams + g[k].nin;
   Ref *vals = xmalloc((nv ? nv : 1) * sizeof(Ref));
@@ -8367,7 +8371,7 @@ static bool thread_known(IrFunc *f, uint32_t B, const uint32_t *nread, uint32_t 
           e->args = ba;
           e->nargs = e->cap = nb;
           /* put back where B's way there is B itself or no place to go */
-          if (!thread_edge(f, B, qi, s, pick, &made)) f->blocks[qi].succs[s] = was;
+          if (!thread_edge(f, B, pi, qi, s, pick, &made)) f->blocks[qi].succs[s] = was;
         }
       }
       xfree(fp);
@@ -8379,7 +8383,7 @@ static bool thread_known(IrFunc *f, uint32_t B, const uint32_t *nread, uint32_t 
       uint32_t pick = kt_pick_n(f, B, nul, ni, xq, x, xq == UINT32_MAX ? REF_NONE : e->args[xq], mask,
                                 &yes, d, pi, s);
       if (pick == UINT32_MAX) continue;
-      thread_edge(f, B, pi, s, pick, &made);
+      thread_edge(f, B, B, pi, s, pick, &made);
     }
   }
   xfree(preds);
@@ -8606,8 +8610,9 @@ static KeV kt_ev_in(KtEv *e, Ref v, int depth, bool inY) {
 
 /* The edge pi's s-th, into B, sent to a copy of B -- its parameters and
    instructions -- that jumps where B's pick-th edge goes; each copied
-   instruction pushed onto cps, REF_NONE for a nop, B's order kept. */
-static bool thread_edge_copy(IrFunc *f, uint32_t B, uint32_t pi, uint32_t s, uint32_t pick,
+   instruction pushed onto cps, REF_NONE for a nop, B's order kept.  was
+   as thread_edge's. */
+static bool thread_edge_copy(IrFunc *f, uint32_t B, uint32_t was, uint32_t pi, uint32_t s, uint32_t pick,
                              TdVec *made, TdVec *cps) {
   {
     const Block *bb = &f->blocks[B];
@@ -8651,6 +8656,8 @@ static bool thread_edge_copy(IrFunc *f, uint32_t B, uint32_t pi, uint32_t s, uin
   f->blocks[x].reachable = true;
   f->blocks[x].cold = f->blocks[pi].cold;
   f->blocks[pi].succs[s].target = x;
+  ir_thread_copy(f, x, B);
+  ir_thread_edge(f, pi, was, x);
   td_push(made, x);
   g_stats.branch_simplified++;
   return true;
@@ -8859,7 +8866,7 @@ static bool thread_eval(IrFunc *f, uint32_t B, const uint32_t *nread, uint32_t n
           ee->target = B;
           ee->args = ba;
           ee->nargs = ee->cap = nb;
-          if (thread_edge_copy(f, B, qi, s, pick, &made, &cps)) *budget -= nc;
+          if (thread_edge_copy(f, B, pi, qi, s, pick, &made, &cps)) *budget -= nc;
           else f->blocks[qi].succs[s] = was;
         }
       }
@@ -8874,7 +8881,7 @@ static bool thread_eval(IrFunc *f, uint32_t B, const uint32_t *nread, uint32_t n
       uint32_t pick = te_pick(&ev);
       if (pick == UINT32_MAX) continue;
       if (!made.n && !consts_to_idom(f, B)) { stop = true; break; }
-      if (thread_edge_copy(f, B, pi, s, pick, &made, &cps)) *budget -= nc;
+      if (thread_edge_copy(f, B, B, pi, s, pick, &made, &cps)) *budget -= nc;
     }
   }
   xfree(preds);
@@ -8993,6 +9000,9 @@ static bool thread_path_copy(IrFunc *f, uint32_t Y, uint32_t sy, uint32_t B, uin
   f->blocks[y2].reachable = f->blocks[b2].reachable = true;
   f->blocks[y2].cold = f->blocks[b2].cold = f->blocks[P].cold;
   f->blocks[P].succs[s].target = y2;
+  ir_thread_copy(f, y2, Y);
+  ir_thread_copy(f, b2, B);
+  ir_thread_edge(f, P, Y, y2);
   td_push(&gy->made, y2);
   td_push(&gb->made, b2);
   g_stats.branch_simplified++;

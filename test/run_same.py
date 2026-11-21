@@ -8,6 +8,10 @@ with each:
                          (ir.c ir_order_light): a light one leaves out the
                          loop depths, the divergence and the layout's order,
                          which nothing between two threadings may read
+  WARMC_NO_ORDER_INC     each of them made by a search of the function, none
+                         from the one before it and what the threading did
+                         (ir.c ir_order_threaded), which leaves the
+                         dominators' intervals as they were
   WARMC_POOL_ALL_TAILS   every tail of a root list looked up in its pool
                          (module_data.c root_run_intern), where the search
                          stops at the first one found
@@ -33,7 +37,7 @@ import gen_gosp
 ROOT = os.path.dirname(HERE)
 BUILD = os.environ.get("BUILD", "build")
 WARMC = os.path.join(ROOT, BUILD, "warmc")
-SWITCHES = ("WARMC_NO_ORDER_LIGHT", "WARMC_POOL_ALL_TAILS", "WARMC_VERIFY_GATES")
+SWITCHES = ("WARMC_NO_ORDER_LIGHT", "WARMC_NO_ORDER_INC", "WARMC_POOL_ALL_TAILS", "WARMC_VERIFY_GATES")
 DIRS = ("cases", "cases_opt", "cases_gc", "cases_traps")
 LEVELS = ("-O2", "-O3")
 

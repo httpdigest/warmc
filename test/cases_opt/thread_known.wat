@@ -18,9 +18,9 @@
 ;; blocks merge_blocks makes one is threaded by thread_eval, which works it
 ;; out along the way in, and not counted here.)
 ;;
-;; stats -O1: threaded_known=26 param_compares=1
-;; stats -O2: threaded_known=26 param_compares=1
-;; stats -O3: threaded_known=26 param_compares=1
+;; stats -O1: threaded_known=26 param_compares=1 thread_orders=16 thread_orders_whole=0
+;; stats -O2: threaded_known=26 param_compares=1 thread_orders=16 thread_orders_whole=0
+;; stats -O3: threaded_known=26 param_compares=1 thread_orders=16 thread_orders_whole=0
 ;;
 ;; run: eqway 0 0 => i32:0
 ;; run: rangeway 0 0 => i32:0
