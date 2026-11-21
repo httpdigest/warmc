@@ -895,7 +895,7 @@ static u64 wasi_path_unlink_file(WarmInstance *vm, u64 fd_, u64 p_, u64 n_) {
 }
 
 static u64 wasi_path_remove_directory(WarmInstance *vm, u64 fd_, u64 p_, u64 n_) {
-  WITH_LEAF(R_PATH_REMOVE_DIRECTORY, 0, unlinkat(dir, name, H_AT_REMOVEDIR))
+  WITH_LEAF(R_PATH_REMOVE_DIRECTORY, 1, unlinkat(dir, name, H_AT_REMOVEDIR))
 }
 
 #if defined(WARMC_WINDOWS)

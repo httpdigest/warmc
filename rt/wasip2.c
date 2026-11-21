@@ -994,9 +994,10 @@ static u64 path_op(WarmInstance *vm, u64 self, u64 p, u64 n, u64 ret, int op) {
   Desc *d = desc_of(self);
   int dir = -1;
   char leaf[PATHMAX];
-  /* a directory is made by a name that ends in a slash as by the name */
+  /* a directory is made, and one removed, by a name that ends in a slash
+     as by the name */
   int trailed;
-  u32 ec = at_leaf(d, vm, p, n, 0, &dir, leaf, op == 0 ? &trailed : 0);
+  u32 ec = at_leaf(d, vm, p, n, 0, &dir, leaf, op != 1 ? &trailed : 0);
   if (ec) { res_err(vm, ret, 1, ec); return 0; }
 
   int r;

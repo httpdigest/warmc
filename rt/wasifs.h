@@ -212,10 +212,11 @@ int wasifs_str_eq(const char *a, const char *b);
 u32 wasifs_walk(int root, const char *path, int *out_dir, char *leaf);
 /* A path that ends in a slash walks into its last component, so that what
    is done is done to "." in it: as wasmtime has it, that is what opening,
-   stating, unlinking or removing such a path means.  Making a directory or
-   renaming by one takes the slashes off and acts on the entry itself, which
-   must then be a directory; this takes them off, all but a first
-   character, and says whether there were any. */
+   stating or unlinking such a path means.  Making a directory, removing one
+   or renaming by one takes the slashes off and acts on the entry itself,
+   which must then be a directory -- a link to one is none, and is not
+   removed by such a name; this takes them off, all but a first character,
+   and says whether there were any. */
 int wasifs_trim_slash(char *path);
 void wasifs_walk_done(int root, int dir);
 u32 wasifs_walk_leaf(int root, char *path, int *out_dir, char *leaf, int follow);

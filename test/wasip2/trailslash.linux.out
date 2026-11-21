@@ -26,10 +26,8 @@ rename ld/ le: rename /d/t/ld/ /d/t/le: errno 44
 link f h/: link /d/t/f /d/t/h/: errno 44
 symlink f s/: symlink f /d/t/s/: errno 2
 remove f/: remove /d/t/f/: errno 54
-remove k/: remove /d/t/k/: errno 28
-remove n2//: remove /d/t/n2//: errno 28
+remove k/: ok
+remove n2//: ok
 readdir: ok
   d
   f
-  k
-  n2

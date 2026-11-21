@@ -862,7 +862,9 @@ int unlinkat(int dirfd, const char *name, int flags) {
   int islink = (attr & ATTR_REPARSE_POINT) != 0;
 
   if (flags & H_AT_REMOVEDIR) {
-    if (!isdir) return fail(E_NOTDIR);
+    /* (not a link to a directory, which RemoveDirectoryW would remove:
+       POSIX removes no link as a directory) */
+    if (!isdir || islink) return fail(E_NOTDIR);
     return RemoveDirectoryW(wp) ? 0 : fail_last();
   }
   /* A symlink to a directory is itself a directory entry on Win32, so it is
