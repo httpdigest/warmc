@@ -15,10 +15,10 @@
 
 set -euo pipefail
 
-# Temurin's newest release for each host: 27.0.1 was built again for macOS and
-# Linux (27.0.1.0.2) and not yet for Windows, whose newest is 27's first.
+# Temurin's newest release for each host: 27.0.1.1 is built for macOS and not
+# yet for arm64 Linux or Windows, whose newest is the 27.0.1 built again.
 JDK_VERSION=27.0.1.0.2+1
-JDK_WINDOWS_VERSION=27+35
+JDK_MACOS_VERSION=27.0.1.1+4
 # Must match the Makefile's KOTLIN_VERSION, whose stdlib klib it fetches.
 KOTLIN_VERSION=2.4.21
 KOTLIN_SHA=7cc140e76daf416a0424a5557f99afd7ca89ebd463ea1101261e3e01c33e75cd
@@ -69,14 +69,14 @@ jdk() {
   local v=$JDK_VERSION host sha ext=tar.gz home=
   case "$(uname -s)/$(uname -m)" in
     Darwin/arm64)
-      host=aarch64_mac home=/Contents/Home
-      sha=c2619cb73ff1d296edd0644d92ae8ed94039bc1bdd43282398835b7f88134fb6 ;;
+      v=$JDK_MACOS_VERSION host=aarch64_mac home=/Contents/Home
+      sha=bd5ff11de5e247372e8b27df700938bd02fe8fe81e24cd297e1daeb027d3151b ;;
     Linux/aarch64)
       host=aarch64_linux
       sha=5ddacf925244a00b60cac828b61ff2f67a68cd32b8dfe5cee1405e333b4589e5 ;;
     MINGW64_NT*/x86_64|CLANG64_NT*/x86_64|MSYS_NT*/x86_64)
-      v=$JDK_WINDOWS_VERSION host=x64_windows ext=zip
-      sha=2031c9c5c624737ed29a0624caaf5bcc25e74235834c28b4bfa88f7ba7a40e4a ;;
+      host=x64_windows ext=zip
+      sha=5fac419f00d2256941a6b1253a827bb8b904da215a1ec0667035e5592811c1dc ;;
     *)
       echo "install-language-tools: no pinned JDK for $(uname -s)/$(uname -m)" >&2
       exit 1 ;;

@@ -95,7 +95,7 @@ jobs:
                                cat test/fetch.sha256; } | sum)"
             echo "rust=$(sed -n 's/^RUST_VERSION=//p' $s/install-rust.sh)"
             echo "rustup=$(sed -n 's/^RUSTUP_VERSION=//p' $s/install-rust.sh)"
-            echo "llvm=$(grep -E '^LLVM_VERSION=|lib/clang/' $s/install-llvm.sh | sum)"
+            echo "llvm=$(grep -E '^LLVM[A-Z_]*_VERSION=|lib/clang/' $s/install-llvm.sh | sum)"
             echo "tools=$(grep -E '^[A-Z_]+_VERSION=' $s/install-tools.sh | sum)"
             echo "languages=$({ grep -E '^[A-Z_]+_(VERSION|COMMIT|FLAVOUR)=' $s/install-language-tools.sh
                                 cat .github/asc/package-lock.json; } | sum)"
@@ -179,18 +179,18 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: &toolcache |
-            ${{ runner.tool_cache }}/go/1.27.3
+            ${{ runner.tool_cache }}/go/1.27.4
             ${{ runner.tool_cache }}/tinygo/0.44.0
             ${{ runner.tool_cache }}/binaryen
-            ${{ runner.tool_cache }}/node/26.13.0
-          key: &toolcache-key toolcache-${{ runner.os }}-${{ runner.arch }}-go1.27.3-tinygo0.44.0-binaryen133-node26.13.0
+            ${{ runner.tool_cache }}/node/26.13.1
+          key: &toolcache-key toolcache-${{ runner.os }}-${{ runner.arch }}-go1.27.4-tinygo0.44.0-binaryen133-node26.13.1
 
       - &setup-go
         name: Install Go
         if: inputs.full
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
-          go-version: 1.27.3
+          go-version: 1.27.4
           cache: false
 
       - &setup-tinygo
@@ -206,14 +206,14 @@ jobs:
         if: inputs.full
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
-          version: 0.17.0
+          version: 0.17.1
 
       - &setup-node
         name: Install Node
         if: inputs.full
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: 26.13.0
+          node-version: 26.13.1
 
       - &save-toolcache
         name: Save the toolchains
@@ -613,7 +613,7 @@ jobs:
       # install-msys2.sh installs in setup-msys2's two passes.  See
       # .github/scripts/pin-msys2.sh for what they are and how to pin anew.
       - name: Set up MSYS2
-        uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2.33.0
+        uses: msys2/setup-msys2@3c51bf698df1e37b2261f53cb67797b97761185c # v2.34.0
         with:
           msystem: CLANG64
           update: false
@@ -709,8 +709,8 @@ jobs:
           path: &toolcache-windows |
             ${{ runner.tool_cache }}/tinygo/0.44.0
             ${{ runner.tool_cache }}/binaryen
-            ${{ runner.tool_cache }}/node/26.13.0
-          key: &toolcache-windows-key toolcache-${{ runner.os }}-${{ runner.arch }}-tinygo0.44.0-binaryen133-node26.13.0
+            ${{ runner.tool_cache }}/node/26.13.1
+          key: &toolcache-windows-key toolcache-${{ runner.os }}-${{ runner.arch }}-tinygo0.44.0-binaryen133-node26.13.1
 
       - *setup-go
       - *setup-tinygo

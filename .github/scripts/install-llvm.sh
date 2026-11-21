@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# The pinned LLVM release, the same on macOS and Linux arm64, unpacked into
+# The pinned LLVM release for macOS and Linux arm64 -- for each the newest
+# that has a tarball for it, which 23.1.6 has not for macOS -- unpacked into
 # build/ci/llvm with only what the build and the test suite run: clang and
 # its resource directory (headers and the sanitizer runtimes), lld under the
 # names the tests call it by, the binary tools the encoder and Mach-O checks
@@ -10,16 +11,18 @@
 
 set -euo pipefail
 
-LLVM_VERSION=23.1.4
+LLVM_VERSION=23.1.6
+LLVM_MACOS_VERSION=23.1.5
 
 case "$(uname -s)/$(uname -m)" in
   Darwin/arm64)
+    LLVM_VERSION=$LLVM_MACOS_VERSION
     asset=LLVM-$LLVM_VERSION-macOS-ARM64.tar.xz
-    sha=5d3179db39adeca5b17a34d82708fe976bc60e055b05fe557878fb3fb64d39ef
+    sha=aba592b4a15e8f90c634c5367b51ec8418b8bcd2829865db331a17dc9418dcff
     ;;
   Linux/aarch64)
     asset=LLVM-$LLVM_VERSION-Linux-ARM64.tar.xz
-    sha=9b27cf263d711aa6ebfd4045ab241d947bd09b3cd19ffa5728f48a80c9eb3a91
+    sha=e9daa167da28b9e31d30046f05f98e3e7da3647cdbe1c1863e8b223c07ccf291
     ;;
   *)
     echo "install-llvm: no pinned LLVM for $(uname -s)/$(uname -m)" >&2

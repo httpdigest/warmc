@@ -563,13 +563,18 @@ teavm: $(TEAVM_PATCHED)
 # Temurin, the JDK the Java corpora's native column runs: the same classes
 # TeaVM compiles, on the JVM and its JIT.  Only a native record needs it
 # (`make bench-record`, `gobench.py --native`), so `make check` does not fetch
-# it.  Adoptium's release for this host, versioned like TeaVM's directory;
-# Temurin 27 has no build for x64 macOS.
-TEMURIN_VERSION := 27.0.1.0.2+1
+# it.  Adoptium's newest release for this host, versioned like TeaVM's
+# directory: 27.0.1.1 is not built for arm64 Linux yet, whose newest is the
+# 27.0.1 built again, and Temurin 27 has no build for x64 macOS.
+TEMURIN_VERSION := 27.0.1.1+4
+TEMURIN_LINUX_ARM64_VERSION := 27.0.1.0.2+1
 TEMURIN_HOST    := $(strip \
   $(if $(filter Darwin-arm64,$(UNAME_S)-$(UNAME_M)),aarch64_mac) \
   $(if $(filter Linux-aarch64 Linux-arm64,$(UNAME_S)-$(UNAME_M)),aarch64_linux) \
   $(if $(filter Linux-x86_64,$(UNAME_S)-$(UNAME_M)),x64_linux))
+ifeq ($(TEMURIN_HOST),aarch64_linux)
+TEMURIN_VERSION := $(TEMURIN_LINUX_ARM64_VERSION)
+endif
 TEMURIN_DIR     := $(BUILD)/tools/temurin-$(TEMURIN_VERSION)
 TEMURIN_STAMP   := $(TEMURIN_DIR)/.complete
 TEMURIN_FEATURE := $(firstword $(subst ., ,$(TEMURIN_VERSION)))
@@ -597,7 +602,7 @@ temurin: $(TEMURIN_STAMP)
 # x86-64, which it loads from a path of Homebrew's.
 WASMEDGE_VERSION := 0.18.1
 WASMER_VERSION   := 7.5.0
-WAMR_VERSION     := 2.4.5
+WAMR_VERSION     := 2.4.6
 ZSTD_VERSION     := 1.5.7
 ENGINES_DIR      := $(BUILD)/tools/engines
 ENGINES_STAMP    := $(ENGINES_DIR)/.wasmedge-$(WASMEDGE_VERSION)-wasmer-$(WASMER_VERSION)-wamr-$(WAMR_VERSION)

@@ -42,9 +42,9 @@ a92cf30f25b6fb6066f3508511f83c5c4fe2a0cff14fc2e7373bc1f6c726374f  https://repo1.
 c927b1bb63bfbe97322d8ee2556aae8b7ec5b173bd9bcfd2b15c618bc4a3eaca  https://github.com/glfw/glfw/releases/download/3.5.1/glfw-3.5.1.bin.MACOS.zip
 
 # make temurin
-c2619cb73ff1d296edd0644d92ae8ed94039bc1bdd43282398835b7f88134fb6  https://github.com/adoptium/temurin27-binaries/releases/download/jdk-27.0.1.0.2%2B1/OpenJDK27U-jdk_aarch64_mac_hotspot_27.0.1.0.2_1.tar.gz
+bd5ff11de5e247372e8b27df700938bd02fe8fe81e24cd297e1daeb027d3151b  https://github.com/adoptium/temurin27-binaries/releases/download/jdk-27.0.1.1%2B4/OpenJDK27U-jdk_aarch64_mac_hotspot_27.0.1.1_4.tar.gz
 5ddacf925244a00b60cac828b61ff2f67a68cd32b8dfe5cee1405e333b4589e5  https://github.com/adoptium/temurin27-binaries/releases/download/jdk-27.0.1.0.2%2B1/OpenJDK27U-jdk_aarch64_linux_hotspot_27.0.1.0.2_1.tar.gz
-30cb129f6cf299c852cec0feca9ea2a596d2ee9f26d8605d3a253951f6c8b20f  https://github.com/adoptium/temurin27-binaries/releases/download/jdk-27.0.1.0.2%2B1/OpenJDK27U-jdk_x64_linux_hotspot_27.0.1.0.2_1.tar.gz
+005e57ee860978acfeeff1be2b30f770664fe2b941e9b803c61c76992086d107  https://github.com/adoptium/temurin27-binaries/releases/download/jdk-27.0.1.1%2B4/OpenJDK27U-jdk_x64_linux_hotspot_27.0.1.1_4.tar.gz
 
 # make wasi-sdk
 9c59398106b417f8f14913380fdf0097a8cc0ff4af9eb3ce0065a859e88d49e9  https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-34/wasi-sdk-34.0-arm64-macos.tar.gz
@@ -57,8 +57,8 @@ b761e3a0721dbae9c09a0059e5fdb2bf917d1b4a8a7b430fb3b5aafb0984b2c4  https://github
 # against the .sha256 its release carries)
 32165a058abee03718f8fa3b7ffd64e5133443486f54a5b79221910fb1ae0628  https://github.com/WasmEdge/WasmEdge/releases/download/0.18.1/WasmEdge-0.18.1-darwin_arm64.tar.gz
 fd6526fdce3f8c68a8c3139e9b0e438991d04bafda3d0f091bf98c1600ea0401  https://github.com/wasmerio/wasmer/releases/download/v7.5.0/wasmer-darwin-arm64.tar.gz
-1ab09d51099f276ca4a1d6629f6b589aab2bd0caa01445e05031a4bed22c199b  https://github.com/bytecodealliance/wasm-micro-runtime/archive/refs/tags/WAMR-2.4.5.tar.gz
-419d41b8b9b29bb8bb0e86e0409725abab81aa693daa479e502fadd0c206db69  https://github.com/bytecodealliance/wasm-micro-runtime/releases/download/WAMR-2.4.5/wamrc-2.4.5-x86_64-macos-15-intel.tar.gz
+6a8de3f74671a72698b4bd61a96c1ce8966db077b2adad7b720757cfd9caff62  https://github.com/bytecodealliance/wasm-micro-runtime/archive/refs/tags/WAMR-2.4.6.tar.gz
+fad5adc9c22338a5454ddd7558482310ae2e19a7b7843a3cea16726e8df85556  https://github.com/bytecodealliance/wasm-micro-runtime/releases/download/WAMR-2.4.6/wamrc-2.4.6-x86_64-macos-15-intel.tar.gz
 eb33e51f49a15e023950cd7825ca74a4a2b43db8354825ac24fc1b7ee09e6fa3  https://github.com/facebook/zstd/releases/download/v1.5.7/zstd-1.5.7.tar.gz
 
 # make simde

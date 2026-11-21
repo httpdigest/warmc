@@ -12,9 +12,9 @@
 
 set -euo pipefail
 
-WASMTIME_VERSION=50.0.1
+WASMTIME_VERSION=51.0.0
 WABT_VERSION=1.0.42
-CCACHE_VERSION=4.14.2
+CCACHE_VERSION=4.14.3
 # Must match the Makefile's WASM_TOOLS_VERSION; where it does not, make builds
 # the Makefile's version with cargo as it would anywhere else.
 WASM_TOOLS_VERSION=1.263.0
@@ -22,31 +22,31 @@ WASM_TOOLS_VERSION=1.263.0
 case "$(uname -s)/$(uname -m)" in
   Darwin/arm64)
     wasmtime_asset=wasmtime-v$WASMTIME_VERSION-aarch64-macos.tar.xz
-    wasmtime_sha=960e5216c7ebd7e9b45e6561d15821b8b801b7d54aee28c7b91921aeb30c65c8
+    wasmtime_sha=61dd882b44bcf854b301518781f407b9f6db4c6bd157a55f8f44b1f1357f93dc
     wabt_asset=wabt-$WABT_VERSION-macos-arm64.tar.gz
     wabt_sha=3f654779b436c628db3ca4323c51538815f5fbc887a6d5f3bb1c18d36281e240
     ccache_asset=ccache-$CCACHE_VERSION-darwin.tar.gz
-    ccache_sha=cf240009630b605b775c7c5c7b7105a3b196c79f31af322c1557969aa28003fc
+    ccache_sha=764dd2a8100ff83e6bbd7b9a1e2016cc401be34bee8a70ea99698186622c34d5
     wasm_tools_asset=wasm-tools-$WASM_TOOLS_VERSION-aarch64-macos.tar.gz
     wasm_tools_sha=b568f04746a699c4068b8d751779b60b501cf2cab6d259a3bc973eb5eeb1f62b
     ;;
   Linux/aarch64)
     wasmtime_asset=wasmtime-v$WASMTIME_VERSION-aarch64-linux.tar.xz
-    wasmtime_sha=d737e077416d78fbfb0a008229ec27d6a0fd5a4924874b8c38b293c850cf4094
+    wasmtime_sha=a263f34aefad1b24ba4d9ca635ddfea415f4acfe3f3f1bb6d4525c34fc6a7397
     wabt_asset=wabt-$WABT_VERSION-linux-arm64.tar.gz
     wabt_sha=a7632c1cc66f70886441842ecf5a2ffa91a98c79e026059458451234ad013ea8
     ccache_asset=ccache-$CCACHE_VERSION-linux-aarch64-glibc.tar.gz
-    ccache_sha=bc537a1f29232be50be3219ffe80c7c1955bc80a99c75311d7fb839828c80dd0
+    ccache_sha=5af4c73f9a2c2ed27c17e48cf06868202738fecf8036cfbcdd7eb679930670cb
     wasm_tools_asset=wasm-tools-$WASM_TOOLS_VERSION-aarch64-linux.tar.gz
     wasm_tools_sha=773b5e6bf957f0d93a9a337c9c5fc4c35509706301a80799f57a76fa367fd1ca
     ;;
   MINGW64_NT*/x86_64|CLANG64_NT*/x86_64|MSYS_NT*/x86_64)
     wasmtime_asset=wasmtime-v$WASMTIME_VERSION-x86_64-windows.zip
-    wasmtime_sha=c3646ee2de8cfcefe532e75852e1fd2728d78c3fcc43251794803a698d1c30ca
+    wasmtime_sha=d2f5853a1cded9b1256b45cd57686b6855e69049ef07fd4ad78feb78dfa3aada
     wabt_asset=wabt-$WABT_VERSION-windows-x64.tar.gz
     wabt_sha=62f1eb2b51aa57cf0f0b8ba333bf2c72a049930aa9c5de01dcad271c4fe48c88
     ccache_asset=ccache-$CCACHE_VERSION-windows-x86_64.zip
-    ccache_sha=6993ce645e53192cec592ee23186200b574ac4c59097ecde8d9cfd681b47ae84
+    ccache_sha=c845c3d65be81954c75659145a522a793a27586bf940c5dcfe18af33fa1a67dd
     wasm_tools_asset=wasm-tools-$WASM_TOOLS_VERSION-x86_64-windows.zip
     wasm_tools_sha=0803df158b4dbea6b029d11f4206c414f432f0447af91542817061e4f0bd912e
     ;;

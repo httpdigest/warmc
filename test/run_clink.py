@@ -102,9 +102,10 @@ CASES = {
 }
 
 # Calls wasmtime cannot make, with the answer their fixture is built to give:
-# wasmtime 50.0.1 panics compiling a resource whose representation is an i64
-# (cm64), on an assertion in its Cranelift trampolines that a representation
-# is an i32.
+# wasmtime 51.0.0 refuses a resource whose representation is an i64 (cm64)
+# unless given -W component-model-memory64, and with that panics compiling
+# it, on an assertion in its Cranelift trampolines that a representation is
+# an i32.
 FIXED = {
     ("restable64", "run"): "111111",
 }

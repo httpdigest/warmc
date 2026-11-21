@@ -8,20 +8,20 @@
 
 set -euo pipefail
 
-RUST_VERSION=1.99.1
-RUSTUP_VERSION=1.29.2
+RUST_VERSION=1.100.0
+RUSTUP_VERSION=1.29.3
 
 exe=
 case "$(uname -s)/$(uname -m)" in
   Darwin/arm64)
     triple=aarch64-apple-darwin
-    sha=f7c7e11eb2e07f006e532a8aaac77b32f4527d305ac386c0c633ca6133d35ca9 ;;
+    sha=63752a1919a3a4793173ec70f8f212621a7ce38ba6a246095984482f4de20f9f ;;
   Linux/aarch64)
     triple=aarch64-unknown-linux-gnu
-    sha=a9c168dbea81a84671c6b7a5c1795cb0eb699020110d107ddfca427bd797e697 ;;
+    sha=9f608c142e0e38a78957d0661ba1dfaf0b6fb37184cfaa4b9a0aa57af6184282 ;;
   MINGW64_NT*/x86_64|CLANG64_NT*/x86_64|MSYS_NT*/x86_64)
     triple=x86_64-pc-windows-msvc exe=.exe
-    sha=00f139da614dced87d3c3d4121c43eebdac3c1bf8a5ee86b9d80dfd71c8d70fd ;;
+    sha=38027d51d69a5d05493627a0634dbea52d6cd793c8f072d2373d3f4163eec7db ;;
   *)
     echo "install-rust: no pinned rustup for $(uname -s)/$(uname -m)" >&2
     exit 1 ;;

@@ -5,9 +5,9 @@
 # from it are tagged with both, so that a new pin builds anew rather than
 # finding the old image under the name.  Sourced, not run.
 
-LINUX_BASE=docker.io/library/debian:trixie-slim@sha256:f6b08b09a05725f9431502d3b5714f5c4576e82c1a84fa1debe0c24a7e0c3ec4
-LINUX_SNAPSHOT=20261031T202858Z
-LINUX_SECURITY_SNAPSHOT=20261031T222717Z
+LINUX_BASE=docker.io/library/debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2
+LINUX_SNAPSHOT=20261121T093758Z
+LINUX_SECURITY_SNAPSHOT=20261121T005332Z
 LINUX_TAG=trixie-${LINUX_BASE##*sha256:}
 LINUX_TAG=${LINUX_TAG:0:19}-$LINUX_SNAPSHOT
 

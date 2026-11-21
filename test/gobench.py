@@ -648,7 +648,10 @@ def build_java(names):
         out[n] = wasm
     return out
 
-TEMURIN_VERSION = _pinned("TEMURIN_VERSION")
+# (the first of the Makefile's two: arm64 Linux has a pin of its own)
+TEMURIN_VERSION = _pinned("TEMURIN_LINUX_ARM64_VERSION"
+                          if sys.platform.startswith("linux") and os.uname().machine in ("aarch64", "arm64")
+                          else "TEMURIN_VERSION")
 TEMURIN_DIR = os.path.join(ROOT, "build", "tools", "temurin-" + TEMURIN_VERSION)
 
 def temurin_bin(tool):
