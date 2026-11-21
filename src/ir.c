@@ -725,12 +725,28 @@ static void dfs_post(IrFunc *f, uint32_t entry, uint8_t *seen, uint32_t *post,
   if (stk != stk0) xfree(stk);
 }
 
+/* a block's dominator and predecessors, which are the graph's own */
+static uint64_t dom_facts(const IrFunc *f, uint32_t i) {
+  const Block *b = &f->blocks[i];
+  uint64_t h = 1469598103934665603ull;
+  if (!b->reachable) return h;
+  h = (h ^ b->idom) * 1099511628211ull;
+  for (uint32_t p = 0; p < b->npreds; p++) h = (h ^ b->preds[p]) * 1099511628211ull;
+  return h;
+}
+
 /* Returns whether every retreating edge was natural, which makes the graph
    reducible: then the dominators, the predecessor lists and the loop depths
    are the graph's own and not the search order's, and a second ordering
-   given keep = true takes them as they are and renumbers only what follows
-   the order -- rpo, and the dominator tree's interval numbering. */
-static bool order_once(IrFunc *f, bool by_score, bool keep, bool noloops) {
+   given keep = OK_ALL takes them as they are and renumbers only what
+   follows the order -- rpo, and the dominator tree's interval numbering.
+   The dominators and the predecessor lists are the graph's own whatever
+   its cycles: the second ordering of a graph that is not reducible, given
+   OK_DOMS, takes those two and finds the loops by its own search -- Go's
+   functions once their dispatch is threaded, each ordered twice, where
+   finding the same dominators again was a quarter of the second. */
+enum { OK_NONE, OK_DOMS, OK_ALL };
+static bool order_once(IrFunc *f, bool by_score, int keep, bool noloops) {
   bool reducible = true;
   /* Every array below is the function's blocks long, or one more, and the
      search's stack twice that: carved from one buffer the function keeps.
@@ -772,11 +788,18 @@ static bool order_once(IrFunc *f, bool by_score, bool keep, bool noloops) {
   for (uint32_t i = 0; i < f->nblocks; i++) {
     f->blocks[i].reachable = seen[i] != 0;
     f->blocks[i].rpo = 0xffffffffu;
-    if (!keep) f->blocks[i].loop_depth = 0;
+    if (keep != OK_ALL) f->blocks[i].loop_depth = 0;
   }
   for (uint32_t i = 0; i < n; i++) f->blocks[f->order[i]].rpo = i;
 
-  if (!keep) {
+  /* (WARMC_VERIFY_GATES=1: what OK_DOMS keeps made anew all the same, and
+     compared) */
+  uint64_t *kept = NULL;
+  if (keep == OK_DOMS && g_order_light == 2) {
+    kept = xmalloc((nb ? nb : 1) * sizeof(uint64_t));
+    for (uint32_t i = 0; i < nb; i++) kept[i] = dom_facts(f, i);
+  }
+  if (!keep || kept) {
   ir_recompute_preds(f);
 
   for (uint32_t i = 0; i < f->nblocks; i++) f->blocks[i].idom = REF_NONE;
@@ -819,6 +842,13 @@ static bool order_once(IrFunc *f, bool by_score, bool keep, bool noloops) {
     }
   }
   }
+  if (kept) {
+    for (uint32_t i = 0; i < nb; i++)
+      if (kept[i] != dom_facts(f, i))
+        warmc_fatal("WARMC_VERIFY_GATES: block %u's dominator or predecessors differ "
+                    "by the search that orders a graph not reducible", i);
+    xfree(kept);
+  }
 
   for (uint32_t i = 0; i < f->nblocks; i++) {
     f->blocks[i].dom_in = UINT32_MAX;
@@ -860,7 +890,7 @@ static bool order_once(IrFunc *f, bool by_score, bool keep, bool noloops) {
      the blocks it marks, so a loop costs its own size: clearing and scanning
      every block per back edge made this blocks times loops, which in a
      function of 78,000 blocks and 300 loops was most of the compile. */
-  if (keep) return true;
+  if (keep == OK_ALL) return true;
   if (noloops) {
     /* the caller reads no depth: only whether every edge back is natural,
        and with one that is not, the loops after all -- its second search
@@ -1273,9 +1303,9 @@ const uint32_t *ir_emit_order(IrFunc *f, uint32_t skip, uint32_t *n) {
    the next ir_order makes them again whatever the graph. */
 void ir_order_depths(IrFunc *f) {
   pthread_once(&g_dom_check_once, dom_check_init);
-  bool reducible = order_once(f, false, false, false);
+  bool reducible = order_once(f, false, OK_NONE, false);
   mark_diverging(f);
-  if (!reducible) order_once(f, true, false, false);
+  if (!reducible) order_once(f, true, OK_DOMS, false);
   f->order_sig_valid = false;
 }
 
@@ -1374,11 +1404,14 @@ static uint64_t order_facts(const IrFunc *f, uint32_t i) {
 void ir_order_light(IrFunc *f) {
   pthread_once(&g_dom_check_once, dom_check_init);
   if (!g_order_light) { ir_order(f); return; }
-  bool reducible = order_once(f, false, false, true);
+  bool reducible = order_once(f, false, OK_NONE, true);
   f->reducible = reducible;
   if (!reducible) {
+    /* (the search that ir_order's order is of, for which edges go back by
+       it; the loops stay the first search's, which found them for this
+       one's scores and which no threading reads) */
     mark_diverging(f);
-    order_once(f, true, false, false);
+    order_once(f, true, OK_ALL, false);
   }
   f->order_sig_valid = false;
   if (g_order_light == 2) {
@@ -1399,11 +1432,11 @@ bool ir_order_changed(IrFunc *f) {
   pthread_once(&g_dom_check_once, dom_check_init);
   if (order_sig_same(f)) return false;
 
-  bool reducible = order_once(f, false, false, false);
+  bool reducible = order_once(f, false, OK_NONE, false);
   f->reducible = reducible;
 
   mark_diverging(f);
-  order_once(f, true, reducible, false);
+  order_once(f, true, reducible ? OK_ALL : OK_DOMS, false);
 
   f->order_sig_len = order_sig_len_of(f);
   order_sig_fill(f, f->order_sig);

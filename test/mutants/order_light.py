@@ -11,7 +11,7 @@ I = 'src/ir.c'
 def m(old, new, path=I): return (path, [(old, new)])
 M = {
  # a graph with an edge back that is not natural is ordered as ir_order orders it
- 'irreducible': m('  if (!reducible) {\n    mark_diverging(f);\n    order_once(f, true, false, false);\n  }\n  f->order_sig_valid = false;',
+ 'irreducible': m('  if (!reducible) {\n    /* (the search that ir_order\'s order is of, for which edges go back by\n       it; the loops stay the first search\'s, which found them for this\n       one\'s scores and which no threading reads) */\n    mark_diverging(f);\n    order_once(f, true, OK_ALL, false);\n  }\n  f->order_sig_valid = false;',
                   '  f->order_sig_valid = false;'),
  'natural': m('        if (f->blocks[t].rpo <= b->rpo && !block_dominates(f, t, bi)) all = false;', '        ;'),
 }
